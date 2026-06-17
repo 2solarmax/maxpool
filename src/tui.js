@@ -83,6 +83,18 @@ function statusColor(status) {
   return String(status);
 }
 
+function loadText(load) {
+  const cur = load?.current || {};
+  const m15 = load?.last15m || {};
+  const h1 = load?.last1h || {};
+  const current = `${cur.inFlight || 0}/${cur.activeWeight || 0}`;
+  const recent = `${m15.requests || 0}r`;
+  const recentAvg = m15.avgMs != null ? ` ${formatMs(m15.avgMs)}` : '';
+  const hour = `${h1.requests || 0}r`;
+  const fails = (m15.failed || 0) > 0 ? ` ${red(`${m15.failed}f`)}` : '';
+  return `Load ${current}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
@@ -535,6 +547,7 @@ export class TUI {
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
+    line += `  ${dim(loadText(a.load))}`;
     return line;
   }
 
@@ -551,7 +564,7 @@ export class TUI {
       limit = `  Lim ${used}/${q.genericLimit}${reset ? ` ${reset}` : ''}`;
     }
     const err = a.lastError ? `  Err ${String(a.lastError).slice(0, 18)}` : '';
-    return ` ${sel}${cur} ${name} ${type} ${status} Act ${String(active).padStart(2)}  OK ${String(completed).padStart(3)}  Fail ${String(failed).padStart(2)}  Last ${last}${limit}${err}`;
+    return ` ${sel}${cur} ${name} ${type} ${status} Act ${String(active).padStart(2)}  OK ${String(completed).padStart(3)}  Fail ${String(failed).padStart(2)}  Last ${last}  ${dim(loadText(a.load))}${limit}${err}`;
   }
 
   _renderFooter() {

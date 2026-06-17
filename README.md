@@ -13,6 +13,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Fast failover on 429/overload** — parks the affected account and retries another account before response bytes are sent
 - **Provider fallback profile** — optional `all` profile can use Claude accounts first, then GLM, then Kimi via local custom headers
 - **Provider telemetry** — GLM/Kimi rows show active requests, completed/failed counts, last status/latency, and standard rate-limit headers when providers return them
+- **Rolling load view** — each row shows current in-flight load plus request counts/average latency over the last 15 minutes and 1 hour
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running; the server auto-syncs config and **R** can reload immediately
@@ -137,6 +138,8 @@ Provider fallback credentials can be supplied per Claude Code process with `ANTH
 Provider rows do not use Claude Max session/week bars unless the provider returns compatible quota headers. For GLM/Kimi, TeamClaude always tracks operational telemetry (`Act`, `OK`, `Fail`, `Last`) and also parses common `x-ratelimit-*` / `ratelimit-*` headers if present.
 
 When GLM/Kimi return 429 without standard retry headers, TeamClaude also parses provider-specific JSON error bodies. Z.AI `next_flush_time` / weekly-monthly exhausted messages and Kimi “try again after N seconds” rate-limit messages are converted into provider cooldowns and queue wake-up timing.
+
+Every account/provider row also includes load telemetry: `Load current/weight`, `15m <requests> <avg latency>`, and `1h <requests>`. This is based on completed requests retained in memory for the last hour, plus current in-flight requests.
 
 ### Other commands
 

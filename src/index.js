@@ -412,6 +412,7 @@ async function statusCommand() {
 
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.status}`);
+      console.log(`    Load:     current ${acct.load?.current?.inFlight || 0}/${acct.load?.current?.activeWeight || 0} weight, 15m ${formatLoadWindow(acct.load?.last15m)}, 1h ${formatLoadWindow(acct.load?.last1h)}`);
 
       if (acct.type === 'provider') {
         const last = acct.lastStatus ? `${acct.lastStatus} in ${formatDurationMs(acct.lastResponseMs)}` : '-';
@@ -835,4 +836,10 @@ function formatDurationMs(ms) {
   const sec = ms / 1000;
   if (sec < 60) return `${sec.toFixed(1)}s`;
   return `${Math.floor(sec / 60)}m${String(Math.round(sec % 60)).padStart(2, '0')}s`;
+}
+
+function formatLoadWindow(load = {}) {
+  const avg = load.avgMs != null ? ` avg ${formatDurationMs(load.avgMs)}` : '';
+  const failed = load.failed ? `, ${load.failed} failed` : '';
+  return `${load.requests || 0} req${avg}${failed}`;
 }

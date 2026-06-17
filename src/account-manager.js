@@ -26,6 +26,7 @@ const DEFAULT_SCHEDULER = {
   cooldownMs: 30_000,
   maxCooldownMs: 15 * 60_000,
 };
+const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 
 function clampRetryAfterSeconds(value) {
   const n = Number(value);
@@ -100,6 +101,7 @@ export class AccountManager {
       activeWeight: 0,
       completedRequests: 0,
       failedRequests: 0,
+      loadEvents: [],
       consecutiveFailures: 0,
       lastStatus: null,
       lastResponseMs: null,
@@ -146,6 +148,7 @@ export class AccountManager {
       account.consecutiveFailures = 0;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
+      this._recordLoadEvent(account, lease, { ...outcome, success: true });
       account.lastSuccessAt = Date.now();
       return;
     }
@@ -155,9 +158,47 @@ export class AccountManager {
       account.consecutiveFailures++;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
+      this._recordLoadEvent(account, lease, outcome);
       account.lastError = outcome.error || `HTTP ${outcome.status}`;
       account.lastErrorAt = Date.now();
     }
+  }
+
+  _recordLoadEvent(account, lease, outcome = {}) {
+    const now = Date.now();
+    account.loadEvents ||= [];
+    account.loadEvents.push({
+      at: now,
+      durationMs: Math.max(0, now - lease.startedAt),
+      weight: Math.max(1, lease.weight || 1),
+      success: Boolean(outcome.success),
+      status: outcome.status || null,
+    });
+    this._pruneLoadEvents(account, now);
+  }
+
+  _pruneLoadEvents(account, now = Date.now()) {
+    if (!account.loadEvents?.length) return;
+    const cutoff = now - LOAD_EVENT_MAX_AGE_MS;
+    while (account.loadEvents.length && account.loadEvents[0].at < cutoff) {
+      account.loadEvents.shift();
+    }
+  }
+
+  _loadSummary(account, windowMs, now = Date.now()) {
+    this._pruneLoadEvents(account, now);
+    const since = now - windowMs;
+    const events = (account.loadEvents || []).filter(e => e.at >= since);
+    const requests = events.length;
+    const failed = events.filter(e => !e.success).length;
+    const weight = events.reduce((sum, e) => sum + (e.weight || 1), 0);
+    const durationMs = events.reduce((sum, e) => sum + (e.durationMs || 0), 0);
+    return {
+      requests,
+      failed,
+      weight,
+      avgMs: requests ? Math.round(durationMs / requests) : null,
+    };
   }
 
   _isAvailable(account) {
@@ -618,6 +659,7 @@ export class AccountManager {
       activeWeight: 0,
       completedRequests: 0,
       failedRequests: 0,
+      loadEvents: [],
       consecutiveFailures: 0,
       lastStatus: null,
       lastResponseMs: null,
@@ -667,6 +709,7 @@ export class AccountManager {
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {
+    const now = Date.now();
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
@@ -686,6 +729,14 @@ export class AccountManager {
         consecutiveFailures: a.consecutiveFailures,
         lastStatus: a.lastStatus,
         lastResponseMs: a.lastResponseMs,
+        load: {
+          current: {
+            inFlight: a.inFlight,
+            activeWeight: a.activeWeight,
+          },
+          last15m: this._loadSummary(a, 15 * 60 * 1000, now),
+          last1h: this._loadSummary(a, 60 * 60 * 1000, now),
+        },
         lastError: a.lastError,
         lastErrorAt: a.lastErrorAt ? new Date(a.lastErrorAt).toISOString() : null,
         cooldownUntil: a.cooldownUntil ? new Date(a.cooldownUntil).toISOString() : null,

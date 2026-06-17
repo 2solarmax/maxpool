@@ -108,3 +108,22 @@ test('provider telemetry parses standard rate limit headers', () => {
   assert.equal(am.accounts[0].quota.genericRemaining, 72);
   assert.ok(am.accounts[0].quota.genericReset > Date.now());
 });
+
+test('load telemetry tracks current and rolling account usage', () => {
+  const am = manager(1);
+  const lease = am.acquireAccount({ weight: 3 });
+  let status = am.getStatus().accounts[0];
+  assert.equal(status.load.current.inFlight, 1);
+  assert.equal(status.load.current.activeWeight, 3);
+  assert.equal(status.load.last15m.requests, 0);
+
+  am.releaseAccount(lease, { success: true, status: 200 });
+  status = am.getStatus().accounts[0];
+  assert.equal(status.load.current.inFlight, 0);
+  assert.equal(status.load.current.activeWeight, 0);
+  assert.equal(status.load.last15m.requests, 1);
+  assert.equal(status.load.last15m.weight, 3);
+  assert.equal(status.load.last1h.requests, 1);
+  assert.equal(status.load.last15m.failed, 0);
+  assert.ok(status.load.last15m.avgMs >= 0);
+});
