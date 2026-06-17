@@ -14,6 +14,12 @@ const DEFAULT_RETRY = {
   maxRetryBufferBytes: 10 * 1024 * 1024,
 };
 
+const DEFAULT_QUEUE = {
+  enabled: true,
+  maxWaitMs: 6 * 60 * 60 * 1000,
+  pollMs: 1000,
+};
+
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -75,6 +81,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       const body = Buffer.concat(bodyChunks);
       const retryConfig = { ...DEFAULT_RETRY, ...(config.retry || {}) };
+      const queueConfig = { ...DEFAULT_QUEUE, ...(config.queue || {}) };
       const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
       const requestInfo = describeRequest(req, body);
       requestInfo.profile = getTeamClaudeProfile(req.headers);
@@ -84,7 +91,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       try {
         await forwardRequest(
           req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
-          retryConfig, requestInfo, canRetryBufferedBody, new Set(),
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, new Set(),
         );
       } catch (err) {
         ctx.status = ctx.status || 502;
@@ -173,7 +180,7 @@ function formatHeaders(headers) {
 
 async function forwardRequest(
   req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir,
-  retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+  retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
 ) {
   const configuredAttempts = Number(retryConfig.maxAttemptsPerRequest) || accountManager.accounts.length;
   const maxAttempts = Math.max(1, configuredAttempts);
@@ -182,6 +189,13 @@ async function forwardRequest(
   const lease = accountManager.acquireAccount(requestInfo, excludedIndexes);
   const account = lease?.account;
   if (!account) {
+    const queued = await queueAndRetry(
+      'no eligible account/provider currently available',
+      req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+    );
+    if (queued) return;
+
     ctx.status = 429;
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
@@ -211,7 +225,7 @@ async function forwardRequest(
     excludedIndexes.add(account.index);
     return forwardRequest(
       req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-      retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
     );
   }
 
@@ -301,9 +315,16 @@ async function forwardRequest(
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-          retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
         );
       }
+
+      const queued = await queueAndRetry(
+        `all routes failed after 429 from "${account.name}"`,
+        req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+      );
+      if (queued) return;
 
       ctx.status = 429;
       if (logDir) writeRequestLog(logDir, reqId, logSections);
@@ -337,9 +358,16 @@ async function forwardRequest(
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-          retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
         );
       }
+
+      const queued = await queueAndRetry(
+        `all routes failed after ${upstreamRes.status} from "${account.name}"`,
+        req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+      );
+      if (queued) return;
 
       ctx.status = upstreamRes.status;
       if (!res.headersSent) {
@@ -425,9 +453,15 @@ async function forwardRequest(
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-          retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
         );
       }
+      const queued = await queueAndRetry(
+        `all routes failed after network error from "${account.name}"`,
+        req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+      );
+      if (queued) return;
       if (!res.headersSent) res.destroy();
       return;
     }
@@ -438,9 +472,15 @@ async function forwardRequest(
       excludedIndexes.add(account.index);
       return forwardRequest(
         req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-        retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
       );
     }
+    const queued = await queueAndRetry(
+      `all routes failed after proxy error from "${account.name}"`,
+      req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+    );
+    if (queued) return;
     ctx.status = 502;
 
     if (!res.headersSent) {
@@ -461,6 +501,61 @@ function parseRetryAfter(value) {
 
 function isRetriableUpstreamStatus(status) {
   return status === 529 || status === 502 || status === 503 || status === 504;
+}
+
+async function queueAndRetry(
+  reason, req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+  retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+) {
+  if (!queueConfig.enabled || !canRetryBufferedBody || res.headersSent || res.destroyed) return false;
+
+  const maxWaitMs = Math.max(0, Number(queueConfig.maxWaitMs) || 0);
+  if (maxWaitMs <= 0) return false;
+
+  requestInfo.queueStartedAt ||= Date.now();
+  const elapsed = Date.now() - requestInfo.queueStartedAt;
+  const remaining = maxWaitMs - elapsed;
+  if (remaining <= 0) return false;
+
+  ctx.account = '(queued)';
+  hooks.onRequestRouted?.(reqId, { account: '(queued)' });
+  console.log(`[TeamClaude] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s`);
+
+  const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
+  if (!available) return res.destroyed || req.destroyed;
+
+  return forwardRequest(
+    req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
+    retryConfig, queueConfig, requestInfo, canRetryBufferedBody, new Set(),
+  ).then(() => true);
+}
+
+async function waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, maxWaitMs) {
+  const startedAt = Date.now();
+  const pollMs = Math.max(100, Number(queueConfig.pollMs) || 1000);
+  let closed = false;
+  const markClosed = () => { closed = true; };
+  req.once('aborted', markClosed);
+  res.once('close', markClosed);
+
+  try {
+    while (Date.now() - startedAt < maxWaitMs) {
+      if (closed || res.destroyed) return false;
+      if (accountManager.getActiveAccount(requestInfo, new Set())) return true;
+
+      const remaining = maxWaitMs - (Date.now() - startedAt);
+      await sleep(Math.min(pollMs, remaining));
+    }
+
+    return accountManager.getActiveAccount(requestInfo, new Set()) != null;
+  } finally {
+    req.off('aborted', markClosed);
+    res.off('close', markClosed);
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function describeRequest(req, body) {

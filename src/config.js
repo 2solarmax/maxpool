@@ -29,6 +29,11 @@ export function createDefaultConfig() {
       maxAttemptsPerRequest: 0,
       maxRetryBufferBytes: 10 * 1024 * 1024,
     },
+    queue: {
+      enabled: true,
+      maxWaitMs: 6 * 60 * 60 * 1000,
+      pollMs: 1000,
+    },
     accounts: [],
   };
 }

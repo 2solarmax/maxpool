@@ -186,6 +186,11 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
     "maxAttemptsPerRequest": 0,
     "maxRetryBufferBytes": 10485760
   },
+  "queue": {
+    "enabled": true,
+    "maxWaitMs": 21600000,
+    "pollMs": 1000
+  },
   "accounts": [
     {
       "name": "user@example.com",
@@ -210,6 +215,9 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `scheduler.safetyMaxGlobalActive` | Emergency global circuit breaker |
 | `retry.maxAttemptsPerRequest` | Retry attempts before returning an error; `0` means one pass over accounts |
 | `retry.maxRetryBufferBytes` | Maximum buffered request body eligible for cross-account retry |
+| `queue.enabled` | Hold requests instead of returning 429 when every eligible route is temporarily unavailable |
+| `queue.maxWaitMs` | Maximum time a request can wait in the proxy queue before returning an error |
+| `queue.pollMs` | How often queued requests check for a recovered account/provider |
 
 ## How It Works
 
@@ -221,8 +229,9 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 6. On 429 responses, the proxy respects `retry-after`, cools down that account, and fails over before response bytes are sent
 7. Transient network errors (connection reset, timeout) fail over before the stream starts; after response bytes are sent, the client sees the broken stream and handles retry
 8. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
-9. If all eligible accounts/providers are exhausted, returns 429 with the soonest reset time
-10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
+9. If all eligible accounts/providers are temporarily unavailable, the proxy queues the request and retries when one recovers
+10. If the queue wait expires, returns 429 with the soonest reset time
+11. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
 

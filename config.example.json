@@ -17,6 +17,11 @@
     "maxAttemptsPerRequest": 0,
     "maxRetryBufferBytes": 10485760
   },
+  "queue": {
+    "enabled": true,
+    "maxWaitMs": 21600000,
+    "pollMs": 1000
+  },
   "accounts": [
     {
       "name": "primary-max",
