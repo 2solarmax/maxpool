@@ -333,7 +333,9 @@ async function loginOAuthCommand() {
 async function envCommand() {
   const config = await loadOrCreateConfig();
   console.log(`export ANTHROPIC_BASE_URL=http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
-  console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
+  if (args.includes('--with-key')) {
+    console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
+  }
 }
 
 // ── run ─────────────────────────────────────────────────────
@@ -596,7 +598,7 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
-  env                 Print env vars to use with Claude
+  env [--with-key]    Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
   accounts            List configured accounts
@@ -610,6 +612,7 @@ Options:
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --with-key          Include proxy API key in teamclaude env output
 
 Config: ${getConfigPath()}
 `);

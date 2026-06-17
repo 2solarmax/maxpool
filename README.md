@@ -119,9 +119,11 @@ teamclaude run
 Or manually set the environment:
 
 ```bash
-eval $(teamclaude env)
+eval "$(teamclaude env)"
 claude
 ```
+
+`teamclaude env` exports only `ANTHROPIC_BASE_URL` by default so Claude Code can keep using your claude.ai subscription login without showing an `ANTHROPIC_API_KEY` auth conflict warning. Use `teamclaude env --with-key` only for non-local clients that need to authenticate to the proxy.
 
 ### Other commands
 
