@@ -232,6 +232,86 @@ test('all profile adds runtime GLM fallback and rewrites provider request', asyn
   }
 });
 
+test('Z.AI 429 body reset hint controls provider cooldown when retry-after is missing', async () => {
+  const resetAt = new Date(Date.now() + 120_000).toISOString();
+  const zaiUpstream = http.createServer((_req, res) => {
+    res.writeHead(429, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: {
+        code: '1310',
+        message: `Weekly/Monthly Limit Exhausted. Your limit will reset at ${resetAt}`,
+      },
+    }));
+  });
+  const zaiPort = await listen(zaiUpstream);
+  const am = new AccountManager([], 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:1',
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamclaude-profile': 'all',
+        'x-teamclaude-zai-token': 'zg',
+        'x-teamclaude-zai-base-url': `http://127.0.0.1:${zaiPort}`,
+      },
+      body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    const account = am.accounts.find(a => a.name === 'glm-fallback');
+    assert.ok(account.rateLimitedUntil - Date.now() > 90_000);
+  } finally {
+    await close(proxy);
+    await close(zaiUpstream);
+  }
+});
+
+test('Kimi 429 body wait hint controls provider cooldown when retry-after is missing', async () => {
+  const kimiUpstream = http.createServer((_req, res) => {
+    res.writeHead(429, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: {
+        type: 'rate_limit_reached_error',
+        message: 'Your account org<ak> request reached organization max RPM: 20, please try again after 75 seconds',
+      },
+    }));
+  });
+  const kimiPort = await listen(kimiUpstream);
+  const am = new AccountManager([], 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:1',
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamclaude-profile': 'all',
+        'x-teamclaude-kimi-token': 'kk',
+        'x-teamclaude-kimi-base-url': `http://127.0.0.1:${kimiPort}`,
+      },
+      body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    const account = am.accounts.find(a => a.name === 'kimi-fallback');
+    assert.ok(account.rateLimitedUntil - Date.now() > 60_000);
+    assert.ok(account.rateLimitedUntil - Date.now() < 90_000);
+  } finally {
+    await close(proxy);
+    await close(kimiUpstream);
+  }
+});
+
 test('status endpoint requires proxy api key even from loopback', async () => {
   const am = new AccountManager(accounts(), 0.90);
   const proxy = createProxyServer(am, {

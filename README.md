@@ -136,6 +136,8 @@ Provider fallback credentials can be supplied per Claude Code process with `ANTH
 
 Provider rows do not use Claude Max session/week bars unless the provider returns compatible quota headers. For GLM/Kimi, TeamClaude always tracks operational telemetry (`Act`, `OK`, `Fail`, `Last`) and also parses common `x-ratelimit-*` / `ratelimit-*` headers if present.
 
+When GLM/Kimi return 429 without standard retry headers, TeamClaude also parses provider-specific JSON error bodies. Z.AI `next_flush_time` / weekly-monthly exhausted messages and Kimi “try again after N seconds” rate-limit messages are converted into provider cooldowns and queue wake-up timing.
+
 ### Other commands
 
 ```bash

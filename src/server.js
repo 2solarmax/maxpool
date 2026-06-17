@@ -298,14 +298,15 @@ async function forwardRequest(
     // Retry/failover can only happen before response bytes are sent. Once a
     // streaming response starts, rerouting would corrupt Claude Code's stream.
     if (upstreamRes.status === 429) {
-      const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'));
-      // Discard the 429 response body
-      await upstreamRes.body?.cancel();
+      const errorBody = await readErrorBody(upstreamRes);
+      const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
+        || parseProviderRetryAfter(errorBody, account.provider);
       accountManager.markRateLimited(account.index, retryAfter);
       accountManager.releaseAccount(lease);
 
       if (logDir) {
         logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
       }
       console.log(`[TeamClaude] 429 on "${account.name}" — failing over before first byte`);
       excludedIndexes.add(account.index);
@@ -492,9 +493,86 @@ async function forwardRequest(
 }
 
 function parseRetryAfter(value) {
+  if (value == null) return null;
   const n = parseInt(value, 10);
-  if (Number.isNaN(n)) return 60;
+  if (Number.isNaN(n)) return null;
   return Math.min(Math.max(n, 1), 24 * 60 * 60);
+}
+
+async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
+  if (!upstreamRes.body) return '';
+  try {
+    const reader = upstreamRes.body.getReader();
+    const chunks = [];
+    let total = 0;
+    while (total < limitBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const slice = value.length > limitBytes - total ? value.slice(0, limitBytes - total) : value;
+      chunks.push(slice);
+      total += slice.length;
+      if (slice.length !== value.length) break;
+    }
+    reader.cancel().catch(() => {});
+    return Buffer.concat(chunks).toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+function parseProviderRetryAfter(body, provider) {
+  const parsed = parseJsonError(body);
+  const code = parsed?.code;
+  const message = parsed?.message || '';
+
+  if (provider === 'zai') {
+    const nextFlush = message.match(/reset at\s+`?([^`\n]+?)`?$/i)?.[1]
+      || message.match(/next_flush_time[:\s]+`?([^`\n]+?)`?$/i)?.[1];
+    const resetSeconds = secondsUntilParsedTime(nextFlush);
+    if (resetSeconds) return resetSeconds;
+
+    if (['1302', '1303', '1305'].includes(String(code))) return 60;
+    if (['1304', '1308', '1310'].includes(String(code))) return 60 * 60;
+  }
+
+  if (provider === 'kimi') {
+    const seconds = message.match(/after\s+(\d+)\s+seconds?/i)?.[1];
+    if (seconds) return Math.min(Math.max(parseInt(seconds, 10), 1), 24 * 60 * 60);
+    if (parsed?.type === 'rate_limit_reached_error' || parsed?.type === 'engine_overloaded_error') return 60;
+    if (parsed?.type === 'exceeded_current_quota_error') return 60 * 60;
+  }
+
+  return 60;
+}
+
+function parseJsonError(body) {
+  if (!body) return null;
+  try {
+    const json = JSON.parse(body);
+    const error = json.error || json;
+    return {
+      type: error.type,
+      code: error.code,
+      message: error.message || '',
+    };
+  } catch {
+    return { message: body };
+  }
+}
+
+function secondsUntilParsedTime(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim();
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isNaN(dateMs)) {
+    return Math.min(Math.max(Math.ceil((dateMs - Date.now()) / 1000), 1), 24 * 60 * 60);
+  }
+  const n = Number(trimmed);
+  if (Number.isFinite(n)) {
+    const ms = n > 10_000_000_000 ? n : n > 1_000_000_000 ? n * 1000 : Date.now() + n * 1000;
+    return Math.min(Math.max(Math.ceil((ms - Date.now()) / 1000), 1), 24 * 60 * 60);
+  }
+  return null;
 }
 
 function isRetriableUpstreamStatus(status) {
