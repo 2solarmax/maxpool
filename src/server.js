@@ -8,6 +8,11 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
+const DEFAULT_RETRY = {
+  maxAttemptsPerRequest: 0,
+  maxRetryBufferBytes: 10 * 1024 * 1024,
+};
+
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -24,19 +29,29 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const clientKey = req.headers['x-api-key'];
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+
+      // Status exposes account names and quota state, so require the local
+      // proxy key even for loopback callers.
+      if (req.method === 'GET' && req.url === '/teamclaude/status') {
+        if (proxyApiKey && clientKey !== proxyApiKey) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Invalid proxy API key' },
+          }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        return;
+      }
+
       if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
           error: { type: 'authentication_error', message: 'Invalid proxy API key' },
         }));
-        return;
-      }
-
-      // Status endpoint
-      if (req.method === 'GET' && req.url === '/teamclaude/status') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.getStatus(), null, 2));
         return;
       }
 
@@ -58,10 +73,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         bodyChunks.push(chunk);
       }
       const body = Buffer.concat(bodyChunks);
+      const retryConfig = { ...DEFAULT_RETRY, ...(config.retry || {}) };
+      const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
+      const requestInfo = describeRequest(req, body);
 
       const ctx = { account: null, status: null };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        await forwardRequest(
+          req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
+          retryConfig, requestInfo, canRetryBufferedBody, new Set(),
+        );
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
@@ -147,11 +168,16 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
-  const maxRetries = accountManager.accounts.length;
+async function forwardRequest(
+  req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir,
+  retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+) {
+  const configuredAttempts = Number(retryConfig.maxAttemptsPerRequest) || accountManager.accounts.length;
+  const maxAttempts = Math.max(1, configuredAttempts);
 
   // Select account
-  const account = accountManager.getActiveAccount();
+  const lease = accountManager.acquireAccount(requestInfo, excludedIndexes);
+  const account = lease?.account;
   if (!account) {
     ctx.status = 429;
     ctx.account = '(none available)';
@@ -177,8 +203,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
-  if (account.status === 'error' && retryCount < maxRetries) {
-    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+  if (account.status === 'error' && retryCount + 1 < maxAttempts) {
+    accountManager.releaseAccount(lease, { error: 'token_refresh_error' });
+    excludedIndexes.add(account.index);
+    return forwardRequest(
+      req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+      retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+    );
   }
 
   // Build upstream request headers
@@ -243,21 +274,73 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion)
+    // Retry/failover can only happen before response bytes are sent. Once a
+    // streaming response starts, rerouting would corrupt Claude Code's stream.
     if (upstreamRes.status === 429) {
-      const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
+      const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'));
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
+      accountManager.markRateLimited(account.index, retryAfter);
+      accountManager.releaseAccount(lease);
 
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      // Client may have disconnected during the wait
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+      console.log(`[TeamClaude] 429 on "${account.name}" — failing over before first byte`);
+      excludedIndexes.add(account.index);
+
+      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+        );
+      }
+
+      ctx.status = 429;
+      if (logDir) writeRequestLog(logDir, reqId, logSections);
+      if (!res.headersSent) {
+        const clientRetryAfter = computeRetryAfter(accountManager.getStatus().accounts);
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'retry-after': String(clientRetryAfter),
+        });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: `No account could accept this request. Retry in ${clientRetryAfter}s.`,
+          },
+        }));
+      }
+      return;
+    }
+
+    if (isRetriableUpstreamStatus(upstreamRes.status)) {
+      await upstreamRes.body?.cancel();
+      accountManager.markTransientFailure(account.index, `HTTP ${upstreamRes.status}`);
+      accountManager.releaseAccount(lease);
+      excludedIndexes.add(account.index);
+
+      if (logDir) {
+        logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" cooling down, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
+      }
+
+      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+        );
+      }
+
+      ctx.status = upstreamRes.status;
+      if (!res.headersSent) {
+        res.writeHead(upstreamRes.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'overloaded_error', message: `Upstream returned ${upstreamRes.status}` },
+        }));
+      }
+      return;
     }
 
     // Log response headers
@@ -276,9 +359,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       responseHeaders[key] = value;
     }
 
-    res.writeHead(upstreamRes.status, responseHeaders);
-
     if (!upstreamRes.body) {
+      res.writeHead(upstreamRes.status, responseHeaders);
+      accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
       if (logDir) {
         logSections.push(`=== RESPONSE BODY ===\n(empty)`);
         writeRequestLog(logDir, reqId, logSections);
@@ -291,14 +374,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog);
+      await streamResponse(upstreamRes.body, res, upstreamRes.status, responseHeaders, account.index, accountManager, streamLog);
+      accountManager.releaseAccount(lease, { success: true, status: upstreamRes.status });
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
+      res.writeHead(upstreamRes.status, responseHeaders);
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager);
+      accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
       if (logDir) {
         try {
           logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
@@ -320,17 +406,31 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const isTransient = err instanceof Error &&
       (err.message.includes('fetch failed') ||
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        err.message.includes('terminated'));
 
-    // Transient network errors: just close the connection and let the client retry
     if (isTransient) {
-      res.destroy();
+      accountManager.markTransientFailure(account.index, err.code || err.message || 'network_error');
+      accountManager.releaseAccount(lease);
+      excludedIndexes.add(account.index);
+      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+        );
+      }
+      if (!res.headersSent) res.destroy();
       return;
     }
 
-    if (retryCount < maxRetries && !res.headersSent) {
+    accountManager.releaseAccount(lease, { error: err.message });
+    if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
       account.status = 'error';
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      excludedIndexes.add(account.index);
+      return forwardRequest(
+        req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+        retryConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+      );
     }
     ctx.status = 502;
 
@@ -344,13 +444,46 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   }
 }
 
+function parseRetryAfter(value) {
+  const n = parseInt(value, 10);
+  if (Number.isNaN(n)) return 60;
+  return Math.min(Math.max(n, 1), 24 * 60 * 60);
+}
+
+function isRetriableUpstreamStatus(status) {
+  return status === 529 || status === 502 || status === 503 || status === 504;
+}
+
+function describeRequest(req, body) {
+  let weight = Math.max(1, Math.ceil(body.length / 64_000));
+  const info = {
+    method: req.method,
+    path: req.url,
+    bodyBytes: body.length,
+    weight,
+  };
+  try {
+    const json = JSON.parse(body.toString());
+    if (json.model) info.model = json.model;
+    if (json.stream) info.stream = true;
+    if (json.max_tokens && json.max_tokens > 16_000) weight += 1;
+    if (json.thinking || json.effort) weight += 1;
+  } catch {
+    // Non-JSON requests are rare; body size still gives a useful load signal.
+  }
+  info.weight = Math.max(1, weight);
+  return info;
+}
+
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog) {
+async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
+  let committed = false;
+  let readFailed = false;
 
   try {
     while (true) {
@@ -359,6 +492,11 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
 
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
+
+      if (!committed) {
+        res.writeHead(status, responseHeaders);
+        committed = true;
+      }
 
       // Forward chunk immediately
       const ok = res.write(value);
@@ -392,10 +530,16 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
     if (sseBuffer.trim()) {
       parseSSEUsage(sseBuffer, accountIndex, accountManager);
     }
+  } catch (err) {
+    readFailed = true;
+    throw err;
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
-    if (!res.writableEnded) res.end();
+    if (!readFailed) {
+      if (!committed && !res.headersSent) res.writeHead(status, responseHeaders);
+      if (!res.writableEnded) res.end();
+    }
   }
 }
 
@@ -429,7 +573,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
 function computeRetryAfter(accounts) {
   let soonest = Infinity;
   for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
+    const reset = acct.rateLimitedUntil || acct.cooldownUntil || acct.quota.resetsAt;
     if (reset) {
       const ms = new Date(reset).getTime() - Date.now();
       if (ms < soonest) soonest = ms;

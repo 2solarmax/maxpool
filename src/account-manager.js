@@ -17,8 +17,22 @@ function emptyQuota() {
   };
 }
 
+const DEFAULT_SCHEDULER = {
+  safetyMaxActivePerAccount: 50,
+  safetyMaxGlobalActive: 150,
+  cooldownMs: 30_000,
+  maxCooldownMs: 15 * 60_000,
+};
+
+function clampRetryAfterSeconds(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 60;
+  return Math.min(Math.max(Math.ceil(n), 1), 24 * 60 * 60);
+}
+
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98) {
+  constructor(accounts, switchThreshold = 0.90, schedulerOptions = {}) {
+    this.scheduler = { ...DEFAULT_SCHEDULER, ...schedulerOptions };
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -38,9 +52,18 @@ export class AccountManager {
         totalRequests: 0,
         lastUsed: null,
       },
+      inFlight: 0,
+      activeWeight: 0,
+      completedRequests: 0,
+      failedRequests: 0,
+      consecutiveFailures: 0,
+      lastError: null,
+      lastErrorAt: null,
+      cooldownUntil: null,
       rateLimitedUntil: null,
     }));
     this.currentIndex = 0;
+    this.nextIndex = 0;
     this.switchThreshold = switchThreshold;
   }
 
@@ -48,40 +71,72 @@ export class AccountManager {
    * Get the best available account, rotating if the current one is near quota.
    * Returns null if all accounts are exhausted.
    */
-  getActiveAccount() {
-    // Clear expired quotas across all accounts and switch proactively if a
-    // session reset made a sooner-expiring account the better choice. This runs
-    // on every request so the behaviour holds without the TUI render loop.
+  getActiveAccount(requestInfo = {}, excludedIndexes = new Set()) {
     this.refreshExpiredQuotas();
-    const current = this.accounts[this.currentIndex];
-    // We just learned a probed account's weekly quota — re-evaluate which
-    // account is best now that its limit is known.
-    if (current && current.requalify) {
-      current.requalify = false;
-      const next = this._selectNext();
-      if (next) return next;
+    return this._selectNext(requestInfo, excludedIndexes);
+  }
+
+  acquireAccount(requestInfo = {}, excludedIndexes = new Set()) {
+    const account = this.getActiveAccount(requestInfo, excludedIndexes);
+    if (!account) return null;
+
+    const weight = Math.max(1, Number(requestInfo.weight) || 1);
+    account.inFlight++;
+    account.activeWeight += weight;
+    account.lastUsedAt = Date.now();
+    return { account, weight, startedAt: Date.now() };
+  }
+
+  releaseAccount(lease, outcome = {}) {
+    if (!lease?.account) return;
+    const account = this.accounts[lease.account.index];
+    if (!account) return;
+
+    account.inFlight = Math.max(0, account.inFlight - 1);
+    account.activeWeight = Math.max(0, account.activeWeight - lease.weight);
+
+    if (outcome.success) {
+      account.completedRequests++;
+      account.consecutiveFailures = 0;
+      account.lastSuccessAt = Date.now();
+      return;
     }
-    if (this._isAvailable(current)) {
-      return current;
+
+    if (outcome.error || outcome.status) {
+      account.failedRequests++;
+      account.consecutiveFailures++;
+      account.lastError = outcome.error || `HTTP ${outcome.status}`;
+      account.lastErrorAt = Date.now();
     }
-    return this._selectNext();
   }
 
   _isAvailable(account) {
     if (!account) return false;
+    const now = Date.now();
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
-      if (Date.now() < account.rateLimitedUntil) return false;
+      if (now < account.rateLimitedUntil) return false;
       account.status = 'active';
       account.rateLimitedUntil = null;
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
 
+    if (account.cooldownUntil) {
+      if (now < account.cooldownUntil) return false;
+      account.cooldownUntil = null;
+    }
+
+    if (account.inFlight >= this.scheduler.safetyMaxActivePerAccount) return false;
+    if (this.getGlobalInFlight() >= this.scheduler.safetyMaxGlobalActive) return false;
     if (account.status === 'exhausted' || account.status === 'error') return false;
     if (this._isNearQuota(account)) return false;
 
     return true;
+  }
+
+  getGlobalInFlight() {
+    return this.accounts.reduce((sum, account) => sum + account.inFlight, 0);
   }
 
   /**
@@ -200,26 +255,22 @@ export class AccountManager {
     return false;
   }
 
-  _selectNext() {
-    // Among all available accounts, prefer the one with no known weekly limit
-    // first — using it lets us discover its quota. Otherwise prefer the account
-    // whose weekly limit expires the soonest: that quota is closest to
-    // refreshing, so spending it first preserves accounts whose weekly window
-    // resets further out.
+  _selectNext(requestInfo = {}, excludedIndexes = new Set()) {
+    // Adaptive least-loaded balancing: spread requests across every healthy
+    // account immediately, and let live load, quota pressure, and recent errors
+    // push traffic away from weaker accounts.
     let best = null;
-    let bestReset = Infinity;
+    let bestScore = Infinity;
 
     for (let i = 0; i < this.accounts.length; i++) {
-      const account = this.accounts[i];
-      // _isAvailable filters out accounts at/above the switch threshold, so the
-      // soonest-expiring pick only ever lands on an account whose 5-hour quota
-      // is still below 98%.
+      const idx = (this.nextIndex + i) % this.accounts.length;
+      const account = this.accounts[idx];
+      if (excludedIndexes.has(account.index)) continue;
       if (!this._isAvailable(account)) continue;
 
-      // Unknown weekly reset sorts first so we fill it in.
-      const weeklyReset = account.quota.unified7dReset || -Infinity;
-      if (weeklyReset < bestReset) {
-        bestReset = weeklyReset;
+      const score = this._scoreAccount(account, requestInfo);
+      if (score < bestScore) {
+        bestScore = score;
         best = account;
       }
     }
@@ -227,6 +278,7 @@ export class AccountManager {
     if (best) {
       const switched = best.index !== this.currentIndex;
       this.currentIndex = best.index;
+      this.nextIndex = (best.index + 1) % this.accounts.length;
       // If we switched to an account whose weekly quota is still unknown, flag
       // it so we re-evaluate once that quota is learned (see updateQuota).
       best.probing = best.quota.unified7dReset == null;
@@ -261,6 +313,27 @@ export class AccountManager {
     }
 
     return null;
+  }
+
+  _scoreAccount(account, requestInfo = {}) {
+    const quotaPressure = this._quotaPressure(account) * 10;
+    const failurePenalty = account.consecutiveFailures * 5;
+    const unknownQuotaBonus = account.quota.unified7dReset == null ? -0.25 : 0;
+    return account.activeWeight + (requestInfo.weight || 1) + quotaPressure + failurePenalty + unknownQuotaBonus;
+  }
+
+  _quotaPressure(account) {
+    const q = account.quota;
+    const values = [];
+    if (q.unified5h != null) values.push(q.unified5h);
+    if (q.unified7d != null) values.push(q.unified7d);
+    if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
+      values.push(1 - q.tokensRemaining / q.tokensLimit);
+    }
+    if (q.requestsLimit != null && q.requestsRemaining != null && q.requestsLimit > 0) {
+      values.push(1 - q.requestsRemaining / q.requestsLimit);
+    }
+    return values.length ? Math.max(...values) : 0;
   }
 
   /**
@@ -338,9 +411,29 @@ export class AccountManager {
   markRateLimited(accountIndex, retryAfterSeconds) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+    const retryAfter = clampRetryAfterSeconds(retryAfterSeconds);
     account.status = 'throttled';
-    account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
-    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+    account.rateLimitedUntil = Date.now() + (retryAfter * 1000);
+    account.lastError = 'rate_limited';
+    account.lastErrorAt = Date.now();
+    account.consecutiveFailures++;
+    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfter}s`);
+  }
+
+  markTransientFailure(accountIndex, reason = 'transient_error') {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    const failures = Math.max(1, account.consecutiveFailures + 1);
+    const cooldown = Math.min(
+      this.scheduler.maxCooldownMs,
+      this.scheduler.cooldownMs * 2 ** Math.min(failures - 1, 5),
+    );
+    account.consecutiveFailures = failures;
+    account.failedRequests++;
+    account.lastError = reason;
+    account.lastErrorAt = Date.now();
+    account.cooldownUntil = Date.now() + cooldown;
+    console.log(`[TeamClaude] Account "${account.name}" cooling down for ${Math.ceil(cooldown / 1000)}s after ${reason}`);
   }
 
   /**
@@ -425,6 +518,14 @@ export class AccountManager {
       probing: true,
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
+      inFlight: 0,
+      activeWeight: 0,
+      completedRequests: 0,
+      failedRequests: 0,
+      consecutiveFailures: 0,
+      lastError: null,
+      lastErrorAt: null,
+      cooldownUntil: null,
       rateLimitedUntil: null,
     });
     return index;
@@ -455,12 +556,26 @@ export class AccountManager {
         name: a.name,
         type: a.type,
         status: a.status,
+        inFlight: a.inFlight,
+        activeWeight: a.activeWeight,
+        completedRequests: a.completedRequests,
+        failedRequests: a.failedRequests,
+        consecutiveFailures: a.consecutiveFailures,
+        lastError: a.lastError,
+        lastErrorAt: a.lastErrorAt ? new Date(a.lastErrorAt).toISOString() : null,
+        cooldownUntil: a.cooldownUntil ? new Date(a.cooldownUntil).toISOString() : null,
         quota: { ...a.quota },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,
       })),
+      scheduler: {
+        mode: 'adaptive-least-loaded',
+        globalInFlight: this.getGlobalInFlight(),
+        safetyMaxActivePerAccount: this.scheduler.safetyMaxActivePerAccount,
+        safetyMaxGlobalActive: this.scheduler.safetyMaxGlobalActive,
+      },
     };
   }
 }

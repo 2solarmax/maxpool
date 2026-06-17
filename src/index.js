@@ -86,8 +86,8 @@ async function serverCommand() {
     process.exit(1);
   }
 
-  const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold);
+  const threshold = config.switchThreshold || 0.90;
+  const accountManager = new AccountManager(accounts, threshold, config.scheduler || {});
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -121,6 +121,7 @@ async function serverCommand() {
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
+  const host = config.proxy.host || '127.0.0.1';
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
   let tui = null;
@@ -162,20 +163,25 @@ async function serverCommand() {
   }
 
   const server = createProxyServer(accountManager, config, hooks);
+  const onListenError = err => handleServerListenError(err, host, port);
+  server.once('error', onListenError);
 
-  server.listen(port, () => {
+  server.listen(port, host, () => {
+    server.removeListener('error', onListenError);
+    server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
     if (tui) {
       tui.start();
-      console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
+      console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
     } else {
       const sep = '='.repeat(60);
       console.log('');
       console.log(sep);
       console.log('  TeamClaude Proxy');
       console.log(sep);
-      console.log(`  Port:       ${port}`);
+      console.log(`  Listen:     ${host}:${port}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
+      console.log(`  Scheduler:  adaptive least-loaded`);
       console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
       console.log('');
       accounts.forEach((a, i) => {
@@ -326,7 +332,7 @@ async function loginOAuthCommand() {
 
 async function envCommand() {
   const config = await loadOrCreateConfig();
-  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
+  console.log(`export ANTHROPIC_BASE_URL=http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
   console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
 }
 
@@ -347,7 +353,7 @@ async function runCommand() {
     stdio: 'inherit',
     env: {
       ...process.env,
-      ANTHROPIC_BASE_URL: `http://localhost:${config.proxy.port}`,
+      ANTHROPIC_BASE_URL: `http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`,
     },
   });
 
@@ -367,7 +373,7 @@ async function runCommand() {
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
-  const url = `http://localhost:${config.proxy.port}/teamclaude/status`;
+  const url = `http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}/teamclaude/status`;
 
   try {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
@@ -398,7 +404,7 @@ async function statusCommand() {
       console.log('');
     }
   } catch {
-    console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
+    console.error(`Cannot connect to proxy at ${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
     console.error('Is the server running? Start with: teamclaude server');
     process.exit(1);
   }
@@ -764,4 +770,19 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+function handleServerListenError(err, host, port) {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[TeamClaude] ${host}:${port} is already in use.`);
+    console.error('Another TeamClaude proxy may already be running.');
+    console.error('Check the existing server with: teamclaude status');
+    console.error(`Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`);
+  } else if (err.code === 'EACCES') {
+    console.error(`[TeamClaude] Permission denied while listening on ${host}:${port}.`);
+    console.error('Choose a non-privileged port in the TeamClaude config.');
+  } else {
+    console.error(`[TeamClaude] Failed to listen on ${host}:${port}: ${err.message}`);
+  }
+  process.exit(1);
 }

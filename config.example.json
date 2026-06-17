@@ -1,10 +1,22 @@
 {
   "proxy": {
+    "host": "127.0.0.1",
     "port": 3456,
     "apiKey": "tc-change-me-to-a-secret"
   },
   "upstream": "https://api.anthropic.com",
-  "switchThreshold": 0.98,
+  "switchThreshold": 0.90,
+  "scheduler": {
+    "mode": "adaptive-least-loaded",
+    "safetyMaxActivePerAccount": 50,
+    "safetyMaxGlobalActive": 150,
+    "cooldownMs": 30000,
+    "maxCooldownMs": 900000
+  },
+  "retry": {
+    "maxAttemptsPerRequest": 0,
+    "maxRetryBufferBytes": 10485760
+  },
   "accounts": [
     {
       "name": "primary-max",

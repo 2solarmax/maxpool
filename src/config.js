@@ -13,10 +13,22 @@ export function createDefaultConfig() {
   return {
     proxy: {
       port: 3456,
+      host: '127.0.0.1',
       apiKey: 'tc-' + randomBytes(24).toString('base64url'),
     },
     upstream: 'https://api.anthropic.com',
-    switchThreshold: 0.98,
+    switchThreshold: 0.90,
+    scheduler: {
+      mode: 'adaptive-least-loaded',
+      safetyMaxActivePerAccount: 50,
+      safetyMaxGlobalActive: 150,
+      cooldownMs: 30_000,
+      maxCooldownMs: 15 * 60_000,
+    },
+    retry: {
+      maxAttemptsPerRequest: 0,
+      maxRetryBufferBytes: 10 * 1024 * 1024,
+    },
     accounts: [],
   };
 }
