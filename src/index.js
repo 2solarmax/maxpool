@@ -125,7 +125,69 @@ async function serverCommand() {
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
   let tui = null;
-  let hooks = {};
+  let server = null;
+  let syncTimer = null;
+  let draining = false;
+  const activeRequests = new Set();
+  const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 10 * 60_000);
+  const hooks = {
+    onRequestStart: (id, info) => {
+      activeRequests.add(id);
+      tui?.onRequestStart(id, info);
+    },
+    onRequestRouted: (id, info) => tui?.onRequestRouted(id, info),
+    onRequestEnd: (id, info) => {
+      activeRequests.delete(id);
+      tui?.onRequestEnd(id, info);
+    },
+  };
+
+  const shutdownGracefully = reason => {
+    if (draining) {
+      console.error(`\n[TeamClaude] Force exiting with ${activeRequests.size} active request(s) still open.`);
+      process.exit(1);
+    }
+
+    draining = true;
+    if (syncTimer) clearInterval(syncTimer);
+    if (tui?.running) tui.stop();
+
+    console.log(`\n[TeamClaude] Draining shutdown (${reason}).`);
+    console.log(`[TeamClaude] Stopped accepting new requests; waiting for ${activeRequests.size} active request(s). Press Ctrl-C again to force.`);
+
+    let done = false;
+    let reportTimer = null;
+    let timeoutTimer = null;
+    const finish = code => {
+      if (done) return;
+      done = true;
+      if (reportTimer) clearInterval(reportTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      process.exit(code);
+    };
+
+    reportTimer = setInterval(() => {
+      console.log(`[TeamClaude] Still draining ${activeRequests.size} active request(s)...`);
+    }, 5000);
+    reportTimer.unref();
+
+    timeoutTimer = setTimeout(() => {
+      console.error(`[TeamClaude] Drain timeout after ${Math.ceil(drainTimeoutMs / 1000)}s; exiting with ${activeRequests.size} active request(s) still open.`);
+      finish(1);
+    }, drainTimeoutMs);
+    timeoutTimer.unref();
+
+    server.close(err => {
+      if (err) {
+        console.error(`[TeamClaude] Shutdown error: ${err.message}`);
+        finish(1);
+        return;
+      }
+      console.log('[TeamClaude] Shutdown complete.');
+      finish(0);
+    });
+    server.closeIdleConnections?.();
+  };
 
   if (useTUI) {
     tui = new TUI({
@@ -154,21 +216,15 @@ async function serverCommand() {
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
       onQuit: () => {
-        clearInterval(syncTimer);
-        server.close(() => process.exit(0));
+        shutdownGracefully('quit');
       },
     });
-    hooks = {
-      onRequestStart: (id, info) => tui.onRequestStart(id, info),
-      onRequestRouted: (id, info) => tui.onRequestRouted(id, info),
-      onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
-    };
   }
 
-  const server = createProxyServer(accountManager, config, hooks);
+  server = createProxyServer(accountManager, config, hooks);
   let syncInFlight = false;
   const syncIntervalMs = config.sync?.accountsIntervalMs ?? 15_000;
-  const syncTimer = setInterval(async () => {
+  syncTimer = setInterval(async () => {
     if (syncInFlight) return;
     syncInFlight = true;
     try {
@@ -215,18 +271,8 @@ async function serverCommand() {
     }
   });
 
-  if (!tui) {
-    process.on('SIGINT', () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      clearInterval(syncTimer);
-      server.close(() => process.exit(0));
-    });
-    process.on('SIGTERM', () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      clearInterval(syncTimer);
-      server.close(() => process.exit(0));
-    });
-  }
+  process.on('SIGINT', () => shutdownGracefully('SIGINT'));
+  process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
 }
 
 // ── import ──────────────────────────────────────────────────

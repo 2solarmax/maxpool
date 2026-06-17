@@ -45,6 +45,87 @@ test('scheduler skips throttled accounts and resumes them after retry window', (
   assert.ok(laterLeases.some(l => l.account.name === 'a1'));
 });
 
+test('session affinity keeps a session on the same available account', () => {
+  const am = manager(3);
+
+  const s1First = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(s1First.account.name, 'a1');
+  am.releaseAccount(s1First, { success: true, status: 200 });
+
+  const s2 = am.acquireAccount({ weight: 1, sessionKey: 'session-2' });
+  assert.equal(s2.account.name, 'a2');
+  am.releaseAccount(s2, { success: true, status: 200 });
+
+  const s1Second = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(s1Second.account.name, 'a1');
+  am.releaseAccount(s1Second, { success: true, status: 200 });
+  assert.equal(am.getStatus().sessions.stickyBindings, 2);
+});
+
+test('session affinity rebinds when the bound account is unavailable', () => {
+  const am = manager(3);
+
+  const first = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+
+  am.markRateLimited(0, 60);
+  const moved = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.notEqual(moved.account.name, 'a1');
+  am.releaseAccount(moved, { success: true, status: 200 });
+
+  const next = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(next.account.name, moved.account.name);
+});
+
+test('session affinity returns to the home Claude account after it recovers', () => {
+  const am = manager(3);
+
+  const first = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+
+  am.markRateLimited(0, 60);
+  const moved = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(moved.account.name, 'a2');
+  am.releaseAccount(moved, { success: true, status: 200 });
+
+  am.accounts[0].rateLimitedUntil = Date.now() - 1;
+  const recovered = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(recovered.account.name, 'a1');
+});
+
+test('session affinity survives account index changes', () => {
+  const am = manager(3);
+
+  const s1 = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  am.releaseAccount(s1, { success: true, status: 200 });
+  const s2 = am.acquireAccount({ weight: 1, sessionKey: 'session-2' });
+  assert.equal(s2.account.name, 'a2');
+  am.releaseAccount(s2, { success: true, status: 200 });
+
+  am.removeAccount(0);
+  const s2Again = am.acquireAccount({ weight: 1, sessionKey: 'session-2' });
+  assert.equal(s2Again.account.name, 'a2');
+});
+
+test('session affinity returns fallback sessions to higher-priority routes', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
+    { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
+    { name: 'kimi-fallback', type: 'provider', provider: 'kimi', authToken: 'kk', upstream: 'http://kimi', profiles: ['all'], priority: 20 },
+  ], 0.90);
+
+  am.markRateLimited(0, 60);
+  const fallback = am.acquireAccount({ profile: 'all', sessionKey: 'session-1' });
+  assert.equal(fallback.account.name, 'glm-fallback');
+  am.releaseAccount(fallback, { success: true, status: 200 });
+
+  am.accounts[0].rateLimitedUntil = Date.now() - 1;
+  const recovered = am.acquireAccount({ profile: 'all', sessionKey: 'session-1' });
+  assert.equal(recovered.account.name, 'claude');
+});
+
 test('scheduler keeps provider fallbacks out of claude-only profile', () => {
   const am = new AccountManager([
     {

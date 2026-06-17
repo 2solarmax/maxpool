@@ -113,6 +113,7 @@ export class AccountManager {
     this.currentIndex = 0;
     this.nextIndex = 0;
     this.switchThreshold = switchThreshold;
+    this.sessionBindings = new Map();
   }
 
   /**
@@ -129,6 +130,9 @@ export class AccountManager {
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
+    if (requestInfo.sessionKey) {
+      this._bindSession(requestInfo.sessionKey, account);
+    }
     account.inFlight++;
     account.activeWeight += weight;
     account.lastUsedAt = Date.now();
@@ -355,6 +359,9 @@ export class AccountManager {
     let bestPriority = Infinity;
     const profile = requestInfo.profile || 'claude';
 
+    const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes);
+    if (bound && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes)) return bound;
+
     for (let i = 0; i < this.accounts.length; i++) {
       const idx = (this.nextIndex + i) % this.accounts.length;
       const account = this.accounts[idx];
@@ -410,6 +417,82 @@ export class AccountManager {
     }
 
     return null;
+  }
+
+  _boundAccount(sessionKey, profile, excludedIndexes = new Set()) {
+    if (!sessionKey) return null;
+    const binding = this._sessionBinding(sessionKey);
+    if (!binding) return null;
+
+    const home = this._eligibleBoundAccount(binding.homeName, profile, excludedIndexes);
+    if (home) return home;
+
+    const current = this._eligibleBoundAccount(binding.currentName, profile, excludedIndexes);
+    if (current) return current;
+
+    const homeExists = binding.homeName && this.accounts.some(a => a.name === binding.homeName);
+    const currentExists = binding.currentName && this.accounts.some(a => a.name === binding.currentName);
+    if (!homeExists && !currentExists) {
+      this.sessionBindings.delete(sessionKey);
+    }
+    return null;
+  }
+
+  _eligibleBoundAccount(accountName, profile, excludedIndexes = new Set()) {
+    if (!accountName) return null;
+    const account = this.accounts.find(a => a.name === accountName);
+    if (!account) return null;
+    if (excludedIndexes.has(account.index)) return null;
+    if (!this._matchesProfile(account, profile)) return null;
+    if (!this._isAvailable(account)) return null;
+    return account;
+  }
+
+  _bindSession(sessionKey, account) {
+    const priority = this._priority(account);
+    const binding = this._sessionBinding(sessionKey) || {
+      homeName: account.name,
+      homePriority: priority,
+      currentName: account.name,
+    };
+
+    if (!binding.homeName || priority < binding.homePriority) {
+      binding.homeName = account.name;
+      binding.homePriority = priority;
+    }
+    binding.currentName = account.name;
+    this.sessionBindings.set(sessionKey, binding);
+  }
+
+  _sessionBinding(sessionKey) {
+    const binding = this.sessionBindings.get(sessionKey);
+    if (!binding) return null;
+    if (typeof binding === 'string') {
+      const account = this.accounts.find(a => a.name === binding);
+      const normalized = {
+        homeName: binding,
+        homePriority: account ? this._priority(account) : Infinity,
+        currentName: binding,
+      };
+      this.sessionBindings.set(sessionKey, normalized);
+      return normalized;
+    }
+    return binding;
+  }
+
+  _hasHigherPriorityAvailable(boundAccount, profile, excludedIndexes = new Set()) {
+    const boundPriority = this._priority(boundAccount);
+    return this.accounts.some(account => {
+      if (account.index === boundAccount.index) return false;
+      if (excludedIndexes.has(account.index)) return false;
+      if (!this._matchesProfile(account, profile)) return false;
+      const priority = this._priority(account);
+      return priority < boundPriority && this._isAvailable(account);
+    });
+  }
+
+  _priority(account) {
+    return Number.isFinite(account?.priority) ? account.priority : 0;
   }
 
   _matchesProfile(account, profile) {
@@ -751,6 +834,9 @@ export class AccountManager {
         globalInFlight: this.getGlobalInFlight(),
         safetyMaxActivePerAccount: this.scheduler.safetyMaxActivePerAccount,
         safetyMaxGlobalActive: this.scheduler.safetyMaxGlobalActive,
+      },
+      sessions: {
+        stickyBindings: this.sessionBindings.size,
       },
     };
   }

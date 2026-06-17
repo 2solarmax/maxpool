@@ -10,11 +10,13 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 - **Quota-aware routing** — avoids accounts when session (5h) or weekly (7d) quota reaches the configured threshold (default 90%)
 - **Adaptive load balancing** — spreads concurrent Claude Code streams across healthy accounts using live in-flight load, request size, quota pressure, and recent errors
+- **Session affinity** — optional session headers keep one Claude Code session on the same account until that account becomes unavailable
 - **Fast failover on 429/overload** — parks the affected account and retries another account before response bytes are sent
 - **Provider fallback profile** — optional `all` profile can use Claude accounts first, then GLM, then Kimi via local custom headers
 - **Provider telemetry** — GLM/Kimi rows show active requests, completed/failed counts, last status/latency, and standard rate-limit headers when providers return them
 - **Rolling load view** — each row shows current in-flight load plus request counts/average latency over the last 15 minutes and 1 hour
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
+- **Graceful drain on restart** — quit/Ctrl-C stops new requests and waits for active streams to finish before exiting
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running; the server auto-syncs config and **R** can reload immediately
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
@@ -135,11 +137,24 @@ The proxy also understands an optional internal header profile:
 
 Provider fallback credentials can be supplied per Claude Code process with `ANTHROPIC_CUSTOM_HEADERS`. TeamClaude strips all `x-teamclaude-*` headers before forwarding upstream.
 
+`x-teamclaude-session: <id>` enables session affinity. With this header, the first request for a Claude Code process is routed by the adaptive load balancer, then later requests from the same process keep using that home account while it remains available. If the home account is rate-limited, exhausted, in cooldown, or removed, the session temporarily uses another eligible route. When the home account becomes available again, the session returns to it. For the `all` profile, fallback priority still wins: a session that had to use GLM or Kimi can move back to Claude when a Claude account becomes available again.
+
 Provider rows do not use Claude Max session/week bars unless the provider returns compatible quota headers. For GLM/Kimi, TeamClaude always tracks operational telemetry (`Act`, `OK`, `Fail`, `Last`) and also parses common `x-ratelimit-*` / `ratelimit-*` headers if present.
 
 When GLM/Kimi return 429 without standard retry headers, TeamClaude also parses provider-specific JSON error bodies. Z.AI `next_flush_time` / weekly-monthly exhausted messages and Kimi “try again after N seconds” rate-limit messages are converted into provider cooldowns and queue wake-up timing.
 
 Every account/provider row also includes load telemetry: `Load current/weight`, `15m <requests> <avg latency>`, and `1h <requests>`. This is based on completed requests retained in memory for the last hour, plus current in-flight requests.
+
+### Restart behavior
+
+When you press `q`, Ctrl-C, or send SIGTERM, TeamClaude enters draining shutdown:
+
+1. The proxy stops accepting new requests.
+2. Existing in-flight streams keep running.
+3. The process exits when active requests finish.
+4. Press Ctrl-C again to force exit.
+
+Idle Claude Code sessions are not tied to the server process. If the server is restarted while a Claude Code session is idle, its next request reconnects to the new server. If the server is forced closed while a stream is actively running, that stream can still fail because the TCP connection disappears.
 
 ### Other commands
 
@@ -199,6 +214,9 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
     "maxWaitMs": 21600000,
     "pollMs": 1000
   },
+  "shutdown": {
+    "drainTimeoutMs": 600000
+  },
   "accounts": [
     {
       "name": "user@example.com",
@@ -226,20 +244,22 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `queue.enabled` | Hold requests instead of returning 429 when every eligible route is temporarily unavailable |
 | `queue.maxWaitMs` | Maximum time a request can wait in the proxy queue before returning an error |
 | `queue.pollMs` | How often queued requests check for a recovered account/provider |
+| `shutdown.drainTimeoutMs` | Maximum time quit/Ctrl-C waits for active requests before exiting |
 
 ## How It Works
 
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
 2. The proxy selects the least-loaded healthy account and forwards requests with that account's credentials
-3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
-4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
-5. When usage reaches the threshold, the account is avoided until quota resets
-6. On 429 responses, the proxy respects `retry-after`, cools down that account, and fails over before response bytes are sent
-7. Transient network errors (connection reset, timeout) fail over before the stream starts; after response bytes are sent, the client sees the broken stream and handles retry
-8. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
-9. If all eligible accounts/providers are temporarily unavailable, the proxy queues the request and retries when one recovers
-10. If the queue wait expires, returns 429 with the soonest reset time
-11. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
+3. If the client sends `x-teamclaude-session`, the session is pinned to that account while it stays available
+4. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
+5. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
+6. When usage reaches the threshold, the account is avoided until quota resets
+7. On 429 responses, the proxy respects `retry-after`, cools down that account, and fails over before response bytes are sent
+8. Transient network errors (connection reset, timeout) fail over before the stream starts; after response bytes are sent, the client sees the broken stream and handles retry
+9. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
+10. If all eligible accounts/providers are temporarily unavailable, the proxy queues the request and retries when one recovers
+11. If the queue wait expires, returns 429 with the soonest reset time
+12. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
 

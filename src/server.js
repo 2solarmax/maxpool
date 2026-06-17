@@ -85,6 +85,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
       const requestInfo = describeRequest(req, body);
       requestInfo.profile = getTeamClaudeProfile(req.headers);
+      requestInfo.sessionKey = headerValue(req.headers, 'x-teamclaude-session');
       prepareRuntimeProviders(accountManager, req.headers);
 
       const ctx = { account: null, status: null };
