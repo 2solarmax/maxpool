@@ -153,7 +153,10 @@ async function serverCommand() {
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
-      onQuit: () => { server.close(() => process.exit(0)); },
+      onQuit: () => {
+        clearInterval(syncTimer);
+        server.close(() => process.exit(0));
+      },
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -163,6 +166,23 @@ async function serverCommand() {
   }
 
   const server = createProxyServer(accountManager, config, hooks);
+  let syncInFlight = false;
+  const syncIntervalMs = config.sync?.accountsIntervalMs ?? 15_000;
+  const syncTimer = setInterval(async () => {
+    if (syncInFlight) return;
+    syncInFlight = true;
+    try {
+      const diskConfig = await loadConfig();
+      if (!diskConfig) return;
+      const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+      if (added && tui) tui._addLog(`Auto-loaded ${added} account(s) from config`);
+    } catch (err) {
+      console.error(`[TeamClaude] Account auto-sync failed: ${err.message}`);
+    } finally {
+      syncInFlight = false;
+    }
+  }, syncIntervalMs);
+  syncTimer.unref();
   const onListenError = err => handleServerListenError(err, host, port);
   server.once('error', onListenError);
 
@@ -198,10 +218,12 @@ async function serverCommand() {
   if (!tui) {
     process.on('SIGINT', () => {
       console.log('\n[TeamClaude] Shutting down...');
+      clearInterval(syncTimer);
       server.close(() => process.exit(0));
     });
     process.on('SIGTERM', () => {
       console.log('\n[TeamClaude] Shutting down...');
+      clearInterval(syncTimer);
       server.close(() => process.exit(0));
     });
   }
@@ -714,6 +736,8 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
+    } else if (diskAcct.type === 'provider' && (diskAcct.authToken || diskAcct.apiKey)) {
+      freshCred = { authToken: diskAcct.authToken || diskAcct.apiKey };
     }
 
     if (!freshCred) continue;
@@ -739,6 +763,10 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
       console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
+    } else if (freshCred.authToken && mgr.credential !== freshCred.authToken) {
+      mgr.credential = freshCred.authToken;
+      if (mgr.status === 'error') mgr.status = 'active';
+      console.log(`[TeamClaude] Updated provider token for "${mgr.name}"`);
     }
   }
   return added;
@@ -764,6 +792,8 @@ async function resolveAccounts(config) {
         console.error(`No token for "${acct.name}", skipping`);
       }
     } else if (acct.type === 'apikey' && acct.apiKey) {
+      accounts.push(acct);
+    } else if (acct.type === 'provider' && (acct.authToken || acct.apiKey)) {
       accounts.push(acct);
     }
   }

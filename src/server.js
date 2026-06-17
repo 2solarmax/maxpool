@@ -7,6 +7,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
+const TEAMCLAUDE_HEADER_PREFIX = 'x-teamclaude-';
 
 const DEFAULT_RETRY = {
   maxAttemptsPerRequest: 0,
@@ -76,6 +77,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const retryConfig = { ...DEFAULT_RETRY, ...(config.retry || {}) };
       const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
       const requestInfo = describeRequest(req, body);
+      requestInfo.profile = getTeamClaudeProfile(req.headers);
+      prepareRuntimeProviders(accountManager, req.headers);
 
       const ctx = { account: null, status: null };
       try {
@@ -218,21 +221,27 @@ async function forwardRequest(
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+    if (lk.startsWith(TEAMCLAUDE_HEADER_PREFIX)) continue;
     if (lk === 'x-api-key') continue;
+    if (lk === 'content-length') continue;
+    if (account.stripBetaHeaders && lk === 'anthropic-beta') continue;
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
     headers[key] = value;
   }
 
-  if (isOAuth) {
+  if (account.authHeader === 'authorization' || account.type === 'provider' || isOAuth) {
     headers['authorization'] = `Bearer ${account.credential}`;
-  } else {
+    delete headers['x-api-key'];
+  } else if (account.authHeader === 'x-api-key' || !isOAuth) {
     headers['x-api-key'] = account.credential;
+    delete headers['authorization'];
   }
 
-  const upstreamUrl = `${upstream}${req.url}`;
+  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
+  const upstreamBody = rewriteBodyForAccount(body, account);
 
   // Build log sections
   const logSections = [];
@@ -261,7 +270,7 @@ async function forwardRequest(
     const upstreamRes = await fetch(upstreamUrl, {
       method,
       headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+      body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
       redirect: 'manual',
     });
 
@@ -473,6 +482,84 @@ function describeRequest(req, body) {
   }
   info.weight = Math.max(1, weight);
   return info;
+}
+
+function getTeamClaudeProfile(headers) {
+  const profile = String(headers['x-teamclaude-profile'] || 'claude').trim().toLowerCase();
+  return profile || 'claude';
+}
+
+function prepareRuntimeProviders(accountManager, headers) {
+  if (getTeamClaudeProfile(headers) !== 'all') return;
+
+  const zaiToken = headerValue(headers, 'x-teamclaude-zai-token');
+  if (zaiToken) {
+    const opus = headerValue(headers, 'x-teamclaude-zai-opus-model') || headerValue(headers, 'x-teamclaude-zai-model') || 'glm-5.2';
+    const sonnet = headerValue(headers, 'x-teamclaude-zai-sonnet-model') || headerValue(headers, 'x-teamclaude-zai-model') || opus;
+    const haiku = headerValue(headers, 'x-teamclaude-zai-haiku-model') || 'glm-5.1';
+    accountManager.upsertRuntimeAccount({
+      name: 'glm-fallback',
+      type: 'provider',
+      provider: 'zai',
+      authToken: zaiToken,
+      upstream: trimTrailingSlash(headerValue(headers, 'x-teamclaude-zai-base-url') || 'https://api.z.ai/api/anthropic'),
+      authHeader: 'authorization',
+      profiles: ['all'],
+      priority: 10,
+      modelMap: { opus, sonnet, haiku, default: sonnet },
+      stripBetaHeaders: true,
+    });
+  }
+
+  const kimiToken = headerValue(headers, 'x-teamclaude-kimi-token');
+  if (kimiToken) {
+    const model = headerValue(headers, 'x-teamclaude-kimi-model') || 'kimi-k2.7';
+    accountManager.upsertRuntimeAccount({
+      name: 'kimi-fallback',
+      type: 'provider',
+      provider: 'kimi',
+      authToken: kimiToken,
+      upstream: trimTrailingSlash(headerValue(headers, 'x-teamclaude-kimi-base-url') || 'https://api.kimi.com/coding'),
+      authHeader: 'authorization',
+      profiles: ['all'],
+      priority: 20,
+      model,
+      stripBetaHeaders: true,
+    });
+  }
+}
+
+function headerValue(headers, name) {
+  const value = headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value[0];
+  return value ? String(value).trim() : '';
+}
+
+function trimTrailingSlash(value) {
+  return String(value).replace(/\/+$/, '');
+}
+
+function rewriteBodyForAccount(body, account) {
+  if (!body.length || (!account.model && !account.modelMap)) return body;
+
+  try {
+    const json = JSON.parse(body.toString());
+    if (!json || typeof json !== 'object' || !json.model) return body;
+    json.model = mappedModel(json.model, account);
+    return Buffer.from(JSON.stringify(json));
+  } catch {
+    return body;
+  }
+}
+
+function mappedModel(originalModel, account) {
+  if (account.model) return account.model;
+  const map = account.modelMap || {};
+  const model = String(originalModel || '').toLowerCase();
+  if (model.includes('haiku')) return map.haiku || map.default || originalModel;
+  if (model.includes('opus')) return map.opus || map.default || originalModel;
+  if (model.includes('sonnet')) return map.sonnet || map.default || originalModel;
+  return map.default || originalModel;
 }
 
 /**

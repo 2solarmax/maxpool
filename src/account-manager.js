@@ -37,8 +37,17 @@ export class AccountManager {
       index,
       name: acct.name,
       type: acct.type,
+      provider: acct.provider || (acct.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acct.accountUuid || null,
-      credential: acct.accessToken || acct.apiKey,
+      credential: acct.accessToken || acct.authToken || acct.apiKey,
+      upstream: acct.upstream || null,
+      authHeader: acct.authHeader || null,
+      profiles: acct.profiles || (acct.type === 'provider' ? ['all'] : ['claude', 'all']),
+      priority: Number.isFinite(acct.priority) ? acct.priority : 0,
+      model: acct.model || null,
+      modelMap: acct.modelMap || null,
+      stripBetaHeaders: Boolean(acct.stripBetaHeaders),
+      runtime: Boolean(acct.runtime),
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
@@ -261,15 +270,20 @@ export class AccountManager {
     // push traffic away from weaker accounts.
     let best = null;
     let bestScore = Infinity;
+    let bestPriority = Infinity;
+    const profile = requestInfo.profile || 'claude';
 
     for (let i = 0; i < this.accounts.length; i++) {
       const idx = (this.nextIndex + i) % this.accounts.length;
       const account = this.accounts[idx];
       if (excludedIndexes.has(account.index)) continue;
+      if (!this._matchesProfile(account, profile)) continue;
       if (!this._isAvailable(account)) continue;
 
+      const priority = Number.isFinite(account.priority) ? account.priority : 0;
       const score = this._scoreAccount(account, requestInfo);
-      if (score < bestScore) {
+      if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
+        bestPriority = priority;
         bestScore = score;
         best = account;
       }
@@ -293,6 +307,7 @@ export class AccountManager {
     let soonestTime = Infinity;
 
     for (const account of this.accounts) {
+      if (!this._matchesProfile(account, profile)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -313,6 +328,11 @@ export class AccountManager {
     }
 
     return null;
+  }
+
+  _matchesProfile(account, profile) {
+    const profiles = account.profiles || ['claude', 'all'];
+    return profiles.includes(profile);
   }
 
   _scoreAccount(account, requestInfo = {}) {
@@ -509,8 +529,17 @@ export class AccountManager {
       index,
       name: acctData.name,
       type: acctData.type,
+      provider: acctData.provider || (acctData.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acctData.accountUuid || null,
-      credential: acctData.accessToken || acctData.apiKey,
+      credential: acctData.accessToken || acctData.authToken || acctData.apiKey,
+      upstream: acctData.upstream || null,
+      authHeader: acctData.authHeader || null,
+      profiles: acctData.profiles || (acctData.type === 'provider' ? ['all'] : ['claude', 'all']),
+      priority: Number.isFinite(acctData.priority) ? acctData.priority : 0,
+      model: acctData.model || null,
+      modelMap: acctData.modelMap || null,
+      stripBetaHeaders: Boolean(acctData.stripBetaHeaders),
+      runtime: Boolean(acctData.runtime),
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
       status: 'active',
@@ -529,6 +558,26 @@ export class AccountManager {
       rateLimitedUntil: null,
     });
     return index;
+  }
+
+  upsertRuntimeAccount(acctData) {
+    const idx = this.accounts.findIndex(a => a.name === acctData.name);
+    if (idx < 0) return this.addAccount({ ...acctData, runtime: true });
+
+    const account = this.accounts[idx];
+    account.type = acctData.type || account.type;
+    account.provider = acctData.provider || account.provider;
+    account.credential = acctData.accessToken || acctData.authToken || acctData.apiKey || account.credential;
+    account.upstream = acctData.upstream || account.upstream;
+    account.authHeader = acctData.authHeader || account.authHeader;
+    account.profiles = acctData.profiles || account.profiles;
+    account.priority = Number.isFinite(acctData.priority) ? acctData.priority : account.priority;
+    account.model = acctData.model || account.model;
+    account.modelMap = acctData.modelMap || account.modelMap;
+    account.stripBetaHeaders = Boolean(acctData.stripBetaHeaders);
+    account.runtime = true;
+    if (account.status === 'error') account.status = 'active';
+    return idx;
   }
 
   /**
@@ -555,6 +604,11 @@ export class AccountManager {
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
+        provider: a.provider,
+        upstream: a.upstream,
+        profiles: a.profiles,
+        priority: a.priority,
+        runtime: a.runtime,
         status: a.status,
         inFlight: a.inFlight,
         activeWeight: a.activeWeight,

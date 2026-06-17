@@ -123,6 +123,68 @@ test('429 does not retry buffered bodies larger than configured retry limit', as
   }
 });
 
+test('all profile adds runtime GLM fallback and rewrites provider request', async () => {
+  const claudeSeen = [];
+  const glmSeen = [];
+
+  const claudeUpstream = http.createServer((req, res) => {
+    claudeSeen.push(req.headers.authorization);
+    res.writeHead(429, { 'retry-after': '60', 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const glmUpstream = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    glmSeen.push({
+      auth: req.headers.authorization,
+      internalHeader: req.headers['x-teamclaude-zai-token'],
+      beta: req.headers['anthropic-beta'],
+      body: JSON.parse(Buffer.concat(chunks).toString()),
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const claudePort = await listen(claudeUpstream);
+  const glmPort = await listen(glmUpstream);
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${claudePort}`,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-beta': 'test-beta',
+        'x-teamclaude-profile': 'all',
+        'x-teamclaude-zai-token': 'zg',
+        'x-teamclaude-zai-base-url': `http://127.0.0.1:${glmPort}`,
+        'x-teamclaude-zai-opus-model': 'glm-opus',
+        'x-teamclaude-zai-sonnet-model': 'glm-sonnet',
+        'x-teamclaude-zai-haiku-model': 'glm-haiku',
+      },
+      body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(claudeSeen, ['Bearer tc']);
+    assert.equal(glmSeen.length, 1);
+    assert.equal(glmSeen[0].auth, 'Bearer zg');
+    assert.equal(glmSeen[0].internalHeader, undefined);
+    assert.equal(glmSeen[0].beta, undefined);
+    assert.equal(glmSeen[0].body.model, 'glm-sonnet');
+    assert.equal(am.accounts.some(a => a.name === 'glm-fallback'), true);
+  } finally {
+    await close(proxy);
+    await close(claudeUpstream);
+    await close(glmUpstream);
+  }
+});
+
 test('status endpoint requires proxy api key even from loopback', async () => {
   const am = new AccountManager(accounts(), 0.90);
   const proxy = createProxyServer(am, {

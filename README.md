@@ -11,9 +11,10 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Quota-aware routing** — avoids accounts when session (5h) or weekly (7d) quota reaches the configured threshold (default 90%)
 - **Adaptive load balancing** — spreads concurrent Claude Code streams across healthy accounts using live in-flight load, request size, quota pressure, and recent errors
 - **Fast failover on 429/overload** — parks the affected account and retries another account before response bytes are sent
+- **Provider fallback profile** — optional `all` profile can use Claude accounts first, then GLM, then Kimi via local custom headers
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
-- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up
+- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running; the server auto-syncs config and **R** can reload immediately
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
@@ -125,6 +126,13 @@ claude
 
 `teamclaude env` exports only `ANTHROPIC_BASE_URL` by default so Claude Code can keep using your claude.ai subscription login without showing an `ANTHROPIC_API_KEY` auth conflict warning. Use `teamclaude env --with-key` only for non-local clients that need to authenticate to the proxy.
 
+The proxy also understands an optional internal header profile:
+
+- default/absent `x-teamclaude-profile`: Claude accounts only
+- `x-teamclaude-profile: all`: Claude accounts first, then lower-priority provider fallbacks
+
+Provider fallback credentials can be supplied per Claude Code process with `ANTHROPIC_CUSTOM_HEADERS`. TeamClaude strips all `x-teamclaude-*` headers before forwarding upstream.
+
 ### Other commands
 
 ```bash
@@ -212,8 +220,9 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 5. When usage reaches the threshold, the account is avoided until quota resets
 6. On 429 responses, the proxy respects `retry-after`, cools down that account, and fails over before response bytes are sent
 7. Transient network errors (connection reset, timeout) fail over before the stream starts; after response bytes are sent, the client sees the broken stream and handles retry
-8. If all accounts are exhausted, returns 429 with the soonest reset time
-9. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
+8. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
+9. If all eligible accounts/providers are exhausted, returns 429 with the soonest reset time
+10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
 
