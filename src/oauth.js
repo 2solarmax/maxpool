@@ -157,7 +157,7 @@ export async function loginOAuth() {
 
   // Start local callback server on a random port
   const { port, codePromise, server } = await startCallbackServer(state);
-  const redirectUri = `http://127.0.0.1:${port}/callback`;
+  const redirectUri = `http://localhost:${port}/callback`;
 
   // Build authorization URL
   const authUrl = new URL(OAUTH_AUTHORIZE);
@@ -298,7 +298,7 @@ function startCallbackServer(expectedState) {
       res.end('Not found');
     });
 
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(0, 'localhost', () => {
       resolve({ port: server.address().port, codePromise, server });
     });
     server.on('error', reject);
