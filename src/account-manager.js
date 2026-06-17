@@ -7,6 +7,9 @@ function emptyQuota() {
     tokensRemaining: null,
     requestsLimit: null,
     requestsRemaining: null,
+    genericLimit: null,
+    genericRemaining: null,
+    genericReset: null,
     // Unified rate limits (Claude Max accounts)
     unified5h: null,       // utilization 0-1
     unified7d: null,       // utilization 0-1
@@ -28,6 +31,38 @@ function clampRetryAfterSeconds(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 60;
   return Math.min(Math.max(Math.ceil(n), 1), 24 * 60 * 60);
+}
+
+function firstHeader(headers, names) {
+  for (const name of names) {
+    if (headers[name] != null) return headers[name];
+  }
+  return null;
+}
+
+function parseFirstInt(headers, names) {
+  const value = firstHeader(headers, names);
+  if (value == null) return null;
+  const first = String(value).split(',')[0].trim();
+  const n = parseInt(first, 10);
+  return Number.isNaN(n) ? null : n;
+}
+
+function parseResetHeader(value) {
+  if (value == null) return null;
+  const raw = String(value).split(',')[0].trim();
+  const asNumber = Number(raw);
+  if (Number.isFinite(asNumber)) {
+    // Most reset headers are epoch seconds or delay seconds. Treat small
+    // values as delay seconds; large values as epoch seconds.
+    return asNumber > 10_000_000_000
+      ? asNumber
+      : asNumber > 1_000_000_000
+        ? asNumber * 1000
+        : Date.now() + asNumber * 1000;
+  }
+  const asDate = Date.parse(raw);
+  return Number.isNaN(asDate) ? null : asDate;
 }
 
 export class AccountManager {
@@ -66,6 +101,8 @@ export class AccountManager {
       completedRequests: 0,
       failedRequests: 0,
       consecutiveFailures: 0,
+      lastStatus: null,
+      lastResponseMs: null,
       lastError: null,
       lastErrorAt: null,
       cooldownUntil: null,
@@ -107,6 +144,8 @@ export class AccountManager {
     if (outcome.success) {
       account.completedRequests++;
       account.consecutiveFailures = 0;
+      account.lastStatus = outcome.status || account.lastStatus;
+      account.lastResponseMs = Date.now() - lease.startedAt;
       account.lastSuccessAt = Date.now();
       return;
     }
@@ -114,6 +153,8 @@ export class AccountManager {
     if (outcome.error || outcome.status) {
       account.failedRequests++;
       account.consecutiveFailures++;
+      account.lastStatus = outcome.status || account.lastStatus;
+      account.lastResponseMs = Date.now() - lease.startedAt;
       account.lastError = outcome.error || `HTTP ${outcome.status}`;
       account.lastErrorAt = Date.now();
     }
@@ -401,6 +442,32 @@ export class AccountManager {
     if (tokensReset) account.quota.resetsAt = tokensReset;
     else if (requestsReset) account.quota.resetsAt = requestsReset;
 
+    const genericLimit = parseFirstInt(headers, [
+      'x-ratelimit-limit',
+      'x-rate-limit-limit',
+      'ratelimit-limit',
+      'x-ratelimit-limit-requests',
+      'x-ratelimit-requests-limit',
+    ]);
+    const genericRemaining = parseFirstInt(headers, [
+      'x-ratelimit-remaining',
+      'x-rate-limit-remaining',
+      'ratelimit-remaining',
+      'x-ratelimit-remaining-requests',
+      'x-ratelimit-requests-remaining',
+    ]);
+    const genericReset = parseResetHeader(firstHeader(headers, [
+      'x-ratelimit-reset',
+      'x-rate-limit-reset',
+      'ratelimit-reset',
+      'x-ratelimit-reset-requests',
+      'x-ratelimit-requests-reset',
+    ]));
+
+    if (genericLimit != null) account.quota.genericLimit = genericLimit;
+    if (genericRemaining != null) account.quota.genericRemaining = genericRemaining;
+    if (genericReset != null) account.quota.genericReset = genericReset;
+
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
 
@@ -552,6 +619,8 @@ export class AccountManager {
       completedRequests: 0,
       failedRequests: 0,
       consecutiveFailures: 0,
+      lastStatus: null,
+      lastResponseMs: null,
       lastError: null,
       lastErrorAt: null,
       cooldownUntil: null,
@@ -615,6 +684,8 @@ export class AccountManager {
         completedRequests: a.completedRequests,
         failedRequests: a.failedRequests,
         consecutiveFailures: a.consecutiveFailures,
+        lastStatus: a.lastStatus,
+        lastResponseMs: a.lastResponseMs,
         lastError: a.lastError,
         lastErrorAt: a.lastErrorAt ? new Date(a.lastErrorAt).toISOString() : null,
         cooldownUntil: a.cooldownUntil ? new Date(a.cooldownUntil).toISOString() : null,

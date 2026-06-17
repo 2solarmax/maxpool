@@ -65,6 +65,24 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+function formatMs(ms) {
+  if (ms == null || isNaN(ms)) return '-';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const min = Math.floor(sec / 60);
+  const rem = Math.round(sec % 60);
+  return `${min}m${String(rem).padStart(2, '0')}s`;
+}
+
+function statusColor(status) {
+  if (status == null) return '-';
+  if (status >= 200 && status < 300) return green(String(status));
+  if (status === 429) return yellow(String(status));
+  if (status >= 500) return red(String(status));
+  return String(status);
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
@@ -489,6 +507,10 @@ export class TUI {
     }
     status = rpad(status, 10);
 
+    if (a.type === 'provider') {
+      return this._renderProviderAcct(sel, cur, name, type, status, a);
+    }
+
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
@@ -514,6 +536,22 @@ export class TUI {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
     return line;
+  }
+
+  _renderProviderAcct(sel, cur, name, type, status, a) {
+    const completed = a.completedRequests || 0;
+    const failed = a.failedRequests || 0;
+    const active = a.inFlight || 0;
+    const last = a.lastStatus ? `${statusColor(a.lastStatus)} ${formatMs(a.lastResponseMs)}` : '-';
+    const q = a.quota || {};
+    let limit = '';
+    if (q.genericLimit != null && q.genericRemaining != null) {
+      const used = q.genericLimit - q.genericRemaining;
+      const reset = formatReset(q.genericReset);
+      limit = `  Lim ${used}/${q.genericLimit}${reset ? ` ${reset}` : ''}`;
+    }
+    const err = a.lastError ? `  Err ${String(a.lastError).slice(0, 18)}` : '';
+    return ` ${sel}${cur} ${name} ${type} ${status} Act ${String(active).padStart(2)}  OK ${String(completed).padStart(3)}  Fail ${String(failed).padStart(2)}  Last ${last}${limit}${err}`;
   }
 
   _renderFooter() {

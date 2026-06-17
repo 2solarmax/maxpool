@@ -177,7 +177,12 @@ test('all profile adds runtime GLM fallback and rewrites provider request', asyn
       beta: req.headers['anthropic-beta'],
       body: JSON.parse(Buffer.concat(chunks).toString()),
     });
-    res.writeHead(200, { 'content-type': 'application/json' });
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'x-ratelimit-limit': '100',
+      'x-ratelimit-remaining': '99',
+      'x-ratelimit-reset': '60',
+    });
     res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
   });
   const claudePort = await listen(claudeUpstream);
@@ -213,7 +218,13 @@ test('all profile adds runtime GLM fallback and rewrites provider request', asyn
     assert.equal(glmSeen[0].internalHeader, undefined);
     assert.equal(glmSeen[0].beta, undefined);
     assert.equal(glmSeen[0].body.model, 'glm-sonnet');
-    assert.equal(am.accounts.some(a => a.name === 'glm-fallback'), true);
+    const glmAccount = am.accounts.find(a => a.name === 'glm-fallback');
+    assert.ok(glmAccount);
+    assert.equal(glmAccount.completedRequests, 1);
+    assert.equal(glmAccount.lastStatus, 200);
+    assert.ok(glmAccount.lastResponseMs >= 0);
+    assert.equal(glmAccount.quota.genericLimit, 100);
+    assert.equal(glmAccount.quota.genericRemaining, 99);
   } finally {
     await close(proxy);
     await close(claudeUpstream);

@@ -92,3 +92,19 @@ test('all profile only uses lower-priority providers after higher-priority accou
   lease = am.acquireAccount({ profile: 'all' });
   assert.equal(lease.account.name, 'kimi-fallback');
 });
+
+test('provider telemetry parses standard rate limit headers', () => {
+  const am = new AccountManager([
+    { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'] },
+  ], 0.90);
+
+  am.updateQuota(0, {
+    'x-ratelimit-limit': '100',
+    'x-ratelimit-remaining': '72',
+    'x-ratelimit-reset': '60',
+  });
+
+  assert.equal(am.accounts[0].quota.genericLimit, 100);
+  assert.equal(am.accounts[0].quota.genericRemaining, 72);
+  assert.ok(am.accounts[0].quota.genericReset > Date.now());
+});

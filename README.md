@@ -12,6 +12,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Adaptive load balancing** — spreads concurrent Claude Code streams across healthy accounts using live in-flight load, request size, quota pressure, and recent errors
 - **Fast failover on 429/overload** — parks the affected account and retries another account before response bytes are sent
 - **Provider fallback profile** — optional `all` profile can use Claude accounts first, then GLM, then Kimi via local custom headers
+- **Provider telemetry** — GLM/Kimi rows show active requests, completed/failed counts, last status/latency, and standard rate-limit headers when providers return them
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running; the server auto-syncs config and **R** can reload immediately
@@ -132,6 +133,8 @@ The proxy also understands an optional internal header profile:
 - `x-teamclaude-profile: all`: Claude accounts first, then lower-priority provider fallbacks
 
 Provider fallback credentials can be supplied per Claude Code process with `ANTHROPIC_CUSTOM_HEADERS`. TeamClaude strips all `x-teamclaude-*` headers before forwarding upstream.
+
+Provider rows do not use Claude Max session/week bars unless the provider returns compatible quota headers. For GLM/Kimi, TeamClaude always tracks operational telemetry (`Act`, `OK`, `Fail`, `Last`) and also parses common `x-ratelimit-*` / `ratelimit-*` headers if present.
 
 ### Other commands
 

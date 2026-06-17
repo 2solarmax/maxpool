@@ -413,7 +413,16 @@ async function statusCommand() {
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.status}`);
 
-      if (q.unified5h != null || q.unified7d != null) {
+      if (acct.type === 'provider') {
+        const last = acct.lastStatus ? `${acct.lastStatus} in ${formatDurationMs(acct.lastResponseMs)}` : '-';
+        console.log(`    Active:   ${acct.inFlight}    OK: ${acct.completedRequests}    Failed: ${acct.failedRequests}`);
+        console.log(`    Last:     ${last}`);
+        if (q.genericLimit != null && q.genericRemaining != null) {
+          const used = q.genericLimit - q.genericRemaining;
+          const reset = q.genericReset ? `    Reset: ${new Date(q.genericReset).toISOString()}` : '';
+          console.log(`    Limit:    ${used}/${q.genericLimit} used${reset}`);
+        }
+      } else if (q.unified5h != null || q.unified7d != null) {
         const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
         const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
         console.log(`    Session:  ${ses} used    Weekly: ${wk} used`);
@@ -818,4 +827,12 @@ function handleServerListenError(err, host, port) {
     console.error(`[TeamClaude] Failed to listen on ${host}:${port}: ${err.message}`);
   }
   process.exit(1);
+}
+
+function formatDurationMs(ms) {
+  if (ms == null || Number.isNaN(ms)) return '-';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  return `${Math.floor(sec / 60)}m${String(Math.round(sec % 60)).padStart(2, '0')}s`;
 }

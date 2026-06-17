@@ -291,9 +291,7 @@ async function forwardRequest(
     // Extract rate limit headers
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
-        rateLimitHeaders[key] = value;
-      }
+      rateLimitHeaders[key] = value;
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
