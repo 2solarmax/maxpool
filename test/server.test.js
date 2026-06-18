@@ -159,6 +159,63 @@ test('request queues instead of returning 429 when all routes are temporarily un
   }
 });
 
+test('request does not queue when reset is beyond auto queue window', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].rateLimitedUntil = Date.now() + 10 * 60_000;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 60 * 60_000, autoMaxWaitMs: 100, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    assert.ok(Date.now() - startedAt < 500);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('network failures return connection unavailable instead of quota exhaustion', async () => {
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:1',
+    queue: { enabled: true, maxWaitMs: 2000, autoMaxWaitMs: 2000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.error.type, 'connection_unavailable');
+    assert.match(body.error.message, /not an account quota issue/i);
+  } finally {
+    await close(proxy);
+  }
+});
+
 test('all profile adds runtime GLM fallback and rewrites provider request', async () => {
   const claudeSeen = [];
   const glmSeen = [];

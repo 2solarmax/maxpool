@@ -11,7 +11,12 @@
     "safetyMaxActivePerAccount": 50,
     "safetyMaxGlobalActive": 150,
     "cooldownMs": 30000,
-    "maxCooldownMs": 900000
+    "maxCooldownMs": 900000,
+    "weeklySoftThreshold": 0.65,
+    "weeklyReserveThreshold": 0.85,
+    "weeklyCriticalThreshold": 0.95,
+    "weeklyExhaustedThreshold": 0.985,
+    "weeklyBurnDebtWeight": 0.6
   },
   "retry": {
     "maxAttemptsPerRequest": 0,
@@ -20,6 +25,7 @@
   "queue": {
     "enabled": true,
     "maxWaitMs": 21600000,
+    "autoMaxWaitMs": 300000,
     "pollMs": 1000
   },
   "accounts": [

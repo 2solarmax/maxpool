@@ -95,6 +95,19 @@ function loadText(load) {
   return `Load ${current}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
 }
 
+function weeklyPolicyText(am, account) {
+  if (!am?._weeklyState || !account || account.type === 'provider') return '';
+  const state = am._weeklyState(account);
+  if (!state || state === 'unknown' || state === 'normal') return '';
+  const pct = am._effectiveWeeklyUsage
+    ? ` ${(am._effectiveWeeklyUsage(account) * 100).toFixed(0)}%`
+    : '';
+  const text = `Wk ${state}${pct}`;
+  if (state === 'critical' || state === 'exhausted') return red(text);
+  if (state === 'reserve') return yellow(text);
+  return cyan(text);
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
@@ -547,6 +560,8 @@ export class TUI {
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
+    const weekly = weeklyPolicyText(this.am, a);
+    if (weekly) line += `  ${weekly}`;
     line += `  ${dim(loadText(a.load))}`;
     return line;
   }

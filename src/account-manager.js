@@ -25,13 +25,25 @@ const DEFAULT_SCHEDULER = {
   safetyMaxGlobalActive: 150,
   cooldownMs: 30_000,
   maxCooldownMs: 15 * 60_000,
+  weeklySoftThreshold: 0.65,
+  weeklyReserveThreshold: 0.85,
+  weeklyCriticalThreshold: 0.95,
+  weeklyExhaustedThreshold: 0.985,
+  weeklyBurnDebtWeight: 0.6,
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 function clampRetryAfterSeconds(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 60;
   return Math.min(Math.max(Math.ceil(n), 1), 24 * 60 * 60);
+}
+
+function clamp01(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
 }
 
 function firstHeader(headers, names) {
@@ -205,7 +217,7 @@ export class AccountManager {
     };
   }
 
-  _isAvailable(account) {
+  _isAvailable(account, options = {}) {
     if (!account) return false;
     const now = Date.now();
 
@@ -225,7 +237,10 @@ export class AccountManager {
     if (account.inFlight >= this.scheduler.safetyMaxActivePerAccount) return false;
     if (this.getGlobalInFlight() >= this.scheduler.safetyMaxGlobalActive) return false;
     if (account.status === 'exhausted' || account.status === 'error') return false;
-    if (this._isNearQuota(account)) return false;
+    if (this._isSessionQuotaUnavailable(account)) return false;
+    const weeklyState = this._weeklyState(account);
+    if (weeklyState === 'exhausted' || weeklyState === 'critical') return false;
+    if (weeklyState === 'reserve' && !options.allowWeeklyReserve) return false;
 
     return true;
   }
@@ -313,7 +328,7 @@ export class AccountManager {
     let bestWeekly = current.quota.unified7dReset;
     for (const acc of candidates) {
       if (acc.index === this.currentIndex) continue;
-      if (!this._isAvailable(acc)) continue; // enough session & weekly quota left
+      if (!this._isAvailable(acc, { allowWeeklyReserve: true })) continue; // enough session & weekly quota left
       const weekly = acc.quota.unified7dReset;
       if (weekly == null) continue; // need a known weekly to compare
       if (weekly < bestWeekly) {
@@ -328,13 +343,13 @@ export class AccountManager {
     }
   }
 
-  _isNearQuota(account) {
+  _isSessionQuotaUnavailable(account) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
 
-    // Unified quotas (Claude Max) — utilization is already 0-1
+    // Unified 5h quota is immediate availability. Weekly quota is handled
+    // separately as long-horizon admission control.
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
-    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
@@ -350,6 +365,11 @@ export class AccountManager {
     return false;
   }
 
+  _isNearQuota(account) {
+    return this._isSessionQuotaUnavailable(account)
+      || ['reserve', 'critical', 'exhausted'].includes(this._weeklyState(account));
+  }
+
   _selectNext(requestInfo = {}, excludedIndexes = new Set()) {
     // Adaptive least-loaded balancing: spread requests across every healthy
     // account immediately, and let live load, quota pressure, and recent errors
@@ -359,36 +379,43 @@ export class AccountManager {
     let bestPriority = Infinity;
     const profile = requestInfo.profile || 'claude';
 
+    const hasBinding = Boolean(requestInfo.sessionKey && this.sessionBindings.has(requestInfo.sessionKey));
     const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes);
     if (bound && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes)) return bound;
 
-    for (let i = 0; i < this.accounts.length; i++) {
-      const idx = (this.nextIndex + i) % this.accounts.length;
-      const account = this.accounts[idx];
-      if (excludedIndexes.has(account.index)) continue;
-      if (!this._matchesProfile(account, profile)) continue;
-      if (!this._isAvailable(account)) continue;
+    for (const allowWeeklyReserve of hasBinding ? [true] : [false, true]) {
+      best = null;
+      bestScore = Infinity;
+      bestPriority = Infinity;
 
-      const priority = Number.isFinite(account.priority) ? account.priority : 0;
-      const score = this._scoreAccount(account, requestInfo);
-      if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
-        bestPriority = priority;
-        bestScore = score;
-        best = account;
-      }
-    }
+      for (let i = 0; i < this.accounts.length; i++) {
+        const idx = (this.nextIndex + i) % this.accounts.length;
+        const account = this.accounts[idx];
+        if (excludedIndexes.has(account.index)) continue;
+        if (!this._matchesProfile(account, profile)) continue;
+        if (!this._isAvailable(account, { allowWeeklyReserve })) continue;
 
-    if (best) {
-      const switched = best.index !== this.currentIndex;
-      this.currentIndex = best.index;
-      this.nextIndex = (best.index + 1) % this.accounts.length;
-      // If we switched to an account whose weekly quota is still unknown, flag
-      // it so we re-evaluate once that quota is learned (see updateQuota).
-      best.probing = best.quota.unified7dReset == null;
-      if (switched) {
-        console.log(`[TeamClaude] Switched to account "${best.name}"`);
+        const priority = Number.isFinite(account.priority) ? account.priority : 0;
+        const score = this._scoreAccount(account, requestInfo);
+        if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
+          bestPriority = priority;
+          bestScore = score;
+          best = account;
+        }
       }
-      return best;
+
+      if (best) {
+        const switched = best.index !== this.currentIndex;
+        this.currentIndex = best.index;
+        this.nextIndex = (best.index + 1) % this.accounts.length;
+        // If we switched to an account whose weekly quota is still unknown, flag
+        // it so we re-evaluate once that quota is learned (see updateQuota).
+        best.probing = best.quota.unified7dReset == null;
+        if (switched) {
+          console.log(`[TeamClaude] Switched to account "${best.name}"`);
+        }
+        return best;
+      }
     }
 
     // All accounts unavailable — find the one that resets soonest
@@ -424,10 +451,10 @@ export class AccountManager {
     const binding = this._sessionBinding(sessionKey);
     if (!binding) return null;
 
-    const home = this._eligibleBoundAccount(binding.homeName, profile, excludedIndexes);
+    const home = this._eligibleBoundAccount(binding.homeName, profile, excludedIndexes, { allowWeeklyReserve: true });
     if (home) return home;
 
-    const current = this._eligibleBoundAccount(binding.currentName, profile, excludedIndexes);
+    const current = this._eligibleBoundAccount(binding.currentName, profile, excludedIndexes, { allowWeeklyReserve: true });
     if (current) return current;
 
     const homeExists = binding.homeName && this.accounts.some(a => a.name === binding.homeName);
@@ -438,13 +465,13 @@ export class AccountManager {
     return null;
   }
 
-  _eligibleBoundAccount(accountName, profile, excludedIndexes = new Set()) {
+  _eligibleBoundAccount(accountName, profile, excludedIndexes = new Set(), options = {}) {
     if (!accountName) return null;
     const account = this.accounts.find(a => a.name === accountName);
     if (!account) return null;
     if (excludedIndexes.has(account.index)) return null;
     if (!this._matchesProfile(account, profile)) return null;
-    if (!this._isAvailable(account)) return null;
+    if (!this._isAvailable(account, options)) return null;
     return account;
   }
 
@@ -487,7 +514,7 @@ export class AccountManager {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesProfile(account, profile)) return false;
       const priority = this._priority(account);
-      return priority < boundPriority && this._isAvailable(account);
+      return priority < boundPriority && this._isAvailable(account, { allowWeeklyReserve: true });
     });
   }
 
@@ -511,7 +538,8 @@ export class AccountManager {
     const q = account.quota;
     const values = [];
     if (q.unified5h != null) values.push(q.unified5h);
-    if (q.unified7d != null) values.push(q.unified7d);
+    const weeklyPressure = this._weeklyPressure(account);
+    if (weeklyPressure != null) values.push(weeklyPressure);
     if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
       values.push(1 - q.tokensRemaining / q.tokensLimit);
     }
@@ -519,6 +547,40 @@ export class AccountManager {
       values.push(1 - q.requestsRemaining / q.requestsLimit);
     }
     return values.length ? Math.max(...values) : 0;
+  }
+
+  _weeklyState(account) {
+    const q = account.quota;
+    this._clearExpiredQuotas(account);
+    if (q.unifiedStatus === 'rejected') return 'exhausted';
+    if (q.unified7d == null) return 'unknown';
+
+    const effective = this._effectiveWeeklyUsage(account);
+    if (effective >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
+    if (effective >= this.scheduler.weeklyCriticalThreshold) return 'critical';
+    if (effective >= this.scheduler.weeklyReserveThreshold) return 'reserve';
+    if (effective >= this.scheduler.weeklySoftThreshold) return 'soft';
+    return 'normal';
+  }
+
+  _weeklyPressure(account) {
+    if (account.quota.unified7d == null) return null;
+    const used = clamp01(account.quota.unified7d);
+    const effective = this._effectiveWeeklyUsage(account);
+    const state = this._weeklyState(account);
+    const statePenalty = state === 'reserve' ? 0.25 : state === 'soft' ? 0.1 : 0;
+    return Math.min(2, Math.max(0, effective * 0.8 + used * 0.2 + statePenalty));
+  }
+
+  _effectiveWeeklyUsage(account) {
+    const q = account.quota;
+    const used = clamp01(q.unified7d ?? 0);
+    if (!q.unified7dReset) return used;
+
+    const remainingMs = Math.max(0, q.unified7dReset - Date.now());
+    const elapsedRatio = clamp01((WEEK_MS - remainingMs) / WEEK_MS);
+    const burnDebt = Math.max(0, used - elapsedRatio);
+    return Math.min(1.5, used + burnDebt * this.scheduler.weeklyBurnDebtWeight);
   }
 
   /**
@@ -824,6 +886,10 @@ export class AccountManager {
         lastErrorAt: a.lastErrorAt ? new Date(a.lastErrorAt).toISOString() : null,
         cooldownUntil: a.cooldownUntil ? new Date(a.cooldownUntil).toISOString() : null,
         quota: { ...a.quota },
+        weekly: {
+          state: this._weeklyState(a),
+          effectiveUsage: this._effectiveWeeklyUsage(a),
+        },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()

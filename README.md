@@ -203,7 +203,12 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
     "safetyMaxActivePerAccount": 50,
     "safetyMaxGlobalActive": 150,
     "cooldownMs": 30000,
-    "maxCooldownMs": 900000
+    "maxCooldownMs": 900000,
+    "weeklySoftThreshold": 0.65,
+    "weeklyReserveThreshold": 0.85,
+    "weeklyCriticalThreshold": 0.95,
+    "weeklyExhaustedThreshold": 0.985,
+    "weeklyBurnDebtWeight": 0.6
   },
   "retry": {
     "maxAttemptsPerRequest": 0,
@@ -212,6 +217,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
   "queue": {
     "enabled": true,
     "maxWaitMs": 21600000,
+    "autoMaxWaitMs": 300000,
     "pollMs": 1000
   },
   "shutdown": {
@@ -242,9 +248,19 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `retry.maxAttemptsPerRequest` | Retry attempts before returning an error; `0` means one pass over accounts |
 | `retry.maxRetryBufferBytes` | Maximum buffered request body eligible for cross-account retry |
 | `queue.enabled` | Hold requests instead of returning 429 when every eligible route is temporarily unavailable |
-| `queue.maxWaitMs` | Maximum time a request can wait in the proxy queue before returning an error |
+| `queue.maxWaitMs` | Hard maximum time a request can wait in the proxy queue before returning an error |
+| `queue.autoMaxWaitMs` | Interactive auto-queue window; requests only queue automatically when the next retry/reset is within this duration |
 | `queue.pollMs` | How often queued requests check for a recovered account/provider |
 | `shutdown.drainTimeoutMs` | Maximum time quit/Ctrl-C waits for active requests before exiting |
+
+Weekly Claude quota is treated as long-horizon budget, not the same as the 5-hour session cap:
+
+- `normal`: accepts new and sticky sessions.
+- `soft`: remains available, but new sessions prefer cooler accounts.
+- `reserve`: existing sticky sessions can continue; new sessions use other Claude accounts when possible.
+- `critical` / `exhausted`: unavailable until weekly reset or upstream recovery.
+
+The weekly state uses both raw utilization and reset-aware burn rate. This keeps an account with high usage and many days until reset from receiving more new sessions too early, while allowing an account close to weekly reset to be used more aggressively.
 
 ## How It Works
 
@@ -253,9 +269,9 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 3. If the client sends `x-teamclaude-session`, the session is pinned to that account while it stays available
 4. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
 5. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
-6. When usage reaches the threshold, the account is avoided until quota resets
+6. 5-hour quota controls immediate availability; weekly quota controls new-session admission and preservation
 7. On 429 responses, the proxy respects `retry-after`, cools down that account, and fails over before response bytes are sent
-8. Transient network errors (connection reset, timeout) fail over before the stream starts; after response bytes are sent, the client sees the broken stream and handles retry
+8. Transient network errors (connection reset, timeout) fail over before the stream starts; if every eligible route has a network failure, the proxy returns `503 connection_unavailable` instead of a quota error
 9. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
 10. If all eligible accounts/providers are temporarily unavailable, the proxy queues the request and retries when one recovers
 11. If the queue wait expires, returns 429 with the soonest reset time

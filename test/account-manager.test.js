@@ -126,6 +126,66 @@ test('session affinity returns fallback sessions to higher-priority routes', () 
   assert.equal(recovered.account.name, 'claude');
 });
 
+test('weekly soft pressure penalizes new placement but does not block', () => {
+  const am = manager(2);
+  am.accounts[0].quota.unified7d = 0.70;
+  am.accounts[1].quota.unified7d = 0.10;
+
+  let lease = am.acquireAccount({ weight: 1 });
+  assert.equal(lease.account.name, 'a2');
+  am.releaseAccount(lease, { success: true, status: 200 });
+
+  lease = am.acquireAccount({ weight: 1 }, new Set([1]));
+  assert.equal(lease.account.name, 'a1');
+  assert.equal(am.getStatus().accounts[0].weekly.state, 'soft');
+});
+
+test('weekly reserve blocks new sessions but permits sticky sessions', () => {
+  const am = manager(2);
+  const first = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+
+  am.accounts[0].quota.unified7d = 0.86;
+  am.accounts[1].quota.unified7d = 0.10;
+
+  const sticky = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(sticky.account.name, 'a1');
+  am.releaseAccount(sticky, { success: true, status: 200 });
+
+  const newSession = am.acquireAccount({ weight: 1, sessionKey: 'session-2' });
+  assert.equal(newSession.account.name, 'a2');
+  assert.equal(am.getStatus().accounts[0].weekly.state, 'reserve');
+});
+
+test('weekly critical breaks sticky affinity', () => {
+  const am = manager(2);
+  const first = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+
+  am.accounts[0].quota.unified7d = 0.96;
+  am.accounts[1].quota.unified7d = 0.10;
+
+  const moved = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(moved.account.name, 'a2');
+  assert.equal(am.getStatus().accounts[0].weekly.state, 'critical');
+});
+
+test('5h quota threshold blocks sticky affinity', () => {
+  const am = manager(2);
+  const first = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+
+  am.accounts[0].quota.unified5h = 0.91;
+  am.accounts[0].quota.unified7d = 0.10;
+  am.accounts[1].quota.unified7d = 0.10;
+
+  const moved = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.equal(moved.account.name, 'a2');
+});
+
 test('scheduler keeps provider fallbacks out of claude-only profile', () => {
   const am = new AccountManager([
     {

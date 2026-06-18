@@ -17,6 +17,7 @@ const DEFAULT_RETRY = {
 const DEFAULT_QUEUE = {
   enabled: true,
   maxWaitMs: 6 * 60 * 60 * 1000,
+  autoMaxWaitMs: 5 * 60 * 1000,
   pollMs: 1000,
 };
 
@@ -193,7 +194,7 @@ async function forwardRequest(
     const queued = await queueAndRetry(
       'no eligible account/provider currently available',
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-      retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'quota',
     );
     if (queued) return;
 
@@ -322,7 +323,7 @@ async function forwardRequest(
       const queued = await queueAndRetry(
         `all routes failed after 429 from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-        retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'quota',
       );
       if (queued) return;
 
@@ -365,7 +366,7 @@ async function forwardRequest(
       const queued = await queueAndRetry(
         `all routes failed after ${upstreamRes.status} from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-        retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'capacity',
       );
       if (queued) return;
 
@@ -459,10 +460,20 @@ async function forwardRequest(
       const queued = await queueAndRetry(
         `all routes failed after network error from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-        retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'network',
       );
       if (queued) return;
-      if (!res.headersSent) res.destroy();
+      ctx.status = 503;
+      if (!res.headersSent) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'connection_unavailable',
+            message: 'Could not connect to Claude or a configured fallback provider. Check your internet connection and try again. This is not an account quota issue.',
+          },
+        }));
+      }
       return;
     }
 
@@ -478,7 +489,7 @@ async function forwardRequest(
     const queued = await queueAndRetry(
       `all routes failed after proxy error from "${account.name}"`,
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-      retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'proxy',
     );
     if (queued) return;
     ctx.status = 502;
@@ -582,21 +593,28 @@ function isRetriableUpstreamStatus(status) {
 
 async function queueAndRetry(
   reason, req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-  retryConfig, queueConfig, requestInfo, canRetryBufferedBody,
+  retryConfig, queueConfig, requestInfo, canRetryBufferedBody, cause = 'quota',
 ) {
   if (!queueConfig.enabled || !canRetryBufferedBody || res.headersSent || res.destroyed) return false;
+  if (cause === 'network' || cause === 'proxy') return false;
 
   const maxWaitMs = Math.max(0, Number(queueConfig.maxWaitMs) || 0);
-  if (maxWaitMs <= 0) return false;
+  const autoMaxWaitMs = Math.max(0, Number(queueConfig.autoMaxWaitMs) || 0);
+  const queueWindowMs = Math.min(maxWaitMs, autoMaxWaitMs || maxWaitMs);
+  if (queueWindowMs <= 0) return false;
+
+  const status = accountManager.getStatus();
+  const retryAfterMs = computeRetryAfterMs(status.accounts);
+  if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) return false;
 
   requestInfo.queueStartedAt ||= Date.now();
   const elapsed = Date.now() - requestInfo.queueStartedAt;
-  const remaining = maxWaitMs - elapsed;
+  const remaining = queueWindowMs - elapsed;
   if (remaining <= 0) return false;
 
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
-  console.log(`[TeamClaude] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s`);
+  console.log(`[TeamClaude] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause})`);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
   if (!available) return res.destroyed || req.destroyed;
@@ -830,13 +848,23 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
 }
 
 function computeRetryAfter(accounts) {
+  const ms = computeRetryAfterMs(accounts);
+  return ms === Infinity ? 60 : Math.max(1, Math.ceil(ms / 1000));
+}
+
+function computeRetryAfterMs(accounts) {
   let soonest = Infinity;
   for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.cooldownUntil || acct.quota.resetsAt;
+    const reset = acct.rateLimitedUntil
+      || acct.cooldownUntil
+      || acct.quota?.unified5hReset
+      || acct.quota?.unified7dReset
+      || acct.quota?.genericReset
+      || acct.quota?.resetsAt;
     if (reset) {
-      const ms = new Date(reset).getTime() - Date.now();
+      const ms = typeof reset === 'number' ? reset - Date.now() : new Date(reset).getTime() - Date.now();
       if (ms < soonest) soonest = ms;
     }
   }
-  return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
+  return soonest;
 }
