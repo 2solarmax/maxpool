@@ -289,6 +289,109 @@ test('all profile adds runtime GLM fallback and rewrites provider request', asyn
   }
 });
 
+test('thinking history disables provider fallback in all profile', async () => {
+  const claudeSeen = [];
+  const glmSeen = [];
+
+  const claudeUpstream = http.createServer((req, res) => {
+    claudeSeen.push(req.headers.authorization);
+    res.writeHead(429, { 'retry-after': '60', 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const glmUpstream = http.createServer(async (req, res) => {
+    for await (const _chunk of req) {}
+    glmSeen.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const claudePort = await listen(claudeUpstream);
+  const glmPort = await listen(glmUpstream);
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${claudePort}`,
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamclaude-profile': 'all',
+        'x-teamclaude-session': 'thinking-session',
+        'x-teamclaude-zai-token': 'zg',
+        'x-teamclaude-zai-base-url': `http://127.0.0.1:${glmPort}`,
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-test',
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'summary', signature: 'signed-by-anthropic' },
+              { type: 'text', text: 'done' },
+            ],
+          },
+          { role: 'user', content: 'continue' },
+        ],
+      }),
+    });
+    assert.equal(res.status, 429);
+    const body = await res.json();
+    assert.match(body.error.message, /Non-Claude fallback is disabled/i);
+    assert.deepEqual(claudeSeen, ['Bearer tc']);
+    assert.deepEqual(glmSeen, []);
+    assert.equal(am.getStatus().sessions.thinkingProtected, 1);
+  } finally {
+    await close(proxy);
+    await close(claudeUpstream);
+    await close(glmUpstream);
+  }
+});
+
+test('Claude thinking response marks session as provider-protected', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      content: [
+        { type: 'thinking', thinking: 'summary', signature: 'signed-by-anthropic' },
+        { type: 'text', text: 'done' },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamclaude-profile': 'all',
+        'x-teamclaude-session': 'response-thinking-session',
+      },
+      body: JSON.stringify({ model: 'claude-sonnet-test', messages: [{ role: 'user', content: 'think' }] }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(am.getStatus().sessions.thinkingProtected, 1);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('Z.AI 429 body reset hint controls provider cooldown when retry-after is missing', async () => {
   const resetAt = new Date(Date.now() + 120_000).toISOString();
   const zaiUpstream = http.createServer((_req, res) => {

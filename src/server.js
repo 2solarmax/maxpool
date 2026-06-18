@@ -87,6 +87,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const requestInfo = describeRequest(req, body);
       requestInfo.profile = getTeamClaudeProfile(req.headers);
       requestInfo.sessionKey = headerValue(req.headers, 'x-teamclaude-session');
+      if (requestInfo.requiresAnthropicThinkingIntegrity && requestInfo.profile === 'all') {
+        console.log('[TeamClaude] Anthropic thinking detected; provider fallback disabled for this session/request');
+      }
       prepareRuntimeProviders(accountManager, req.headers);
 
       const ctx = { account: null, status: null };
@@ -210,7 +213,7 @@ async function forwardRequest(
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+        message: unavailableMessage(accountManager, requestInfo, retryAfter),
       },
     }));
     return;
@@ -344,7 +347,7 @@ async function forwardRequest(
           type: 'error',
           error: {
             type: 'rate_limit_error',
-            message: `No account could accept this request. Retry in ${clientRetryAfter}s.`,
+            message: unavailableMessage(accountManager, requestInfo, clientRetryAfter),
           },
         }));
       }
@@ -457,7 +460,7 @@ async function forwardRequest(
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, upstreamRes.status, responseHeaders, account.index, accountManager, streamLog);
+      await streamResponse(upstreamRes.body, res, upstreamRes.status, responseHeaders, account.index, accountManager, streamLog, requestInfo);
       accountManager.releaseAccount(lease, { success: true, status: upstreamRes.status });
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
@@ -467,6 +470,7 @@ async function forwardRequest(
       res.writeHead(upstreamRes.status, responseHeaders);
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager);
+      markThinkingFromResponse(buf, accountManager, requestInfo);
       accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
       if (logDir) {
         try {
@@ -564,10 +568,21 @@ function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = ne
   const profile = requestInfo.profile || 'claude';
   return accountManager.accounts.some(account => {
     if (excludedIndexes.has(account.index)) return false;
-    if (accountManager._matchesProfile && !accountManager._matchesProfile(account, profile)) return false;
+    if (accountManager._matchesRequest) {
+      if (!accountManager._matchesRequest(account, profile, requestInfo)) return false;
+    } else if (accountManager._matchesProfile && !accountManager._matchesProfile(account, profile)) {
+      return false;
+    }
     if (accountManager._isAvailable && !accountManager._isAvailable(account, { allowWeeklyReserve: true })) return false;
     return true;
   });
+}
+
+function unavailableMessage(accountManager, requestInfo = {}, retryAfter) {
+  if (requestInfo.requiresAnthropicThinkingIntegrity || accountManager._requiresAnthropicThinkingIntegrity?.(requestInfo)) {
+    return `No Claude account could accept this request. Non-Claude fallback is disabled because this session contains Anthropic signed thinking blocks. Retry in ${retryAfter}s, wait for Claude capacity, or start a fresh non-thinking session to use GLM/Kimi.`;
+  }
+  return `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
@@ -726,11 +741,34 @@ function describeRequest(req, body) {
     if (json.stream) info.stream = true;
     if (json.max_tokens && json.max_tokens > 16_000) weight += 1;
     if (json.thinking || json.effort) weight += 1;
+    if (requiresAnthropicThinkingIntegrity(json)) {
+      info.requiresAnthropicThinkingIntegrity = true;
+    }
   } catch {
     // Non-JSON requests are rare; body size still gives a useful load signal.
   }
   info.weight = Math.max(1, weight);
   return info;
+}
+
+function requiresAnthropicThinkingIntegrity(json) {
+  if (!json || typeof json !== 'object') return false;
+  if (json.thinking || json.effort) return true;
+  return containsThinkingBlock(json.messages);
+}
+
+function containsThinkingBlock(value) {
+  if (!value) return false;
+  if (Array.isArray(value)) return value.some(containsThinkingBlock);
+  if (typeof value !== 'object') return false;
+
+  if (value.type === 'thinking' || value.type === 'redacted_thinking') return true;
+  if (value.type === 'signature_delta') return true;
+  if (value.signature && (value.thinking != null || value.type == null)) return true;
+
+  if (value.content && containsThinkingBlock(value.content)) return true;
+  if (value.messages && containsThinkingBlock(value.messages)) return true;
+  return false;
 }
 
 function getTeamClaudeProfile(headers) {
@@ -814,7 +852,7 @@ function mappedModel(originalModel, account) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog) {
+async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog, requestInfo = {}) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -848,7 +886,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEEvent(event, accountIndex, accountManager, requestInfo);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -864,7 +902,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEEvent(sseBuffer, accountIndex, accountManager, requestInfo);
     }
   } catch (err) {
     readFailed = true;
@@ -879,7 +917,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -890,9 +928,18 @@ function parseSSEUsage(event, accountIndex, accountManager) {
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
     }
+    if (sseEventContainsThinking(data)) {
+      accountManager.markSessionThinkingProtected?.(requestInfo.sessionKey, requestInfo.model);
+    }
   } catch {
     // not valid JSON, skip
   }
+}
+
+function sseEventContainsThinking(data) {
+  return data?.content_block?.type === 'thinking'
+    || data?.content_block?.type === 'redacted_thinking'
+    || data?.delta?.type === 'signature_delta';
 }
 
 function extractUsageFromBody(buffer, accountIndex, accountManager) {
@@ -903,6 +950,17 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
     }
   } catch {
     // not JSON or no usage
+  }
+}
+
+function markThinkingFromResponse(buffer, accountManager, requestInfo = {}) {
+  try {
+    const json = JSON.parse(buffer.toString());
+    if (containsThinkingBlock(json?.content)) {
+      accountManager.markSessionThinkingProtected?.(requestInfo.sessionKey, requestInfo.model);
+    }
+  } catch {
+    // not JSON
   }
 }
 

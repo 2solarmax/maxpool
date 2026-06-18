@@ -129,6 +129,7 @@ export class AccountManager {
     this.nextIndex = 0;
     this.switchThreshold = switchThreshold;
     this.sessionBindings = new Map();
+    this.sessionPolicies = new Map();
   }
 
   /**
@@ -141,6 +142,7 @@ export class AccountManager {
   }
 
   acquireAccount(requestInfo = {}, excludedIndexes = new Set()) {
+    this._noteRequestPolicy(requestInfo);
     const account = this.getActiveAccount(requestInfo, excludedIndexes);
     if (!account) return null;
 
@@ -391,8 +393,8 @@ export class AccountManager {
     const profile = requestInfo.profile || 'claude';
 
     const hasBinding = Boolean(requestInfo.sessionKey && this.sessionBindings.has(requestInfo.sessionKey));
-    const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes);
-    if (bound && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes)) return bound;
+    const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo);
+    if (bound && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)) return bound;
 
     for (const allowWeeklyReserve of hasBinding ? [true] : [false, true]) {
       best = null;
@@ -403,7 +405,7 @@ export class AccountManager {
         const idx = (this.nextIndex + i) % this.accounts.length;
         const account = this.accounts[idx];
         if (excludedIndexes.has(account.index)) continue;
-        if (!this._matchesProfile(account, profile)) continue;
+        if (!this._matchesRequest(account, profile, requestInfo)) continue;
         if (!this._isAvailable(account, { allowWeeklyReserve })) continue;
 
         const priority = Number.isFinite(account.priority) ? account.priority : 0;
@@ -434,7 +436,7 @@ export class AccountManager {
     let soonestTime = Infinity;
 
     for (const account of this.accounts) {
-      if (!this._matchesProfile(account, profile)) continue;
+      if (!this._matchesRequest(account, profile, requestInfo)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -457,15 +459,15 @@ export class AccountManager {
     return null;
   }
 
-  _boundAccount(sessionKey, profile, excludedIndexes = new Set()) {
+  _boundAccount(sessionKey, profile, excludedIndexes = new Set(), requestInfo = {}) {
     if (!sessionKey) return null;
     const binding = this._sessionBinding(sessionKey);
     if (!binding) return null;
 
-    const home = this._eligibleBoundAccount(binding.homeName, profile, excludedIndexes, { allowWeeklyReserve: true });
+    const home = this._eligibleBoundAccount(binding.homeName, profile, excludedIndexes, { allowWeeklyReserve: true }, requestInfo);
     if (home) return home;
 
-    const current = this._eligibleBoundAccount(binding.currentName, profile, excludedIndexes, { allowWeeklyReserve: true });
+    const current = this._eligibleBoundAccount(binding.currentName, profile, excludedIndexes, { allowWeeklyReserve: true }, requestInfo);
     if (current) return current;
 
     const homeExists = binding.homeName && this.accounts.some(a => a.name === binding.homeName);
@@ -476,12 +478,12 @@ export class AccountManager {
     return null;
   }
 
-  _eligibleBoundAccount(accountName, profile, excludedIndexes = new Set(), options = {}) {
+  _eligibleBoundAccount(accountName, profile, excludedIndexes = new Set(), options = {}, requestInfo = {}) {
     if (!accountName) return null;
     const account = this.accounts.find(a => a.name === accountName);
     if (!account) return null;
     if (excludedIndexes.has(account.index)) return null;
-    if (!this._matchesProfile(account, profile)) return null;
+    if (!this._matchesRequest(account, profile, requestInfo)) return null;
     if (!this._isAvailable(account, options)) return null;
     return account;
   }
@@ -518,12 +520,12 @@ export class AccountManager {
     return binding;
   }
 
-  _hasHigherPriorityAvailable(boundAccount, profile, excludedIndexes = new Set()) {
+  _hasHigherPriorityAvailable(boundAccount, profile, excludedIndexes = new Set(), requestInfo = {}) {
     const boundPriority = this._priority(boundAccount);
     return this.accounts.some(account => {
       if (account.index === boundAccount.index) return false;
       if (excludedIndexes.has(account.index)) return false;
-      if (!this._matchesProfile(account, profile)) return false;
+      if (!this._matchesRequest(account, profile, requestInfo)) return false;
       const priority = this._priority(account);
       return priority < boundPriority && this._isAvailable(account, { allowWeeklyReserve: true });
     });
@@ -536,6 +538,36 @@ export class AccountManager {
   _matchesProfile(account, profile) {
     const profiles = account.profiles || ['claude', 'all'];
     return profiles.includes(profile);
+  }
+
+  _matchesRequest(account, profile, requestInfo = {}) {
+    if (!this._matchesProfile(account, profile)) return false;
+    if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) return false;
+    return true;
+  }
+
+  _noteRequestPolicy(requestInfo = {}) {
+    if (!requestInfo.sessionKey || !requestInfo.requiresAnthropicThinkingIntegrity) return;
+    this.markSessionThinkingProtected(requestInfo.sessionKey, requestInfo.model);
+  }
+
+  markSessionThinkingProtected(sessionKey, model = null) {
+    if (!sessionKey) return;
+    const existing = this.sessionPolicies.get(sessionKey) || {};
+    if (!existing.requiresAnthropicThinkingIntegrity) {
+      console.log(`[TeamClaude] Session "${sessionKey}" contains Anthropic signed thinking; provider fallback disabled`);
+    }
+    this.sessionPolicies.set(sessionKey, {
+      ...existing,
+      requiresAnthropicThinkingIntegrity: true,
+      model: existing.model || model || null,
+    });
+  }
+
+  _requiresAnthropicThinkingIntegrity(requestInfo = {}) {
+    if (requestInfo.requiresAnthropicThinkingIntegrity) return true;
+    if (!requestInfo.sessionKey) return false;
+    return Boolean(this.sessionPolicies.get(requestInfo.sessionKey)?.requiresAnthropicThinkingIntegrity);
   }
 
   _scoreAccount(account, requestInfo = {}) {
@@ -951,6 +983,7 @@ export class AccountManager {
       },
       sessions: {
         stickyBindings: this.sessionBindings.size,
+        thinkingProtected: [...this.sessionPolicies.values()].filter(p => p.requiresAnthropicThinkingIntegrity).length,
       },
     };
   }

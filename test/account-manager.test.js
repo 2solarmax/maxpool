@@ -126,6 +126,27 @@ test('session affinity returns fallback sessions to higher-priority routes', () 
   assert.equal(recovered.account.name, 'claude');
 });
 
+test('thinking-protected sessions do not stay bound to provider fallback', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
+    { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
+  ], 0.90);
+
+  am.markRateLimited(0, 60);
+  const fallback = am.acquireAccount({ profile: 'all', sessionKey: 'session-1' });
+  assert.equal(fallback.account.name, 'glm-fallback');
+  am.releaseAccount(fallback, { success: true, status: 200 });
+
+  am.accounts[0].rateLimitedUntil = Date.now() - 1;
+  const protectedLease = am.acquireAccount({
+    profile: 'all',
+    sessionKey: 'session-1',
+    requiresAnthropicThinkingIntegrity: true,
+  });
+  assert.equal(protectedLease.account.name, 'claude');
+  assert.equal(am.getStatus().sessions.thinkingProtected, 1);
+});
+
 test('weekly soft pressure penalizes new placement but does not block', () => {
   const am = manager(2);
   am.accounts[0].quota.unified7d = 0.70;
