@@ -13,6 +13,8 @@ function emptyQuota() {
     // Unified rate limits (Claude Max accounts)
     unified5h: null,       // utilization 0-1
     unified7d: null,       // utilization 0-1
+    unified5hRaw: null,    // upstream-reported utilization before display clamp
+    unified7dRaw: null,    // upstream-reported utilization before display clamp
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
     unifiedStatus: null,   // allowed | allowed_warning | rejected
@@ -121,6 +123,7 @@ export class AccountManager {
       lastErrorAt: null,
       cooldownUntil: null,
       rateLimitedUntil: null,
+      lastQuotaLogKey: null,
     }));
     this.currentIndex = 0;
     this.nextIndex = 0;
@@ -164,6 +167,8 @@ export class AccountManager {
       account.consecutiveFailures = 0;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
+      account.lastError = null;
+      account.lastErrorAt = null;
       this._recordLoadEvent(account, lease, { ...outcome, success: true });
       account.lastSuccessAt = Date.now();
       return;
@@ -226,6 +231,10 @@ export class AccountManager {
       if (now < account.rateLimitedUntil) return false;
       account.status = 'active';
       account.rateLimitedUntil = null;
+      if (account.lastError === 'rate_limited') {
+        account.lastError = null;
+        account.lastErrorAt = null;
+      }
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
 
@@ -593,8 +602,14 @@ export class AccountManager {
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
-    if (!isNaN(u5h)) account.quota.unified5h = u5h;
-    if (!isNaN(u7d)) account.quota.unified7d = u7d;
+    if (!isNaN(u5h)) {
+      account.quota.unified5hRaw = u5h;
+      account.quota.unified5h = clamp01(u5h);
+    }
+    if (!isNaN(u7d)) {
+      account.quota.unified7dRaw = u7d;
+      account.quota.unified7d = clamp01(u7d);
+    }
 
     const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
@@ -664,7 +679,12 @@ export class AccountManager {
         : account.quota.tokensLimit
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
           : '?';
-      console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+      const reason = this._isSessionQuotaUnavailable(account) ? 'session quota' : `weekly ${this._weeklyState(account)}`;
+      const logKey = `${reason}:${pct}`;
+      if (account.lastQuotaLogKey !== logKey) {
+        account.lastQuotaLogKey = logKey;
+        console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — limiting new placement (${reason})`);
+      }
     }
   }
 
@@ -691,6 +711,18 @@ export class AccountManager {
     account.lastErrorAt = Date.now();
     account.consecutiveFailures++;
     console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfter}s`);
+  }
+
+  markAuthFailed(accountIndex, status = 403, reason = 'auth_failed') {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    account.status = 'error';
+    account.rateLimitedUntil = null;
+    account.cooldownUntil = null;
+    account.lastStatus = status;
+    account.lastError = reason;
+    account.lastErrorAt = Date.now();
+    console.log(`[TeamClaude] Account "${account.name}" disabled after HTTP ${status} (${reason})`);
   }
 
   markTransientFailure(accountIndex, reason = 'transient_error') {
@@ -812,6 +844,7 @@ export class AccountManager {
       lastErrorAt: null,
       cooldownUntil: null,
       rateLimitedUntil: null,
+      lastQuotaLogKey: null,
     });
     return index;
   }
@@ -821,10 +854,14 @@ export class AccountManager {
     if (idx < 0) return this.addAccount({ ...acctData, runtime: true });
 
     const account = this.accounts[idx];
+    const nextCredential = acctData.accessToken || acctData.authToken || acctData.apiKey || account.credential;
+    const nextUpstream = acctData.upstream || account.upstream;
+    const changed = nextCredential !== account.credential || nextUpstream !== account.upstream;
+
     account.type = acctData.type || account.type;
     account.provider = acctData.provider || account.provider;
-    account.credential = acctData.accessToken || acctData.authToken || acctData.apiKey || account.credential;
-    account.upstream = acctData.upstream || account.upstream;
+    account.credential = nextCredential;
+    account.upstream = nextUpstream;
     account.authHeader = acctData.authHeader || account.authHeader;
     account.profiles = acctData.profiles || account.profiles;
     account.priority = Number.isFinite(acctData.priority) ? acctData.priority : account.priority;
@@ -832,7 +869,12 @@ export class AccountManager {
     account.modelMap = acctData.modelMap || account.modelMap;
     account.stripBetaHeaders = Boolean(acctData.stripBetaHeaders);
     account.runtime = true;
-    if (account.status === 'error') account.status = 'active';
+    if (account.status === 'error' && changed) {
+      account.status = 'active';
+      account.lastError = null;
+      account.lastErrorAt = null;
+      account.consecutiveFailures = 0;
+    }
     return idx;
   }
 

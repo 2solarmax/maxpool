@@ -313,7 +313,12 @@ async function forwardRequest(
       console.log(`[TeamClaude] 429 on "${account.name}" — failing over before first byte`);
       excludedIndexes.add(account.index);
 
-      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+      if (
+        canRetryBufferedBody &&
+        retryCount + 1 < maxAttempts &&
+        !res.headersSent &&
+        hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
+      ) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
@@ -340,6 +345,46 @@ async function forwardRequest(
           error: {
             type: 'rate_limit_error',
             message: `No account could accept this request. Retry in ${clientRetryAfter}s.`,
+          },
+        }));
+      }
+      return;
+    }
+
+    if (account.type === 'provider' && isProviderAuthStatus(upstreamRes.status)) {
+      const errorBody = await readErrorBody(upstreamRes);
+      const reason = upstreamRes.status === 401 ? 'auth_failed' : 'forbidden';
+      accountManager.markAuthFailed(account.index, upstreamRes.status, reason);
+      accountManager.releaseAccount(lease, { status: upstreamRes.status, error: reason });
+      excludedIndexes.add(account.index);
+
+      if (logDir) {
+        logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" disabled (${reason}), failing over ===\n${formatHeaders(upstreamRes.headers)}`);
+        if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
+      }
+      console.log(`[TeamClaude] ${upstreamRes.status} on provider "${account.name}" — disabled and failing over before first byte`);
+
+      if (
+        canRetryBufferedBody &&
+        retryCount + 1 < maxAttempts &&
+        !res.headersSent &&
+        hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
+      ) {
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+        );
+      }
+
+      ctx.status = 502;
+      if (logDir) writeRequestLog(logDir, reqId, logSections);
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'provider_auth_error',
+            message: `Fallback provider "${account.name}" returned HTTP ${upstreamRes.status}. Check its token, base URL, and model config.`,
           },
         }));
       }
@@ -509,6 +554,20 @@ function parseRetryAfter(value) {
   const n = parseInt(value, 10);
   if (Number.isNaN(n)) return null;
   return Math.min(Math.max(n, 1), 24 * 60 * 60);
+}
+
+function isProviderAuthStatus(status) {
+  return status === 401 || status === 403;
+}
+
+function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = new Set()) {
+  const profile = requestInfo.profile || 'claude';
+  return accountManager.accounts.some(account => {
+    if (excludedIndexes.has(account.index)) return false;
+    if (accountManager._matchesProfile && !accountManager._matchesProfile(account, profile)) return false;
+    if (accountManager._isAvailable && !accountManager._isAvailable(account, { allowWeeklyReserve: true })) return false;
+    return true;
+  });
 }
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {

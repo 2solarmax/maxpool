@@ -99,8 +99,9 @@ function weeklyPolicyText(am, account) {
   if (!am?._weeklyState || !account || account.type === 'provider') return '';
   const state = am._weeklyState(account);
   if (!state || state === 'unknown' || state === 'normal') return '';
-  const pct = am._effectiveWeeklyUsage
-    ? ` ${(am._effectiveWeeklyUsage(account) * 100).toFixed(0)}%`
+  const used = Number(account.quota?.unified7d);
+  const pct = Number.isFinite(used)
+    ? ` ${Math.max(0, Math.min(100, used * 100)).toFixed(0)}%`
     : '';
   const text = `Wk ${state}${pct}`;
   if (state === 'critical' || state === 'exhausted') return red(text);
@@ -562,7 +563,7 @@ export class TUI {
     }
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
-    line += `  ${dim(loadText(a.load))}`;
+    line += `  ${dim(loadText(this._accountLoad(a)))}`;
     return line;
   }
 
@@ -579,7 +580,21 @@ export class TUI {
       limit = `  Lim ${used}/${q.genericLimit}${reset ? ` ${reset}` : ''}`;
     }
     const err = a.lastError ? `  Err ${String(a.lastError).slice(0, 18)}` : '';
-    return ` ${sel}${cur} ${name} ${type} ${status} Act ${String(active).padStart(2)}  OK ${String(completed).padStart(3)}  Fail ${String(failed).padStart(2)}  Last ${last}  ${dim(loadText(a.load))}${limit}${err}`;
+    return ` ${sel}${cur} ${name} ${type} ${status} Act ${String(active).padStart(2)}  OK ${String(completed).padStart(3)}  Fail ${String(failed).padStart(2)}  Last ${last}  ${dim(loadText(this._accountLoad(a)))}${limit}${err}`;
+  }
+
+  _accountLoad(account) {
+    if (account.load) return account.load;
+    if (!this.am?._loadSummary) return null;
+    const now = Date.now();
+    return {
+      current: {
+        inFlight: account.inFlight,
+        activeWeight: account.activeWeight,
+      },
+      last15m: this.am._loadSummary(account, 15 * 60 * 1000, now),
+      last1h: this.am._loadSummary(account, 60 * 60 * 1000, now),
+    };
   }
 
   _renderFooter() {

@@ -369,6 +369,53 @@ test('Kimi 429 body wait hint controls provider cooldown when retry-after is mis
   }
 });
 
+test('provider 403 disables fallback and is not counted as success', async () => {
+  const kimiUpstream = http.createServer((_req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: {
+        type: 'permission_error',
+        message: 'forbidden',
+      },
+    }));
+  });
+  const kimiPort = await listen(kimiUpstream);
+  const am = new AccountManager([], 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:1',
+    queue: { enabled: false },
+    retry: { maxAttemptsPerRequest: 2 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamclaude-profile': 'all',
+        'x-teamclaude-kimi-token': 'kk',
+        'x-teamclaude-kimi-base-url': `http://127.0.0.1:${kimiPort}`,
+      },
+      body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.error.type, 'provider_auth_error');
+
+    const account = am.accounts.find(a => a.name === 'kimi-fallback');
+    assert.equal(account.status, 'error');
+    assert.equal(account.lastError, 'forbidden');
+    assert.equal(account.completedRequests, 0);
+    assert.equal(account.failedRequests, 1);
+    assert.equal(account.lastStatus, 403);
+  } finally {
+    await close(proxy);
+    await close(kimiUpstream);
+  }
+});
+
 test('status endpoint requires proxy api key even from loopback', async () => {
   const am = new AccountManager(accounts(), 0.90);
   const proxy = createProxyServer(am, {

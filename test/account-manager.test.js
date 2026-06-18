@@ -172,6 +172,38 @@ test('weekly critical breaks sticky affinity', () => {
   assert.equal(am.getStatus().accounts[0].weekly.state, 'critical');
 });
 
+test('upstream weekly overage is clamped for routing and display quota', () => {
+  const am = manager(1);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-7d-utilization': '1.39',
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 4 * 24 * 60 * 60 * 1000) / 1000)),
+  });
+
+  assert.equal(am.accounts[0].quota.unified7d, 1);
+  assert.equal(am.accounts[0].quota.unified7dRaw, 1.39);
+  assert.equal(am.getStatus().accounts[0].quota.unified7d, 1);
+  assert.equal(am.getStatus().accounts[0].weekly.state, 'exhausted');
+});
+
+test('near-quota logging is de-duplicated for unchanged quota state', () => {
+  const am = manager(1);
+  const originalLog = console.log;
+  const lines = [];
+  console.log = (...args) => lines.push(args.join(' '));
+  try {
+    const headers = {
+      'anthropic-ratelimit-unified-7d-utilization': '0.86',
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 5 * 24 * 60 * 60 * 1000) / 1000)),
+    };
+    am.updateQuota(0, headers);
+    am.updateQuota(0, headers);
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.equal(lines.filter(line => line.includes('limiting new placement')).length, 1);
+});
+
 test('5h quota threshold blocks sticky affinity', () => {
   const am = manager(2);
   const first = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
