@@ -31,7 +31,10 @@ export function createDefaultConfig() {
     },
     queue: {
       enabled: true,
-      maxWaitMs: 6 * 60 * 60 * 1000,
+      maxWaitMs: 24 * 60 * 60 * 1000,
+      autoMaxWaitMs: null,
+      capacityMaxWaitMs: 15 * 60 * 1000,
+      weeklyMaxWaitMs: 0,
       pollMs: 1000,
     },
     accounts: [],

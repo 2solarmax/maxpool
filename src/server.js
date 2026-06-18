@@ -16,8 +16,10 @@ const DEFAULT_RETRY = {
 
 const DEFAULT_QUEUE = {
   enabled: true,
-  maxWaitMs: 6 * 60 * 60 * 1000,
-  autoMaxWaitMs: 5 * 60 * 1000,
+  maxWaitMs: 24 * 60 * 60 * 1000,
+  autoMaxWaitMs: null,
+  capacityMaxWaitMs: 15 * 60 * 1000,
+  weeklyMaxWaitMs: 0,
   pollMs: 1000,
 };
 
@@ -203,8 +205,7 @@ async function forwardRequest(
 
     ctx.status = 429;
     ctx.account = '(none available)';
-    const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts);
+    const retryAfter = computeRetryAfter(accountManager, requestInfo);
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -303,7 +304,7 @@ async function forwardRequest(
     // Retry/failover can only happen before response bytes are sent. Once a
     // streaming response starts, rerouting would corrupt Claude Code's stream.
     if (upstreamRes.status === 429) {
-      const errorBody = await readErrorBody(upstreamRes);
+      const errorBody = await readErrorBody(upstreamRes, null);
       const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
       accountManager.markRateLimited(account.index, retryAfter, { status: 429, recordFailure: false });
@@ -338,7 +339,7 @@ async function forwardRequest(
       ctx.status = 429;
       if (logDir) writeRequestLog(logDir, reqId, logSections);
       if (!res.headersSent) {
-        const clientRetryAfter = computeRetryAfter(accountManager.getStatus().accounts);
+        const clientRetryAfter = computeRetryAfter(accountManager, requestInfo);
         res.writeHead(429, {
           'Content-Type': 'application/json',
           'retry-after': String(clientRetryAfter),
@@ -355,7 +356,7 @@ async function forwardRequest(
     }
 
     if (account.type === 'provider' && isProviderAuthStatus(upstreamRes.status)) {
-      const errorBody = await readErrorBody(upstreamRes);
+      const errorBody = await readErrorBody(upstreamRes, null);
       const reason = upstreamRes.status === 401 ? 'auth_failed' : 'forbidden';
       accountManager.markAuthFailed(account.index, upstreamRes.status, reason);
       accountManager.releaseAccount(lease, { status: upstreamRes.status, error: reason });
@@ -425,6 +426,37 @@ async function forwardRequest(
           type: 'error',
           error: { type: 'overloaded_error', message: `Upstream returned ${upstreamRes.status}` },
         }));
+      }
+      return;
+    }
+
+    if (upstreamRes.status >= 400 && upstreamRes.status < 500) {
+      const errorBody = await readErrorBody(upstreamRes);
+      const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
+        ? 'invalid_thinking_signature'
+        : `HTTP ${upstreamRes.status}`;
+      accountManager.releaseAccount(lease, { status: upstreamRes.status, error: errorType });
+
+      if (logDir) {
+        logSections.push(`=== RESPONSE ${upstreamRes.status} — non-retryable client error from "${account.name}" ===\n${formatHeaders(upstreamRes.headers)}`);
+        if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
+        writeRequestLog(logDir, reqId, logSections);
+      }
+      if (errorType === 'invalid_thinking_signature') {
+        console.log(`[TeamClaude] Non-retryable Anthropic thinking signature error on "${account.name}"`);
+      }
+
+      ctx.status = upstreamRes.status;
+      if (!res.headersSent) {
+        const responseHeaders = {};
+        for (const [key, value] of upstreamRes.headers.entries()) {
+          if (key === 'transfer-encoding' || key === 'connection') continue;
+          if (key === 'content-encoding' || key === 'content-length') continue;
+          responseHeaders[key] = value;
+        }
+        responseHeaders['content-type'] ||= 'application/json';
+        res.writeHead(upstreamRes.status, responseHeaders);
+        res.end(errorBody);
       }
       return;
     }
@@ -565,17 +597,10 @@ function isProviderAuthStatus(status) {
 }
 
 function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = new Set()) {
-  const profile = requestInfo.profile || 'claude';
-  return accountManager.accounts.some(account => {
-    if (excludedIndexes.has(account.index)) return false;
-    if (accountManager._matchesRequest) {
-      if (!accountManager._matchesRequest(account, profile, requestInfo)) return false;
-    } else if (accountManager._matchesProfile && !accountManager._matchesProfile(account, profile)) {
-      return false;
-    }
-    if (accountManager._isAvailable && !accountManager._isAvailable(account, { allowWeeklyReserve: true })) return false;
-    return true;
-  });
+  if (accountManager.nextRetryForRequest) {
+    return accountManager.nextRetryForRequest(requestInfo, excludedIndexes).available;
+  }
+  return false;
 }
 
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter) {
@@ -591,13 +616,15 @@ async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
     const reader = upstreamRes.body.getReader();
     const chunks = [];
     let total = 0;
-    while (total < limitBytes) {
+    while (limitBytes == null || total < limitBytes) {
       const { done, value } = await reader.read();
       if (done) break;
-      const slice = value.length > limitBytes - total ? value.slice(0, limitBytes - total) : value;
+      const slice = limitBytes != null && value.length > limitBytes - total
+        ? value.slice(0, limitBytes - total)
+        : value;
       chunks.push(slice);
       total += slice.length;
-      if (slice.length !== value.length) break;
+      if (limitBytes != null && slice.length !== value.length) break;
     }
     reader.cancel().catch(() => {});
     return Buffer.concat(chunks).toString('utf8');
@@ -673,12 +700,25 @@ async function queueAndRetry(
   if (cause === 'network' || cause === 'proxy') return false;
 
   const maxWaitMs = Math.max(0, Number(queueConfig.maxWaitMs) || 0);
-  const autoMaxWaitMs = Math.max(0, Number(queueConfig.autoMaxWaitMs) || 0);
-  const queueWindowMs = Math.min(maxWaitMs, autoMaxWaitMs || maxWaitMs);
+  const autoMaxWaitMs = queueConfig.autoMaxWaitMs == null
+    ? maxWaitMs
+    : Math.max(0, Number(queueConfig.autoMaxWaitMs) || 0);
+  const capacityMaxWaitMs = queueConfig.capacityMaxWaitMs == null
+    ? autoMaxWaitMs
+    : Math.max(0, Number(queueConfig.capacityMaxWaitMs) || 0);
+  const weeklyMaxWaitMs = Math.max(0, Number(queueConfig.weeklyMaxWaitMs) || 0);
+  const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {
+    retryAfterMs: Infinity,
+    cause: 'unavailable',
+  };
+  const queueWindowMs = retryPlan.cause === 'weekly_exhausted'
+    ? Math.min(maxWaitMs, weeklyMaxWaitMs)
+    : cause === 'capacity'
+      ? Math.min(maxWaitMs, capacityMaxWaitMs)
+    : Math.min(maxWaitMs, autoMaxWaitMs);
   if (queueWindowMs <= 0) return false;
 
-  const status = accountManager.getStatus();
-  const retryAfterMs = computeRetryAfterMs(status.accounts);
+  const retryAfterMs = retryPlan.retryAfterMs;
   if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) return false;
 
   requestInfo.queueStartedAt ||= Date.now();
@@ -688,7 +728,7 @@ async function queueAndRetry(
 
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
-  console.log(`[TeamClaude] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause})`);
+  console.log(`[TeamClaude] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
   if (!available) return res.destroyed || req.destroyed;
@@ -964,24 +1004,7 @@ function markThinkingFromResponse(buffer, accountManager, requestInfo = {}) {
   }
 }
 
-function computeRetryAfter(accounts) {
-  const ms = computeRetryAfterMs(accounts);
+function computeRetryAfter(accountManager, requestInfo = {}) {
+  const ms = accountManager.nextRetryForRequest?.(requestInfo, new Set())?.retryAfterMs ?? Infinity;
   return ms === Infinity ? 60 : Math.max(1, Math.ceil(ms / 1000));
-}
-
-function computeRetryAfterMs(accounts) {
-  let soonest = Infinity;
-  for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil
-      || acct.cooldownUntil
-      || acct.quota?.unified5hReset
-      || acct.quota?.unified7dReset
-      || acct.quota?.genericReset
-      || acct.quota?.resetsAt;
-    if (reset) {
-      const ms = typeof reset === 'number' ? reset - Date.now() : new Date(reset).getTime() - Date.now();
-      if (ms < soonest) soonest = ms;
-    }
-  }
-  return soonest;
 }

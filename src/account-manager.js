@@ -141,6 +141,82 @@ export class AccountManager {
     return this._selectNext(requestInfo, excludedIndexes);
   }
 
+  nextRetryForRequest(requestInfo = {}, excludedIndexes = new Set()) {
+    this.refreshExpiredQuotas();
+    const profile = requestInfo.profile || 'claude';
+    let soonestTemporary = Infinity;
+    let temporaryCause = null;
+    let soonestWeekly = Infinity;
+    let matchingRoutes = 0;
+    const reasons = {};
+
+    const note = reason => {
+      reasons[reason] = (reasons[reason] || 0) + 1;
+    };
+
+    for (const account of this.accounts) {
+      if (excludedIndexes.has(account.index)) continue;
+      if (!this._matchesRequest(account, profile, requestInfo)) {
+        if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) {
+          note('provider_fallback_disabled_signed_thinking');
+        }
+        continue;
+      }
+
+      matchingRoutes++;
+      if (this._isAvailable(account, { allowWeeklyReserve: true })) {
+        return {
+          available: true,
+          retryAfterMs: 0,
+          cause: 'available',
+          reasons,
+          matchingRoutes,
+        };
+      }
+
+      const retry = this._retryInfo(account);
+      note(retry.cause);
+      if (retry.queueable && retry.retryAt) {
+        const ms = retry.retryAt - Date.now();
+        if (ms < soonestTemporary) {
+          soonestTemporary = ms;
+          temporaryCause = retry.cause;
+        }
+      } else if (retry.cause === 'weekly_exhausted' && retry.retryAt) {
+        const ms = retry.retryAt - Date.now();
+        if (ms < soonestWeekly) soonestWeekly = ms;
+      }
+    }
+
+    if (Number.isFinite(soonestTemporary)) {
+      return {
+        available: false,
+        retryAfterMs: Math.max(0, soonestTemporary),
+        cause: temporaryCause || 'temporary_unavailable',
+        reasons,
+        matchingRoutes,
+      };
+    }
+
+    if (Number.isFinite(soonestWeekly)) {
+      return {
+        available: false,
+        retryAfterMs: Math.max(0, soonestWeekly),
+        cause: 'weekly_exhausted',
+        reasons,
+        matchingRoutes,
+      };
+    }
+
+    return {
+      available: false,
+      retryAfterMs: Infinity,
+      cause: matchingRoutes ? 'unavailable' : 'no_eligible_route',
+      reasons,
+      matchingRoutes,
+    };
+  }
+
   acquireAccount(requestInfo = {}, excludedIndexes = new Set()) {
     this._noteRequestPolicy(requestInfo);
     const account = this.getActiveAccount(requestInfo, excludedIndexes);
@@ -381,6 +457,51 @@ export class AccountManager {
   _isNearQuota(account) {
     return this._isSessionQuotaUnavailable(account)
       || ['reserve', 'critical', 'exhausted'].includes(this._weeklyState(account));
+  }
+
+  _retryInfo(account) {
+    const now = Date.now();
+    const q = account.quota || {};
+    const weeklyState = this._weeklyState(account);
+    if (weeklyState === 'critical' || weeklyState === 'exhausted') {
+      return { cause: 'weekly_exhausted', retryAt: q.unified7dReset || null, queueable: false };
+    }
+
+    if (account.status === 'throttled' && account.rateLimitedUntil && now < account.rateLimitedUntil) {
+      return { cause: 'rate_limited', retryAt: account.rateLimitedUntil, queueable: true };
+    }
+
+    if (account.cooldownUntil && now < account.cooldownUntil) {
+      return { cause: 'cooldown', retryAt: account.cooldownUntil, queueable: true };
+    }
+
+    if (q.unified5h != null && q.unified5h >= this.switchThreshold) {
+      return { cause: 'session_limit', retryAt: q.unified5hReset || null, queueable: Boolean(q.unified5hReset) };
+    }
+
+    if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
+      const used = 1 - q.tokensRemaining / q.tokensLimit;
+      if (used >= this.switchThreshold) {
+        const retryAt = q.resetsAt ? new Date(q.resetsAt).getTime() : null;
+        return { cause: 'token_limit', retryAt, queueable: Boolean(retryAt) };
+      }
+    }
+
+    if (q.requestsLimit != null && q.requestsRemaining != null && q.requestsLimit > 0) {
+      const used = 1 - q.requestsRemaining / q.requestsLimit;
+      if (used >= this.switchThreshold) {
+        const retryAt = q.resetsAt ? new Date(q.resetsAt).getTime() : null;
+        return { cause: 'request_limit', retryAt, queueable: Boolean(retryAt) };
+      }
+    }
+
+    if (q.genericLimit != null && q.genericRemaining != null && q.genericRemaining <= 0) {
+      return { cause: 'provider_limit', retryAt: q.genericReset || null, queueable: Boolean(q.genericReset) };
+    }
+
+    if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
+    if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
+    return { cause: 'unavailable', retryAt: null, queueable: false };
   }
 
   _selectNext(requestInfo = {}, excludedIndexes = new Set()) {

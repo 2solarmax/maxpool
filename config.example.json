@@ -24,8 +24,10 @@
   },
   "queue": {
     "enabled": true,
-    "maxWaitMs": 21600000,
-    "autoMaxWaitMs": 300000,
+    "maxWaitMs": 86400000,
+    "autoMaxWaitMs": null,
+    "capacityMaxWaitMs": 900000,
+    "weeklyMaxWaitMs": 0,
     "pollMs": 1000
   },
   "accounts": [

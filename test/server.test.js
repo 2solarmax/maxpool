@@ -192,6 +192,70 @@ test('request does not queue when reset is beyond auto queue window', async () =
   }
 });
 
+test('capacity failures use capacity queue window instead of long quota window', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90, { cooldownMs: 150, maxCooldownMs: 150 });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 2000, capacityMaxWaitMs: 50, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 503);
+    assert.ok(Date.now() - startedAt < 500);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('weekly exhaustion does not queue by default even when reset is near', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].quota.unified7d = 1;
+  am.accounts[0].quota.unified7dReset = Date.now() + 150;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 2000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    assert.ok(Date.now() - startedAt < 500);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('network failures return connection unavailable instead of quota exhaustion', async () => {
   const am = new AccountManager(accounts(), 0.90);
   const proxy = createProxyServer(am, {
@@ -213,6 +277,44 @@ test('network failures return connection unavailable instead of quota exhaustion
     assert.match(body.error.message, /not an account quota issue/i);
   } finally {
     await close(proxy);
+  }
+});
+
+test('nonretryable 400 is recorded as failure and passed through', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: 'messages.41.content.0: Invalid `signature` in `thinking` block',
+      },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 2000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error.message, /Invalid `signature`/);
+    assert.equal(am.accounts[0].failedRequests, 1);
+    assert.equal(am.accounts[0].lastError, 'invalid_thinking_signature');
+    assert.equal(am.accounts[1].usage.totalRequests, 0);
+  } finally {
+    await close(proxy);
+    await close(upstream);
   }
 });
 

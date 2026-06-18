@@ -216,8 +216,10 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
   },
   "queue": {
     "enabled": true,
-    "maxWaitMs": 21600000,
-    "autoMaxWaitMs": 300000,
+    "maxWaitMs": 86400000,
+    "autoMaxWaitMs": null,
+    "capacityMaxWaitMs": 900000,
+    "weeklyMaxWaitMs": 0,
     "pollMs": 1000
   },
   "shutdown": {
@@ -248,8 +250,10 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `retry.maxAttemptsPerRequest` | Retry attempts before returning an error; `0` means one pass over accounts |
 | `retry.maxRetryBufferBytes` | Maximum buffered request body eligible for cross-account retry |
 | `queue.enabled` | Hold requests instead of returning 429 when every eligible route is temporarily unavailable |
-| `queue.maxWaitMs` | Hard maximum time a request can wait in the proxy queue before returning an error |
-| `queue.autoMaxWaitMs` | Interactive auto-queue window; requests only queue automatically when the next retry/reset is within this duration |
+| `queue.maxWaitMs` | Hard maximum time a request can wait in the proxy queue before returning an error; defaults to 24h for long-running agent loops |
+| `queue.autoMaxWaitMs` | Optional shorter auto-queue cap. Set to `null` or omit it to use `queue.maxWaitMs`; set a number for interactive sessions where you prefer fast errors |
+| `queue.capacityMaxWaitMs` | Separate cap for repeated upstream 5xx/overload failures; defaults to 15m so broken providers do not park requests for 24h |
+| `queue.weeklyMaxWaitMs` | Optional cap for weekly-limit waits. Defaults to `0`, so weekly exhaustion fails fast instead of parking requests for days |
 | `queue.pollMs` | How often queued requests check for a recovered account/provider |
 | `shutdown.drainTimeoutMs` | Maximum time quit/Ctrl-C waits for active requests before exiting |
 
@@ -273,9 +277,10 @@ The weekly state uses both raw utilization and reset-aware burn rate. This keeps
 7. On 429 responses, the proxy respects `retry-after`, cools down that account, and fails over before response bytes are sent
 8. Transient network errors (connection reset, timeout) fail over before the stream starts; if every eligible route has a network failure, the proxy returns `503 connection_unavailable` instead of a quota error
 9. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
-10. If all eligible accounts/providers are temporarily unavailable, the proxy queues the request and retries when one recovers
-11. If the queue wait expires, returns 429 with the soonest reset time
-12. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
+10. If all eligible accounts/providers are temporarily unavailable for a temporary reason (5h/session limit, provider cooldown, short 429), the proxy queues the request and retries when one recovers
+11. Repeated upstream 5xx/overload failures use the shorter `capacityMaxWaitMs` cap, not the long quota wait
+12. Weekly exhaustion and non-retryable 4xx errors fail fast by default; if the queue wait expires, returns 429 with the soonest retry time
+13. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
 
