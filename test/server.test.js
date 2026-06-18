@@ -323,6 +323,11 @@ test('Z.AI 429 body reset hint controls provider cooldown when retry-after is mi
     assert.equal(res.status, 429);
     const account = am.accounts.find(a => a.name === 'glm-fallback');
     assert.ok(account.rateLimitedUntil - Date.now() > 90_000);
+    assert.equal(account.failedRequests, 1);
+    assert.equal(account.lastStatus, 429);
+    assert.equal(account.lastError, 'rate_limited');
+    assert.equal(account.loadEvents.at(-1).success, false);
+    assert.equal(account.loadEvents.at(-1).status, 429);
   } finally {
     await close(proxy);
     await close(zaiUpstream);

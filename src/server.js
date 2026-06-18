@@ -303,8 +303,8 @@ async function forwardRequest(
       const errorBody = await readErrorBody(upstreamRes);
       const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
-      accountManager.markRateLimited(account.index, retryAfter);
-      accountManager.releaseAccount(lease);
+      accountManager.markRateLimited(account.index, retryAfter, { status: 429, recordFailure: false });
+      accountManager.releaseAccount(lease, { status: 429, error: 'rate_limited' });
 
       if (logDir) {
         logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);

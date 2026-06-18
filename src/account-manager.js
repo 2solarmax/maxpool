@@ -167,8 +167,10 @@ export class AccountManager {
       account.consecutiveFailures = 0;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
-      account.lastError = null;
-      account.lastErrorAt = null;
+      if (account.status !== 'throttled' || account.lastError !== 'rate_limited') {
+        account.lastError = null;
+        account.lastErrorAt = null;
+      }
       this._recordLoadEvent(account, lease, { ...outcome, success: true });
       account.lastSuccessAt = Date.now();
       return;
@@ -701,15 +703,19 @@ export class AccountManager {
   /**
    * Mark an account as rate-limited for a given duration.
    */
-  markRateLimited(accountIndex, retryAfterSeconds) {
+  markRateLimited(accountIndex, retryAfterSeconds, options = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     const retryAfter = clampRetryAfterSeconds(retryAfterSeconds);
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfter * 1000);
+    account.lastStatus = options.status || 429;
     account.lastError = 'rate_limited';
     account.lastErrorAt = Date.now();
-    account.consecutiveFailures++;
+    if (options.recordFailure !== false) {
+      account.failedRequests++;
+      account.consecutiveFailures++;
+    }
     console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfter}s`);
   }
 
