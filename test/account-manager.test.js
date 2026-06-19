@@ -193,6 +193,17 @@ test('weekly critical breaks sticky affinity', () => {
   assert.equal(am.getStatus().accounts[0].weekly.state, 'critical');
 });
 
+test('weekly critical is used as last resort instead of failing request', () => {
+  const am = manager(2);
+  am.accounts[0].quota.unified7d = 0.96;
+  am.accounts[1].quota.unified7d = 0.97;
+
+  const lease = am.acquireAccount({ weight: 1, sessionKey: 'session-1' });
+  assert.ok(lease);
+  assert.match(lease.account.name, /^a[12]$/);
+  assert.equal(am.nextRetryForRequest({ sessionKey: 'session-2' }).available, true);
+});
+
 test('upstream weekly overage is clamped for routing and display quota', () => {
   const am = manager(1);
   am.updateQuota(0, {
@@ -285,6 +296,17 @@ test('all profile only uses lower-priority providers after higher-priority accou
   am.markRateLimited(1, 60);
   lease = am.acquireAccount({ profile: 'all' });
   assert.equal(lease.account.name, 'kimi-fallback');
+});
+
+test('all profile uses provider before weekly-critical Claude account', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
+    { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
+  ], 0.90);
+  am.accounts[0].quota.unified7d = 0.96;
+
+  const lease = am.acquireAccount({ profile: 'all' });
+  assert.equal(lease.account.name, 'glm-fallback');
 });
 
 test('provider telemetry parses standard rate limit headers', () => {

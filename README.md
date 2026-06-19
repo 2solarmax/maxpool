@@ -262,7 +262,8 @@ Weekly Claude quota is treated as long-horizon budget, not the same as the 5-hou
 - `normal`: accepts new and sticky sessions.
 - `soft`: remains available, but new sessions prefer cooler accounts.
 - `reserve`: existing sticky sessions can continue; new sessions use other Claude accounts when possible.
-- `critical` / `exhausted`: unavailable until weekly reset or upstream recovery.
+- `critical`: avoided unless no healthier eligible route exists.
+- `exhausted`: unavailable until weekly reset or upstream recovery.
 
 The weekly state uses both raw utilization and reset-aware burn rate. This keeps an account with high usage and many days until reset from receiving more new sessions too early, while allowing an account close to weekly reset to be used more aggressively.
 
@@ -273,7 +274,7 @@ The weekly state uses both raw utilization and reset-aware burn rate. This keeps
 3. If the client sends `x-teamclaude-session`, the session is pinned to that account while it stays available
 4. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
 5. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
-6. 5-hour quota controls immediate availability; weekly quota controls new-session admission and preservation
+6. 5-hour quota controls immediate availability; weekly quota controls new-session admission and preservation; weekly `critical` is last-resort, while weekly `exhausted` is blocked
 7. On 429 responses, the proxy respects `retry-after`, cools down that account, and fails over before response bytes are sent
 8. Transient network errors (connection reset, timeout) fail over before the stream starts; if every eligible route has a network failure, the proxy returns `503 connection_unavailable` instead of a quota error
 9. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi

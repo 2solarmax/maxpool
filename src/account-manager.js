@@ -176,6 +176,15 @@ export class AccountManager {
 
       const retry = this._retryInfo(account);
       note(retry.cause);
+      if (retry.cause === 'weekly_critical' && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+        return {
+          available: true,
+          retryAfterMs: 0,
+          cause: 'weekly_critical_last_resort',
+          reasons,
+          matchingRoutes,
+        };
+      }
       if (retry.queueable && retry.retryAt) {
         const ms = retry.retryAt - Date.now();
         if (ms < soonestTemporary) {
@@ -328,7 +337,8 @@ export class AccountManager {
     if (account.status === 'exhausted' || account.status === 'error') return false;
     if (this._isSessionQuotaUnavailable(account)) return false;
     const weeklyState = this._weeklyState(account);
-    if (weeklyState === 'exhausted' || weeklyState === 'critical') return false;
+    if (weeklyState === 'exhausted') return false;
+    if (weeklyState === 'critical' && !options.allowWeeklyCritical) return false;
     if (weeklyState === 'reserve' && !options.allowWeeklyReserve) return false;
 
     return true;
@@ -463,7 +473,11 @@ export class AccountManager {
     const now = Date.now();
     const q = account.quota || {};
     const weeklyState = this._weeklyState(account);
-    if (weeklyState === 'critical' || weeklyState === 'exhausted') {
+    if (weeklyState === 'critical') {
+      return { cause: 'weekly_critical', retryAt: q.unified7dReset || null, queueable: false };
+    }
+
+    if (weeklyState === 'exhausted') {
       return { cause: 'weekly_exhausted', retryAt: q.unified7dReset || null, queueable: false };
     }
 
@@ -517,7 +531,18 @@ export class AccountManager {
     const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo);
     if (bound && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)) return bound;
 
-    for (const allowWeeklyReserve of hasBinding ? [true] : [false, true]) {
+    const weeklyPasses = hasBinding
+      ? [
+          { allowWeeklyReserve: true, allowWeeklyCritical: false },
+          { allowWeeklyReserve: true, allowWeeklyCritical: true },
+        ]
+      : [
+          { allowWeeklyReserve: false, allowWeeklyCritical: false },
+          { allowWeeklyReserve: true, allowWeeklyCritical: false },
+          { allowWeeklyReserve: true, allowWeeklyCritical: true },
+        ];
+
+    for (const weeklyOptions of weeklyPasses) {
       best = null;
       bestScore = Infinity;
       bestPriority = Infinity;
@@ -527,7 +552,7 @@ export class AccountManager {
         const account = this.accounts[idx];
         if (excludedIndexes.has(account.index)) continue;
         if (!this._matchesRequest(account, profile, requestInfo)) continue;
-        if (!this._isAvailable(account, { allowWeeklyReserve })) continue;
+        if (!this._isAvailable(account, weeklyOptions)) continue;
 
         const priority = Number.isFinite(account.priority) ? account.priority : 0;
         const score = this._scoreAccount(account, requestInfo);
