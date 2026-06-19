@@ -36,3 +36,29 @@ test('restart key stops TUI and invokes restart callback', () => {
   assert.equal(stopped, true);
   assert.equal(restarted, true);
 });
+
+test('TUI start returns false instead of throwing when raw mode fails', () => {
+  const originalSetRawMode = process.stdin.setRawMode;
+  const originalWrite = process.stderr.write;
+  let stderr = '';
+  process.stdin.setRawMode = () => {
+    const err = new Error('setRawMode EIO');
+    err.code = 'EIO';
+    throw err;
+  };
+  process.stderr.write = chunk => {
+    stderr += String(chunk);
+    return true;
+  };
+
+  try {
+    const tui = new TUI({ accountManager: { accounts: [] } });
+
+    assert.equal(tui.start(), false);
+    assert.equal(tui.running, false);
+    assert.match(stderr, /TUI unavailable \(EIO\)/);
+  } finally {
+    process.stdin.setRawMode = originalSetRawMode;
+    process.stderr.write = originalWrite;
+  }
+});

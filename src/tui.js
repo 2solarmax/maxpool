@@ -194,9 +194,15 @@ export class TUI {
   // ── lifecycle ──────────────────────────────────────
 
   start() {
+    try {
+      process.stdin.setRawMode(true);
+    } catch (err) {
+      process.stderr.write(`[TeamClaude] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
+      return false;
+    }
+
     this.running = true;
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
-    process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     this._dataHandler = d => this._onData(d);
@@ -215,6 +221,7 @@ export class TUI {
       this.frame = (this.frame + 1) % SPINNER.length;
       this.render();
     }, 500);
+    return true;
   }
 
   stop() {

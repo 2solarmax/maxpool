@@ -144,7 +144,13 @@ async function serverCommand() {
 
   const restartSelf = () => {
     console.log('[TeamClaude] Restarting server...');
-    const child = spawn(process.execPath, process.argv.slice(1), {
+    const child = spawn('/bin/sh', [
+      '-c',
+      'sleep 0.25; exec "$@"',
+      'teamclaude-restart',
+      process.execPath,
+      ...process.argv.slice(1),
+    ], {
       cwd: process.cwd(),
       env: process.env,
       stdio: 'inherit',
@@ -262,33 +268,41 @@ async function serverCommand() {
     server.removeListener('error', onListenError);
     server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
     if (tui) {
-      tui.start();
-      console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
+      if (tui.start()) {
+        console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
+      } else {
+        tui = null;
+        logPlainServerStart({ host, port, accounts, threshold, config });
+      }
     } else {
-      const sep = '='.repeat(60);
-      console.log('');
-      console.log(sep);
-      console.log('  TeamClaude Proxy');
-      console.log(sep);
-      console.log(`  Listen:     ${host}:${port}`);
-      console.log(`  Accounts:   ${accounts.length}`);
-      console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
-      console.log(`  Scheduler:  adaptive least-loaded`);
-      console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
-      console.log('');
-      accounts.forEach((a, i) => {
-        console.log(`  [${i + 1}] ${a.name} (${a.type})`);
-      });
-      console.log('');
-      console.log('  Run Claude through proxy:  teamclaude run');
-      console.log('  Show env vars:             teamclaude env');
-      console.log(sep);
-      console.log('');
+      logPlainServerStart({ host, port, accounts, threshold, config });
     }
   });
 
   process.on('SIGINT', () => shutdownGracefully('SIGINT'));
   process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+}
+
+function logPlainServerStart({ host, port, accounts, threshold, config }) {
+  const sep = '='.repeat(60);
+  console.log('');
+  console.log(sep);
+  console.log('  TeamClaude Proxy');
+  console.log(sep);
+  console.log(`  Listen:     ${host}:${port}`);
+  console.log(`  Accounts:   ${accounts.length}`);
+  console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
+  console.log(`  Scheduler:  adaptive least-loaded`);
+  console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
+  console.log('');
+  accounts.forEach((a, i) => {
+    console.log(`  [${i + 1}] ${a.name} (${a.type})`);
+  });
+  console.log('');
+  console.log('  Run Claude through proxy:  teamclaude run');
+  console.log('  Show env vars:             teamclaude env');
+  console.log(sep);
+  console.log('');
 }
 
 // ── import ──────────────────────────────────────────────────
