@@ -65,6 +65,15 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+function quotaLabel(ratio, resetTs, width) {
+  const rst = formatReset(resetTs);
+  if (ratio == null || isNaN(ratio)) return (rst || '-').slice(0, width);
+  const pct = `${Math.max(0, Math.min(100, ratio * 100)).toFixed(0)}%`;
+  const full = rst ? `${pct} ${rst}` : pct;
+  if (full.length <= width) return full;
+  return (rst || pct).slice(0, width);
+}
+
 function formatMs(ms) {
   if (ms == null || isNaN(ms)) return '-';
   if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -99,12 +108,14 @@ function weeklyPolicyText(am, account) {
   if (!am?._weeklyState || !account || account.type === 'provider') return '';
   const state = am._weeklyState(account);
   if (!state || state === 'unknown' || state === 'normal') return '';
+  const rawState = am._weeklyRawState?.(account) || state;
   const used = Number(account.quota?.unified7d);
   const pct = Number.isFinite(used)
     ? ` ${Math.max(0, Math.min(100, used * 100)).toFixed(0)}%`
     : '';
-  const text = `Wk ${state}${pct}`;
-  if (state === 'critical' || state === 'exhausted') return red(text);
+  const label = state !== rawState && rawState !== 'exhausted' ? `Pace ${state}` : `Wk ${state}`;
+  const text = `${label}${pct}`;
+  if (state === 'critical' || state === 'exhausted') return state !== rawState ? yellow(text) : red(text);
   if (state === 'reserve') return yellow(text);
   return cyan(text);
 }
@@ -114,11 +125,9 @@ function weeklyPolicyText(am, account) {
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
  */
 function bar(ratio, w = 10, resetTs) {
-  const rst = formatReset(resetTs);
-
   if (ratio == null || isNaN(ratio)) {
     // No data — dim background, show label or dash
-    const label = rst || '-';
+    const label = quotaLabel(ratio, resetTs, w);
     const text = label.slice(0, w);
     const pad = w - text.length;
     const lp = Math.floor(pad / 2);
@@ -131,9 +140,8 @@ function bar(ratio, w = 10, resetTs) {
   // Background colors: 42=green, 43=yellow, 41=red; 100=bright black (gray) for empty
   const bg = ratio < 0.7 ? 42 : ratio < 0.9 ? 43 : 41;
 
-  // Build the label to overlay: show reset time if available, else percentage
-  const pct = (ratio * 100).toFixed(0) + '%';
-  const label = rst || pct;
+  // Build the label to overlay: show both usage and reset when it fits.
+  const label = quotaLabel(ratio, resetTs, w);
   const text = label.slice(0, w);
   const pad = w - text.length;
   const lp = Math.floor(pad / 2);
@@ -150,6 +158,8 @@ function bar(ratio, w = 10, resetTs) {
   out += RESET;
   return out;
 }
+
+export const __tuiTest = { formatReset, quotaLabel, bar, strip };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });

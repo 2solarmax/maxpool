@@ -204,6 +204,18 @@ test('weekly critical is used as last resort instead of failing request', () => 
   assert.equal(am.nextRetryForRequest({ sessionKey: 'session-2' }).available, true);
 });
 
+test('weekly pace pressure does not masquerade as actual exhaustion', () => {
+  const am = manager(1);
+  am.accounts[0].quota.unified7d = 0.70;
+  am.accounts[0].quota.unified7dReset = Date.now() + 6 * 24 * 60 * 60 * 1000;
+
+  const status = am.getStatus().accounts[0].weekly;
+  assert.equal(status.rawState, 'soft');
+  assert.equal(status.state, 'critical');
+  assert.equal(status.paceState, 'exhausted');
+  assert.equal(am.nextRetryForRequest({ sessionKey: 'session-1' }).available, true);
+});
+
 test('upstream weekly overage is clamped for routing and display quota', () => {
   const am = manager(1);
   am.updateQuota(0, {
@@ -215,6 +227,23 @@ test('upstream weekly overage is clamped for routing and display quota', () => {
   assert.equal(am.accounts[0].quota.unified7dRaw, 1.39);
   assert.equal(am.getStatus().accounts[0].quota.unified7d, 1);
   assert.equal(am.getStatus().accounts[0].weekly.state, 'exhausted');
+});
+
+test('unified reset headers accept epoch milliseconds and date strings', () => {
+  const am = manager(1);
+  const fiveHourReset = Date.now() + 2 * 60 * 60 * 1000;
+  const weeklyReset = new Date(Math.floor((Date.now() + 3 * 24 * 60 * 60 * 1000) / 1000) * 1000);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.54',
+    'anthropic-ratelimit-unified-5h-reset': String(fiveHourReset),
+    'anthropic-ratelimit-unified-7d-utilization': '0.85',
+    'anthropic-ratelimit-unified-7d-reset': weeklyReset.toUTCString(),
+  });
+
+  assert.equal(am.accounts[0].quota.unified5h, 0.54);
+  assert.ok(Math.abs(am.accounts[0].quota.unified5hReset - fiveHourReset) < 1000);
+  assert.equal(am.accounts[0].quota.unified7d, 0.85);
+  assert.ok(Math.abs(am.accounts[0].quota.unified7dReset - weeklyReset.getTime()) < 1000);
 });
 
 test('near-quota logging is de-duplicated for unchanged quota state', () => {

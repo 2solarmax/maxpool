@@ -262,10 +262,10 @@ Weekly Claude quota is treated as long-horizon budget, not the same as the 5-hou
 - `normal`: accepts new and sticky sessions.
 - `soft`: remains available, but new sessions prefer cooler accounts.
 - `reserve`: existing sticky sessions can continue; new sessions use other Claude accounts when possible.
-- `critical`: avoided unless no healthier eligible route exists.
+- `critical`: avoided unless no healthier eligible route exists. This can be raw weekly usage or reset-aware pace pressure.
 - `exhausted`: unavailable until weekly reset or upstream recovery.
 
-The weekly state uses both raw utilization and reset-aware burn rate. This keeps an account with high usage and many days until reset from receiving more new sessions too early, while allowing an account close to weekly reset to be used more aggressively.
+The weekly usage bar shows raw upstream utilization and reset timing. Reset-aware burn rate is a separate pace signal used for routing pressure; it can mark an account as `Pace critical`, but only raw near-exhaustion or upstream rejection can show/block as `Wk exhausted`.
 
 ## How It Works
 

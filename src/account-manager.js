@@ -65,8 +65,9 @@ function parseFirstInt(headers, names) {
 
 function parseResetHeader(value) {
   if (value == null) return null;
-  const raw = String(value).split(',')[0].trim();
-  const asNumber = Number(raw);
+  const raw = String(value).trim();
+  const first = raw.split(',')[0].trim();
+  const asNumber = Number(first);
   if (Number.isFinite(asNumber)) {
     // Most reset headers are epoch seconds or delay seconds. Treat small
     // values as delay seconds; large values as epoch seconds.
@@ -739,11 +740,32 @@ export class AccountManager {
   }
 
   _weeklyState(account) {
+    const rawState = this._weeklyRawState(account);
+    if (rawState === 'unknown' || rawState === 'exhausted') return rawState;
+
+    const pressure = Math.max(clamp01(account.quota.unified7d ?? 0), this._effectiveWeeklyUsage(account));
+    if (pressure >= this.scheduler.weeklyCriticalThreshold) return 'critical';
+    if (pressure >= this.scheduler.weeklyReserveThreshold) return 'reserve';
+    if (pressure >= this.scheduler.weeklySoftThreshold) return 'soft';
+    return 'normal';
+  }
+
+  _weeklyRawState(account) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
     if (q.unifiedStatus === 'rejected') return 'exhausted';
     if (q.unified7d == null) return 'unknown';
 
+    const used = clamp01(q.unified7d);
+    if (used >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
+    if (used >= this.scheduler.weeklyCriticalThreshold) return 'critical';
+    if (used >= this.scheduler.weeklyReserveThreshold) return 'reserve';
+    if (used >= this.scheduler.weeklySoftThreshold) return 'soft';
+    return 'normal';
+  }
+
+  _weeklyPaceState(account) {
+    if (account.quota.unified7d == null) return 'unknown';
     const effective = this._effectiveWeeklyUsage(account);
     if (effective >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
     if (effective >= this.scheduler.weeklyCriticalThreshold) return 'critical';
@@ -756,8 +778,14 @@ export class AccountManager {
     if (account.quota.unified7d == null) return null;
     const used = clamp01(account.quota.unified7d);
     const effective = this._effectiveWeeklyUsage(account);
-    const state = this._weeklyState(account);
-    const statePenalty = state === 'reserve' ? 0.25 : state === 'soft' ? 0.1 : 0;
+    const paceState = this._weeklyPaceState(account);
+    const statePenalty = paceState === 'critical' || paceState === 'exhausted'
+      ? 0.35
+      : paceState === 'reserve'
+        ? 0.25
+        : paceState === 'soft'
+          ? 0.1
+          : 0;
     return Math.min(2, Math.max(0, effective * 0.8 + used * 0.2 + statePenalty));
   }
 
@@ -793,8 +821,8 @@ export class AccountManager {
 
     const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
-    if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
-    if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+    if (r5h) account.quota.unified5hReset = parseResetHeader(r5h);
+    if (r7d) account.quota.unified7dReset = parseResetHeader(r7d);
 
     // We switched to this account to discover its weekly quota; now that we
     // know it, flag for re-evaluation so selection can pick the best account.
@@ -1114,7 +1142,9 @@ export class AccountManager {
         quota: { ...a.quota },
         weekly: {
           state: this._weeklyState(a),
+          rawState: this._weeklyRawState(a),
           effectiveUsage: this._effectiveWeeklyUsage(a),
+          paceState: this._weeklyPaceState(a),
         },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil
