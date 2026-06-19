@@ -221,6 +221,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
     "maxWaitMs": 86400000,
     "autoMaxWaitMs": null,
     "capacityMaxWaitMs": 900000,
+    "maxQueuedBodyBytes": 268435456,
     "weeklyMaxWaitMs": 0,
     "pollMs": 1000
   },
@@ -255,6 +256,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `queue.maxWaitMs` | Hard maximum time a request can wait in the proxy queue before returning an error; defaults to 24h for long-running agent loops |
 | `queue.autoMaxWaitMs` | Optional shorter auto-queue cap. Set to `null` or omit it to use `queue.maxWaitMs`; set a number for interactive sessions where you prefer fast errors |
 | `queue.capacityMaxWaitMs` | Separate cap for repeated upstream 5xx/overload failures; defaults to 15m so broken providers do not park requests for 24h |
+| `queue.maxQueuedBodyBytes` | Maximum request body TeamClaude will hold in memory while waiting for capacity before the request has been sent upstream; defaults to 256 MiB |
 | `queue.weeklyMaxWaitMs` | Optional cap for weekly-limit waits. Defaults to `0`, so weekly exhaustion fails fast instead of parking requests for days |
 | `queue.pollMs` | How often queued requests check for a recovered account/provider |
 | `shutdown.drainTimeoutMs` | Maximum time quit/Ctrl-C waits for active requests before exiting |

@@ -27,6 +27,7 @@
     "maxWaitMs": 86400000,
     "autoMaxWaitMs": null,
     "capacityMaxWaitMs": 900000,
+    "maxQueuedBodyBytes": 268435456,
     "weeklyMaxWaitMs": 0,
     "pollMs": 1000
   },

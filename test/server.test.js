@@ -159,6 +159,43 @@ test('request queues instead of returning 429 when all routes are temporarily un
   }
 });
 
+test('large request can queue before upstream send even when it is too large for retry', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].rateLimitedUntil = Date.now() + 150;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    retry: { maxRetryBufferBytes: 10 },
+    queue: { enabled: true, maxWaitMs: 2000, maxQueuedBodyBytes: 2048, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [{ content: 'this body is intentionally over ten bytes' }] }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['Bearer t1']);
+    assert.ok(Date.now() - startedAt >= 100);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('request does not queue when reset is beyond auto queue window', async () => {
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });

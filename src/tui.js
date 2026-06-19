@@ -113,8 +113,9 @@ function weeklyPolicyText(am, account) {
   const pct = Number.isFinite(used)
     ? ` ${Math.max(0, Math.min(100, used * 100)).toFixed(0)}%`
     : '';
-  const label = state !== rawState && rawState !== 'exhausted' ? `Pace ${state}` : `Wk ${state}`;
-  const text = `${label}${pct}`;
+  const paceOnly = state !== rawState && rawState !== 'exhausted';
+  const label = paceOnly ? `Pace ${state}` : `Wk ${state}`;
+  const text = paceOnly ? label : `${label}${pct}`;
   if (state === 'critical' || state === 'exhausted') return state !== rawState ? yellow(text) : red(text);
   if (state === 'reserve') return yellow(text);
   return cyan(text);

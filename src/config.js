@@ -34,6 +34,7 @@ export function createDefaultConfig() {
       maxWaitMs: 24 * 60 * 60 * 1000,
       autoMaxWaitMs: null,
       capacityMaxWaitMs: 15 * 60 * 1000,
+      maxQueuedBodyBytes: 256 * 1024 * 1024,
       weeklyMaxWaitMs: 0,
       pollMs: 1000,
     },

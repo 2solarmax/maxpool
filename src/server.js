@@ -87,6 +87,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const queueConfig = { ...DEFAULT_QUEUE, ...(config.queue || {}) };
       const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
       const requestInfo = describeRequest(req, body);
+      const maxQueuedBodyBytes = queueConfig.maxQueuedBodyBytes == null
+        ? Infinity
+        : Math.max(0, Number(queueConfig.maxQueuedBodyBytes) || 0);
+      const canQueueBufferedBody = body.length <= maxQueuedBodyBytes;
+      if (!canQueueBufferedBody) {
+        requestInfo.queueBlockedReason = `request body ${body.length} bytes exceeds queue.maxQueuedBodyBytes ${maxQueuedBodyBytes}`;
+      }
       requestInfo.profile = getTeamClaudeProfile(req.headers);
       requestInfo.sessionKey = headerValue(req.headers, 'x-teamclaude-session');
       if (requestInfo.requiresAnthropicThinkingIntegrity && requestInfo.profile === 'all') {
@@ -98,7 +105,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       try {
         await forwardRequest(
           req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
-          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, new Set(),
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set(),
         );
       } catch (err) {
         ctx.status = ctx.status || 502;
@@ -187,7 +194,7 @@ function formatHeaders(headers) {
 
 async function forwardRequest(
   req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir,
-  retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+  retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
 ) {
   const configuredAttempts = Number(retryConfig.maxAttemptsPerRequest) || accountManager.accounts.length;
   const maxAttempts = Math.max(1, configuredAttempts);
@@ -199,7 +206,7 @@ async function forwardRequest(
     const queued = await queueAndRetry(
       'no eligible account/provider currently available',
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'quota',
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'quota',
     );
     if (queued) return;
 
@@ -231,7 +238,7 @@ async function forwardRequest(
     excludedIndexes.add(account.index);
     return forwardRequest(
       req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
     );
   }
 
@@ -325,14 +332,14 @@ async function forwardRequest(
       ) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
 
       const queued = await queueAndRetry(
         `all routes failed after 429 from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'quota',
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'quota',
       );
       if (queued) return;
 
@@ -376,7 +383,7 @@ async function forwardRequest(
       ) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
 
@@ -408,14 +415,14 @@ async function forwardRequest(
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
 
       const queued = await queueAndRetry(
         `all routes failed after ${upstreamRes.status} from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'capacity',
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'capacity',
       );
       if (queued) return;
 
@@ -535,13 +542,13 @@ async function forwardRequest(
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
       const queued = await queueAndRetry(
         `all routes failed after network error from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'network',
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'network',
       );
       if (queued) return;
       ctx.status = 503;
@@ -564,13 +571,13 @@ async function forwardRequest(
       excludedIndexes.add(account.index);
       return forwardRequest(
         req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, excludedIndexes,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
       );
     }
     const queued = await queueAndRetry(
       `all routes failed after proxy error from "${account.name}"`,
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, 'proxy',
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'proxy',
     );
     if (queued) return;
     ctx.status = 502;
@@ -694,9 +701,14 @@ function isRetriableUpstreamStatus(status) {
 
 async function queueAndRetry(
   reason, req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-  retryConfig, queueConfig, requestInfo, canRetryBufferedBody, cause = 'quota',
+  retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody = canRetryBufferedBody, cause = 'quota',
 ) {
-  if (!queueConfig.enabled || !canRetryBufferedBody || res.headersSent || res.destroyed) return false;
+  if (!queueConfig.enabled || !canQueueBufferedBody || res.headersSent || res.destroyed) {
+    if (queueConfig.enabled && !canQueueBufferedBody && requestInfo.queueBlockedReason) {
+      console.log(`[TeamClaude] Not queueing request: ${requestInfo.queueBlockedReason}`);
+    }
+    return false;
+  }
   if (cause === 'network' || cause === 'proxy') return false;
 
   const maxWaitMs = Math.max(0, Number(queueConfig.maxWaitMs) || 0);
@@ -735,7 +747,7 @@ async function queueAndRetry(
 
   return forwardRequest(
     req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
-    retryConfig, queueConfig, requestInfo, canRetryBufferedBody, new Set(),
+    retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set(),
   ).then(() => true);
 }
 
