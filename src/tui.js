@@ -168,12 +168,13 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
+    this.onRestart = onRestart;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -280,6 +281,7 @@ export class TUI {
 
   _keyNormal(k) {
     if (k === 'q') { this.stop(); this.onQuit?.(); }
+    else if (k === 'x') { this.stop(); this.onRestart?.(); }
     else if (k === 's' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex;
     }
@@ -610,7 +612,7 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('x')}restart  ${bold('q')}uit`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;

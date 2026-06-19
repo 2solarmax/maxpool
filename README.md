@@ -16,7 +16,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Provider telemetry** — GLM/Kimi rows show active requests, completed/failed counts, last status/latency, and standard rate-limit headers when providers return them
 - **Rolling load view** — each row shows current in-flight load plus request counts/average latency over the last 15 minutes and 1 hour
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
-- **Graceful drain on restart** — quit/Ctrl-C stops new requests and waits for active streams to finish before exiting
+- **Graceful drain on restart** — restart/quit/Ctrl-C stops new requests and waits for active streams to finish before exiting or relaunching
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running; the server auto-syncs config and **R** can reload immediately
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
@@ -111,6 +111,7 @@ Falls back to plain log output when not a TTY (e.g. running as a service).
 | `a` | Add account (import or API key) |
 | `r` | Remove an account |
 | `R` | Reload accounts from config |
+| `x` | Restart server after draining active requests |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
@@ -147,12 +148,13 @@ Every account/provider row also includes load telemetry: `Load current/weight`, 
 
 ### Restart behavior
 
-When you press `q`, Ctrl-C, or send SIGTERM, TeamClaude enters draining shutdown:
+When you press `x`, `q`, Ctrl-C, or send SIGTERM, TeamClaude enters draining shutdown:
 
 1. The proxy stops accepting new requests.
 2. Existing in-flight streams keep running.
 3. The process exits when active requests finish.
-4. Press Ctrl-C again to force exit.
+4. If you pressed `x`, TeamClaude starts a fresh `teamclaude server` process in the same terminal.
+5. Press Ctrl-C again to force exit.
 
 Idle Claude Code sessions are not tied to the server process. If the server is restarted while a Claude Code session is idle, its next request reconnects to the new server. If the server is forced closed while a stream is actively running, that stream can still fail because the TCP connection disappears.
 

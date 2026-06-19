@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -142,7 +142,19 @@ async function serverCommand() {
     },
   };
 
-  const shutdownGracefully = reason => {
+  const restartSelf = () => {
+    console.log('[TeamClaude] Restarting server...');
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: 'inherit',
+    });
+    child.on('error', err => {
+      console.error(`[TeamClaude] Failed to restart: ${err.message}`);
+    });
+  };
+
+  const shutdownGracefully = (reason, options = {}) => {
     if (draining) {
       console.error(`\n[TeamClaude] Force exiting with ${activeRequests.size} active request(s) still open.`);
       process.exit(1);
@@ -163,6 +175,7 @@ async function serverCommand() {
       done = true;
       if (reportTimer) clearInterval(reportTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (options.restart && code === 0) restartSelf();
       process.exit(code);
     };
 
@@ -217,6 +230,9 @@ async function serverCommand() {
       },
       onQuit: () => {
         shutdownGracefully('quit');
+      },
+      onRestart: () => {
+        shutdownGracefully('restart', { restart: true });
       },
     });
   }
