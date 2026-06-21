@@ -10,6 +10,8 @@ import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
+const SERVER_RESTART_EXIT_CODE = 75;
+const SERVER_WORKER_ENV = 'TEAMCLAUDE_SERVER_WORKER';
 
 switch (command) {
   case 'server':
@@ -65,6 +67,46 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  if (
+    process.env[SERVER_WORKER_ENV] === '1' ||
+    !process.stdout.isTTY ||
+    !process.stdin.isTTY
+  ) {
+    return serverWorkerCommand();
+  }
+
+  // Keep a stable foreground process attached to the shell. The worker can
+  // then request a restart without orphaning its replacement or losing TTY IO.
+  const ignoreTerminalSignal = () => {};
+  process.on('SIGINT', ignoreTerminalSignal);
+  process.on('SIGTERM', ignoreTerminalSignal);
+  try {
+    while (true) {
+      const result = await runServerWorker();
+      if (result.code === SERVER_RESTART_EXIT_CODE) continue;
+      if (result.signal) process.exitCode = 1;
+      else process.exitCode = result.code ?? 1;
+      return;
+    }
+  } finally {
+    process.off('SIGINT', ignoreTerminalSignal);
+    process.off('SIGTERM', ignoreTerminalSignal);
+  }
+}
+
+function runServerWorker() {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      cwd: process.cwd(),
+      env: { ...process.env, [SERVER_WORKER_ENV]: '1' },
+      stdio: 'inherit',
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+}
+
+async function serverWorkerCommand() {
   const config = await loadOrCreateConfig();
 
   // --log-to <dir>
@@ -142,24 +184,6 @@ async function serverCommand() {
     },
   };
 
-  const restartSelf = () => {
-    console.log('[TeamClaude] Restarting server...');
-    const child = spawn('/bin/sh', [
-      '-c',
-      'sleep 0.25; exec "$@"',
-      'teamclaude-restart',
-      process.execPath,
-      ...process.argv.slice(1),
-    ], {
-      cwd: process.cwd(),
-      env: process.env,
-      stdio: 'inherit',
-    });
-    child.on('error', err => {
-      console.error(`[TeamClaude] Failed to restart: ${err.message}`);
-    });
-  };
-
   const shutdownGracefully = (reason, options = {}) => {
     if (draining) {
       console.error(`\n[TeamClaude] Force exiting with ${activeRequests.size} active request(s) still open.`);
@@ -181,7 +205,10 @@ async function serverCommand() {
       done = true;
       if (reportTimer) clearInterval(reportTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (options.restart && code === 0) restartSelf();
+      if (options.restart && code === 0) {
+        console.log('[TeamClaude] Restarting server...');
+        process.exit(SERVER_RESTART_EXIT_CODE);
+      }
       process.exit(code);
     };
 

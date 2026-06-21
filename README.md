@@ -286,6 +286,7 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 11. Repeated upstream 5xx/overload failures use the shorter `capacityMaxWaitMs` cap, not the long quota wait
 12. Weekly exhaustion and non-retryable 4xx errors fail fast by default; if the queue wait expires, returns 429 with the soonest retry time
 13. Temporary OAuth refresh failures cool the account down and queue/fail over; invalid refresh credentials disable only that account and require login
+14. In an interactive terminal, the server runs under a foreground supervisor so `x` can drain and restart without detaching the replacement TUI
 13. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
