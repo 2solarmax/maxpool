@@ -82,8 +82,9 @@ function parseResetHeader(value) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.90, schedulerOptions = {}) {
+  constructor(accounts, switchThreshold = 0.90, schedulerOptions = {}, dependencies = {}) {
     this.scheduler = { ...DEFAULT_SCHEDULER, ...schedulerOptions };
+    this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -960,9 +961,9 @@ export class AccountManager {
    */
   async ensureTokenFresh(accountIndex, force = false) {
     const account = this.accounts[accountIndex];
-    if (!account || account.type !== 'oauth' || !account.refreshToken) return;
+    if (!account || account.type !== 'oauth' || !account.refreshToken) return true;
 
-    if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
+    if (!force && !isTokenExpiringSoon(account.expiresAt)) return true;
 
     // Coalesce concurrent refreshes
     if (account._refreshPromise) return account._refreshPromise;
@@ -970,19 +971,28 @@ export class AccountManager {
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
-        const newTokens = await refreshAccessToken(account.refreshToken);
+        const newTokens = await this._refreshAccessToken(account.refreshToken);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        account.status = 'active';
+        account.cooldownUntil = null;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
+        return true;
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token
         if (!account.expiresAt || Date.now() >= account.expiresAt) {
-          account.status = 'error';
+          if (err.retryable) {
+            this.markTransientFailure(accountIndex, `token_refresh_${err.status || 'network'}`);
+          } else {
+            this.markAuthFailed(accountIndex, err.status || 401, 'token_refresh_failed');
+          }
+          return false;
         }
+        return true;
       } finally {
         account._refreshPromise = null;
       }

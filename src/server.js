@@ -232,14 +232,39 @@ async function forwardRequest(
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
-  await accountManager.ensureTokenFresh(account.index);
-  if (account.status === 'error' && retryCount + 1 < maxAttempts) {
-    accountManager.releaseAccount(lease, { error: 'token_refresh_error' });
+  const tokenReady = await accountManager.ensureTokenFresh(account.index);
+  if (!tokenReady) {
+    accountManager.releaseAccount(lease);
     excludedIndexes.add(account.index);
-    return forwardRequest(
-      req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+    if (
+      retryCount + 1 < maxAttempts &&
+      hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
+    ) {
+      return forwardRequest(
+        req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+      );
+    }
+
+    const queued = await queueAndRetry(
+      `OAuth token refresh unavailable for "${account.name}"`,
+      req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+      retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'quota',
     );
+    if (queued) return;
+
+    ctx.status = 401;
+    if (!res.headersSent) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'authentication_error',
+          message: `Claude account "${account.name}" could not refresh its OAuth token. Run teamclaude accounts -v or log in again.`,
+        },
+      }));
+    }
+    return;
   }
 
   // Build upstream request headers

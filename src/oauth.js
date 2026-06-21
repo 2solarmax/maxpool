@@ -62,7 +62,10 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           continue;
         }
         const text = await res.text();
-        throw new Error(`Token refresh failed (${res.status}): ${text}`);
+        const error = new Error(`Token refresh failed (${res.status}): ${text}`);
+        error.status = res.status;
+        error.retryable = res.status === 429 || res.status >= 500;
+        throw error;
       }
 
       const data = await res.json();
@@ -80,6 +83,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
       if (attempt < maxRetries && isNetworkError) {
         continue;
       }
+      if (isNetworkError) err.retryable = true;
       throw err;
     }
   }

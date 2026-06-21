@@ -45,6 +45,49 @@ test('scheduler skips throttled accounts and resumes them after retry window', (
   assert.ok(laterLeases.some(l => l.account.name === 'a1'));
 });
 
+test('temporary expired-token refresh failure cools down and remains retryable', async () => {
+  let attempts = 0;
+  const refreshAccessToken = async () => {
+    attempts++;
+    if (attempts === 1) {
+      const error = new Error('Token refresh failed (429)');
+      error.status = 429;
+      error.retryable = true;
+      throw error;
+    }
+    return { accessToken: 'fresh', refreshToken: 'fresh-r', expiresAt: Date.now() + 3600_000 };
+  };
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 'expired', refreshToken: 'r1', expiresAt: Date.now() - 1000 },
+  ], 0.90, { cooldownMs: 10, maxCooldownMs: 10 }, { refreshAccessToken });
+
+  assert.equal(await am.ensureTokenFresh(0), false);
+  assert.equal(am.accounts[0].status, 'active');
+  assert.ok(am.accounts[0].cooldownUntil > Date.now());
+  assert.equal(am.nextRetryForRequest().cause, 'cooldown');
+
+  am.accounts[0].cooldownUntil = Date.now() - 1;
+  assert.equal(await am.ensureTokenFresh(0), true);
+  assert.equal(am.accounts[0].credential, 'fresh');
+});
+
+test('invalid expired-token refresh marks account as requiring login', async () => {
+  const refreshAccessToken = async () => {
+    const error = new Error('Token refresh failed (400)');
+    error.status = 400;
+    error.retryable = false;
+    throw error;
+  };
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 'expired', refreshToken: 'r1', expiresAt: Date.now() - 1000 },
+  ], 0.90, {}, { refreshAccessToken });
+
+  assert.equal(await am.ensureTokenFresh(0), false);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].lastError, 'token_refresh_failed');
+  assert.equal(am.nextRetryForRequest().cause, 'unavailable');
+});
+
 test('session affinity keeps a session on the same available account', () => {
   const am = manager(3);
 

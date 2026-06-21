@@ -159,6 +159,50 @@ test('request queues instead of returning 429 when all routes are temporarily un
   }
 });
 
+test('request queues while an expired OAuth token recovers from temporary refresh failure', async () => {
+  let refreshAttempts = 0;
+  const refreshAccessToken = async () => {
+    refreshAttempts++;
+    if (refreshAttempts === 1) {
+      const error = new Error('Token refresh failed (429)');
+      error.status = 429;
+      error.retryable = true;
+      throw error;
+    }
+    return { accessToken: 'fresh-token', refreshToken: 'fresh-refresh', expiresAt: Date.now() + 3600_000 };
+  };
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 'expired', refreshToken: 'r1', expiresAt: Date.now() - 1000 },
+  ], 0.90, { cooldownMs: 20, maxCooldownMs: 20 }, { refreshAccessToken });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 2000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['Bearer fresh-token']);
+    assert.equal(refreshAttempts, 2);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('large request can queue before upstream send even when it is too large for retry', async () => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
