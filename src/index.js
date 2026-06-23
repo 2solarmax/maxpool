@@ -170,6 +170,7 @@ async function serverWorkerCommand() {
   let server = null;
   let syncTimer = null;
   let draining = false;
+  let restartPending = false;
   const activeRequests = new Set();
   const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 10 * 60_000);
   const hooks = {
@@ -181,7 +182,23 @@ async function serverWorkerCommand() {
     onRequestEnd: (id, info) => {
       activeRequests.delete(id);
       tui?.onRequestEnd(id, info);
+      maybeRunPendingRestart();
     },
+  };
+
+  const maybeRunPendingRestart = () => {
+    if (!restartPending || draining || activeRequests.size > 0) return;
+    restartPending = false;
+    shutdownGracefully('restart', { restart: true });
+  };
+
+  const requestRestart = () => {
+    if (activeRequests.size === 0) {
+      shutdownGracefully('restart', { restart: true });
+      return;
+    }
+    restartPending = true;
+    console.log(`[TeamClaude] Restart pending; waiting for ${activeRequests.size} active request(s) while continuing to accept new requests.`);
   };
 
   const shutdownGracefully = (reason, options = {}) => {
@@ -265,7 +282,7 @@ async function serverWorkerCommand() {
         shutdownGracefully('quit');
       },
       onRestart: () => {
-        shutdownGracefully('restart', { restart: true });
+        requestRestart();
       },
     });
   }
@@ -822,8 +839,9 @@ function findConfigAccount(diskConfig, account) {
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
   for (const diskAcct of diskConfig.accounts) {
-    const matchByUuid = diskAcct.accountUuid &&
-      memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid);
+    const matchByUuid = diskAcct.accountUuid
+      ? memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid)
+      : -1;
     const matchByName = memConfig.accounts.findIndex(a => a.name === diskAcct.name);
     const memIdx = (matchByUuid >= 0 ? matchByUuid : null) ?? (matchByName >= 0 ? matchByName : -1);
 

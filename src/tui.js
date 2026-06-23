@@ -343,6 +343,7 @@ export class TUI {
 
   async _doSync() {
     try {
+      this._addLog('Reloading config...');
       const count = await this.syncAccounts();
       if (count > 0) {
         this._addLog(`Synced ${count} new account(s) from config`);
