@@ -1633,6 +1633,11 @@ export class AccountManager {
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
       }
+      // Only keep a restored utilization that carries a clearable reset window.
+      // A stale value with no reset can't be cleared by _clearExpiredQuotas and
+      // could otherwise pin the account unavailable until the first live response.
+      if (account.quota.unified5hReset == null) account.quota.unified5h = null;
+      if (account.quota.unified7dReset == null) account.quota.unified7d = null;
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
     }

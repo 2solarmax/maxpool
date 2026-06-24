@@ -67,6 +67,13 @@ test('a restored but already-expired window is cleared on first use', () => {
   assert.equal(am2.accounts[0].quota.unified7dReset, null);
 });
 
+test('a restored utilization with no reset window is dropped (cannot pin unavailable)', () => {
+  const am = manager(1);
+  // Simulate a saved state where 5h utilization was high but no reset was known.
+  am.restoreQuotaState([{ name: 'a1', quota: { unified5h: 0.99, unified5hReset: null } }]);
+  assert.equal(am.accounts[0].quota.unified5h, null);
+});
+
 test('restoreQuotaState ignores bad payloads', () => {
   const am = manager(1);
   assert.doesNotThrow(() => am.restoreQuotaState(null));
