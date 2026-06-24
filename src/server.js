@@ -371,20 +371,84 @@ async function forwardRequest(
     // Retry/failover can only happen before response bytes are sent. Once a
     // streaming response starts, rerouting would corrupt Claude Code's stream.
     if (upstreamRes.status === 429) {
-      const errorBody = await readErrorBody(upstreamRes, null);
+      const errorBody = await readErrorBody(upstreamRes);
       const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
       const rateLimit = classifyRateLimit(account, rateLimitHeaders, errorBody);
+      if (rateLimit.scope === 'upstream') {
+        const parsedError = parseJsonError(errorBody);
+        const fingerprint = `429:${rateLimit.fingerprint || overloadFingerprint(errorBody, body)}`;
+        const incident = recordRequestIncident(requestInfo, fingerprint, account.index, retryAfter);
+        accountManager.markProvisionalUpstreamFailure(account.index, 429, fingerprint, retryAfter);
+        accountManager.releaseAccount(lease, {
+          status: 429,
+          error: 'upstream_throttled',
+          neutral: true,
+        });
+        excludedIndexes.add(account.index);
+
+        if (logDir) {
+          logSections.push(`=== RESPONSE 429 — "${account.name}" server-throttled ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+          if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
+        }
+
+        if (
+          canRetryBufferedBody
+          && retryCount + 1 < maxAttempts
+          && !res.headersSent
+          && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
+        ) {
+          return forwardRequest(
+            req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+
+        if (accountManager.shouldPromoteUpstreamFailure(incident, requestInfo)) {
+          accountManager.clearProvisionalUpstreamFailures(fingerprint, incident.accounts);
+          accountManager.markUpstreamThrottled(
+            incident.retryAfter,
+            parsedError?.message || parsedError?.type || 'matching_request_wide_429s',
+          );
+          console.log('[TeamClaude] Every eligible Claude account returned the same server-side 429; opening shared Anthropic throttle');
+
+          const queued = await queueAndRetry(
+            'Anthropic upstream is temporarily limiting requests',
+            req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'upstream_throttle',
+          );
+          if (queued) return;
+
+          ctx.status = 429;
+          sendErrorResponse(res, requestInfo, 429, {
+            type: 'error',
+            error: {
+              type: 'rate_limit_error',
+              message: 'Anthropic is temporarily limiting requests. TeamClaude will retry automatically when capacity returns.',
+            },
+          }, { 'retry-after': String(computeRetryAfter(accountManager, requestInfo)) });
+          return;
+        }
+
+        const queued = await queueAndRetry(
+          `all routes failed after server-side 429 from "${account.name}"`,
+          req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'capacity',
+        );
+        if (queued) return;
+
+        ctx.status = 429;
+        sendErrorBody(res, requestInfo, 429, errorBody, upstreamRes.headers);
+        return;
+      }
+
       const promotedAmbiguous = rateLimit.scope === 'unknown'
         && accountManager.noteAmbiguousRateLimit(account.index, rateLimit.fingerprint, retryAfter);
-
-      if (rateLimit.scope === 'upstream' || promotedAmbiguous) {
+      if (promotedAmbiguous) {
         const parsedError = parseJsonError(errorBody);
         accountManager.markUpstreamThrottled(
           retryAfter,
-          promotedAmbiguous
-            ? 'matching_ambiguous_429s'
-            : parsedError?.message || parsedError?.type || 'temporary_server_limit',
+          parsedError?.message || parsedError?.type || 'matching_ambiguous_429s',
         );
         accountManager.releaseAccount(lease, {
           status: 429,
@@ -392,12 +456,6 @@ async function forwardRequest(
           upstreamThrottled: true,
           neutral: true,
         });
-
-        if (logDir) {
-          logSections.push(`=== RESPONSE 429 — Anthropic upstream throttled ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
-          if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
-        }
-        console.log('[TeamClaude] Shared Anthropic 429 detected; queueing without penalizing individual accounts');
 
         const queued = await queueAndRetry(
           'Anthropic upstream is temporarily limiting requests',
@@ -407,17 +465,15 @@ async function forwardRequest(
         if (queued) return;
 
         ctx.status = 429;
-        sendErrorResponse(res, requestInfo, 429, {
-          type: 'error',
-          error: {
-            type: 'rate_limit_error',
-            message: 'Anthropic is temporarily limiting requests. TeamClaude will retry automatically when capacity returns.',
-          },
-        }, { 'retry-after': String(computeRetryAfter(accountManager, requestInfo)) });
+        sendErrorBody(res, requestInfo, 429, errorBody, upstreamRes.headers);
         return;
       }
 
-      accountManager.markRateLimited(account.index, retryAfter, { status: 429, recordFailure: false });
+      accountManager.markRateLimited(account.index, retryAfter, {
+        status: 429,
+        recordFailure: false,
+        fingerprint: rateLimit.scope === 'unknown' ? rateLimit.fingerprint : null,
+      });
       accountManager.releaseAccount(lease, { status: 429, error: 'rate_limited' });
 
       if (logDir) {
@@ -460,7 +516,7 @@ async function forwardRequest(
     }
 
     if (account.type === 'provider' && isProviderAuthStatus(upstreamRes.status)) {
-      const errorBody = await readErrorBody(upstreamRes, null);
+      const errorBody = await readErrorBody(upstreamRes);
       const reason = upstreamRes.status === 401 ? 'auth_failed' : 'forbidden';
       accountManager.markAuthFailed(account.index, upstreamRes.status, reason);
       accountManager.releaseAccount(lease, { status: upstreamRes.status, error: reason });
@@ -497,36 +553,68 @@ async function forwardRequest(
     }
 
     if (upstreamRes.status === 529 && account.type !== 'provider') {
-      await upstreamRes.body?.cancel();
+      const errorBody = await readErrorBody(upstreamRes);
       const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after')) || 30;
-      accountManager.markUpstreamThrottled(retryAfter, 'HTTP 529 overloaded_error');
+      const fingerprint = overloadFingerprint(errorBody, body);
+      const incident = recordRequestIncident(requestInfo, fingerprint, account.index, retryAfter);
+
+      if (logDir) {
+        logSections.push(`=== RESPONSE 529 — "${account.name}" overloaded ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
+      }
+
+      accountManager.markProvisionalUpstreamFailure(account.index, 529, fingerprint, retryAfter);
       accountManager.releaseAccount(lease, {
         status: 529,
         error: 'upstream_overloaded',
-        upstreamThrottled: true,
         neutral: true,
       });
+      excludedIndexes.add(account.index);
 
-      if (logDir) {
-        logSections.push(`=== RESPONSE 529 — Anthropic upstream overloaded ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+      if (
+        canRetryBufferedBody
+        && retryCount + 1 < maxAttempts
+        && !res.headersSent
+        && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
+      ) {
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+        );
       }
-      console.log('[TeamClaude] Shared Anthropic 529 detected; queueing without cooling individual accounts');
+
+      if (accountManager.shouldPromoteUpstreamFailure(incident, requestInfo)) {
+        accountManager.clearProvisionalUpstreamFailures(fingerprint, incident.accounts);
+        accountManager.markUpstreamThrottled(incident.retryAfter, 'matching_request_wide_529s');
+        console.log('[TeamClaude] Every eligible Claude account returned the same 529; opening shared Anthropic throttle');
+
+        const queued = await queueAndRetry(
+          'Anthropic upstream is overloaded',
+          req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'upstream_throttle',
+        );
+        if (queued) return;
+
+        ctx.status = 529;
+        sendErrorResponse(res, requestInfo, 529, {
+          type: 'error',
+          error: {
+            type: 'overloaded_error',
+            message: 'Anthropic is temporarily overloaded. TeamClaude will retry automatically when capacity returns.',
+          },
+        });
+        return;
+      }
 
       const queued = await queueAndRetry(
-        'Anthropic upstream is overloaded',
+        `all routes failed after HTTP 529 from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
-        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'upstream_throttle',
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'capacity',
       );
       if (queued) return;
 
       ctx.status = 529;
-      sendErrorResponse(res, requestInfo, 529, {
-        type: 'error',
-        error: {
-          type: 'overloaded_error',
-          message: 'Anthropic is temporarily overloaded. TeamClaude will retry automatically when capacity returns.',
-        },
-      });
+      sendErrorBody(res, requestInfo, 529, errorBody, upstreamRes.headers);
       return;
     }
 
@@ -585,6 +673,7 @@ async function forwardRequest(
 
     if (upstreamRes.status < 400) {
       accountManager.confirmUpstreamProbe?.(lease);
+      accountManager.markUpstreamAccepted?.(account.index);
     }
 
     // Log response headers
@@ -828,15 +917,44 @@ function classifyRateLimit(account, headers, body) {
     || message.includes('temporarily limiting requests')
     || message.includes('server is temporarily limiting')
     || type === 'overloaded_error';
-  if (explicitSharedThrottle) return { scope: 'upstream', fingerprint: null };
-
   const normalized = `${type}:${message}`
     .replace(/\b[0-9a-f]{8,}\b/gi, '#')
     .replace(/\b\d+\b/g, '#')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 240);
+  if (explicitSharedThrottle) return { scope: 'upstream', fingerprint: normalized || 'explicit_429' };
   return { scope: 'unknown', fingerprint: normalized || 'unknown_429' };
+}
+
+function overloadFingerprint(errorBody, requestBody) {
+  const parsed = parseJsonError(errorBody);
+  let model = '';
+  try {
+    model = JSON.parse(requestBody.toString())?.model || '';
+  } catch {
+    // The response fingerprint still works when the request is not JSON.
+  }
+  return `529:${model}:${parsed?.type || ''}:${parsed?.message || ''}`
+    .toLowerCase()
+    .replace(/\b[0-9a-f]{8,}\b/gi, '#')
+    .replace(/\b\d+\b/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240);
+}
+
+function recordRequestIncident(requestInfo, fingerprint, accountIndex, retryAfter) {
+  requestInfo.upstreamIncidents ||= new Map();
+  const incident = requestInfo.upstreamIncidents.get(fingerprint) || {
+    accounts: new Set(),
+    firstAt: Date.now(),
+    retryAfter: 0,
+  };
+  incident.accounts.add(accountIndex);
+  incident.retryAfter = Math.max(incident.retryAfter, retryAfter);
+  requestInfo.upstreamIncidents.set(fingerprint, incident);
+  return incident;
 }
 
 function secondsUntilParsedTime(value) {

@@ -63,6 +63,80 @@ test('shared upstream throttle allows one recovery probe and self-clears on succ
   assert.ok(am.acquireAccount({ weight: 1 }));
 });
 
+test('recent Claude success vetoes request-wide 529 promotion', () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1' },
+    { name: 'a2', type: 'oauth', accessToken: 't2' },
+  ]);
+  const firstAt = Date.now();
+  am.accounts[1].lastSuccessAt = firstAt + 1;
+  assert.equal(am.shouldPromoteUpstreamFailure({
+    accounts: new Set([0, 1]),
+    firstAt,
+  }, { profile: 'claude' }), false);
+});
+
+test('untried eligible Claude account vetoes request-wide 529 promotion', () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1' },
+    { name: 'a2', type: 'oauth', accessToken: 't2' },
+    { name: 'a3', type: 'oauth', accessToken: 't3' },
+  ]);
+  assert.equal(am.shouldPromoteUpstreamFailure({
+    accounts: new Set([0, 1]),
+    firstAt: Date.now(),
+  }, { profile: 'claude' }), false);
+});
+
+test('provisional overload telemetry clears when cooldown expires', () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1' },
+  ]);
+  am.markProvisionalUpstreamFailure(0, 529, 'fingerprint', 1);
+  am.accounts[0].provisionalUpstreamUntil = Date.now() - 1;
+  assert.equal(am.hasAvailableRoute({ profile: 'claude' }), true);
+  assert.equal(am.accounts[0].lastError, null);
+  assert.equal(am.accounts[0].provisionalUpstreamFingerprint, null);
+});
+
+test('queued work does not hide an untried Claude account from promotion checks', () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1' },
+    { name: 'a2', type: 'oauth', accessToken: 't2' },
+    { name: 'a3', type: 'oauth', accessToken: 't3' },
+  ]);
+  am.queueState.waiting.push({ id: 1 });
+  assert.equal(am.shouldPromoteUpstreamFailure({
+    accounts: new Set([0, 1]),
+    firstAt: Date.now(),
+  }, { profile: 'claude' }), false);
+});
+
+test('promotion cleanup preserves an unrelated transient cooldown', () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1' },
+  ], 0.90, { cooldownMs: 30_000 });
+  am.markProvisionalUpstreamFailure(0, 529, 'fingerprint', 10);
+  am.markTransientFailure(0, 'HTTP 503');
+  const transientCooldown = am.accounts[0].cooldownUntil;
+  am.clearProvisionalUpstreamFailures('fingerprint', new Set([0]));
+  assert.equal(am.accounts[0].cooldownUntil, transientCooldown);
+  assert.equal(am.accounts[0].provisionalUpstreamUntil, null);
+});
+
+test('accepted Claude response vetoes promotion before its stream finishes', () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1' },
+    { name: 'a2', type: 'oauth', accessToken: 't2' },
+  ]);
+  const firstAt = Date.now();
+  am.markUpstreamAccepted(1);
+  assert.equal(am.shouldPromoteUpstreamFailure({
+    accounts: new Set([0, 1]),
+    firstAt: firstAt - 1,
+  }, { profile: 'claude' }), false);
+});
+
 test('shared upstream throttle re-arms when recovery probe is throttled again', () => {
   const am = manager(2);
   am.markUpstreamThrottled(60, 'temporary server limit');

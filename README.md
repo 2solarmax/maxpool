@@ -281,7 +281,7 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 5. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
 6. 5-hour quota controls immediate availability; weekly quota controls new-session admission and preservation; weekly `critical` is last-resort, while weekly `exhausted` is blocked
 7. Account quota 429s cool down only that account and fail over before response bytes are sent
-8. Anthropic's temporary server-side 429 and 529 overload responses open a shared circuit breaker without penalizing accounts; one real request probes recovery after `retry-after`, then queued work resumes automatically
+8. Anthropic's server-side 429 and 529 responses first fail over across every eligible Claude account; only a request-wide set of matching failures with no concurrent Claude success promotes to the shared circuit breaker. One real request probes recovery after `retry-after`, then queued work resumes automatically
 9. Queued streaming requests receive SSE heartbeats, preventing Claude Code's client timeout from abandoning temporary waits
 10. Transient network errors (connection reset, timeout) fail over before the stream starts; if every eligible route has a network failure, the proxy returns `503 connection_unavailable` instead of a quota error
 11. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi

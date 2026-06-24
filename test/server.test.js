@@ -57,7 +57,7 @@ test('429 on one account fails over to another before sending response bytes', a
   }
 });
 
-test('temporary server 429 opens shared breaker, queues, and recovers with one probe', async () => {
+test('temporary server 429 fails over before opening shared breaker', async () => {
   const seen = [];
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
@@ -91,7 +91,6 @@ test('temporary server 429 opens shared breaker, queues, and recovers with one p
   const proxyPort = await listen(proxy);
 
   try {
-    const startedAt = Date.now();
     const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -99,7 +98,7 @@ test('temporary server 429 opens shared breaker, queues, and recovers with one p
     });
     assert.equal(res.status, 200);
     assert.equal(seen.length, 2);
-    assert.ok(Date.now() - startedAt >= 900);
+    assert.ok(am.accounts[0].provisionalUpstreamUntil > Date.now());
     assert.deepEqual(am.accounts.map(a => a.status), ['active', 'active']);
     assert.deepEqual(am.accounts.map(a => a.failedRequests), [0, 0]);
     assert.equal(am.getStatus().upstreamThrottle.active, false);
@@ -109,14 +108,12 @@ test('temporary server 429 opens shared breaker, queues, and recovers with one p
   }
 });
 
-test('Anthropic 529 opens shared breaker without cooling individual accounts', async () => {
-  let attempts = 0;
+test('Anthropic 529 fails over to another Claude account before opening shared breaker', async () => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     seen.push(req.headers.authorization);
-    attempts++;
-    if (attempts === 1) {
-      res.writeHead(529, { 'retry-after': '1', 'content-type': 'application/json' });
+    if (req.headers.authorization === 'Bearer t1') {
+      res.writeHead(529, { 'retry-after': '10', 'content-type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
         error: { type: 'overloaded_error', message: 'Overloaded' },
@@ -143,10 +140,189 @@ test('Anthropic 529 opens shared breaker without cooling individual accounts', a
     });
     assert.equal(res.status, 200);
     assert.match(await res.text(), /message_delta/);
-    assert.equal(seen.length, 2);
-    assert.deepEqual(am.accounts.map(a => a.cooldownUntil), [null, null]);
-    assert.deepEqual(am.accounts.map(a => a.failedRequests), [0, 0]);
+    assert.deepEqual(seen, ['Bearer t1', 'Bearer t2']);
+    assert.ok(am.accounts[0].provisionalUpstreamUntil > Date.now());
+    assert.equal(am.accounts[0].lastError, 'upstream_throttled');
+    assert.equal(am.accounts[1].provisionalUpstreamUntil, null);
     assert.equal(am.getStatus().upstreamThrottle.active, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('matching Anthropic 529s from two Claude accounts promote to shared breaker', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(529, { 'retry-after': '10', 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'overloaded_error', message: 'Overloaded incident 12345' },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 529);
+    assert.deepEqual(seen, ['Bearer t1', 'Bearer t2']);
+    assert.equal(am.getStatus().upstreamThrottle.active, true);
+    assert.deepEqual(am.accounts.map(a => a.cooldownUntil), [null, null]);
+    assert.deepEqual(am.accounts.map(a => a.lastError), [null, null]);
+    assert.deepEqual(am.accounts.map(a => a.failedRequests), [0, 0]);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('Anthropic 529s keep failing over when another Claude account can succeed', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    if (req.headers.authorization !== 'Bearer t3') {
+      res.writeHead(529, { 'retry-after': '10', 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'overloaded_error', message: 'Overloaded incident 12345' },
+      }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    ...accounts(),
+    { name: 'a3', type: 'oauth', accessToken: 't3', refreshToken: 'r3', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['Bearer t1', 'Bearer t2', 'Bearer t3']);
+    assert.equal(am.getStatus().upstreamThrottle.active, false);
+    assert.deepEqual(am.accounts.map(a => a.failedRequests), [0, 0, 0]);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('different Anthropic 529 fingerprints remain account-scoped', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    const suffix = req.headers.authorization === 'Bearer t1' ? 'alpha' : 'beta';
+    res.writeHead(529, { 'retry-after': '10', 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'overloaded_error', message: `Overloaded ${suffix}` },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 529);
+    assert.deepEqual(seen, ['Bearer t1', 'Bearer t2']);
+    assert.equal(am.getStatus().upstreamThrottle.active, false);
+    assert.ok(am.accounts.every(account => account.provisionalUpstreamUntil > Date.now()));
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('provider 529 remains provider-scoped and fails over', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    if (req.headers.authorization === 'Bearer provider-token') {
+      res.writeHead(529, { 'retry-after': '10', 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'overloaded_error', message: 'Provider overloaded' },
+      }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    {
+      name: 'provider',
+      type: 'provider',
+      provider: 'zai',
+      apiKey: 'provider-token',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      profiles: ['all'],
+      priority: 0,
+    },
+    {
+      name: 'provider-2',
+      type: 'provider',
+      provider: 'kimi',
+      apiKey: 'provider-token-2',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      profiles: ['all'],
+      priority: 1,
+    },
+  ], 0.90, { cooldownMs: 100, maxCooldownMs: 100 });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamclaude-profile': 'all',
+      },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(seen, ['Bearer provider-token', 'Bearer provider-token-2']);
+    assert.equal(am.getStatus().upstreamThrottle.active, false);
+    assert.ok(am.accounts[0].cooldownUntil > Date.now());
   } finally {
     await close(proxy);
     await close(upstream);
@@ -157,7 +333,7 @@ test('multiple queued streaming requests all recover without rotating out of the
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts++;
-    if (attempts === 1) {
+    if (attempts <= 2) {
       res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
@@ -193,7 +369,7 @@ test('multiple queued streaming requests all recover without rotating out of the
     const third = request();
     const bodies = await Promise.all([first, second, third]);
 
-    assert.equal(attempts, 4);
+    assert.equal(attempts, 5);
     for (const body of bodies) {
       assert.match(body, /"type":"message_delta"/);
       assert.doesNotMatch(body, /event: error/);
@@ -210,7 +386,7 @@ test('successful streaming probe clears breaker on response acceptance before st
   let finishStream;
   const upstream = http.createServer((req, res) => {
     attempts++;
-    if (attempts === 1) {
+    if (attempts <= 2) {
       res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
@@ -292,7 +468,7 @@ test('queued streaming request receives heartbeats and then the recovered upstre
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts++;
-    if (attempts === 1) {
+    if (attempts <= 2) {
       res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
@@ -337,7 +513,7 @@ test('queued streaming request terminates with SSE error when recovery returns 4
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts++;
-    if (attempts === 1) {
+    if (attempts <= 2) {
       res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
@@ -385,7 +561,7 @@ test('queued streaming request terminates with SSE error when recovery connectio
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts++;
-    if (attempts === 1) {
+    if (attempts <= 2) {
       res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',

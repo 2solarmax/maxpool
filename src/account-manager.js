@@ -121,10 +121,14 @@ export class AccountManager {
       consecutiveFailures: 0,
       lastStatus: null,
       lastResponseMs: null,
+      lastAcceptedAt: null,
       lastError: null,
       lastErrorAt: null,
       cooldownUntil: null,
+      provisionalUpstreamFingerprint: null,
+      provisionalUpstreamUntil: null,
       rateLimitedUntil: null,
+      provisionalRateLimitFingerprint: null,
       lastQuotaLogKey: null,
     }));
     this.currentIndex = 0;
@@ -309,6 +313,10 @@ export class AccountManager {
       account.consecutiveFailures = 0;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
+      if (account.provisionalUpstreamFingerprint) {
+        account.provisionalUpstreamUntil = null;
+        account.provisionalUpstreamFingerprint = null;
+      }
       if (account.status !== 'throttled' || account.lastError !== 'rate_limited') {
         account.lastError = null;
         account.lastErrorAt = null;
@@ -378,6 +386,7 @@ export class AccountManager {
       if (account.lastError === 'rate_limited') {
         account.lastError = null;
         account.lastErrorAt = null;
+        account.provisionalRateLimitFingerprint = null;
       }
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
@@ -385,6 +394,16 @@ export class AccountManager {
     if (account.cooldownUntil) {
       if (now < account.cooldownUntil) return false;
       account.cooldownUntil = null;
+    }
+
+    if (account.provisionalUpstreamUntil) {
+      if (now < account.provisionalUpstreamUntil) return false;
+      account.provisionalUpstreamUntil = null;
+      account.provisionalUpstreamFingerprint = null;
+      if (account.lastError === 'upstream_throttled') {
+        account.lastError = null;
+        account.lastErrorAt = null;
+      }
     }
 
     if (account.inFlight >= this.scheduler.safetyMaxActivePerAccount) return false;
@@ -464,11 +483,16 @@ export class AccountManager {
 
     for (const index of incident.accounts) {
       const account = this.accounts[index];
-      if (!account || account.lastError !== 'rate_limited') continue;
+      if (
+        !account
+        || account.lastError !== 'rate_limited'
+        || account.provisionalRateLimitFingerprint !== fingerprint
+      ) continue;
       account.status = 'active';
       account.rateLimitedUntil = null;
       account.lastError = null;
       account.lastErrorAt = null;
+      account.provisionalRateLimitFingerprint = null;
     }
     this.ambiguousRateLimits.delete(fingerprint);
     return true;
@@ -696,6 +720,10 @@ export class AccountManager {
       return { cause: 'cooldown', retryAt: account.cooldownUntil, queueable: true };
     }
 
+    if (account.provisionalUpstreamUntil && now < account.provisionalUpstreamUntil) {
+      return { cause: 'upstream_failure', retryAt: account.provisionalUpstreamUntil, queueable: true };
+    }
+
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) {
       return { cause: 'session_limit', retryAt: q.unified5hReset || null, queueable: Boolean(q.unified5hReset) };
     }
@@ -895,7 +923,7 @@ export class AccountManager {
 
   _matchesRequest(account, profile, requestInfo = {}) {
     if (this.admissionPaused) return false;
-    if (!this._matchesProfile(account, profile)) return false;
+    if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
     if (
       account.type !== 'provider'
       && this.queueState.waiting.length
@@ -903,6 +931,11 @@ export class AccountManager {
       && !requestInfo.queueAdmitted
     ) return false;
     if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) return false;
+    return true;
+  }
+
+  _isRequestCompatible(account, profile, requestInfo = {}) {
+    if (!this._matchesProfile(account, profile)) return false;
     if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) return false;
     return true;
   }
@@ -1132,6 +1165,7 @@ export class AccountManager {
     account.lastStatus = options.status || 429;
     account.lastError = 'rate_limited';
     account.lastErrorAt = Date.now();
+    account.provisionalRateLimitFingerprint = options.fingerprint || null;
     if (options.recordFailure !== false) {
       account.failedRequests++;
       account.consecutiveFailures++;
@@ -1145,6 +1179,8 @@ export class AccountManager {
     account.status = 'error';
     account.rateLimitedUntil = null;
     account.cooldownUntil = null;
+    account.provisionalUpstreamUntil = null;
+    account.provisionalUpstreamFingerprint = null;
     account.lastStatus = status;
     account.lastError = reason;
     account.lastErrorAt = Date.now();
@@ -1165,6 +1201,59 @@ export class AccountManager {
     account.lastErrorAt = Date.now();
     account.cooldownUntil = Date.now() + cooldown;
     console.log(`[TeamClaude] Account "${account.name}" cooling down for ${Math.ceil(cooldown / 1000)}s after ${reason}`);
+  }
+
+  markProvisionalUpstreamFailure(accountIndex, status, fingerprint, retryAfterSeconds = 10) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    const retryAfter = Math.min(clampRetryAfterSeconds(retryAfterSeconds), 30);
+    account.provisionalUpstreamUntil = Math.max(
+      account.provisionalUpstreamUntil || 0,
+      Date.now() + retryAfter * 1000,
+    );
+    account.lastStatus = status;
+    account.lastError = 'upstream_throttled';
+    account.lastErrorAt = Date.now();
+    account.provisionalUpstreamFingerprint = fingerprint;
+    console.log(`[TeamClaude] Account "${account.name}" returned HTTP ${status}; trying another Claude account and retrying this one in ${retryAfter}s`);
+  }
+
+  clearProvisionalUpstreamFailures(fingerprint, accountIndexes) {
+    for (const index of accountIndexes) {
+      const account = this.accounts[index];
+      if (!account || account.provisionalUpstreamFingerprint !== fingerprint) continue;
+      account.provisionalUpstreamUntil = null;
+      account.provisionalUpstreamFingerprint = null;
+      if (account.lastError === 'upstream_throttled') {
+        account.lastError = null;
+        account.lastErrorAt = null;
+      }
+    }
+  }
+
+  shouldPromoteUpstreamFailure(incident, requestInfo = {}) {
+    if (!incident || incident.accounts.size < 2) return false;
+    for (const account of this.accounts) {
+      if (account.type === 'provider' || !this._isRequestCompatible(account, requestInfo.profile || 'claude', requestInfo)) {
+        continue;
+      }
+      if (
+        (account.lastSuccessAt && account.lastSuccessAt >= incident.firstAt)
+        || (account.lastAcceptedAt && account.lastAcceptedAt >= incident.firstAt)
+      ) return false;
+      if (incident.accounts.has(account.index)) continue;
+      if (account.status === 'exhausted' || account.status === 'error') continue;
+      if (this._isSessionQuotaUnavailable(account)) continue;
+      if (this._weeklyState(account) === 'exhausted') continue;
+      return false;
+    }
+    return true;
+  }
+
+  markUpstreamAccepted(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    account.lastAcceptedAt = Date.now();
   }
 
   /**
@@ -1275,10 +1364,14 @@ export class AccountManager {
       consecutiveFailures: 0,
       lastStatus: null,
       lastResponseMs: null,
+      lastAcceptedAt: null,
       lastError: null,
       lastErrorAt: null,
       cooldownUntil: null,
+      provisionalUpstreamFingerprint: null,
+      provisionalUpstreamUntil: null,
       rateLimitedUntil: null,
+      provisionalRateLimitFingerprint: null,
       lastQuotaLogKey: null,
     });
     return index;
@@ -1361,7 +1454,9 @@ export class AccountManager {
         },
         lastError: a.lastError,
         lastErrorAt: a.lastErrorAt ? new Date(a.lastErrorAt).toISOString() : null,
-        cooldownUntil: a.cooldownUntil ? new Date(a.cooldownUntil).toISOString() : null,
+        cooldownUntil: Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)
+          ? new Date(Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)).toISOString()
+          : null,
         quota: { ...a.quota },
         weekly: {
           state: this._weeklyState(a),
