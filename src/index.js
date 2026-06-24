@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -137,6 +137,16 @@ async function serverWorkerCommand() {
     config.routing?.preferredAccount,
   );
 
+  // Restore quota observed in a previous run so a restart doesn't lose routing
+  // accuracy and re-probe from scratch. Stale windows clear on first use.
+  const savedState = await loadState();
+  if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  const persistQuotaState = () =>
+    saveState({ quota: accountManager.exportQuotaState() }).catch(() => {});
+  // Persist quota every minute; unref so it never keeps the process alive.
+  const quotaSaveInterval = setInterval(persistQuotaState, 60_000);
+  quotaSaveInterval.unref?.();
+
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `maxpool import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
@@ -199,6 +209,8 @@ async function serverWorkerCommand() {
     if (draining) return;
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
+    clearInterval(quotaSaveInterval);
+    persistQuotaState(); // flush learned quota so the restart restores it
     if (tui?.running) tui.stop();
     console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
@@ -218,6 +230,8 @@ async function serverWorkerCommand() {
 
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
+    clearInterval(quotaSaveInterval);
+    persistQuotaState(); // best-effort final flush of learned quota
     if (tui?.running) tui.stop();
 
     console.log(`\n[Maxpool] Draining shutdown (${reason}).`);

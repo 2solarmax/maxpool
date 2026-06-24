@@ -17,6 +17,17 @@ export function getConfigPath() {
   return current;
 }
 
+/**
+ * Path to the runtime state file (a sibling of the config). Holds volatile data
+ * learned at runtime — quota utilization observed passively from traffic — kept
+ * out of the hand-editable config so config stays clean and isn't rewritten on
+ * every state save.
+ */
+export function getStatePath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.state.json') : cfg + '.state';
+}
+
 export function createDefaultConfig() {
   return {
     proxy: {
@@ -85,22 +96,41 @@ export async function loadOrCreateConfig() {
   return config;
 }
 
-export async function saveConfig(config) {
-  const path = getConfigPath();
+/**
+ * Atomic 0600 write: a crash/power-loss mid-write must never truncate the file
+ * (config holds every account's OAuth tokens). Write a sibling temp file, force
+ * 0600 (writeFile's mode only applies on create, not when overwriting an
+ * existing 0644 file), then rename — atomic within a filesystem on POSIX.
+ */
+async function atomicWrite(path, content) {
   await mkdir(dirname(path), { recursive: true });
-  // Atomic write: a crash/power-loss mid-write must never truncate the file
-  // (it holds every account's OAuth tokens). Write a sibling temp file, force
-  // 0600 (writeFile's mode only applies on create, not when overwriting an
-  // existing 0644 file), then rename — atomic within a filesystem on POSIX.
   const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   try {
-    await writeFile(tmp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+    await writeFile(tmp, content, { mode: 0o600 });
     await chmod(tmp, 0o600);
     await rename(tmp, path);
   } catch (err) {
     await unlink(tmp).catch(() => {});
     throw err;
   }
+}
+
+export async function saveConfig(config) {
+  await atomicWrite(getConfigPath(), JSON.stringify(config, null, 2) + '\n');
+}
+
+/** Load runtime state (regenerable). Returns null if missing or unreadable —
+ *  never throws, since stale/corrupt learned state must not crash startup. */
+export async function loadState() {
+  try {
+    return JSON.parse(await readFile(getStatePath(), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+export async function saveState(state) {
+  await atomicWrite(getStatePath(), JSON.stringify(state, null, 2) + '\n');
 }
 
 let _configWriteChain = Promise.resolve();

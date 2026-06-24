@@ -45,6 +45,15 @@ const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
+// Quota fields that survive a restart: utilization levels and their reset
+// windows, learned passively from upstream responses. Transient/derived state
+// (probing, requalify, rateLimitedUntil) and credentials are intentionally
+// excluded. A stale restored window is wiped on first use by _clearExpiredQuotas.
+const PERSISTED_QUOTA_FIELDS = [
+  'unified5h', 'unified7d', 'unified5hReset', 'unified7dReset', 'unifiedStatus',
+  'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+];
+
 function clampRetryAfterSeconds(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 60;
@@ -1558,6 +1567,43 @@ export class AccountManager {
       this.setRoutingMode('automatic');
     }
     return true;
+  }
+
+  // Match a saved state entry to a live account by stable identity: prefer the
+  // account UUID when both have one, otherwise fall back to the name.
+  _sameIdentity(saved, account) {
+    if (saved.accountUuid && account.accountUuid) return saved.accountUuid === account.accountUuid;
+    return saved.name === account.name;
+  }
+
+  /**
+   * Serialize persistable quota state for all accounts (no credentials), keyed
+   * by account identity so it can be matched back after a restart.
+   */
+  exportQuotaState() {
+    return this.accounts.map(a => {
+      const quota = {};
+      for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
+      return { accountUuid: a.accountUuid, name: a.name, quota };
+    });
+  }
+
+  /**
+   * Restore quota learned in a previous run, matched to accounts by identity.
+   * Stale windows are not special-cased — _clearExpiredQuotas wipes any restored
+   * window whose reset time has already passed on first use.
+   */
+  restoreQuotaState(saved) {
+    if (!Array.isArray(saved)) return;
+    for (const account of this.accounts) {
+      const match = saved.find(s => this._sameIdentity(s, account));
+      if (!match || !match.quota) continue;
+      for (const f of PERSISTED_QUOTA_FIELDS) {
+        if (match.quota[f] != null) account.quota[f] = match.quota[f];
+      }
+      // We already know this account's weekly window, so it isn't "probing".
+      if (account.quota.unified7dReset != null) account.probing = false;
+    }
   }
 
   /**
