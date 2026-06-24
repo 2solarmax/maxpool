@@ -45,6 +45,174 @@ test('scheduler skips throttled accounts and resumes them after retry window', (
   assert.ok(laterLeases.some(l => l.account.name === 'a1'));
 });
 
+test('shared upstream throttle allows one recovery probe and self-clears on success', () => {
+  const am = manager(2);
+  am.markUpstreamThrottled(60, 'temporary server limit');
+  assert.equal(am.acquireAccount({ weight: 1 }), null);
+  assert.equal(am.nextRetryForRequest().cause, 'upstream_throttle');
+
+  am.upstreamThrottle.until = Date.now() - 1;
+  const probe = am.acquireAccount({ weight: 1 });
+  assert.ok(probe);
+  assert.equal(probe.upstreamThrottleProbe, true);
+  assert.equal(am.acquireAccount({ weight: 1 }), null);
+  assert.equal(am.nextRetryForRequest().cause, 'upstream_probe');
+
+  am.releaseAccount(probe, { success: true, status: 200 });
+  assert.equal(am.getStatus().upstreamThrottle.active, false);
+  assert.ok(am.acquireAccount({ weight: 1 }));
+});
+
+test('shared upstream throttle re-arms when recovery probe is throttled again', () => {
+  const am = manager(2);
+  am.markUpstreamThrottled(60, 'temporary server limit');
+  am.upstreamThrottle.until = Date.now() - 1;
+  const probe = am.acquireAccount({ weight: 1 });
+
+  am.markUpstreamThrottled(60, 'still limited');
+  am.releaseAccount(probe, { upstreamThrottled: true, neutral: true });
+
+  assert.equal(am.getStatus().upstreamThrottle.active, true);
+  assert.equal(am.accounts[probe.account.index].status, 'active');
+  assert.equal(am.accounts[probe.account.index].failedRequests, 0);
+});
+
+test('unrelated in-flight success does not clear a shared upstream throttle', () => {
+  const am = manager(2);
+  const lease = am.acquireAccount({ weight: 1 });
+  am.markUpstreamThrottled(60, 'temporary server limit');
+
+  am.releaseAccount(lease, { success: true, status: 200 });
+
+  assert.equal(am.getStatus().upstreamThrottle.active, true);
+});
+
+test('failed recovery probe schedules another probe instead of getting stuck half-open', () => {
+  const am = manager(2);
+  am.markUpstreamThrottled(60, 'temporary server limit');
+  am.upstreamThrottle.until = Date.now() - 1;
+  const probe = am.acquireAccount({ weight: 1 });
+
+  am.releaseAccount(probe, { status: 400, error: 'HTTP 400' });
+
+  const status = am.getStatus().upstreamThrottle;
+  assert.equal(status.active, true);
+  assert.equal(status.probeInFlight, false);
+  assert.ok(Date.parse(status.until) > Date.now());
+});
+
+test('queued requests are admitted FIFO and ramped after recovery', () => {
+  const am = manager(2);
+  const first = {};
+  const second = {};
+  am.registerQueuedRequest(first);
+  am.registerQueuedRequest(second);
+
+  assert.equal(am.canAdmitQueuedRequest(second), false);
+  assert.equal(am.canAdmitQueuedRequest(first), true);
+
+  am.queueState.rampUntil = Date.now() + 5000;
+  am.queueState.lastAdmissionAt = Date.now();
+  assert.equal(am.canAdmitQueuedRequest(second), false);
+  am.queueState.lastAdmissionAt = Date.now() - 300;
+  assert.equal(am.canAdmitQueuedRequest(second), true);
+});
+
+test('fresh requests cannot bypass queued recovery work', () => {
+  const am = manager(2);
+  am.markUpstreamThrottled(60, 'temporary server limit');
+  am.upstreamThrottle.until = Date.now() - 1;
+  const queued = {};
+  am.registerQueuedRequest(queued);
+
+  assert.equal(am.getActiveAccount({}), null);
+  assert.ok(am.getActiveAccount(queued));
+});
+
+test('admitted queue head remains routable while later tickets are waiting', () => {
+  const am = manager(2);
+  const first = {};
+  const second = {};
+  am.registerQueuedRequest(first);
+  am.registerQueuedRequest(second);
+  assert.equal(am.canAdmitQueuedRequest(first), true);
+
+  assert.equal(am.queueState.waiting.length, 1);
+  assert.ok(am.getActiveAccount(first));
+  assert.equal(am.getActiveAccount({}), null);
+});
+
+test('fresh requests remain behind queued work after breaker clears', () => {
+  const am = manager(2);
+  am.markUpstreamThrottled(60, 'temporary server limit');
+  const queued = {};
+  am.registerQueuedRequest(queued);
+  am.clearUpstreamThrottle('test recovery');
+
+  assert.equal(am.getActiveAccount({}), null);
+  am.queueState.lastAdmissionAt = Date.now() - 300;
+  assert.equal(am.canAdmitQueuedRequest(queued), true);
+  assert.ok(am.getActiveAccount(queued));
+});
+
+test('availability checks do not mutate account selection state', () => {
+  const am = manager(3);
+  const beforeCurrent = am.currentIndex;
+  const beforeNext = am.nextIndex;
+
+  for (let i = 0; i < 20; i++) assert.equal(am.hasAvailableRoute({ weight: 1 }), true);
+
+  assert.equal(am.currentIndex, beforeCurrent);
+  assert.equal(am.nextIndex, beforeNext);
+});
+
+test('shared Anthropic throttle leaves eligible providers available', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
+    { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
+  ], 0.90);
+  am.markUpstreamThrottled(60, 'temporary server limit');
+
+  assert.equal(am.acquireAccount({ profile: 'claude' }), null);
+  const fallback = am.acquireAccount({ profile: 'all' });
+  assert.equal(fallback.account.name, 'glm-fallback');
+});
+
+test('provider traffic cannot claim or clear the Anthropic recovery probe', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
+    { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
+  ], 0.90);
+  am.markUpstreamThrottled(60, 'temporary server limit');
+  am.upstreamThrottle.until = Date.now() - 1;
+  am.registerQueuedRequest({});
+
+  const fallback = am.acquireAccount({ profile: 'all' });
+  assert.equal(fallback.account.name, 'glm-fallback');
+  assert.equal(fallback.upstreamThrottleProbe, false);
+  am.releaseAccount(fallback, { success: true, status: 200 });
+  assert.ok(am.upstreamThrottle.until);
+});
+
+test('shared Anthropic throttle keeps thinking-protected sessions queued', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
+    { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
+  ], 0.90);
+  am.markUpstreamThrottled(60, 'temporary server limit');
+
+  assert.equal(am.acquireAccount({
+    profile: 'all',
+    sessionKey: 'thinking-session',
+    requiresAnthropicThinkingIntegrity: true,
+  }), null);
+  assert.equal(am.nextRetryForRequest({
+    profile: 'all',
+    sessionKey: 'thinking-session',
+    requiresAnthropicThinkingIntegrity: true,
+  }).cause, 'upstream_throttle');
+});
+
 test('temporary expired-token refresh failure cools down and remains retryable', async () => {
   let attempts = 0;
   const refreshAccessToken = async () => {

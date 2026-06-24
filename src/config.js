@@ -37,6 +37,7 @@ export function createDefaultConfig() {
       maxQueuedBodyBytes: 256 * 1024 * 1024,
       weeklyMaxWaitMs: 0,
       pollMs: 1000,
+      heartbeatMs: 10_000,
     },
     accounts: [],
   };

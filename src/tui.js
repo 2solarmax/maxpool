@@ -469,6 +469,18 @@ export class TUI {
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
+    const queuedCount = this.am.queueState?.waiting?.length || 0;
+    if (this.am._isUpstreamThrottleBlocking?.() || queuedCount) {
+      const throttle = this.am.upstreamThrottle;
+      const remaining = throttle.until ? Math.max(0, Math.ceil((throttle.until - Date.now()) / 1000)) : 0;
+      const state = this.am._isUpstreamThrottleBlocking?.()
+        ? throttle.probeInFlight ? 'probing recovery' : `retry in ${remaining}s`
+        : 'recovering';
+      const queued = queuedCount;
+      const oldest = queued ? Math.max(0, Date.now() - this.am.queueState.waiting[0].queuedAt) : 0;
+      const queueText = queued ? `  queued ${queued}  oldest ${formatMs(oldest)}` : '';
+      lines.push(` ${yellow(' Anthropic upstream throttled')}  ${dim(state + queueText)}`);
+    }
 
     // ── Accounts
     if (this.am.accounts.length === 0) {
@@ -545,8 +557,10 @@ export class TUI {
 
     // Status
     let status;
-    switch (a.status) {
+    const upstreamPaused = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
+    switch (upstreamPaused ? 'paused' : a.status) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
+      case 'paused':    status = yellow('paused'); break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
       case 'error':     status = red('error'); break;

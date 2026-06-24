@@ -57,6 +57,419 @@ test('429 on one account fails over to another before sending response bytes', a
   }
 });
 
+test('temporary server 429 opens shared breaker, queues, and recovers with one probe', async () => {
+  const seen = [];
+  let attempts = 0;
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(429, {
+        'retry-after': '1',
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-status': 'allowed',
+      });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: 'Server is temporarily limiting requests (not your usage limit)',
+        },
+      }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(seen.length, 2);
+    assert.ok(Date.now() - startedAt >= 900);
+    assert.deepEqual(am.accounts.map(a => a.status), ['active', 'active']);
+    assert.deepEqual(am.accounts.map(a => a.failedRequests), [0, 0]);
+    assert.equal(am.getStatus().upstreamThrottle.active, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('multiple queued streaming requests all recover without rotating out of the queue', async () => {
+  let attempts = 0;
+  const upstream = http.createServer((req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: 'Server is temporarily limiting requests (not your usage limit)',
+        },
+      }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: {"type":"message_delta","attempt":${attempts}}\n\n`);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20, heartbeatMs: 50 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const request = () => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(6000),
+    }).then(res => res.text());
+    const first = request();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const second = request();
+    const third = request();
+    const bodies = await Promise.all([first, second, third]);
+
+    assert.equal(attempts, 4);
+    for (const body of bodies) {
+      assert.match(body, /"type":"message_delta"/);
+      assert.doesNotMatch(body, /event: error/);
+    }
+    assert.equal(am.getStatus().upstreamThrottle.queued, 0);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('successful streaming probe clears breaker on response acceptance before stream end', async () => {
+  let attempts = 0;
+  let finishStream;
+  const upstream = http.createServer((req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: 'Server is temporarily limiting requests (not your usage limit)',
+        },
+      }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"message_start"}\n\n');
+    finishStream = () => res.end('data: {"type":"message_stop"}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20, heartbeatMs: 50 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const responsePromise = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal(am.getStatus().upstreamThrottle.active, false);
+    assert.equal(am.getStatus().upstreamThrottle.probeInFlight, false);
+    finishStream();
+    const res = await responsePromise;
+    assert.match(await res.text(), /message_stop/);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('matching ambiguous 429s promote to shared throttle without poisoning all accounts', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: 'Request pressure incident 12345' },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    assert.deepEqual(seen, ['Bearer t1', 'Bearer t2']);
+    assert.equal(am.getStatus().upstreamThrottle.active, true);
+    assert.deepEqual(am.accounts.map(a => a.status), ['active', 'active']);
+    assert.deepEqual(am.accounts.map(a => a.rateLimitedUntil), [null, null]);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('queued streaming request receives heartbeats and then the recovered upstream stream', async () => {
+  let attempts = 0;
+  const upstream = http.createServer((req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: 'Server is temporarily limiting requests (not your usage limit)',
+        },
+      }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20, heartbeatMs: 50 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.match(text, /: teamclaude queued/);
+    assert.match(text, /"type":"message_delta"/);
+    assert.ok(text.match(/: teamclaude queued/g).length >= 2);
+    assert.equal(am.getStatus().upstreamThrottle.active, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('queued streaming request terminates with SSE error when recovery returns 400', async () => {
+  let attempts = 0;
+  const upstream = http.createServer((req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: 'Server is temporarily limiting requests (not your usage limit)',
+        },
+      }));
+      return;
+    }
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'bad request' },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20, heartbeatMs: 50 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(4000),
+    });
+    const text = await res.text();
+    assert.match(text, /: teamclaude queued/);
+    assert.match(text, /event: error/);
+    assert.match(text, /invalid_request_error/);
+    assert.equal(am.getStatus().upstreamThrottle.probeInFlight, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('queued streaming request terminates with SSE error when recovery connection fails', async () => {
+  let attempts = 0;
+  const upstream = http.createServer((req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: 'Server is temporarily limiting requests (not your usage limit)',
+        },
+      }));
+      return;
+    }
+    req.socket.destroy();
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20, heartbeatMs: 50 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(4000),
+    });
+    const text = await res.text();
+    assert.match(text, /: teamclaude queued/);
+    assert.match(text, /event: error/);
+    assert.match(text, /connection_unavailable/);
+    assert.equal(am.getStatus().upstreamThrottle.probeInFlight, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('disconnecting a queued client removes it from queue telemetry', async () => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(429, { 'retry-after': '2', 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        message: 'Server is temporarily limiting requests (not your usage limit)',
+      },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20, heartbeatMs: 50 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const disconnected = new Promise((resolve, reject) => {
+      const clientReq = http.request({
+        host: '127.0.0.1',
+        port: proxyPort,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      }, clientRes => {
+        clientRes.once('data', () => {
+          try {
+            assert.equal(am.getStatus().upstreamThrottle.queued, 1);
+            clientReq.destroy();
+            clientRes.destroy();
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+      });
+      clientReq.on('error', error => {
+        if (error.code !== 'ECONNRESET') reject(error);
+      });
+      clientReq.end(JSON.stringify({ model: 'test', stream: true, messages: [] }));
+    });
+    await disconnected;
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(am.getStatus().upstreamThrottle.queued, 0);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('explicit quota exhaustion overrides temporary-limit wording', async () => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(429, { 'retry-after': '60', 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        message: 'Weekly quota exhausted while server is temporarily limiting requests',
+      },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    assert.equal(am.getStatus().upstreamThrottle.active, false);
+    assert.deepEqual(am.accounts.map(a => a.status), ['throttled', 'throttled']);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('streaming response is not committed until first upstream chunk is available', async () => {
   const seen = [];
   const upstream = http.createServer((req, res) => {

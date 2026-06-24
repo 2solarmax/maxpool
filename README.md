@@ -259,6 +259,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `queue.maxQueuedBodyBytes` | Maximum request body TeamClaude will hold in memory while waiting for capacity before the request has been sent upstream; defaults to 256 MiB |
 | `queue.weeklyMaxWaitMs` | Optional cap for weekly-limit waits. Defaults to `0`, so weekly exhaustion fails fast instead of parking requests for days |
 | `queue.pollMs` | How often queued requests check for a recovered account/provider |
+| `queue.heartbeatMs` | SSE heartbeat interval for queued streaming requests; defaults to 10s so Claude Code keeps the queued connection alive |
 | `shutdown.drainTimeoutMs` | Maximum time quit/Ctrl-C waits for active requests before exiting |
 
 Weekly Claude quota is treated as long-horizon budget, not the same as the 5-hour session cap:
@@ -279,16 +280,18 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 4. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
 5. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
 6. 5-hour quota controls immediate availability; weekly quota controls new-session admission and preservation; weekly `critical` is last-resort, while weekly `exhausted` is blocked
-7. On 429 responses, the proxy respects `retry-after`, cools down that account, and fails over before response bytes are sent
-8. Transient network errors (connection reset, timeout) fail over before the stream starts; if every eligible route has a network failure, the proxy returns `503 connection_unavailable` instead of a quota error
-9. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
-10. If all eligible accounts/providers are temporarily unavailable for a temporary reason (5h/session limit, provider cooldown, short 429), the proxy queues the request and retries when one recovers
-11. Repeated upstream 5xx/overload failures use the shorter `capacityMaxWaitMs` cap, not the long quota wait
-12. Weekly exhaustion and non-retryable 4xx errors fail fast by default; if the queue wait expires, returns 429 with the soonest retry time
-13. Temporary OAuth refresh failures cool the account down and queue/fail over; invalid refresh credentials disable only that account and require login
-14. In an interactive terminal, the server runs under a foreground supervisor so `x` can drain and restart without detaching the replacement TUI
-15. If requests are active, `x` marks restart pending and keeps accepting traffic until the active count reaches zero, avoiding a long connection-refused drain window
-13. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
+7. Account quota 429s cool down only that account and fail over before response bytes are sent
+8. Anthropic's temporary server-side 429 opens a shared circuit breaker without penalizing accounts; one real request probes recovery after `retry-after`, then queued work resumes automatically
+9. Queued streaming requests receive SSE heartbeats, preventing Claude Code's client timeout from abandoning temporary waits
+10. Transient network errors (connection reset, timeout) fail over before the stream starts; if every eligible route has a network failure, the proxy returns `503 connection_unavailable` instead of a quota error
+11. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
+12. If all eligible accounts/providers are temporarily unavailable for a temporary reason (5h/session limit, provider cooldown, short 429), the proxy queues the request and retries when one recovers
+13. Repeated upstream 5xx/overload failures use the shorter `capacityMaxWaitMs` cap, not the long quota wait
+14. Weekly exhaustion and non-retryable 4xx errors fail fast by default; if the queue wait expires, returns 429 with the soonest retry time
+15. Temporary OAuth refresh failures cool the account down and queue/fail over; invalid refresh credentials disable only that account and require login
+16. In an interactive terminal, the server runs under a foreground supervisor so `x` can drain and restart without detaching the replacement TUI
+17. If requests are active, `x` marks restart pending and keeps accepting traffic until the active count reaches zero, avoiding a long connection-refused drain window
+18. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
 

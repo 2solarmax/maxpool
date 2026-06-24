@@ -132,6 +132,20 @@ export class AccountManager {
     this.switchThreshold = switchThreshold;
     this.sessionBindings = new Map();
     this.sessionPolicies = new Map();
+    this.upstreamThrottle = {
+      until: null,
+      reason: null,
+      probeInFlight: false,
+      count: 0,
+      lastAt: null,
+    };
+    this.ambiguousRateLimits = new Map();
+    this.queueState = {
+      nextId: 1,
+      waiting: [],
+      lastAdmissionAt: 0,
+      rampUntil: 0,
+    };
   }
 
   /**
@@ -145,6 +159,11 @@ export class AccountManager {
 
   nextRetryForRequest(requestInfo = {}, excludedIndexes = new Set()) {
     this.refreshExpiredQuotas();
+    const upstreamRetry = this._upstreamThrottleRetry();
+    if (upstreamRetry && !this._hasAvailableProvider(requestInfo, excludedIndexes)) {
+      return upstreamRetry;
+    }
+
     const profile = requestInfo.profile || 'claude';
     let soonestTemporary = Infinity;
     let temporaryCause = null;
@@ -228,19 +247,42 @@ export class AccountManager {
     };
   }
 
+  hasAvailableRoute(requestInfo = {}, excludedIndexes = new Set()) {
+    this.refreshExpiredQuotas();
+    const profile = requestInfo.profile || 'claude';
+    const hasBinding = Boolean(requestInfo.sessionKey && this.sessionBindings.has(requestInfo.sessionKey));
+    const weeklyPasses = hasBinding
+      ? [
+          { allowWeeklyReserve: true, allowWeeklyCritical: false },
+          { allowWeeklyReserve: true, allowWeeklyCritical: true },
+        ]
+      : [
+          { allowWeeklyReserve: false, allowWeeklyCritical: false },
+          { allowWeeklyReserve: true, allowWeeklyCritical: false },
+          { allowWeeklyReserve: true, allowWeeklyCritical: true },
+        ];
+
+    return weeklyPasses.some(options => this.accounts.some(account => {
+      if (excludedIndexes.has(account.index)) return false;
+      if (!this._matchesRequest(account, profile, requestInfo)) return false;
+      return this._isAvailable(account, options);
+    }));
+  }
+
   acquireAccount(requestInfo = {}, excludedIndexes = new Set()) {
     this._noteRequestPolicy(requestInfo);
     const account = this.getActiveAccount(requestInfo, excludedIndexes);
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
+    const upstreamThrottleProbe = account.type !== 'provider' && this._claimUpstreamThrottleProbe();
     if (requestInfo.sessionKey) {
       this._bindSession(requestInfo.sessionKey, account);
     }
     account.inFlight++;
     account.activeWeight += weight;
     account.lastUsedAt = Date.now();
-    return { account, weight, startedAt: Date.now() };
+    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe };
   }
 
   releaseAccount(lease, outcome = {}) {
@@ -250,6 +292,16 @@ export class AccountManager {
 
     account.inFlight = Math.max(0, account.inFlight - 1);
     account.activeWeight = Math.max(0, account.activeWeight - lease.weight);
+
+    if (lease.upstreamThrottleProbe) {
+      if (outcome.success) {
+        this.clearUpstreamThrottle('successful recovery probe');
+      } else if (!outcome.upstreamThrottled) {
+        this.deferUpstreamThrottleProbe(5, outcome.error || `HTTP ${outcome.status || 'failure'}`);
+      }
+    }
+
+    if (outcome.neutral) return;
 
     if (outcome.success) {
       account.completedRequests++;
@@ -348,6 +400,154 @@ export class AccountManager {
 
   getGlobalInFlight() {
     return this.accounts.reduce((sum, account) => sum + account.inFlight, 0);
+  }
+
+  markUpstreamThrottled(retryAfterSeconds, reason = 'temporary_server_limit') {
+    const retryAfter = clampRetryAfterSeconds(retryAfterSeconds);
+    const until = Date.now() + retryAfter * 1000;
+    this.upstreamThrottle.until = Math.max(this.upstreamThrottle.until || 0, until);
+    this.upstreamThrottle.reason = reason;
+    this.upstreamThrottle.probeInFlight = false;
+    this.upstreamThrottle.count++;
+    this.upstreamThrottle.lastAt = Date.now();
+    console.log(`[TeamClaude] Anthropic upstream temporarily limiting requests for ${retryAfter}s; pausing Claude routes`);
+  }
+
+  clearUpstreamThrottle(reason = 'recovered') {
+    if (!this.upstreamThrottle.until && !this.upstreamThrottle.probeInFlight) return;
+    this.upstreamThrottle.until = null;
+    this.upstreamThrottle.reason = null;
+    this.upstreamThrottle.probeInFlight = false;
+    this.queueState.rampUntil = Date.now() + 5000;
+    this.queueState.lastAdmissionAt = Date.now();
+    console.log(`[TeamClaude] Anthropic upstream throttle cleared (${reason})`);
+  }
+
+  confirmUpstreamProbe(lease) {
+    if (!lease?.upstreamThrottleProbe) return;
+    this.clearUpstreamThrottle('Anthropic accepted recovery probe');
+    lease.upstreamThrottleProbe = false;
+  }
+
+  deferUpstreamThrottleProbe(retryAfterSeconds = 5, reason = 'probe_failed') {
+    if (!this.upstreamThrottle.until && !this.upstreamThrottle.probeInFlight) return;
+    const retryAfter = clampRetryAfterSeconds(retryAfterSeconds);
+    this.upstreamThrottle.until = Date.now() + retryAfter * 1000;
+    this.upstreamThrottle.reason = reason;
+    this.upstreamThrottle.probeInFlight = false;
+    this.upstreamThrottle.lastAt = Date.now();
+    console.log(`[TeamClaude] Anthropic recovery probe failed; retrying in ${retryAfter}s (${reason})`);
+  }
+
+  noteAmbiguousRateLimit(accountIndex, fingerprint, retryAfterSeconds) {
+    if (!fingerprint) return false;
+    const now = Date.now();
+    const windowMs = 30_000;
+    for (const [key, incident] of this.ambiguousRateLimits) {
+      if (now - incident.lastAt > windowMs) this.ambiguousRateLimits.delete(key);
+    }
+
+    const incident = this.ambiguousRateLimits.get(fingerprint) || {
+      accounts: new Set(),
+      firstAt: now,
+      lastAt: now,
+    };
+    incident.accounts.add(accountIndex);
+    incident.lastAt = now;
+    this.ambiguousRateLimits.set(fingerprint, incident);
+    if (incident.accounts.size < 2) return false;
+
+    for (const index of incident.accounts) {
+      const account = this.accounts[index];
+      if (!account || account.lastError !== 'rate_limited') continue;
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+      account.lastError = null;
+      account.lastErrorAt = null;
+    }
+    this.ambiguousRateLimits.delete(fingerprint);
+    return true;
+  }
+
+  _isUpstreamThrottleBlocking() {
+    const throttle = this.upstreamThrottle;
+    if (!throttle.until) return false;
+    if (Date.now() < throttle.until) return true;
+    return throttle.probeInFlight;
+  }
+
+  _claimUpstreamThrottleProbe() {
+    const throttle = this.upstreamThrottle;
+    if (!throttle.until || Date.now() < throttle.until || throttle.probeInFlight) return false;
+    throttle.probeInFlight = true;
+    console.log('[TeamClaude] Anthropic upstream throttle window expired; sending one recovery probe');
+    return true;
+  }
+
+  _upstreamThrottleRetry() {
+    const throttle = this.upstreamThrottle;
+    if (!throttle.until) return null;
+    const now = Date.now();
+    if (now < throttle.until) {
+      return {
+        available: false,
+        retryAfterMs: throttle.until - now,
+        cause: 'upstream_throttle',
+        reasons: { upstream_throttle: 1 },
+        matchingRoutes: this.accounts.filter(a => a.type !== 'provider').length,
+      };
+    }
+    if (throttle.probeInFlight) {
+      return {
+        available: false,
+        retryAfterMs: 1000,
+        cause: 'upstream_probe',
+        reasons: { upstream_probe: 1 },
+        matchingRoutes: this.accounts.filter(a => a.type !== 'provider').length,
+      };
+    }
+    return null;
+  }
+
+  _hasAvailableProvider(requestInfo = {}, excludedIndexes = new Set()) {
+    const profile = requestInfo.profile || 'claude';
+    return this.accounts.some(account => {
+      if (account.type !== 'provider' || excludedIndexes.has(account.index)) return false;
+      if (!this._matchesRequest(account, profile, requestInfo)) return false;
+      return this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true });
+    });
+  }
+
+  registerQueuedRequest(requestInfo = {}) {
+    if (requestInfo.queueTicket) return requestInfo.queueTicket;
+    const ticket = {
+      id: this.queueState.nextId++,
+      queuedAt: Date.now(),
+    };
+    this.queueState.waiting.push(ticket);
+    requestInfo.queueTicket = ticket;
+    return ticket;
+  }
+
+  canAdmitQueuedRequest(requestInfo = {}) {
+    const ticket = requestInfo.queueTicket;
+    if (!ticket) return true;
+    if (this.queueState.waiting[0]?.id !== ticket.id) return false;
+    const now = Date.now();
+    if (now < this.queueState.rampUntil && now - this.queueState.lastAdmissionAt < 250) return false;
+    this.queueState.waiting.shift();
+    this.queueState.lastAdmissionAt = now;
+    requestInfo.queueTicket = null;
+    requestInfo.queueAdmitted = true;
+    return true;
+  }
+
+  removeQueuedRequest(requestInfo = {}) {
+    const ticket = requestInfo.queueTicket;
+    if (!ticket) return;
+    const index = this.queueState.waiting.findIndex(entry => entry.id === ticket.id);
+    if (index >= 0) this.queueState.waiting.splice(index, 1);
+    requestInfo.queueTicket = null;
   }
 
   /**
@@ -690,6 +890,13 @@ export class AccountManager {
 
   _matchesRequest(account, profile, requestInfo = {}) {
     if (!this._matchesProfile(account, profile)) return false;
+    if (
+      account.type !== 'provider'
+      && this.queueState.waiting.length
+      && !requestInfo.queueTicket
+      && !requestInfo.queueAdmitted
+    ) return false;
+    if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) return false;
     if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) return false;
     return true;
   }
@@ -1166,6 +1373,22 @@ export class AccountManager {
         globalInFlight: this.getGlobalInFlight(),
         safetyMaxActivePerAccount: this.scheduler.safetyMaxActivePerAccount,
         safetyMaxGlobalActive: this.scheduler.safetyMaxGlobalActive,
+      },
+      upstreamThrottle: {
+        active: this._isUpstreamThrottleBlocking(),
+        until: this.upstreamThrottle.until
+          ? new Date(this.upstreamThrottle.until).toISOString()
+          : null,
+        reason: this.upstreamThrottle.reason,
+        probeInFlight: this.upstreamThrottle.probeInFlight,
+        count: this.upstreamThrottle.count,
+        lastAt: this.upstreamThrottle.lastAt
+          ? new Date(this.upstreamThrottle.lastAt).toISOString()
+          : null,
+        queued: this.queueState.waiting.length,
+        oldestQueuedMs: this.queueState.waiting.length
+          ? Math.max(0, now - this.queueState.waiting[0].queuedAt)
+          : 0,
       },
       sessions: {
         stickyBindings: this.sessionBindings.size,

@@ -21,6 +21,7 @@ const DEFAULT_QUEUE = {
   capacityMaxWaitMs: 15 * 60 * 1000,
   weeklyMaxWaitMs: 0,
   pollMs: 1000,
+  heartbeatMs: 10_000,
 };
 
 export function createProxyServer(accountManager, config, hooks = {}) {
@@ -110,13 +111,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'proxy_error', message: 'Internal proxy error' },
-          }));
-        }
+        sendErrorResponse(res, requestInfo, 502, {
+          type: 'error',
+          error: { type: 'proxy_error', message: 'Internal proxy error' },
+        });
       } finally {
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
@@ -213,17 +211,13 @@ async function forwardRequest(
     ctx.status = 429;
     ctx.account = '(none available)';
     const retryAfter = computeRetryAfter(accountManager, requestInfo);
-    res.writeHead(429, {
-      'Content-Type': 'application/json',
-      'retry-after': String(retryAfter),
-    });
-    res.end(JSON.stringify({
+    sendErrorResponse(res, requestInfo, 429, {
       type: 'error',
       error: {
         type: 'rate_limit_error',
         message: unavailableMessage(accountManager, requestInfo, retryAfter),
       },
-    }));
+    }, { 'retry-after': String(retryAfter) });
     return;
   }
 
@@ -254,16 +248,13 @@ async function forwardRequest(
     if (queued) return;
 
     ctx.status = 401;
-    if (!res.headersSent) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        type: 'error',
-        error: {
-          type: 'authentication_error',
-          message: `Claude account "${account.name}" could not refresh its OAuth token. Run teamclaude accounts -v or log in again.`,
-        },
-      }));
-    }
+    sendErrorResponse(res, requestInfo, 401, {
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        message: `Claude account "${account.name}" could not refresh its OAuth token. Run teamclaude accounts -v or log in again.`,
+      },
+    });
     return;
   }
 
@@ -339,6 +330,49 @@ async function forwardRequest(
       const errorBody = await readErrorBody(upstreamRes, null);
       const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
+      const rateLimit = classifyRateLimit(account, rateLimitHeaders, errorBody);
+      const promotedAmbiguous = rateLimit.scope === 'unknown'
+        && accountManager.noteAmbiguousRateLimit(account.index, rateLimit.fingerprint, retryAfter);
+
+      if (rateLimit.scope === 'upstream' || promotedAmbiguous) {
+        const parsedError = parseJsonError(errorBody);
+        accountManager.markUpstreamThrottled(
+          retryAfter,
+          promotedAmbiguous
+            ? 'matching_ambiguous_429s'
+            : parsedError?.message || parsedError?.type || 'temporary_server_limit',
+        );
+        accountManager.releaseAccount(lease, {
+          status: 429,
+          error: 'upstream_throttled',
+          upstreamThrottled: true,
+          neutral: true,
+        });
+
+        if (logDir) {
+          logSections.push(`=== RESPONSE 429 — Anthropic upstream throttled ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+          if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
+        }
+        console.log('[TeamClaude] Shared Anthropic 429 detected; queueing without penalizing individual accounts');
+
+        const queued = await queueAndRetry(
+          'Anthropic upstream is temporarily limiting requests',
+          req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'upstream_throttle',
+        );
+        if (queued) return;
+
+        ctx.status = 429;
+        sendErrorResponse(res, requestInfo, 429, {
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: 'Anthropic is temporarily limiting requests. TeamClaude will retry automatically when capacity returns.',
+          },
+        }, { 'retry-after': String(computeRetryAfter(accountManager, requestInfo)) });
+        return;
+      }
+
       accountManager.markRateLimited(account.index, retryAfter, { status: 429, recordFailure: false });
       accountManager.releaseAccount(lease, { status: 429, error: 'rate_limited' });
 
@@ -370,20 +404,14 @@ async function forwardRequest(
 
       ctx.status = 429;
       if (logDir) writeRequestLog(logDir, reqId, logSections);
-      if (!res.headersSent) {
-        const clientRetryAfter = computeRetryAfter(accountManager, requestInfo);
-        res.writeHead(429, {
-          'Content-Type': 'application/json',
-          'retry-after': String(clientRetryAfter),
-        });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: {
-            type: 'rate_limit_error',
-            message: unavailableMessage(accountManager, requestInfo, clientRetryAfter),
-          },
-        }));
-      }
+      const clientRetryAfter = computeRetryAfter(accountManager, requestInfo);
+      sendErrorResponse(res, requestInfo, 429, {
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: unavailableMessage(accountManager, requestInfo, clientRetryAfter),
+        },
+      }, { 'retry-after': String(clientRetryAfter) });
       return;
     }
 
@@ -414,16 +442,13 @@ async function forwardRequest(
 
       ctx.status = 502;
       if (logDir) writeRequestLog(logDir, reqId, logSections);
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: {
-            type: 'provider_auth_error',
-            message: `Fallback provider "${account.name}" returned HTTP ${upstreamRes.status}. Check its token, base URL, and model config.`,
-          },
-        }));
-      }
+      sendErrorResponse(res, requestInfo, 502, {
+        type: 'error',
+        error: {
+          type: 'provider_auth_error',
+          message: `Fallback provider "${account.name}" returned HTTP ${upstreamRes.status}. Check its token, base URL, and model config.`,
+        },
+      });
       return;
     }
 
@@ -452,13 +477,10 @@ async function forwardRequest(
       if (queued) return;
 
       ctx.status = upstreamRes.status;
-      if (!res.headersSent) {
-        res.writeHead(upstreamRes.status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'overloaded_error', message: `Upstream returned ${upstreamRes.status}` },
-        }));
-      }
+      sendErrorResponse(res, requestInfo, upstreamRes.status, {
+        type: 'error',
+        error: { type: 'overloaded_error', message: `Upstream returned ${upstreamRes.status}` },
+      });
       return;
     }
 
@@ -479,18 +501,12 @@ async function forwardRequest(
       }
 
       ctx.status = upstreamRes.status;
-      if (!res.headersSent) {
-        const responseHeaders = {};
-        for (const [key, value] of upstreamRes.headers.entries()) {
-          if (key === 'transfer-encoding' || key === 'connection') continue;
-          if (key === 'content-encoding' || key === 'content-length') continue;
-          responseHeaders[key] = value;
-        }
-        responseHeaders['content-type'] ||= 'application/json';
-        res.writeHead(upstreamRes.status, responseHeaders);
-        res.end(errorBody);
-      }
+      sendErrorBody(res, requestInfo, upstreamRes.status, errorBody, upstreamRes.headers);
       return;
+    }
+
+    if (upstreamRes.status < 400) {
+      accountManager.confirmUpstreamProbe?.(lease);
     }
 
     // Log response headers
@@ -510,7 +526,7 @@ async function forwardRequest(
     }
 
     if (!upstreamRes.body) {
-      res.writeHead(upstreamRes.status, responseHeaders);
+      if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
       accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
       if (logDir) {
         logSections.push(`=== RESPONSE BODY ===\n(empty)`);
@@ -531,7 +547,6 @@ async function forwardRequest(
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
-      res.writeHead(upstreamRes.status, responseHeaders);
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager);
       markThinkingFromResponse(buf, accountManager, requestInfo);
@@ -544,7 +559,16 @@ async function forwardRequest(
         }
         writeRequestLog(logDir, reqId, logSections);
       }
-      res.end(buf);
+      if (requestInfo.queueHeartbeatActive) {
+        clearQueueHeartbeat(requestInfo);
+        if (!res.destroyed && !res.writableEnded) {
+          res.write(`data: ${buf.toString()}\n\n`);
+          res.end();
+        }
+      } else {
+        if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
+        res.end(buf);
+      }
     }
   } catch (err) {
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
@@ -577,16 +601,13 @@ async function forwardRequest(
       );
       if (queued) return;
       ctx.status = 503;
-      if (!res.headersSent) {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: {
-            type: 'connection_unavailable',
-            message: 'Could not connect to Claude or a configured fallback provider. Check your internet connection and try again. This is not an account quota issue.',
-          },
-        }));
-      }
+      sendErrorResponse(res, requestInfo, 503, {
+        type: 'error',
+        error: {
+          type: 'connection_unavailable',
+          message: 'Could not connect to Claude or a configured fallback provider. Check your internet connection and try again. This is not an account quota issue.',
+        },
+      });
       return;
     }
 
@@ -607,13 +628,10 @@ async function forwardRequest(
     if (queued) return;
     ctx.status = 502;
 
-    if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        type: 'error',
-        error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
-      }));
-    }
+    sendErrorResponse(res, requestInfo, 502, {
+      type: 'error',
+      error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
+    });
   }
 }
 
@@ -629,10 +647,7 @@ function isProviderAuthStatus(status) {
 }
 
 function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = new Set()) {
-  if (accountManager.nextRetryForRequest) {
-    return accountManager.nextRetryForRequest(requestInfo, excludedIndexes).available;
-  }
-  return false;
+  return accountManager.hasAvailableRoute?.(requestInfo, excludedIndexes) || false;
 }
 
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter) {
@@ -705,6 +720,47 @@ function parseJsonError(body) {
   }
 }
 
+function classifyRateLimit(account, headers, body) {
+  if (account.type === 'provider') return { scope: 'account', fingerprint: null };
+
+  const parsed = parseJsonError(body);
+  const message = String(parsed?.message || '').toLowerCase();
+  const type = String(parsed?.type || '').toLowerCase();
+  const unifiedStatus = String(headers['anthropic-ratelimit-unified-status'] || '').toLowerCase();
+  const fiveHour = Number(headers['anthropic-ratelimit-unified-5h-utilization']);
+  const weekly = Number(headers['anthropic-ratelimit-unified-7d-utilization']);
+  const tokensRemaining = Number(headers['anthropic-ratelimit-tokens-remaining']);
+  const requestsRemaining = Number(headers['anthropic-ratelimit-requests-remaining']);
+
+  const quotaHeaderExhaustion =
+    unifiedStatus === 'rejected'
+    || (Number.isFinite(fiveHour) && fiveHour >= 0.985)
+    || (Number.isFinite(weekly) && weekly >= 0.985)
+    || (headers['anthropic-ratelimit-tokens-remaining'] != null && tokensRemaining <= 0)
+    || (headers['anthropic-ratelimit-requests-remaining'] != null && requestsRemaining <= 0);
+  if (quotaHeaderExhaustion) return { scope: 'account', fingerprint: null };
+
+  const quotaBodyExhaustion =
+    /\b(account|plan|session|weekly|quota)\b.{0,40}\b(exhausted|limit|exceeded|reached)\b/i.test(message)
+    || /\busage\b.{0,40}\b(exhausted|exceeded|reached)\b/i.test(message);
+  if (quotaBodyExhaustion) return { scope: 'account', fingerprint: null };
+
+  const explicitSharedThrottle =
+    message.includes('not your usage limit')
+    || message.includes('temporarily limiting requests')
+    || message.includes('server is temporarily limiting')
+    || type === 'overloaded_error';
+  if (explicitSharedThrottle) return { scope: 'upstream', fingerprint: null };
+
+  const normalized = `${type}:${message}`
+    .replace(/\b[0-9a-f]{8,}\b/gi, '#')
+    .replace(/\b\d+\b/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240);
+  return { scope: 'unknown', fingerprint: normalized || 'unknown_429' };
+}
+
 function secondsUntilParsedTime(value) {
   if (!value) return null;
   const trimmed = String(value).trim();
@@ -724,11 +780,50 @@ function isRetriableUpstreamStatus(status) {
   return status === 529 || status === 502 || status === 503 || status === 504;
 }
 
+function sendErrorResponse(res, requestInfo, status, payload, headers = {}) {
+  if (requestInfo.queueHeartbeatActive || res.headersSent) {
+    clearQueueHeartbeat(requestInfo);
+    if (!res.destroyed && !res.writableEnded) {
+      res.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
+      res.end();
+    }
+    return;
+  }
+  res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+  res.end(JSON.stringify(payload));
+}
+
+function sendErrorBody(res, requestInfo, status, body, headers) {
+  if (requestInfo.queueHeartbeatActive || res.headersSent) {
+    let payload;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      payload = {
+        type: 'error',
+        error: { type: 'upstream_error', message: body || `Upstream returned ${status}` },
+      };
+    }
+    sendErrorResponse(res, requestInfo, status, payload);
+    return;
+  }
+
+  const responseHeaders = {};
+  for (const [key, value] of headers.entries()) {
+    if (key === 'transfer-encoding' || key === 'connection') continue;
+    if (key === 'content-encoding' || key === 'content-length') continue;
+    responseHeaders[key] = value;
+  }
+  responseHeaders['content-type'] ||= 'application/json';
+  res.writeHead(status, responseHeaders);
+  res.end(body);
+}
+
 async function queueAndRetry(
   reason, req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
   retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody = canRetryBufferedBody, cause = 'quota',
 ) {
-  if (!queueConfig.enabled || !canQueueBufferedBody || res.headersSent || res.destroyed) {
+  if (!queueConfig.enabled || !canQueueBufferedBody || (res.headersSent && !requestInfo.queueHeartbeatActive) || res.destroyed) {
     if (queueConfig.enabled && !canQueueBufferedBody && requestInfo.queueBlockedReason) {
       console.log(`[TeamClaude] Not queueing request: ${requestInfo.queueBlockedReason}`);
     }
@@ -753,27 +848,79 @@ async function queueAndRetry(
     : cause === 'capacity'
       ? Math.min(maxWaitMs, capacityMaxWaitMs)
     : Math.min(maxWaitMs, autoMaxWaitMs);
-  if (queueWindowMs <= 0) return false;
+  if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, 'No retry window is available.');
 
   const retryAfterMs = retryPlan.retryAfterMs;
-  if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) return false;
+  if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) {
+    return finishQueuedStreamIfNeeded(res, requestInfo, 'No route is expected to recover within the configured queue window.');
+  }
 
   requestInfo.queueStartedAt ||= Date.now();
+  accountManager.registerQueuedRequest?.(requestInfo);
   const elapsed = Date.now() - requestInfo.queueStartedAt;
   const remaining = queueWindowMs - elapsed;
-  if (remaining <= 0) return false;
+  if (remaining <= 0) {
+    accountManager.removeQueuedRequest?.(requestInfo);
+    return finishQueuedStreamIfNeeded(res, requestInfo, 'The TeamClaude queue wait expired.');
+  }
 
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
   console.log(`[TeamClaude] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
+  ensureQueueHeartbeat(res, requestInfo, queueConfig);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
-  if (!available) return res.destroyed || req.destroyed;
+  if (!available) {
+    if (res.destroyed || req.destroyed) return true;
+    accountManager.removeQueuedRequest?.(requestInfo);
+    return finishQueuedStreamIfNeeded(res, requestInfo, 'The TeamClaude queue wait expired.');
+  }
 
   return forwardRequest(
     req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
     retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set(),
-  ).then(() => true);
+  ).then(() => true).finally(() => clearQueueHeartbeat(requestInfo));
+}
+
+function ensureQueueHeartbeat(res, requestInfo, queueConfig) {
+  if (!requestInfo.stream || requestInfo.queueHeartbeatActive || res.headersSent) return;
+  const heartbeatMs = Math.max(1000, Number(queueConfig.heartbeatMs) || 10_000);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders?.();
+  res.write(': teamclaude queued\n\n');
+  requestInfo.queueHeartbeatActive = true;
+  requestInfo.queueHeartbeatTimer = setInterval(() => {
+    if (res.destroyed || res.writableEnded) {
+      clearQueueHeartbeat(requestInfo);
+      return;
+    }
+    res.write(': teamclaude queued\n\n');
+  }, heartbeatMs);
+  requestInfo.queueHeartbeatTimer.unref?.();
+}
+
+function clearQueueHeartbeat(requestInfo) {
+  if (requestInfo.queueHeartbeatTimer) clearInterval(requestInfo.queueHeartbeatTimer);
+  requestInfo.queueHeartbeatTimer = null;
+  requestInfo.queueHeartbeatActive = false;
+}
+
+function finishQueuedStreamIfNeeded(res, requestInfo, message) {
+  if (!requestInfo.queueHeartbeatActive) return false;
+  clearQueueHeartbeat(requestInfo);
+  if (!res.destroyed && !res.writableEnded) {
+    res.write(`event: error\ndata: ${JSON.stringify({
+      type: 'error',
+      error: { type: 'rate_limit_error', message },
+    })}\n\n`);
+    res.end();
+  }
+  return true;
 }
 
 async function waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, maxWaitMs) {
@@ -787,14 +934,22 @@ async function waitForAvailableRoute(req, res, accountManager, requestInfo, queu
   try {
     while (Date.now() - startedAt < maxWaitMs) {
       if (closed || res.destroyed) return false;
-      if (accountManager.getActiveAccount(requestInfo, new Set())) return true;
+      if (
+        accountManager.hasAvailableRoute(requestInfo, new Set())
+        && accountManager.canAdmitQueuedRequest?.(requestInfo) !== false
+      ) return true;
 
       const remaining = maxWaitMs - (Date.now() - startedAt);
       await sleep(Math.min(pollMs, remaining));
     }
 
-    return accountManager.getActiveAccount(requestInfo, new Set()) != null;
+    return accountManager.hasAvailableRoute(requestInfo, new Set())
+      && accountManager.canAdmitQueuedRequest?.(requestInfo) !== false;
   } finally {
+    if (closed || res.destroyed) {
+      accountManager.removeQueuedRequest?.(requestInfo);
+      clearQueueHeartbeat(requestInfo);
+    }
     req.off('aborted', markClosed);
     res.off('close', markClosed);
   }
@@ -933,7 +1088,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
-  let committed = false;
+  let committed = res.headersSent;
   let readFailed = false;
 
   try {

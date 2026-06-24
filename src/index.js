@@ -525,6 +525,16 @@ async function statusCommand() {
 
     console.log(`Active account: ${data.currentAccount}`);
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
+    if (data.upstreamThrottle?.active || data.upstreamThrottle?.queued) {
+      const state = data.upstreamThrottle.active
+        ? data.upstreamThrottle.probeInFlight
+          ? 'probing recovery'
+          : `retry at ${data.upstreamThrottle.until}`
+        : 'recovering';
+      const queued = data.upstreamThrottle.queued || 0;
+      const oldest = queued ? `, oldest ${formatDurationMs(data.upstreamThrottle.oldestQueuedMs)}` : '';
+      console.log(`Anthropic:      temporarily throttled (${state}, queued ${queued}${oldest})\n`);
+    }
 
     for (const acct of data.accounts) {
       const q = acct.quota;
