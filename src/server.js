@@ -509,12 +509,15 @@ async function forwardRequest(
 
       ctx.status = 429;
       if (logDir) writeRequestLog(logDir, reqId, logSections);
-      const clientRetryAfter = computeRetryAfter(accountManager, requestInfo);
+      const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
+      const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
+      const clientRetryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
+      console.log(`[TeamClaude] No route after failover — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
       sendErrorResponse(res, requestInfo, 429, {
         type: 'error',
         error: {
           type: 'rate_limit_error',
-          message: unavailableMessage(accountManager, requestInfo, clientRetryAfter),
+          message: unavailableMessage(accountManager, requestInfo, clientRetryAfter, willRecoverSoon),
         },
       }, { 'retry-after': String(clientRetryAfter) });
       return;
@@ -842,6 +845,8 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   }
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
+
+export const __serverTest = { unavailableMessage, isRetriableUpstreamStatus };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';

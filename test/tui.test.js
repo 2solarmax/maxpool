@@ -216,6 +216,21 @@ test('paste with an embedded control char keeps the printable characters', () =>
   assert.equal(tui.mode, 'input');
 });
 
+test('bracketed-paste marker split across two chunks is not corrupted', () => {
+  const tui = new TUI({ accountManager: accountManager(), config: { accounts: [] } });
+  tui.render = () => {};
+  let submitted = null;
+  tui.mode = 'input';
+  tui.inputBuf = '';
+  tui.inputCb = v => { submitted = v; };
+
+  tui._onData('\x1b[20');               // partial start marker
+  tui._onData('0~sk-ant-split\x1b[201~\n'); // rest + end marker + newline
+
+  assert.equal(submitted, 'sk-ant-split');
+  assert.equal(tui.mode, 'normal');
+});
+
 test('failed API key persistence does not leave a routable phantom account', async () => {
   const am = accountManager();
   am.addAccount = account => am.accounts.push(account);

@@ -2,7 +2,29 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, __serverTest } from '../src/server.js';
+
+const { unavailableMessage, isRetriableUpstreamStatus } = __serverTest;
+
+test('unavailableMessage tells the truth when no account will recover soon', () => {
+  const am = { accounts: [{}, {}], _requiresAnthropicThinkingIntegrity: () => false };
+
+  // Recoverable soon -> a retry hint is honest.
+  assert.match(unavailableMessage(am, {}, 60, true), /Retry in 60s/);
+
+  // Not recoverable soon (every account at its 5h/weekly limit) -> no fake retry.
+  const exhausted = unavailableMessage(am, {}, 60, false);
+  assert.match(exhausted, /at their 5h or weekly limit/);
+  assert.doesNotMatch(exhausted, /Retry in 60s/);
+  assert.doesNotMatch(exhausted, /accounts exhausted\. Retry/);
+});
+
+test('500 is treated as a retriable upstream status', () => {
+  assert.equal(isRetriableUpstreamStatus(500), true);
+  assert.equal(isRetriableUpstreamStatus(529), true);
+  assert.equal(isRetriableUpstreamStatus(400), false);
+  assert.equal(isRetriableUpstreamStatus(200), false);
+});
 
 function listen(server, host = '127.0.0.1') {
   return new Promise(resolve => server.listen(0, host, () => resolve(server.address().port)));

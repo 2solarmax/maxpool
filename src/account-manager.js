@@ -958,7 +958,7 @@ export class AccountManager {
     if (mode !== 'preferred') {
       this.routingMode = 'automatic';
       this.preferredAccountName = null;
-      return;
+      return true;
     }
     const account = this.accounts.find(candidate => candidate.name === preferredAccount);
     if (!account || account.type === 'provider' || !account.enabled) {
@@ -1037,8 +1037,13 @@ export class AccountManager {
    */
   _scoringContext() {
     const now = Date.now();
+    // Denominator for the recent-load *share* term: the primary OAuth pool we
+    // balance across. Exclude disabled accounts (never selectable) and provider
+    // fallbacks (last-resort, not part of the spread) so a busy provider can't
+    // shrink the share signal for the OAuth accounts.
     let fleetRecentWeight = 0;
     for (const account of this.accounts) {
+      if (account.enabled === false || account.type === 'provider') continue;
       fleetRecentWeight += this._loadSummary(account, this.scheduler.spreadWindowMs, now).weight;
     }
     return { now, fleetRecentWeight };

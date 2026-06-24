@@ -283,14 +283,25 @@ export class TUI {
     // markers, take the text up to the first newline, drop control chars, append
     // it, and treat an embedded newline as Enter (submit).
     if (this.mode === 'input') {
-      const cleaned = d.replace(/\x1b\[20[01]~/g, '');
-      const nlIdx = cleaned.search(/[\r\n]/);
-      const typed = (nlIdx === -1 ? cleaned : cleaned.slice(0, nlIdx))
+      // Prepend any partial escape held from the previous chunk so a bracketed-
+      // paste marker split across two stdin reads (e.g. "\x1b[20" then "0~key")
+      // is recognized rather than appended as literal text.
+      let chunk = (this._pendingPaste || '') + d;
+      this._pendingPaste = '';
+      chunk = chunk.replace(/\x1b\[20[01]~/g, '');
+      // Hold back a trailing fragment that could be the start of a paste marker.
+      const partial = chunk.match(/\x1b(?:\[(?:2(?:0[01]?)?)?)?$/);
+      if (partial) {
+        this._pendingPaste = partial[0];
+        chunk = chunk.slice(0, chunk.length - partial[0].length);
+      }
+      const nlIdx = chunk.search(/[\r\n]/);
+      const typed = (nlIdx === -1 ? chunk : chunk.slice(0, nlIdx))
         .split('')
         .filter(c => c >= ' ' && c !== '\x7f')
         .join('');
       if (typed) { this.inputBuf += typed; this.render(); }
-      if (nlIdx !== -1) return this._key('enter');
+      if (nlIdx !== -1) { this._pendingPaste = ''; return this._key('enter'); }
       return;
     }
 
@@ -453,11 +464,11 @@ export class TUI {
     if (k === 'enter') {
       const cb = this.inputCb;
       const v = this.inputBuf;
-      this.mode = 'normal'; this.inputCb = null; this.inputBuf = ''; this.inputSensitive = false;
+      this.mode = 'normal'; this.inputCb = null; this.inputBuf = ''; this.inputSensitive = false; this._pendingPaste = '';
       cb?.(v);
     }
     else if (k === 'esc') {
-      this.mode = 'normal'; this.inputCb = null; this.inputBuf = ''; this.inputSensitive = false;
+      this.mode = 'normal'; this.inputCb = null; this.inputBuf = ''; this.inputSensitive = false; this._pendingPaste = '';
     }
     else if (k === 'bs') { this.inputBuf = this.inputBuf.slice(0, -1); }
     else if (k.length === 1) { this.inputBuf += k; }
