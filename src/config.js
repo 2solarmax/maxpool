@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, chmod, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -18,6 +18,10 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.90,
+    routing: {
+      mode: 'automatic',
+      preferredAccount: null,
+    },
     scheduler: {
       mode: 'adaptive-least-loaded',
       safetyMaxActivePerAccount: 50,
@@ -45,11 +49,21 @@ export function createDefaultConfig() {
 
 export async function loadConfig() {
   const path = getConfigPath();
+  let raw;
   try {
-    return JSON.parse(await readFile(path, 'utf-8'));
+    raw = await readFile(path, 'utf-8');
   } catch (err) {
     if (err.code === 'ENOENT') return null;
     throw err;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    // With atomic temp+rename writes a torn read is impossible, so a parse
+    // failure means genuine corruption. Surface it clearly rather than as a
+    // cryptic crash, and do NOT return null — that would let a caller overwrite
+    // the file with defaults and lose recoverable OAuth credentials.
+    throw new Error(`config at ${path} is not valid JSON (corrupt?): ${err.message}`);
   }
 }
 
@@ -66,17 +80,44 @@ export async function loadOrCreateConfig() {
 export async function saveConfig(config) {
   const path = getConfigPath();
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  // Atomic write: a crash/power-loss mid-write must never truncate the file
+  // (it holds every account's OAuth tokens). Write a sibling temp file, force
+  // 0600 (writeFile's mode only applies on create, not when overwriting an
+  // existing 0644 file), then rename — atomic within a filesystem on POSIX.
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+    await chmod(tmp, 0o600);
+    await rename(tmp, path);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
 }
 
+let _configWriteChain = Promise.resolve();
+
 /**
- * Atomically update the config: re-reads from disk, calls updater(config),
- * then saves. Returns the updated config. This prevents overwriting changes
- * made by other processes (e.g. `teamclaude import` while the server runs).
+ * Serialize an in-process read-modify-write of the config so concurrent updates
+ * cannot lose each other's writes — e.g. a background OAuth token refresh
+ * (fire-and-forget) racing a TUI account add/delete. Each update re-reads the
+ * latest config, applies updater(config), then saves atomically.
+ *
+ * NOTE: this serializes writes within THIS process only. A separate
+ * `teamclaude import`/`login` process writing concurrently is not coordinated
+ * (that would require a lockfile) — but those are short, rare, human-driven.
  */
-export async function atomicConfigUpdate(updater) {
-  const config = await loadConfig() || createDefaultConfig();
-  await updater(config);
-  await saveConfig(config);
-  return config;
+export function atomicConfigUpdate(updater) {
+  const run = async () => {
+    const config = await loadConfig() || createDefaultConfig();
+    await updater(config);
+    await saveConfig(config);
+    return config;
+  };
+  // Run after any in-flight update regardless of whether it resolved or
+  // rejected, so one failure doesn't poison the chain; the caller still sees
+  // this update's real result/error.
+  const result = _configWriteChain.then(run, run);
+  _configWriteChain = result.then(() => {}, () => {});
+  return result;
 }

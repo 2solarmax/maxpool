@@ -254,12 +254,17 @@ async function forwardRequest(
 
     ctx.status = 429;
     ctx.account = '(none available)';
-    const retryAfter = computeRetryAfter(accountManager, requestInfo);
+    const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
+    const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
+    const retryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
+    // Surface the routing decision (logs go to the TUI; this is the only record
+    // of WHY a request was rejected rather than queued).
+    console.log(`[TeamClaude] No route for request — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
     sendErrorResponse(res, requestInfo, 429, {
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: unavailableMessage(accountManager, requestInfo, retryAfter),
+        message: unavailableMessage(accountManager, requestInfo, retryAfter, willRecoverSoon),
       },
     }, { 'retry-after': String(retryAfter) });
     return;
@@ -817,11 +822,25 @@ function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = ne
   return accountManager.hasAvailableRoute?.(requestInfo, excludedIndexes) || false;
 }
 
-function unavailableMessage(accountManager, requestInfo = {}, retryAfter) {
-  if (requestInfo.requiresAnthropicThinkingIntegrity || accountManager._requiresAnthropicThinkingIntegrity?.(requestInfo)) {
+function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRecoverSoon = true) {
+  const thinking = requestInfo.requiresAnthropicThinkingIntegrity
+    || accountManager._requiresAnthropicThinkingIntegrity?.(requestInfo);
+  const n = accountManager.accounts.length;
+
+  // No route is expected to recover within the queue window — i.e. every Claude
+  // account is at its own 5h/weekly limit. A short "retry in Ns" would be a lie;
+  // tell the user the real fix.
+  if (!willRecoverSoon) {
+    const base = `No Claude account can take this request — all ${n} are at their 5h or weekly limit. Add another Claude account or wait for a quota reset.`;
+    return thinking
+      ? `${base} GLM/Kimi fallback is unavailable because this session contains Anthropic signed thinking blocks; start a fresh non-thinking session to use them.`
+      : base;
+  }
+
+  if (thinking) {
     return `No Claude account could accept this request. Non-Claude fallback is disabled because this session contains Anthropic signed thinking blocks. Retry in ${retryAfter}s, wait for Claude capacity, or start a fresh non-thinking session to use GLM/Kimi.`;
   }
-  return `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`;
+  return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
@@ -973,7 +992,10 @@ function secondsUntilParsedTime(value) {
 }
 
 function isRetriableUpstreamStatus(status) {
-  return status === 529 || status === 502 || status === 503 || status === 504;
+  // 500 included: Anthropic 500s are transient server errors (same class as
+  // 502/503/504). Without this they were passed straight through to the client
+  // ("Internal server error") instead of failing over to another account.
+  return status === 500 || status === 529 || status === 502 || status === 503 || status === 504;
 }
 
 function sendErrorResponse(res, requestInfo, status, payload, headers = {}) {

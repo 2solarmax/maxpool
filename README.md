@@ -18,7 +18,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls
 - **Graceful drain on restart** — restart/quit/Ctrl-C stops new requests and waits for active streams to finish before exiting or relaunching
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
-- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running; the server auto-syncs config and **R** can reload immediately
+- **Hot-sync accounts** — add accounts via `import` or `login` while the server is running; the server auto-syncs config and **s** can sync immediately
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
@@ -63,7 +63,7 @@ teamclaude login
 
 Uses the same OAuth flow as Claude Code. Auto-detects the account email and subscription tier. Logging in with the same account again updates its credentials.
 
-You can add accounts while the server is running — press **R** in the TUI to reload.
+You can add accounts while the server is running — press **s** in the TUI to sync immediately, or wait for automatic sync.
 
 ### Import from Claude Code
 
@@ -107,14 +107,22 @@ Falls back to plain log output when not a TTY (e.g. running as a service).
 
 | Key | Action |
 |-----|--------|
-| `s` | Switch active account |
-| `a` | Add account (import or API key) |
-| `r` | Remove an account |
-| `R` | Reload accounts from config |
-| `x` | Restart server after draining active requests |
-| `q` | Quit |
+| `a` | Open account management |
+| `m` | Choose automatic routing or a preferred account |
+| `s` | Sync accounts and credentials from config now |
+| `r` | Restart server after draining active requests |
+| `q` | Stop server after draining active requests |
 
-In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
+State-changing actions show what will happen and require `y` or `n`. In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to choose, and `Esc` to go back.
+
+The Accounts menu can import the current Claude Code login, add an Anthropic API key, enable or disable an account, or permanently delete an idle account. Disabling keeps credentials in config but prevents new requests from using the account. Deletion is blocked while that account has active requests.
+
+Routing modes:
+
+- **Automatic** spreads requests across healthy accounts using live load, quota pressure, and recent errors.
+- **Manual preference** sends subsequent requests, including the next request from existing idle sessions, to the selected Claude account whenever it is healthy. TeamClaude still fails over automatically when necessary and returns to the preferred account after recovery.
+
+Routing changes do not move requests already in flight.
 
 ### Run Claude Code through the proxy
 
@@ -148,12 +156,12 @@ Every account/provider row also includes load telemetry: `Load current/weight`, 
 
 ### Restart behavior
 
-When you press `x`, `q`, Ctrl-C, or send SIGTERM, TeamClaude enters draining shutdown:
+When you confirm Restart, confirm Stop, press Ctrl-C, or send SIGTERM, TeamClaude enters draining shutdown:
 
 1. The proxy stops accepting new requests.
 2. Existing in-flight streams keep running.
 3. The process exits when active requests finish.
-4. If you pressed `x`, TeamClaude starts a fresh `teamclaude server` process in the same terminal.
+4. If you selected Restart, TeamClaude starts a fresh `teamclaude server` process in the same terminal.
 5. Press Ctrl-C again to force exit.
 
 Idle Claude Code sessions are not tied to the server process. If the server is restarted while a Claude Code session is idle, its next request reconnects to the new server. If the server is forced closed while a stream is actively running, that stream can still fail because the TCP connection disappears.
@@ -289,8 +297,8 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 13. Repeated upstream 5xx/overload failures use the shorter `capacityMaxWaitMs` cap, not the long quota wait
 14. Weekly exhaustion and non-retryable 4xx errors fail fast by default; if the queue wait expires, returns 429 with the soonest retry time
 15. Temporary OAuth refresh failures cool the account down and queue/fail over; invalid refresh credentials disable only that account and require login
-16. In an interactive terminal, the server runs under a foreground supervisor so `x` can drain and restart without detaching the replacement TUI
-17. When `x` is pressed, new upstream admission pauses immediately. Existing upstream requests finish, queued requests cannot deadlock restart, and their sockets close during relaunch so Claude Code reconnects automatically
+16. In an interactive terminal, the server runs under a foreground supervisor so confirmed Restart (`r`) can drain and restart without detaching the replacement TUI
+17. When Restart is confirmed, new upstream admission pauses immediately. Existing upstream requests finish, queued requests cannot deadlock restart, and their sockets close during relaunch so Claude Code reconnects automatically
 18. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License

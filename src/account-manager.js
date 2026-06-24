@@ -32,9 +32,18 @@ const DEFAULT_SCHEDULER = {
   weeklyCriticalThreshold: 0.95,
   weeklyExhaustedThreshold: 0.985,
   weeklyBurnDebtWeight: 0.6,
+  // Routing-cost tuning (lower cost = preferred). Quota scarcity is the primary
+  // signal; recent-load spread breaks ties between equally-scarce accounts so
+  // sequential traffic rotates instead of funnelling onto one account.
+  scarcityWeight: 6,          // multiplies quota scarcity (pace overage, 0..~1)
+  spreadShareWeight: 3,       // multiplies an account's share of recent fleet load (0..1)
+  recoveryRampWeight: 4,      // decaying penalty applied to a just-recovered account
+  recoveryRampMs: 5 * 60_000, // how long the post-recovery ramp lasts
+  spreadWindowMs: 15 * 60_000,// rolling window used to measure recent per-account load
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
 function clampRetryAfterSeconds(value) {
   const n = Number(value);
@@ -100,6 +109,7 @@ export class AccountManager {
       modelMap: acct.modelMap || null,
       stripBetaHeaders: Boolean(acct.stripBetaHeaders),
       runtime: Boolean(acct.runtime),
+      enabled: acct.enabled !== false,
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
@@ -129,11 +139,14 @@ export class AccountManager {
       provisionalUpstreamUntil: null,
       rateLimitedUntil: null,
       provisionalRateLimitFingerprint: null,
+      recoveredAt: null,
       lastQuotaLogKey: null,
     }));
     this.currentIndex = 0;
     this.nextIndex = 0;
     this.switchThreshold = switchThreshold;
+    this.routingMode = 'automatic';
+    this.preferredAccountName = null;
     this.sessionBindings = new Map();
     this.sessionPolicies = new Map();
     this.upstreamThrottle = {
@@ -292,8 +305,7 @@ export class AccountManager {
 
   releaseAccount(lease, outcome = {}) {
     if (!lease?.account) return;
-    const account = this.accounts[lease.account.index];
-    if (!account) return;
+    const account = lease.account;
 
     account.inFlight = Math.max(0, account.inFlight - 1);
     account.activeWeight = Math.max(0, account.activeWeight - lease.weight);
@@ -376,6 +388,7 @@ export class AccountManager {
 
   _isAvailable(account, options = {}) {
     if (!account) return false;
+    if (!account.enabled) return false;
     const now = Date.now();
 
     // Check rate limit expiry
@@ -383,6 +396,7 @@ export class AccountManager {
       if (now < account.rateLimitedUntil) return false;
       account.status = 'active';
       account.rateLimitedUntil = null;
+      account.recoveredAt = now;
       if (account.lastError === 'rate_limited') {
         account.lastError = null;
         account.lastErrorAt = null;
@@ -394,12 +408,14 @@ export class AccountManager {
     if (account.cooldownUntil) {
       if (now < account.cooldownUntil) return false;
       account.cooldownUntil = null;
+      account.recoveredAt = now;
     }
 
     if (account.provisionalUpstreamUntil) {
       if (now < account.provisionalUpstreamUntil) return false;
       account.provisionalUpstreamUntil = null;
       account.provisionalUpstreamFingerprint = null;
+      account.recoveredAt = now;
       if (account.lastError === 'upstream_throttled') {
         account.lastError = null;
         account.lastErrorAt = null;
@@ -748,6 +764,7 @@ export class AccountManager {
       return { cause: 'provider_limit', retryAt: q.genericReset || null, queueable: Boolean(q.genericReset) };
     }
 
+    if (!account.enabled) return { cause: 'disabled', retryAt: null, queueable: false };
     if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
     if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
     return { cause: 'unavailable', retryAt: null, queueable: false };
@@ -761,8 +778,20 @@ export class AccountManager {
     let bestScore = Infinity;
     let bestPriority = Infinity;
     const profile = requestInfo.profile || 'claude';
+    const scoringCtx = this._scoringContext();
 
     const hasBinding = Boolean(requestInfo.sessionKey && this.sessionBindings.has(requestInfo.sessionKey));
+    const preferred = this._preferredAccount(profile, excludedIndexes, requestInfo);
+    if (preferred) {
+      const preferredPasses = [
+        { allowWeeklyReserve: true, allowWeeklyCritical: false },
+        { allowWeeklyReserve: true, allowWeeklyCritical: true },
+      ];
+      if (preferredPasses.some(options => this._isAvailable(preferred, options))) {
+        this.currentIndex = preferred.index;
+        return preferred;
+      }
+    }
     const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo);
     if (bound && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)) return bound;
 
@@ -790,7 +819,7 @@ export class AccountManager {
         if (!this._isAvailable(account, weeklyOptions)) continue;
 
         const priority = Number.isFinite(account.priority) ? account.priority : 0;
-        const score = this._scoreAccount(account, requestInfo);
+        const score = this._scoreAccount(account, requestInfo, scoringCtx);
         if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
           bestPriority = priority;
           bestScore = score;
@@ -818,6 +847,7 @@ export class AccountManager {
 
     for (const account of this.accounts) {
       if (!this._matchesRequest(account, profile, requestInfo)) continue;
+      if (!account.enabled) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -916,6 +946,42 @@ export class AccountManager {
     return Number.isFinite(account?.priority) ? account.priority : 0;
   }
 
+  _preferredAccount(profile, excludedIndexes = new Set(), requestInfo = {}) {
+    if (this.routingMode !== 'preferred' || !this.preferredAccountName) return null;
+    const account = this.accounts.find(candidate => candidate.name === this.preferredAccountName);
+    if (!account || excludedIndexes.has(account.index)) return null;
+    if (!this._matchesRequest(account, profile, requestInfo)) return null;
+    return account;
+  }
+
+  setRoutingMode(mode, preferredAccount = null) {
+    if (mode !== 'preferred') {
+      this.routingMode = 'automatic';
+      this.preferredAccountName = null;
+      return;
+    }
+    const account = this.accounts.find(candidate => candidate.name === preferredAccount);
+    if (!account || account.type === 'provider' || !account.enabled) {
+      this.routingMode = 'automatic';
+      this.preferredAccountName = null;
+      return false;
+    }
+    this.routingMode = 'preferred';
+    this.preferredAccountName = account.name;
+    this.currentIndex = account.index;
+    return true;
+  }
+
+  setAccountEnabled(index, enabled) {
+    const account = this.accounts[index];
+    if (!account) return false;
+    account.enabled = Boolean(enabled);
+    if (!enabled && account.name === this.preferredAccountName) {
+      this.setRoutingMode('automatic');
+    }
+    return true;
+  }
+
   _matchesProfile(account, profile) {
     const profiles = account.profiles || ['claude', 'all'];
     return profiles.includes(profile);
@@ -964,26 +1030,97 @@ export class AccountManager {
     return Boolean(this.sessionPolicies.get(requestInfo.sessionKey)?.requiresAnthropicThinkingIntegrity);
   }
 
-  _scoreAccount(account, requestInfo = {}) {
-    const quotaPressure = this._quotaPressure(account) * 10;
-    const failurePenalty = account.consecutiveFailures * 5;
-    const unknownQuotaBonus = account.quota.unified7dReset == null ? -0.25 : 0;
-    return account.activeWeight + (requestInfo.weight || 1) + quotaPressure + failurePenalty + unknownQuotaBonus;
+  /**
+   * Per-selection context shared across the candidate loop so each account's
+   * recent-load *share* can be computed against the live fleet total exactly
+   * once (rather than O(N) per candidate).
+   */
+  _scoringContext() {
+    const now = Date.now();
+    let fleetRecentWeight = 0;
+    for (const account of this.accounts) {
+      fleetRecentWeight += this._loadSummary(account, this.scheduler.spreadWindowMs, now).weight;
+    }
+    return { now, fleetRecentWeight };
   }
 
-  _quotaPressure(account) {
+  /**
+   * Routing cost — lower is preferred. Composed of independent forces rather
+   * than a single quota ratio:
+   *   - concurrency: never pile concurrent streams on one account (dominant when busy)
+   *   - scarcity:    quota *rate* pressure — high only when an account would burn out
+   *                  before its window resets; ~0 for a near-reset account with quota
+   *                  left (use-it-or-lose-it), so that account is drained, not avoided
+   *   - spread:      recent-load share, so sequential traffic rotates off whoever
+   *                  served last instead of funnelling onto the lowest-quota account
+   *   - ramp:        ease a just-recovered account back in instead of slamming it
+   *   - failures:    direct per-account backoff after errors
+   */
+  _scoreAccount(account, requestInfo = {}, ctx = null) {
+    const now = ctx?.now ?? Date.now();
+    const reqWeight = Math.max(1, requestInfo.weight || 1);
+    const concurrency = account.activeWeight + reqWeight;
+    const scarcity = this._accountScarcity(account, now) * this.scheduler.scarcityWeight;
+
+    const fleetRecentWeight = ctx?.fleetRecentWeight ?? 0;
+    const recentWeight = this._loadSummary(account, this.scheduler.spreadWindowMs, now).weight;
+    const share = fleetRecentWeight > 0 ? recentWeight / fleetRecentWeight : 0;
+    const spread = share * this.scheduler.spreadShareWeight;
+
+    const ramp = this._recoveryRamp(account, now);
+    const failurePenalty = account.consecutiveFailures * 5;
+    // Bias toward an account whose weekly quota is still unknown so it gets
+    // probed and learned (matches the legacy unknown-quota exploration nudge).
+    const explorationBonus = account.quota.unified7dReset == null ? -0.5 : 0;
+
+    return concurrency + scarcity + spread + ramp + failurePenalty + explorationBonus;
+  }
+
+  /**
+   * Quota scarcity in [0, 1+]: the worst (max) pace-overage across all known
+   * windows. Pace overage = how far an account's utilization is *ahead of* an
+   * even burn over the window. It is ~0 when a window is about to reset (the
+   * remaining quota is about to refresh, so it is cheap to spend) and grows
+   * toward 1 for an account burning quota fast early in a long window (the
+   * genuinely scarce case). When a reset time is unknown we fall back to raw
+   * utilization (conservative — no time information to discount by).
+   */
+  _accountScarcity(account, now = Date.now()) {
     const q = account.quota;
-    const values = [];
-    if (q.unified5h != null) values.push(q.unified5h);
-    const weeklyPressure = this._weeklyPressure(account);
-    if (weeklyPressure != null) values.push(weeklyPressure);
+    let scarcity = 0;
+    if (q.unified5h != null) {
+      scarcity = Math.max(scarcity, this._windowScarcity(q.unified5h, q.unified5hReset, FIVE_HOUR_MS, now));
+    }
+    if (q.unified7d != null) {
+      scarcity = Math.max(scarcity, this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now));
+    }
     if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
-      values.push(1 - q.tokensRemaining / q.tokensLimit);
+      scarcity = Math.max(scarcity, 1 - q.tokensRemaining / q.tokensLimit);
     }
     if (q.requestsLimit != null && q.requestsRemaining != null && q.requestsLimit > 0) {
-      values.push(1 - q.requestsRemaining / q.requestsLimit);
+      scarcity = Math.max(scarcity, 1 - q.requestsRemaining / q.requestsLimit);
     }
-    return values.length ? Math.max(...values) : 0;
+    return scarcity;
+  }
+
+  _windowScarcity(util, resetMs, windowLen, now = Date.now()) {
+    const used = clamp01(util);
+    if (!resetMs || resetMs <= now) return used; // unknown / just-reset → face value
+    const remainingMs = Math.max(0, resetMs - now);
+    const elapsedFrac = clamp01((windowLen - remainingMs) / windowLen);
+    return Math.max(0, used - elapsedFrac);
+  }
+
+  /**
+   * Decaying penalty applied for `recoveryRampMs` after an account un-parks,
+   * so a freshly-recovered account (which has ~0 recent load and may look most
+   * attractive) is eased back in rather than instantly slammed back to a limit.
+   */
+  _recoveryRamp(account, now = Date.now()) {
+    if (!account.recoveredAt) return 0;
+    const age = now - account.recoveredAt;
+    if (age < 0 || age >= this.scheduler.recoveryRampMs) return 0;
+    return this.scheduler.recoveryRampWeight * (1 - age / this.scheduler.recoveryRampMs);
   }
 
   _weeklyState(account) {
@@ -1019,21 +1156,6 @@ export class AccountManager {
     if (effective >= this.scheduler.weeklyReserveThreshold) return 'reserve';
     if (effective >= this.scheduler.weeklySoftThreshold) return 'soft';
     return 'normal';
-  }
-
-  _weeklyPressure(account) {
-    if (account.quota.unified7d == null) return null;
-    const used = clamp01(account.quota.unified7d);
-    const effective = this._effectiveWeeklyUsage(account);
-    const paceState = this._weeklyPaceState(account);
-    const statePenalty = paceState === 'critical' || paceState === 'exhausted'
-      ? 0.35
-      : paceState === 'reserve'
-        ? 0.25
-        : paceState === 'soft'
-          ? 0.1
-          : 0;
-    return Math.min(2, Math.max(0, effective * 0.8 + used * 0.2 + statePenalty));
   }
 
   _effectiveWeeklyUsage(account) {
@@ -1234,7 +1356,11 @@ export class AccountManager {
   shouldPromoteUpstreamFailure(incident, requestInfo = {}) {
     if (!incident || incident.accounts.size < 2) return false;
     for (const account of this.accounts) {
-      if (account.type === 'provider' || !this._isRequestCompatible(account, requestInfo.profile || 'claude', requestInfo)) {
+      if (
+        !account.enabled
+        || account.type === 'provider'
+        || !this._isRequestCompatible(account, requestInfo.profile || 'claude', requestInfo)
+      ) {
         continue;
       }
       if (
@@ -1349,6 +1475,7 @@ export class AccountManager {
       modelMap: acctData.modelMap || null,
       stripBetaHeaders: Boolean(acctData.stripBetaHeaders),
       runtime: Boolean(acctData.runtime),
+      enabled: acctData.enabled !== false,
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
       status: 'active',
@@ -1372,6 +1499,7 @@ export class AccountManager {
       provisionalUpstreamUntil: null,
       rateLimitedUntil: null,
       provisionalRateLimitFingerprint: null,
+      recoveredAt: null,
       lastQuotaLogKey: null,
     });
     return index;
@@ -1411,6 +1539,9 @@ export class AccountManager {
    */
   removeAccount(index) {
     if (index < 0 || index >= this.accounts.length) return;
+    const removed = this.accounts[index];
+    if (removed.inFlight > 0) return false;
+    const removedName = removed.name;
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
@@ -1418,6 +1549,10 @@ export class AccountManager {
     } else if (this.currentIndex > index) {
       this.currentIndex--;
     }
+    if (removedName === this.preferredAccountName) {
+      this.setRoutingMode('automatic');
+    }
+    return true;
   }
 
   /**
@@ -1428,10 +1563,15 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      routing: {
+        mode: this.routingMode,
+        preferredAccount: this.preferredAccountName,
+      },
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
         provider: a.provider,
+        enabled: a.enabled,
         upstream: a.upstream,
         profiles: a.profiles,
         priority: a.priority,

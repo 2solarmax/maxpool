@@ -32,6 +32,56 @@ test('adaptive scheduler distributes concurrent leases across healthy accounts',
   assert.deepEqual(am.accounts.map(a => a.inFlight), [0, 0, 0]);
 });
 
+test('preferred routing uses selected account, fails over, and returns after recovery', () => {
+  const am = manager(3);
+  am.setRoutingMode('preferred', 'a2');
+
+  const preferred = am.acquireAccount({ profile: 'claude' });
+  assert.equal(preferred.account.name, 'a2');
+  am.releaseAccount(preferred, { success: true, status: 200 });
+
+  am.markRateLimited(1, 60);
+  const fallback = am.acquireAccount({ profile: 'claude' });
+  assert.notEqual(fallback.account.name, 'a2');
+  am.releaseAccount(fallback, { success: true, status: 200 });
+
+  am.accounts[1].rateLimitedUntil = Date.now() - 1;
+  const recovered = am.acquireAccount({ profile: 'claude' });
+  assert.equal(recovered.account.name, 'a2');
+});
+
+test('disabled account is excluded without being removed', () => {
+  const am = manager(2);
+  am.setAccountEnabled(0, false);
+
+  assert.equal(am.accounts.length, 2);
+  assert.equal(am.accounts[0].enabled, false);
+  assert.equal(am.acquireAccount({ profile: 'claude' }).account.name, 'a2');
+});
+
+test('disabling an in-flight account survives its late successful response', () => {
+  const am = manager(2);
+  const lease = am.acquireAccount({ profile: 'claude' });
+  am.setAccountEnabled(lease.account.index, false);
+  am.releaseAccount(lease, { success: true, status: 200 });
+
+  assert.equal(lease.account.enabled, false);
+  assert.notEqual(am.acquireAccount({ profile: 'claude' }).account.name, lease.account.name);
+});
+
+test('active lease releases correctly after an earlier idle account is removed', () => {
+  const am = manager(3);
+  am.setRoutingMode('preferred', 'a3');
+  const lease = am.acquireAccount({ profile: 'claude' });
+
+  assert.equal(lease.account.name, 'a3');
+  assert.equal(am.removeAccount(0), true);
+  am.releaseAccount(lease, { success: true, status: 200 });
+
+  assert.equal(lease.account.inFlight, 0);
+  assert.equal(lease.account.completedRequests, 1);
+});
+
 test('scheduler skips throttled accounts and resumes them after retry window', () => {
   const am = manager(2);
   am.markRateLimited(0, 60);
@@ -672,4 +722,98 @@ test('load telemetry tracks current and rolling account usage', () => {
   assert.equal(status.load.last1h.requests, 1);
   assert.equal(status.load.last15m.failed, 0);
   assert.ok(status.load.last15m.avgMs >= 0);
+});
+
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+
+test('near-reset account with quota left is preferred (use-it-or-lose-it)', () => {
+  const am = manager(2);
+  const now = Date.now();
+  // a1: high weekly use but resets in 2h -> the remaining quota is about to
+  // refresh, so it is cheap to spend. a2: lower weekly use but resets in 6 days.
+  am.accounts[0].quota.unified7d = 0.79;
+  am.accounts[0].quota.unified7dReset = now + 2 * HOUR;
+  am.accounts[1].quota.unified7d = 0.40;
+  am.accounts[1].quota.unified7dReset = now + 6 * DAY;
+
+  // Scarcity (pace overage) is lower for the near-reset account despite higher %.
+  assert.ok(am._accountScarcity(am.accounts[0], now) < am._accountScarcity(am.accounts[1], now));
+
+  const lease = am.acquireAccount({ weight: 1 });
+  assert.equal(lease.account.name, 'a1');
+});
+
+test('early-week account burning quota fast is avoided as genuinely scarce', () => {
+  const am = manager(2);
+  const now = Date.now();
+  // Both reset in 6 days, but a1 has already burned 80% this early in the week
+  // (ahead of pace -> scarce). a2 is at 30%.
+  am.accounts[0].quota.unified7d = 0.80;
+  am.accounts[0].quota.unified7dReset = now + 6 * DAY;
+  am.accounts[1].quota.unified7d = 0.30;
+  am.accounts[1].quota.unified7dReset = now + 6 * DAY;
+
+  assert.ok(am._accountScarcity(am.accounts[0], now) > am._accountScarcity(am.accounts[1], now));
+
+  const lease = am.acquireAccount({ weight: 1 });
+  assert.equal(lease.account.name, 'a2');
+});
+
+test('recent-load share spreads sequential traffic across equal accounts', () => {
+  const am = manager(2);
+  const now = Date.now();
+  // Identical quota state -> identical scarcity. Without a recent-load term,
+  // sequential traffic would funnel onto whichever account is encountered first.
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.50;
+    a.quota.unified7dReset = now + 3 * DAY;
+    a.quota.unified5h = 0.20;
+    a.quota.unified5hReset = now + 4 * HOUR;
+    a.probing = false;
+  }
+
+  const counts = { a1: 0, a2: 0 };
+  for (let i = 0; i < 20; i++) {
+    const lease = am.acquireAccount({ weight: 1 });
+    counts[lease.account.name]++;
+    am.releaseAccount(lease, { success: true, status: 200 });
+  }
+  // Neither account should be starved; sequential traffic rotates.
+  assert.ok(counts.a1 >= 6, `a1 got ${counts.a1}`);
+  assert.ok(counts.a2 >= 6, `a2 got ${counts.a2}`);
+});
+
+test('recovery ramp eases a just-recovered account back in', () => {
+  const am = manager(2);
+  const now = Date.now();
+  // a1 just recovered from a park; a2 has been idle. The ramp should make the
+  // freshly-recovered account temporarily less attractive so it is not slammed.
+  am.accounts[0].recoveredAt = now;
+  const lease = am.acquireAccount({ weight: 1 });
+  assert.equal(lease.account.name, 'a2');
+  am.releaseAccount(lease, { success: true, status: 200 });
+
+  // Once the ramp window has elapsed, the recovered account is no longer penalized.
+  am.accounts[0].recoveredAt = now - am.scheduler.recoveryRampMs - 1;
+  assert.equal(am._recoveryRamp(am.accounts[0], Date.now()), 0);
+});
+
+test('preferring a provider, disabled, or missing account is rejected and stays automatic', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
+    { name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'http://glm', profiles: ['all'], priority: 10 },
+    { name: 'off', type: 'oauth', accessToken: 'to', refreshToken: 'ro', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0, enabled: false },
+  ], 0.90);
+
+  assert.equal(am.setRoutingMode('preferred', 'glm'), false);      // provider
+  assert.equal(am.routingMode, 'automatic');
+  assert.equal(am.setRoutingMode('preferred', 'off'), false);      // disabled
+  assert.equal(am.routingMode, 'automatic');
+  assert.equal(am.setRoutingMode('preferred', 'missing'), false);  // missing
+  assert.equal(am.routingMode, 'automatic');
+
+  assert.equal(am.setRoutingMode('preferred', 'claude'), true);    // valid
+  assert.equal(am.routingMode, 'preferred');
+  assert.equal(am.preferredAccountName, 'claude');
 });

@@ -8,6 +8,7 @@ import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
+import { resolveAccounts } from './account-config.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -131,6 +132,10 @@ async function serverWorkerCommand() {
 
   const threshold = config.switchThreshold || 0.90;
   const accountManager = new AccountManager(accounts, threshold, config.scheduler || {});
+  accountManager.setRoutingMode(
+    config.routing?.mode,
+    config.routing?.preferredAccount,
+  );
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -138,10 +143,11 @@ async function serverWorkerCommand() {
     const account = accountManager.accounts[idx];
     if (!account) return;
     // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-    if (config.accounts[idx]) {
-      config.accounts[idx].accessToken = newTokens.accessToken;
-      config.accounts[idx].refreshToken = newTokens.refreshToken;
-      config.accounts[idx].expiresAt = newTokens.expiresAt;
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx >= 0) {
+      config.accounts[memIdx].accessToken = newTokens.accessToken;
+      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
+      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
     }
     atomicConfigUpdate(diskConfig => {
       // Pick up any new accounts from disk so index matching stays correct
@@ -259,11 +265,17 @@ async function serverWorkerCommand() {
     tui = new TUI({
       accountManager, config,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
+        diskConfig.routing = {
+          mode: config.routing?.mode || 'automatic',
+          preferredAccount: config.routing?.preferredAccount || null,
+        };
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
         // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map((a, i) => {
-          const am = accountManager.accounts[i];
+        diskConfig.accounts = config.accounts.map(a => {
+          const am = accountManager.accounts.find(candidate =>
+            (a.accountUuid && candidate.accountUuid === a.accountUuid) || candidate.name === a.name
+          );
           const live = am ? {
             ...a,
             accessToken: am.credential,
@@ -526,7 +538,11 @@ async function statusCommand() {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
 
-    console.log(`Active account: ${data.currentAccount}`);
+    const routing = data.routing?.mode === 'preferred'
+      ? `prefer ${data.routing.preferredAccount} with automatic failover`
+      : 'automatic load balancing';
+    console.log(`Routing:        ${routing}`);
+    console.log(`Last selected:  ${data.currentAccount}`);
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
     if (data.upstreamThrottle?.active || data.upstreamThrottle?.queued) {
       const state = data.upstreamThrottle.active
@@ -544,7 +560,7 @@ async function statusCommand() {
       const current = acct.name === data.currentAccount ? ' *' : '';
 
       console.log(`  ${acct.name} (${acct.type})${current}`);
-      console.log(`    Status:   ${acct.status}`);
+      console.log(`    Status:   ${acct.enabled === false ? 'disabled' : acct.status}`);
       console.log(`    Load:     current ${acct.load?.current?.inFlight || 0}/${acct.load?.current?.activeWeight || 0} weight, 15m ${formatLoadWindow(acct.load?.last15m)}, 1h ${formatLoadWindow(acct.load?.last1h)}`);
 
       if (acct.type === 'provider') {
@@ -891,6 +907,12 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       (diskAcct.accountUuid && a.accountUuid === diskAcct.accountUuid) || a.name === diskAcct.name
     );
     if (!mgr) continue;
+    const enabled = diskAcct.enabled !== false;
+    if (mgr.enabled !== enabled) {
+      accountManager.setAccountEnabled(mgr.index, enabled);
+      console.log(`[TeamClaude] ${enabled ? 'Enabled' : 'Disabled'} account "${mgr.name}" from config`);
+    }
+    memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct };
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
@@ -913,36 +935,21 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       console.log(`[TeamClaude] Updated provider token for "${mgr.name}"`);
     }
   }
+  memConfig.routing = {
+    mode: diskConfig.routing?.mode || 'automatic',
+    preferredAccount: diskConfig.routing?.preferredAccount || null,
+  };
+  const preferredApplied = accountManager.setRoutingMode(
+    memConfig.routing.mode,
+    memConfig.routing.preferredAccount,
+  );
+  if (memConfig.routing.mode === 'preferred' && !preferredApplied) {
+    memConfig.routing = { mode: 'automatic', preferredAccount: null };
+  }
   return added;
 }
 
 // ── helpers ─────────────────────────────────────────────────
-
-async function resolveAccounts(config) {
-  const accounts = [];
-  for (const acct of config.accounts) {
-    if (acct.type === 'oauth') {
-      if (acct.importFrom) {
-        try {
-          const creds = await importCredentials(acct.importFrom);
-          accounts.push({ name: acct.name, type: 'oauth', ...creds });
-          console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
-        } catch (err) {
-          console.error(`Failed to import "${acct.name}": ${err.message}`);
-        }
-      } else if (acct.accessToken) {
-        accounts.push(acct);
-      } else {
-        console.error(`No token for "${acct.name}", skipping`);
-      }
-    } else if (acct.type === 'apikey' && acct.apiKey) {
-      accounts.push(acct);
-    } else if (acct.type === 'provider' && (acct.authToken || acct.apiKey)) {
-      accounts.push(acct);
-    }
-  }
-  return accounts;
-}
 
 function argValue(flag) {
   const i = args.indexOf(flag);

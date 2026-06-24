@@ -179,12 +179,16 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input
-    this.selAction = null;   // switch | remove
+    this.mode = 'normal';    // normal | accounts | routing | select | input | confirm
+    this.selAction = null;   // prefer | toggle | delete
     this.selIdx = 0;
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
+    this.inputSensitive = false;
+    this.confirmTitle = '';
+    this.confirmDetail = '';
+    this.confirmCb = null;
     this.frame = 0;
     this.running = false;
     this.timer = null;
@@ -269,9 +273,28 @@ export class TUI {
     if (d === '\x1b[A') return this._key('up');
     if (d === '\x1b[B') return this._key('down');
     if (d === '\x1b') return this._key('esc');
-    if (d === '\r' || d === '\n') return this._key('enter');
     if (d === '\x03') return this._key('ctrl-c');
     if (d === '\x7f' || d === '\x08') return this._key('bs');
+
+    // Input mode accepts typed AND pasted text. A terminal delivers a paste as
+    // one multi-char chunk — often wrapped in bracketed-paste markers and/or
+    // ending in a newline. Sanitize the chunk instead of all-or-nothing
+    // rejecting it (which silently dropped pasted API keys): strip the paste
+    // markers, take the text up to the first newline, drop control chars, append
+    // it, and treat an embedded newline as Enter (submit).
+    if (this.mode === 'input') {
+      const cleaned = d.replace(/\x1b\[20[01]~/g, '');
+      const nlIdx = cleaned.search(/[\r\n]/);
+      const typed = (nlIdx === -1 ? cleaned : cleaned.slice(0, nlIdx))
+        .split('')
+        .filter(c => c >= ' ' && c !== '\x7f')
+        .join('');
+      if (typed) { this.inputBuf += typed; this.render(); }
+      if (nlIdx !== -1) return this._key('enter');
+      return;
+    }
+
+    if (d === '\r' || d === '\n') return this._key('enter');
     if (d.length === 1 && d >= ' ') return this._key(d);
   }
 
@@ -280,63 +303,190 @@ export class TUI {
 
     switch (this.mode) {
       case 'normal': this._keyNormal(k); break;
+      case 'accounts': this._keyAccounts(k); break;
+      case 'routing': this._keyRouting(k); break;
       case 'select': this._keySelect(k); break;
-      case 'add':    this._keyAdd(k); break;
       case 'input':  this._keyInput(k); break;
+      case 'confirm': this._keyConfirm(k); break;
     }
     this.render();
   }
 
   _keyNormal(k) {
-    if (k === 'q') { this.stop(); this.onQuit?.(); }
-    else if (k === 'x') { this.stop(); this.onRestart?.(); }
-    else if (k === 's' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex;
+    if (k === 'q') {
+      this._confirm(
+        'Stop TeamClaude?',
+        'New requests will stop; active requests will drain before the server exits.',
+        () => { this.stop(); this.onQuit?.(); },
+      );
+    } else if (k === 'r') {
+      this._confirm(
+        'Restart TeamClaude?',
+        'Pause new requests, drain active work, then start the updated server.',
+        () => { this.stop(); this.onRestart?.(); },
+      );
+    } else if (k === 'a') {
+      this.mode = 'accounts';
+    } else if (k === 'm') {
+      this.mode = 'routing';
+    } else if (k === 's') {
+      this._confirm(
+        'Sync accounts now?',
+        'Reload account credentials and newly added accounts from the config file.',
+        () => this._doSync(),
+      );
     }
-    else if (k === 'r' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0;
+  }
+
+  _keyAccounts(k) {
+    if (k === 'i') {
+      this._confirm(
+        'Import current Claude login?',
+        'Add or update the account currently logged into Claude Code.',
+        () => this._doImport(),
+      );
+    } else if (k === 'k') {
+      this.mode = 'input';
+      this.inputPrompt = 'Anthropic API key';
+      this.inputBuf = '';
+      this.inputSensitive = true;
+      this.inputCb = value => {
+        if (!value) return;
+        this._confirm(
+          'Add this API key?',
+          'Store it in TeamClaude config as a new Anthropic API account.',
+          () => this._doAddKey(value),
+        );
+      };
+    } else if (k === 't' && this.am.accounts.length > 0) {
+      this._startSelection('toggle');
+    } else if (k === 'd' && this.am.accounts.length > 0) {
+      this._startSelection('delete');
+    } else if (k === 'esc' || k === 'q') {
+      this.mode = 'normal';
     }
-    else if (k === 'a') { this.mode = 'add'; }
-    else if (k === 'R') { this._doSync(); }
+  }
+
+  _keyRouting(k) {
+    if (k === 'a') {
+      this._confirm(
+        'Use automatic routing?',
+        'Spread new requests across healthy accounts using load, quota, and recent errors.',
+        () => this._setAutomaticRouting(),
+      );
+    } else if (k === 'p' && this.am.accounts.some(account => account.type !== 'provider')) {
+      this._startSelection('prefer');
+    } else if (k === 'esc' || k === 'q') {
+      this.mode = 'normal';
+    }
   }
 
   _keySelect(k) {
-    const len = this.am.accounts.length;
-    if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
-    else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
+    const selectable = this._selectableIndexes(this.selAction);
+    const position = Math.max(0, selectable.indexOf(this.selIdx));
+    if (k === 'up' || k === 'k') this.selIdx = selectable[Math.max(0, position - 1)] ?? this.selIdx;
+    else if (k === 'down' || k === 'j') this.selIdx = selectable[Math.min(selectable.length - 1, position + 1)] ?? this.selIdx;
     else if (k === 'enter') {
-      if (this.selAction === 'switch') {
-        this.am.currentIndex = this.selIdx;
-        this._addLog(`Switched to "${this.am.accounts[this.selIdx].name}"`);
-      } else {
-        this._doRemove(this.selIdx);
+      const account = this.am.accounts[this.selIdx];
+      if (!account) {
+        this.mode = 'normal';
+        return;
       }
-      this.mode = 'normal';
+      if (this.selAction === 'prefer') {
+        if (account.type === 'provider') {
+          this._addLog('Manual preference is available only for Claude accounts');
+          return;
+        }
+        if (!account.enabled) {
+          this._addLog(`Enable "${account.name}" before selecting it as the manual preference`);
+          return;
+        }
+        this._confirm(
+          `Use manual preference for "${account.name}"?`,
+          'Move idle sessions on their next request; fail over and return automatically.',
+          () => this._setPreferredRouting(account.name),
+        );
+      } else if (this.selAction === 'toggle') {
+        const enable = !account.enabled;
+        this._confirm(
+          `${enable ? 'Enable' : 'Disable'} "${account.name}"?`,
+          enable
+            ? 'Allow this account to receive new requests again.'
+            : 'Stop assigning new requests to it. Active requests will continue.',
+          () => this._doToggle(this.selIdx, enable),
+        );
+      } else if (this.selAction === 'delete') {
+        this._confirm(
+          `Delete "${account.name}"?`,
+          'Permanently remove it from TeamClaude config. Deletion is blocked while it has active requests.',
+          () => this._doDelete(this.selIdx),
+        );
+      }
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
   }
 
-  _keyAdd(k) {
-    if (k === 'i') { this._doImport(); this.mode = 'normal'; }
-    else if (k === 'k') {
-      this.mode = 'input';
-      this.inputPrompt = 'API key';
-      this.inputBuf = '';
-      this.inputCb = v => { if (v) this._doAddKey(v); };
+  _startSelection(action) {
+    const selectable = this._selectableIndexes(action);
+    if (!selectable.length) {
+      this._addLog(action === 'prefer'
+        ? 'No enabled Claude account is available for manual preference'
+        : 'No configurable account is available for this action');
+      return;
     }
-    else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+    this.mode = 'select';
+    this.selAction = action;
+    this.selIdx = selectable.includes(this.am.currentIndex) ? this.am.currentIndex : selectable[0];
+  }
+
+  _selectableIndexes(action) {
+    return this.am.accounts
+      .map((account, index) => ({ account, index }))
+      .filter(({ account }) => {
+        if (action === 'prefer') return account.type !== 'provider' && account.enabled;
+        return this._configAccountIndex(account) >= 0;
+      })
+      .map(({ index }) => index);
   }
 
   _keyInput(k) {
     if (k === 'enter') {
       const cb = this.inputCb;
       const v = this.inputBuf;
-      this.mode = 'normal'; this.inputCb = null; this.inputBuf = '';
+      this.mode = 'normal'; this.inputCb = null; this.inputBuf = ''; this.inputSensitive = false;
       cb?.(v);
     }
-    else if (k === 'esc') { this.mode = 'normal'; this.inputCb = null; this.inputBuf = ''; }
+    else if (k === 'esc') {
+      this.mode = 'normal'; this.inputCb = null; this.inputBuf = ''; this.inputSensitive = false;
+    }
     else if (k === 'bs') { this.inputBuf = this.inputBuf.slice(0, -1); }
     else if (k.length === 1) { this.inputBuf += k; }
+  }
+
+  _keyConfirm(k) {
+    if (k === 'y') {
+      const cb = this.confirmCb;
+      this._clearConfirm();
+      Promise.resolve(cb?.()).catch(error => {
+        this._addLog(`Action failed: ${error.message}`);
+      });
+    } else if (k === 'n' || k === 'esc' || k === 'q') {
+      this._clearConfirm();
+    }
+  }
+
+  _confirm(title, detail, cb) {
+    this.mode = 'confirm';
+    this.confirmTitle = title;
+    this.confirmDetail = detail;
+    this.confirmCb = cb;
+  }
+
+  _clearConfirm() {
+    this.mode = 'normal';
+    this.confirmTitle = '';
+    this.confirmDetail = '';
+    this.confirmCb = null;
   }
 
   // ── account operations ─────────────────────────────
@@ -391,9 +541,19 @@ export class TUI {
       if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
 
       if (idx >= 0) {
+        const previous = this.config.accounts[idx];
+        entry.enabled = this.config.accounts[idx].enabled;
         this.config.accounts[idx] = entry;
+        try {
+          await this.saveConfig(this.config);
+        } catch (error) {
+          this.config.accounts[idx] = previous;
+          throw error;
+        }
         // Update the running account manager entry
-        const amAcct = this.am.accounts[idx];
+        const amAcct = this.am.accounts.find(account =>
+          (entry.accountUuid && account.accountUuid === entry.accountUuid) || account.name === name
+        );
         if (amAcct) {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
@@ -405,33 +565,145 @@ export class TUI {
         this._addLog(`Updated account "${name}"`);
       } else {
         this.config.accounts.push(entry);
+        try {
+          await this.saveConfig(this.config);
+        } catch (error) {
+          this.config.accounts.pop();
+          throw error;
+        }
         this.am.addAccount(entry);
         this._addLog(`Imported account "${name}"`);
       }
-
-      await this.saveConfig(this.config);
     } catch (e) {
       this._addLog(`Import failed: ${e.message}`);
     }
   }
 
   async _doAddKey(apiKey) {
+    const key = String(apiKey || '').trim();
+    if (!key) { this._addLog('No API key entered'); return; }
     const n = this.config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
     const name = `api-${n}`;
-    this.config.accounts.push({ name, type: 'apikey', apiKey });
-    this.am.addAccount({ name, type: 'apikey', apiKey });
-    await this.saveConfig(this.config);
+    const entry = { name, type: 'apikey', apiKey: key };
+    this.config.accounts.push(entry);
+    try {
+      await this.saveConfig(this.config);
+    } catch (error) {
+      this.config.accounts.pop();
+      throw error;
+    }
+    this.am.addAccount(entry);
     this._addLog(`Added API key account "${name}"`);
   }
 
-  async _doRemove(idx) {
+  async _setAutomaticRouting() {
+    const previous = this.config.routing;
+    this.config.routing = { mode: 'automatic', preferredAccount: null };
+    try {
+      await this.saveConfig(this.config);
+    } catch (error) {
+      this.config.routing = previous;
+      throw error;
+    }
+    this.am.setRoutingMode('automatic');
+    this._addLog('Routing set to automatic load balancing');
+  }
+
+  async _setPreferredRouting(name) {
+    const account = this.am.accounts.find(candidate => candidate.name === name);
+    if (!account?.enabled || account.type === 'provider') {
+      throw new Error(`Claude account "${name}" must be enabled before it can be preferred`);
+    }
+    const previous = this.config.routing;
+    this.config.routing = { mode: 'preferred', preferredAccount: name };
+    try {
+      await this.saveConfig(this.config);
+    } catch (error) {
+      this.config.routing = previous;
+      throw error;
+    }
+    this.am.setRoutingMode('preferred', name);
+    this._addLog(`Routing now prefers "${name}" with automatic failover`);
+  }
+
+  _configAccountIndex(account) {
+    if (!account) return -1;
+    if (account.accountUuid) {
+      const byUuid = this.config.accounts.findIndex(candidate => candidate.accountUuid === account.accountUuid);
+      if (byUuid >= 0) return byUuid;
+    }
+    return this.config.accounts.findIndex(candidate => candidate.name === account.name);
+  }
+
+  async _doToggle(idx, enabled) {
+    const account = this.am.accounts[idx];
+    if (!account) return;
+    const configIndex = this._configAccountIndex(account);
+    if (configIndex < 0) {
+      this._addLog(`Cannot ${enabled ? 'enable' : 'disable'} runtime provider "${account.name}" here`);
+      return;
+    }
+    const previous = this.config.accounts[configIndex].enabled;
+    this.config.accounts[configIndex].enabled = enabled;
+    const previousRouting = this.config.routing;
+    const resetsRouting = !enabled && this.config.routing?.preferredAccount === account.name;
+    if (resetsRouting) {
+      this.config.routing = { mode: 'automatic', preferredAccount: null };
+    }
+    try {
+      await this.saveConfig(this.config);
+    } catch (error) {
+      this.config.accounts[configIndex].enabled = previous;
+      this.config.routing = previousRouting;
+      throw error;
+    }
+    this.am.setAccountEnabled(idx, enabled);
+    this._addLog(`${enabled ? 'Enabled' : 'Disabled'} account "${account.name}"`);
+  }
+
+  async _doDelete(idx) {
     if (idx < 0 || idx >= this.am.accounts.length) return;
-    const name = this.am.accounts[idx].name;
-    this.am.removeAccount(idx);
-    this.config.accounts.splice(idx, 1);
+    const account = this.am.accounts[idx];
+    const name = account.name;
+    if (account.inFlight > 0) {
+      this._addLog(`Cannot delete "${name}" while ${account.inFlight} request(s) are active; disable it and retry when idle`);
+      return;
+    }
+    const configIndex = this._configAccountIndex(account);
+    if (configIndex < 0) {
+      this._addLog(`Cannot permanently delete runtime provider "${name}" from the TUI`);
+      return;
+    }
+    const wasEnabled = account.enabled;
+    this.am.setAccountEnabled(idx, false);
+    if (account.inFlight > 0) {
+      this.am.setAccountEnabled(idx, wasEnabled);
+      this._addLog(`Cannot delete "${name}" because a request started; the account was not changed`);
+      return;
+    }
+
+    const [removedConfig] = this.config.accounts.splice(configIndex, 1);
+    const previousRouting = this.config.routing;
+    if (this.config.routing?.preferredAccount === name) {
+      this.config.routing = { mode: 'automatic', preferredAccount: null };
+    }
+    try {
+      await this.saveConfig(this.config);
+    } catch (error) {
+      this.config.accounts.splice(configIndex, 0, removedConfig);
+      this.config.routing = previousRouting;
+      this.am.setAccountEnabled(idx, wasEnabled);
+      throw error;
+    }
+    if (!this.am.removeAccount(idx)) {
+      this.config.accounts.splice(configIndex, 0, removedConfig);
+      this.config.routing = previousRouting;
+      this.am.setAccountEnabled(idx, wasEnabled);
+      await this.saveConfig(this.config);
+      throw new Error(`Account "${name}" became active before deletion completed`);
+    }
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
-    await this.saveConfig(this.config);
-    this._addLog(`Removed account "${name}"`);
+    this._addLog(`Deleted account "${name}"`);
   }
 
   // ── rendering ──────────────────────────────────────
@@ -469,6 +741,10 @@ export class TUI {
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
+    const routing = this.am.routingMode === 'preferred'
+      ? `Manual preference: ${this.am.preferredAccountName} (automatic failover)`
+      : 'Automatic load balancing';
+    lines.push(` Routing  ${cyan(routing)}`);
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     if (this.am._isUpstreamThrottleBlocking?.() || queuedCount) {
       const throttle = this.am.upstreamThrottle;
@@ -515,7 +791,7 @@ export class TUI {
     }
 
     // Completed log
-    const footerH = 2;
+    const footerH = this.mode === 'confirm' ? 3 : 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
       lines.push(`   ${gray(this.log[i].t)}  ${this.log[i].msg}`);
@@ -526,6 +802,7 @@ export class TUI {
 
     // ── Footer
     lines.push(' ' + dim('─'.repeat(W - 2)));
+    if (this.mode === 'confirm') lines.push(` ${this.confirmDetail}`);
     lines.push(this._renderFooter());
 
     // Write buffer
@@ -541,7 +818,7 @@ export class TUI {
 
   _renderAcct(idx, bw, showBoth) {
     const a = this.am.accounts[idx];
-    const isCur = idx === this.am.currentIndex;
+    const isCur = this.am.routingMode === 'preferred' && a.name === this.am.preferredAccountName;
     const isSel = this.mode === 'select' && idx === this.selIdx;
 
     // Prefix: selection marker + current marker
@@ -557,10 +834,21 @@ export class TUI {
 
     // Status
     let status;
-    const upstreamPaused = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
-    switch (upstreamPaused ? 'paused' : a.status) {
+    // A shared upstream throttle holds the whole Claude pool, not any one
+    // account. Don't mislabel healthy accounts as per-account "paused": show
+    // the one running the recovery probe as "probing" and the rest "waiting"
+    // (the pool-wide throttle banner above conveys the cause).
+    const upstreamBlocking = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
+    let effectiveStatus = a.enabled === false ? 'disabled' : a.status;
+    if (a.enabled !== false && upstreamBlocking && a.status === 'active') {
+      effectiveStatus = a.inFlight > 0 ? 'probing' : 'waiting';
+    }
+    switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
+      case 'probing':   status = green('probing'); break;
+      case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
+      case 'disabled':  status = gray('disabled'); break;
       case 'throttled': status = yellow('throttled'); break;
       case 'exhausted': status = red('exhausted'); break;
       case 'error':     status = red('error'); break;
@@ -635,15 +923,23 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('R')}eload  ${bold('x')}restart  ${bold('q')}uit`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
+      case 'accounts':
+        return ` ${bold('i')} Import Claude login  ${bold('k')} API key  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+      case 'routing':
+        return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('Esc')} Back`;
       case 'select': {
-        const act = this.selAction === 'switch' ? 'switch' : 'remove';
+        const act = this.selAction === 'prefer'
+          ? 'prefer'
+          : this.selAction === 'toggle'
+            ? 'enable/disable'
+            : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
-      case 'add':
-        return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
-        return ` ${this.inputPrompt}: ${this.inputBuf}█`;
+        return ` ${this.inputPrompt}: ${this.inputSensitive ? '•'.repeat(this.inputBuf.length) : this.inputBuf}█`;
+      case 'confirm':
+        return ` ${bold(this.confirmTitle)}  ${bold('y')} Yes  ${bold('n')} No`;
       default:
         return '';
     }

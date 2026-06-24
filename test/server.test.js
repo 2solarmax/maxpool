@@ -151,6 +151,43 @@ test('Anthropic 529 fails over to another Claude account before opening shared b
   }
 });
 
+test('Anthropic 500 fails over to another Claude account instead of passing through', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    if (req.headers.authorization === 'Bearer t1') {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Internal server error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20, heartbeatMs: 50 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /message_delta/);
+    assert.deepEqual(seen, ['Bearer t1', 'Bearer t2']);
+    assert.ok(am.accounts[0].cooldownUntil > Date.now());
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('matching Anthropic 529s from two Claude accounts promote to shared breaker', async () => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
