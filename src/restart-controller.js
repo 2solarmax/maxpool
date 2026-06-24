@@ -41,7 +41,7 @@ export class RestartController {
 
     this.pending = true;
     const queuedOrIdle = Math.max(0, this.activeRequests.size - this.upstreamRequests.size);
-    this.log(`[TeamClaude] Restart pending; admission paused while ${this.upstreamRequests.size} upstream request(s) finish. ${queuedOrIdle} queued/idle request(s) will reconnect after restart.`);
+    this.log(`[Maxpool] Restart pending; admission paused while ${this.upstreamRequests.size} upstream request(s) finish. ${queuedOrIdle} queued/idle request(s) will reconnect after restart.`);
   }
 
   _maybeRestart() {

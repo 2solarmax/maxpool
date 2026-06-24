@@ -1,27 +1,40 @@
 {
-  "name": "@karpeleslab/teamclaude",
-  "version": "1.0.6",
-  "description": "Multi-account Claude proxy with automatic quota-based rotation",
+  "name": "maxpool",
+  "version": "1.0.0",
+  "description": "Multi-account Claude Code proxy with adaptive, rate-aware load balancing across Claude accounts",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "teamclaude": "src/index.js"
+    "maxpool": "src/index.js"
   },
   "files": [
-    "src/"
+    "src/",
+    "LICENSE"
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "lint": "eslint src/ test/"
   },
   "keywords": [
     "claude",
+    "claude-code",
     "anthropic",
     "proxy",
     "load-balancer",
+    "rate-limit",
     "multi-account"
   ],
+  "author": "Max Krasnykh",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2solarmax/maxpool.git"
+  },
+  "homepage": "https://github.com/2solarmax/maxpool#readme",
+  "bugs": {
+    "url": "https://github.com/2solarmax/maxpool/issues"
+  },
   "engines": {
     "node": ">=18.0.0"
   }

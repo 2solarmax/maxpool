@@ -374,7 +374,7 @@ test('provider 529 remains provider-scoped and fails over', async () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-teamclaude-profile': 'all',
+        'x-maxpool-profile': 'all',
       },
       body: JSON.stringify({ model: 'test', messages: [] }),
     });
@@ -558,9 +558,9 @@ test('queued streaming request receives heartbeats and then the recovered upstre
     });
     assert.equal(res.status, 200);
     const text = await res.text();
-    assert.match(text, /: teamclaude queued/);
+    assert.match(text, /: maxpool queued/);
     assert.match(text, /"type":"message_delta"/);
-    assert.ok(text.match(/: teamclaude queued/g).length >= 2);
+    assert.ok(text.match(/: maxpool queued/g).length >= 2);
     assert.equal(am.getStatus().upstreamThrottle.active, false);
   } finally {
     await close(proxy);
@@ -606,7 +606,7 @@ test('queued streaming request terminates with SSE error when recovery returns 4
       signal: AbortSignal.timeout(4000),
     });
     const text = await res.text();
-    assert.match(text, /: teamclaude queued/);
+    assert.match(text, /: maxpool queued/);
     assert.match(text, /event: error/);
     assert.match(text, /invalid_request_error/);
     assert.equal(am.getStatus().upstreamThrottle.probeInFlight, false);
@@ -650,7 +650,7 @@ test('queued streaming request terminates with SSE error when recovery connectio
       signal: AbortSignal.timeout(4000),
     });
     const text = await res.text();
-    assert.match(text, /: teamclaude queued/);
+    assert.match(text, /: maxpool queued/);
     assert.match(text, /event: error/);
     assert.match(text, /connection_unavailable/);
     assert.equal(am.getStatus().upstreamThrottle.probeInFlight, false);
@@ -1105,7 +1105,7 @@ test('all profile adds runtime GLM fallback and rewrites provider request', asyn
     for await (const chunk of req) chunks.push(chunk);
     glmSeen.push({
       auth: req.headers.authorization,
-      internalHeader: req.headers['x-teamclaude-zai-token'],
+      internalHeader: req.headers['x-maxpool-zai-token'],
       beta: req.headers['anthropic-beta'],
       body: JSON.parse(Buffer.concat(chunks).toString()),
     });
@@ -1134,12 +1134,12 @@ test('all profile adds runtime GLM fallback and rewrites provider request', asyn
       headers: {
         'content-type': 'application/json',
         'anthropic-beta': 'test-beta',
-        'x-teamclaude-profile': 'all',
-        'x-teamclaude-zai-token': 'zg',
-        'x-teamclaude-zai-base-url': `http://127.0.0.1:${glmPort}`,
-        'x-teamclaude-zai-opus-model': 'glm-opus',
-        'x-teamclaude-zai-sonnet-model': 'glm-sonnet',
-        'x-teamclaude-zai-haiku-model': 'glm-haiku',
+        'x-maxpool-profile': 'all',
+        'x-maxpool-zai-token': 'zg',
+        'x-maxpool-zai-base-url': `http://127.0.0.1:${glmPort}`,
+        'x-maxpool-zai-opus-model': 'glm-opus',
+        'x-maxpool-zai-sonnet-model': 'glm-sonnet',
+        'x-maxpool-zai-haiku-model': 'glm-haiku',
       },
       body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
     });
@@ -1196,10 +1196,10 @@ test('thinking history disables provider fallback in all profile', async () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-teamclaude-profile': 'all',
-        'x-teamclaude-session': 'thinking-session',
-        'x-teamclaude-zai-token': 'zg',
-        'x-teamclaude-zai-base-url': `http://127.0.0.1:${glmPort}`,
+        'x-maxpool-profile': 'all',
+        'x-maxpool-session': 'thinking-session',
+        'x-maxpool-zai-token': 'zg',
+        'x-maxpool-zai-base-url': `http://127.0.0.1:${glmPort}`,
       },
       body: JSON.stringify({
         model: 'claude-sonnet-test',
@@ -1254,8 +1254,8 @@ test('Claude thinking response marks session as provider-protected', async () =>
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-teamclaude-profile': 'all',
-        'x-teamclaude-session': 'response-thinking-session',
+        'x-maxpool-profile': 'all',
+        'x-maxpool-session': 'response-thinking-session',
       },
       body: JSON.stringify({ model: 'claude-sonnet-test', messages: [{ role: 'user', content: 'think' }] }),
     });
@@ -1292,9 +1292,9 @@ test('Z.AI 429 body reset hint controls provider cooldown when retry-after is mi
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-teamclaude-profile': 'all',
-        'x-teamclaude-zai-token': 'zg',
-        'x-teamclaude-zai-base-url': `http://127.0.0.1:${zaiPort}`,
+        'x-maxpool-profile': 'all',
+        'x-maxpool-zai-token': 'zg',
+        'x-maxpool-zai-base-url': `http://127.0.0.1:${zaiPort}`,
       },
       body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
     });
@@ -1336,9 +1336,9 @@ test('Kimi 429 body wait hint controls provider cooldown when retry-after is mis
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-teamclaude-profile': 'all',
-        'x-teamclaude-kimi-token': 'kk',
-        'x-teamclaude-kimi-base-url': `http://127.0.0.1:${kimiPort}`,
+        'x-maxpool-profile': 'all',
+        'x-maxpool-kimi-token': 'kk',
+        'x-maxpool-kimi-base-url': `http://127.0.0.1:${kimiPort}`,
       },
       body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
     });
@@ -1377,9 +1377,9 @@ test('provider 403 disables fallback and is not counted as success', async () =>
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-teamclaude-profile': 'all',
-        'x-teamclaude-kimi-token': 'kk',
-        'x-teamclaude-kimi-base-url': `http://127.0.0.1:${kimiPort}`,
+        'x-maxpool-profile': 'all',
+        'x-maxpool-kimi-token': 'kk',
+        'x-maxpool-kimi-base-url': `http://127.0.0.1:${kimiPort}`,
       },
       body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
     });
@@ -1408,10 +1408,10 @@ test('status endpoint requires proxy api key even from loopback', async () => {
   const proxyPort = await listen(proxy);
 
   try {
-    const noKey = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/status`);
+    const noKey = await fetch(`http://127.0.0.1:${proxyPort}/maxpool/status`);
     assert.equal(noKey.status, 401);
 
-    const withKey = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/status`, {
+    const withKey = await fetch(`http://127.0.0.1:${proxyPort}/maxpool/status`, {
       headers: { 'x-api-key': 'tc-test' },
     });
     assert.equal(withKey.status, 200);

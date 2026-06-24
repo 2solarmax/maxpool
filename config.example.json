@@ -2,7 +2,7 @@
   "proxy": {
     "host": "127.0.0.1",
     "port": 3456,
-    "apiKey": "tc-change-me-to-a-secret"
+    "apiKey": "mp-change-me-to-a-secret"
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.90,

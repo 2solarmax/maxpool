@@ -17,15 +17,15 @@ test('default config uses automatic routing', () => {
 });
 
 async function withTempConfig(fn) {
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-cfg-'));
-  const path = join(dir, 'teamclaude.json');
-  const prev = process.env.TEAMCLAUDE_CONFIG;
-  process.env.TEAMCLAUDE_CONFIG = path;
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-cfg-'));
+  const path = join(dir, 'maxpool.json');
+  const prev = process.env.MAXPOOL_CONFIG;
+  process.env.MAXPOOL_CONFIG = path;
   try {
     return await fn(dir, path);
   } finally {
-    if (prev === undefined) delete process.env.TEAMCLAUDE_CONFIG;
-    else process.env.TEAMCLAUDE_CONFIG = prev;
+    if (prev === undefined) delete process.env.MAXPOOL_CONFIG;
+    else process.env.MAXPOOL_CONFIG = prev;
     await rm(dir, { recursive: true, force: true });
   }
 }

@@ -402,7 +402,7 @@ export class AccountManager {
         account.lastErrorAt = null;
         account.provisionalRateLimitFingerprint = null;
       }
-      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
+      console.log(`[Maxpool] Account "${account.name}" rate limit expired, marking active`);
     }
 
     if (account.cooldownUntil) {
@@ -450,7 +450,7 @@ export class AccountManager {
     this.upstreamThrottle.probeInFlight = false;
     this.upstreamThrottle.count++;
     this.upstreamThrottle.lastAt = Date.now();
-    console.log(`[TeamClaude] Anthropic upstream temporarily limiting requests for ${retryAfter}s; pausing Claude routes`);
+    console.log(`[Maxpool] Anthropic upstream temporarily limiting requests for ${retryAfter}s; pausing Claude routes`);
   }
 
   clearUpstreamThrottle(reason = 'recovered') {
@@ -460,7 +460,7 @@ export class AccountManager {
     this.upstreamThrottle.probeInFlight = false;
     this.queueState.rampUntil = Date.now() + 5000;
     this.queueState.lastAdmissionAt = Date.now();
-    console.log(`[TeamClaude] Anthropic upstream throttle cleared (${reason})`);
+    console.log(`[Maxpool] Anthropic upstream throttle cleared (${reason})`);
   }
 
   confirmUpstreamProbe(lease) {
@@ -476,7 +476,7 @@ export class AccountManager {
     this.upstreamThrottle.reason = reason;
     this.upstreamThrottle.probeInFlight = false;
     this.upstreamThrottle.lastAt = Date.now();
-    console.log(`[TeamClaude] Anthropic recovery probe failed; retrying in ${retryAfter}s (${reason})`);
+    console.log(`[Maxpool] Anthropic recovery probe failed; retrying in ${retryAfter}s (${reason})`);
   }
 
   noteAmbiguousRateLimit(accountIndex, fingerprint, retryAfterSeconds) {
@@ -525,7 +525,7 @@ export class AccountManager {
     const throttle = this.upstreamThrottle;
     if (!throttle.until || Date.now() < throttle.until || throttle.probeInFlight) return false;
     throttle.probeInFlight = true;
-    console.log('[TeamClaude] Anthropic upstream throttle window expired; sending one recovery probe');
+    console.log('[Maxpool] Anthropic upstream throttle window expired; sending one recovery probe');
     return true;
   }
 
@@ -610,14 +610,14 @@ export class AccountManager {
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
-      console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
+      console.log(`[Maxpool] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
       changed = true;
       session = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
-      console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
+      console.log(`[Maxpool] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -685,7 +685,7 @@ export class AccountManager {
 
     if (best) {
       this.currentIndex = best.index;
-      console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
+      console.log(`[Maxpool] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
     }
   }
 
@@ -835,7 +835,7 @@ export class AccountManager {
         // it so we re-evaluate once that quota is learned (see updateQuota).
         best.probing = best.quota.unified7dReset == null;
         if (switched) {
-          console.log(`[TeamClaude] Switched to account "${best.name}"`);
+          console.log(`[Maxpool] Switched to account "${best.name}"`);
         }
         return best;
       }
@@ -863,7 +863,7 @@ export class AccountManager {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
       this.currentIndex = soonestAccount.index;
-      console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
+      console.log(`[Maxpool] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
     }
 
@@ -1015,7 +1015,7 @@ export class AccountManager {
     if (!sessionKey) return;
     const existing = this.sessionPolicies.get(sessionKey) || {};
     if (!existing.requiresAnthropicThinkingIntegrity) {
-      console.log(`[TeamClaude] Session "${sessionKey}" contains Anthropic signed thinking; provider fallback disabled`);
+      console.log(`[Maxpool] Session "${sessionKey}" contains Anthropic signed thinking; provider fallback disabled`);
     }
     this.sessionPolicies.set(sessionKey, {
       ...existing,
@@ -1203,7 +1203,7 @@ export class AccountManager {
     if (account.probing && account.quota.unified7dReset != null) {
       account.probing = false;
       account.requalify = true;
-      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+      console.log(`[Maxpool] Learned weekly quota for "${account.name}", re-evaluating selection`);
     }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
@@ -1265,7 +1265,7 @@ export class AccountManager {
       const logKey = `${reason}:${pct}`;
       if (account.lastQuotaLogKey !== logKey) {
         account.lastQuotaLogKey = logKey;
-        console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — limiting new placement (${reason})`);
+        console.log(`[Maxpool] Account "${account.name}" at ${pct}% usage — limiting new placement (${reason})`);
       }
     }
   }
@@ -1297,7 +1297,7 @@ export class AccountManager {
       account.failedRequests++;
       account.consecutiveFailures++;
     }
-    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfter}s`);
+    console.log(`[Maxpool] Account "${account.name}" rate limited for ${retryAfter}s`);
   }
 
   markAuthFailed(accountIndex, status = 403, reason = 'auth_failed') {
@@ -1311,7 +1311,7 @@ export class AccountManager {
     account.lastStatus = status;
     account.lastError = reason;
     account.lastErrorAt = Date.now();
-    console.log(`[TeamClaude] Account "${account.name}" disabled after HTTP ${status} (${reason})`);
+    console.log(`[Maxpool] Account "${account.name}" disabled after HTTP ${status} (${reason})`);
   }
 
   markTransientFailure(accountIndex, reason = 'transient_error') {
@@ -1327,7 +1327,7 @@ export class AccountManager {
     account.lastError = reason;
     account.lastErrorAt = Date.now();
     account.cooldownUntil = Date.now() + cooldown;
-    console.log(`[TeamClaude] Account "${account.name}" cooling down for ${Math.ceil(cooldown / 1000)}s after ${reason}`);
+    console.log(`[Maxpool] Account "${account.name}" cooling down for ${Math.ceil(cooldown / 1000)}s after ${reason}`);
   }
 
   markProvisionalUpstreamFailure(accountIndex, status, fingerprint, retryAfterSeconds = 10) {
@@ -1342,7 +1342,7 @@ export class AccountManager {
     account.lastError = 'upstream_throttled';
     account.lastErrorAt = Date.now();
     account.provisionalUpstreamFingerprint = fingerprint;
-    console.log(`[TeamClaude] Account "${account.name}" returned HTTP ${status}; trying another Claude account and retrying this one in ${retryAfter}s`);
+    console.log(`[Maxpool] Account "${account.name}" returned HTTP ${status}; trying another Claude account and retrying this one in ${retryAfter}s`);
   }
 
   clearProvisionalUpstreamFailures(fingerprint, accountIndexes) {
@@ -1402,7 +1402,7 @@ export class AccountManager {
     if (account._refreshPromise) return account._refreshPromise;
 
     account._refreshPromise = (async () => {
-      console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
+      console.log(`[Maxpool] Refreshing token for account "${account.name}"...`);
       try {
         const newTokens = await this._refreshAccessToken(account.refreshToken);
         account.credential = newTokens.accessToken;
@@ -1410,11 +1410,11 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account.status = 'active';
         account.cooldownUntil = null;
-        console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
+        console.log(`[Maxpool] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
         return true;
       } catch (err) {
-        console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
+        console.error(`[Maxpool] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token
         if (!account.expiresAt || Date.now() >= account.expiresAt) {
@@ -1452,7 +1452,7 @@ export class AccountManager {
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     if (account.status === 'error') account.status = 'active';
-    console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
+    console.log(`[Maxpool] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
       refreshToken: account.refreshToken,

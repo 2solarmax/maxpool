@@ -7,7 +7,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
-const TEAMCLAUDE_HEADER_PREFIX = 'x-teamclaude-';
+const MAXPOOL_HEADER_PREFIX = 'x-maxpool-';
 
 const DEFAULT_RETRY = {
   maxAttemptsPerRequest: 0,
@@ -43,7 +43,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       // Status exposes account names and quota state, so require the local
       // proxy key even for loopback callers.
-      if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      if (req.method === 'GET' && req.url === '/maxpool/status') {
         if (proxyApiKey && clientKey !== proxyApiKey) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -83,7 +83,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             type: 'error',
             error: {
               type: 'restart_in_progress',
-              message: 'TeamClaude is restarting. Retry immediately.',
+              message: 'Maxpool is restarting. Retry immediately.',
             },
           }));
           return;
@@ -116,7 +116,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           type: 'error',
           error: {
             type: 'restart_in_progress',
-            message: 'TeamClaude is restarting. Retry immediately.',
+            message: 'Maxpool is restarting. Retry immediately.',
           },
         }));
         return;
@@ -139,10 +139,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (!canQueueBufferedBody) {
         requestInfo.queueBlockedReason = `request body ${body.length} bytes exceeds queue.maxQueuedBodyBytes ${maxQueuedBodyBytes}`;
       }
-      requestInfo.profile = getTeamClaudeProfile(req.headers);
-      requestInfo.sessionKey = headerValue(req.headers, 'x-teamclaude-session');
+      requestInfo.profile = getMaxpoolProfile(req.headers);
+      requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
       if (requestInfo.requiresAnthropicThinkingIntegrity && requestInfo.profile === 'all') {
-        console.log('[TeamClaude] Anthropic thinking detected; provider fallback disabled for this session/request');
+        console.log('[Maxpool] Anthropic thinking detected; provider fallback disabled for this session/request');
       }
       prepareRuntimeProviders(accountManager, req.headers);
 
@@ -154,7 +154,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         );
       } catch (err) {
         ctx.status = ctx.status || 502;
-        console.error('[TeamClaude] Unhandled error:', err);
+        console.error('[Maxpool] Unhandled error:', err);
         sendErrorResponse(res, requestInfo, 502, {
           type: 'error',
           error: { type: 'proxy_error', message: 'Internal proxy error' },
@@ -166,7 +166,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         });
       }
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      console.error('[Maxpool] Unhandled error:', err);
     }
   });
 
@@ -201,7 +201,7 @@ async function relayRaw(req, res, upstream) {
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
-    console.error('[TeamClaude] Raw relay error:', err.message);
+    console.error('[Maxpool] Raw relay error:', err.message);
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
@@ -223,7 +223,7 @@ async function writeRequestLog(logDir, reqId, sections) {
   try {
     await writeFile(join(logDir, filename), sections.join('\n\n'), 'utf-8');
   } catch (err) {
-    console.error(`[TeamClaude] Failed to write log: ${err.message}`);
+    console.error(`[Maxpool] Failed to write log: ${err.message}`);
   }
 }
 
@@ -259,7 +259,7 @@ async function forwardRequest(
     const retryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
     // Surface the routing decision (logs go to the TUI; this is the only record
     // of WHY a request was rejected rather than queued).
-    console.log(`[TeamClaude] No route for request — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
+    console.log(`[Maxpool] No route for request — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
     sendErrorResponse(res, requestInfo, 429, {
       type: 'error',
       error: {
@@ -301,7 +301,7 @@ async function forwardRequest(
       type: 'error',
       error: {
         type: 'authentication_error',
-        message: `Claude account "${account.name}" could not refresh its OAuth token. Run teamclaude accounts -v or log in again.`,
+        message: `Claude account "${account.name}" could not refresh its OAuth token. Run maxpool accounts -v or log in again.`,
       },
     });
     return;
@@ -313,7 +313,7 @@ async function forwardRequest(
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-    if (lk.startsWith(TEAMCLAUDE_HEADER_PREFIX)) continue;
+    if (lk.startsWith(MAXPOOL_HEADER_PREFIX)) continue;
     if (lk === 'x-api-key') continue;
     if (lk === 'content-length') continue;
     if (account.stripBetaHeaders && lk === 'anthropic-beta') continue;
@@ -415,7 +415,7 @@ async function forwardRequest(
             incident.retryAfter,
             parsedError?.message || parsedError?.type || 'matching_request_wide_429s',
           );
-          console.log('[TeamClaude] Every eligible Claude account returned the same server-side 429; opening shared Anthropic throttle');
+          console.log('[Maxpool] Every eligible Claude account returned the same server-side 429; opening shared Anthropic throttle');
 
           const queued = await queueAndRetry(
             'Anthropic upstream is temporarily limiting requests',
@@ -429,7 +429,7 @@ async function forwardRequest(
             type: 'error',
             error: {
               type: 'rate_limit_error',
-              message: 'Anthropic is temporarily limiting requests. TeamClaude will retry automatically when capacity returns.',
+              message: 'Anthropic is temporarily limiting requests. Maxpool will retry automatically when capacity returns.',
             },
           }, { 'retry-after': String(computeRetryAfter(accountManager, requestInfo)) });
           return;
@@ -485,7 +485,7 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
         if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — failing over before first byte`);
+      console.log(`[Maxpool] 429 on "${account.name}" — failing over before first byte`);
       excludedIndexes.add(account.index);
 
       if (
@@ -512,7 +512,7 @@ async function forwardRequest(
       const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
       const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
       const clientRetryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
-      console.log(`[TeamClaude] No route after failover — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
+      console.log(`[Maxpool] No route after failover — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
       sendErrorResponse(res, requestInfo, 429, {
         type: 'error',
         error: {
@@ -534,7 +534,7 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" disabled (${reason}), failing over ===\n${formatHeaders(upstreamRes.headers)}`);
         if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
       }
-      console.log(`[TeamClaude] ${upstreamRes.status} on provider "${account.name}" — disabled and failing over before first byte`);
+      console.log(`[Maxpool] ${upstreamRes.status} on provider "${account.name}" — disabled and failing over before first byte`);
 
       if (
         canRetryBufferedBody &&
@@ -594,7 +594,7 @@ async function forwardRequest(
       if (accountManager.shouldPromoteUpstreamFailure(incident, requestInfo)) {
         accountManager.clearProvisionalUpstreamFailures(fingerprint, incident.accounts);
         accountManager.markUpstreamThrottled(incident.retryAfter, 'matching_request_wide_529s');
-        console.log('[TeamClaude] Every eligible Claude account returned the same 529; opening shared Anthropic throttle');
+        console.log('[Maxpool] Every eligible Claude account returned the same 529; opening shared Anthropic throttle');
 
         const queued = await queueAndRetry(
           'Anthropic upstream is overloaded',
@@ -608,7 +608,7 @@ async function forwardRequest(
           type: 'error',
           error: {
             type: 'overloaded_error',
-            message: 'Anthropic is temporarily overloaded. TeamClaude will retry automatically when capacity returns.',
+            message: 'Anthropic is temporarily overloaded. Maxpool will retry automatically when capacity returns.',
           },
         });
         return;
@@ -671,7 +671,7 @@ async function forwardRequest(
         writeRequestLog(logDir, reqId, logSections);
       }
       if (errorType === 'invalid_thinking_signature') {
-        console.log(`[TeamClaude] Non-retryable Anthropic thinking signature error on "${account.name}"`);
+        console.log(`[Maxpool] Non-retryable Anthropic thinking signature error on "${account.name}"`);
       }
 
       ctx.status = upstreamRes.status;
@@ -746,7 +746,7 @@ async function forwardRequest(
       }
     }
   } catch (err) {
-    console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
+    console.error(`[Maxpool] Upstream error (account "${account.name}"):`, err.message);
 
     if (logDir) {
       logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
@@ -1048,7 +1048,7 @@ async function queueAndRetry(
 ) {
   if (!queueConfig.enabled || !canQueueBufferedBody || (res.headersSent && !requestInfo.queueHeartbeatActive) || res.destroyed) {
     if (queueConfig.enabled && !canQueueBufferedBody && requestInfo.queueBlockedReason) {
-      console.log(`[TeamClaude] Not queueing request: ${requestInfo.queueBlockedReason}`);
+      console.log(`[Maxpool] Not queueing request: ${requestInfo.queueBlockedReason}`);
     }
     return false;
   }
@@ -1084,19 +1084,19 @@ async function queueAndRetry(
   const remaining = queueWindowMs - elapsed;
   if (remaining <= 0) {
     accountManager.removeQueuedRequest?.(requestInfo);
-    return finishQueuedStreamIfNeeded(res, requestInfo, 'The TeamClaude queue wait expired.');
+    return finishQueuedStreamIfNeeded(res, requestInfo, 'The Maxpool queue wait expired.');
   }
 
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
-  console.log(`[TeamClaude] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
+  console.log(`[Maxpool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
   ensureQueueHeartbeat(res, requestInfo, queueConfig);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
   if (!available) {
     if (res.destroyed || req.destroyed) return true;
     accountManager.removeQueuedRequest?.(requestInfo);
-    return finishQueuedStreamIfNeeded(res, requestInfo, 'The TeamClaude queue wait expired.');
+    return finishQueuedStreamIfNeeded(res, requestInfo, 'The Maxpool queue wait expired.');
   }
 
   return forwardRequest(
@@ -1115,14 +1115,14 @@ function ensureQueueHeartbeat(res, requestInfo, queueConfig) {
     'X-Accel-Buffering': 'no',
   });
   res.flushHeaders?.();
-  res.write(': teamclaude queued\n\n');
+  res.write(': maxpool queued\n\n');
   requestInfo.queueHeartbeatActive = true;
   requestInfo.queueHeartbeatTimer = setInterval(() => {
     if (res.destroyed || res.writableEnded) {
       clearQueueHeartbeat(requestInfo);
       return;
     }
-    res.write(': teamclaude queued\n\n');
+    res.write(': maxpool queued\n\n');
   }, heartbeatMs);
   requestInfo.queueHeartbeatTimer.unref?.();
 }
@@ -1226,25 +1226,25 @@ function containsThinkingBlock(value) {
   return false;
 }
 
-function getTeamClaudeProfile(headers) {
-  const profile = String(headers['x-teamclaude-profile'] || 'claude').trim().toLowerCase();
+function getMaxpoolProfile(headers) {
+  const profile = String(headers['x-maxpool-profile'] || 'claude').trim().toLowerCase();
   return profile || 'claude';
 }
 
 function prepareRuntimeProviders(accountManager, headers) {
-  if (getTeamClaudeProfile(headers) !== 'all') return;
+  if (getMaxpoolProfile(headers) !== 'all') return;
 
-  const zaiToken = headerValue(headers, 'x-teamclaude-zai-token');
+  const zaiToken = headerValue(headers, 'x-maxpool-zai-token');
   if (zaiToken) {
-    const opus = headerValue(headers, 'x-teamclaude-zai-opus-model') || headerValue(headers, 'x-teamclaude-zai-model') || 'glm-5.2';
-    const sonnet = headerValue(headers, 'x-teamclaude-zai-sonnet-model') || headerValue(headers, 'x-teamclaude-zai-model') || opus;
-    const haiku = headerValue(headers, 'x-teamclaude-zai-haiku-model') || 'glm-5.1';
+    const opus = headerValue(headers, 'x-maxpool-zai-opus-model') || headerValue(headers, 'x-maxpool-zai-model') || 'glm-5.2';
+    const sonnet = headerValue(headers, 'x-maxpool-zai-sonnet-model') || headerValue(headers, 'x-maxpool-zai-model') || opus;
+    const haiku = headerValue(headers, 'x-maxpool-zai-haiku-model') || 'glm-5.1';
     accountManager.upsertRuntimeAccount({
       name: 'glm-fallback',
       type: 'provider',
       provider: 'zai',
       authToken: zaiToken,
-      upstream: trimTrailingSlash(headerValue(headers, 'x-teamclaude-zai-base-url') || 'https://api.z.ai/api/anthropic'),
+      upstream: trimTrailingSlash(headerValue(headers, 'x-maxpool-zai-base-url') || 'https://api.z.ai/api/anthropic'),
       authHeader: 'authorization',
       profiles: ['all'],
       priority: 10,
@@ -1253,15 +1253,15 @@ function prepareRuntimeProviders(accountManager, headers) {
     });
   }
 
-  const kimiToken = headerValue(headers, 'x-teamclaude-kimi-token');
+  const kimiToken = headerValue(headers, 'x-maxpool-kimi-token');
   if (kimiToken) {
-    const model = headerValue(headers, 'x-teamclaude-kimi-model') || 'kimi-k2.7';
+    const model = headerValue(headers, 'x-maxpool-kimi-model') || 'kimi-k2.7';
     accountManager.upsertRuntimeAccount({
       name: 'kimi-fallback',
       type: 'provider',
       provider: 'kimi',
       authToken: kimiToken,
-      upstream: trimTrailingSlash(headerValue(headers, 'x-teamclaude-kimi-base-url') || 'https://api.kimi.com/coding'),
+      upstream: trimTrailingSlash(headerValue(headers, 'x-maxpool-kimi-base-url') || 'https://api.kimi.com/coding'),
       authHeader: 'authorization',
       profiles: ['all'],
       priority: 20,

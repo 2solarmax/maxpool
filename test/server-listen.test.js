@@ -20,7 +20,7 @@ function close(server) {
 test('server exits cleanly when configured port is already in use', async () => {
   const occupied = http.createServer((_req, res) => res.end('ok'));
   const port = await listen(occupied);
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-'));
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-'));
   const configPath = join(dir, 'config.json');
   await writeFile(configPath, JSON.stringify({
     proxy: { host: '127.0.0.1', port, apiKey: 'tc-test' },
@@ -30,7 +30,7 @@ test('server exits cleanly when configured port is already in use', async () => 
   }));
 
   const child = spawn(process.execPath, [cliPath, 'server'], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    env: { ...process.env, MAXPOOL_CONFIG: configPath },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -61,7 +61,7 @@ test('server exits cleanly when configured port is already in use', async () => 
 });
 
 test('env command avoids Claude Code auth conflict by default', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-'));
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-'));
   const configPath = join(dir, 'config.json');
   await writeFile(configPath, JSON.stringify({
     proxy: { host: '127.0.0.1', port: 3456, apiKey: 'tc-test' },
@@ -70,7 +70,7 @@ test('env command avoids Claude Code auth conflict by default', async () => {
     accounts: [],
   }));
 
-  const baseEnv = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const baseEnv = { ...process.env, MAXPOOL_CONFIG: configPath };
   const normal = spawnSync(process.execPath, [cliPath, 'env'], {
     env: baseEnv,
     encoding: 'utf8',

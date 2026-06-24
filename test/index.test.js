@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { resolveAccounts } from '../src/account-config.js';
 
 test('importFrom account preserves routing and disabled metadata at startup', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-import-'));
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-import-'));
   const credentialPath = join(dir, 'credentials.json');
   await writeFile(credentialPath, JSON.stringify({
     claudeAiOauth: {

@@ -202,7 +202,7 @@ export class TUI {
     try {
       process.stdin.setRawMode(true);
     } catch (err) {
-      process.stderr.write(`[TeamClaude] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
+      process.stderr.write(`[Maxpool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
       return false;
     }
 
@@ -261,7 +261,7 @@ export class TUI {
   }
 
   _addLog(msg) {
-    msg = msg.replace(/^\[TeamClaude\]\s*/, '');
+    msg = msg.replace(/^\[Maxpool\]\s*/, '');
     this.log.unshift({ t: timestamp(), msg });
     if (this.log.length > 200) this.log.length = 200;
     if (this.running) this.render();
@@ -326,13 +326,13 @@ export class TUI {
   _keyNormal(k) {
     if (k === 'q') {
       this._confirm(
-        'Stop TeamClaude?',
+        'Stop Maxpool?',
         'New requests will stop; active requests will drain before the server exits.',
         () => { this.stop(); this.onQuit?.(); },
       );
     } else if (k === 'r') {
       this._confirm(
-        'Restart TeamClaude?',
+        'Restart Maxpool?',
         'Pause new requests, drain active work, then start the updated server.',
         () => { this.stop(); this.onRestart?.(); },
       );
@@ -365,7 +365,7 @@ export class TUI {
         if (!value) return;
         this._confirm(
           'Add this API key?',
-          'Store it in TeamClaude config as a new Anthropic API account.',
+          'Store it in Maxpool config as a new Anthropic API account.',
           () => this._doAddKey(value),
         );
       };
@@ -429,7 +429,7 @@ export class TUI {
       } else if (this.selAction === 'delete') {
         this._confirm(
           `Delete "${account.name}"?`,
-          'Permanently remove it from TeamClaude config. Deletion is blocked while it has active requests.',
+          'Permanently remove it from Maxpool config. Deletion is blocked while it has active requests.',
           () => this._doDelete(this.selIdx),
         );
       }
@@ -747,7 +747,7 @@ export class TUI {
     const lines = [];
 
     // ── Header
-    const left = bold(' TeamClaude');
+    const left = bold(' Maxpool');
     const port = this.config.proxy?.port || 3456;
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);

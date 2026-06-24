@@ -13,7 +13,7 @@ import { resolveAccounts } from './account-config.js';
 const args = process.argv.slice(2);
 const command = args[0];
 const SERVER_RESTART_EXIT_CODE = 75;
-const SERVER_WORKER_ENV = 'TEAMCLAUDE_SERVER_WORKER';
+const SERVER_WORKER_ENV = 'MAXPOOL_SERVER_WORKER';
 
 switch (command) {
   case 'server':
@@ -118,9 +118,9 @@ async function serverWorkerCommand() {
   if (config.accounts.length === 0) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
-    console.error('  teamclaude import           Import from Claude Code');
-    console.error('  teamclaude login            OAuth login via browser');
-    console.error('  teamclaude login --api      Add an API key');
+    console.error('  maxpool import           Import from Claude Code');
+    console.error('  maxpool login            OAuth login via browser');
+    console.error('  maxpool login --api      Add an API key');
     process.exit(1);
   }
 
@@ -138,7 +138,7 @@ async function serverWorkerCommand() {
   );
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
-  // accounts added externally, e.g. by `teamclaude import` while server is running)
+  // accounts added externally, e.g. by `maxpool import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
@@ -167,7 +167,7 @@ async function serverWorkerCommand() {
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
       }
-    }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
+    }).catch(err => console.error(`[Maxpool] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
   const host = config.proxy.host || '127.0.0.1';
@@ -200,7 +200,7 @@ async function serverWorkerCommand() {
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
     if (tui?.running) tui.stop();
-    console.log('\n[TeamClaude] Restarting server now; queued requests will reconnect automatically.');
+    console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
     process.exit(SERVER_RESTART_EXIT_CODE);
   };
@@ -212,7 +212,7 @@ async function serverWorkerCommand() {
 
   const shutdownGracefully = (reason, options = {}) => {
     if (draining) {
-      console.error(`\n[TeamClaude] Force exiting with ${restartController.activeRequests.size} active request(s) still open.`);
+      console.error(`\n[Maxpool] Force exiting with ${restartController.activeRequests.size} active request(s) still open.`);
       process.exit(1);
     }
 
@@ -220,8 +220,8 @@ async function serverWorkerCommand() {
     if (syncTimer) clearInterval(syncTimer);
     if (tui?.running) tui.stop();
 
-    console.log(`\n[TeamClaude] Draining shutdown (${reason}).`);
-    console.log(`[TeamClaude] Stopped accepting new requests; waiting for ${restartController.activeRequests.size} active request(s). Press Ctrl-C again to force.`);
+    console.log(`\n[Maxpool] Draining shutdown (${reason}).`);
+    console.log(`[Maxpool] Stopped accepting new requests; waiting for ${restartController.activeRequests.size} active request(s). Press Ctrl-C again to force.`);
 
     let done = false;
     let reportTimer = null;
@@ -232,30 +232,30 @@ async function serverWorkerCommand() {
       if (reportTimer) clearInterval(reportTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (options.restart && code === 0) {
-        console.log('[TeamClaude] Restarting server...');
+        console.log('[Maxpool] Restarting server...');
         process.exit(SERVER_RESTART_EXIT_CODE);
       }
       process.exit(code);
     };
 
     reportTimer = setInterval(() => {
-      console.log(`[TeamClaude] Still draining ${restartController.activeRequests.size} active request(s)...`);
+      console.log(`[Maxpool] Still draining ${restartController.activeRequests.size} active request(s)...`);
     }, 5000);
     reportTimer.unref();
 
     timeoutTimer = setTimeout(() => {
-      console.error(`[TeamClaude] Drain timeout after ${Math.ceil(drainTimeoutMs / 1000)}s; exiting with ${restartController.activeRequests.size} active request(s) still open.`);
+      console.error(`[Maxpool] Drain timeout after ${Math.ceil(drainTimeoutMs / 1000)}s; exiting with ${restartController.activeRequests.size} active request(s) still open.`);
       finish(1);
     }, drainTimeoutMs);
     timeoutTimer.unref();
 
     server.close(err => {
       if (err) {
-        console.error(`[TeamClaude] Shutdown error: ${err.message}`);
+        console.error(`[Maxpool] Shutdown error: ${err.message}`);
         finish(1);
         return;
       }
-      console.log('[TeamClaude] Shutdown complete.');
+      console.log('[Maxpool] Shutdown complete.');
       finish(0);
     });
     server.closeIdleConnections?.();
@@ -314,7 +314,7 @@ async function serverWorkerCommand() {
       const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
       if (added && tui) tui._addLog(`Auto-loaded ${added} account(s) from config`);
     } catch (err) {
-      console.error(`[TeamClaude] Account auto-sync failed: ${err.message}`);
+      console.error(`[Maxpool] Account auto-sync failed: ${err.message}`);
     } finally {
       syncInFlight = false;
     }
@@ -325,7 +325,7 @@ async function serverWorkerCommand() {
 
   server.listen(port, host, () => {
     server.removeListener('error', onListenError);
-    server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
+    server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
     if (tui) {
       if (tui.start()) {
         console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
@@ -346,7 +346,7 @@ function logPlainServerStart({ host, port, accounts, threshold, config }) {
   const sep = '='.repeat(60);
   console.log('');
   console.log(sep);
-  console.log('  TeamClaude Proxy');
+  console.log('  Maxpool Proxy');
   console.log(sep);
   console.log(`  Listen:     ${host}:${port}`);
   console.log(`  Accounts:   ${accounts.length}`);
@@ -358,8 +358,8 @@ function logPlainServerStart({ host, port, accounts, threshold, config }) {
     console.log(`  [${i + 1}] ${a.name} (${a.type})`);
   });
   console.log('');
-  console.log('  Run Claude through proxy:  teamclaude run');
-  console.log('  Show env vars:             teamclaude env');
+  console.log('  Run Claude through proxy:  maxpool run');
+  console.log('  Show env vars:             maxpool env');
   console.log(sep);
   console.log('');
 }
@@ -477,8 +477,8 @@ async function loginOAuthCommand() {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
     console.error('Alternatives:');
-    console.error('  teamclaude import        Import from existing Claude Code credentials');
-    console.error('  teamclaude login --api   Add an API key instead');
+    console.error('  maxpool import        Import from existing Claude Code credentials');
+    console.error('  maxpool login --api   Add an API key instead');
     process.exit(1);
   }
 
@@ -532,7 +532,7 @@ async function runCommand() {
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
-  const url = `http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}/teamclaude/status`;
+  const url = `http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}/maxpool/status`;
 
   try {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
@@ -588,7 +588,7 @@ async function statusCommand() {
     }
   } catch {
     console.error(`Cannot connect to proxy at ${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
-    console.error('Is the server running? Start with: teamclaude server');
+    console.error('Is the server running? Start with: maxpool server');
     process.exit(1);
   }
 }
@@ -601,7 +601,7 @@ async function accountsCommand() {
 
   if (config.accounts.length === 0) {
     console.log('No accounts configured.');
-    console.log('Add one with: teamclaude import, teamclaude login, or teamclaude login --api');
+    console.log('Add one with: maxpool import, maxpool login, or maxpool login --api');
     return;
   }
 
@@ -692,8 +692,8 @@ async function apiCommand() {
   const path = args[1];
 
   if (!path) {
-    console.error('Usage: teamclaude api <path> [--account NAME] [--method POST] [--data JSON]');
-    console.error('Example: teamclaude api /api/oauth/claude_cli/roles');
+    console.error('Usage: maxpool api <path> [--account NAME] [--method POST] [--data JSON]');
+    console.error('Example: maxpool api /api/oauth/claude_cli/roles');
     process.exit(1);
   }
 
@@ -752,7 +752,7 @@ async function removeCommand() {
   const name = args[1];
 
   if (!name) {
-    console.error('Usage: teamclaude remove <account-name>');
+    console.error('Usage: maxpool remove <account-name>');
     process.exit(1);
   }
 
@@ -770,9 +770,9 @@ async function removeCommand() {
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
-  console.log(`TeamClaude - Multi-account Claude proxy
+  console.log(`Maxpool - Multi-account Claude proxy
 
-Usage: teamclaude [command] [options]
+Usage: maxpool [command] [options]
 
 Commands:
   server              Start the proxy server (default)
@@ -793,7 +793,7 @@ Options:
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
-  --with-key          Include proxy API key in teamclaude env output
+  --with-key          Include proxy API key in maxpool env output
 
 Config: ${getConfigPath()}
 `);
@@ -879,7 +879,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       memConfig.accounts.push(diskAcct);
       accountManager.addAccount(diskAcct);
       added++;
-      console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
+      console.log(`[Maxpool] Picked up new account "${diskAcct.name}" from config`);
       continue;
     }
 
@@ -890,7 +890,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         const creds = await importCredentials(diskAcct.importFrom);
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
       } catch (err) {
-        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
+        console.error(`[Maxpool] Re-import failed for "${diskAcct.name}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
       freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
@@ -910,7 +910,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     const enabled = diskAcct.enabled !== false;
     if (mgr.enabled !== enabled) {
       accountManager.setAccountEnabled(mgr.index, enabled);
-      console.log(`[TeamClaude] ${enabled ? 'Enabled' : 'Disabled'} account "${mgr.name}" from config`);
+      console.log(`[Maxpool] ${enabled ? 'Enabled' : 'Disabled'} account "${mgr.name}" from config`);
     }
     memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct };
 
@@ -923,16 +923,16 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
-        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
+        console.log(`[Maxpool] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
+      console.log(`[Maxpool] Updated API key for "${mgr.name}"`);
     } else if (freshCred.authToken && mgr.credential !== freshCred.authToken) {
       mgr.credential = freshCred.authToken;
       if (mgr.status === 'error') mgr.status = 'active';
-      console.log(`[TeamClaude] Updated provider token for "${mgr.name}"`);
+      console.log(`[Maxpool] Updated provider token for "${mgr.name}"`);
     }
   }
   memConfig.routing = {
@@ -958,15 +958,15 @@ function argValue(flag) {
 
 function handleServerListenError(err, host, port) {
   if (err.code === 'EADDRINUSE') {
-    console.error(`[TeamClaude] ${host}:${port} is already in use.`);
-    console.error('Another TeamClaude proxy may already be running.');
-    console.error('Check the existing server with: teamclaude status');
+    console.error(`[Maxpool] ${host}:${port} is already in use.`);
+    console.error('Another Maxpool proxy may already be running.');
+    console.error('Check the existing server with: maxpool status');
     console.error(`Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`);
   } else if (err.code === 'EACCES') {
-    console.error(`[TeamClaude] Permission denied while listening on ${host}:${port}.`);
-    console.error('Choose a non-privileged port in the TeamClaude config.');
+    console.error(`[Maxpool] Permission denied while listening on ${host}:${port}.`);
+    console.error('Choose a non-privileged port in the Maxpool config.');
   } else {
-    console.error(`[TeamClaude] Failed to listen on ${host}:${port}: ${err.message}`);
+    console.error(`[Maxpool] Failed to listen on ${host}:${port}: ${err.message}`);
   }
   process.exit(1);
 }

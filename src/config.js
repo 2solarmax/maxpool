@@ -1,12 +1,20 @@
 import { readFile, writeFile, mkdir, rename, chmod, unlink } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 
 export function getConfigPath() {
-  if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
+  if (process.env.MAXPOOL_CONFIG) return process.env.MAXPOOL_CONFIG;
+  if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG; // legacy env
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  return join(configDir, 'teamclaude.json');
+  const current = join(configDir, 'maxpool.json');
+  if (existsSync(current)) return current;
+  // Seamless upgrade from the project's former name: keep using an existing
+  // teamclaude.json in place rather than starting empty.
+  const legacy = join(configDir, 'teamclaude.json');
+  if (existsSync(legacy)) return legacy;
+  return current;
 }
 
 export function createDefaultConfig() {
@@ -14,7 +22,7 @@ export function createDefaultConfig() {
     proxy: {
       port: 3456,
       host: '127.0.0.1',
-      apiKey: 'tc-' + randomBytes(24).toString('base64url'),
+      apiKey: 'mp-' + randomBytes(24).toString('base64url'),
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.90,
@@ -104,7 +112,7 @@ let _configWriteChain = Promise.resolve();
  * latest config, applies updater(config), then saves atomically.
  *
  * NOTE: this serializes writes within THIS process only. A separate
- * `teamclaude import`/`login` process writing concurrently is not coordinated
+ * `maxpool import`/`login` process writing concurrently is not coordinated
  * (that would require a lockfile) — but those are short, rare, human-driven.
  */
 export function atomicConfigUpdate(updater) {
