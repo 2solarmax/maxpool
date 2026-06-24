@@ -143,6 +143,72 @@ export async function fetchProfile(accessToken) {
   }
 }
 
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
+
+/** Normalize one usage bucket from the /api/oauth/usage response to
+ *  { utilization: 0..1, resetAt: ms-timestamp } (tolerant of field-name and
+ *  percentage/epoch-vs-iso variations). */
+export function normalizeUsageBucket(bucket) {
+  if (!bucket || typeof bucket !== 'object') return null;
+
+  const rawPct = bucket.used_percentage ?? bucket.utilization ?? bucket.usedPercentage;
+  const parsedPct = typeof rawPct === 'number' ? rawPct : parseFloat(rawPct);
+  const utilization = Number.isFinite(parsedPct)
+    ? (parsedPct > 1 ? parsedPct / 100 : parsedPct)
+    : null;
+
+  const rawReset = bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt;
+  let resetAt = null;
+  if (typeof rawReset === 'number') {
+    resetAt = rawReset < 1e12 ? rawReset * 1000 : rawReset;
+  } else if (typeof rawReset === 'string') {
+    const asNum = Number(rawReset);
+    if (Number.isFinite(asNum) && rawReset.trim() !== '') {
+      resetAt = asNum < 1e12 ? asNum * 1000 : asNum;
+    } else {
+      const parsed = Date.parse(rawReset);
+      if (Number.isFinite(parsed)) resetAt = parsed;
+    }
+  }
+
+  return { utilization, resetAt };
+}
+
+/** Read an account's quota from the zero-spend /api/oauth/usage endpoint.
+ *  Returns { fiveHour, sevenDay, sevenDaySonnet } buckets, or { error, status }. */
+export async function fetchUsage(accessToken) {
+  try {
+    const res = await fetch(USAGE_URL, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'anthropic-beta': OAUTH_USAGE_BETA,
+        'Accept': 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const body = await res.json();
+        detail = body?.error?.message || JSON.stringify(body).slice(0, 200);
+      } catch {
+        detail = await res.text().catch(() => '');
+      }
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
+    }
+
+    const data = await res.json();
+    return {
+      fiveHour: normalizeUsageBucket(data?.five_hour),
+      sevenDay: normalizeUsageBucket(data?.seven_day),
+      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
+    };
+  } catch (err) {
+    return { error: err.message || String(err), status: null };
+  }
+}
+
 // OAuth config (extracted from Claude Code)
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';

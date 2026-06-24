@@ -6,6 +6,7 @@
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.90,
+  "quotaProbeSeconds": 0,
   "scheduler": {
     "mode": "adaptive-least-loaded",
     "safetyMaxActivePerAccount": 50,

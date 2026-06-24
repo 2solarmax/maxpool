@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
+import { Prober } from './prober.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
@@ -147,6 +148,10 @@ async function serverWorkerCommand() {
   const quotaSaveInterval = setInterval(persistQuotaState, 60_000);
   quotaSaveInterval.unref?.();
 
+  // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
+  const prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  prober.start();
+
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `maxpool import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
@@ -211,6 +216,7 @@ async function serverWorkerCommand() {
     if (syncTimer) clearInterval(syncTimer);
     clearInterval(quotaSaveInterval);
     persistQuotaState(); // flush learned quota so the restart restores it
+    prober.stop();
     if (tui?.running) tui.stop();
     console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
@@ -232,6 +238,7 @@ async function serverWorkerCommand() {
     if (syncTimer) clearInterval(syncTimer);
     clearInterval(quotaSaveInterval);
     persistQuotaState(); // best-effort final flush of learned quota
+    prober.stop();
     if (tui?.running) tui.stop();
 
     console.log(`\n[Maxpool] Draining shutdown (${reason}).`);

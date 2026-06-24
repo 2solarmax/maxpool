@@ -37,6 +37,7 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.90,
+    quotaProbeSeconds: 0, // background quota probe; 0 = off (opt-in)
     routing: {
       mode: 'automatic',
       preferredAccount: null,

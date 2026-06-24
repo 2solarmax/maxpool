@@ -17,6 +17,8 @@ function emptyQuota() {
     unified7dRaw: null,    // upstream-reported utilization before display clamp
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
+    unified7dSonnet: null,      // Sonnet-specific weekly utilization (from usage probe)
+    unified7dSonnetReset: null, // ms timestamp
     unifiedStatus: null,   // allowed | allowed_warning | rejected
     resetsAt: null,
   };
@@ -1181,6 +1183,36 @@ export class AccountManager {
     const elapsedRatio = clamp01((WEEK_MS - remainingMs) / WEEK_MS);
     const burnDebt = Math.max(0, used - elapsedRatio);
     return Math.min(1.5, used + burnDebt * this.scheduler.weeklyBurnDebtWeight);
+  }
+
+  /**
+   * Update an account's quota from a background usage probe (fetchUsage result).
+   * Same effect as learning quota from a live response, but for idle accounts.
+   */
+  applyUsageData(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage) return;
+    const q = account.quota;
+
+    if (usage.fiveHour) {
+      if (usage.fiveHour.utilization != null) q.unified5h = clamp01(usage.fiveHour.utilization);
+      if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
+    }
+    if (usage.sevenDay) {
+      if (usage.sevenDay.utilization != null) q.unified7d = clamp01(usage.sevenDay.utilization);
+      if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
+    }
+    if (usage.sevenDaySonnet) {
+      if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = clamp01(usage.sevenDaySonnet.utilization);
+      if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
+    }
+
+    // If we just learned this account's weekly window while probing, re-evaluate
+    // selection (same path as learning it from a live response).
+    if (account.probing && q.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+    }
   }
 
   /**
