@@ -7,6 +7,7 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
+import { RestartController } from './restart-controller.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -170,40 +171,42 @@ async function serverWorkerCommand() {
   let server = null;
   let syncTimer = null;
   let draining = false;
-  let restartPending = false;
-  const activeRequests = new Set();
+  let restartController = null;
   const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 10 * 60_000);
   const hooks = {
     onRequestStart: (id, info) => {
-      activeRequests.add(id);
-      tui?.onRequestStart(id, info);
+      const accepted = restartController.requestStarted(id);
+      if (accepted) tui?.onRequestStart(id, info);
+      return accepted;
     },
-    onRequestRouted: (id, info) => tui?.onRequestRouted(id, info),
+    onRequestRouted: (id, info) => {
+      restartController.requestRouted(id, info.account);
+      tui?.onRequestRouted(id, info);
+    },
     onRequestEnd: (id, info) => {
-      activeRequests.delete(id);
+      restartController.requestEnded(id);
       tui?.onRequestEnd(id, info);
-      maybeRunPendingRestart();
     },
   };
 
-  const maybeRunPendingRestart = () => {
-    if (!restartPending || draining || activeRequests.size > 0) return;
-    restartPending = false;
-    shutdownGracefully('restart', { restart: true });
+  const restartWorkerNow = () => {
+    if (draining) return;
+    draining = true;
+    if (syncTimer) clearInterval(syncTimer);
+    if (tui?.running) tui.stop();
+    console.log('\n[TeamClaude] Restarting server now; queued requests will reconnect automatically.');
+    server.closeAllConnections?.();
+    process.exit(SERVER_RESTART_EXIT_CODE);
   };
 
-  const requestRestart = () => {
-    if (activeRequests.size === 0) {
-      shutdownGracefully('restart', { restart: true });
-      return;
-    }
-    restartPending = true;
-    console.log(`[TeamClaude] Restart pending; waiting for ${activeRequests.size} active request(s) while continuing to accept new requests.`);
-  };
+  restartController = new RestartController({
+    pauseAdmission: () => accountManager.setAdmissionPaused(true),
+    restartNow: restartWorkerNow,
+  });
 
   const shutdownGracefully = (reason, options = {}) => {
     if (draining) {
-      console.error(`\n[TeamClaude] Force exiting with ${activeRequests.size} active request(s) still open.`);
+      console.error(`\n[TeamClaude] Force exiting with ${restartController.activeRequests.size} active request(s) still open.`);
       process.exit(1);
     }
 
@@ -212,7 +215,7 @@ async function serverWorkerCommand() {
     if (tui?.running) tui.stop();
 
     console.log(`\n[TeamClaude] Draining shutdown (${reason}).`);
-    console.log(`[TeamClaude] Stopped accepting new requests; waiting for ${activeRequests.size} active request(s). Press Ctrl-C again to force.`);
+    console.log(`[TeamClaude] Stopped accepting new requests; waiting for ${restartController.activeRequests.size} active request(s). Press Ctrl-C again to force.`);
 
     let done = false;
     let reportTimer = null;
@@ -230,12 +233,12 @@ async function serverWorkerCommand() {
     };
 
     reportTimer = setInterval(() => {
-      console.log(`[TeamClaude] Still draining ${activeRequests.size} active request(s)...`);
+      console.log(`[TeamClaude] Still draining ${restartController.activeRequests.size} active request(s)...`);
     }, 5000);
     reportTimer.unref();
 
     timeoutTimer = setTimeout(() => {
-      console.error(`[TeamClaude] Drain timeout after ${Math.ceil(drainTimeoutMs / 1000)}s; exiting with ${activeRequests.size} active request(s) still open.`);
+      console.error(`[TeamClaude] Drain timeout after ${Math.ceil(drainTimeoutMs / 1000)}s; exiting with ${restartController.activeRequests.size} active request(s) still open.`);
       finish(1);
     }, drainTimeoutMs);
     timeoutTimer.unref();
@@ -282,7 +285,7 @@ async function serverWorkerCommand() {
         shutdownGracefully('quit');
       },
       onRestart: () => {
-        requestRestart();
+        restartController.requestRestart();
       },
     });
   }

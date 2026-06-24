@@ -109,6 +109,50 @@ test('temporary server 429 opens shared breaker, queues, and recovers with one p
   }
 });
 
+test('Anthropic 529 opens shared breaker without cooling individual accounts', async () => {
+  let attempts = 0;
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(529, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'overloaded_error', message: 'Overloaded' },
+      }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20, heartbeatMs: 50 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /message_delta/);
+    assert.equal(seen.length, 2);
+    assert.deepEqual(am.accounts.map(a => a.cooldownUntil), [null, null]);
+    assert.deepEqual(am.accounts.map(a => a.failedRequests), [0, 0]);
+    assert.equal(am.getStatus().upstreamThrottle.active, false);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('multiple queued streaming requests all recover without rotating out of the queue', async () => {
   let attempts = 0;
   const upstream = http.createServer((req, res) => {

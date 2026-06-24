@@ -70,13 +70,57 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
       // or rewriting client refreshes would cause token rotation conflicts.
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-        await relayRaw(req, res, upstream);
+        const reqId = ++requestCounter;
+        const ctx = { account: '(oauth relay)', status: null };
+        const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+        if (accepted === false) {
+          res.writeHead(503, {
+            'Content-Type': 'application/json',
+            'retry-after': '1',
+            Connection: 'close',
+          });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'restart_in_progress',
+              message: 'TeamClaude is restarting. Retry immediately.',
+            },
+          }));
+          return;
+        }
+        hooks.onRequestRouted?.(reqId, { account: ctx.account });
+        try {
+          await relayRaw(req, res, upstream);
+          ctx.status = res.statusCode;
+        } finally {
+          hooks.onRequestEnd?.(reqId, {
+            method: req.method,
+            path: req.url,
+            account: ctx.account,
+            status: ctx.status,
+          });
+        }
         return;
       }
 
       // Track request
       const reqId = ++requestCounter;
-      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+      const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+      if (accepted === false) {
+        res.writeHead(503, {
+          'Content-Type': 'application/json',
+          'retry-after': '1',
+          Connection: 'close',
+        });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'restart_in_progress',
+            message: 'TeamClaude is restarting. Retry immediately.',
+          },
+        }));
+        return;
+      }
 
       // Buffer request body (needed for retry on 429)
       const bodyChunks = [];
@@ -447,6 +491,40 @@ async function forwardRequest(
         error: {
           type: 'provider_auth_error',
           message: `Fallback provider "${account.name}" returned HTTP ${upstreamRes.status}. Check its token, base URL, and model config.`,
+        },
+      });
+      return;
+    }
+
+    if (upstreamRes.status === 529 && account.type !== 'provider') {
+      await upstreamRes.body?.cancel();
+      const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after')) || 30;
+      accountManager.markUpstreamThrottled(retryAfter, 'HTTP 529 overloaded_error');
+      accountManager.releaseAccount(lease, {
+        status: 529,
+        error: 'upstream_overloaded',
+        upstreamThrottled: true,
+        neutral: true,
+      });
+
+      if (logDir) {
+        logSections.push(`=== RESPONSE 529 — Anthropic upstream overloaded ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+      }
+      console.log('[TeamClaude] Shared Anthropic 529 detected; queueing without cooling individual accounts');
+
+      const queued = await queueAndRetry(
+        'Anthropic upstream is overloaded',
+        req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'upstream_throttle',
+      );
+      if (queued) return;
+
+      ctx.status = 529;
+      sendErrorResponse(res, requestInfo, 529, {
+        type: 'error',
+        error: {
+          type: 'overloaded_error',
+          message: 'Anthropic is temporarily overloaded. TeamClaude will retry automatically when capacity returns.',
         },
       });
       return;

@@ -281,7 +281,7 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 5. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization
 6. 5-hour quota controls immediate availability; weekly quota controls new-session admission and preservation; weekly `critical` is last-resort, while weekly `exhausted` is blocked
 7. Account quota 429s cool down only that account and fail over before response bytes are sent
-8. Anthropic's temporary server-side 429 opens a shared circuit breaker without penalizing accounts; one real request probes recovery after `retry-after`, then queued work resumes automatically
+8. Anthropic's temporary server-side 429 and 529 overload responses open a shared circuit breaker without penalizing accounts; one real request probes recovery after `retry-after`, then queued work resumes automatically
 9. Queued streaming requests receive SSE heartbeats, preventing Claude Code's client timeout from abandoning temporary waits
 10. Transient network errors (connection reset, timeout) fail over before the stream starts; if every eligible route has a network failure, the proxy returns `503 connection_unavailable` instead of a quota error
 11. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
@@ -290,7 +290,7 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 14. Weekly exhaustion and non-retryable 4xx errors fail fast by default; if the queue wait expires, returns 429 with the soonest retry time
 15. Temporary OAuth refresh failures cool the account down and queue/fail over; invalid refresh credentials disable only that account and require login
 16. In an interactive terminal, the server runs under a foreground supervisor so `x` can drain and restart without detaching the replacement TUI
-17. If requests are active, `x` marks restart pending and keeps accepting traffic until the active count reaches zero, avoiding a long connection-refused drain window
+17. When `x` is pressed, new upstream admission pauses immediately. Existing upstream requests finish, queued requests cannot deadlock restart, and their sockets close during relaunch so Claude Code reconnects automatically
 18. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License

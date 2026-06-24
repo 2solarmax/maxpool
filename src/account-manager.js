@@ -146,6 +146,7 @@ export class AccountManager {
       lastAdmissionAt: 0,
       rampUntil: 0,
     };
+    this.admissionPaused = false;
   }
 
   /**
@@ -400,6 +401,10 @@ export class AccountManager {
 
   getGlobalInFlight() {
     return this.accounts.reduce((sum, account) => sum + account.inFlight, 0);
+  }
+
+  setAdmissionPaused(paused) {
+    this.admissionPaused = Boolean(paused);
   }
 
   markUpstreamThrottled(retryAfterSeconds, reason = 'temporary_server_limit') {
@@ -889,6 +894,7 @@ export class AccountManager {
   }
 
   _matchesRequest(account, profile, requestInfo = {}) {
+    if (this.admissionPaused) return false;
     if (!this._matchesProfile(account, profile)) return false;
     if (
       account.type !== 'provider'
@@ -1371,6 +1377,7 @@ export class AccountManager {
       scheduler: {
         mode: 'adaptive-least-loaded',
         globalInFlight: this.getGlobalInFlight(),
+        admissionPaused: this.admissionPaused,
         safetyMaxActivePerAccount: this.scheduler.safetyMaxActivePerAccount,
         safetyMaxGlobalActive: this.scheduler.safetyMaxGlobalActive,
       },

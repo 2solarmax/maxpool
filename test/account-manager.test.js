@@ -166,6 +166,22 @@ test('availability checks do not mutate account selection state', () => {
   assert.equal(am.nextIndex, beforeNext);
 });
 
+test('restart admission barrier lets existing leases finish but blocks new leases', () => {
+  const am = manager(2);
+  const existing = am.acquireAccount({ weight: 1 });
+  assert.ok(existing);
+  am.setAdmissionPaused(true);
+
+  assert.equal(am.getGlobalInFlight(), 1);
+  assert.equal(am.acquireAccount({ weight: 1 }), null);
+  assert.equal(am.hasAvailableRoute({ weight: 1 }), false);
+  assert.equal(am.getStatus().scheduler.admissionPaused, true);
+
+  am.releaseAccount(existing, { success: true, status: 200 });
+  assert.equal(am.getGlobalInFlight(), 0);
+  assert.equal(am.acquireAccount({ weight: 1 }), null);
+});
+
 test('shared Anthropic throttle leaves eligible providers available', () => {
   const am = new AccountManager([
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
