@@ -40,8 +40,11 @@ test('exportQuotaState round-trips quota windows but never credentials', () => {
 
 test('restore matches accounts by identity, not position', () => {
   const am = manager(2);
+  const reset = Date.now() + 3 * 24 * 3600_000;
   am.accounts[0].quota.unified7d = 0.10;
+  am.accounts[0].quota.unified7dReset = reset;
   am.accounts[1].quota.unified7d = 0.90;
+  am.accounts[1].quota.unified7dReset = reset;
   const state = am.exportQuotaState();
 
   // New manager with the accounts in REVERSE order.
