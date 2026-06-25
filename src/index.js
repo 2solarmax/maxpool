@@ -193,7 +193,11 @@ async function serverWorkerCommand() {
   let syncTimer = null;
   let draining = false;
   let restartController = null;
-  const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 10 * 60_000);
+  // Quit drains in-flight requests, then force-exits. Kept short so a single
+  // 'q' / Ctrl-C / SIGTERM actually quits under a continuous request flood
+  // (where there are always active requests) instead of waiting indefinitely.
+  // A second signal forces an immediate exit. Override via config.shutdown.drainTimeoutMs.
+  const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
   const hooks = {
     onRequestStart: (id, info) => {
       const accepted = restartController.requestStarted(id);
@@ -242,7 +246,7 @@ async function serverWorkerCommand() {
     if (tui?.running) tui.stop();
 
     console.log(`\n[Maxpool] Draining shutdown (${reason}).`);
-    console.log(`[Maxpool] Stopped accepting new requests; waiting for ${restartController.activeRequests.size} active request(s). Press Ctrl-C again to force.`);
+    console.log(`[Maxpool] Stopped accepting new requests; waiting up to ${Math.ceil(drainTimeoutMs / 1000)}s for ${restartController.activeRequests.size} active request(s), then forcing exit. Press Ctrl-C again to force now.`);
 
     let done = false;
     let reportTimer = null;

@@ -36,6 +36,12 @@ export function createDefaultConfig() {
       apiKey: 'mp-' + randomBytes(24).toString('base64url'),
     },
     upstream: 'https://api.anthropic.com',
+    // Per-account "stop using this account" gate, applied to BOTH the 5h
+    // session window and the 7d weekly window (whichever utilization is
+    // higher). 0.90 = stop routing to an account once it crosses 90% of a
+    // window, leaving a 10% safety margin so it is never hard-limited (429).
+    // Raise toward 0.97 to squeeze more out of accounts before rotating
+    // (less margin, slightly higher 429 risk); lower to rotate more eagerly.
     switchThreshold: 0.90,
     quotaProbeSeconds: 0, // background quota probe; 0 = off (opt-in)
     routing: {
@@ -48,10 +54,27 @@ export function createDefaultConfig() {
       safetyMaxGlobalActive: 150,
       cooldownMs: 30_000,
       maxCooldownMs: 15 * 60_000,
+      // Weekly (7d) quota tiers — how aggressively to de-prioritise an account
+      // as its weekly usage climbs. Each is a fraction (0..1) of the weekly
+      // limit. Below soft = full speed; soft..reserve = mild penalty;
+      // reserve..critical = heavy penalty; above exhausted = effectively
+      // parked until the weekly window resets. Tune to trade burst capacity
+      // against weekly-limit safety.
+      weeklySoftThreshold: 0.65,
+      weeklyReserveThreshold: 0.85,
+      weeklyCriticalThreshold: 0.95,
+      weeklyExhaustedThreshold: 0.985,
     },
     retry: {
       maxAttemptsPerRequest: 0,
       maxRetryBufferBytes: 10 * 1024 * 1024,
+    },
+    // On quit (q / Ctrl-C / SIGTERM): stop accepting new requests, give
+    // in-flight requests up to drainTimeoutMs to finish, then force-exit.
+    // A second signal forces an immediate exit. Kept short so quit works
+    // under a continuous request flood instead of hanging.
+    shutdown: {
+      drainTimeoutMs: 15_000,
     },
     queue: {
       enabled: true,
