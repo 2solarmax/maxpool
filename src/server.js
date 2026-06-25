@@ -846,7 +846,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, isRetriableUpstreamStatus };
+export const __serverTest = { unavailableMessage, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1227,7 +1227,8 @@ function containsThinkingBlock(value) {
 }
 
 function getMaxpoolProfile(headers) {
-  const profile = String(headers['x-maxpool-profile'] || 'claude').trim().toLowerCase();
+  // headerValue() handles the x-teamclaude-* legacy fallback.
+  const profile = String(headerValue(headers, 'x-maxpool-profile') || 'claude').trim().toLowerCase();
   return profile || 'claude';
 }
 
@@ -1272,7 +1273,15 @@ function prepareRuntimeProviders(accountManager, headers) {
 }
 
 function headerValue(headers, name) {
-  const value = headers[name.toLowerCase()];
+  const lname = name.toLowerCase();
+  let value = headers[lname];
+  // Backward compatibility: sessions launched before the teamclaude→maxpool
+  // rename send x-teamclaude-* headers (a process's ANTHROPIC_CUSTOM_HEADERS is
+  // fixed at launch). Fall back to the legacy name so already-running sessions
+  // keep full routing/fallback without needing a restart.
+  if ((value == null || value === '') && lname.startsWith('x-maxpool-')) {
+    value = headers['x-teamclaude-' + lname.slice('x-maxpool-'.length)];
+  }
   if (Array.isArray(value)) return value[0];
   return value ? String(value).trim() : '';
 }

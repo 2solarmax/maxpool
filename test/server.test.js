@@ -1421,3 +1421,17 @@ test('status endpoint requires proxy api key even from loopback', async () => {
     await close(proxy);
   }
 });
+
+test('headerValue falls back to legacy x-teamclaude-* names (backward compat)', () => {
+  const { headerValue, getMaxpoolProfile } = __serverTest;
+  // New name present → used.
+  assert.equal(headerValue({ 'x-maxpool-zai-token': 'new' }, 'x-maxpool-zai-token'), 'new');
+  // Only legacy name present → falls back.
+  assert.equal(headerValue({ 'x-teamclaude-zai-token': 'old' }, 'x-maxpool-zai-token'), 'old');
+  // New name wins when both present.
+  assert.equal(headerValue({ 'x-maxpool-zai-token': 'new', 'x-teamclaude-zai-token': 'old' }, 'x-maxpool-zai-token'), 'new');
+  // Profile from a legacy session still resolves to 'all'.
+  assert.equal(getMaxpoolProfile({ 'x-teamclaude-profile': 'all' }), 'all');
+  // Non-maxpool header names do not get a legacy fallback.
+  assert.equal(headerValue({ 'x-teamclaude-other': 'x' }, 'x-other'), '');
+});
