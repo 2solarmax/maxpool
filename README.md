@@ -6,6 +6,19 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 ![Maxpool TUI](screenshots/maxpool.png)
 
+## ⚠️ Read this first: account risk and Anthropic's terms
+
+This tool sits in a **contested gray area** of Anthropic's terms. Using it could put your Claude accounts at risk. Please read before installing.
+
+- **Not blessed by Anthropic.** This is an independent project. Anthropic has not approved multi-account proxying, and nothing here is covered by an official "this is allowed" statement.
+- **The terms can be read to prohibit it.** Anthropic's Consumer Terms (Section 3, automated access) and its February 2026 rule that subscription OAuth tokens are "only authorized for use with Claude Code" can reasonably be read to cover a proxy that selects and injects tokens across accounts. It is genuinely ambiguous, and the ambiguity is not in your favor.
+- **Multiplexing is a detectable pattern.** Many accounts fronted by one machine, with parallel sessions and fast token rotation, looks like the anomaly Anthropic's automated systems flag, regardless of intent. People have lost accounts to pattern detection, and a clawback can hit all your pooled accounts at once.
+- **Owned accounts only. No spoofing.** Only use accounts you personally own and pay for. Never share accounts across people (that is the clear violation), and never add IP/residential proxies, fingerprint spoofing, or MITM. Those are the documented ban triggers, and this fork deliberately leaves them out. PRs adding them will be rejected.
+- **You are accepting the risk.** If you use this, you may lose accounts you pay for. This notice protects honesty, not your account.
+- **Do your own research. This is not legal advice.** The terms have moved several times in 2026. Check the current terms yourself before relying on it.
+
+If you want certainty, ask Anthropic support directly, or use **API-key accounts** (the sanctioned path for tooling) instead of subscription OAuth.
+
 ## Features
 
 - **Rate-aware load balancing** — ranks accounts by remaining quota ÷ time-to-reset, not raw usage %, so a near-reset account with quota left is drained (use-it-or-lose-it) and one burning fast early in its window is spared; sequential traffic rotates across accounts instead of funnelling onto one
