@@ -10,6 +10,7 @@ import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isToke
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
+import { maybeCheckForUpdate } from './updater.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -361,6 +362,11 @@ async function serverWorkerCommand() {
     } else {
       logPlainServerStart({ host, port, accounts, threshold, config });
     }
+
+    // Non-blocking update check. Notifies (or self-updates if config.autoUpdate);
+    // never interrupts the running proxy. Failures are swallowed.
+    const notify = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
+    maybeCheckForUpdate(config, notify).catch(() => {});
   });
 
   process.on('SIGINT', () => shutdownGracefully('SIGINT'));

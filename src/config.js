@@ -36,6 +36,11 @@ export function createDefaultConfig() {
       apiKey: 'mp-' + randomBytes(24).toString('base64url'),
     },
     upstream: 'https://api.anthropic.com',
+    // On startup, check npm for a newer maxpool and notify. Set false to disable.
+    updateCheck: true,
+    // When true, a newer version is installed automatically (npm i -g maxpool@latest)
+    // and applied on the NEXT restart — running sessions are never interrupted.
+    autoUpdate: false,
     // Per-account "stop using this account" gate, applied to BOTH the 5h
     // session window and the 7d weekly window (whichever utilization is
     // higher). 0.90 = stop routing to an account once it crosses 90% of a

@@ -14,7 +14,8 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test",
-    "lint": "eslint src/ test/"
+    "lint": "eslint src/ test/",
+    "release": "bash scripts/release.sh"
   },
   "keywords": [
     "claude",
