@@ -1,4 +1,5 @@
-import { importCredentials, fetchProfile } from './oauth.js';
+import { createInterface } from 'node:readline';
+import { importCredentials, fetchProfile, loginOAuth } from './oauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -369,6 +370,14 @@ export class TUI {
           () => this._doAddKey(value),
         );
       };
+    } else if (k === 'l') {
+      this._confirm(
+        'Log in via browser?',
+        'Opens a browser to add any Claude account; you name it afterward.',
+        () => this._doLogin(),
+      );
+    } else if (k === 'n' && this.am.accounts.length > 0) {
+      this._startSelection('rename');
     } else if (k === 't' && this.am.accounts.length > 0) {
       this._startSelection('toggle');
     } else if (k === 'd' && this.am.accounts.length > 0) {
@@ -432,6 +441,14 @@ export class TUI {
           'Permanently remove it from Maxpool config. Deletion is blocked while it has active requests.',
           () => this._doDelete(this.selIdx),
         );
+      } else if (this.selAction === 'rename') {
+        const targetIdx = this.selIdx;
+        const current = account.name;
+        this.mode = 'input';
+        this.inputPrompt = `New name for "${current}"`;
+        this.inputBuf = '';
+        this.inputSensitive = false;
+        this.inputCb = value => this._doRename(targetIdx, String(value || '').trim());
       }
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
@@ -519,74 +536,123 @@ export class TUI {
   async _doImport() {
     try {
       this._addLog('Importing credentials...');
-      const creds = await importCredentials('~/.claude/.credentials.json');
+      const creds = await importCredentials(); // file, then macOS Keychain fallback
       const profile = await fetchProfile(creds.accessToken);
-      const profileOk = profile && !profile.error;
-
-      if (!profileOk) {
+      if (!profile || profile.error) {
         this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
       }
-
       let name;
       if (profile?.email) {
         name = profile.email;
         const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
         if (tier) this._addLog(`Detected Claude ${tier}: ${name}`);
-      } else {
-        const n = this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-        name = `account-${n}`;
       }
-
-      const entry = {
-        name, type: 'oauth', source: 'import',
-        accountUuid: profile?.accountUuid || null,
-        accessToken: creds.accessToken,
-        refreshToken: creds.refreshToken,
-        expiresAt: creds.expiresAt,
-      };
-
-      // Deduplicate: match by UUID first, then by name
-      let idx = profile?.accountUuid
-        ? this.config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-        : -1;
-      if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
-
-      if (idx >= 0) {
-        const previous = this.config.accounts[idx];
-        entry.enabled = this.config.accounts[idx].enabled;
-        this.config.accounts[idx] = entry;
-        try {
-          await this.saveConfig(this.config);
-        } catch (error) {
-          this.config.accounts[idx] = previous;
-          throw error;
-        }
-        // Update the running account manager entry
-        const amAcct = this.am.accounts.find(account =>
-          (entry.accountUuid && account.accountUuid === entry.accountUuid) || account.name === name
-        );
-        if (amAcct) {
-          amAcct.credential = creds.accessToken;
-          amAcct.refreshToken = creds.refreshToken;
-          amAcct.expiresAt = creds.expiresAt;
-          amAcct.accountUuid = entry.accountUuid;
-          amAcct.name = name;
-          if (amAcct.status === 'error') amAcct.status = 'active';
-        }
-        this._addLog(`Updated account "${name}"`);
-      } else {
-        this.config.accounts.push(entry);
-        try {
-          await this.saveConfig(this.config);
-        } catch (error) {
-          this.config.accounts.pop();
-          throw error;
-        }
-        this.am.addAccount(entry);
-        this._addLog(`Imported account "${name}"`);
-      }
+      await this._upsertOAuthAccount({ creds, profile, name, source: 'import', verb: 'Imported' });
     } catch (e) {
       this._addLog(`Import failed: ${e.message}`);
+    }
+  }
+
+  // Browser OAuth login: any Claude account, named afterward. Suspends the TUI
+  // around the interactive flow (browser + name prompt), then resumes.
+  async _doLogin() {
+    const wasRunning = this.running;
+    if (wasRunning) this.stop();
+    try {
+      process.stdout.write('\nOpening browser to log into Claude…\n');
+      const creds = await loginOAuth();
+      const profile = await fetchProfile(creds.accessToken);
+      const suggested = profile?.email
+        || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await new Promise(resolve => rl.question(`Name this account [${suggested}]: `, resolve));
+      rl.close();
+      const name = String(answer || '').trim() || suggested;
+      await this._upsertOAuthAccount({ creds, profile, name, source: 'login', verb: 'Added' });
+      process.stdout.write(`\nAdded account "${name}". Returning to maxpool…\n`);
+    } catch (e) {
+      process.stdout.write(`\nLogin failed: ${e.message}\n`);
+    } finally {
+      if (wasRunning) this.start();
+    }
+  }
+
+  // Rename an account in config and in the running manager.
+  async _doRename(idx, newName) {
+    const account = this.am.accounts[idx];
+    if (!account) { this._addLog('Account no longer exists'); return; }
+    if (!newName) { this._addLog('Rename cancelled (empty name)'); return; }
+    if (this.am.accounts.some((a, i) => i !== idx && a.name === newName)) {
+      this._addLog(`An account named "${newName}" already exists`); return;
+    }
+    const cfgIdx = this._configAccountIndex(account);
+    if (cfgIdx < 0) { this._addLog(`Cannot rename "${account.name}" (not in config)`); return; }
+    const old = account.name;
+    const prev = this.config.accounts[cfgIdx].name;
+    this.config.accounts[cfgIdx].name = newName;
+    if (this.config.routing?.preferredAccount === old) this.config.routing.preferredAccount = newName;
+    try {
+      await this.saveConfig(this.config);
+    } catch (error) {
+      this.config.accounts[cfgIdx].name = prev;
+      throw error;
+    }
+    account.name = newName; // update the running account manager
+    this._addLog(`Renamed "${old}" → "${newName}"`);
+  }
+
+  // Upsert an OAuth account into config + the running manager. Dedupes by
+  // accountUuid, then name. Shared by import and browser login.
+  async _upsertOAuthAccount({ creds, profile, name, source, verb = 'Added' }) {
+    if (!name) {
+      name = profile?.email
+        || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
+    }
+    const entry = {
+      name, type: 'oauth', source,
+      accountUuid: profile?.accountUuid || null,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
+
+    let idx = entry.accountUuid
+      ? this.config.accounts.findIndex(a => a.accountUuid === entry.accountUuid)
+      : -1;
+    if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+
+    if (idx >= 0) {
+      const previous = this.config.accounts[idx];
+      entry.enabled = previous.enabled;
+      this.config.accounts[idx] = entry;
+      try {
+        await this.saveConfig(this.config);
+      } catch (error) {
+        this.config.accounts[idx] = previous;
+        throw error;
+      }
+      const amAcct = this.am.accounts.find(account =>
+        (entry.accountUuid && account.accountUuid === entry.accountUuid) || account.name === name
+      );
+      if (amAcct) {
+        amAcct.credential = creds.accessToken;
+        amAcct.refreshToken = creds.refreshToken;
+        amAcct.expiresAt = creds.expiresAt;
+        amAcct.accountUuid = entry.accountUuid;
+        amAcct.name = name;
+        if (amAcct.status === 'error') amAcct.status = 'active';
+      }
+      this._addLog(`Updated account "${name}"`);
+    } else {
+      this.config.accounts.push(entry);
+      try {
+        await this.saveConfig(this.config);
+      } catch (error) {
+        this.config.accounts.pop();
+        throw error;
+      }
+      this.am.addAccount(entry);
+      this._addLog(`${verb} account "${name}"`);
     }
   }
 
@@ -829,7 +895,13 @@ export class TUI {
 
   _renderAcct(idx, bw, showBoth) {
     const a = this.am.accounts[idx];
-    const isCur = this.am.routingMode === 'preferred' && a.name === this.am.preferredAccountName;
+    // Highlight the currently-active account. In manual mode that's the
+    // preferred account; in automatic mode it's the one most recently routed
+    // to (currentIndex). Previously only manual mode highlighted anything, so
+    // in automatic load-balancing no row was ever marked current.
+    const isCur = this.am.routingMode === 'preferred'
+      ? a.name === this.am.preferredAccountName
+      : idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
 
     // Prefix: selection marker + current marker
@@ -936,7 +1008,7 @@ export class TUI {
       case 'normal':
         return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
       case 'accounts':
-        return ` ${bold('i')} Import Claude login  ${bold('k')} API key  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('i')} Import  ${bold('l')} Login (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'routing':
         return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('Esc')} Back`;
       case 'select': {
@@ -944,7 +1016,9 @@ export class TUI {
           ? 'prefer'
           : this.selAction === 'toggle'
             ? 'enable/disable'
-            : 'delete';
+            : this.selAction === 'rename'
+              ? 'rename'
+              : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'input':

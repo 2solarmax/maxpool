@@ -48,6 +48,10 @@ switch (command) {
     await removeCommand();
     process.exit(0);
     break;
+  case 'rename':
+    await renameCommand();
+    process.exit(0);
+    break;
   case 'api':
     await apiCommand();
     process.exit(0);
@@ -798,6 +802,42 @@ async function removeCommand() {
   console.log(`Removed account "${name}"`);
 }
 
+// Resolve an account by exact name, else by 1-based index. Returns -1 if none.
+function resolveAccountIndex(accounts, target) {
+  let idx = accounts.findIndex(a => a.name === target);
+  if (idx < 0 && /^\d+$/.test(String(target))) idx = Number(target) - 1;
+  return idx >= 0 && idx < accounts.length ? idx : -1;
+}
+
+async function renameCommand() {
+  const config = await loadOrCreateConfig();
+  const target = args[1];
+  const newName = args[2];
+
+  if (!target || !newName) {
+    console.error('Usage: maxpool rename <account-name|number> <new-name>');
+    process.exit(1);
+  }
+
+  const idx = resolveAccountIndex(config.accounts, target);
+  if (idx < 0) {
+    console.error(`Account "${target}" not found`);
+    process.exit(1);
+  }
+  if (config.accounts.some((a, i) => i !== idx && a.name === newName)) {
+    console.error(`An account named "${newName}" already exists`);
+    process.exit(1);
+  }
+
+  const old = config.accounts[idx].name;
+  config.accounts[idx].name = newName;
+  // Keep manual-preference routing pointing at the renamed account.
+  if (config.routing?.preferredAccount === old) config.routing.preferredAccount = newName;
+  await saveConfig(config);
+  console.log(`Renamed "${old}" → "${newName}"`);
+  console.log('Restart maxpool to apply this to a running proxy (or rename live from the TUI: a → n).');
+}
+
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
@@ -815,6 +855,7 @@ Commands:
   status              Show proxy & account status (live)
   accounts            List configured accounts
   remove <name>       Remove an account
+  rename <name|#> <new>  Rename an account (by name or list number)
   api <path>          Call an API endpoint with account credentials
   help                Show this help
 
