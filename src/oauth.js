@@ -1,19 +1,65 @@
 import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
 
-/**
- * Import OAuth credentials from a Claude Code credentials file.
- */
-export async function importCredentials(filePath) {
-  const resolvedPath = filePath.replace(/^~/, homedir());
-  const raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+const execFileAsync = promisify(execFile);
 
-  // Claude Code stores credentials nested under "claudeAiOauth"
-  const data = raw.claudeAiOauth || raw;
+const KEYCHAIN_SERVICE = 'Claude Code-credentials';
+
+/**
+ * Read Claude Code credentials from the macOS Keychain.
+ * Claude Code (recent versions, macOS) stores OAuth creds in the login
+ * Keychain under service "Claude Code-credentials", account = the OS
+ * username — NOT in ~/.claude/.credentials.json. Returns the parsed
+ * credential object (unwrapped from "claudeAiOauth"), or null if absent.
+ */
+async function readMacKeychainCredentials() {
+  if (process.platform !== 'darwin') return null;
+  const account = userInfo().username;
+  try {
+    const { stdout } = await execFileAsync('security', [
+      'find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w',
+    ]);
+    const raw = JSON.parse(stdout.trim());
+    return raw.claudeAiOauth || raw;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Import OAuth credentials from a Claude Code credentials file, falling back
+ * to the macOS Keychain when the file is absent (the default on macOS).
+ */
+export async function importCredentials(filePath = '~/.claude/.credentials.json') {
+  const resolvedPath = filePath.replace(/^~/, homedir());
+
+  let data;
+  try {
+    const raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+    // Claude Code stores credentials nested under "claudeAiOauth"
+    data = raw.claudeAiOauth || raw;
+  } catch (fileErr) {
+    // No file → try the macOS Keychain (where Claude Code now stores creds).
+    data = await readMacKeychainCredentials();
+    if (!data) {
+      throw new Error(
+        process.platform === 'darwin'
+          ? `No credentials at ${resolvedPath} and none in the macOS Keychain ` +
+            `("${KEYCHAIN_SERVICE}"). Is Claude Code logged in on this machine? ` +
+            `Run 'claude' once to log in, or paste a token with 'maxpool import --json ...'.`
+          : `Could not read credentials from ${resolvedPath}: ${fileErr.message}`,
+      );
+    }
+  }
+
+  if (!data.accessToken) {
+    throw new Error('Imported credentials have no accessToken');
+  }
   return {
     accessToken: data.accessToken,
     refreshToken: data.refreshToken,
