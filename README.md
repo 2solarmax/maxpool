@@ -52,6 +52,48 @@ claude /login           # Log into an account in Claude Code
 maxpool import       # Import its credentials
 ```
 
+## Recommended setup
+
+The cleanest way to use maxpool day-to-day: **keep your normal `claude` login untouched, and add a separate alias that routes through the pool.** Then plain `claude` still uses your default single account, and `ccmax` (call it whatever you like) spreads work across all your accounts.
+
+1. **Install and add your accounts** (see [Adding Accounts](#adding-accounts)):
+   ```bash
+   npm install -g maxpool
+   maxpool login        # repeat for each account (browser) — or `maxpool import`
+   ```
+2. **Start the proxy** and leave it running (it shows a live dashboard):
+   ```bash
+   maxpool
+   ```
+3. **Add an alias** to your `~/.zshrc` (or `~/.bashrc`):
+   ```bash
+   # Run Claude Code through the maxpool proxy.
+   # Your plain `claude` stays on its own separate login.
+   ccmax() {
+     local url
+     url="$(maxpool env | sed -n 's/^export ANTHROPIC_BASE_URL=//p')"
+     ( unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+       ANTHROPIC_BASE_URL="$url" \
+       ANTHROPIC_CUSTOM_HEADERS="x-maxpool-session: $(uuidgen)" \
+       claude "$@" )
+   }
+   ```
+   Reload with `source ~/.zshrc` (or just open a new terminal).
+4. **Use it:**
+   ```bash
+   ccmax            # Claude Code, load-balanced across all your accounts
+   claude           # unchanged — still your normal single-account login
+   ```
+
+Why this approach:
+
+- **Your normal `claude` stays separate.** maxpool keeps its own account tokens in its config; your everyday Claude Code login (in the OS keychain) is never touched. Use `ccmax` when you want the pool, `claude` when you don't.
+- **Session affinity.** The `x-maxpool-session` header pins each terminal to one account (with automatic failover), so a single task doesn't bounce between accounts mid-stream.
+- **No key needed locally.** The proxy listens on `127.0.0.1` and accepts local clients without an API key, so the alias stays short.
+- **Composes with your other aliases.** If you already use aliases for other providers (GLM, Kimi, …), `ccmax` slots right in alongside them.
+
+> Prefer zero config? `maxpool run` launches Claude Code through the proxy for you — the alias above is the same idea, just composable with your own setup. Most people end up making an alias.
+
 ## Adding Accounts
 
 ### OAuth Login (recommended)
@@ -116,7 +158,18 @@ Falls back to plain log output when not a TTY (e.g. running as a service).
 
 State-changing actions show what will happen and require `y` or `n`. In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to choose, and `Esc` to go back.
 
-The Accounts menu can import the current Claude Code login, add an Anthropic API key, enable or disable an account, or permanently delete an idle account. Disabling keeps credentials in config but prevents new requests from using the account. Deletion is blocked while that account has active requests.
+The Accounts menu (`a`) lets you add and manage accounts without leaving the TUI:
+
+| Key | Action |
+|-----|--------|
+| `i` | Import the account you're currently logged into Claude Code as |
+| `l` | Log in via browser — add *any* account, then name it |
+| `k` | Add an Anthropic API key account |
+| `n` | Rename the selected account |
+| `t` | Enable or disable the selected account |
+| `d` | Permanently delete an idle account |
+
+Disabling keeps credentials in config but prevents new requests from using the account. Deletion is blocked while that account has active requests. The currently-active account is marked with a green `►`.
 
 Routing modes:
 
@@ -174,6 +227,7 @@ maxpool accounts          # List accounts with subscription tier and token statu
 maxpool accounts -v       # Also show token expiry times
 maxpool status            # Show live proxy status (requires running server)
 maxpool remove <name>     # Remove an account
+maxpool rename <name|#> <new>  # Rename an account (by name or list number)
 maxpool api <path>        # Call an API endpoint with account credentials
 maxpool help              # Show all commands
 ```
@@ -208,6 +262,8 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
     "apiKey": "tc-auto-generated-key"
   },
   "upstream": "https://api.anthropic.com",
+  "updateCheck": true,
+  "autoUpdate": false,
   "switchThreshold": 0.90,
   "scheduler": {
     "mode": "adaptive-least-loaded",
@@ -235,7 +291,7 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
     "pollMs": 1000
   },
   "shutdown": {
-    "drainTimeoutMs": 600000
+    "drainTimeoutMs": 15000
   },
   "accounts": [
     {
@@ -256,7 +312,10 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.apiKey` | API key clients use for status/admin requests |
 | `upstream` | Upstream API base URL |
-| `switchThreshold` | Quota utilization (0–1) at which an account is avoided |
+| `updateCheck` | Check npm for a newer maxpool on startup and notify; defaults to `true` |
+| `autoUpdate` | Install new versions automatically (applied on next restart, never interrupting sessions); defaults to `false` |
+| `switchThreshold` | Quota utilization (0–1) at which an account is avoided (5h *and* weekly); default `0.90`. Raise toward `0.97` to use more before rotating |
+| `scheduler.weeklySoftThreshold` / `weeklyReserveThreshold` / `weeklyCriticalThreshold` / `weeklyExhaustedThreshold` | Weekly (7d) quota tiers (0–1) controlling how aggressively an account is de-prioritised as its weekly usage climbs |
 | `scheduler.safetyMaxActivePerAccount` | Emergency circuit breaker, not a normal capacity cap |
 | `scheduler.safetyMaxGlobalActive` | Emergency global circuit breaker |
 | `retry.maxAttemptsPerRequest` | Retry attempts before returning an error; `0` means one pass over accounts |
@@ -301,6 +360,32 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 16. In an interactive terminal, the server runs under a foreground supervisor so confirmed Restart (`r`) can drain and restart without detaching the replacement TUI
 17. When Restart is confirmed, new upstream admission pauses immediately. Existing upstream requests finish, queued requests cannot deadlock restart, and their sockets close during relaunch so Claude Code reconnects automatically
 18. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
+
+## FAQ
+
+**Does this touch my normal Claude Code login?**
+No. maxpool stores its own account tokens in its config file. Your everyday `claude` login lives in the OS keychain and is never modified. Run `ccmax` for the pool, `claude` for your normal login.
+
+**How do I add another account?**
+`maxpool login` (browser — adds any account), or in the TUI press `a` then `l`. To add the account you're currently logged into Claude Code with, use `maxpool import` (or `a` then `i`).
+
+**Can I rename an account?**
+Yes — `maxpool rename <name|number> <new-name>`, or in the TUI press `a` then `n`.
+
+**An account stopped being used before it hit 100% — why?**
+maxpool stops routing to an account at `switchThreshold` (default 90%) of its 5-hour or weekly window, leaving a safety margin so it's never hard rate-limited. Raise it in your config (toward 0.97) to use more before rotating.
+
+**One account shows empty quota bars but it's serving requests — is it broken?**
+No. The bars show how *full* an account is toward its limit, so an empty bar means lots of headroom (good). Actual activity is in the `15m`/`1h` request-count columns.
+
+**Will updates apply automatically?**
+Set `"autoUpdate": true` in your config and maxpool installs new versions itself (applied on the next restart; running sessions are never interrupted). Otherwise `npm i -g maxpool` updates it.
+
+**Where do my tokens go?**
+They're stored locally in your config (file mode `0600`) and sent only to Anthropic — or, in the optional `all` profile, to GLM/Kimi if you supply those. Nothing else leaves your machine. Zero third-party dependencies.
+
+**How do I stop it?**
+Press `q` in the TUI (or Ctrl-C). It drains briefly, then exits.
 
 ## Credits
 
