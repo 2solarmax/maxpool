@@ -4,7 +4,50 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, __serverTest } from '../src/server.js';
 
-const { unavailableMessage, isRetriableUpstreamStatus } = __serverTest;
+const { unavailableMessage, isRetriableUpstreamStatus, ensureQueueHeartbeat, clearQueueHeartbeat } = __serverTest;
+
+test('bug (ghost-leak): heartbeat reap releases the queue slot+bytes when the held client write throws EPIPE', async () => {
+  // Binding test for reapDead: the heartbeat is the liveness probe. When the
+  // held client's socket is gone, res.write throws and the reap MUST release the
+  // queue slot + bytes via removeQueuedRequest — else a dead ticket squats the
+  // queue for up to streamHoldMaxMs (7d), exhausting backpressure → "queue full".
+  // (The independent res.once('close') path does NOT cover the write-throw/tick-
+  // before-close window — only reapDead does, so this neuters green without it.)
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  const requestInfo = { stream: true, sessionKey: 'S' };
+  // A real ticket occupying the queue (slot + bytes).
+  am.registerQueuedRequest(requestInfo, { sessionKey: 'S', bytes: 4242, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am.queueState.waiting.length, 1, 'ticket queued');
+  assert.equal(am.queueState.bytes, 4242, 'bytes accounted');
+
+  // A live-looking res whose write throws (EPIPE) on the heartbeat tick — the
+  // client vanished without the socket flipping destroyed/writableEnded first.
+  let headersSent = false;
+  const res = {
+    get headersSent() { return headersSent; },
+    writeHead() { headersSent = true; },
+    flushHeaders() {},
+    destroyed: false,
+    writableEnded: false,
+    write(chunk) {
+      if (chunk.includes('maxpool queued') && headersSent && this._ticked) {
+        const e = new Error('write EPIPE'); e.code = 'EPIPE'; throw e;
+      }
+      this._ticked = true;
+    },
+  };
+
+  ensureQueueHeartbeat(res, requestInfo, { heartbeatMs: 1000 }, am);
+  // Heartbeat floors to 1000ms; wait for one tick (which throws) → reap.
+  await new Promise(r => setTimeout(r, 1300));
+
+  assert.equal(am.queueState.waiting.length, 0, 'reap released the queue slot');
+  assert.equal(am.queueState.bytes, 0, 'reap released the queued bytes');
+  assert.equal(requestInfo.queueHeartbeatActive, false, 'heartbeat timer cleared by reap');
+  clearQueueHeartbeat(requestInfo);
+});
 
 test('unavailableMessage tells the truth when no account will recover soon', () => {
   const am = { accounts: [{}, {}], _requiresAnthropicThinkingIntegrity: () => false };

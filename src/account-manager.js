@@ -290,21 +290,18 @@ export class AccountManager {
       };
     }
 
-    if (Number.isFinite(soonestWeekly)) {
+    // Min-merge the two weekly buckets and emit the cause of the SOONER recovery.
+    // A weekly-critical account is last-resort usable and frees when its
+    // short-term blocker clears (often ~minutes); a weekly-exhausted account is
+    // unusable until its full 7d reset. Returning exhausted first (the old order)
+    // masked a sooner critical recovery behind a far reset — error-fasting a
+    // holdable request and emitting a multi-day Retry-After.
+    if (Number.isFinite(soonestWeekly) || Number.isFinite(soonestWeeklyCritical)) {
+      const weeklyCriticalWins = soonestWeeklyCritical < soonestWeekly;
       return {
         available: false,
-        retryAfterMs: Math.max(0, soonestWeekly),
-        cause: 'weekly_exhausted',
-        reasons,
-        matchingRoutes,
-      };
-    }
-
-    if (Number.isFinite(soonestWeeklyCritical)) {
-      return {
-        available: false,
-        retryAfterMs: Math.max(0, soonestWeeklyCritical),
-        cause: 'weekly_critical',
+        retryAfterMs: Math.max(0, weeklyCriticalWins ? soonestWeeklyCritical : soonestWeekly),
+        cause: weeklyCriticalWins ? 'weekly_critical' : 'weekly_exhausted',
         reasons,
         matchingRoutes,
       };
@@ -695,6 +692,11 @@ export class AccountManager {
     this.queueState.waiting.push(ticket);
     this.queueState.bytes += bytes;
     requestInfo.queueTicket = ticket;
+    // Re-queuing CONSUMES any prior admission: a request that was admitted
+    // (ticket cleared, queueAdmitted=true) but then failed to acquire the freed
+    // slot (lost the race) must re-enter the FIFO as a fair waiter, NOT keep
+    // bypassing the fairness gate forever and starve everyone behind it.
+    requestInfo.queueAdmitted = false;
     return ticket;
   }
 

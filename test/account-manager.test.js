@@ -1018,6 +1018,49 @@ test('bug B (blocker): weekly-critical + 5h-capped with UNKNOWN resets HOLDS fin
   assert.ok(plan.retryAfterMs > 0 && plan.retryAfterMs <= 60_000, 'bounded re-poll hold so the poll loop re-checks real availability');
 });
 
+test('bug (fairness): re-queuing clears a stale queueAdmitted so a resumed request cannot bypass the gate forever', () => {
+  // BLOCKER: queueAdmitted was set once at admission and never cleared. A resumed
+  // request that admitted (ticket consumed) but lost the race for the freed slot
+  // re-queues — and kept queueAdmitted=true forever, permanently bypassing the
+  // fairness gate and starving every other waiter. Re-queuing must consume it.
+  const am = manager(1);
+  const X = {};
+  am.registerQueuedRequest(X, { sessionKey: 'X', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am.canAdmitQueuedRequest(X), true, 'X at head is admitted');
+  assert.equal(X.queueTicket, null, 'admission consumes the ticket');
+  assert.equal(X.queueAdmitted, true, 'admission flag set');
+
+  // X failed to acquire the freed slot (lost the race) and RE-QUEUES.
+  am.registerQueuedRequest(X, { sessionKey: 'X', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(X.queueAdmitted, false, 're-queue consumed the stale admission — X is a fair FIFO waiter again');
+
+  // Behavioural proof: a ticketless, un-admitted X must be BLOCKED by the fairness
+  // gate while other waiters are queued (no permanent bypass).
+  X.queueTicket = null;
+  am.registerQueuedRequest({}, { sessionKey: 'Y', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am._matchesRequest(am.accounts[0], 'claude', X), false, 'ticketless un-admitted X gated behind the waiter');
+});
+
+test('bug B (masking): a sooner weekly-critical recovery wins over a far weekly-exhausted reset', () => {
+  // Mixed fleet: account A is weekly-EXHAUSTED with a far 40h reset; account B is
+  // weekly-CRITICAL (last-resort usable) recovering ~60s. The oracle used to
+  // return weekly_exhausted (40h) first, masking B's sooner recovery → a non-
+  // streaming request error-fasts (40h > its 5min window) and clients see a
+  // multi-day Retry-After. Min-merge must surface the SOONER critical recovery.
+  const am = manager(2);
+  const A = am.accounts[0], B = am.accounts[1];
+  A.quota.unified7d = 0.99;                       // exhausted (>= 0.985)
+  A.quota.unified7dReset = Date.now() + 40 * 3600_000;
+  B.quota.unified7d = 0.96;                       // critical [0.95, 0.985)
+  B.quota.unified7dReset = null;                  // reset unknown
+  B.quota.unified5h = 0.95;                       // ALSO 5h-capped, reset unknown
+  B.quota.unified5hReset = null;                  // → bounded ~60s weekly-critical hold
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_critical', 'sooner critical recovery must win, not weekly_exhausted');
+  assert.ok(plan.retryAfterMs <= 60_000, `retry-after ${plan.retryAfterMs}ms must be the ~60s critical recovery, not 40h`);
+});
+
 test('bug C: a LIVE concurrent same-session request is NOT evicted (no starve)', () => {
   const am = manager(1);
   const r1 = {}; const r2 = {};
