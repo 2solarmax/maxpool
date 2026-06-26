@@ -163,8 +163,11 @@ test('seamless reload: in-flight stream survives, no ECONNREFUSED, supervisor st
       try { return (await proxyStream(port, apiKey)).status === 200; } catch { return false; }
     }, 20000);
 
-    // 1) Start an in-flight streaming request. Don't await yet.
-    const inflight = proxyStream(port, apiKey);
+    // 1) Start an in-flight streaming request. Don't await yet. A generous
+    //    timeout so host CPU saturation (8+ parallel test files spawning real
+    //    processes) can't spuriously time it out — the assertion is that the
+    //    stream is NOT CUT, not that it's fast.
+    const inflight = proxyStream(port, apiKey, 60000);
     // Let the stream get going so it's genuinely mid-flight at reload time.
     await new Promise(r => setTimeout(r, 180));
 
@@ -367,6 +370,40 @@ test('killing the supervisor frees the port — a later connection gets clean EC
     }, 8000);
   } finally {
     killGroup(child);
+    await new Promise(r => upstream.server.close(r));
+  }
+});
+
+test('two consecutive reloads both cut over (supervisor re-wires monitoring to each new worker)', async () => {
+  const upstream = await startJsonUpstream();
+  const port = await getFreePort();
+  const apiKey = 'mp-test-key';
+  const configPath = await writeReloadConfig(port, upstream.port, apiKey);
+
+  let out = '';
+  const child = spawn(process.execPath, [cliPath, 'server'], {
+    env: { ...process.env, MAXPOOL_CONFIG: configPath, MAXPOOL_FORCE_SUPERVISOR: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'], detached: true,
+  });
+  child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
+
+  try {
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } });
+
+    // First reload.
+    child.kill('SIGHUP');
+    await waitFor(() => (out.match(/cutover complete/g) || []).length >= 1, 20000);
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
+
+    // Second reload — only works if the supervisor re-wired RELOAD_REQUEST to the
+    // worker spawned by the first reload (not the original cold worker).
+    child.kill('SIGHUP');
+    await waitFor(() => (out.match(/cutover complete/g) || []).length >= 2, 20000);
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
+    assert.equal(child.exitCode, null, 'supervisor still up after two reloads');
+  } finally {
+    killGroup(child);
+    await new Promise(r => child.once('exit', r));
     await new Promise(r => upstream.server.close(r));
   }
 });
