@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { importCredentials, fetchProfile, loginOAuth } from './oauth.js';
+import { fetchProfile, loginOAuth } from './oauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -351,13 +351,7 @@ export class TUI {
   }
 
   _keyAccounts(k) {
-    if (k === 'i') {
-      this._confirm(
-        'Import current Claude login?',
-        'Add or update the account currently logged into Claude Code.',
-        () => this._doImport(),
-      );
-    } else if (k === 'k') {
+    if (k === 'k') {
       this.mode = 'input';
       this.inputPrompt = 'Anthropic API key';
       this.inputBuf = '';
@@ -530,26 +524,6 @@ export class TUI {
       }
     } catch (e) {
       this._addLog(`Sync failed: ${e.message}`);
-    }
-  }
-
-  async _doImport() {
-    try {
-      this._addLog('Importing credentials...');
-      const creds = await importCredentials(); // file, then macOS Keychain fallback
-      const profile = await fetchProfile(creds.accessToken);
-      if (!profile || profile.error) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
-      }
-      let name;
-      if (profile?.email) {
-        name = profile.email;
-        const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
-        if (tier) this._addLog(`Detected Claude ${tier}: ${name}`);
-      }
-      await this._upsertOAuthAccount({ creds, profile, name, source: 'import', verb: 'Imported' });
-    } catch (e) {
-      this._addLog(`Import failed: ${e.message}`);
     }
   }
 
@@ -1008,7 +982,7 @@ export class TUI {
       case 'normal':
         return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
       case 'accounts':
-        return ` ${bold('i')} Import  ${bold('l')} Login (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('l')} Login (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'routing':
         return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('Esc')} Back`;
       case 'select': {

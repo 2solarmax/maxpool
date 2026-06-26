@@ -1,38 +1,33 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { resolveAccounts } from '../src/account-config.js';
 
-test('importFrom account preserves routing and disabled metadata at startup', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'maxpool-import-'));
-  const credentialPath = join(dir, 'credentials.json');
-  await writeFile(credentialPath, JSON.stringify({
-    claudeAiOauth: {
-      accessToken: 'fresh-access',
-      refreshToken: 'fresh-refresh',
+test('stored-token oauth account preserves routing and disabled metadata at startup', async () => {
+  // Import was removed; oauth accounts now carry their own stored token
+  // (browser-login grant), and resolveAccounts must preserve their metadata
+  // without re-reading any external credential source.
+  const [account] = await resolveAccounts({
+    accounts: [{
+      name: 'personal',
+      type: 'oauth',
+      accessToken: 'stored-access',
+      refreshToken: 'stored-refresh',
       expiresAt: Date.now() + 3600_000,
-    },
-  }));
+      enabled: false,
+      priority: 7,
+      profiles: ['claude'],
+    }],
+  });
 
-  try {
-    const [account] = await resolveAccounts({
-      accounts: [{
-        name: 'personal',
-        type: 'oauth',
-        importFrom: credentialPath,
-        enabled: false,
-        priority: 7,
-        profiles: ['claude'],
-      }],
-    });
+  assert.equal(account.enabled, false);
+  assert.equal(account.priority, 7);
+  assert.deepEqual(account.profiles, ['claude']);
+  assert.equal(account.accessToken, 'stored-access');
+});
 
-    assert.equal(account.enabled, false);
-    assert.equal(account.priority, 7);
-    assert.deepEqual(account.profiles, ['claude']);
-    assert.equal(account.accessToken, 'fresh-access');
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+test('oauth account with no token is skipped (re-add via login)', async () => {
+  const accounts = await resolveAccounts({
+    accounts: [{ name: 'broken', type: 'oauth' }],
+  });
+  assert.equal(accounts.length, 0);
 });
