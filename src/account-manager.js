@@ -1,5 +1,13 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 
+// Bounded hold for a weekly-critical account whose next-recovery time is genuinely
+// unknown (no short-term blocker reset AND no learned weekly reset — e.g. cold
+// start / post-reset / probe failure). A weekly-critical account is recoverable by
+// definition (still has some quota; usable as last resort), so it must HOLD finite
+// and let waitForAvailableRoute's poll loop re-check real availability, never
+// collapse to an Infinity session-kill.
+const WEEKLY_CRITICAL_UNKNOWN_HOLD_MS = 60_000;
+
 function emptyQuota() {
   return {
     // Standard API rate limits (API key accounts)
@@ -235,7 +243,7 @@ export class AccountManager {
 
       const retry = this._retryInfo(account);
       note(retry.cause);
-      if (retry.cause === 'weekly_critical' && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+      if (retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -245,17 +253,21 @@ export class AccountManager {
         };
       }
       if (retry.queueable && retry.retryAt) {
+        // A known, soon short-term reset (5h cap / rate-limit / cooldown) — even on
+        // a weekly-critical account, this is the REAL near-term recovery time, so
+        // it holds here with the true cause rather than the distant weekly reset.
         const ms = retry.retryAt - Date.now();
         if (ms < soonestTemporary) {
           soonestTemporary = ms;
           temporaryCause = retry.cause;
         }
-      } else if (retry.cause === 'weekly_critical' && retry.retryAt) {
-        // Last-resort admit failed for a transient reason (the account is ALSO
-        // 5h-capped / cooling down). It still has a known weekly reset, so HOLD
-        // the session until then rather than letting the fleet collapse to
-        // Infinity and KILL the session on a recoverable cap.
-        const ms = retry.retryAt - Date.now();
+      } else if (retry.weeklyCritical) {
+        // Last-resort admit failed AND there is no queueable short-term reset (the
+        // account is 5h-capped / cooling with an UNKNOWN reset, or purely critical).
+        // A weekly-critical account is recoverable by definition, so HOLD finite —
+        // soonest known reset, else a bounded re-poll — never collapse to Infinity
+        // and KILL the session on a recoverable cap.
+        const ms = retry.retryAt ? (retry.retryAt - Date.now()) : WEEKLY_CRITICAL_UNKNOWN_HOLD_MS;
         if (ms < soonestWeeklyCritical) soonestWeeklyCritical = ms;
       } else if (retry.cause === 'weekly_exhausted' && retry.retryAt) {
         const ms = retry.retryAt - Date.now();
@@ -844,14 +856,44 @@ export class AccountManager {
     // the queue keys on a far-future reset instead of the account's real
     // short-term availability — the session-kill bug.)
     const weeklyState = this._weeklyRawState(account);
-    if (weeklyState === 'critical') {
-      return { cause: 'weekly_critical', retryAt: q.unified7dReset || null, queueable: false };
-    }
+
+    // Short-term blockers (rate-limit / cooldown / upstream / 5h session cap /
+    // token-request-provider limits) clear on their OWN schedule — usually FAR
+    // sooner than a 7d weekly reset. Compute them up front so a weekly-critical
+    // account reports its REAL near-term recovery, not the distant weekly reset.
+    const shortTerm = this._shortTermRetry(account, now, q);
 
     if (weeklyState === 'exhausted') {
+      // Hard block: only a weekly reset unblocks it — a sooner short-term clear
+      // does not help — so key the hold on the weekly reset.
       return { cause: 'weekly_exhausted', retryAt: q.unified7dReset || null, queueable: false };
     }
 
+    if (weeklyState === 'critical') {
+      // Last-resort USABLE: the account becomes selectable (as last resort) the
+      // moment its short-term blocker clears — NOT at the far weekly reset. So
+      // report the SOONER real blocker (the 5h cap / rate-limit), not unified7dReset.
+      // Tag weeklyCritical so the oracle ALWAYS holds (finite) on it: a critical
+      // account is recoverable by definition and must never collapse to an
+      // Infinity session-kill, even when no reset time is known.
+      if (shortTerm) return { ...shortTerm, weeklyCritical: true };
+      return { cause: 'weekly_critical', retryAt: q.unified7dReset || null, queueable: false, weeklyCritical: true };
+    }
+
+    // Healthy / soft / reserve weekly: the ordinary short-term blocker, if any.
+    if (shortTerm) return shortTerm;
+
+    if (!account.enabled) return { cause: 'disabled', retryAt: null, queueable: false };
+    if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
+    if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
+    return { cause: 'unavailable', retryAt: null, queueable: false };
+  }
+
+  // The soonest active short-term (non-weekly) blocker for an account, or null if
+  // none is active. Ordered most-specific-first; each entry is a {cause, retryAt,
+  // queueable} the retry oracle can hold on. Kept separate from the weekly state
+  // so weekly-critical accounts surface their real near-term recovery time.
+  _shortTermRetry(account, now, q) {
     if (account.status === 'throttled' && account.rateLimitedUntil && now < account.rateLimitedUntil) {
       return { cause: 'rate_limited', retryAt: account.rateLimitedUntil, queueable: true };
     }
@@ -888,10 +930,7 @@ export class AccountManager {
       return { cause: 'provider_limit', retryAt: q.genericReset || null, queueable: Boolean(q.genericReset) };
     }
 
-    if (!account.enabled) return { cause: 'disabled', retryAt: null, queueable: false };
-    if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
-    if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
-    return { cause: 'unavailable', retryAt: null, queueable: false };
+    return null;
   }
 
   _selectNext(requestInfo = {}, excludedIndexes = new Set()) {

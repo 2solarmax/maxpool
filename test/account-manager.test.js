@@ -977,18 +977,45 @@ test('ghost guard: a fresh session is not blocked by a superseded same-session g
 
 // ── council fixes: bug B (weekly-critical+5h hold) + bug C (ghost-only evict) ──
 
-test('bug B: weekly-critical + 5h-capped fleet HOLDS (finite retry), not killed', () => {
+test('bug B: weekly-critical + 5h-capped fleet HOLDS for the SOON 5h reset, not the far weekly reset', () => {
+  // The MAJOR oracle defect: _retryInfo keyed the hold on the 40h weekly reset
+  // even though the real blocker (the 5h cap) clears in 2h. A weekly-critical
+  // account is last-resort usable, so it frees the moment the 5h cap clears.
   const am = manager(2);
+  const fiveHReset = Date.now() + 2 * 3600_000;
   for (const a of am.accounts) {
     a.quota.unified7d = 0.96;                          // raw weekly critical [0.95,0.985)
     a.quota.unified7dReset = Date.now() + 40 * 3600_000;
     a.quota.unified5h = 0.95;                          // ALSO 5h-capped (>= switchThreshold)
-    a.quota.unified5hReset = Date.now() + 2 * 3600_000;
+    a.quota.unified5hReset = fiveHReset;
   }
   const plan = am.nextRetryForRequest({ profile: 'claude' });
   assert.equal(plan.available, false);
   assert.ok(Number.isFinite(plan.retryAfterMs), 'must HOLD (finite), not error-fast on Infinity');
+  // Holds for ~2h (the 5h cap), NOT ~40h (the weekly reset).
+  assert.ok(plan.retryAfterMs <= 2 * 3600_000 + 5000, `retry-after ${plan.retryAfterMs}ms must track the 2h 5h-cap, not the 40h weekly reset`);
+  assert.ok(plan.retryAfterMs >= 2 * 3600_000 - 60_000, 'retry-after must be ~2h, the real near-term recovery');
+  assert.equal(plan.cause, 'session_limit', 'reports the REAL short-term blocker, not weekly_critical');
+});
+
+test('bug B (blocker): weekly-critical + 5h-capped with UNKNOWN resets HOLDS finite, never Infinity-kills', () => {
+  // The BLOCKER: on cold-start / post-reset, a weekly-critical account can be
+  // 5h-capped with NO learned reset (unified5hReset null AND unified7dReset null).
+  // The old bucket gated on retry.retryAt being truthy → fell through to
+  // {retryAfterMs: Infinity} → killed the session — the exact regression this work
+  // set out to fix. A critical account is recoverable by definition: hold finite.
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.96;            // raw weekly critical
+    a.quota.unified7dReset = null;       // reset time unknown
+    a.quota.unified5h = 0.95;            // ALSO 5h-capped
+    a.quota.unified5hReset = null;       // 5h reset unknown too
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.ok(Number.isFinite(plan.retryAfterMs), 'MUST HOLD finite — never collapse to Infinity and kill the session');
   assert.equal(plan.cause, 'weekly_critical');
+  assert.ok(plan.retryAfterMs > 0 && plan.retryAfterMs <= 60_000, 'bounded re-poll hold so the poll loop re-checks real availability');
 });
 
 test('bug C: a LIVE concurrent same-session request is NOT evicted (no starve)', () => {

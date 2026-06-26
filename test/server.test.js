@@ -1505,18 +1505,19 @@ test('headerValue falls back to legacy x-teamclaude-* names (backward compat)', 
   assert.equal(headerValue({ 'x-teamclaude-other': 'x' }, 'x-other'), '');
 });
 
-test('resumed stream has NO heartbeat comment interleaved after real events', async () => {
-  // Pins the invariant the council flagged as "bug A": once the queued stream
-  // resumes onto the committed SSE body, no `: maxpool queued` heartbeat may
-  // appear between real events. Two independent guards enforce it — the
-  // clear-before-forward at resume AND the heartbeat's own write-failure reap —
-  // so this stays green; it's a regression pin, not a red-before repro (the
-  // interleave does not manifest empirically because the reap already stops it).
+test('bug A: resumed stream has NO heartbeat comment interleaved between real events', async () => {
+  // Real red-green for the clear-before-forward fix (server.js, resume path).
+  // ensureQueueHeartbeat floors heartbeatMs to 1000ms (Math.max(1000, ...)), so
+  // the timer only ticks mid-stream when the upstream's inter-event gap exceeds
+  // ~1s. The upstream below spaces message_delta 1300ms after message_start, so a
+  // surviving heartbeat WOULD inject `: maxpool queued` between them. With the fix
+  // the heartbeat is stopped at resume → clean stream. (Verified RED on the
+  // pre-fix code, GREEN here — this defeats the old tautological 240ms test.)
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('data: {"type":"message_start"}\n\n');
-    setTimeout(() => res.write('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n'), 120);
-    setTimeout(() => res.end('data: {"type":"message_stop"}\n\n'), 240);
+    setTimeout(() => res.write('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n'), 1300);
+    setTimeout(() => res.end('data: {"type":"message_stop"}\n\n'), 2600);
   });
   const upstreamPort = await listen(upstream);
   const am = new AccountManager([
@@ -1530,7 +1531,7 @@ test('resumed stream has NO heartbeat comment interleaved after real events', as
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
-    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20, heartbeatMs: 30 },
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20, heartbeatMs: 1000 },
   });
   const proxyPort = await listen(proxy);
 
