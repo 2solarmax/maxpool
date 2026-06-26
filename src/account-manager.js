@@ -173,6 +173,7 @@ export class AccountManager {
       waiting: [],
       lastAdmissionAt: 0,
       rampUntil: 0,
+      bytes: 0, // aggregate buffered body bytes across all held requests
     };
     this.admissionPaused = false;
   }
@@ -197,6 +198,7 @@ export class AccountManager {
     let soonestTemporary = Infinity;
     let temporaryCause = null;
     let soonestWeekly = Infinity;
+    let weeklyUnknownReset = 0; // weekly-exhausted accounts whose reset time we don't know yet
     let matchingRoutes = 0;
     const reasons = {};
 
@@ -244,6 +246,11 @@ export class AccountManager {
       } else if (retry.cause === 'weekly_exhausted' && retry.retryAt) {
         const ms = retry.retryAt - Date.now();
         if (ms < soonestWeekly) soonestWeekly = ms;
+      } else if (retry.cause === 'weekly_exhausted' && !retry.retryAt) {
+        // Weekly-capped but we haven't learned the reset time (cold start /
+        // probe failure). We cannot estimate a wait — flag it so the caller
+        // emits an honest "reset time unknown" error instead of waiting forever.
+        weeklyUnknownReset++;
       }
     }
 
@@ -262,6 +269,16 @@ export class AccountManager {
         available: false,
         retryAfterMs: Math.max(0, soonestWeekly),
         cause: 'weekly_exhausted',
+        reasons,
+        matchingRoutes,
+      };
+    }
+
+    if (weeklyUnknownReset > 0) {
+      return {
+        available: false,
+        retryAfterMs: Infinity,
+        cause: 'weekly_reset_unknown',
         reasons,
         matchingRoutes,
       };
@@ -574,13 +591,41 @@ export class AccountManager {
     });
   }
 
-  registerQueuedRequest(requestInfo = {}) {
+  // Drop wedged head tickets (deadline passed or explicitly marked dead) so a
+  // single orphaned waiter cannot block every other request behind it. Cheap;
+  // safe to call before every head check.
+  _reapStaleQueueHead() {
+    const q = this.queueState;
+    const now = Date.now();
+    let guard = 0;
+    while (q.waiting.length && guard++ < 10_000) {
+      const head = q.waiting[0];
+      const stale = head.dead === true || (head.deadlineAt && now > head.deadlineAt);
+      if (!stale) break;
+      q.waiting.shift();
+      q.bytes = Math.max(0, q.bytes - (head.bytes || 0));
+    }
+  }
+
+  // Register a waiter. Returns the ticket, or null if a backpressure limit
+  // (maxConcurrentQueued / maxQueuedBytes) would be exceeded — the caller then
+  // rejects the request with a "queue full" error instead of holding it.
+  registerQueuedRequest(requestInfo = {}, opts = {}) {
     if (requestInfo.queueTicket) return requestInfo.queueTicket;
+    this._reapStaleQueueHead();
+    const bytes = Math.max(0, Number(opts.bytes) || 0);
+    const { maxConcurrentQueued, maxQueuedBytes } = opts;
+    if (maxConcurrentQueued != null && this.queueState.waiting.length >= maxConcurrentQueued) return null;
+    if (maxQueuedBytes != null && this.queueState.waiting.length > 0
+      && this.queueState.bytes + bytes > maxQueuedBytes) return null;
     const ticket = {
       id: this.queueState.nextId++,
       queuedAt: Date.now(),
+      bytes,
+      deadlineAt: opts.deadlineAt || null,
     };
     this.queueState.waiting.push(ticket);
+    this.queueState.bytes += bytes;
     requestInfo.queueTicket = ticket;
     return ticket;
   }
@@ -588,10 +633,12 @@ export class AccountManager {
   canAdmitQueuedRequest(requestInfo = {}) {
     const ticket = requestInfo.queueTicket;
     if (!ticket) return true;
+    this._reapStaleQueueHead();
     if (this.queueState.waiting[0]?.id !== ticket.id) return false;
     const now = Date.now();
     if (now < this.queueState.rampUntil && now - this.queueState.lastAdmissionAt < 250) return false;
     this.queueState.waiting.shift();
+    this.queueState.bytes = Math.max(0, this.queueState.bytes - (ticket.bytes || 0));
     this.queueState.lastAdmissionAt = now;
     requestInfo.queueTicket = null;
     requestInfo.queueAdmitted = true;
@@ -602,7 +649,10 @@ export class AccountManager {
     const ticket = requestInfo.queueTicket;
     if (!ticket) return;
     const index = this.queueState.waiting.findIndex(entry => entry.id === ticket.id);
-    if (index >= 0) this.queueState.waiting.splice(index, 1);
+    if (index >= 0) {
+      this.queueState.waiting.splice(index, 1);
+      this.queueState.bytes = Math.max(0, this.queueState.bytes - (ticket.bytes || 0));
+    }
     requestInfo.queueTicket = null;
   }
 

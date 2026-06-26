@@ -19,7 +19,19 @@ const DEFAULT_QUEUE = {
   maxWaitMs: 24 * 60 * 60 * 1000,
   autoMaxWaitMs: null,
   capacityMaxWaitMs: 15 * 60 * 1000,
-  weeklyMaxWaitMs: 0,
+  // Weekly (7d) cap hold. A generous bound is SAFE because the early-exit
+  // gates on the REAL reset time (unified7dReset - now): it only waits when a
+  // reset genuinely lands inside the window, and errors honestly otherwise.
+  // 0 here was the bug — it fail-fast-killed sessions the instant every
+  // account hit its weekly cap, instead of waiting for the soonest reset.
+  weeklyMaxWaitMs: 24 * 60 * 60 * 1000,
+  // Non-streaming requests have no SSE heartbeat to keep them alive, so a long
+  // hold would die on the client timeout anyway. Cap their wait conservatively.
+  nonStreamMaxWaitMs: 5 * 60 * 1000,
+  // Backpressure: holds used to be 0ms, now they can be hours. Bound the queue
+  // so 22 retrying agents can't grow the heap without limit.
+  maxConcurrentQueued: 64,
+  maxQueuedBytes: 1024 * 1024 * 1024, // 1 GiB aggregate across all held bodies
   pollMs: 1000,
   heartbeatMs: 10_000,
 };
@@ -825,6 +837,14 @@ function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = ne
   return accountManager.hasAvailableRoute?.(requestInfo, excludedIndexes) || false;
 }
 
+function formatRetryDuration(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s >= 86400) return `${Math.round(s / 86400)}d`;
+  if (s >= 3600) return `${Math.round(s / 3600)}h`;
+  if (s >= 60) return `${Math.round(s / 60)}m`;
+  return `${s}s`;
+}
+
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRecoverSoon = true) {
   const thinking = requestInfo.requiresAnthropicThinkingIntegrity
     || accountManager._requiresAnthropicThinkingIntegrity?.(requestInfo);
@@ -834,7 +854,10 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   // account is at its own 5h/weekly limit. A short "retry in Ns" would be a lie;
   // tell the user the real fix.
   if (!willRecoverSoon) {
-    const base = `No Claude account can take this request — all ${n} are at their 5h or weekly limit. Add another Claude account or wait for a quota reset.`;
+    const eta = Number.isFinite(retryAfter) && retryAfter > 0
+      ? ` Soonest reset in ~${formatRetryDuration(retryAfter)}, beyond the hold window.`
+      : '';
+    const base = `No Claude account can take this request — all ${n} are at their 5h or weekly limit.${eta} Add another Claude account or wait for a quota reset.`;
     return thinking
       ? `${base} GLM/Kimi fallback is unavailable because this session contains Anthropic signed thinking blocks; start a fresh non-thinking session to use them.`
       : base;
@@ -1062,29 +1085,64 @@ async function queueAndRetry(
     ? autoMaxWaitMs
     : Math.max(0, Number(queueConfig.capacityMaxWaitMs) || 0);
   const weeklyMaxWaitMs = Math.max(0, Number(queueConfig.weeklyMaxWaitMs) || 0);
+  const nonStreamMaxWaitMs = queueConfig.nonStreamMaxWaitMs == null
+    ? 5 * 60_000
+    : Math.max(0, Number(queueConfig.nonStreamMaxWaitMs) || 0);
   const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {
     retryAfterMs: Infinity,
     cause: 'unavailable',
   };
-  const queueWindowMs = retryPlan.cause === 'weekly_exhausted'
-    ? Math.min(maxWaitMs, weeklyMaxWaitMs)
-    : cause === 'capacity'
-      ? Math.min(maxWaitMs, capacityMaxWaitMs)
-    : Math.min(maxWaitMs, autoMaxWaitMs);
-  if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, 'No retry window is available.');
+
+  // Honest, cause-/thinking-aware message used for every give-up path below.
+  const honestMessage = unavailableMessage(
+    accountManager, requestInfo,
+    Math.ceil((Number.isFinite(retryPlan.retryAfterMs) ? retryPlan.retryAfterMs : 0) / 1000),
+    false,
+  );
+
+  // Weekly-capped but the reset time is unknown (cold start / probe failure):
+  // we can't estimate a wait, so don't pretend to — error honestly now.
+  if (retryPlan.cause === 'weekly_reset_unknown') {
+    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
+  }
+
+  // Pick the wait window. Capacity (upstream 529/overload) MUST stay on its own
+  // short cap even when it coincides with weekly exhaustion — never let a
+  // transient overload inherit the long weekly bound.
+  let queueWindowMs = cause === 'capacity'
+    ? Math.min(maxWaitMs, capacityMaxWaitMs)
+    : retryPlan.cause === 'weekly_exhausted'
+      ? Math.min(maxWaitMs, weeklyMaxWaitMs)
+      : Math.min(maxWaitMs, autoMaxWaitMs);
+  // Non-streaming requests have no SSE heartbeat, so a long hold would die on
+  // the client timeout. Cap them so we never promise a wait we can't deliver.
+  if (!requestInfo.stream) queueWindowMs = Math.min(queueWindowMs, nonStreamMaxWaitMs);
+
+  if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
 
   const retryAfterMs = retryPlan.retryAfterMs;
   if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) {
-    return finishQueuedStreamIfNeeded(res, requestInfo, 'No route is expected to recover within the configured queue window.');
+    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
 
   requestInfo.queueStartedAt ||= Date.now();
-  accountManager.registerQueuedRequest?.(requestInfo);
+  const ticket = accountManager.registerQueuedRequest?.(requestInfo, {
+    bytes: body?.length || 0,
+    deadlineAt: requestInfo.queueStartedAt + queueWindowMs,
+    maxConcurrentQueued: queueConfig.maxConcurrentQueued,
+    maxQueuedBytes: queueConfig.maxQueuedBytes,
+  });
+  if (ticket === null) {
+    // Backpressure: too many requests already waiting / too many bytes buffered.
+    // Reject honestly instead of growing the heap unbounded.
+    return finishQueuedStreamIfNeeded(res, requestInfo,
+      'Maxpool queue is full — too many requests are already waiting for capacity. Try again shortly.');
+  }
   const elapsed = Date.now() - requestInfo.queueStartedAt;
   const remaining = queueWindowMs - elapsed;
   if (remaining <= 0) {
     accountManager.removeQueuedRequest?.(requestInfo);
-    return finishQueuedStreamIfNeeded(res, requestInfo, 'The Maxpool queue wait expired.');
+    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
 
   ctx.account = '(queued)';
@@ -1096,7 +1154,7 @@ async function queueAndRetry(
   if (!available) {
     if (res.destroyed || req.destroyed) return true;
     accountManager.removeQueuedRequest?.(requestInfo);
-    return finishQueuedStreamIfNeeded(res, requestInfo, 'The Maxpool queue wait expired.');
+    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
 
   return forwardRequest(
@@ -1163,7 +1221,10 @@ async function waitForAvailableRoute(req, res, accountManager, requestInfo, queu
       ) return true;
 
       const remaining = maxWaitMs - (Date.now() - startedAt);
-      await sleep(Math.min(pollMs, remaining));
+      // Jitter the poll so a synchronized weekly-reset event doesn't re-align
+      // every waiter's poll into the same instant (thundering scan).
+      const jittered = pollMs * (0.8 + Math.random() * 0.4);
+      await sleep(Math.min(jittered, remaining));
     }
 
     return accountManager.hasAvailableRoute(requestInfo, new Set())

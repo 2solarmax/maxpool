@@ -817,3 +817,64 @@ test('preferring a provider, disabled, or missing account is rejected and stays 
   assert.equal(am.routingMode, 'preferred');
   assert.equal(am.preferredAccountName, 'claude');
 });
+
+// ── queue backpressure + reaper (queue redesign 2026-06-26) ──────────────
+
+test('registerQueuedRequest enforces maxConcurrentQueued (rejects overflow)', () => {
+  const am = manager(1);
+  const limits = { maxConcurrentQueued: 2 };
+  const a = am.registerQueuedRequest({}, limits);
+  const b = am.registerQueuedRequest({}, limits);
+  const c = am.registerQueuedRequest({}, limits);
+  assert.ok(a && b, 'first two should register');
+  assert.equal(c, null, 'third should be rejected at the tail');
+  assert.equal(am.queueState.waiting.length, 2);
+});
+
+test('registerQueuedRequest enforces maxQueuedBytes aggregate budget', () => {
+  const am = manager(1);
+  const limits = { maxQueuedBytes: 1000 };
+  const a = am.registerQueuedRequest({}, { ...limits, bytes: 600 });
+  const b = am.registerQueuedRequest({}, { ...limits, bytes: 600 }); // 600+600 > 1000, queue non-empty
+  assert.ok(a, 'first fits');
+  assert.equal(b, null, 'second exceeds aggregate budget');
+  assert.equal(am.queueState.bytes, 600);
+});
+
+test('queue byte accounting is released on remove and on admit', () => {
+  const am = manager(1);
+  const r1 = {}; const r2 = {};
+  am.registerQueuedRequest(r1, { bytes: 100 });
+  am.registerQueuedRequest(r2, { bytes: 250 });
+  assert.equal(am.queueState.bytes, 350);
+  am.removeQueuedRequest(r2);
+  assert.equal(am.queueState.bytes, 100);
+  // r1 is now head; admit it (no ramp gate active) and bytes should release
+  const admitted = am.canAdmitQueuedRequest(r1);
+  assert.equal(admitted, true);
+  assert.equal(am.queueState.bytes, 0);
+});
+
+test('stale head ticket (deadline passed) is reaped and does not wedge the queue', () => {
+  const am = manager(1);
+  const dead = {}; const live = {};
+  am.registerQueuedRequest(dead, {});
+  am.registerQueuedRequest(live, {});
+  assert.equal(am.queueState.waiting.length, 2);
+  // The head goes stale after the fact (e.g. its socket died mid-wait and the
+  // normal removal was missed). The next admit must reap it, not wedge.
+  am.queueState.waiting[0].deadlineAt = Date.now() - 1;
+  const admitted = am.canAdmitQueuedRequest(live);
+  assert.equal(admitted, true, 'live ticket admits after the dead head is reaped');
+  assert.equal(am.queueState.waiting.length, 0);
+});
+
+test('nextRetryForRequest returns weekly_reset_unknown when reset time is unknown', () => {
+  const am = manager(1);
+  am.accounts[0].quota.unified7d = 1;
+  am.accounts[0].quota.unified7dReset = null; // unknown
+  const plan = am.nextRetryForRequest({ profile: 'claude' }, new Set());
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_reset_unknown');
+  assert.equal(plan.retryAfterMs, Infinity);
+});

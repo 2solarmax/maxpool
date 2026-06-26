@@ -996,7 +996,7 @@ test('capacity failures use capacity queue window instead of long quota window',
   }
 });
 
-test('weekly exhaustion does not queue by default even when reset is near', async () => {
+test('weekly exhaustion queues and recovers when the reset is near (was a fail-fast bug)', async () => {
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
@@ -1006,11 +1006,80 @@ test('weekly exhaustion does not queue by default even when reset is near', asyn
     { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
   ], 0.90);
   am.accounts[0].quota.unified7d = 1;
-  am.accounts[0].quota.unified7dReset = Date.now() + 150;
+  am.accounts[0].quota.unified7dReset = Date.now() + 200;
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
-    queue: { enabled: true, maxWaitMs: 2000, pollMs: 25 },
+    // weeklyMaxWaitMs now defaults to 24h, so a near weekly reset is waited out.
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    const elapsed = Date.now() - startedAt;
+    assert.equal(res.status, 200);              // it waited for the reset, didn't kill the session
+    assert.ok(elapsed >= 150, `expected a wait for the weekly reset, got ${elapsed}ms`);
+    assert.ok(elapsed < 5000, `should recover well inside the window, got ${elapsed}ms`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('weekly exhaustion with reset FAR beyond the window errors promptly (no pointless spin)', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].quota.unified7d = 1;
+  am.accounts[0].quota.unified7dReset = Date.now() + 3 * 24 * 60 * 60 * 1000; // 3 days out
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 2000, weeklyMaxWaitMs: 2000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 429);                 // nothing recovers in the window → honest prompt error
+    assert.ok(Date.now() - startedAt < 800, 'should not spin');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('weekly exhaustion with UNKNOWN reset errors honestly, does not wait forever', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].quota.unified7d = 1;
+  am.accounts[0].quota.unified7dReset = null; // reset time unknown (cold start)
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 5000, weeklyMaxWaitMs: 5000, pollMs: 25 },
   });
   const proxyPort = await listen(proxy);
 
@@ -1022,7 +1091,7 @@ test('weekly exhaustion does not queue by default even when reset is near', asyn
       body: JSON.stringify({ model: 'test', messages: [] }),
     });
     assert.equal(res.status, 429);
-    assert.ok(Date.now() - startedAt < 500);
+    assert.ok(Date.now() - startedAt < 800, 'must not wait forever on an unknown reset');
   } finally {
     await close(proxy);
     await close(upstream);

@@ -299,8 +299,11 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
     "maxWaitMs": 86400000,
     "autoMaxWaitMs": null,
     "capacityMaxWaitMs": 900000,
+    "weeklyMaxWaitMs": 86400000,
+    "nonStreamMaxWaitMs": 300000,
+    "maxConcurrentQueued": 64,
+    "maxQueuedBytes": 1073741824,
     "maxQueuedBodyBytes": 268435456,
-    "weeklyMaxWaitMs": 0,
     "pollMs": 1000
   },
   "shutdown": {
@@ -338,7 +341,10 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
 | `queue.autoMaxWaitMs` | Optional shorter auto-queue cap. Set to `null` or omit it to use `queue.maxWaitMs`; set a number for interactive sessions where you prefer fast errors |
 | `queue.capacityMaxWaitMs` | Separate cap for repeated upstream 5xx/overload failures; defaults to 15m so broken providers do not park requests for 24h |
 | `queue.maxQueuedBodyBytes` | Maximum request body Maxpool will hold in memory while waiting for capacity before the request has been sent upstream; defaults to 256 MiB |
-| `queue.weeklyMaxWaitMs` | Optional cap for weekly-limit waits. Defaults to `0`, so weekly exhaustion fails fast instead of parking requests for days |
+| `queue.weeklyMaxWaitMs` | How long to hold a request when every account is at its weekly (7d) cap. Defaults to 24h — but the early-exit gates on each account's REAL reset time, so it only waits when a reset genuinely lands inside the window and errors honestly otherwise. (Was `0` = fail-fast, which killed sessions the instant all accounts hit their weekly cap.) |
+| `queue.nonStreamMaxWaitMs` | Max hold for non-streaming requests; defaults to 5m. They have no SSE keepalive, so a longer hold would die on the client timeout anyway |
+| `queue.maxConcurrentQueued` | Backpressure: max requests held waiting at once; defaults to 64. Beyond it, new waiters get a clear "queue full" error instead of growing the heap |
+| `queue.maxQueuedBytes` | Backpressure: max aggregate buffered request-body bytes across all held requests; defaults to 1 GiB |
 | `queue.pollMs` | How often queued requests check for a recovered account/provider |
 | `queue.heartbeatMs` | SSE heartbeat interval for queued streaming requests; defaults to 10s so Claude Code keeps the queued connection alive |
 | `shutdown.drainTimeoutMs` | Maximum time quit/Ctrl-C waits for active requests before exiting |
@@ -368,7 +374,7 @@ The weekly usage bar shows raw upstream utilization and reset timing. Reset-awar
 11. In the `all` profile only, if all Claude accounts are unavailable, provider fallbacks are tried by priority: GLM before Kimi
 12. If all eligible accounts/providers are temporarily unavailable for a temporary reason (5h/session limit, provider cooldown, short 429), the proxy queues the request and retries when one recovers
 13. Repeated upstream 5xx/overload failures use the shorter `capacityMaxWaitMs` cap, not the long quota wait
-14. Weekly exhaustion and non-retryable 4xx errors fail fast by default; if the queue wait expires, returns 429 with the soonest retry time
+14. Weekly (7d) exhaustion is held and retried like a 5h cap, up to `weeklyMaxWaitMs`, but only when an account's real reset lands inside the window; if the soonest reset is beyond it (or unknown), it returns 429 promptly with an honest message naming the soonest reset rather than spinning. Non-retryable 4xx errors still fail fast
 15. Temporary OAuth refresh failures cool the account down and queue/fail over; invalid refresh credentials disable only that account and require login
 16. In an interactive terminal, the server runs under a foreground supervisor so confirmed Restart (`r`) can drain and restart without detaching the replacement TUI
 17. When Restart is confirmed, new upstream admission pauses immediately. Existing upstream requests finish, queued requests cannot deadlock restart, and their sockets close during relaunch so Claude Code reconnects automatically

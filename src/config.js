@@ -81,13 +81,20 @@ export function createDefaultConfig() {
     shutdown: {
       drainTimeoutMs: 15_000,
     },
+    // When every account is rate-limited, hold the request and retry until one
+    // frees up, instead of erroring and killing the session. Only error if
+    // nothing recovers within the window below (the early-exit gates on each
+    // account's REAL reset time, so a generous bound never spins pointlessly).
     queue: {
       enabled: true,
-      maxWaitMs: 24 * 60 * 60 * 1000,
-      autoMaxWaitMs: null,
-      capacityMaxWaitMs: 15 * 60 * 1000,
-      maxQueuedBodyBytes: 256 * 1024 * 1024,
-      weeklyMaxWaitMs: 0,
+      maxWaitMs: 24 * 60 * 60 * 1000,    // hard ceiling for any hold
+      autoMaxWaitMs: null,               // 5h/session-cap hold (null = maxWaitMs)
+      capacityMaxWaitMs: 15 * 60 * 1000, // upstream 529/overload — stays short, never governed by the others
+      weeklyMaxWaitMs: 24 * 60 * 60 * 1000, // weekly (7d) cap hold; was 0 (fail-fast) — that killed sessions on weekly cap
+      nonStreamMaxWaitMs: 5 * 60 * 1000, // non-streaming requests have no keepalive; cap their wait
+      maxConcurrentQueued: 64,           // backpressure: max requests held at once
+      maxQueuedBytes: 1024 * 1024 * 1024, // backpressure: max aggregate buffered body bytes (1 GiB)
+      maxQueuedBodyBytes: 256 * 1024 * 1024, // per-request cap on a queueable body
       pollMs: 1000,
       heartbeatMs: 10_000,
     },
