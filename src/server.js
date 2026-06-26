@@ -1179,13 +1179,16 @@ async function queueAndRetry(
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
 
-  // Stop the heartbeat BEFORE streaming real bytes. The heartbeat already sent
-  // the SSE headers (the resumed forward writes onto the committed stream); if
-  // the setInterval keeps firing it injects ': maxpool queued' comments INTO the
-  // live SSE body and corrupts every resumed completion longer than heartbeatMs.
-  // Comments already written before this point are harmless (clients ignore ':').
-  clearQueueHeartbeat(requestInfo);
-
+  // NOTE: the heartbeat is deliberately NOT cleared here. It must stay alive
+  // through the resumed forward's CONNECTION + failover attempts: if the freed
+  // account 529s/throttles on the first resumed request (before any upstream
+  // bytes), forwardRequest re-enters queueAndRetry — whose guard at the top
+  // (`res.headersSent && !queueHeartbeatActive`) would otherwise BAIL on the
+  // committed stream and DROP the held session. Keeping the heartbeat active lets
+  // it re-hold. The heartbeat is instead stopped the instant real upstream bytes
+  // start flowing, inside streamResponse — that prevents the Bug A interleave
+  // (': maxpool queued' comments injected between real SSE events) without losing
+  // re-holdability on a post-resume failover.
   return forwardRequest(
     req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
     retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set(),
@@ -1429,6 +1432,14 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   let sseBuffer = '';
   let committed = res.headersSent;
   let readFailed = false;
+
+  // We're now committed to streaming a real upstream response body onto this
+  // response — there is no more failover for this forward. Stop the queue
+  // heartbeat (if this was a resumed held stream) BEFORE the first real byte, so
+  // the setInterval can't inject ': maxpool queued' comments between live SSE
+  // events (Bug A). It is deliberately NOT cleared earlier (on resume), so a
+  // pre-byte failover can still re-hold the session via queueAndRetry.
+  clearQueueHeartbeat(requestInfo);
 
   try {
     while (true) {

@@ -1041,6 +1041,40 @@ test('bug (fairness): re-queuing clears a stale queueAdmitted so a resumed reque
   assert.equal(am._matchesRequest(am.accounts[0], 'claude', X), false, 'ticketless un-admitted X gated behind the waiter');
 });
 
+test('minor: weekly-critical blocked only by the in-flight cap holds a bounded re-poll, not the 7d reset', () => {
+  // A weekly-critical account whose ONLY block is the per-account in-flight cap
+  // frees in seconds when a sibling completes — it must NOT report the ~7d weekly
+  // reset as its hold (which would error-fast a non-stream request for days).
+  const am = manager(1);
+  const a = am.accounts[0];
+  a.quota.unified7d = 0.96;                       // weekly critical, last-resort usable
+  a.quota.unified7dReset = Date.now() + 40 * 3600_000;
+  a.inFlight = am.scheduler.safetyMaxActivePerAccount; // sole block: concurrency cap
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_critical');
+  assert.ok(plan.retryAfterMs <= 60_000, `bounded re-poll (~60s), got ${plan.retryAfterMs}ms — must NOT be the 40h weekly reset`);
+});
+
+test('minor (min-merge): a sibling weekly-exhausted 30min reset wins over a weekly-critical 3h short-term hold', () => {
+  // soonestTemporary must NOT hard-win over the weekly buckets: A is weekly-critical
+  // with a queueable 3h session_limit (→ soonestTemporary=3h); B is weekly-exhausted
+  // resetting in 30min. The emitted Retry-After must reflect B's sooner 30min recovery.
+  const am = manager(2);
+  const A = am.accounts[0], B = am.accounts[1];
+  A.quota.unified7d = 0.96;                       // critical
+  A.quota.unified7dReset = Date.now() + 40 * 3600_000;
+  A.quota.unified5h = 0.95;                       // queueable 3h session_limit
+  A.quota.unified5hReset = Date.now() + 3 * 3600_000;
+  B.quota.unified7d = 0.99;                       // exhausted
+  B.quota.unified7dReset = Date.now() + 30 * 60_000;
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_exhausted', 'the sooner sibling recovery (B) must win, not A 3h session_limit');
+  assert.ok(plan.retryAfterMs <= 30 * 60_000 + 5000 && plan.retryAfterMs >= 30 * 60_000 - 60_000,
+    `retry-after ${plan.retryAfterMs}ms must track B's ~30min reset, not A's 3h hold`);
+});
+
 test('bug B (masking): a sooner weekly-critical recovery wins over a far weekly-exhausted reset', () => {
   // Mixed fleet: account A is weekly-EXHAUSTED with a far 40h reset; account B is
   // weekly-CRITICAL (last-resort usable) recovering ~60s. The oracle used to

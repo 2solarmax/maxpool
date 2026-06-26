@@ -1597,3 +1597,62 @@ test('bug A: resumed stream has NO heartbeat comment interleaved between real ev
     await close(upstream);
   }
 });
+
+test('major: a post-resume failover RE-HOLDS the session instead of dropping it', async () => {
+  // The feature's core promise: a held stream that resumes onto a freed account,
+  // and that account 529s on the very first forwarded request, must be RE-HELD
+  // (the heartbeat stays alive through the failover) and ultimately complete on
+  // another account — NOT terminate abruptly. Pre-fix, clearQueueHeartbeat ran
+  // before forwardRequest, so the post-529 queueAndRetry guard
+  // (`headersSent && !heartbeatActive`) bailed and the session was dropped.
+  let attempts = 0;
+  const upstream = http.createServer((_req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      // First forwarded request (the resume) overloads → must re-hold, not drop.
+      res.writeHead(529, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'overloaded' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"type":"message_start"}\n\ndata: {"type":"message_stop"}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  // Two accounts: both briefly throttled so the request queues+holds first; when
+  // they free, the resume hits account-1's 529, re-holds, then completes on the
+  // other account.
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    { name: 'a2', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  for (const a of am.accounts) {
+    a.status = 'throttled';
+    a.lastError = 'rate_limited';
+    a.rateLimitedUntil = Date.now() + 120;
+  }
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 8000, pollMs: 20, heartbeatMs: 1000, capacityMaxWaitMs: 8000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(7000),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    // Re-held and completed on the retry, NOT dropped after the 529.
+    assert.match(body, /message_stop/, 'session re-held after the post-resume 529 and completed');
+    assert.ok(!/overloaded_error/.test(body.slice(body.indexOf('data:') >= 0 ? body.indexOf('data:') : 0)) || /message_stop/.test(body),
+      'did not terminate on the 529');
+    assert.ok(attempts >= 2, 'the request was actually retried (re-held), not dropped on the first 529');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});

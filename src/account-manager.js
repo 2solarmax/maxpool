@@ -280,28 +280,24 @@ export class AccountManager {
       }
     }
 
-    if (Number.isFinite(soonestTemporary)) {
-      return {
-        available: false,
-        retryAfterMs: Math.max(0, soonestTemporary),
-        cause: temporaryCause || 'temporary_unavailable',
-        reasons,
-        matchingRoutes,
-      };
-    }
-
-    // Min-merge the two weekly buckets and emit the cause of the SOONER recovery.
+    // Min-merge ALL THREE recovery buckets and emit the cause of the SOONEST one.
     // A weekly-critical account is last-resort usable and frees when its
     // short-term blocker clears (often ~minutes); a weekly-exhausted account is
-    // unusable until its full 7d reset. Returning exhausted first (the old order)
-    // masked a sooner critical recovery behind a far reset — error-fasting a
-    // holdable request and emitting a multi-day Retry-After.
-    if (Number.isFinite(soonestWeekly) || Number.isFinite(soonestWeeklyCritical)) {
-      const weeklyCriticalWins = soonestWeeklyCritical < soonestWeekly;
+    // unusable until its full 7d reset. Picking any one bucket ahead of the others
+    // (the old temporary-then-weekly-then-critical order) could mask a sibling's
+    // sooner recovery behind a far reset — error-fasting a holdable request and
+    // emitting a misleading multi-day Retry-After.
+    const recoveries = [
+      { ms: soonestTemporary, cause: temporaryCause || 'temporary_unavailable' },
+      { ms: soonestWeekly, cause: 'weekly_exhausted' },
+      { ms: soonestWeeklyCritical, cause: 'weekly_critical' },
+    ].filter(r => Number.isFinite(r.ms));
+    if (recoveries.length) {
+      const best = recoveries.reduce((a, b) => (b.ms < a.ms ? b : a));
       return {
         available: false,
-        retryAfterMs: Math.max(0, weeklyCriticalWins ? soonestWeeklyCritical : soonestWeekly),
-        cause: weeklyCriticalWins ? 'weekly_critical' : 'weekly_exhausted',
+        retryAfterMs: Math.max(0, best.ms),
+        cause: best.cause,
         reasons,
         matchingRoutes,
       };
@@ -879,7 +875,12 @@ export class AccountManager {
       // account is recoverable by definition and must never collapse to an
       // Infinity session-kill, even when no reset time is known.
       if (shortTerm) return { ...shortTerm, weeklyCritical: true };
-      return { cause: 'weekly_critical', retryAt: q.unified7dReset || null, queueable: false, weeklyCritical: true };
+      // No short-term blocker → the only thing keeping it out of the last-resort
+      // pool is a TRANSIENT cap (in-flight/concurrency, admission pause), which
+      // clears in seconds when a sibling completes — NOT the 7d weekly reset. Hold
+      // a bounded re-poll (retryAt:null → WEEKLY_CRITICAL_UNKNOWN_HOLD_MS), never
+      // the far weekly reset, so a non-stream request isn't error-fasted for ~7d.
+      return { cause: 'weekly_critical', retryAt: null, queueable: false, weeklyCritical: true };
     }
 
     // Healthy / soft / reserve weekly: the ordinary short-term blocker, if any.
