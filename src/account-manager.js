@@ -182,6 +182,21 @@ export class AccountManager {
       bytes: 0, // aggregate buffered body bytes across all held requests
     };
     this.admissionPaused = false;
+    // Single-writer baton: only the lease holder may rotate OAuth refresh tokens
+    // (refresh tokens are single-use; two refreshers brick the account). A worker
+    // booted headless during a reload starts WITHOUT the lease and refreshes
+    // nothing until it acquires the baton. Default true so the standalone /
+    // direct-listen (non-supervised, headless service) path is unchanged.
+    this.writerLease = true;
+  }
+
+  /**
+   * Acquire/release the single-writer baton. While released, ensureTokenFresh is
+   * a no-op (the worker serves on its existing access tokens but never rotates a
+   * single-use refresh token — that's the lease holder's job).
+   */
+  setWriterLease(held) {
+    this.writerLease = Boolean(held);
   }
 
   /**
@@ -516,7 +531,7 @@ export class AccountManager {
     console.log(`[Maxpool] Anthropic recovery probe failed; retrying in ${retryAfter}s (${reason})`);
   }
 
-  noteAmbiguousRateLimit(accountIndex, fingerprint, retryAfterSeconds) {
+  noteAmbiguousRateLimit(accountIndex, fingerprint, _retryAfterSeconds) {
     if (!fingerprint) return false;
     const now = Date.now();
     const windowMs = 30_000;
@@ -1509,6 +1524,12 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return true;
 
+    // Single-writer baton: a worker without the lease NEVER rotates a single-use
+    // refresh token (doing so would invalidate the lease holder's token →
+    // invalid_grant → bricked account). It serves on its existing access token
+    // for the bounded drain; the lease holder owns all rotation.
+    if (!this.writerLease) return true;
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return true;
 
     // Coalesce concurrent refreshes
@@ -1516,6 +1537,9 @@ export class AccountManager {
 
     account._refreshPromise = (async () => {
       console.log(`[Maxpool] Refreshing token for account "${account.name}"...`);
+      // Record the token we're rotating FROM so the persistence layer's
+      // generation guard can detect another writer having already advanced it.
+      account._refreshedFrom = account.refreshToken;
       try {
         const newTokens = await this._refreshAccessToken(account.refreshToken);
         account.credential = newTokens.accessToken;

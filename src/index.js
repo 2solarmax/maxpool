@@ -11,11 +11,20 @@ import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate } from './updater.js';
+import {
+  runReloadBaton,
+  RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
+  MSG_LISTEN, MSG_RELEASE, MSG_TAKEOVER, MSG_PROBE_READY,
+  MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY,
+} from './reload-protocol.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
 const SERVER_RESTART_EXIT_CODE = 75;
 const SERVER_WORKER_ENV = 'MAXPOOL_SERVER_WORKER';
+// Set by the supervisor when it spawns a worker for a seamless reload: that
+// worker boots HEADLESS (plain logs, no writer lease) and waits for the baton.
+const SERVER_RELOAD_WORKER_ENV = 'MAXPOOL_RELOAD_WORKER';
 
 switch (command) {
   case 'server':
@@ -75,43 +84,263 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
-  if (
-    process.env[SERVER_WORKER_ENV] === '1' ||
-    !process.stdout.isTTY ||
-    !process.stdin.isTTY
-  ) {
+  // A spawned worker (env flag set by the supervisor) runs the proxy itself.
+  if (process.env[SERVER_WORKER_ENV] === '1') {
     return serverWorkerCommand();
   }
 
-  // Keep a stable foreground process attached to the shell. The worker can
-  // then request a restart without orphaning its replacement or losing TTY IO.
-  const ignoreTerminalSignal = () => {};
-  process.on('SIGINT', ignoreTerminalSignal);
-  process.on('SIGTERM', ignoreTerminalSignal);
+  // Non-TTY (e.g. `maxpool server` as a background service): keep the existing
+  // tested direct-listen path. The seamless-reload feature is only active under
+  // the TTY supervisor; a service manager already handles restart/respawn.
+  // MAXPOOL_FORCE_SUPERVISOR=1 forces the supervisor path without a TTY (used by
+  // the reload integration tests; the worker still runs plain-log without a TTY).
+  const forceSupervisor = process.env.MAXPOOL_FORCE_SUPERVISOR === '1';
+  if (!forceSupervisor && (!process.stdout.isTTY || !process.stdin.isTTY)) {
+    return serverWorkerCommand();
+  }
+
+  return supervisorCommand();
+}
+
+// ── supervisor (TTY) ─────────────────────────────────────────
+//
+// Owns the listening socket for its whole life (never closes it) and hands the
+// socket HANDLE to exactly one worker at a time over IPC. A worker requests a
+// seamless reload; the supervisor spawns a fresh headless worker, runs the
+// single-writer baton, then swaps. Any failure falls back to the tested abrupt
+// exit-75 respawn. A crash-loop degrades to loud single-worker failure via an
+// exponential backoff, never a tight fork loop.
+
+async function supervisorCommand() {
+  const { createServer } = await import('node:net');
+  const config = await loadOrCreateConfig();
+  const port = config.proxy.port;
+  const host = config.proxy.host || '127.0.0.1';
+
+  // Bind once. EADDRINUSE / EACCES here is a cold-start failure → exit(1) is
+  // correct (there's no worker to keep alive yet).
+  const masterServer = createServer();
+  try {
+    await new Promise((resolve, reject) => {
+      const onErr = err => { masterServer.removeListener('listening', onListen); reject(err); };
+      const onListen = () => { masterServer.removeListener('error', onErr); resolve(); };
+      masterServer.once('error', onErr);
+      masterServer.once('listening', onListen);
+      masterServer.listen(port, host);
+    });
+  } catch (err) {
+    handleServerListenError(err, host, port);
+    return;
+  }
+
+  // Keep the supervisor attached to the shell; terminal signals are forwarded to
+  // the active worker so the worker can drain + restore the terminal.
+  let activeWorker = null;
+  const forwardSignal = sig => { try { activeWorker?.child.kill(sig); } catch { /* ignore */ } };
+  process.on('SIGINT', () => forwardSignal('SIGINT'));
+  process.on('SIGTERM', () => forwardSignal('SIGTERM'));
+  // SIGHUP → forward to the active worker, which requests a seamless reload.
+  process.on('SIGHUP', () => forwardSignal('SIGHUP'));
+
+  // Crash-loop guard: count rapid consecutive non-restart exits and back off so
+  // a worker that crashes on boot doesn't spin the CPU forking. A clean run for
+  // a while resets the counter.
+  let crashCount = 0;
+  const CRASH_WINDOW_MS = 10_000;
+  const MAX_BACKOFF_MS = 8_000;
+
+  let reloadInFlight = false;
+  // Resolver for the CURRENT supervision turn. A swap re-points monitoring to
+  // the new worker WITHOUT ending the turn; only an exit/fallback resolves it.
+  let endTurn = null;
+
+  // Spawn a worker. `reload=true` boots it HEADLESS with no writer lease; it
+  // waits for the baton instead of going primary immediately.
+  const spawnWorker = ({ reload = false } = {}) => {
+    const env = { ...process.env, [SERVER_WORKER_ENV]: '1' };
+    if (reload) env[SERVER_RELOAD_WORKER_ENV] = '1';
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      cwd: process.cwd(),
+      env,
+      stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    });
+    const worker = makeWorkerChannel(child);
+    if (!reload) {
+      // Cold start: hand the socket and tell it to go primary immediately.
+      child.send({ type: MSG_LISTEN }, masterServer);
+    }
+    return worker;
+  };
+
+  // Wire a worker as the active primary: its RELOAD_REQUEST triggers the baton;
+  // its exit ends the current supervision turn (so the loop reacts). Replaces any
+  // prior active wiring (used after a swap to monitor the NEW worker).
+  const monitorAsActive = worker => {
+    activeWorker = worker;
+    worker.child.removeAllListeners('message');
+    worker.child.on('message', msg => {
+      if (msg?.type === MSG_RELOAD_REQUEST) orchestrateReload().catch(() => {});
+    });
+    worker.child.once('exit', (code, signal) => {
+      // Only the worker that is STILL active when it exits ends the turn. A
+      // reaped old worker (already swapped out) exiting must be ignored here.
+      if (activeWorker === worker) endTurn?.({ code, signal });
+    });
+  };
+
+  // Reload orchestration: spawn a fresh headless worker, run the baton, swap.
+  const orchestrateReload = async () => {
+    if (reloadInFlight) return;
+    reloadInFlight = true;
+    const oldWorker = activeWorker;
+    let newWorker = null;
+    try {
+      newWorker = spawnWorker({ reload: true });
+      const outcome = await runReloadBaton({
+        oldWorker,
+        newWorker,
+        handle: masterServer,
+        log: msg => console.log(`[Maxpool] ${msg}`),
+      });
+
+      if (outcome === RELOAD_SWAPPED) {
+        // Re-point monitoring to the new worker (it's now primary), THEN reap the
+        // old one. Order matters: monitorAsActive sets activeWorker=new so the
+        // old worker's pending exit handler no-ops.
+        monitorAsActive(newWorker);
+        reapOldWorker(oldWorker, config);
+        return;
+      }
+
+      if (outcome === RELOAD_ROLLED_BACK) {
+        // Old worker never released — it's still fully primary. Kill the new
+        // headless worker; nothing else changed. ZERO disruption.
+        try { newWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
+        return;
+      }
+
+      // FALLBACK: the old worker may have released; neither is reliably primary.
+      // Kill both and let the respawn loop bring a fresh primary up on the
+      // supervisor-owned socket. Queued conns sit in the OS backlog meanwhile.
+      try { newWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
+      try { oldWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
+      activeWorker = null;
+      endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
+    } catch (err) {
+      console.error(`[Maxpool] Reload error: ${err.message}; falling back to abrupt restart`);
+      try { newWorker?.child.kill('SIGKILL'); } catch { /* ignore */ }
+      try { oldWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
+      activeWorker = null;
+      endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
+    } finally {
+      reloadInFlight = false;
+    }
+  };
+
+  // One supervision turn: monitor `worker` until it exits (or a fallback forces a
+  // respawn). Swaps re-point monitoring without resolving. Resolves exit info.
+  const superviseTurn = worker => new Promise(resolve => {
+    endTurn = info => { endTurn = null; resolve(info); };
+    monitorAsActive(worker);
+  });
+
   try {
     while (true) {
-      const result = await runServerWorker();
-      if (result.code === SERVER_RESTART_EXIT_CODE) continue;
+      const worker = spawnWorker({ reload: false });
+      const startedAt = Date.now();
+      const result = await superviseTurn(worker);
+
+      if (result.fallback) {
+        // Fallback swap killed both workers; bring a fresh primary straight back.
+        crashCount = 0;
+        continue;
+      }
+      if (result.code === SERVER_RESTART_EXIT_CODE) {
+        // Abrupt self-restart (worker-initiated exit-75 fallback path).
+        crashCount = 0;
+        continue;
+      }
+
+      // Non-restart exit. If it died fast, it's likely crash-looping on boot.
+      const ranFor = Date.now() - startedAt;
+      if (ranFor < CRASH_WINDOW_MS && (result.code ?? 1) !== 0) {
+        crashCount++;
+        const backoff = Math.min(MAX_BACKOFF_MS, 250 * 2 ** (crashCount - 1));
+        console.error(`[Maxpool] Worker exited (code ${result.code}, signal ${result.signal}) after ${ranFor}ms — crash #${crashCount}. Backing off ${backoff}ms before respawn.`);
+        await delay(backoff);
+        continue;
+      }
+
+      // Clean shutdown (q / signal). Propagate the exit code and stop.
       if (result.signal) process.exitCode = 1;
       else process.exitCode = result.code ?? 1;
       return;
     }
   } finally {
-    process.off('SIGINT', ignoreTerminalSignal);
-    process.off('SIGTERM', ignoreTerminalSignal);
+    try { masterServer.close(); } catch { /* ignore */ }
   }
 }
 
-function runServerWorker() {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, process.argv.slice(1), {
-      cwd: process.cwd(),
-      env: { ...process.env, [SERVER_WORKER_ENV]: '1' },
-      stdio: 'inherit',
-    });
-    child.once('error', reject);
-    child.once('exit', (code, signal) => resolve({ code, signal }));
-  });
+// Drain + reap a released worker. The worker exits itself once its bounded
+// in-flight finishes; the supervisor SIGKILLs it if it outlives the drain cap.
+function reapOldWorker(worker, config) {
+  if (!worker) return;
+  const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
+  let reaped = false;
+  const finish = () => { if (reaped) return; reaped = true; clearTimeout(timer); };
+  const timer = setTimeout(() => {
+    if (reaped) return;
+    console.error(`[Maxpool] Old worker outlived ${Math.ceil(drainTimeoutMs / 1000)}s drain cap; SIGKILL.`);
+    try { worker.child.kill('SIGKILL'); } catch { /* ignore */ }
+    finish();
+  }, drainTimeoutMs);
+  timer.unref?.();
+  worker.child.once('exit', finish);
+}
+
+/**
+ * Wrap a child process in a small IPC channel: `.send(msg[,handle])` and an
+ * async `.waitFor([types], timeoutMs)` that resolves with the first matching
+ * message, or rejects on timeout / premature child exit.
+ */
+function makeWorkerChannel(child) {
+  return {
+    child,
+    send(msg, handle) {
+      try {
+        if (handle) child.send(msg, handle);
+        else child.send(msg);
+      } catch { /* IPC may be torn down mid-swap; baton timeouts cover it */ }
+    },
+    waitFor(types, timeoutMs) {
+      const want = Array.isArray(types) ? types : [types];
+      return new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          child.removeListener('message', onMsg);
+          child.removeListener('exit', onExit);
+        };
+        const onMsg = msg => {
+          if (msg && want.includes(msg.type)) { cleanup(); resolve(msg); }
+        };
+        const onExit = (code, signal) => {
+          cleanup();
+          reject(new Error(`worker exited (code ${code}, signal ${signal}) before ${want.join('/')}`));
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`timed out waiting for ${want.join('/')}`));
+        }, timeoutMs);
+        timer.unref?.();
+        child.on('message', onMsg);
+        child.once('exit', onExit);
+      });
+    },
+  };
+}
+
+function delay(ms) {
+  return new Promise(resolve => { const t = setTimeout(resolve, ms); t.unref?.(); });
 }
 
 async function serverWorkerCommand() {
@@ -143,23 +372,42 @@ async function serverWorkerCommand() {
     config.routing?.preferredAccount,
   );
 
+  // Supervised = spawned by the TTY supervisor over IPC (handle-based listen +
+  // baton). A reload worker boots HEADLESS without the writer lease and waits
+  // for the baton; a cold-start worker takes the lease on MSG_LISTEN.
+  const supervised = typeof process.send === 'function';
+  const isReloadWorker = process.env[SERVER_RELOAD_WORKER_ENV] === '1';
+
   // Restore quota observed in a previous run so a restart doesn't lose routing
   // accuracy and re-probe from scratch. Stale windows clear on first use.
+  // A reload worker restores quota IN-MEMORY only (state file handed via the
+  // lease holder); a cold/direct worker reads the on-disk state file.
   const savedState = await loadState();
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
-  const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState() }).catch(() => {});
+  // Track the state-file generation we last observed so a stale flush is refused.
+  let stateGeneration = Number(savedState?._generation) || 0;
+
+  // ── single-writer baton: refresh / probe / persistence gated by the lease ──
+  // A worker without the lease writes NOTHING (no token rotation, no config
+  // write, no state write, no probe). Only the lease holder may write.
+  let hasLease = false;
+  const persistQuotaState = () => {
+    if (!hasLease) return Promise.resolve();
+    return saveState({ quota: accountManager.exportQuotaState() }, { expectedGeneration: stateGeneration })
+      .then(written => { if (written != null) stateGeneration = written; })
+      .catch(() => {});
+  };
   // Persist quota every minute; unref so it never keeps the process alive.
-  const quotaSaveInterval = setInterval(persistQuotaState, 60_000);
-  quotaSaveInterval.unref?.();
+  let quotaSaveInterval = null;
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   const prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
-  prober.start();
 
-  // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
-  // accounts added externally, e.g. by `maxpool import` while server is running)
-  accountManager.onTokenRefresh((idx, newTokens) => {
+  // Persist refreshed tokens back to config. Defense-in-depth: the updater reads
+  // the on-disk refresh token and SKIPS the rotation if a fresher writer already
+  // advanced it (generation guard), so a stale write can't double-spend a token.
+  const persistTokenRefresh = (idx, newTokens) => {
+    if (!hasLease) return; // only the lease holder writes tokens
     const account = accountManager.accounts[idx];
     if (!account) return;
     // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
@@ -183,15 +431,30 @@ async function serverWorkerCommand() {
       // Match by UUID first, then by name — index may have shifted
       const cfgIdx = findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
-        diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
-        diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
-        diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
+        const onDisk = diskConfig.accounts[cfgIdx];
+        // Generation guard: if the on-disk refresh token already advanced past
+        // the token we rotated FROM, another writer beat us — skip the write so
+        // we don't revert a fresher single-use token (the brick-the-account case).
+        if (onDisk.refreshToken && onDisk.refreshToken !== account._refreshedFrom &&
+            onDisk.refreshToken !== newTokens.refreshToken) {
+          return;
+        }
+        onDisk.accessToken = newTokens.accessToken;
+        onDisk.refreshToken = newTokens.refreshToken;
+        onDisk.expiresAt = newTokens.expiresAt;
       }
-    }).catch(err => console.error(`[Maxpool] Failed to save refreshed token: ${err.message}`));
-  });
+    }).catch(err => {
+      if (err?.code === 'STALE_GENERATION') return; // another writer advanced; benign
+      console.error(`[Maxpool] Failed to save refreshed token: ${err.message}`);
+    });
+  };
+  accountManager.onTokenRefresh(persistTokenRefresh);
+
   const port = config.proxy.port;
   const host = config.proxy.host || '127.0.0.1';
-  const useTUI = process.stdout.isTTY && process.stdin.isTTY;
+  // A headless reload worker NEVER drives the TUI (single-owner terminal); it
+  // takes the TUI only on baton takeover. Cold/direct workers use it if on a TTY.
+  const useTUI = process.stdout.isTTY && process.stdin.isTTY && !isReloadWorker;
 
   let tui = null;
   let server = null;
@@ -219,22 +482,60 @@ async function serverWorkerCommand() {
     },
   };
 
+  // ── writer lease (single-writer baton) ──
+  // Acquiring the lease turns ON token rotation, the quota-save interval, and the
+  // prober. Releasing turns them all OFF and flushes once. Exactly one worker
+  // holds the lease at a time — enforced by the supervisor's baton sequencing.
+  const acquireLease = () => {
+    if (hasLease) return;
+    hasLease = true;
+    accountManager.setWriterLease(true);
+    if (!quotaSaveInterval) {
+      quotaSaveInterval = setInterval(() => { persistQuotaState(); }, 60_000);
+      quotaSaveInterval.unref?.();
+    }
+    prober.start();
+  };
+  const releaseLease = () => {
+    if (!hasLease) return;
+    hasLease = false;
+    if (quotaSaveInterval) { clearInterval(quotaSaveInterval); quotaSaveInterval = null; }
+    prober.stop();
+    accountManager.setWriterLease(false);
+  };
+
+  // Abrupt self-restart — the tested fallback path. Cuts in-flight connections;
+  // clients retry ~2s. Used when NOT supervised, or when a seamless reload can't
+  // be requested. NEVER exit(1) here (that escapes the exit-75 supervisor loop).
   const restartWorkerNow = () => {
     if (draining) return;
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
-    clearInterval(quotaSaveInterval);
     persistQuotaState(); // flush learned quota so the restart restores it
-    prober.stop();
-    if (tui?.running) tui.stop();
+    releaseLease();
+    if (tui?.running) { tui.stop(); }
     console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
     process.exit(SERVER_RESTART_EXIT_CODE);
   };
 
+  // Seamless reload entry point. When supervised, ask the supervisor to run the
+  // baton (spawn new worker, hand off socket + lease). If anything is off
+  // (not supervised, no IPC), fall back to the abrupt restart.
+  const requestReload = () => {
+    if (draining) return;
+    if (supervised) {
+      try {
+        process.send({ type: MSG_RELOAD_REQUEST });
+        return;
+      } catch { /* IPC gone — fall through to abrupt restart */ }
+    }
+    restartWorkerNow();
+  };
+
   restartController = new RestartController({
     pauseAdmission: () => accountManager.setAdmissionPaused(true),
-    restartNow: restartWorkerNow,
+    restartNow: requestReload,
   });
 
   const shutdownGracefully = (reason, options = {}) => {
@@ -245,9 +546,8 @@ async function serverWorkerCommand() {
 
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
-    clearInterval(quotaSaveInterval);
     persistQuotaState(); // best-effort final flush of learned quota
-    prober.stop();
+    releaseLease();
     if (tui?.running) tui.stop();
 
     console.log(`\n[Maxpool] Draining shutdown (${reason}).`);
@@ -350,12 +650,12 @@ async function serverWorkerCommand() {
     }
   }, syncIntervalMs);
   syncTimer.unref();
-  const onListenError = err => handleServerListenError(err, host, port);
-  server.once('error', onListenError);
 
-  server.listen(port, host, () => {
-    server.removeListener('error', onListenError);
-    server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
+  // Become the live primary: start serving UI/logs, take the writer lease, run
+  // the update check. `viaTakeover` true means we acquired the socket through the
+  // baton (a reload) — freeze the update check so a reload doesn't re-probe npm
+  // (only a cold supervisor start self-updates).
+  const becomePrimary = ({ viaTakeover }) => {
     if (tui) {
       if (tui.start()) {
         console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
@@ -366,15 +666,113 @@ async function serverWorkerCommand() {
     } else {
       logPlainServerStart({ host, port, accounts, threshold, config });
     }
+    acquireLease();
 
-    // Non-blocking update check. Notifies (or self-updates if config.autoUpdate);
-    // never interrupts the running proxy. Failures are swallowed.
-    const notify = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
-    maybeCheckForUpdate(config, notify).catch(() => {});
-  });
+    // Reload-storm guard: only a cold (non-reload) lease holder probes npm.
+    // A reload-spawned/takeover worker must NEVER re-probe (1x not 2x traffic).
+    if (!viaTakeover && !isReloadWorker) {
+      if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') console.log('[Maxpool] UPDATE_CHECK_FIRED');
+      const notify = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
+      maybeCheckForUpdate(config, notify).catch(() => {});
+    } else if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') {
+      console.log('[Maxpool] UPDATE_CHECK_SKIPPED (reload)');
+    }
+  };
+
+  // ── start accepting ──
+  if (supervised) {
+    // Supervised: NEVER listen(port) directly — the supervisor owns the socket.
+    // Wait for the baton over IPC. A cold worker gets MSG_LISTEN; a reload worker
+    // boots headless (already done above) and waits for MSG_PROBE_READY/TAKEOVER.
+    server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
+
+    const listenOnHandle = handle => new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(handle, () => { server.removeListener('error', reject); resolve(); });
+    });
+
+    // Baton release: the old primary gives up acceptance + the writer lease,
+    // flushes config+state once, then drains its bounded in-flight and exits(0).
+    const releaseBatonAndDrain = async () => {
+      if (draining) { try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ } return; }
+      draining = true;
+      if (syncTimer) clearInterval(syncTimer);
+      // Stop accepting NEW connections; KEEP in-flight requests alive.
+      server.maxpoolBeginDrain?.();
+      server.close(() => {});
+      server.closeIdleConnections?.(); // retire idle keep-alive sockets now
+      // Final single flush of learned quota + any pending token writes, THEN
+      // drop the lease so the incoming worker is the sole writer.
+      await persistQuotaState();
+      releaseLease();
+      if (tui?.running) tui.stop(); // restore terminal before the new worker takes it
+      try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ }
+
+      // Drain bounded in-flight on EXISTING access tokens (no refresh needed),
+      // then exit(0). The supervisor SIGKILLs us if we outlive its drain cap.
+      const waitForDrain = () => {
+        if (restartController.activeRequests.size === 0) { process.exit(0); return; }
+      };
+      const drainPoll = setInterval(waitForDrain, 200);
+      drainPoll.unref?.();
+      const hardCap = setTimeout(() => {
+        console.error(`[Maxpool] Released worker drain cap reached with ${restartController.activeRequests.size} active; exiting.`);
+        process.exit(0);
+      }, drainTimeoutMs);
+      hardCap.unref?.();
+      waitForDrain();
+    };
+
+    process.on('message', async (msg, handle) => {
+      try {
+        if (msg?.type === MSG_LISTEN && handle) {
+          // Cold start: take the socket and go primary immediately.
+          await listenOnHandle(handle);
+          becomePrimary({ viaTakeover: false });
+        } else if (msg?.type === MSG_PROBE_READY) {
+          // Headless reload worker: we've booted the new code and restored quota
+          // in memory. Confirm readiness (we are NOT yet accepting / writing).
+          // Test hook: simulate a new-version that fails to boot → forces the
+          // supervisor's rollback (old worker stays primary, zero disruption).
+          if (process.env.MAXPOOL_TEST_FAIL_RELOAD_WORKER === '1') {
+            process.send({ type: MSG_FAILED, reason: 'test-forced failure' });
+          } else {
+            process.send({ type: MSG_READY });
+          }
+        } else if (msg?.type === MSG_TAKEOVER && handle) {
+          // Baton acquire: the old worker already released, so we're the SOLE
+          // acceptor. Start accepting + take the writer lease + TUI.
+          await listenOnHandle(handle);
+          becomePrimary({ viaTakeover: true });
+          process.send({ type: MSG_PRIMARY });
+        } else if (msg?.type === MSG_RELEASE) {
+          // Baton release: stop accepting NEW (keep in-flight), retire keep-alive
+          // sockets with Connection: close, stop writing, flush once, drop TUI.
+          await releaseBatonAndDrain();
+        }
+      } catch (err) {
+        // A failed reload worker must NOT exit(1) (kills the supervisor loop).
+        // Report failure so the supervisor rolls back; stay alive harmlessly.
+        console.error(`[Maxpool] Reload worker error: ${err.message}`);
+        try { process.send({ type: MSG_FAILED, reason: err.message }); } catch { /* ignore */ }
+      }
+    });
+  } else {
+    // Direct (non-TTY service) path: bind the port ourselves, exactly as before.
+    const onListenError = err => handleServerListenError(err, host, port);
+    server.once('error', onListenError);
+    server.listen(port, host, () => {
+      server.removeListener('error', onListenError);
+      server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
+      becomePrimary({ viaTakeover: false });
+    });
+  }
 
   process.on('SIGINT', () => shutdownGracefully('SIGINT'));
   process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+  // SIGHUP requests a seamless reload (the conventional "reload" signal). Under
+  // the supervisor this runs the baton; otherwise it falls back to exit-75.
+  process.on('SIGHUP', () => requestReload());
 }
 
 function logPlainServerStart({ host, port, accounts, threshold, config }) {
@@ -651,7 +1049,7 @@ async function accountsCommand() {
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
       configDirty = true;
-    } catch (err) {
+    } catch {
       // refresh failed — fetchProfile will report the specific error
     }
   }));
