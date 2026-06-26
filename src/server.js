@@ -287,6 +287,13 @@ async function forwardRequest(
     return;
   }
 
+  // The admission (if this was a resumed queued request) has now been CONSUMED —
+  // it got its account. Clear queueAdmitted so any subsequent internal failover
+  // recursion (excludedIndexes path) re-enters the fairness gate as a normal
+  // waiter instead of preferentially jumping ahead of the FIFO for the rest of
+  // this request's failover chain.
+  requestInfo.queueAdmitted = false;
+
   // Track which account handles this request
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });

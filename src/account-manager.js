@@ -212,7 +212,7 @@ export class AccountManager {
     let soonestTemporary = Infinity;
     let temporaryCause = null;
     let soonestWeekly = Infinity;
-    let soonestWeeklyCritical = Infinity; // weekly-critical (last-resort) accounts with a known reset
+    let soonestWeeklyCritical = Infinity; // weekly-critical (last-resort) accounts: always a bounded re-poll (known short-term resets route through soonestTemporary instead)
     let weeklyUnknownReset = 0; // weekly-exhausted accounts whose reset time we don't know yet
     let matchingRoutes = 0;
     const reasons = {};
@@ -264,11 +264,13 @@ export class AccountManager {
       } else if (retry.weeklyCritical) {
         // Last-resort admit failed AND there is no queueable short-term reset (the
         // account is 5h-capped / cooling with an UNKNOWN reset, or purely critical).
-        // A weekly-critical account is recoverable by definition, so HOLD finite —
-        // soonest known reset, else a bounded re-poll — never collapse to Infinity
-        // and KILL the session on a recoverable cap.
-        const ms = retry.retryAt ? (retry.retryAt - Date.now()) : WEEKLY_CRITICAL_UNKNOWN_HOLD_MS;
-        if (ms < soonestWeeklyCritical) soonestWeeklyCritical = ms;
+        // _retryInfo always reaches here with retryAt:null (a KNOWN short-term reset
+        // is queueable and routes through soonestTemporary above), so the hold is a
+        // bounded re-poll. A weekly-critical account is recoverable by definition —
+        // hold finite, never collapse to Infinity and KILL the session.
+        if (WEEKLY_CRITICAL_UNKNOWN_HOLD_MS < soonestWeeklyCritical) {
+          soonestWeeklyCritical = WEEKLY_CRITICAL_UNKNOWN_HOLD_MS;
+        }
       } else if (retry.cause === 'weekly_exhausted' && retry.retryAt) {
         const ms = retry.retryAt - Date.now();
         if (ms < soonestWeekly) soonestWeekly = ms;
@@ -849,6 +851,16 @@ export class AccountManager {
   _retryInfo(account) {
     const now = Date.now();
     const q = account.quota || {};
+
+    // TERMINAL (non-recoverable) states FIRST — before any weekly/short-term
+    // bucket. An auth-dead / disabled / exhausted-status account is NOT
+    // recoverable-by-definition: it must error-fast (retryAt:null, no weeklyCritical
+    // tag → Infinity → 429), and a stale critical/exhausted QUOTA reading must never
+    // shadow that into a finite hold that spins the session for up to 7 days.
+    if (!account.enabled) return { cause: 'disabled', retryAt: null, queueable: false };
+    if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
+    if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
+
     // RAW weekly state, so the retry oracle agrees with _isAvailable's raw gate.
     // (Pace must NOT classify a raw-healthy account as weekly_critical here, or
     // the queue keys on a far-future reset instead of the account's real
@@ -886,9 +898,6 @@ export class AccountManager {
     // Healthy / soft / reserve weekly: the ordinary short-term blocker, if any.
     if (shortTerm) return shortTerm;
 
-    if (!account.enabled) return { cause: 'disabled', retryAt: null, queueable: false };
-    if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
-    if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
     return { cause: 'unavailable', retryAt: null, queueable: false };
   }
 

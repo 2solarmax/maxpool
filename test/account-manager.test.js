@@ -1041,6 +1041,23 @@ test('bug (fairness): re-queuing clears a stale queueAdmitted so a resumed reque
   assert.equal(am._matchesRequest(am.accounts[0], 'claude', X), false, 'ticketless un-admitted X gated behind the waiter');
 });
 
+test('major: an auth-dead account with a STALE critical quota error-fasts (Infinity), not a 60s spin', () => {
+  // A terminal account (status='error' / disabled) is NOT recoverable-by-definition.
+  // Its stale weekly-critical QUOTA reading must not shadow the terminal check into a
+  // finite weeklyCritical hold — that would spin the session up to streamHoldMaxMs (7d)
+  // instead of returning 429. _retryInfo must evaluate terminal status BEFORE weekly.
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.status = 'error';               // auth-dead (e.g. refresh failed)
+    a.lastError = 'invalid_grant';
+    a.quota.unified7d = 0.96;         // STALE raw-critical reading lingers
+    a.quota.unified7dReset = Date.now() + 40 * 3600_000;
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.retryAfterMs, Infinity, 'auth-dead fleet must ERROR FAST (Infinity), never hold finite');
+});
+
 test('minor: weekly-critical blocked only by the in-flight cap holds a bounded re-poll, not the 7d reset', () => {
   // A weekly-critical account whose ONLY block is the per-account in-flight cap
   // frees in seconds when a sibling completes — it must NOT report the ~7d weekly
