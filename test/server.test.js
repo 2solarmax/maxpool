@@ -1504,3 +1504,52 @@ test('headerValue falls back to legacy x-teamclaude-* names (backward compat)', 
   // Non-maxpool header names do not get a legacy fallback.
   assert.equal(headerValue({ 'x-teamclaude-other': 'x' }, 'x-other'), '');
 });
+
+test('resumed stream has NO heartbeat comment interleaved after real events', async () => {
+  // Pins the invariant the council flagged as "bug A": once the queued stream
+  // resumes onto the committed SSE body, no `: maxpool queued` heartbeat may
+  // appear between real events. Two independent guards enforce it — the
+  // clear-before-forward at resume AND the heartbeat's own write-failure reap —
+  // so this stays green; it's a regression pin, not a red-before repro (the
+  // interleave does not manifest empirically because the reap already stops it).
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"message_start"}\n\n');
+    setTimeout(() => res.write('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n'), 120);
+    setTimeout(() => res.end('data: {"type":"message_stop"}\n\n'), 240);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  // Only account is briefly throttled → the streaming request must QUEUE first
+  // (heartbeat fires), then recover and RESUME onto the committed SSE stream.
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].lastError = 'rate_limited';
+  am.accounts[0].rateLimitedUntil = Date.now() + 150;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20, heartbeatMs: 30 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    assert.match(body, /message_stop/, 'the resumed stream completed');
+    // Heartbeat comments may appear BEFORE the first real event (while queued),
+    // but NEVER after — interleaving mid-stream is the corruption bug.
+    const after = body.slice(body.indexOf('data:'));
+    assert.ok(!after.includes(': maxpool queued'),
+      'no heartbeat comment interleaved into the live SSE body after the first event');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});

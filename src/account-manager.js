@@ -204,6 +204,7 @@ export class AccountManager {
     let soonestTemporary = Infinity;
     let temporaryCause = null;
     let soonestWeekly = Infinity;
+    let soonestWeeklyCritical = Infinity; // weekly-critical (last-resort) accounts with a known reset
     let weeklyUnknownReset = 0; // weekly-exhausted accounts whose reset time we don't know yet
     let matchingRoutes = 0;
     const reasons = {};
@@ -249,6 +250,13 @@ export class AccountManager {
           soonestTemporary = ms;
           temporaryCause = retry.cause;
         }
+      } else if (retry.cause === 'weekly_critical' && retry.retryAt) {
+        // Last-resort admit failed for a transient reason (the account is ALSO
+        // 5h-capped / cooling down). It still has a known weekly reset, so HOLD
+        // the session until then rather than letting the fleet collapse to
+        // Infinity and KILL the session on a recoverable cap.
+        const ms = retry.retryAt - Date.now();
+        if (ms < soonestWeeklyCritical) soonestWeeklyCritical = ms;
       } else if (retry.cause === 'weekly_exhausted' && retry.retryAt) {
         const ms = retry.retryAt - Date.now();
         if (ms < soonestWeekly) soonestWeekly = ms;
@@ -275,6 +283,16 @@ export class AccountManager {
         available: false,
         retryAfterMs: Math.max(0, soonestWeekly),
         cause: 'weekly_exhausted',
+        reasons,
+        matchingRoutes,
+      };
+    }
+
+    if (Number.isFinite(soonestWeeklyCritical)) {
+      return {
+        available: false,
+        retryAfterMs: Math.max(0, soonestWeeklyCritical),
+        cause: 'weekly_critical',
         reasons,
         matchingRoutes,
       };
@@ -627,10 +645,19 @@ export class AccountManager {
     if (!sessionKey) return;
     const q = this.queueState;
     for (let i = q.waiting.length - 1; i >= 0; i--) {
-      if (q.waiting[i].sessionKey === sessionKey) {
-        q.bytes = Math.max(0, q.bytes - (q.waiting[i].bytes || 0));
-        q.waiting.splice(i, 1);
-      }
+      const t = q.waiting[i];
+      if (t.sessionKey !== sessionKey) continue;
+      // Only supersede a GHOST — a prior hold whose client connection is already
+      // gone (a timeout-retry of the SAME logical request). NEVER evict a LIVE
+      // concurrent sibling: a single Claude Code process fires concurrent
+      // requests under ONE session id (the main stream + the haiku title/summary
+      // call + parallel subagents), and evicting a live one orphans it for days.
+      const dead = !t.res || t.res.destroyed || t.res.writableEnded;
+      if (!dead) continue;
+      if (t.requestInfo) t.requestInfo.queueTicket = null; // let its waiter exit fast
+      t.dead = true;
+      q.bytes = Math.max(0, q.bytes - (t.bytes || 0));
+      q.waiting.splice(i, 1);
     }
   }
 
@@ -638,7 +665,7 @@ export class AccountManager {
     if (requestInfo.queueTicket) return requestInfo.queueTicket;
     this._reapStaleQueueHead();
     const sessionKey = opts.sessionKey || requestInfo.sessionKey || null;
-    this._evictQueuedSession(sessionKey); // a retry supersedes its own prior hold
+    this._evictQueuedSession(sessionKey); // a retry supersedes its own DEAD prior hold
     const bytes = Math.max(0, Number(opts.bytes) || 0);
     const { maxConcurrentQueued, maxQueuedBytes } = opts;
     if (maxConcurrentQueued != null && this.queueState.waiting.length >= maxConcurrentQueued) return null;
@@ -650,6 +677,8 @@ export class AccountManager {
       bytes,
       deadlineAt: opts.deadlineAt || null,
       sessionKey,
+      res: opts.res || null,
+      requestInfo,
     };
     this.queueState.waiting.push(ticket);
     this.queueState.bytes += bytes;

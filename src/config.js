@@ -87,7 +87,7 @@ export function createDefaultConfig() {
     // account's REAL reset time, so a generous bound never spins pointlessly).
     queue: {
       enabled: true,
-      maxWaitMs: 24 * 60 * 60 * 1000,    // hard ceiling for any hold
+      maxWaitMs: 24 * 60 * 60 * 1000,    // hard ceiling for non-streaming/capacity holds; streaming uses streamHoldMaxMs
       autoMaxWaitMs: null,               // 5h/session-cap hold (null = maxWaitMs)
       capacityMaxWaitMs: 15 * 60 * 1000, // upstream 529/overload — stays short, never governed by the others
       weeklyMaxWaitMs: 24 * 60 * 60 * 1000, // legacy bound; streaming holds use streamHoldMaxMs

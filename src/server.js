@@ -1089,7 +1089,6 @@ async function queueAndRetry(
   const capacityMaxWaitMs = queueConfig.capacityMaxWaitMs == null
     ? autoMaxWaitMs
     : Math.max(0, Number(queueConfig.capacityMaxWaitMs) || 0);
-  const weeklyMaxWaitMs = Math.max(0, Number(queueConfig.weeklyMaxWaitMs) || 0);
   const nonStreamMaxWaitMs = queueConfig.nonStreamMaxWaitMs == null
     ? 5 * 60_000
     : Math.max(0, Number(queueConfig.nonStreamMaxWaitMs) || 0);
@@ -1127,6 +1126,10 @@ async function queueAndRetry(
   } else {
     queueWindowMs = streamHoldMaxMs;
   }
+  // A non-streaming request has no heartbeat regardless of cause, so it must
+  // never outlast nonStreamMaxWaitMs even under capacity (it would occupy a
+  // slot 3x its documented cap with nothing to reap it).
+  if (!requestInfo.stream) queueWindowMs = Math.min(queueWindowMs, nonStreamMaxWaitMs);
 
   if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
 
@@ -1147,6 +1150,7 @@ async function queueAndRetry(
     bytes: body?.length || 0,
     deadlineAt: requestInfo.queueStartedAt + queueWindowMs,
     sessionKey: requestInfo.sessionKey,
+    res, // liveness check for ghost-only eviction
     maxConcurrentQueued: queueConfig.maxConcurrentQueued,
     maxQueuedBytes: queueConfig.maxQueuedBytes,
   });
@@ -1175,10 +1179,17 @@ async function queueAndRetry(
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
 
+  // Stop the heartbeat BEFORE streaming real bytes. The heartbeat already sent
+  // the SSE headers (the resumed forward writes onto the committed stream); if
+  // the setInterval keeps firing it injects ': maxpool queued' comments INTO the
+  // live SSE body and corrupts every resumed completion longer than heartbeatMs.
+  // Comments already written before this point are harmless (clients ignore ':').
+  clearQueueHeartbeat(requestInfo);
+
   return forwardRequest(
     req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
     retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set(),
-  ).then(() => true).finally(() => clearQueueHeartbeat(requestInfo));
+  ).then(() => true);
 }
 
 function ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager) {

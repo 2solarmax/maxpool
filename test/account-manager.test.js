@@ -974,3 +974,39 @@ test('ghost guard: a fresh session is not blocked by a superseded same-session g
   assert.ok(fresh, 'distinct fresh session admitted (not rejected by a dead same-session duplicate)');
   assert.equal(am.queueState.waiting.length, 2);
 });
+
+// ── council fixes: bug B (weekly-critical+5h hold) + bug C (ghost-only evict) ──
+
+test('bug B: weekly-critical + 5h-capped fleet HOLDS (finite retry), not killed', () => {
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.96;                          // raw weekly critical [0.95,0.985)
+    a.quota.unified7dReset = Date.now() + 40 * 3600_000;
+    a.quota.unified5h = 0.95;                          // ALSO 5h-capped (>= switchThreshold)
+    a.quota.unified5hReset = Date.now() + 2 * 3600_000;
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.ok(Number.isFinite(plan.retryAfterMs), 'must HOLD (finite), not error-fast on Infinity');
+  assert.equal(plan.cause, 'weekly_critical');
+});
+
+test('bug C: a LIVE concurrent same-session request is NOT evicted (no starve)', () => {
+  const am = manager(1);
+  const r1 = {}; const r2 = {};
+  am.registerQueuedRequest(r1, { sessionKey: 'S', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  am.registerQueuedRequest(r2, { sessionKey: 'S', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am.queueState.waiting.length, 2, 'both live concurrent siblings held');
+  assert.ok(r1.queueTicket, 'first live sibling not orphaned');
+});
+
+test('bug C: a DEAD same-session hold IS superseded and its waiter freed', () => {
+  const am = manager(1);
+  const r1 = {}; const r2 = {};
+  am.registerQueuedRequest(r1, { sessionKey: 'S', bytes: 1, res: { destroyed: true } }); // ghost
+  assert.equal(am.queueState.waiting.length, 1);
+  am.registerQueuedRequest(r2, { sessionKey: 'S', bytes: 1, res: { destroyed: false } });
+  assert.equal(am.queueState.waiting.length, 1, 'dead ghost evicted, new live one remains');
+  assert.equal(r1.queueTicket, null, 'orphaned waiter freed so its loop exits fast');
+  assert.equal(am.queueState.bytes, 1, 'ghost bytes released');
+});
