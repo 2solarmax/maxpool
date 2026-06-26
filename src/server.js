@@ -19,12 +19,17 @@ const DEFAULT_QUEUE = {
   maxWaitMs: 24 * 60 * 60 * 1000,
   autoMaxWaitMs: null,
   capacityMaxWaitMs: 15 * 60 * 1000,
-  // Weekly (7d) cap hold. A generous bound is SAFE because the early-exit
-  // gates on the REAL reset time (unified7dReset - now): it only waits when a
-  // reset genuinely lands inside the window, and errors honestly otherwise.
-  // 0 here was the bug — it fail-fast-killed sessions the instant every
-  // account hit its weekly cap, instead of waiting for the soonest reset.
-  weeklyMaxWaitMs: 24 * 60 * 60 * 1000,
+  weeklyMaxWaitMs: 24 * 60 * 60 * 1000, // legacy bound; streaming holds use streamHoldMaxMs
+  // STREAMING hold ceiling: how long a streaming request may be HELD ALIVE on
+  // the SSE heartbeat waiting for any account to free up. Defaults to 7d (the
+  // max weekly window) so a session is never killed while a real reset is on the
+  // way — it resumes the instant any account frees. The hold is gated by the
+  // nextRetryForRequest oracle: it ONLY holds when ≥1 eligible route has a finite
+  // reset within this ceiling; permanent failures (all accounts logged out / no
+  // eligible route / reset unknown) error fast instead of hanging. The heartbeat
+  // resets idle-gap client timeouts; if a client uses a wall-clock total-request
+  // deadline, lower this to just under it.
+  streamHoldMaxMs: 7 * 24 * 60 * 60 * 1000,
   // Non-streaming requests have no SSE heartbeat to keep them alive, so a long
   // hold would die on the client timeout anyway. Cap their wait conservatively.
   nonStreamMaxWaitMs: 5 * 60 * 1000,
@@ -1106,20 +1111,32 @@ async function queueAndRetry(
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
 
-  // Pick the wait window. Capacity (upstream 529/overload) MUST stay on its own
-  // short cap even when it coincides with weekly exhaustion — never let a
-  // transient overload inherit the long weekly bound.
-  let queueWindowMs = cause === 'capacity'
-    ? Math.min(maxWaitMs, capacityMaxWaitMs)
-    : retryPlan.cause === 'weekly_exhausted'
-      ? Math.min(maxWaitMs, weeklyMaxWaitMs)
-      : Math.min(maxWaitMs, autoMaxWaitMs);
-  // Non-streaming requests have no SSE heartbeat, so a long hold would die on
-  // the client timeout. Cap them so we never promise a wait we can't deliver.
-  if (!requestInfo.stream) queueWindowMs = Math.min(queueWindowMs, nonStreamMaxWaitMs);
+  const streamHoldMaxMs = queueConfig.streamHoldMaxMs == null
+    ? 7 * 24 * 60 * 60 * 1000
+    : Math.max(0, Number(queueConfig.streamHoldMaxMs) || 0);
+  // Pick the hold ceiling:
+  //   capacity (upstream 529/overload) → its own short cap, never a long hold
+  //   non-streaming (no heartbeat)      → short cap (would die on client timeout)
+  //   streaming                         → up to streamHoldMaxMs (7d), kept alive
+  //                                       by the heartbeat
+  let queueWindowMs;
+  if (cause === 'capacity') {
+    queueWindowMs = Math.min(maxWaitMs, capacityMaxWaitMs);
+  } else if (!requestInfo.stream) {
+    queueWindowMs = nonStreamMaxWaitMs;
+  } else {
+    queueWindowMs = streamHoldMaxMs;
+  }
 
   if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
 
+  // HOLD-vs-ERROR oracle (from nextRetryForRequest): HOLD only when a TEMPORARY
+  // cause has a finite real reset within the ceiling. ERROR FAST for permanent /
+  // unsatisfiable cases — nextRetryForRequest returns retryAfterMs === Infinity
+  // for no_eligible_route, weekly_reset_unknown, and "all matching routes are
+  // terminal (disabled / error / auth-dead)". This is what stops an indefinite
+  // hold from silently hanging every session when something is actually broken
+  // (all accounts logged out, the only healthy account removed, etc.).
   const retryAfterMs = retryPlan.retryAfterMs;
   if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) {
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
@@ -1129,6 +1146,7 @@ async function queueAndRetry(
   const ticket = accountManager.registerQueuedRequest?.(requestInfo, {
     bytes: body?.length || 0,
     deadlineAt: requestInfo.queueStartedAt + queueWindowMs,
+    sessionKey: requestInfo.sessionKey,
     maxConcurrentQueued: queueConfig.maxConcurrentQueued,
     maxQueuedBytes: queueConfig.maxQueuedBytes,
   });
@@ -1148,7 +1166,7 @@ async function queueAndRetry(
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
   console.log(`[Maxpool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
-  ensureQueueHeartbeat(res, requestInfo, queueConfig);
+  ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
   if (!available) {
@@ -1163,7 +1181,7 @@ async function queueAndRetry(
   ).then(() => true).finally(() => clearQueueHeartbeat(requestInfo));
 }
 
-function ensureQueueHeartbeat(res, requestInfo, queueConfig) {
+function ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager) {
   if (!requestInfo.stream || requestInfo.queueHeartbeatActive || res.headersSent) return;
   const heartbeatMs = Math.max(1000, Number(queueConfig.heartbeatMs) || 10_000);
   res.writeHead(200, {
@@ -1175,12 +1193,21 @@ function ensureQueueHeartbeat(res, requestInfo, queueConfig) {
   res.flushHeaders?.();
   res.write(': maxpool queued\n\n');
   requestInfo.queueHeartbeatActive = true;
+  // The heartbeat is the liveness probe: if the client is gone (socket
+  // destroyed/ended, or the write throws EPIPE/ERR_STREAM_DESTROYED), release
+  // the queue slot + bytes IMMEDIATELY rather than letting a dead ticket occupy
+  // the queue until its (up to 7d) deadline — the ghost-leak guard.
+  const reapDead = () => {
+    clearQueueHeartbeat(requestInfo);
+    accountManager?.removeQueuedRequest?.(requestInfo);
+  };
   requestInfo.queueHeartbeatTimer = setInterval(() => {
-    if (res.destroyed || res.writableEnded) {
-      clearQueueHeartbeat(requestInfo);
-      return;
+    if (res.destroyed || res.writableEnded) { reapDead(); return; }
+    try {
+      res.write(': maxpool queued\n\n');
+    } catch {
+      reapDead();
     }
-    res.write(': maxpool queued\n\n');
   }, heartbeatMs);
   requestInfo.queueHeartbeatTimer.unref?.();
 }
@@ -1219,6 +1246,14 @@ async function waitForAvailableRoute(req, res, accountManager, requestInfo, queu
         accountManager.hasAvailableRoute(requestInfo, new Set())
         && accountManager.canAdmitQueuedRequest?.(requestInfo) !== false
       ) return true;
+
+      // Re-classify each tick: if no eligible route can EVER recover (every
+      // matching account went terminal/auth-dead, the only healthy account was
+      // removed, or the reset is unknown → retryAfterMs Infinity), stop holding
+      // and error fast instead of spinning to the 7d ceiling. Hold is valid only
+      // while ≥1 eligible route has a finite, known reset.
+      const plan = accountManager.nextRetryForRequest?.(requestInfo, new Set());
+      if (plan && plan.cause !== 'available' && !Number.isFinite(plan.retryAfterMs)) return false;
 
       const remaining = maxWaitMs - (Date.now() - startedAt);
       // Jitter the poll so a synchronized weekly-reset event doesn't re-align

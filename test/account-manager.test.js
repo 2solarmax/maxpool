@@ -917,3 +917,60 @@ test('load spreads across healthy accounts instead of concentrating on the near-
 
   leases.forEach(l => am.releaseAccount(l, { success: true, status: 200 }));
 });
+
+// ── routing oracle + hold-vs-error + ghost guard (2026-06-26, issue #2) ──
+
+test('raw-healthy but pace-critical account stays available (routing consistency, R1)', () => {
+  const am = manager(1);
+  // 74% raw weekly = "soft", but resets in 5 days → pace burn-debt flips the
+  // PACE state to critical. The fix: gates use RAW state, so it stays usable.
+  am.accounts[0].quota.unified7d = 0.74;
+  am.accounts[0].quota.unified7dReset = Date.now() + 5 * 24 * 3600_000;
+  assert.equal(am._weeklyRawState(am.accounts[0]), 'soft');
+  assert.equal(am._isAvailable(am.accounts[0], { allowWeeklyReserve: true }), true);
+  assert.equal(am.hasAvailableRoute({ profile: 'claude' }), true);
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, true, 'oracle no longer benches it on pace');
+  assert.equal(plan.cause, 'available');
+});
+
+test('hold-vs-error oracle: all weekly-exhausted with KNOWN reset → finite retry (HOLD)', () => {
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.99;
+    a.quota.unified7dReset = Date.now() + 51 * 3600_000; // 51h out — the case the old kill rejected
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_exhausted');
+  assert.ok(Number.isFinite(plan.retryAfterMs) && plan.retryAfterMs > 0, 'finite reset → holdable');
+});
+
+test('hold-vs-error oracle: all accounts auth-dead → Infinity retry (ERROR FAST, never hold)', () => {
+  const am = manager(2);
+  for (const a of am.accounts) a.status = 'error';
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.retryAfterMs, Infinity, 'permanent → server errors fast, never parks the session');
+});
+
+test('sessionKey supersede: a client retry evicts its own prior ghost ticket', () => {
+  const am = manager(1);
+  am.registerQueuedRequest({}, { sessionKey: 'S', bytes: 100 });
+  assert.equal(am.queueState.waiting.length, 1);
+  assert.equal(am.queueState.bytes, 100);
+  am.registerQueuedRequest({}, { sessionKey: 'S', bytes: 250 }); // retry for same session
+  assert.equal(am.queueState.waiting.length, 1, 'old same-session ticket evicted, not stacked');
+  assert.equal(am.queueState.bytes, 250);
+  assert.equal(am.queueState.waiting[0].sessionKey, 'S');
+});
+
+test('ghost guard: a fresh session is not blocked by a superseded same-session ghost', () => {
+  const am = manager(1);
+  const lim = { maxConcurrentQueued: 2 };
+  am.registerQueuedRequest({}, { ...lim, sessionKey: 'S', bytes: 1 });
+  am.registerQueuedRequest({}, { ...lim, sessionKey: 'S', bytes: 1 }); // supersedes → still 1 in queue
+  const fresh = am.registerQueuedRequest({}, { ...lim, sessionKey: 'T', bytes: 1 });
+  assert.ok(fresh, 'distinct fresh session admitted (not rejected by a dead same-session duplicate)');
+  assert.equal(am.queueState.waiting.length, 2);
+});

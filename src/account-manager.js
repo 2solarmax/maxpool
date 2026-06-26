@@ -619,9 +619,26 @@ export class AccountManager {
   // Register a waiter. Returns the ticket, or null if a backpressure limit
   // (maxConcurrentQueued / maxQueuedBytes) would be exceeded — the caller then
   // rejects the request with a "queue full" error instead of holding it.
+  // Evict any waiting ticket(s) for a session key, releasing their slot + bytes.
+  // A client timeout-retry opens a fresh request for the same session; this lets
+  // the retry SUPERSEDE its own ghost instead of leaving a dead ticket occupying
+  // a queue slot for up to the hold ceiling (the steady-state ghost-leak DoS).
+  _evictQueuedSession(sessionKey) {
+    if (!sessionKey) return;
+    const q = this.queueState;
+    for (let i = q.waiting.length - 1; i >= 0; i--) {
+      if (q.waiting[i].sessionKey === sessionKey) {
+        q.bytes = Math.max(0, q.bytes - (q.waiting[i].bytes || 0));
+        q.waiting.splice(i, 1);
+      }
+    }
+  }
+
   registerQueuedRequest(requestInfo = {}, opts = {}) {
     if (requestInfo.queueTicket) return requestInfo.queueTicket;
     this._reapStaleQueueHead();
+    const sessionKey = opts.sessionKey || requestInfo.sessionKey || null;
+    this._evictQueuedSession(sessionKey); // a retry supersedes its own prior hold
     const bytes = Math.max(0, Number(opts.bytes) || 0);
     const { maxConcurrentQueued, maxQueuedBytes } = opts;
     if (maxConcurrentQueued != null && this.queueState.waiting.length >= maxConcurrentQueued) return null;
@@ -632,6 +649,7 @@ export class AccountManager {
       queuedAt: Date.now(),
       bytes,
       deadlineAt: opts.deadlineAt || null,
+      sessionKey,
     };
     this.queueState.waiting.push(ticket);
     this.queueState.bytes += bytes;
@@ -782,14 +800,21 @@ export class AccountManager {
   }
 
   _isNearQuota(account) {
+    // RAW weekly state (not pace): a raw-healthy account with real headroom is
+    // never treated as near-quota just because it's burning fast. Pace stays a
+    // soft cost in _scoreAccount only.
     return this._isSessionQuotaUnavailable(account)
-      || ['reserve', 'critical', 'exhausted'].includes(this._weeklyState(account));
+      || ['reserve', 'critical', 'exhausted'].includes(this._weeklyRawState(account));
   }
 
   _retryInfo(account) {
     const now = Date.now();
     const q = account.quota || {};
-    const weeklyState = this._weeklyState(account);
+    // RAW weekly state, so the retry oracle agrees with _isAvailable's raw gate.
+    // (Pace must NOT classify a raw-healthy account as weekly_critical here, or
+    // the queue keys on a far-future reset instead of the account's real
+    // short-term availability — the session-kill bug.)
+    const weeklyState = this._weeklyRawState(account);
     if (weeklyState === 'critical') {
       return { cause: 'weekly_critical', retryAt: q.unified7dReset || null, queueable: false };
     }
@@ -1374,7 +1399,7 @@ export class AccountManager {
         : account.quota.tokensLimit
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
           : '?';
-      const reason = this._isSessionQuotaUnavailable(account) ? 'session quota' : `weekly ${this._weeklyState(account)}`;
+      const reason = this._isSessionQuotaUnavailable(account) ? 'session quota' : `weekly ${this._weeklyRawState(account)}`;
       const logKey = `${reason}:${pct}`;
       if (account.lastQuotaLogKey !== logKey) {
         account.lastQuotaLogKey = logKey;
@@ -1488,7 +1513,7 @@ export class AccountManager {
       if (incident.accounts.has(account.index)) continue;
       if (account.status === 'exhausted' || account.status === 'error') continue;
       if (this._isSessionQuotaUnavailable(account)) continue;
-      if (this._weeklyState(account) === 'exhausted') continue;
+      if (this._weeklyRawState(account) === 'exhausted') continue;
       return false;
     }
     return true;
