@@ -878,3 +878,42 @@ test('nextRetryForRequest returns weekly_reset_unknown when reset time is unknow
   assert.equal(plan.cause, 'weekly_reset_unknown');
   assert.equal(plan.retryAfterMs, Infinity);
 });
+
+// ── routing redesign: spread-to-stay-healthy (2026-06-26) ────────────────
+
+test('load spreads across healthy accounts instead of concentrating on the near-reset one', () => {
+  // Reproduces the 2026-06-26 screenshot: max@dubner.io is near its 7d reset
+  // with quota left; mk@gomokka has real raw headroom but is burning fast;
+  // partnerships/personal are near-empty. 6 concurrent requests should FAN OUT
+  // across the two healthy accounts, not pile onto max@dubner.io.
+  const now = Date.now();
+  const am = new AccountManager([
+    { name: 'partnerships', type: 'oauth', accessToken: 'tp', refreshToken: 'rp', expiresAt: now + 3600_000 },
+    { name: 'personal', type: 'oauth', accessToken: 'tu', refreshToken: 'ru', expiresAt: now + 3600_000 },
+    { name: 'mk@gomokka', type: 'oauth', accessToken: 'tm', refreshToken: 'rm', expiresAt: now + 3600_000 },
+    { name: 'max@dubner.io', type: 'oauth', accessToken: 'td', refreshToken: 'rd', expiresAt: now + 3600_000 },
+  ], 0.90);
+  // weekly utilisation + reset horizons from the screenshot
+  am.accounts[0].quota.unified7d = 0.96; am.accounts[0].quota.unified7dReset = now + 4 * 24 * 3600_000;
+  am.accounts[1].quota.unified7d = 0.99; am.accounts[1].quota.unified7dReset = now + 2.4 * 24 * 3600_000;
+  am.accounts[2].quota.unified7d = 0.69; am.accounts[2].quota.unified7dReset = now + 5.3 * 24 * 3600_000; // raw-healthy, fast-burning
+  am.accounts[3].quota.unified7d = 0.26; am.accounts[3].quota.unified7dReset = now + 15 * 3600_000;        // near reset, quota left
+
+  const picks = {};
+  const leases = [];
+  for (let i = 0; i < 6; i++) {
+    const lease = am.acquireAccount({ weight: 1 });
+    assert.ok(lease, `request ${i} should get an account`);
+    picks[lease.account.name] = (picks[lease.account.name] || 0) + 1;
+    leases.push(lease);
+  }
+
+  // mk@gomokka must NOT be benched (the core gate fix) and load must spread.
+  assert.ok(picks['mk@gomokka'] > 0, `mk@gomokka must be used, got: ${JSON.stringify(picks)}`);
+  assert.ok(picks['max@dubner.io'] > 0, `max@dubner.io should also be used, got: ${JSON.stringify(picks)}`);
+  // No single account absorbs the whole 6-deep burst (the old bug).
+  const maxOnOne = Math.max(...Object.values(picks));
+  assert.ok(maxOnOne <= 4, `no account should absorb the whole burst; got: ${JSON.stringify(picks)}`);
+
+  leases.forEach(l => am.releaseAccount(l, { success: true, status: 200 }));
+});

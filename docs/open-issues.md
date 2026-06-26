@@ -14,14 +14,20 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 
 ## OPEN
 
-### 1. Routing: spread-to-stay-healthy; use-it-or-lose-it only near reset  ⟵ CORE, START HERE
-**Status:** designing (not implemented)
-**Problem:** The scheduler over-weights pace + near-reset, so it *concentrates* load on the single soonest-to-reset account (e.g. max@dubner.io) and demotes raw-healthy accounts (e.g. mk@gomokka at 69% raw, resets in 5d) to last-resort "critical" via pace. That concentration is exactly what risks rate-limiting the hammered account — the opposite of the goal.
-**Plan:**
-- Make the "spread" (even-distribution) term dominate for all *healthy* accounts, so load fans out across them.
-- Demote the pace / use-it-or-lose-it influence to a weak preference that only strongly activates when an account's binding window reset is *imminent* (e.g. within a few hours).
-- Stop classifying a raw-healthy account as "critical" purely on pace (retune `weeklyBurnDebtWeight` / pace thresholds, or change the tier gate so reserve/pace accounts share load instead of being overflow-only).
-- Validate by simulation/tests across realistic quota mixes (the 4-account state in the 2026-06-26 screenshot is a good fixture).
+### 1. Routing: spread-to-stay-healthy; use-it-or-lose-it only near reset  ⟵ CORE
+**Status:** Phase 1 SHIPPED (v1.2.0). Phases 2-3 deferred pending live observation.
+**Problem:** The scheduler over-weighted pace + near-reset (`scarcity×6` was the dominant term), so it *concentrated* load on the single soonest-to-reset account and benched raw-healthy accounts (mk@gomokka at 69% raw) to last-resort "critical" via pace. Concentration is exactly what triggers the short-term throttle — the opposite of the goal.
+**Design:** 3-advocate council + lead-architect synthesis (2026-06-26). Continuous, load-gated additive scoring — no mode switches. Phased "prove-it" rollout.
+**Phase 1 (DONE, v1.2.0):**
+- In-flight concurrency is now the DOMINANT score term (`concurrencyWeight=2`) + a steep per-account soft cap (`capPenaltyWeight=10` past `perAccountConcurrencyTarget D=3`) so no account absorbs a deep burst.
+- Burn-pace demoted from `×6` dominant to a soft `paceCostWeight=1.5` de-preference (never a bench).
+- Eligibility gates on RAW weekly state (`_weeklyRawState`), so a raw-healthy fast-burner stays in the spread pool.
+- Screenshot-replay regression test: 6 concurrent over the 4-account state fans out across max@dubner.io + mk@gomokka, no account absorbs the burst.
+- `D=3` chosen from observed evidence (max@dubner.io throttled ~6 concurrent); tunable.
+**Phase 2-3 (deferred — only if Phase 1 leaves residual concentration/under-drain):**
+- Per-account `throttlePressure` (decaying ~90s) so the fleet steers *around* a freshly-429'd account (today the throttle is a single global pause — the router can't prefer the un-throttled account).
+- Load factor `L` (0..1, from in-flight vs soft target, recent weight, throttle heat) + a late, load-gated `drainBonus` (fires only in a window's final ~12% with quota left, and `×(1-L)` so it vanishes under load) = the "drain a near-reset account only when load is light" behavior.
+**Open knob:** `D` (per-account concurrency where Anthropic 429s). Default 3; add telemetry to auto-tune from live 429-rate-vs-depth.
 
 ### 2. Wait-don't-error for the short-term "Server is temporarily limiting requests" throttle
 **Status:** partially done — weekly-cap wait shipped in 1.1.0; the short-term throttle path is NOT yet covered the way the user wants.

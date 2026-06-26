@@ -34,14 +34,20 @@ const DEFAULT_SCHEDULER = {
   weeklyCriticalThreshold: 0.95,
   weeklyExhaustedThreshold: 0.985,
   weeklyBurnDebtWeight: 0.6,
-  // Routing-cost tuning (lower cost = preferred). Quota scarcity is the primary
-  // signal; recent-load spread breaks ties between equally-scarce accounts so
-  // sequential traffic rotates instead of funnelling onto one account.
-  scarcityWeight: 6,          // multiplies quota scarcity (pace overage, 0..~1)
-  spreadShareWeight: 3,       // multiplies an account's share of recent fleet load (0..1)
-  recoveryRampWeight: 4,      // decaying penalty applied to a just-recovered account
-  recoveryRampMs: 5 * 60_000, // how long the post-recovery ramp lasts
-  spreadWindowMs: 15 * 60_000,// rolling window used to measure recent per-account load
+  // Routing-cost tuning (lower cost = preferred). The goal is to AVOID
+  // short-term (rate/concurrency) throttling by spreading load across healthy
+  // accounts. So in-flight concurrency is the DOMINANT term, with a steep
+  // per-account soft cap; burn-pace is only a soft de-preference (never a
+  // bench); quota "use-it-or-lose-it" is intentionally a minor signal here.
+  concurrencyWeight: 2,            // multiplies in-flight load (activeWeight+reqWeight) — dominant
+  perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
+  capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
+  paceCostWeight: 1.5,            // soft de-preference of accounts burning ahead of pace (was the ×6 term)
+  scarcityWeight: 6,              // legacy; superseded by paceCostWeight (kept so old configs don't error)
+  spreadShareWeight: 3,           // multiplies an account's share of recent fleet load (0..1)
+  recoveryRampWeight: 4,          // decaying penalty applied to a just-recovered account
+  recoveryRampMs: 5 * 60_000,     // how long the post-recovery ramp lasts
+  spreadWindowMs: 15 * 60_000,    // rolling window used to measure recent per-account load
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -454,7 +460,10 @@ export class AccountManager {
     if (this.getGlobalInFlight() >= this.scheduler.safetyMaxGlobalActive) return false;
     if (account.status === 'exhausted' || account.status === 'error') return false;
     if (this._isSessionQuotaUnavailable(account)) return false;
-    const weeklyState = this._weeklyState(account);
+    // Gate on RAW weekly usage, not pace-adjusted: an account with real
+    // headroom (e.g. 69% used, resets in days) must stay in the healthy-spread
+    // pool even if it's burning fast. Pace is a soft SCORE cost, never a bench.
+    const weeklyState = this._weeklyRawState(account);
     if (weeklyState === 'exhausted') return false;
     if (weeklyState === 'critical' && !options.allowWeeklyCritical) return false;
     if (weeklyState === 'reserve' && !options.allowWeeklyReserve) return false;
@@ -1125,8 +1134,21 @@ export class AccountManager {
   _scoreAccount(account, requestInfo = {}, ctx = null) {
     const now = ctx?.now ?? Date.now();
     const reqWeight = Math.max(1, requestInfo.weight || 1);
-    const concurrency = account.activeWeight + reqWeight;
-    const scarcity = this._accountScarcity(account, now) * this.scheduler.scarcityWeight;
+    const inflight = account.activeWeight + reqWeight;
+
+    // DOMINANT term: in-flight concurrency. Short-term throttling is driven by
+    // how many requests pile on one account, so least-loaded-first spread is
+    // the primary objective.
+    const concurrency = inflight * this.scheduler.concurrencyWeight;
+
+    // Steep soft cap past depth D — the throttle safety floor. No single
+    // account absorbs a deep concurrent burst no matter how "cheap" it looks.
+    const capPenalty = this.scheduler.capPenaltyWeight
+      * Math.max(0, inflight - this.scheduler.perAccountConcurrencyTarget);
+
+    // Burn-pace COST only (demoted from the old dominant scarcity×6 term): a
+    // soft de-preference of accounts burning ahead of an even pace. Never a bench.
+    const paceCost = this._accountScarcity(account, now) * this.scheduler.paceCostWeight;
 
     const fleetRecentWeight = ctx?.fleetRecentWeight ?? 0;
     const recentWeight = this._loadSummary(account, this.scheduler.spreadWindowMs, now).weight;
@@ -1139,7 +1161,7 @@ export class AccountManager {
     // probed and learned (matches the legacy unknown-quota exploration nudge).
     const explorationBonus = account.quota.unified7dReset == null ? -0.5 : 0;
 
-    return concurrency + scarcity + spread + ramp + failurePenalty + explorationBonus;
+    return concurrency + capPenalty + paceCost + spread + ramp + failurePenalty + explorationBonus;
   }
 
   /**
