@@ -194,19 +194,36 @@ export async function readGeneration(path) {
  * generation you read; omit it to read-then-bump unconditionally (single-owner
  * fast path). Returns the generation written, or null when refused.
  */
-export async function saveState(state, { expectedGeneration = null } = {}) {
-  const path = getStatePath();
-  const onDisk = await readGeneration(path);
-  if (expectedGeneration != null && onDisk > expectedGeneration) {
-    // A newer writer advanced the file under us — refuse the stale flush.
-    return null;
-  }
-  const next = onDisk + 1;
-  await atomicWrite(path, JSON.stringify({ ...state, _generation: next }, null, 2) + '\n');
-  return next;
+let _stateWriteChain = Promise.resolve();
+
+export function saveState(state, { expectedGeneration = null } = {}) {
+  // Serialize state writes (a 60s interval flush can otherwise race the final
+  // baton flush, read the same on-disk generation, and double-write).
+  const run = async () => {
+    const path = getStatePath();
+    const onDisk = await readGeneration(path);
+    if (expectedGeneration != null && onDisk > expectedGeneration) {
+      // A newer writer advanced the file under us — refuse the stale flush.
+      return null;
+    }
+    const next = onDisk + 1;
+    await atomicWrite(path, JSON.stringify({ ...state, _generation: next }, null, 2) + '\n');
+    return next;
+  };
+  const result = _stateWriteChain.then(run, run);
+  _stateWriteChain = result.then(() => {}, () => {});
+  return result;
 }
 
+/** Barrier: resolves once every queued state write has settled. */
+export const flushStateWrites = () => _stateWriteChain;
+
 let _configWriteChain = Promise.resolve();
+
+/** Barrier: resolves once every queued config write (e.g. a fire-and-forget
+ *  token-refresh persist) has settled. Awaited on baton release so a rotated
+ *  token can't be left unwritten when the new worker boots from disk (M3). */
+export const flushConfigWrites = () => _configWriteChain;
 
 /**
  * Serialize an in-process read-modify-write of the config so concurrent updates

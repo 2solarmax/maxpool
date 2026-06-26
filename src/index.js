@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { Prober } from './prober.js';
@@ -119,28 +119,63 @@ async function supervisorCommand() {
 
   // Bind once. EADDRINUSE / EACCES here is a cold-start failure → exit(1) is
   // correct (there's no worker to keep alive yet).
-  const masterServer = createServer();
+  let masterServer = createServer();
+  // We DROP any connection the supervisor accidentally accepts while a worker is
+  // also accepting on the shared handle — but the design avoids that: the
+  // supervisor's acceptor is only LIVE during the brief cutover gap (it stops
+  // once a worker confirms it is the sole acceptor). A bare handler is required
+  // so the rare gap-accepted socket isn't left dangling.
+  const relistenMaster = () => new Promise((resolve, reject) => {
+    if (masterServer.listening) { resolve(); return; }
+    const onErr = err => { masterServer.removeListener('listening', onListen); reject(err); };
+    const onListen = () => { masterServer.removeListener('error', onErr); resolve(); };
+    masterServer.once('error', onErr);
+    masterServer.once('listening', onListen);
+    masterServer.listen(port, host);
+  });
+  const closeMasterAccept = () => new Promise(resolve => {
+    if (!masterServer.listening) { resolve(); return; }
+    masterServer.close(() => resolve());
+  });
   try {
-    await new Promise((resolve, reject) => {
-      const onErr = err => { masterServer.removeListener('listening', onListen); reject(err); };
-      const onListen = () => { masterServer.removeListener('error', onErr); resolve(); };
-      masterServer.once('error', onErr);
-      masterServer.once('listening', onListen);
-      masterServer.listen(port, host);
-    });
+    await relistenMaster();
   } catch (err) {
     handleServerListenError(err, host, port);
     return;
   }
 
-  // Keep the supervisor attached to the shell; terminal signals are forwarded to
-  // the active worker so the worker can drain + restore the terminal.
+  // Keep the supervisor attached to the shell. The worker shares the supervisor's
+  // process group, so a terminal Ctrl-C (SIGINT/SIGTERM) is delivered by the TTY
+  // to BOTH already — the supervisor must NOT forward those or the worker gets a
+  // doubled signal (the "second Ctrl-C force-quits" footgun). The supervisor
+  // ignores SIGINT/SIGTERM itself (the worker drains + exits, ending the turn).
   let activeWorker = null;
   const forwardSignal = sig => { try { activeWorker?.child.kill(sig); } catch { /* ignore */ } };
-  process.on('SIGINT', () => forwardSignal('SIGINT'));
-  process.on('SIGTERM', () => forwardSignal('SIGTERM'));
-  // SIGHUP → forward to the active worker, which requests a seamless reload.
+  process.on('SIGINT', () => { /* delivered to the worker by the TTY group */ });
+  process.on('SIGTERM', () => { /* delivered to the worker by the TTY group */ });
+  // SIGHUP (from `kill -HUP <supervisor-pid>`) reaches ONLY the supervisor →
+  // forward it so the worker requests a seamless reload.
   process.on('SIGHUP', () => forwardSignal('SIGHUP'));
+  // A spawn failure / stray rejection must NOT kill the supervisor (it would
+  // wedge the port and drop the service). Log and let the supervision loop or
+  // the reload's own error handling recover.
+  process.on('uncaughtException', err => {
+    console.error(`[Maxpool] Supervisor uncaughtException (continuing): ${err?.stack || err}`);
+  });
+  process.on('unhandledRejection', reason => {
+    console.error(`[Maxpool] Supervisor unhandledRejection (continuing): ${reason}`);
+  });
+
+  // After SIGKILLing a worker that may have owned the TUI, the worker had no
+  // chance to restore the terminal — the supervisor emits the restore itself
+  // (exit alt-screen + show cursor + raw off) so the user's shell is clean.
+  const restoreTerminalFromSupervisor = () => {
+    try {
+      if (process.stdout.isTTY) process.stdout.write('\x1b[?25h\x1b[?1049l');
+      if (process.stdin.isTTY) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
+    } catch { /* never throw */ }
+  };
+  process.on('exit', restoreTerminalFromSupervisor);
 
   // Crash-loop guard: count rapid consecutive non-restart exits and back off so
   // a worker that crashes on boot doesn't spin the CPU forking. A clean run for
@@ -154,8 +189,11 @@ async function supervisorCommand() {
   // the new worker WITHOUT ending the turn; only an exit/fallback resolves it.
   let endTurn = null;
 
-  // Spawn a worker. `reload=true` boots it HEADLESS with no writer lease; it
-  // waits for the baton instead of going primary immediately.
+  // Spawn a worker in the SAME process group as the supervisor. A terminal
+  // Ctrl-C (SIGINT/SIGTERM) is delivered by the TTY to the whole foreground
+  // group, so BOTH already receive it — the supervisor therefore does NOT
+  // forward those (that would double-deliver). Same-group also means a group
+  // SIGKILL of the supervisor reaps the worker (no orphan holding the port).
   const spawnWorker = ({ reload = false } = {}) => {
     const env = { ...process.env, [SERVER_WORKER_ENV]: '1' };
     if (reload) env[SERVER_RELOAD_WORKER_ENV] = '1';
@@ -167,24 +205,35 @@ async function supervisorCommand() {
     const worker = makeWorkerChannel(child);
     if (!reload) {
       // Cold start: hand the socket and tell it to go primary immediately.
-      child.send({ type: MSG_LISTEN }, masterServer);
+      worker.send({ type: MSG_LISTEN }, masterServer);
     }
     return worker;
   };
 
   // Wire a worker as the active primary: its RELOAD_REQUEST triggers the baton;
-  // its exit ends the current supervision turn (so the loop reacts). Replaces any
-  // prior active wiring (used after a swap to monitor the NEW worker).
+  // its MSG_PRIMARY means it is now the sole acceptor (so the supervisor stops
+  // its own competing accept loop); its exit/spawn-error ends the turn.
   const monitorAsActive = worker => {
     activeWorker = worker;
     worker.child.removeAllListeners('message');
     worker.child.on('message', msg => {
       if (msg?.type === MSG_RELOAD_REQUEST) orchestrateReload().catch(() => {});
+      else if (msg?.type === MSG_PRIMARY && activeWorker === worker) {
+        // The worker is now sole acceptor on the handle → stop the supervisor
+        // racing it for accepts (the steady-state ~78%-hang bug). The supervisor
+        // still HOLDS the socket via the worker's fd; it re-arms only at reload.
+        closeMasterAccept().catch(() => {});
+      }
     });
     worker.child.once('exit', (code, signal) => {
       // Only the worker that is STILL active when it exits ends the turn. A
       // reaped old worker (already swapped out) exiting must be ignored here.
       if (activeWorker === worker) endTurn?.({ code, signal });
+    });
+    // A spawn-time failure (EMFILE/EAGAIN under load) surfaces as 'error', not
+    // 'exit' — treat it as a crashed turn so backoff handles it (M5).
+    worker.child.once('error', err => {
+      if (activeWorker === worker) endTurn?.({ code: 1, signal: null, spawnError: err.message });
     });
   };
 
@@ -196,18 +245,28 @@ async function supervisorCommand() {
     let newWorker = null;
     try {
       newWorker = spawnWorker({ reload: true });
+      // Hold the new worker's spawn-error so a fork failure mid-baton becomes a
+      // clean ROLLED_BACK/FALLBACK instead of crashing the supervisor (M5).
+      newWorker.child.once('error', () => { /* surfaced via waitFor reject */ });
       const outcome = await runReloadBaton({
         oldWorker,
         newWorker,
         handle: masterServer,
+        // After the OLD worker has released its fd, re-arm the supervisor's own
+        // listener to cover the cutover gap, then hand THAT live handle to the
+        // new worker. The new worker's MSG_PRIMARY then closes it again.
+        prepareHandle: async () => { await relistenMaster(); return masterServer; },
         log: msg => console.log(`[Maxpool] ${msg}`),
       });
 
       if (outcome === RELOAD_SWAPPED) {
         // Re-point monitoring to the new worker (it's now primary), THEN reap the
         // old one. Order matters: monitorAsActive sets activeWorker=new so the
-        // old worker's pending exit handler no-ops.
+        // old worker's pending exit handler no-ops. monitorAsActive also handles
+        // the new worker's already-sent MSG_PRIMARY is moot here — the new worker
+        // sent PRIMARY during the baton; re-assert the master-accept close.
         monitorAsActive(newWorker);
+        closeMasterAccept().catch(() => {});
         reapOldWorker(oldWorker, config);
         return;
       }
@@ -224,12 +283,14 @@ async function supervisorCommand() {
       // supervisor-owned socket. Queued conns sit in the OS backlog meanwhile.
       try { newWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
       try { oldWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
+      restoreTerminalFromSupervisor(); // SIGKILLed workers can't restore the TUI
       activeWorker = null;
       endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
     } catch (err) {
       console.error(`[Maxpool] Reload error: ${err.message}; falling back to abrupt restart`);
       try { newWorker?.child.kill('SIGKILL'); } catch { /* ignore */ }
       try { oldWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
+      restoreTerminalFromSupervisor();
       activeWorker = null;
       endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
     } finally {
@@ -319,6 +380,7 @@ function makeWorkerChannel(child) {
           clearTimeout(timer);
           child.removeListener('message', onMsg);
           child.removeListener('exit', onExit);
+          child.removeListener('error', onError);
         };
         const onMsg = msg => {
           if (msg && want.includes(msg.type)) { cleanup(); resolve(msg); }
@@ -327,6 +389,9 @@ function makeWorkerChannel(child) {
           cleanup();
           reject(new Error(`worker exited (code ${code}, signal ${signal}) before ${want.join('/')}`));
         };
+        // A spawn failure (EMFILE/EAGAIN) surfaces as 'error', not 'exit' — the
+        // baton must see it as a failed step (→ ROLLED_BACK/FALLBACK), not hang.
+        const onError = err => { cleanup(); reject(new Error(`worker spawn error before ${want.join('/')}: ${err.message}`)); };
         const timer = setTimeout(() => {
           cleanup();
           reject(new Error(`timed out waiting for ${want.join('/')}`));
@@ -334,6 +399,7 @@ function makeWorkerChannel(child) {
         timer.unref?.();
         child.on('message', onMsg);
         child.once('exit', onExit);
+        child.once('error', onError);
       });
     },
   };
@@ -378,6 +444,12 @@ async function serverWorkerCommand() {
   const supervised = typeof process.send === 'function';
   const isReloadWorker = process.env[SERVER_RELOAD_WORKER_ENV] === '1';
 
+  // M6: a reload worker boots WITHOUT the writer lease so the AM-level brick
+  // guard (ensureTokenFresh no-op) is CLOSED for the entire headless window —
+  // before any code path could trigger a refresh. acquireLease() flips it true
+  // at takeover. (writerLease defaults true for the standalone/direct path.)
+  if (isReloadWorker) accountManager.setWriterLease(false);
+
   // Restore quota observed in a previous run so a restart doesn't lose routing
   // accuracy and re-probe from scratch. Stale windows clear on first use.
   // A reload worker restores quota IN-MEMORY only (state file handed via the
@@ -406,8 +478,14 @@ async function serverWorkerCommand() {
   // Persist refreshed tokens back to config. Defense-in-depth: the updater reads
   // the on-disk refresh token and SKIPS the rotation if a fresher writer already
   // advanced it (generation guard), so a stale write can't double-spend a token.
+  //
+  // We do NOT gate this on `hasLease`: a refresh that already STARTED (it passed
+  // the lease gate in ensureTokenFresh) MUST persist its rotated single-use token
+  // even if the lease was dropped while its POST was in flight — otherwise the
+  // baton hands off and the new worker boots from the now-invalidated on-disk
+  // token (B1/M3). New refreshes can't start without the lease (ensureTokenFresh
+  // no-ops), so every callback here is from a legitimate lease-era refresh.
   const persistTokenRefresh = (idx, newTokens) => {
-    if (!hasLease) return; // only the lease holder writes tokens
     const account = accountManager.accounts[idx];
     if (!account) return;
     // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
@@ -461,6 +539,28 @@ async function serverWorkerCommand() {
   let syncTimer = null;
   let draining = false;
   let restartController = null;
+
+  // Best-effort terminal restore on ANY abnormal exit path (uncaughtException,
+  // a bare process.exit, a crash) so the user's shell is never left in raw mode
+  // or the alt-screen. Idempotent and safe even when no TUI was running.
+  const restoreTerminal = () => {
+    try {
+      if (tui?.running) { tui.stop(); return; }
+      if (process.stdout.isTTY) process.stdout.write('\x1b[?25h\x1b[?1049l');
+      if (process.stdin.isTTY) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
+    } catch { /* never throw from a restore */ }
+  };
+  process.on('exit', restoreTerminal);
+  process.on('uncaughtException', err => {
+    console.error(`[Maxpool] Worker uncaughtException: ${err?.stack || err}`);
+    restoreTerminal();
+    // A reload worker must NEVER exit(1) (escapes the supervisor exit-75 loop).
+    // Stay alive so the supervisor's baton timeouts roll us back cleanly.
+    if (!isReloadWorker) process.exit(SERVER_RESTART_EXIT_CODE);
+  });
+  process.on('unhandledRejection', reason => {
+    console.error(`[Maxpool] Worker unhandledRejection: ${reason}`);
+  });
   // Quit drains in-flight requests, then force-exits. Kept short so a single
   // 'q' / Ctrl-C / SIGTERM actually quits under a continuous request flood
   // (where there are always active requests) instead of waiting indefinitely.
@@ -486,8 +586,14 @@ async function serverWorkerCommand() {
   // Acquiring the lease turns ON token rotation, the quota-save interval, and the
   // prober. Releasing turns them all OFF and flushes once. Exactly one worker
   // holds the lease at a time — enforced by the supervisor's baton sequencing.
-  const acquireLease = () => {
+  const acquireLease = async () => {
     if (hasLease) return;
+    // M4: re-read the on-disk state generation NOW. A reload's old worker bumped
+    // it during its final flush; without this re-sync the new primary's
+    // saveState(expectedGeneration=<boot N>) would be refused for its whole
+    // tenure (quota persistence wedged forever). As sole writer it safely adopts
+    // the current on-disk generation.
+    try { stateGeneration = await readGeneration(getStatePath()); } catch { /* keep prior */ }
     hasLease = true;
     accountManager.setWriterLease(true);
     if (!quotaSaveInterval) {
@@ -496,12 +602,16 @@ async function serverWorkerCommand() {
     }
     prober.start();
   };
-  const releaseLease = () => {
+  // Stop scheduling writes and flip the lease. Returns a promise that settles
+  // once any in-flight prober cycle has finished (so no probe-driven token
+  // rotation is still pending). Token-refresh draining is awaited separately in
+  // the baton release (drainRefreshes) before the lease is handed off.
+  const releaseLease = async () => {
     if (!hasLease) return;
     hasLease = false;
     if (quotaSaveInterval) { clearInterval(quotaSaveInterval); quotaSaveInterval = null; }
-    prober.stop();
     accountManager.setWriterLease(false);
+    await prober.stop(); // awaits any in-flight probe cycle (B1)
   };
 
   // Abrupt self-restart — the tested fallback path. Cuts in-flight connections;
@@ -511,12 +621,16 @@ async function serverWorkerCommand() {
     if (draining) return;
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
-    persistQuotaState(); // flush learned quota so the restart restores it
-    releaseLease();
     if (tui?.running) { tui.stop(); }
     console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
-    process.exit(SERVER_RESTART_EXIT_CODE);
+    // Best-effort: flush quota + settle in-flight refreshes/prober before exit so
+    // the respawned worker doesn't boot from a half-written state. Bounded so the
+    // abrupt path stays fast even if a write hangs.
+    Promise.race([
+      (async () => { await persistQuotaState(); await releaseLease(); await flushConfigWrites(); await flushStateWrites(); })(),
+      delay(2000),
+    ]).finally(() => process.exit(SERVER_RESTART_EXIT_CODE));
   };
 
   // Seamless reload entry point. When supervised, ask the supervisor to run the
@@ -546,9 +660,16 @@ async function serverWorkerCommand() {
 
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
-    persistQuotaState(); // best-effort final flush of learned quota
-    releaseLease();
     if (tui?.running) tui.stop();
+    // Best-effort final flush + settle writes (fire-and-forget; the drain timeout
+    // below bounds total quit time, and write barriers protect the on-disk state).
+    (async () => {
+      await releaseLease();
+      await accountManager.drainRefreshes();
+      await persistQuotaState();
+      await flushConfigWrites();
+      await flushStateWrites();
+    })().catch(() => {});
 
     console.log(`\n[Maxpool] Draining shutdown (${reason}).`);
     console.log(`[Maxpool] Stopped accepting new requests; waiting up to ${Math.ceil(drainTimeoutMs / 1000)}s for ${restartController.activeRequests.size} active request(s), then forcing exit. Press Ctrl-C again to force now.`);
@@ -655,7 +776,7 @@ async function serverWorkerCommand() {
   // the update check. `viaTakeover` true means we acquired the socket through the
   // baton (a reload) — freeze the update check so a reload doesn't re-probe npm
   // (only a cold supervisor start self-updates).
-  const becomePrimary = ({ viaTakeover }) => {
+  const becomePrimary = async ({ viaTakeover }) => {
     if (tui) {
       if (tui.start()) {
         console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
@@ -666,7 +787,28 @@ async function serverWorkerCommand() {
     } else {
       logPlainServerStart({ host, port, accounts, threshold, config });
     }
-    acquireLease();
+    // On a reload TAKEOVER, adopt the latest tokens from disk. The headless
+    // reload worker loaded config at spawn time; the OLD worker may have rotated
+    // a single-use refresh token DURING the handoff (and flushed it before
+    // MSG_RELEASED). Without this re-sync the new worker would present the now-
+    // invalidated token on its first refresh → invalid_grant → bricked account.
+    if (viaTakeover) {
+      try {
+        const diskConfig = await loadConfig();
+        if (diskConfig) await syncAccountsFromDisk(diskConfig, config, accountManager);
+      } catch (err) {
+        console.error(`[Maxpool] Token re-sync at takeover failed: ${err.message}`);
+      }
+    }
+
+    // Acquire the lease (re-syncs state generation + enables writes) BEFORE we
+    // announce primacy, so the moment the supervisor reaps the old worker we are
+    // a fully-functional sole writer.
+    await acquireLease();
+
+    // Tell the supervisor we are the sole acceptor now → it stops its own accept
+    // loop (the steady-state race fix). Cold start AND takeover both signal this.
+    if (supervised) { try { process.send({ type: MSG_PRIMARY }); } catch { /* ignore */ } }
 
     // Reload-storm guard: only a cold (non-reload) lease holder probes npm.
     // A reload-spawned/takeover worker must NEVER re-probe (1x not 2x traffic).
@@ -691,8 +833,11 @@ async function serverWorkerCommand() {
       server.listen(handle, () => { server.removeListener('error', reject); resolve(); });
     });
 
-    // Baton release: the old primary gives up acceptance + the writer lease,
-    // flushes config+state once, then drains its bounded in-flight and exits(0).
+    // Baton release: the old primary gives up acceptance + the writer lease.
+    // MSG_RELEASED MUST mean "no write is in flight" — not merely "flag flipped"
+    // — so the new worker can acquire the lease and rotate the single-use refresh
+    // token WITHOUT racing a still-pending rotation here (B1) and boots from a
+    // config that already has any rotated token persisted (M3).
     const releaseBatonAndDrain = async () => {
       if (draining) { try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ } return; }
       draining = true;
@@ -701,10 +846,21 @@ async function serverWorkerCommand() {
       server.maxpoolBeginDrain?.();
       server.close(() => {});
       server.closeIdleConnections?.(); // retire idle keep-alive sockets now
-      // Final single flush of learned quota + any pending token writes, THEN
-      // drop the lease so the incoming worker is the sole writer.
+
+      // 1) Stop scheduling writes + flip the lease + await any in-flight prober
+      //    cycle (releaseLease awaits prober.stop()).
+      await releaseLease();
+      // 2) Await every in-flight OAuth token refresh that started before the lease
+      //    dropped — the headline brick hazard (B1).
+      await accountManager.drainRefreshes();
+      // 3) Final flush of learned quota.
       await persistQuotaState();
-      releaseLease();
+      // 4) Barrier: ensure every queued config write (a rotated-token persist is
+      //    fire-and-forget) AND state write has actually hit disk before we hand
+      //    off (M3 — otherwise the new worker boots from the invalidated token).
+      await flushConfigWrites();
+      await flushStateWrites();
+
       if (tui?.running) tui.stop(); // restore terminal before the new worker takes it
       try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ }
 
@@ -728,7 +884,7 @@ async function serverWorkerCommand() {
         if (msg?.type === MSG_LISTEN && handle) {
           // Cold start: take the socket and go primary immediately.
           await listenOnHandle(handle);
-          becomePrimary({ viaTakeover: false });
+          await becomePrimary({ viaTakeover: false });
         } else if (msg?.type === MSG_PROBE_READY) {
           // Headless reload worker: we've booted the new code and restored quota
           // in memory. Confirm readiness (we are NOT yet accepting / writing).
@@ -741,10 +897,10 @@ async function serverWorkerCommand() {
           }
         } else if (msg?.type === MSG_TAKEOVER && handle) {
           // Baton acquire: the old worker already released, so we're the SOLE
-          // acceptor. Start accepting + take the writer lease + TUI.
+          // acceptor. Start accepting + take the writer lease + TUI. becomePrimary
+          // sends MSG_PRIMARY (the baton waits on it).
           await listenOnHandle(handle);
-          becomePrimary({ viaTakeover: true });
-          process.send({ type: MSG_PRIMARY });
+          await becomePrimary({ viaTakeover: true });
         } else if (msg?.type === MSG_RELEASE) {
           // Baton release: stop accepting NEW (keep in-flight), retire keep-alive
           // sockets with Connection: close, stop writing, flush once, drop TUI.
@@ -764,7 +920,7 @@ async function serverWorkerCommand() {
     server.listen(port, host, () => {
       server.removeListener('error', onListenError);
       server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
-      becomePrimary({ viaTakeover: false });
+      becomePrimary({ viaTakeover: false }).catch(err => console.error(`[Maxpool] ${err.message}`));
     });
   }
 

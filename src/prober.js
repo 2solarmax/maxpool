@@ -40,20 +40,29 @@ export class Prober {
     }
   }
 
-  stop() {
+  /** Stop scheduling AND await any probe cycle already in flight, so a caller
+   *  (the baton release) can be sure no probe-driven token rotation is pending
+   *  before it hands the writer lease to another worker. */
+  async stop() {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this._inflight) { try { await this._inflight; } catch { /* swallow */ } }
   }
 
-  /** Probe every OAuth account once. Overlapping cycles are skipped. */
-  async probeAll() {
-    if (this._running) return;
+  /** Probe every OAuth account once. Overlapping cycles are skipped. The active
+   *  cycle is tracked on `_inflight` so stop() can await it. */
+  probeAll() {
+    if (this._running) return this._inflight || Promise.resolve();
     this._running = true;
-    try {
-      const accounts = this.am.accounts.filter(a => a.type === 'oauth' && a.credential);
-      await Promise.all(accounts.map(a => this.probeOne(a)));
-    } finally {
-      this._running = false;
-    }
+    this._inflight = (async () => {
+      try {
+        const accounts = this.am.accounts.filter(a => a.type === 'oauth' && a.credential);
+        await Promise.all(accounts.map(a => this.probeOne(a)));
+      } finally {
+        this._running = false;
+        this._inflight = null;
+      }
+    })();
+    return this._inflight;
   }
 
   async probeOne(account) {

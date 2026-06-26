@@ -57,6 +57,7 @@ export async function runReloadBaton({
   oldWorker,
   newWorker,
   handle,
+  prepareHandle = async h => h,
   readyTimeoutMs = 10_000,
   releaseTimeoutMs = 20_000,
   takeoverTimeoutMs = 10_000,
@@ -79,7 +80,8 @@ export async function runReloadBaton({
 
   // (c) Old worker releases: stop accepting NEW, keep in-flight, stop writing,
   //     flush config+state ONE final time, drop the TUI. After this point the
-  //     old worker holds no lease and no acceptor.
+  //     old worker holds no lease and no acceptor — and (single-writer) no
+  //     refresh/prober write is still in flight (it awaits drainRefreshes).
   try {
     oldWorker.send({ type: MSG_RELEASE });
     await oldWorker.waitFor([MSG_RELEASED], releaseTimeoutMs);
@@ -90,10 +92,21 @@ export async function runReloadBaton({
     return RELOAD_FALLBACK;
   }
 
+  // The old worker has now freed the listening fd. Re-arm the supervisor's own
+  // acceptor over the cutover gap (covers new conns in the OS backlog) and get a
+  // fresh re-sendable handle for the new worker.
+  let liveHandle = handle;
+  try {
+    liveHandle = await prepareHandle(handle);
+  } catch (err) {
+    log(`reload: could not re-arm listening socket (${err.message}); falling back`);
+    return RELOAD_FALLBACK;
+  }
+
   // (d) New worker takes over: it becomes the SOLE acceptor (old already closed)
   //     and ACQUIRES the writer lease (refresh/probe/persist re-enabled) + TUI.
   try {
-    newWorker.send({ type: MSG_TAKEOVER }, handle);
+    newWorker.send({ type: MSG_TAKEOVER }, liveHandle);
     await newWorker.waitFor([MSG_PRIMARY], takeoverTimeoutMs);
   } catch (err) {
     // The new worker failed to start accepting after the old already released.

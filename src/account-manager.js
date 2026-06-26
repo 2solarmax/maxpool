@@ -1572,6 +1572,18 @@ export class AccountManager {
   }
 
   /**
+   * Await every in-flight OAuth token refresh to settle. The single-writer baton
+   * uses this on RELEASE: a refresh that passed the `if(!writerLease) return` gate
+   * BEFORE the lease was dropped is still awaiting its OAuth POST; the new worker
+   * must not acquire the lease and rotate the SAME single-use token until these
+   * settle, or the upstream invalidates one token → invalid_grant → bricked.
+   */
+  async drainRefreshes() {
+    const pending = this.accounts.map(a => a._refreshPromise).filter(Boolean);
+    if (pending.length) await Promise.allSettled(pending);
+  }
+
+  /**
    * Set a callback to persist refreshed tokens to config.
    */
   onTokenRefresh(callback) {

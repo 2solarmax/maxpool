@@ -53,8 +53,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // upstream response headers — a setHeader here survives the later writeHead.
   let draining = false;
 
+  // Identifies the WORKER process that served a response — proves the supervisor
+  // (which holds the socket but does not serve) never swallowed the request. Set
+  // before any writeHead; `x-maxpool-*` is informative-only and stripped from
+  // upstream-bound request headers elsewhere.
+  const workerStamp = String(process.pid);
+
   const server = http.createServer(async (req, res) => {
     try {
+      try { res.setHeader('x-maxpool-worker', workerStamp); } catch { /* headers sent */ }
       if (draining) {
         try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
       }
