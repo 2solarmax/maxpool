@@ -50,13 +50,19 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 - **"throttled"** is a temporary auto-recovering cooldown (account hit a 429 → rested a few seconds → request failed over to another account → auto-flips back to active). The TUI shows bare `throttled` with no countdown, so it looks stuck. Fix: show `throttled Ns` (the `rateLimitedUntil` cooldown is known), like the other countdowns.
 - **"Load X/Y"** = X in-flight requests / Y their combined weight (~payload size). It's cryptic (weight denominator unexplained; "Load" collides with the 15m/1h throughput counts). Fix: clearer label and/or a one-line legend/help.
 
-### 6. Seamless (zero-/low-blip) version upgrade — graceful restart
-**Status:** logged (not started). High leverage: makes every future ship painless.
-**Today:** restart respawns the worker (picks up the new version) but `closeAllConnections()` abruptly cuts in-flight streams → each active request retries once. Nothing lost; visible blip.
-**Plan:**
-- **Level 1 (draining restart):** stop admitting new requests, let in-flight streams finish on the old worker, then exit+respawn (new worker loads the new version). Only requests arriving in the sub-second port-swap window retry. Reuses the existing drain logic — small change.
-- **Level 2 (true zero-downtime):** supervisor holds the listening socket (cluster-style fd handoff); new worker takes new connections while old worker drains in-flight. Zero retries. Node 20 has no `SO_REUSEPORT` (added v23), so this is the cluster/fd-passing route — moderate refactor.
-- Tie to `autoUpdate`: download in background → graceful restart when the fleet is quiet → hands-off seamless upgrade.
+### 6. Seamless version upgrade — near-zero-downtime reload (single-writer baton)
+**Status:** designed (pre-mortem done); awaiting go to implement, then code-review/judge.
+**Today:** restart respawns the worker (picks up the new version) but `closeAllConnections()` abruptly cuts in-flight streams → each active request retries once. Nothing lost; visible 2s self-healing blip.
+**Pre-mortem (3 personas + architect, 2026-06-26) — DECISIVE:** TRUE symmetric two-worker overlap is unsafe. Both workers load the same `config.json` → same **single-use** OAuth refresh token; Anthropic rotates on every use; with 22 sessions, near-simultaneous refreshes → one worker invalidates the other's token → **bricked accounts** (manual re-login). Same for config/state last-writer-wins clobber. Strictly worse than today's self-healing blip. → Do NOT build symmetric overlap.
+**Chosen design — supervisor-owns-socket + single-writer baton (near-zero-downtime):**
+- Supervisor binds :3456 once and **owns the listening fd for life** (never closes it) → no ECONNREFUSED, deterministic routing, clean failure if it dies. Workers receive the handle via IPC (NOT node:cluster — its round-robin starves the drain).
+- New worker boots **headless, no writer lease**: does NOT refresh tokens / write config / write state / probe. Quota handed in-memory via existing `exportQuotaState`/`restoreQuotaState`.
+- Cutover: new conns → new worker; old worker stops accepting, `Connection: close` + `closeIdleConnections()`, **stops refreshing/probing/persisting** (baton release), flushes final config+state once, then new worker **acquires the writer lease** (flock/pidfile + generation counter on config/state as defense-in-depth), re-enables refresh/probe/persist, takes the TUI only after old `tui.stop()`.
+- Old worker drains its bounded in-flight on existing access tokens (no refresh needed), exits; supervisor reaper SIGKILLs it past a hard cap.
+- **Reads overlap (streams never cut); writes single-owner (tokens never double-spent).**
+- **Safe fallback:** any failure mid-swap → today's tested abrupt restart (exit 75, clients retry ~2s). Never wedged, never both-writing. New worker NEVER `exit(1)` (would kill the supervisor loop) — always exit 75.
+- Freeze autoUpdate + double-probe during reload.
+**Must-have tests:** concurrent-refresh torture (only lease holder rotates; no invalid_grant), config/state gen-guard lost-update, drain under SSE+keep-alive+queue, socket-ownership + rollback on kill (zero ECONNREFUSED), TTY single-owner + terminal restored on every exit path, reload-storm guard.
 
 ## DONE (this session, for context)
 
