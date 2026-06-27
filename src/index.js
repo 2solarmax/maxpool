@@ -465,7 +465,15 @@ async function serverWorkerCommand() {
   // 60s-stale quota and the state generation would never advance across a reload.
   const persistQuotaState = (force = false) => {
     if (!hasLease && !force) return Promise.resolve();
-    return saveState({ quota: accountManager.exportQuotaState() }, { expectedGeneration: stateGeneration })
+    // The forced final flush (baton release / shutdown) is the SOLE writer at that
+    // point — releaseLease() already cleared the periodic interval and the next
+    // worker hasn't acquired the lease yet — so it bypasses the cross-worker
+    // stale-generation guard. Without this, a 60s-interval write that fired just
+    // before releaseLease could bump the on-disk generation and get the forced
+    // flush REFUSED (dropping the final quota snapshot). The guard only exists to
+    // serialize CROSS-worker writes; the final flush is provably intra-worker.
+    const expectedGeneration = force ? null : stateGeneration;
+    return saveState({ quota: accountManager.exportQuotaState() }, { expectedGeneration })
       .then(written => { if (written != null) stateGeneration = written; })
       .catch(() => {});
   };

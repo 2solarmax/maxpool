@@ -95,3 +95,23 @@ test('saveState refuses a stale flush so fresher quota is not reverted', async (
     assert.equal(disk2.quota[0].quota.unified7d, 0.95);
   });
 });
+
+test('saveState with expectedGeneration:null (forced final flush) is NEVER refused, even when the on-disk gen is ahead', async () => {
+  await withConfigEnv(async ({ statePath, mod }) => {
+    // Simulate a just-fired 60s-interval write that already bumped the on-disk gen.
+    const g1 = await mod.saveState({ quota: [{ name: 'a1', quota: { unified7d: 0.5 } }] });
+    assert.equal(g1, 1);
+
+    // The baton-release FORCED final flush (persistQuotaState(force=true) → no
+    // expectedGeneration) is the sole writer: it must land its final snapshot
+    // unconditionally, advancing the generation — never refused like a stale write.
+    const forced = await mod.saveState(
+      { quota: [{ name: 'a1', quota: { unified7d: 0.99 } }] },
+      { expectedGeneration: null },
+    );
+    assert.equal(forced, 2, 'forced final flush lands (not refused) and advances the generation');
+    const disk = JSON.parse(await readFile(statePath, 'utf-8'));
+    assert.equal(disk._generation, 2);
+    assert.equal(disk.quota[0].quota.unified7d, 0.99, 'the final snapshot is what persisted');
+  });
+});
