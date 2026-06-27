@@ -1598,6 +1598,45 @@ test('bug A: resumed stream has NO heartbeat comment interleaved between real ev
   }
 });
 
+test('major: a concurrency-cap hold is bounded by the capacity window, not the 7d streaming hold', async () => {
+  // A streaming request blocked only by a SATURATED concurrency cap must shed load
+  // within the short capacity window — never spin a queue slot for the multi-day
+  // streaming hold (the soft-deadlock guard). Here the only account is pinned at its
+  // cap and never frees, so the request must give up promptly with an SSE error.
+  const upstream = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {}\n\n'); });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].inFlight = am.scheduler.safetyMaxActivePerAccount; // pinned at the cap, never frees
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 7 * 24 * 3600 * 1000, streamHoldMaxMs: 7 * 24 * 3600 * 1000, capacityMaxWaitMs: 300, pollMs: 50, heartbeatMs: 1000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const body = await res.text();
+    const elapsed = Date.now() - started;
+    // The decisive signal: the request RESOLVES bounded (vs hanging until the 7d
+    // streamHoldMaxMs deadline, which would trip the 5s client timeout → throw).
+    assert.ok(elapsed < 3000, `concurrency-cap hold bounded by the capacity window (${elapsed}ms), not the 7d streaming hold`);
+    assert.equal(res.status, 429, 'shed load with a rate-limit error, not an indefinite hold');
+    assert.match(body, /Retry in|rate_limit|error/i, 'gave up with an error response');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('major (lease): client disconnect during the resumed pre-stream window releases the account lease', async () => {
   // A resumed forward acquires a lease (inFlight++) then awaits the upstream. If
   // the client disconnects during that pre-first-byte window, the lease must be

@@ -319,6 +319,12 @@ async function forwardRequest(
   const tokenReady = await accountManager.ensureTokenFresh(account.index);
   if (clientGone.signal.aborted) { releaseOnClientGone(); return; }
   if (!tokenReady) {
+    // Token refresh failed (not a client disconnect). This frame is leaving via
+    // recursion / queue / error WITHOUT reaching the post-fetch off() — drop the
+    // 'close' listener now so it doesn't accumulate one-per-failover-hop on `res`
+    // (MaxListenersExceededWarning + leak); the recursive/resumed frame registers
+    // its own.
+    res.off('close', onClientClose);
     accountManager.releaseAccount(lease);
     excludedIndexes.add(account.index);
     if (
@@ -1180,6 +1186,16 @@ async function queueAndRetry(
   // never outlast nonStreamMaxWaitMs even under capacity (it would occupy a
   // slot 3x its documented cap with nothing to reap it).
   if (!requestInfo.stream) queueWindowMs = Math.min(queueWindowMs, nonStreamMaxWaitMs);
+
+  // A pure concurrency-cap block (every account healthy but all in-flight/global
+  // slots busy — NOT a quota/rate-limit reset) is a LOCAL capacity transient. Bound
+  // it by the short capacity window, never the multi-day streaming hold: a slot
+  // frees as active requests finish (seconds–minutes), and if the fleet stays
+  // saturated past the window the request sheds load (error-fast) instead of
+  // spinning a queue slot for up to streamHoldMaxMs (7d) — the soft-deadlock guard.
+  if (retryPlan.cause === 'concurrency_cap') {
+    queueWindowMs = Math.min(queueWindowMs, capacityMaxWaitMs);
+  }
 
   if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
 

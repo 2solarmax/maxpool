@@ -270,7 +270,7 @@ export class AccountManager {
         // retryAt:null (a KNOWN short-term reset is queueable and routes through
         // soonestTemporary above), so the hold is a bounded re-poll. Recoverable by
         // definition — hold finite, never collapse to Infinity and KILL the session.
-        soonestBoundedHold = BOUNDED_REPOLL_HOLD_MS;
+        soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
         // Label precedence: an account that is BOTH weekly-critical and short-term
         // capped is fundamentally weekly_critical; concurrency_cap only labels the
         // hold when no weekly-critical account contributed it.
@@ -666,11 +666,12 @@ export class AccountManager {
       // call + parallel subagents), and evicting a live one orphans it for days.
       // Catch a half-dead EPIPE ghost too: after a client RST the ServerResponse
       // may not have flipped destroyed/writableEnded yet (it's noticed on the next
-      // write), but its underlying socket is destroyed / the stream is no longer
-      // writable. A LIVE sibling has writable===true and a live socket, so this
-      // never evicts one. (Mock-live res objects leave both undefined → not dead.)
+      // write), but its underlying socket is already destroyed. A LIVE sibling has a
+      // live socket (socket.destroyed===false), so this never evicts one. (Mock-live
+      // res objects leave socket undefined → not dead.) Uses socket.destroyed only —
+      // a stable terminal signal — not the transient res.writable.
       const dead = !t.res || t.res.destroyed || t.res.writableEnded
-        || t.res.writable === false || t.res.socket?.destroyed === true;
+        || t.res.socket?.destroyed === true;
       if (!dead) continue;
       if (t.requestInfo) t.requestInfo.queueTicket = null; // let its waiter exit fast
       t.dead = true;
