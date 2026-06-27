@@ -97,7 +97,10 @@ test('M4: quota persistence keeps working after a reload (state generation advan
 
   try {
     await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
-    child.kill('SIGUSR2'); // no-op if unhandled; primary persists on its own interval
+    // NOTE: do NOT send SIGUSR2 here — maxpool doesn't handle it, and Node's default
+    // action for an unhandled SIGUSR2 is to TERMINATE the process (it would kill the
+    // supervisor and the reload below would never cut over). The primary persists on
+    // its own quota-save interval, so the baseline generation exists anyway.
 
     // Reload — the old worker flushes state (bumping the on-disk generation), the
     // new primary must re-sync it so ITS writes aren't refused.
