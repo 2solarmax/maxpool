@@ -930,7 +930,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat };
+export const __serverTest = { unavailableMessage, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1375,6 +1375,11 @@ function describeRequest(req, body) {
     if (requiresAnthropicThinkingIntegrity(json)) {
       info.requiresAnthropicThinkingIntegrity = true;
     }
+    // We fully scanned this body for signed-thinking content. Only a successfully
+    // scanned, thinking-free body is safe to migrate to another account (session
+    // rebalancing); an unparsed body leaves this false → treated as NOT safe
+    // (fail-closed) so we never replay a signed thinking block to a new account.
+    info.bodyThinkingScanned = true;
   } catch {
     // Non-JSON requests are rare; body size still gives a useful load signal.
   }

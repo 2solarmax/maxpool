@@ -1164,3 +1164,87 @@ test('bug C: a DEAD same-session hold IS superseded and its waiter freed', () =>
   assert.equal(r1.queueTicket, null, 'orphaned waiter freed so its loop exits fast');
   assert.equal(am.queueState.bytes, 1, 'ghost bytes released');
 });
+
+// ── #1 session rebalancing: migrate a bound session off a HOT account onto fresh
+//    capacity, but ONLY on a thinking-safe request, and only on a clear win. ──
+
+function hot(account) {            // weekly reserve = hot but still usable
+  account.quota.unified7d = 0.90;
+  account.quota.unified7dReset = Date.now() + 2 * 24 * 3600 * 1000;
+}
+function fresh(account) {          // unknown weekly, idle = best migration target
+  account.quota.unified7d = null;
+  account.quota.unified7dReset = null;
+  account.inFlight = 0;
+}
+
+test('rebalance: a thinking-SAFE request migrates a bound session off a HOT account to fresh capacity', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(first.account.name, 'a1');           // bound to a1
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6;                          // a1 now hot + heavily loaded
+  fresh(a2);
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(next.account.name, 'a2', 'safe + hot + much-healthier alt → migrates');
+});
+
+test('rebalance: a request carrying signed thinking NEVER migrates (no invalid-signature break)', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  // Body carries a signed thinking block → must stay on a1.
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, requiresAnthropicThinkingIntegrity: true });
+  assert.equal(next.account.name, 'a1', 'signed-thinking request stays put');
+});
+
+test('rebalance: an UNSCANNED body fails closed (no migration)', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  // No bodyThinkingScanned (e.g. non-JSON / parse failure) → treated as unsafe.
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1' });
+  assert.equal(next.account.name, 'a1', 'unparsed body never migrates (fail-closed)');
+});
+
+test('rebalance: a HEALTHY bound account is never migrated away from', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  // a1 healthy (not hot), a2 fresh + idle (cheaper score) — must NOT migrate.
+  a1.quota.unified7d = 0.10; a1.inFlight = 2; fresh(a2);
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(next.account.name, 'a1', 'healthy bound account stays put (no churn)');
+});
+
+test('rebalance: suppressed while the request is consuming a queue admission', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, queueAdmitted: true });
+  assert.equal(next.account.name, 'a1', 'no migration mid queue-admission');
+});
+
+test('rebalance: does not flap — once on the fresh account it stays (HOT gate + re-home)', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  const moved = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(moved.account.name, 'a2');
+  am.releaseAccount(moved, { success: true, status: 200 });
+  // a2 now took load (higher concurrency score) but stays HEALTHY weekly; a1 still
+  // hot. The session must NOT ping-pong back to a1.
+  a2.inFlight = 6;
+  const again = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(again.account.name, 'a2', 'healthy current account is not hot → no migration back');
+});

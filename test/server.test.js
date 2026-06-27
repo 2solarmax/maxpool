@@ -1791,3 +1791,19 @@ test('major: a post-resume failover RE-HOLDS the session instead of dropping it'
     await close(upstream);
   }
 });
+
+test('describeRequest marks bodyThinkingScanned only on a fully-scanned body (migration fail-closed)', () => {
+  const { describeRequest } = __serverTest;
+  const req = { method: 'POST', url: '/v1/messages' };
+  // Plain JSON, no thinking → scanned + safe to migrate.
+  const plain = describeRequest(req, Buffer.from(JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }] })));
+  assert.equal(plain.bodyThinkingScanned, true);
+  assert.notEqual(plain.requiresAnthropicThinkingIntegrity, true);
+  // Body carrying a signed thinking block → scanned but NOT migration-safe.
+  const thinking = describeRequest(req, Buffer.from(JSON.stringify({ model: 'x', messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: '…', signature: 'sig' }] }] })));
+  assert.equal(thinking.bodyThinkingScanned, true);
+  assert.equal(thinking.requiresAnthropicThinkingIntegrity, true);
+  // Non-JSON body → NOT scanned → fails closed (never migrates).
+  const garbage = describeRequest(req, Buffer.from('not json at all'));
+  assert.notEqual(garbage.bodyThinkingScanned, true);
+});

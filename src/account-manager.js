@@ -9,6 +9,16 @@ import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 // an Infinity session-kill / error-fast.
 const BOUNDED_REPOLL_HOLD_MS = 60_000;
 
+// Session rebalancing (issue #1): a bound session may migrate OFF a hot account
+// onto a much-healthier one, but ONLY on a thinking-safe request (see
+// _migrationSafeForRequest). These margins force a CLEAR, flap-stable win so a
+// session can never ping-pong between two similarly-loaded accounts.
+const REBALANCE_SCORE_MARGIN = 0.5;   // candidate score must be ≤ 50% of the bound account's
+const REBALANCE_MIN_ABS_GAP = 0.5;    // …with a small absolute floor so near-zero scores don't micro-churn
+// Weekly-pressure tiers, healthiest first. A fresh (unknown) account is the best
+// migration target; migration requires the candidate be a STRICTLY healthier tier.
+const WEEKLY_TIER = { unknown: 0, normal: 0, soft: 1, reserve: 2, critical: 3, exhausted: 4 };
+
 function emptyQuota() {
   return {
     // Standard API rate limits (API key accounts)
@@ -860,6 +870,62 @@ export class AccountManager {
       || ['reserve', 'critical', 'exhausted'].includes(this._weeklyRawState(account));
   }
 
+  // ── Session rebalancing (issue #1) ────────────────────────────────────────
+  // A bound session normally sticks to its account (continuity + Anthropic signed-
+  // thinking signature validity). These let it migrate OFF a hot account onto fresh
+  // capacity, but only when it's provably safe and clearly worth it.
+
+  /** Per-request safety gate: a request is safe to migrate to a DIFFERENT account
+   *  iff its body carries NO signed thinking (replaying a signed thinking block to
+   *  another account → non-retryable "invalid signature"). Uses the PER-REQUEST
+   *  body signal only — never the session-sticky policy — and fails CLOSED on any
+   *  body we couldn't fully scan (non-JSON / parse error → bodyThinkingScanned unset). */
+  _migrationSafeForRequest(requestInfo = {}) {
+    return requestInfo.bodyThinkingScanned === true
+      && requestInfo.requiresAnthropicThinkingIntegrity !== true;
+  }
+
+  /** Flap-stable "hot": weekly reserve/critical or 5h-cap pressure — signals that
+   *  do NOT flip the instant a request migrates (unlike live in-flight, left to the
+   *  score loop). A healthy bound account is never hot, so it never migrates → no
+   *  ping-pong. */
+  _isBoundAccountHot(account) {
+    return this._isNearQuota(account);
+  }
+
+  /** Decide whether a bound session should leave its (hot) account THIS request.
+   *  All gates must hold: thinking-safe + not mid queue-admission + bound is hot +
+   *  a genuinely-healthy alternative that is BOTH much cheaper AND a strictly
+   *  healthier weekly tier (so concurrency jitter alone can never trigger a move). */
+  _shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx) {
+    if (!this._migrationSafeForRequest(requestInfo)) return false;
+    if (requestInfo.queueTicket || requestInfo.queueAdmitted) return false;
+    if (!this._isBoundAccountHot(bound)) return false;
+
+    const boundScore = this._scoreAccount(bound, requestInfo, scoringCtx);
+    const boundTier = WEEKLY_TIER[this._weeklyRawState(bound)] ?? 0;
+
+    let bestScore = Infinity;
+    let bestTier = Infinity;
+    for (const account of this.accounts) {
+      if (account.index === bound.index) continue;
+      if (excludedIndexes.has(account.index)) continue;
+      if (!this._matchesRequest(account, profile, requestInfo)) continue;
+      // Genuinely-healthy alternatives only (normal/soft/unknown weekly).
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false })) continue;
+      const score = this._scoreAccount(account, requestInfo, scoringCtx);
+      if (score < bestScore) {
+        bestScore = score;
+        bestTier = WEEKLY_TIER[this._weeklyRawState(account)] ?? 0;
+      }
+    }
+    if (!Number.isFinite(bestScore)) return false; // no healthy alternative
+
+    return bestScore <= boundScore * REBALANCE_SCORE_MARGIN
+      && (boundScore - bestScore) >= REBALANCE_MIN_ABS_GAP
+      && bestTier < boundTier;
+  }
+
   _retryInfo(account) {
     const now = Date.now();
     const q = account.quota || {};
@@ -989,7 +1055,13 @@ export class AccountManager {
       }
     }
     const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo);
-    if (bound && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)) return bound;
+    if (bound
+      && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)
+      && !this._shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx)) {
+      return bound;
+    }
+    // Else fall through to the candidate score loop, which re-homes the session
+    // onto the best healthy account via _bindSession on acquire.
 
     const weeklyPasses = hasBinding
       ? [
@@ -1106,6 +1178,16 @@ export class AccountManager {
     if (!binding.homeName || priority < binding.homePriority) {
       binding.homeName = account.name;
       binding.homePriority = priority;
+    } else if (priority === binding.homePriority && account.name !== binding.homeName) {
+      // Same-priority move. If the previous home is still AVAILABLE we left it by
+      // CHOICE (session rebalancing off a hot-but-usable account) → re-home, so
+      // _boundAccount (which prefers homeName) doesn't snap the session straight
+      // back to the hot home next request. If the old home is UNAVAILABLE this is a
+      // FAILOVER → keep homeName so the session returns to it once it recovers.
+      const oldHome = this.accounts.find(a => a.name === binding.homeName);
+      if (oldHome && this._isAvailable(oldHome, { allowWeeklyReserve: true })) {
+        binding.homeName = account.name;
+      }
     }
     binding.currentName = account.name;
     this.sessionBindings.set(sessionKey, binding);
