@@ -93,16 +93,33 @@ function statusColor(status) {
   return String(status);
 }
 
+/** Short live countdown to a timestamp: seconds under a minute (the common
+ *  throttle cooldown), else minute/hour/day granularity. '' once elapsed. */
+function countdown(ts) {
+  if (!ts) return '';
+  const target = typeof ts === 'string' ? Date.parse(ts) : ts;
+  const ms = target - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  if (ms < 60_000) return `${Math.ceil(ms / 1000)}s`;
+  return formatReset(target);
+}
+
 function loadText(load) {
   const cur = load?.current || {};
   const m15 = load?.last15m || {};
   const h1 = load?.last1h || {};
-  const current = `${cur.inFlight || 0}/${cur.activeWeight || 0}`;
+  // "Now" = what this account is handling right THIS moment: N in-flight requests
+  // (and their combined weight ~ payload size, the scheduler's load input). Kept
+  // distinct from the "15m"/"1h" THROUGHPUT counts that follow, which the old
+  // "Load X/Y" label collided with.
+  const inflight = cur.inFlight || 0;
+  const weight = cur.activeWeight || 0;
+  const now = weight > 0 ? `Now ${inflight} (${weight}w)` : `Now ${inflight}`;
   const recent = `${m15.requests || 0}r`;
   const recentAvg = m15.avgMs != null ? ` ${formatMs(m15.avgMs)}` : '';
   const hour = `${h1.requests || 0}r`;
   const fails = (m15.failed || 0) > 0 ? ` ${red(`${m15.failed}f`)}` : '';
-  return `Load ${current}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
+  return `${now}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
 }
 
 function weeklyPolicyText(am, account) {
@@ -161,7 +178,7 @@ function bar(ratio, w = 10, resetTs) {
   return out;
 }
 
-export const __tuiTest = { formatReset, quotaLabel, bar, strip };
+export const __tuiTest = { formatReset, quotaLabel, bar, strip, loadText, countdown };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -906,12 +923,19 @@ export class TUI {
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = gray('disabled'); break;
-      case 'throttled': status = yellow('throttled'); break;
+      case 'throttled': {
+        // A transient auto-recovering cooldown — show the remaining time (from
+        // rateLimitedUntil) so it reads as "recovering in Ns", not stuck.
+        const cd = countdown(a.rateLimitedUntil);
+        status = yellow(cd ? `throttled ${cd}` : 'throttled');
+        break;
+      }
       case 'exhausted': status = red('exhausted'); break;
       case 'error':     status = red('error'); break;
       default:          status = a.status || 'ready';
     }
-    status = rpad(status, 10);
+    // Widened from 10 to fit "throttled 59s" so the quota bars stay column-aligned.
+    status = rpad(status, 13);
 
     if (a.type === 'provider') {
       return this._renderProviderAcct(sel, cur, name, type, status, a);
