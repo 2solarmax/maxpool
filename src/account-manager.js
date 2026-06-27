@@ -250,48 +250,53 @@ export class AccountManager {
 
     for (const account of this.accounts) {
       if (excludedIndexes.has(account.index)) continue;
-      if (!this._matchesRequest(account, profile, requestInfo)) {
-        // A signed-thinking request behind the TRANSIENT FIFO queue-fairness gate
-        // (a queue already exists and this newcomer hasn't registered a ticket yet
-        // — the `!requestInfo.queueTicket` clause in _matchesRequest) must HOLD,
-        // not error-fast. Such a request has NO fallback: providers are barred
-        // (signed thinking), so shedding it with a 429 KILLS the session — the
-        // reproduced "all N are at their 5h or weekly limit" false kill
-        // (2026-06-27) while healthy accounts sat idle behind the queue. The
-        // instant it registers a ticket the gate lifts and it waits its FIFO turn
-        // behind the existing waiters (which drain as the healthy accounts finish),
-        // so a bounded re-poll hold is the right answer.
-        // Scoped to THINKING requests on purpose: a non-thinking request can fall
-        // back to a provider or be cheaply retried, so the fairness gate keeps
-        // shedding it as backpressure (never grow the queue past its cap under a
-        // pure-concurrency burst). admissionPaused (restart/shutdown shed) and
-        // upstream-throttle keep their existing behavior (throttle is handled by
-        // the early return above). NOTE: queueAndRetry does NOT special-case
-        // 'queued_behind_fairness' in its window switch, so a STREAMING thinking
-        // hold rides streamHoldMaxMs (kept alive by the heartbeat) — intended: a
-        // signed-thinking stream should wait its turn, bounded by the per-ticket
-        // deadlineAt + _reapStaleQueueHead + the client's own disconnect, not the
-        // 15-min concurrency-cap clamp.
-        const thinkingFairnessGated = this._requiresAnthropicThinkingIntegrity(requestInfo)
-          && !this.admissionPaused
-          && !this._isUpstreamThrottleBlocking()
-          && this.queueState.waiting.length > 0
-          && !requestInfo.queueTicket
-          && !requestInfo.queueAdmitted;
-        if (thinkingFairnessGated
-          && account.type !== 'provider'
-          && this._isRequestCompatible(account, profile, requestInfo)
-          && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
-          soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
-          if (!boundedHoldCause) boundedHoldCause = 'queued_behind_fairness';
-        } else if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) {
+      const matches = this._matchesRequest(account, profile, requestInfo);
+
+      // A signed-thinking request behind the TRANSIENT FIFO queue-fairness gate
+      // (a queue already exists and this newcomer hasn't registered a ticket yet
+      // — the `!requestInfo.queueTicket` clause in _matchesRequest) must still be
+      // CONSIDERED for retry timing, not skipped. Such a request has NO fallback:
+      // providers are barred (signed thinking), so dropping the account here — and
+      // losing its REAL cooldown / rate-limit / 5h reset — collapses the oracle to
+      // Infinity and KILLS the session. Two reproduced kills (2026-06-27): a queue
+      // forms, then either (a) healthy accounts sit idle behind it, or (b) a
+      // network blip has cooled EVERY account, and the thinking newcomer dies with
+      // the false "all N are at their 5h or weekly limit". The gate lifts the
+      // instant the request registers a ticket, so bypass it for retry timing here.
+      // Still respected: admissionPaused (restart/shutdown shed → stays terminal),
+      // upstream-throttle (handled by the early return above), and structural
+      // profile / provider-thinking compatibility. Scoped to THINKING on purpose: a
+      // non-thinking newcomer can fall back to a provider or be cheaply retried, so
+      // the gate keeps shedding it as backpressure (never grow the queue past its
+      // cap under a pure-concurrency burst).
+      const fairnessOnlyBlock = !matches
+        && this._requiresAnthropicThinkingIntegrity(requestInfo)
+        && account.type !== 'provider'
+        && this._isRequestCompatible(account, profile, requestInfo)
+        && !this.admissionPaused
+        && !this._isUpstreamThrottleBlocking()
+        && this.queueState.waiting.length > 0
+        && !requestInfo.queueTicket
+        && !requestInfo.queueAdmitted;
+
+      if (!matches && !fairnessOnlyBlock) {
+        if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) {
           note('provider_fallback_disabled_signed_thinking');
         }
         continue;
       }
 
       matchingRoutes++;
-      if (this._isAvailable(account, { allowWeeklyReserve: true })) {
+
+      // NEVER claim available:0 for a fairness-gated account — _selectNext still
+      // refuses it (the gate), so an available verdict would desync the oracle from
+      // selection and spin the caller. A healthy gated account holds a bounded
+      // re-poll (queued_behind_fairness); a transiently-blocked one (cooldown /
+      // rate-limit / 5h cap) falls through so its REAL short-term reset drives a
+      // finite hold. It must NEVER contribute the WEEKLY reset (days) — that is the
+      // multi-day-hang the bounded path fences off; see the !fairnessOnlyBlock
+      // guards on the weekly branches below.
+      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -300,10 +305,15 @@ export class AccountManager {
           matchingRoutes,
         };
       }
+      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+        soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
+        if (!boundedHoldCause) boundedHoldCause = 'queued_behind_fairness';
+        continue;
+      }
 
       const retry = this._retryInfo(account);
       note(retry.cause);
-      if (retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+      if (!fairnessOnlyBlock && retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -334,10 +344,15 @@ export class AccountManager {
         // hold when no weekly-critical account contributed it.
         if (retry.weeklyCritical) boundedHoldCause = 'weekly_critical';
         else if (!boundedHoldCause) boundedHoldCause = 'concurrency_cap';
-      } else if (retry.cause === 'weekly_exhausted' && retry.retryAt) {
+      } else if (!fairnessOnlyBlock && retry.cause === 'weekly_exhausted' && retry.retryAt) {
+        // A fairness-gated account NEVER contributes the weekly reset: holding a
+        // thinking session for days behind the queue is the over-correction we
+        // avoid (a weekly-exhausted gated fleet stays terminal → honest error,
+        // matching the no-newcomer-vs-queue distinction). Only its short-term reset
+        // (above) or the bounded hold may fire.
         const ms = retry.retryAt - Date.now();
         if (ms < soonestWeekly) soonestWeekly = ms;
-      } else if (retry.cause === 'weekly_exhausted' && !retry.retryAt) {
+      } else if (!fairnessOnlyBlock && retry.cause === 'weekly_exhausted' && !retry.retryAt) {
         // Weekly-capped but we haven't learned the reset time (cold start /
         // probe failure). We cannot estimate a wait — flag it so the caller
         // emits an honest "reset time unknown" error instead of waiting forever.

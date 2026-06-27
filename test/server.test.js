@@ -659,7 +659,13 @@ test('queued streaming request terminates with SSE error when recovery returns 4
   }
 });
 
-test('queued streaming request terminates with SSE error when recovery connection fails', async () => {
+test('queued streaming request HOLDS on a recovery network failure, then terminates with a network-honest SSE error when the outage persists', async () => {
+  // After a rate-limit queue, the request resumes and its RECOVERY connection hits a
+  // network failure (req.socket.destroy). Pre-v1.5.2 this immediately error-fasted
+  // (connection_unavailable). Now a streaming request HOLDS and retries the blip; only
+  // when the outage persists past the (short) hold window does it give up — and the
+  // give-up message must be NETWORK-honest ("check your internet"), never the
+  // misleading "all accounts at their 5h or weekly limit" (the accounts are fine).
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts++;
@@ -667,21 +673,21 @@ test('queued streaming request terminates with SSE error when recovery connectio
       res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
-        error: {
-          type: 'rate_limit_error',
-          message: 'Server is temporarily limiting requests (not your usage limit)',
-        },
+        error: { type: 'rate_limit_error', message: 'Server is temporarily limiting requests (not your usage limit)' },
       }));
       return;
     }
-    req.socket.destroy();
+    req.socket.destroy(); // recovery connection keeps failing (persistent outage)
   });
   const upstreamPort = await listen(upstream);
   const am = new AccountManager(accounts(), 0.90);
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
-    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20, heartbeatMs: 50 },
+    // streamHoldMaxMs short so the persistent-outage give-up is fast & deterministic
+    // (the 30s network cooldown exceeds it). Still > the 1s 429 retry-after so the
+    // first hold survives to reach the recovery attempt.
+    queue: { enabled: true, maxWaitMs: 3000, pollMs: 20, heartbeatMs: 50, streamHoldMaxMs: 1500 },
   });
   const proxyPort = await listen(proxy);
 
@@ -690,13 +696,14 @@ test('queued streaming request terminates with SSE error when recovery connectio
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(6000),
     });
     const text = await res.text();
-    assert.match(text, /: maxpool queued/);
-    assert.match(text, /event: error/);
-    assert.match(text, /connection_unavailable/);
-    assert.equal(am.getStatus().upstreamThrottle.probeInFlight, false);
+    assert.match(text, /: maxpool queued/, 'was held (queued) first');
+    assert.match(text, /event: error/, 'terminates with an SSE error once the outage persists');
+    assert.match(text, /internet|connect/i, 'network-honest give-up message');
+    assert.doesNotMatch(text, /5h or weekly limit/, 'must NOT misattribute a network outage to quota');
+    assert.ok(attempts >= 3, 'retried the recovery connection (held through the blip)');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1806,4 +1813,67 @@ test('describeRequest marks bodyThinkingScanned only on a fully-scanned body (mi
   // Non-JSON body → NOT scanned → fails closed (never migrates).
   const garbage = describeRequest(req, Buffer.from('not json at all'));
   assert.notEqual(garbage.bodyThinkingScanned, true);
+});
+
+test('network blip: a STREAMING request whose upstream connection RESETS holds then resumes (not a 503 kill)', async () => {
+  // A VPN/internet drop makes the upstream fetch throw (ECONNRESET). Pre-fix,
+  // queueAndRetry refused every 'network'-cause hold and 503'd the session. A
+  // streaming, replayable request must instead HOLD on the cooled accounts' finite
+  // recovery and resume when connectivity returns (2026-06-27 v1.5.2).
+  let attempts = 0;
+  const upstream = http.createServer((req, res) => {
+    attempts++;
+    if (attempts <= 2) { req.socket.destroy(); return; } // the blip: kill the connection
+    // A streaming request requires an SSE response (maxpool rejects a non-stream 200).
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('event: message\ndata: {"ok":true,"resumed":true}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90, { cooldownMs: 80, maxCooldownMs: 80 });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    retry: { maxRetryBufferBytes: 1024 * 1024 },
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20, heartbeatMs: 1000, streamHoldMaxMs: 5000, nonStreamMaxWaitMs: 5000 },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, 'held + resumed, not a 503 connection_unavailable');
+    assert.ok(text.includes('resumed') || text.includes('"ok":true'), `resumed upstream body was streamed: ${text.slice(0, 200)}`);
+    assert.ok(attempts >= 3, `retried after the blip cleared (attempts=${attempts})`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('network blip: a NON-streaming request still fails fast (no keepalive to hold it)', async () => {
+  // The hold is streaming-only: a non-streaming request has no heartbeat, so it would
+  // die on the client's own timeout — fail fast with an honest connection error instead.
+  const upstream = http.createServer((req) => { req.socket.destroy(); });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90, { cooldownMs: 80, maxCooldownMs: 80 });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20 },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }), // NOT streaming
+    });
+    assert.ok(res.status === 503 || res.status === 502, `non-streaming network failure fails fast, got ${res.status}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
 });

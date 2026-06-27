@@ -1338,3 +1338,45 @@ test('NOT over-corrected: thinking + ALL accounts weekly-exhausted behind a queu
   assert.notEqual(plan.cause, 'queued_behind_fairness', 'must not fake a near-term fairness hold for a weekly-exhausted fleet');
   assert.equal(plan.retryAfterMs, Infinity, 'no eligible route behind the queue → error-fast (unchanged by the fix)');
 });
+
+// --- Regression: network blip cools EVERY account behind a FIFO queue (2026-06-27 v1.5.2) ---
+// The complement of the 1.5.1 fix: when a VPN/internet drop cools down every account
+// (markTransientFailure → finite cooldownUntil) AND a queue already formed, a thinking
+// newcomer was still error-killed ("all N at their 5h or weekly limit") because the
+// FIFO-fairness gate skipped the cooled accounts entirely, losing their real (finite)
+// cooldown reset. A thinking request must now HOLD for the soonest real recovery.
+
+test('network-blip: thinking newcomer behind a queue with ALL accounts cooled HOLDS for the real cooldown, never error-kills', () => {
+  const am = healthyPair();
+  am.accounts.forEach((_, i) => am.markTransientFailure(i, 'ECONNRESET')); // VPN/internet drop cooled both
+  am.queueState.waiting.push({ id: 999 });
+  const newcomer = { profile: 'claude', stream: true, sessionKey: 'nc', requiresAnthropicThinkingIntegrity: true };
+  const plan = am.nextRetryForRequest(newcomer);
+  assert.equal(plan.available, false);
+  assert.ok(Number.isFinite(plan.retryAfterMs), `must HOLD, got ${plan.retryAfterMs}`);
+  assert.equal(plan.cause, 'cooldown', 'holds on the REAL near-term cooldown reset, not a fake 60s fairness hold');
+  assert.ok(plan.retryAfterMs <= 30_000, 'bounded by the cooldown, ~30s');
+});
+
+test('network-blip: holds the SOONEST cooldown across mixed-cooldown accounts behind a queue', () => {
+  const am = healthyPair();
+  am.markTransientFailure(0, 'ECONNRESET');        // ~30s default cooldown
+  am.accounts[1].cooldownUntil = Date.now() + 10_000; // sooner
+  am.accounts[1].consecutiveFailures = 1; am.accounts[1].lastError = 'ECONNRESET';
+  am.queueState.waiting.push({ id: 999 });
+  const newcomer = { profile: 'claude', stream: true, sessionKey: 'nc', requiresAnthropicThinkingIntegrity: true };
+  const plan = am.nextRetryForRequest(newcomer);
+  assert.ok(Number.isFinite(plan.retryAfterMs));
+  assert.ok(plan.retryAfterMs <= 10_500 && plan.retryAfterMs > 8_000, `min-merges to the ~10s account, got ${plan.retryAfterMs}`);
+});
+
+test('oracle/selector agree: a fairness-gated thinking account is NEVER reported available (no busy-spin)', () => {
+  const am = healthyPair(); // both healthy
+  am.queueState.waiting.push({ id: 999 });
+  const newcomer = { profile: 'claude', stream: true, sessionKey: 'nc', requiresAnthropicThinkingIntegrity: true };
+  const plan = am.nextRetryForRequest(newcomer);
+  // The oracle must say "hold" (available:false) AND selection must refuse it — they
+  // must agree, or the caller would loop forever (oracle says go, selector says no).
+  assert.equal(plan.available, false, 'oracle never claims available for a gated account');
+  assert.equal(am.acquireAccount(newcomer), null, 'selection refuses the gated newcomer (FIFO preserved)');
+});

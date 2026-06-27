@@ -1158,7 +1158,18 @@ async function queueAndRetry(
     }
     return false;
   }
-  if (cause === 'network' || cause === 'proxy') return false;
+  // A 'proxy' (non-transient upstream) error fails fast. A 'network' error (the
+  // upstream fetch threw — ECONNRESET / ETIMEDOUT / a VPN or internet blip) is the
+  // MOST transient failure there is, and must NOT kill a live session: when the
+  // request is a STREAMING, replayable one (heartbeat keeps it alive, buffered body
+  // can be re-sent) and ≥1 account will recover on a finite schedule, hold it and
+  // resume when connectivity returns — exactly the "a network drop shouldn't break
+  // my session" goal (2026-06-27). The hold-vs-error gate below still error-fasts if
+  // nextRetryForRequest reports no finite recovery (all accounts genuinely gone), so
+  // a real outage doesn't spin. A non-streaming network failure (no keepalive) still
+  // fails fast — it would die on the client's own timeout anyway.
+  if (cause === 'proxy') return false;
+  if (cause === 'network' && (!requestInfo.stream || !canQueueBufferedBody)) return false;
 
   const maxWaitMs = Math.max(0, Number(queueConfig.maxWaitMs) || 0);
   const autoMaxWaitMs = queueConfig.autoMaxWaitMs == null
@@ -1176,11 +1187,16 @@ async function queueAndRetry(
   };
 
   // Honest, cause-/thinking-aware message used for every give-up path below.
-  const honestMessage = unavailableMessage(
-    accountManager, requestInfo,
-    Math.ceil((Number.isFinite(retryPlan.retryAfterMs) ? retryPlan.retryAfterMs : 0) / 1000),
-    false,
-  );
+  // A 'network'-cause hold that ultimately gives up means connectivity never came
+  // back within the window — say THAT (check your internet), not the misleading
+  // "all accounts at their quota limit" (the accounts are fine; the network isn't).
+  const honestMessage = cause === 'network'
+    ? 'Could not connect to Claude (network error) and connectivity did not return in time. Check your internet connection and try again. This is not an account quota issue.'
+    : unavailableMessage(
+      accountManager, requestInfo,
+      Math.ceil((Number.isFinite(retryPlan.retryAfterMs) ? retryPlan.retryAfterMs : 0) / 1000),
+      false,
+    );
 
   // Weekly-capped but the reset time is unknown (cold start / probe failure):
   // we can't estimate a wait, so don't pretend to — error honestly now.
