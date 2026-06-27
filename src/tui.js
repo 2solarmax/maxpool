@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { importCredentials, fetchProfile, loginOAuth } from './oauth.js';
+import { fetchProfile, loginOAuth } from './oauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -93,16 +93,37 @@ function statusColor(status) {
   return String(status);
 }
 
+/** Short live countdown to a timestamp, SINGLE-unit so it stays ≤3 chars
+ *  ("41s"/"5m"/"23h"/"2d") and never overflows the status column: seconds under a
+ *  minute (the common throttle cooldown), then minute/hour/day. '' once elapsed.
+ *  Accepts a numeric ms timestamp (live account field) or an ISO string (snapshot). */
+function countdown(ts) {
+  if (!ts) return '';
+  const target = typeof ts === 'string' ? Date.parse(ts) : ts;
+  const ms = target - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  if (ms < 60_000) return `${Math.ceil(ms / 1000)}s`;
+  if (ms < 3_600_000) return `${Math.ceil(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.ceil(ms / 3_600_000)}h`;
+  return `${Math.ceil(ms / 86_400_000)}d`;
+}
+
 function loadText(load) {
   const cur = load?.current || {};
   const m15 = load?.last15m || {};
   const h1 = load?.last1h || {};
-  const current = `${cur.inFlight || 0}/${cur.activeWeight || 0}`;
+  // "Now" = what this account is handling right THIS moment: N in-flight requests
+  // (and their combined weight ~ payload size, the scheduler's load input). Kept
+  // distinct from the "15m"/"1h" THROUGHPUT counts that follow, which the old
+  // "Load X/Y" label collided with.
+  const inflight = cur.inFlight || 0;
+  const weight = cur.activeWeight || 0;
+  const now = weight > 0 ? `Now ${inflight} (${weight}w)` : `Now ${inflight}`;
   const recent = `${m15.requests || 0}r`;
   const recentAvg = m15.avgMs != null ? ` ${formatMs(m15.avgMs)}` : '';
   const hour = `${h1.requests || 0}r`;
   const fails = (m15.failed || 0) > 0 ? ` ${red(`${m15.failed}f`)}` : '';
-  return `Load ${current}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
+  return `${now}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
 }
 
 function weeklyPolicyText(am, account) {
@@ -161,7 +182,7 @@ function bar(ratio, w = 10, resetTs) {
   return out;
 }
 
-export const __tuiTest = { formatReset, quotaLabel, bar, strip };
+export const __tuiTest = { formatReset, quotaLabel, bar, strip, loadText, countdown };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -351,13 +372,7 @@ export class TUI {
   }
 
   _keyAccounts(k) {
-    if (k === 'i') {
-      this._confirm(
-        'Import current Claude login?',
-        'Add or update the account currently logged into Claude Code.',
-        () => this._doImport(),
-      );
-    } else if (k === 'k') {
+    if (k === 'k') {
       this.mode = 'input';
       this.inputPrompt = 'Anthropic API key';
       this.inputBuf = '';
@@ -530,26 +545,6 @@ export class TUI {
       }
     } catch (e) {
       this._addLog(`Sync failed: ${e.message}`);
-    }
-  }
-
-  async _doImport() {
-    try {
-      this._addLog('Importing credentials...');
-      const creds = await importCredentials(); // file, then macOS Keychain fallback
-      const profile = await fetchProfile(creds.accessToken);
-      if (!profile || profile.error) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
-      }
-      let name;
-      if (profile?.email) {
-        name = profile.email;
-        const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
-        if (tier) this._addLog(`Detected Claude ${tier}: ${name}`);
-      }
-      await this._upsertOAuthAccount({ creds, profile, name, source: 'import', verb: 'Imported' });
-    } catch (e) {
-      this._addLog(`Import failed: ${e.message}`);
     }
   }
 
@@ -932,12 +927,19 @@ export class TUI {
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = gray('disabled'); break;
-      case 'throttled': status = yellow('throttled'); break;
+      case 'throttled': {
+        // A transient auto-recovering cooldown — show the remaining time (from
+        // rateLimitedUntil) so it reads as "recovering in Ns", not stuck.
+        const cd = countdown(a.rateLimitedUntil);
+        status = yellow(cd ? `throttled ${cd}` : 'throttled');
+        break;
+      }
       case 'exhausted': status = red('exhausted'); break;
       case 'error':     status = red('error'); break;
       default:          status = a.status || 'ready';
     }
-    status = rpad(status, 10);
+    // Widened from 10 to fit "throttled 59s" so the quota bars stay column-aligned.
+    status = rpad(status, 13);
 
     if (a.type === 'provider') {
       return this._renderProviderAcct(sel, cur, name, type, status, a);
@@ -1008,7 +1010,7 @@ export class TUI {
       case 'normal':
         return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
       case 'accounts':
-        return ` ${bold('i')} Import  ${bold('l')} Login (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('l')} Login (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'routing':
         return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('Esc')} Back`;
       case 'select': {

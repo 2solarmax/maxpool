@@ -19,12 +19,17 @@ const DEFAULT_QUEUE = {
   maxWaitMs: 24 * 60 * 60 * 1000,
   autoMaxWaitMs: null,
   capacityMaxWaitMs: 15 * 60 * 1000,
-  // Weekly (7d) cap hold. A generous bound is SAFE because the early-exit
-  // gates on the REAL reset time (unified7dReset - now): it only waits when a
-  // reset genuinely lands inside the window, and errors honestly otherwise.
-  // 0 here was the bug — it fail-fast-killed sessions the instant every
-  // account hit its weekly cap, instead of waiting for the soonest reset.
-  weeklyMaxWaitMs: 24 * 60 * 60 * 1000,
+  weeklyMaxWaitMs: 24 * 60 * 60 * 1000, // legacy bound; streaming holds use streamHoldMaxMs
+  // STREAMING hold ceiling: how long a streaming request may be HELD ALIVE on
+  // the SSE heartbeat waiting for any account to free up. Defaults to 7d (the
+  // max weekly window) so a session is never killed while a real reset is on the
+  // way — it resumes the instant any account frees. The hold is gated by the
+  // nextRetryForRequest oracle: it ONLY holds when ≥1 eligible route has a finite
+  // reset within this ceiling; permanent failures (all accounts logged out / no
+  // eligible route / reset unknown) error fast instead of hanging. The heartbeat
+  // resets idle-gap client timeouts; if a client uses a wall-clock total-request
+  // deadline, lower this to just under it.
+  streamHoldMaxMs: 7 * 24 * 60 * 60 * 1000,
   // Non-streaming requests have no SSE heartbeat to keep them alive, so a long
   // hold would die on the client timeout anyway. Cap their wait conservatively.
   nonStreamMaxWaitMs: 5 * 60 * 1000,
@@ -304,13 +309,44 @@ async function forwardRequest(
     return;
   }
 
+  // The admission (if this was a resumed queued request) has now been CONSUMED —
+  // it got its account. Clear queueAdmitted so any subsequent internal failover
+  // recursion (excludedIndexes path) re-enters the fairness gate as a normal
+  // waiter instead of preferentially jumping ahead of the FIFO for the rest of
+  // this request's failover chain.
+  requestInfo.queueAdmitted = false;
+
+  // Abort the upstream fetch and release the lease if the CLIENT disconnects during
+  // the pre-response window (token refresh + connect + waiting for the upstream's
+  // first byte). Without this, a client that drops mid-flight leaves account.inFlight
+  // pinned until the fetch resolves on its own (~undici body timeout), benching
+  // scarce capacity — acute for the hold feature, which targets already-scarce
+  // accounts. The listener is removed once the response arrives; mid-stream
+  // disconnects are handled by streamResponse's res.destroyed checks.
+  const clientGone = new AbortController();
+  const onClientClose = () => clientGone.abort();
+  res.once('close', onClientClose);
+  const releaseOnClientGone = () => {
+    res.off('close', onClientClose);
+    accountManager.releaseAccount(lease);
+    clearQueueHeartbeat(requestInfo);
+    accountManager.removeQueuedRequest?.(requestInfo);
+  };
+
   // Track which account handles this request
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
   const tokenReady = await accountManager.ensureTokenFresh(account.index);
+  if (clientGone.signal.aborted) { releaseOnClientGone(); return; }
   if (!tokenReady) {
+    // Token refresh failed (not a client disconnect). This frame is leaving via
+    // recursion / queue / error WITHOUT reaching the post-fetch off() — drop the
+    // 'close' listener now so it doesn't accumulate one-per-failover-hop on `res`
+    // (MaxListenersExceededWarning + leak); the recursive/resumed frame registers
+    // its own.
+    res.off('close', onClientClose);
     accountManager.releaseAccount(lease);
     excludedIndexes.add(account.index);
     if (
@@ -398,7 +434,11 @@ async function forwardRequest(
       headers,
       body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
       redirect: 'manual',
+      signal: clientGone.signal,
     });
+    // Response arrived — the pre-response leak window is over. Stop guarding for
+    // client-disconnect via abort (streamResponse handles mid-stream disconnects).
+    res.off('close', onClientClose);
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -771,7 +811,20 @@ async function forwardRequest(
       if (requestInfo.queueHeartbeatActive) {
         clearQueueHeartbeat(requestInfo);
         if (!res.destroyed && !res.writableEnded) {
-          res.write(`data: ${buf.toString()}\n\n`);
+          // We already committed `200 text/event-stream` (the queue heartbeat), but
+          // the resumed upstream returned a NON-streaming body. Writing the raw JSON
+          // as a lone `data:` line corrupts the client's SSE parser (no message_start
+          // envelope, no message_stop). Frame it as a proper SSE error event so the
+          // client fails cleanly instead of hanging/mis-parsing. (Rare: an upstream
+          // honoring stream:true never lands here; reachable on a fallback upstream
+          // quirk.)
+          res.write(`event: error\ndata: ${JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'api_error',
+              message: `Upstream returned a non-streaming ${upstreamRes.status} response for a streaming request`,
+            },
+          })}\n\n`);
           res.end();
         }
       } else {
@@ -780,6 +833,14 @@ async function forwardRequest(
       }
     }
   } catch (err) {
+    res.off('close', onClientClose);
+    // Client disconnected mid-flight → we aborted the upstream fetch. Release the
+    // lease (free the scarce account) and STOP: no retry (the client is gone), no
+    // write (the socket is dead).
+    if (clientGone.signal.aborted) {
+      releaseOnClientGone();
+      return;
+    }
     console.error(`[Maxpool] Upstream error (account "${account.name}"):`, err.message);
 
     if (logDir) {
@@ -891,7 +952,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile };
+export const __serverTest = { unavailableMessage, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1106,7 +1167,6 @@ async function queueAndRetry(
   const capacityMaxWaitMs = queueConfig.capacityMaxWaitMs == null
     ? autoMaxWaitMs
     : Math.max(0, Number(queueConfig.capacityMaxWaitMs) || 0);
-  const weeklyMaxWaitMs = Math.max(0, Number(queueConfig.weeklyMaxWaitMs) || 0);
   const nonStreamMaxWaitMs = queueConfig.nonStreamMaxWaitMs == null
     ? 5 * 60_000
     : Math.max(0, Number(queueConfig.nonStreamMaxWaitMs) || 0);
@@ -1128,20 +1188,46 @@ async function queueAndRetry(
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
 
-  // Pick the wait window. Capacity (upstream 529/overload) MUST stay on its own
-  // short cap even when it coincides with weekly exhaustion — never let a
-  // transient overload inherit the long weekly bound.
-  let queueWindowMs = cause === 'capacity'
-    ? Math.min(maxWaitMs, capacityMaxWaitMs)
-    : retryPlan.cause === 'weekly_exhausted'
-      ? Math.min(maxWaitMs, weeklyMaxWaitMs)
-      : Math.min(maxWaitMs, autoMaxWaitMs);
-  // Non-streaming requests have no SSE heartbeat, so a long hold would die on
-  // the client timeout. Cap them so we never promise a wait we can't deliver.
+  const streamHoldMaxMs = queueConfig.streamHoldMaxMs == null
+    ? 7 * 24 * 60 * 60 * 1000
+    : Math.max(0, Number(queueConfig.streamHoldMaxMs) || 0);
+  // Pick the hold ceiling:
+  //   capacity (upstream 529/overload) → its own short cap, never a long hold
+  //   non-streaming (no heartbeat)      → short cap (would die on client timeout)
+  //   streaming                         → up to streamHoldMaxMs (7d), kept alive
+  //                                       by the heartbeat
+  let queueWindowMs;
+  if (cause === 'capacity') {
+    queueWindowMs = Math.min(maxWaitMs, capacityMaxWaitMs);
+  } else if (!requestInfo.stream) {
+    queueWindowMs = nonStreamMaxWaitMs;
+  } else {
+    queueWindowMs = streamHoldMaxMs;
+  }
+  // A non-streaming request has no heartbeat regardless of cause, so it must
+  // never outlast nonStreamMaxWaitMs even under capacity (it would occupy a
+  // slot 3x its documented cap with nothing to reap it).
   if (!requestInfo.stream) queueWindowMs = Math.min(queueWindowMs, nonStreamMaxWaitMs);
+
+  // A pure concurrency-cap block (every account healthy but all in-flight/global
+  // slots busy — NOT a quota/rate-limit reset) is a LOCAL capacity transient. Bound
+  // it by the short capacity window, never the multi-day streaming hold: a slot
+  // frees as active requests finish (seconds–minutes), and if the fleet stays
+  // saturated past the window the request sheds load (error-fast) instead of
+  // spinning a queue slot for up to streamHoldMaxMs (7d) — the soft-deadlock guard.
+  if (retryPlan.cause === 'concurrency_cap') {
+    queueWindowMs = Math.min(queueWindowMs, capacityMaxWaitMs);
+  }
 
   if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
 
+  // HOLD-vs-ERROR oracle (from nextRetryForRequest): HOLD only when a TEMPORARY
+  // cause has a finite real reset within the ceiling. ERROR FAST for permanent /
+  // unsatisfiable cases — nextRetryForRequest returns retryAfterMs === Infinity
+  // for no_eligible_route, weekly_reset_unknown, and "all matching routes are
+  // terminal (disabled / error / auth-dead)". This is what stops an indefinite
+  // hold from silently hanging every session when something is actually broken
+  // (all accounts logged out, the only healthy account removed, etc.).
   const retryAfterMs = retryPlan.retryAfterMs;
   if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) {
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
@@ -1151,6 +1237,8 @@ async function queueAndRetry(
   const ticket = accountManager.registerQueuedRequest?.(requestInfo, {
     bytes: body?.length || 0,
     deadlineAt: requestInfo.queueStartedAt + queueWindowMs,
+    sessionKey: requestInfo.sessionKey,
+    res, // liveness check for ghost-only eviction
     maxConcurrentQueued: queueConfig.maxConcurrentQueued,
     maxQueuedBytes: queueConfig.maxQueuedBytes,
   });
@@ -1170,7 +1258,7 @@ async function queueAndRetry(
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
   console.log(`[Maxpool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
-  ensureQueueHeartbeat(res, requestInfo, queueConfig);
+  ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
   if (!available) {
@@ -1179,13 +1267,23 @@ async function queueAndRetry(
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }
 
+  // NOTE: the heartbeat is deliberately NOT cleared here. It must stay alive
+  // through the resumed forward's CONNECTION + failover attempts: if the freed
+  // account 529s/throttles on the first resumed request (before any upstream
+  // bytes), forwardRequest re-enters queueAndRetry — whose guard at the top
+  // (`res.headersSent && !queueHeartbeatActive`) would otherwise BAIL on the
+  // committed stream and DROP the held session. Keeping the heartbeat active lets
+  // it re-hold. The heartbeat is instead stopped the instant real upstream bytes
+  // start flowing, inside streamResponse — that prevents the Bug A interleave
+  // (': maxpool queued' comments injected between real SSE events) without losing
+  // re-holdability on a post-resume failover.
   return forwardRequest(
     req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
     retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set(),
-  ).then(() => true).finally(() => clearQueueHeartbeat(requestInfo));
+  ).then(() => true);
 }
 
-function ensureQueueHeartbeat(res, requestInfo, queueConfig) {
+function ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager) {
   if (!requestInfo.stream || requestInfo.queueHeartbeatActive || res.headersSent) return;
   const heartbeatMs = Math.max(1000, Number(queueConfig.heartbeatMs) || 10_000);
   res.writeHead(200, {
@@ -1197,12 +1295,21 @@ function ensureQueueHeartbeat(res, requestInfo, queueConfig) {
   res.flushHeaders?.();
   res.write(': maxpool queued\n\n');
   requestInfo.queueHeartbeatActive = true;
+  // The heartbeat is the liveness probe: if the client is gone (socket
+  // destroyed/ended, or the write throws EPIPE/ERR_STREAM_DESTROYED), release
+  // the queue slot + bytes IMMEDIATELY rather than letting a dead ticket occupy
+  // the queue until its (up to 7d) deadline — the ghost-leak guard.
+  const reapDead = () => {
+    clearQueueHeartbeat(requestInfo);
+    accountManager?.removeQueuedRequest?.(requestInfo);
+  };
   requestInfo.queueHeartbeatTimer = setInterval(() => {
-    if (res.destroyed || res.writableEnded) {
-      clearQueueHeartbeat(requestInfo);
-      return;
+    if (res.destroyed || res.writableEnded) { reapDead(); return; }
+    try {
+      res.write(': maxpool queued\n\n');
+    } catch {
+      reapDead();
     }
-    res.write(': maxpool queued\n\n');
   }, heartbeatMs);
   requestInfo.queueHeartbeatTimer.unref?.();
 }
@@ -1241,6 +1348,14 @@ async function waitForAvailableRoute(req, res, accountManager, requestInfo, queu
         accountManager.hasAvailableRoute(requestInfo, new Set())
         && accountManager.canAdmitQueuedRequest?.(requestInfo) !== false
       ) return true;
+
+      // Re-classify each tick: if no eligible route can EVER recover (every
+      // matching account went terminal/auth-dead, the only healthy account was
+      // removed, or the reset is unknown → retryAfterMs Infinity), stop holding
+      // and error fast instead of spinning to the 7d ceiling. Hold is valid only
+      // while ≥1 eligible route has a finite, known reset.
+      const plan = accountManager.nextRetryForRequest?.(requestInfo, new Set());
+      if (plan && plan.cause !== 'available' && !Number.isFinite(plan.retryAfterMs)) return false;
 
       const remaining = maxWaitMs - (Date.now() - startedAt);
       // Jitter the poll so a synchronized weekly-reset event doesn't re-align
@@ -1282,6 +1397,11 @@ function describeRequest(req, body) {
     if (requiresAnthropicThinkingIntegrity(json)) {
       info.requiresAnthropicThinkingIntegrity = true;
     }
+    // We fully scanned this body for signed-thinking content. Only a successfully
+    // scanned, thinking-free body is safe to migrate to another account (session
+    // rebalancing); an unparsed body leaves this false → treated as NOT safe
+    // (fail-closed) so we never replay a signed thinking block to a new account.
+    info.bodyThinkingScanned = true;
   } catch {
     // Non-JSON requests are rare; body size still gives a useful load signal.
   }
@@ -1405,6 +1525,14 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   let sseBuffer = '';
   let committed = res.headersSent;
   let readFailed = false;
+
+  // We're now committed to streaming a real upstream response body onto this
+  // response — there is no more failover for this forward. Stop the queue
+  // heartbeat (if this was a resumed held stream) BEFORE the first real byte, so
+  // the setInterval can't inject ': maxpool queued' comments between live SSE
+  // events (Bug A). It is deliberately NOT cleared earlier (on resume), so a
+  // pre-byte failover can still re-hold the session via queueAndRetry.
+  clearQueueHeartbeat(requestInfo);
 
   try {
     while (true) {

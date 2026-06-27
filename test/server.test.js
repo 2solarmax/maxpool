@@ -4,7 +4,50 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, __serverTest } from '../src/server.js';
 
-const { unavailableMessage, isRetriableUpstreamStatus } = __serverTest;
+const { unavailableMessage, isRetriableUpstreamStatus, ensureQueueHeartbeat, clearQueueHeartbeat } = __serverTest;
+
+test('bug (ghost-leak): heartbeat reap releases the queue slot+bytes when the held client write throws EPIPE', async () => {
+  // Binding test for reapDead: the heartbeat is the liveness probe. When the
+  // held client's socket is gone, res.write throws and the reap MUST release the
+  // queue slot + bytes via removeQueuedRequest — else a dead ticket squats the
+  // queue for up to streamHoldMaxMs (7d), exhausting backpressure → "queue full".
+  // (The independent res.once('close') path does NOT cover the write-throw/tick-
+  // before-close window — only reapDead does, so this neuters green without it.)
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  const requestInfo = { stream: true, sessionKey: 'S' };
+  // A real ticket occupying the queue (slot + bytes).
+  am.registerQueuedRequest(requestInfo, { sessionKey: 'S', bytes: 4242, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am.queueState.waiting.length, 1, 'ticket queued');
+  assert.equal(am.queueState.bytes, 4242, 'bytes accounted');
+
+  // A live-looking res whose write throws (EPIPE) on the heartbeat tick — the
+  // client vanished without the socket flipping destroyed/writableEnded first.
+  let headersSent = false;
+  const res = {
+    get headersSent() { return headersSent; },
+    writeHead() { headersSent = true; },
+    flushHeaders() {},
+    destroyed: false,
+    writableEnded: false,
+    write(chunk) {
+      if (chunk.includes('maxpool queued') && headersSent && this._ticked) {
+        const e = new Error('write EPIPE'); e.code = 'EPIPE'; throw e;
+      }
+      this._ticked = true;
+    },
+  };
+
+  ensureQueueHeartbeat(res, requestInfo, { heartbeatMs: 1000 }, am);
+  // Heartbeat floors to 1000ms; wait for one tick (which throws) → reap.
+  await new Promise(r => setTimeout(r, 1300));
+
+  assert.equal(am.queueState.waiting.length, 0, 'reap released the queue slot');
+  assert.equal(am.queueState.bytes, 0, 'reap released the queued bytes');
+  assert.equal(requestInfo.queueHeartbeatActive, false, 'heartbeat timer cleared by reap');
+  clearQueueHeartbeat(requestInfo);
+});
 
 test('unavailableMessage tells the truth when no account will recover soon', () => {
   const am = { accounts: [{}, {}], _requiresAnthropicThinkingIntegrity: () => false };
@@ -1503,4 +1546,264 @@ test('headerValue falls back to legacy x-teamclaude-* names (backward compat)', 
   assert.equal(getMaxpoolProfile({ 'x-teamclaude-profile': 'all' }), 'all');
   // Non-maxpool header names do not get a legacy fallback.
   assert.equal(headerValue({ 'x-teamclaude-other': 'x' }, 'x-other'), '');
+});
+
+test('bug A: resumed stream has NO heartbeat comment interleaved between real events', async () => {
+  // Real red-green for the clear-before-forward fix (server.js, resume path).
+  // ensureQueueHeartbeat floors heartbeatMs to 1000ms (Math.max(1000, ...)), so
+  // the timer only ticks mid-stream when the upstream's inter-event gap exceeds
+  // ~1s. The upstream below spaces message_delta 1300ms after message_start, so a
+  // surviving heartbeat WOULD inject `: maxpool queued` between them. With the fix
+  // the heartbeat is stopped at resume → clean stream. (Verified RED on the
+  // pre-fix code, GREEN here — this defeats the old tautological 240ms test.)
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"message_start"}\n\n');
+    setTimeout(() => res.write('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n'), 1300);
+    setTimeout(() => res.end('data: {"type":"message_stop"}\n\n'), 2600);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  // Only account is briefly throttled → the streaming request must QUEUE first
+  // (heartbeat fires), then recover and RESUME onto the committed SSE stream.
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].lastError = 'rate_limited';
+  am.accounts[0].rateLimitedUntil = Date.now() + 150;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20, heartbeatMs: 1000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    assert.match(body, /message_stop/, 'the resumed stream completed');
+    // Heartbeat comments may appear BEFORE the first real event (while queued),
+    // but NEVER after — interleaving mid-stream is the corruption bug.
+    const after = body.slice(body.indexOf('data:'));
+    assert.ok(!after.includes(': maxpool queued'),
+      'no heartbeat comment interleaved into the live SSE body after the first event');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('major: a concurrency-cap hold is bounded by the capacity window, not the 7d streaming hold', async () => {
+  // A streaming request blocked only by a SATURATED concurrency cap must shed load
+  // within the short capacity window — never spin a queue slot for the multi-day
+  // streaming hold (the soft-deadlock guard). Here the only account is pinned at its
+  // cap and never frees, so the request must give up promptly with an SSE error.
+  const upstream = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {}\n\n'); });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].inFlight = am.scheduler.safetyMaxActivePerAccount; // pinned at the cap, never frees
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 7 * 24 * 3600 * 1000, streamHoldMaxMs: 7 * 24 * 3600 * 1000, capacityMaxWaitMs: 300, pollMs: 50, heartbeatMs: 1000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const body = await res.text();
+    const elapsed = Date.now() - started;
+    // The decisive signal: the request RESOLVES bounded (vs hanging until the 7d
+    // streamHoldMaxMs deadline, which would trip the 5s client timeout → throw).
+    assert.ok(elapsed < 3000, `concurrency-cap hold bounded by the capacity window (${elapsed}ms), not the 7d streaming hold`);
+    assert.equal(res.status, 429, 'shed load with a rate-limit error, not an indefinite hold');
+    assert.match(body, /Retry in|rate_limit|error/i, 'gave up with an error response');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('major (lease): client disconnect during the resumed pre-stream window releases the account lease', async () => {
+  // A resumed forward acquires a lease (inFlight++) then awaits the upstream. If
+  // the client disconnects during that pre-first-byte window, the lease must be
+  // released promptly (abort the fetch), NOT pinned until the upstream resolves on
+  // its own (~undici timeout) — which would bench the scarce account it targets.
+  let upstreamReqs = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamReqs++;
+    // Hold the response open well past the client's disconnect.
+    setTimeout(() => { try { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {}\n\n'); } catch { /* client gone */ } }, 3000);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].lastError = 'rate_limited';
+  am.accounts[0].rateLimitedUntil = Date.now() + 100;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 8000, pollMs: 20, heartbeatMs: 1000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const ac = new AbortController();
+    const p = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: ac.signal,
+    }).catch(() => {});
+    // Let it queue, resume, acquire the lease, and enter the slow upstream fetch.
+    await new Promise(r => setTimeout(r, 600));
+    assert.ok(upstreamReqs >= 1, 'request resumed and reached the upstream (lease acquired)');
+    ac.abort();                       // client disconnects mid-fetch
+    await p;
+    await new Promise(r => setTimeout(r, 500));
+    assert.equal(am.accounts[0].inFlight, 0, 'lease released on client disconnect — inFlight not pinned by the 3s upstream');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('minor: a non-streaming resumed response is framed as an SSE error, not a raw data blob', async () => {
+  // After the heartbeat committed 200 text/event-stream, the resumed upstream
+  // returns a NON-streaming JSON body. It must be emitted as a proper SSE
+  // `event: error` (parseable), never a lone `data: {raw json}` that corrupts the
+  // client's SSE state machine (no message_start envelope).
+  let attempts = 0;
+  const upstream = http.createServer((_req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'limit' } }));
+      return;
+    }
+    // Non-streaming JSON body for a stream request (an upstream contract quirk).
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'hi' }] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].lastError = 'rate_limited';
+  am.accounts[0].rateLimitedUntil = Date.now() + 120;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 8000, pollMs: 20, heartbeatMs: 1000, capacityMaxWaitMs: 8000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(7000),
+    });
+    const body = await res.text();
+    const after = body.slice(body.indexOf('data:') >= 0 ? body.indexOf('data:') : 0);
+    assert.match(body, /event: error/, 'non-streaming resume framed as a proper SSE error event');
+    // The raw upstream JSON must NOT appear as a bare data line (would corrupt the parser).
+    assert.ok(!/data: \{"type":"message"/.test(body), 'raw non-SSE JSON not written as a lone data blob');
+    void after;
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('major: a post-resume failover RE-HOLDS the session instead of dropping it', async () => {
+  // The feature's core promise: a held stream that resumes onto a freed account,
+  // and that account 529s on the very first forwarded request, must be RE-HELD
+  // (the heartbeat stays alive through the failover) and ultimately complete on
+  // another account — NOT terminate abruptly. Pre-fix, clearQueueHeartbeat ran
+  // before forwardRequest, so the post-529 queueAndRetry guard
+  // (`headersSent && !heartbeatActive`) bailed and the session was dropped.
+  let attempts = 0;
+  const upstream = http.createServer((_req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      // First forwarded request (the resume) overloads → must re-hold, not drop.
+      res.writeHead(529, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'overloaded' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"type":"message_start"}\n\ndata: {"type":"message_stop"}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  // Two accounts: both briefly throttled so the request queues+holds first; when
+  // they free, the resume hits account-1's 529, re-holds, then completes on the
+  // other account.
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    { name: 'a2', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  for (const a of am.accounts) {
+    a.status = 'throttled';
+    a.lastError = 'rate_limited';
+    a.rateLimitedUntil = Date.now() + 120;
+  }
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 8000, pollMs: 20, heartbeatMs: 1000, capacityMaxWaitMs: 8000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(7000),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.text();
+    // Re-held and completed on the retry, NOT dropped after the 529.
+    assert.match(body, /message_stop/, 'session re-held after the post-resume 529 and completed');
+    assert.ok(!/overloaded_error/.test(body.slice(body.indexOf('data:') >= 0 ? body.indexOf('data:') : 0)) || /message_stop/.test(body),
+      'did not terminate on the 529');
+    assert.ok(attempts >= 2, 'the request was actually retried (re-held), not dropped on the first 529');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('describeRequest marks bodyThinkingScanned only on a fully-scanned body (migration fail-closed)', () => {
+  const { describeRequest } = __serverTest;
+  const req = { method: 'POST', url: '/v1/messages' };
+  // Plain JSON, no thinking → scanned + safe to migrate.
+  const plain = describeRequest(req, Buffer.from(JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }] })));
+  assert.equal(plain.bodyThinkingScanned, true);
+  assert.notEqual(plain.requiresAnthropicThinkingIntegrity, true);
+  // Body carrying a signed thinking block → scanned but NOT migration-safe.
+  const thinking = describeRequest(req, Buffer.from(JSON.stringify({ model: 'x', messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: '…', signature: 'sig' }] }] })));
+  assert.equal(thinking.bodyThinkingScanned, true);
+  assert.equal(thinking.requiresAnthropicThinkingIntegrity, true);
+  // Non-JSON body → NOT scanned → fails closed (never migrates).
+  const garbage = describeRequest(req, Buffer.from('not json at all'));
+  assert.notEqual(garbage.bodyThinkingScanned, true);
 });

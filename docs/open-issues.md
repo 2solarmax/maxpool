@@ -24,15 +24,20 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 - Eligibility gates on RAW weekly state (`_weeklyRawState`), so a raw-healthy fast-burner stays in the spread pool.
 - Screenshot-replay regression test: 6 concurrent over the 4-account state fans out across max@dubner.io + mk@gomokka, no account absorbs the burst.
 - `D=3` chosen from observed evidence (max@dubner.io throttled ~6 concurrent); tunable.
-**Phase 2-3 (deferred — only if Phase 1 leaves residual concentration/under-drain):**
-- Per-account `throttlePressure` (decaying ~90s) so the fleet steers *around* a freshly-429'd account (today the throttle is a single global pause — the router can't prefer the un-throttled account).
-- Load factor `L` (0..1, from in-flight vs soft target, recent weight, throttle heat) + a late, load-gated `drainBonus` (fires only in a window's final ~12% with quota left, and `×(1-L)` so it vanishes under load) = the "drain a near-reset account only when load is light" behavior.
+**Phase 2 — safe-point session rebalancing (DONE, v1.4.0):**
+- A bound session no longer sticks to a HOT account forever. `_selectNext` migrates it to a much-healthier account, but ONLY on a **thinking-safe** request (per-request body carries no signed `thinking` block; fail-closed on unparsed bodies) so Anthropic's non-retryable "invalid signature" can never fire.
+- Flap-stable: HOT = `_isNearQuota` (weekly reserve/critical or 5h-cap, NOT live in-flight); migrate only to a `normal/soft/unknown`-weekly alt that is ≥2× cheaper AND a strictly healthier tier; suppressed during queue admission; `_bindSession` re-homes on a same-priority *choice* migration but not on failover (snap-back-on-recovery preserved).
+- This is the fix for "I added an account mid-session but it didn't get picked up": added/cooled capacity now drains in-progress hot sessions at their next safe turn.
+- Pre-mortem (9 failure modes) + focused adversarial review (SHIP); red→green tests for migrate-when-safe-and-hot, never-on-signed-thinking, fail-closed-unparsed, never-when-healthy, queue-suppressed, no-flap, describeRequest fail-closed.
+**Phase 3 (remaining, optional — only if observed):**
+- Per-account `throttlePressure` (decaying ~90s) so the fleet steers *around* a freshly-429'd account (today the throttle is a single global pause).
+- Herd-jitter on the rebalance burst-drain: many sessions on one hot account + a fresh account appear → they migrate in a burst (self-damped by the score-margin backpressure, fine for a small pool, but un-staggered). Add a per-tick migration cap/jitter + a bounded-migrations-per-tick test if the account pool grows. Reviewer-flagged nit, not ship-blocking.
 **Open knob:** `D` (per-account concurrency where Anthropic 429s). Default 3; add telemetry to auto-tune from live 429-rate-vs-depth.
 
-### 2. Wait-don't-error for the short-term "Server is temporarily limiting requests" throttle
-**Status:** partially done — weekly-cap wait shipped in 1.1.0; the short-term throttle path is NOT yet covered the way the user wants.
-**Problem:** "Server is temporarily limiting requests (not your usage limit)" is Anthropic's shared/short-term throttle (request-wide 429s → `markUpstreamThrottled`). That path queues only `capacityMaxWaitMs` (15 min) and then errors, killing the session. It is NOT the 5h/weekly cap.
-**Plan:** confirm with real runtime evidence (the actual upstream status/headers), then make transient throttles wait+retry up to the user's tolerance instead of dying at 15 min — while keeping genuine "broken upstream" fast-fail distinct.
+### 2. Hold the session on rate-limit instead of killing it (+ routing-oracle correctness) — DONE
+**Status:** SHIPPED (v1.3.0, branch feat/hold-session-and-routing merged to main). 165 tests.
+**What shipped:** A rate-limited STREAMING session is now HELD ALIVE on an SSE heartbeat (up to `streamHoldMaxMs`, 7d) and resumed the instant any account frees — never killed. The hold-vs-error oracle (`nextRetryForRequest`/`_retryInfo`) error-fasts ONLY on genuinely-unrecoverable states (all accounts logged out / weekly-exhausted with unknown reset / no eligible route), and HOLDS finite for everything recoverable (weekly-critical last-resort, 5h cap, rate-limit, cooldown, concurrency cap). Retry-after now reflects the SOONEST real recovery (3-bucket min-merge), not a far weekly reset.
+**Rigor:** 5 full code-review council rounds + focused adversarial passes; every confirmed finding fixed with a red-before/green-after test. Fixes included: session-kill on weekly-critical+unknown-reset, fairness-gate starvation, misleading multi-day retry-after, auth-dead spin, Bug-A heartbeat SSE interleave, post-resume-failover drop, lease-leak on client disconnect, healthy-concurrency-cap symmetry + 15-min bound, non-SSE-resume framing, EPIPE ghost eviction.
 
 ### 3. Remove the import mechanic (browser login only)
 **Status:** agreed, not started.
@@ -45,10 +50,11 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 
 ---
 
-### 5. TUI clarity: "throttled" and "Load X/Y" under-communicate
-**Status:** logged (not started). Behavior is correct; the *display* is unclear.
-- **"throttled"** is a temporary auto-recovering cooldown (account hit a 429 → rested a few seconds → request failed over to another account → auto-flips back to active). The TUI shows bare `throttled` with no countdown, so it looks stuck. Fix: show `throttled Ns` (the `rateLimitedUntil` cooldown is known), like the other countdowns.
-- **"Load X/Y"** = X in-flight requests / Y their combined weight (~payload size). It's cryptic (weight denominator unexplained; "Load" collides with the 15m/1h throughput counts). Fix: clearer label and/or a one-line legend/help.
+### 5. TUI clarity: "throttled" and "Load X/Y" under-communicate — DONE
+**Status:** SHIPPED (v1.3.1).
+- **"throttled"** now renders `throttled Ns` (single-unit countdown from `rateLimitedUntil`, s/m/h/d, ≤3 chars so it never shifts the quota-bar columns) — reads as auto-recovering, not stuck.
+- **"Load X/Y"** → **`Now N (Ww)`**: N in-flight requests, W combined weight, clearly distinct from the `15m`/`1h` throughput counts that follow.
+- Focused code-review pass; red→green tests for the countdown + label + the multi-hour-overflow guard.
 
 ### 6. Seamless version upgrade — near-zero-downtime reload (single-writer baton)
 **Status:** designed (pre-mortem done); awaiting go to implement, then code-review/judge.

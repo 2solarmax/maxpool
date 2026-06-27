@@ -87,10 +87,16 @@ export function createDefaultConfig() {
     // account's REAL reset time, so a generous bound never spins pointlessly).
     queue: {
       enabled: true,
-      maxWaitMs: 24 * 60 * 60 * 1000,    // hard ceiling for any hold
+      maxWaitMs: 24 * 60 * 60 * 1000,    // hard ceiling for non-streaming/capacity holds; streaming uses streamHoldMaxMs
       autoMaxWaitMs: null,               // 5h/session-cap hold (null = maxWaitMs)
       capacityMaxWaitMs: 15 * 60 * 1000, // upstream 529/overload — stays short, never governed by the others
-      weeklyMaxWaitMs: 24 * 60 * 60 * 1000, // weekly (7d) cap hold; was 0 (fail-fast) — that killed sessions on weekly cap
+      weeklyMaxWaitMs: 24 * 60 * 60 * 1000, // legacy bound; streaming holds use streamHoldMaxMs
+      // Streaming hold ceiling: how long a streaming session is held ALIVE on the
+      // heartbeat waiting for any account to free up. 7d so a session is never
+      // killed while a real reset is on the way; only permanent failures (all
+      // accounts logged out / no eligible route) error fast. Lower if your client
+      // uses a wall-clock total-request timeout the heartbeat can't reset.
+      streamHoldMaxMs: 7 * 24 * 60 * 60 * 1000,
       nonStreamMaxWaitMs: 5 * 60 * 1000, // non-streaming requests have no keepalive; cap their wait
       maxConcurrentQueued: 64,           // backpressure: max requests held at once
       maxQueuedBytes: 1024 * 1024 * 1024, // backpressure: max aggregate buffered body bytes (1 GiB)

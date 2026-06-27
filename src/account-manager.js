@@ -1,5 +1,24 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 
+// Bounded re-poll hold for an account blocked ONLY by a transient, self-clearing
+// condition whose exact recovery time is unknown: (a) a weekly-critical account
+// (last-resort usable, no learned reset), or (b) an otherwise-healthy account at
+// its in-flight / global concurrency cap (a sibling completing frees a slot in
+// seconds). Both are recoverable by definition, so they must HOLD finite and let
+// waitForAvailableRoute's poll loop re-check real availability — never collapse to
+// an Infinity session-kill / error-fast.
+const BOUNDED_REPOLL_HOLD_MS = 60_000;
+
+// Session rebalancing (issue #1): a bound session may migrate OFF a hot account
+// onto a much-healthier one, but ONLY on a thinking-safe request (see
+// _migrationSafeForRequest). These margins force a CLEAR, flap-stable win so a
+// session can never ping-pong between two similarly-loaded accounts.
+const REBALANCE_SCORE_MARGIN = 0.5;   // candidate score must be ≤ 50% of the bound account's
+const REBALANCE_MIN_ABS_GAP = 0.5;    // …with a small absolute floor so near-zero scores don't micro-churn
+// Weekly-pressure tiers, healthiest first. A fresh (unknown) account is the best
+// migration target; migration requires the candidate be a STRICTLY healthier tier.
+const WEEKLY_TIER = { unknown: 0, normal: 0, soft: 1, reserve: 2, critical: 3, exhausted: 4 };
+
 function emptyQuota() {
   return {
     // Standard API rate limits (API key accounts)
@@ -219,6 +238,8 @@ export class AccountManager {
     let soonestTemporary = Infinity;
     let temporaryCause = null;
     let soonestWeekly = Infinity;
+    let soonestBoundedHold = Infinity;    // recoverable-transient accounts (weekly-critical last-resort, or concurrency-capped): always a bounded re-poll (known short-term resets route through soonestTemporary instead)
+    let boundedHoldCause = null;
     let weeklyUnknownReset = 0; // weekly-exhausted accounts whose reset time we don't know yet
     let matchingRoutes = 0;
     const reasons = {};
@@ -249,7 +270,7 @@ export class AccountManager {
 
       const retry = this._retryInfo(account);
       note(retry.cause);
-      if (retry.cause === 'weekly_critical' && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+      if (retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -259,11 +280,27 @@ export class AccountManager {
         };
       }
       if (retry.queueable && retry.retryAt) {
+        // A known, soon short-term reset (5h cap / rate-limit / cooldown) — even on
+        // a weekly-critical account, this is the REAL near-term recovery time, so
+        // it holds here with the true cause rather than the distant weekly reset.
         const ms = retry.retryAt - Date.now();
         if (ms < soonestTemporary) {
           soonestTemporary = ms;
           temporaryCause = retry.cause;
         }
+      } else if (retry.weeklyCritical || retry.transientCap) {
+        // A recoverable-transient block with no queueable short-term reset — a
+        // weekly-critical account (last-resort usable) or an otherwise-healthy
+        // account at its concurrency cap. _retryInfo always reaches here with
+        // retryAt:null (a KNOWN short-term reset is queueable and routes through
+        // soonestTemporary above), so the hold is a bounded re-poll. Recoverable by
+        // definition — hold finite, never collapse to Infinity and KILL the session.
+        soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
+        // Label precedence: an account that is BOTH weekly-critical and short-term
+        // capped is fundamentally weekly_critical; concurrency_cap only labels the
+        // hold when no weekly-critical account contributed it.
+        if (retry.weeklyCritical) boundedHoldCause = 'weekly_critical';
+        else if (!boundedHoldCause) boundedHoldCause = 'concurrency_cap';
       } else if (retry.cause === 'weekly_exhausted' && retry.retryAt) {
         const ms = retry.retryAt - Date.now();
         if (ms < soonestWeekly) soonestWeekly = ms;
@@ -275,21 +312,24 @@ export class AccountManager {
       }
     }
 
-    if (Number.isFinite(soonestTemporary)) {
+    // Min-merge ALL THREE recovery buckets and emit the cause of the SOONEST one.
+    // A weekly-critical account is last-resort usable and frees when its
+    // short-term blocker clears (often ~minutes); a weekly-exhausted account is
+    // unusable until its full 7d reset. Picking any one bucket ahead of the others
+    // (the old temporary-then-weekly-then-critical order) could mask a sibling's
+    // sooner recovery behind a far reset — error-fasting a holdable request and
+    // emitting a misleading multi-day Retry-After.
+    const recoveries = [
+      { ms: soonestTemporary, cause: temporaryCause || 'temporary_unavailable' },
+      { ms: soonestWeekly, cause: 'weekly_exhausted' },
+      { ms: soonestBoundedHold, cause: boundedHoldCause || 'weekly_critical' },
+    ].filter(r => Number.isFinite(r.ms));
+    if (recoveries.length) {
+      const best = recoveries.reduce((a, b) => (b.ms < a.ms ? b : a));
       return {
         available: false,
-        retryAfterMs: Math.max(0, soonestTemporary),
-        cause: temporaryCause || 'temporary_unavailable',
-        reasons,
-        matchingRoutes,
-      };
-    }
-
-    if (Number.isFinite(soonestWeekly)) {
-      return {
-        available: false,
-        retryAfterMs: Math.max(0, soonestWeekly),
-        cause: 'weekly_exhausted',
+        retryAfterMs: Math.max(0, best.ms),
+        cause: best.cause,
         reasons,
         matchingRoutes,
       };
@@ -634,9 +674,42 @@ export class AccountManager {
   // Register a waiter. Returns the ticket, or null if a backpressure limit
   // (maxConcurrentQueued / maxQueuedBytes) would be exceeded — the caller then
   // rejects the request with a "queue full" error instead of holding it.
+  // Evict any waiting ticket(s) for a session key, releasing their slot + bytes.
+  // A client timeout-retry opens a fresh request for the same session; this lets
+  // the retry SUPERSEDE its own ghost instead of leaving a dead ticket occupying
+  // a queue slot for up to the hold ceiling (the steady-state ghost-leak DoS).
+  _evictQueuedSession(sessionKey) {
+    if (!sessionKey) return;
+    const q = this.queueState;
+    for (let i = q.waiting.length - 1; i >= 0; i--) {
+      const t = q.waiting[i];
+      if (t.sessionKey !== sessionKey) continue;
+      // Only supersede a GHOST — a prior hold whose client connection is already
+      // gone (a timeout-retry of the SAME logical request). NEVER evict a LIVE
+      // concurrent sibling: a single Claude Code process fires concurrent
+      // requests under ONE session id (the main stream + the haiku title/summary
+      // call + parallel subagents), and evicting a live one orphans it for days.
+      // Catch a half-dead EPIPE ghost too: after a client RST the ServerResponse
+      // may not have flipped destroyed/writableEnded yet (it's noticed on the next
+      // write), but its underlying socket is already destroyed. A LIVE sibling has a
+      // live socket (socket.destroyed===false), so this never evicts one. (Mock-live
+      // res objects leave socket undefined → not dead.) Uses socket.destroyed only —
+      // a stable terminal signal — not the transient res.writable.
+      const dead = !t.res || t.res.destroyed || t.res.writableEnded
+        || t.res.socket?.destroyed === true;
+      if (!dead) continue;
+      if (t.requestInfo) t.requestInfo.queueTicket = null; // let its waiter exit fast
+      t.dead = true;
+      q.bytes = Math.max(0, q.bytes - (t.bytes || 0));
+      q.waiting.splice(i, 1);
+    }
+  }
+
   registerQueuedRequest(requestInfo = {}, opts = {}) {
     if (requestInfo.queueTicket) return requestInfo.queueTicket;
     this._reapStaleQueueHead();
+    const sessionKey = opts.sessionKey || requestInfo.sessionKey || null;
+    this._evictQueuedSession(sessionKey); // a retry supersedes its own DEAD prior hold
     const bytes = Math.max(0, Number(opts.bytes) || 0);
     const { maxConcurrentQueued, maxQueuedBytes } = opts;
     if (maxConcurrentQueued != null && this.queueState.waiting.length >= maxConcurrentQueued) return null;
@@ -647,10 +720,18 @@ export class AccountManager {
       queuedAt: Date.now(),
       bytes,
       deadlineAt: opts.deadlineAt || null,
+      sessionKey,
+      res: opts.res || null,
+      requestInfo,
     };
     this.queueState.waiting.push(ticket);
     this.queueState.bytes += bytes;
     requestInfo.queueTicket = ticket;
+    // Re-queuing CONSUMES any prior admission: a request that was admitted
+    // (ticket cleared, queueAdmitted=true) but then failed to acquire the freed
+    // slot (lost the race) must re-enter the FIFO as a fair waiter, NOT keep
+    // bypassing the fairness gate forever and starve everyone behind it.
+    requestInfo.queueAdmitted = false;
     return ticket;
   }
 
@@ -797,22 +878,136 @@ export class AccountManager {
   }
 
   _isNearQuota(account) {
+    // RAW weekly state (not pace): a raw-healthy account with real headroom is
+    // never treated as near-quota just because it's burning fast. Pace stays a
+    // soft cost in _scoreAccount only.
     return this._isSessionQuotaUnavailable(account)
-      || ['reserve', 'critical', 'exhausted'].includes(this._weeklyState(account));
+      || ['reserve', 'critical', 'exhausted'].includes(this._weeklyRawState(account));
+  }
+
+  // ── Session rebalancing (issue #1) ────────────────────────────────────────
+  // A bound session normally sticks to its account (continuity + Anthropic signed-
+  // thinking signature validity). These let it migrate OFF a hot account onto fresh
+  // capacity, but only when it's provably safe and clearly worth it.
+
+  /** Per-request safety gate: a request is safe to migrate to a DIFFERENT account
+   *  iff its body carries NO signed thinking (replaying a signed thinking block to
+   *  another account → non-retryable "invalid signature"). Uses the PER-REQUEST
+   *  body signal only — never the session-sticky policy — and fails CLOSED on any
+   *  body we couldn't fully scan (non-JSON / parse error → bodyThinkingScanned unset). */
+  _migrationSafeForRequest(requestInfo = {}) {
+    return requestInfo.bodyThinkingScanned === true
+      && requestInfo.requiresAnthropicThinkingIntegrity !== true;
+  }
+
+  /** Flap-stable "hot": weekly reserve/critical or 5h-cap pressure — signals that
+   *  do NOT flip the instant a request migrates (unlike live in-flight, left to the
+   *  score loop). A healthy bound account is never hot, so it never migrates → no
+   *  ping-pong. */
+  _isBoundAccountHot(account) {
+    return this._isNearQuota(account);
+  }
+
+  /** Decide whether a bound session should leave its (hot) account THIS request.
+   *  All gates must hold: thinking-safe + not mid queue-admission + bound is hot +
+   *  a genuinely-healthy alternative that is BOTH much cheaper AND a strictly
+   *  healthier weekly tier (so concurrency jitter alone can never trigger a move). */
+  _shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx) {
+    if (!this._migrationSafeForRequest(requestInfo)) return false;
+    if (requestInfo.queueTicket || requestInfo.queueAdmitted) return false;
+    if (!this._isBoundAccountHot(bound)) return false;
+
+    const boundScore = this._scoreAccount(bound, requestInfo, scoringCtx);
+    const boundTier = WEEKLY_TIER[this._weeklyRawState(bound)] ?? 0;
+
+    let bestScore = Infinity;
+    let bestTier = Infinity;
+    for (const account of this.accounts) {
+      if (account.index === bound.index) continue;
+      if (excludedIndexes.has(account.index)) continue;
+      if (!this._matchesRequest(account, profile, requestInfo)) continue;
+      // Genuinely-healthy alternatives only (normal/soft/unknown weekly).
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false })) continue;
+      const score = this._scoreAccount(account, requestInfo, scoringCtx);
+      if (score < bestScore) {
+        bestScore = score;
+        bestTier = WEEKLY_TIER[this._weeklyRawState(account)] ?? 0;
+      }
+    }
+    if (!Number.isFinite(bestScore)) return false; // no healthy alternative
+
+    return bestScore <= boundScore * REBALANCE_SCORE_MARGIN
+      && (boundScore - bestScore) >= REBALANCE_MIN_ABS_GAP
+      && bestTier < boundTier;
   }
 
   _retryInfo(account) {
     const now = Date.now();
     const q = account.quota || {};
-    const weeklyState = this._weeklyState(account);
-    if (weeklyState === 'critical') {
-      return { cause: 'weekly_critical', retryAt: q.unified7dReset || null, queueable: false };
-    }
+
+    // TERMINAL (non-recoverable) states FIRST — before any weekly/short-term
+    // bucket. An auth-dead / disabled / exhausted-status account is NOT
+    // recoverable-by-definition: it must error-fast (retryAt:null, no weeklyCritical
+    // tag → Infinity → 429), and a stale critical/exhausted QUOTA reading must never
+    // shadow that into a finite hold that spins the session for up to 7 days.
+    if (!account.enabled) return { cause: 'disabled', retryAt: null, queueable: false };
+    if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
+    if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
+
+    // RAW weekly state, so the retry oracle agrees with _isAvailable's raw gate.
+    // (Pace must NOT classify a raw-healthy account as weekly_critical here, or
+    // the queue keys on a far-future reset instead of the account's real
+    // short-term availability — the session-kill bug.)
+    const weeklyState = this._weeklyRawState(account);
+
+    // Short-term blockers (rate-limit / cooldown / upstream / 5h session cap /
+    // token-request-provider limits) clear on their OWN schedule — usually FAR
+    // sooner than a 7d weekly reset. Compute them up front so a weekly-critical
+    // account reports its REAL near-term recovery, not the distant weekly reset.
+    const shortTerm = this._shortTermRetry(account, now, q);
 
     if (weeklyState === 'exhausted') {
+      // Hard block: only a weekly reset unblocks it — a sooner short-term clear
+      // does not help — so key the hold on the weekly reset.
       return { cause: 'weekly_exhausted', retryAt: q.unified7dReset || null, queueable: false };
     }
 
+    if (weeklyState === 'critical') {
+      // Last-resort USABLE: the account becomes selectable (as last resort) the
+      // moment its short-term blocker clears — NOT at the far weekly reset. So
+      // report the SOONER real blocker (the 5h cap / rate-limit), not unified7dReset.
+      // Tag weeklyCritical so the oracle ALWAYS holds (finite) on it: a critical
+      // account is recoverable by definition and must never collapse to an
+      // Infinity session-kill, even when no reset time is known.
+      if (shortTerm) return { ...shortTerm, weeklyCritical: true };
+      // No short-term blocker → the only thing keeping it out of the last-resort
+      // pool is a TRANSIENT cap (in-flight/concurrency, admission pause), which
+      // clears in seconds when a sibling completes — NOT the 7d weekly reset. Hold
+      // a bounded re-poll (retryAt:null → BOUNDED_REPOLL_HOLD_MS), never the far
+      // weekly reset, so a non-stream request isn't error-fasted for ~7d.
+      return { cause: 'weekly_critical', retryAt: null, queueable: false, weeklyCritical: true };
+    }
+
+    // Healthy / soft / reserve weekly: the ordinary short-term blocker, if any.
+    if (shortTerm) return shortTerm;
+
+    // Otherwise-healthy but at the in-flight / global concurrency cap — a TRANSIENT,
+    // self-clearing block (a sibling completing frees a slot in seconds). HOLD a
+    // bounded re-poll rather than error-fasting (Infinity): the symmetric case to a
+    // concurrency-capped weekly-critical account, which already holds finite above.
+    if (account.inFlight >= this.scheduler.safetyMaxActivePerAccount
+        || this.getGlobalInFlight() >= this.scheduler.safetyMaxGlobalActive) {
+      return { cause: 'concurrency_cap', retryAt: null, queueable: false, transientCap: true };
+    }
+
+    return { cause: 'unavailable', retryAt: null, queueable: false };
+  }
+
+  // The soonest active short-term (non-weekly) blocker for an account, or null if
+  // none is active. Ordered most-specific-first; each entry is a {cause, retryAt,
+  // queueable} the retry oracle can hold on. Kept separate from the weekly state
+  // so weekly-critical accounts surface their real near-term recovery time.
+  _shortTermRetry(account, now, q) {
     if (account.status === 'throttled' && account.rateLimitedUntil && now < account.rateLimitedUntil) {
       return { cause: 'rate_limited', retryAt: account.rateLimitedUntil, queueable: true };
     }
@@ -849,10 +1044,7 @@ export class AccountManager {
       return { cause: 'provider_limit', retryAt: q.genericReset || null, queueable: Boolean(q.genericReset) };
     }
 
-    if (!account.enabled) return { cause: 'disabled', retryAt: null, queueable: false };
-    if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
-    if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
-    return { cause: 'unavailable', retryAt: null, queueable: false };
+    return null;
   }
 
   _selectNext(requestInfo = {}, excludedIndexes = new Set()) {
@@ -878,7 +1070,13 @@ export class AccountManager {
       }
     }
     const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo);
-    if (bound && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)) return bound;
+    if (bound
+      && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)
+      && !this._shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx)) {
+      return bound;
+    }
+    // Else fall through to the candidate score loop, which re-homes the session
+    // onto the best healthy account via _bindSession on acquire.
 
     const weeklyPasses = hasBinding
       ? [
@@ -995,6 +1193,16 @@ export class AccountManager {
     if (!binding.homeName || priority < binding.homePriority) {
       binding.homeName = account.name;
       binding.homePriority = priority;
+    } else if (priority === binding.homePriority && account.name !== binding.homeName) {
+      // Same-priority move. If the previous home is still AVAILABLE we left it by
+      // CHOICE (session rebalancing off a hot-but-usable account) → re-home, so
+      // _boundAccount (which prefers homeName) doesn't snap the session straight
+      // back to the hot home next request. If the old home is UNAVAILABLE this is a
+      // FAILOVER → keep homeName so the session returns to it once it recovers.
+      const oldHome = this.accounts.find(a => a.name === binding.homeName);
+      if (oldHome && this._isAvailable(oldHome, { allowWeeklyReserve: true })) {
+        binding.homeName = account.name;
+      }
     }
     binding.currentName = account.name;
     this.sessionBindings.set(sessionKey, binding);
@@ -1389,7 +1597,7 @@ export class AccountManager {
         : account.quota.tokensLimit
           ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
           : '?';
-      const reason = this._isSessionQuotaUnavailable(account) ? 'session quota' : `weekly ${this._weeklyState(account)}`;
+      const reason = this._isSessionQuotaUnavailable(account) ? 'session quota' : `weekly ${this._weeklyRawState(account)}`;
       const logKey = `${reason}:${pct}`;
       if (account.lastQuotaLogKey !== logKey) {
         account.lastQuotaLogKey = logKey;
@@ -1503,7 +1711,7 @@ export class AccountManager {
       if (incident.accounts.has(account.index)) continue;
       if (account.status === 'exhausted' || account.status === 'error') continue;
       if (this._isSessionQuotaUnavailable(account)) continue;
-      if (this._weeklyState(account) === 'exhausted') continue;
+      if (this._weeklyRawState(account) === 'exhausted') continue;
       return false;
     }
     return true;

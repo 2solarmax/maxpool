@@ -917,3 +917,334 @@ test('load spreads across healthy accounts instead of concentrating on the near-
 
   leases.forEach(l => am.releaseAccount(l, { success: true, status: 200 }));
 });
+
+// ── routing oracle + hold-vs-error + ghost guard (2026-06-26, issue #2) ──
+
+test('raw-healthy but pace-critical account stays available (routing consistency, R1)', () => {
+  const am = manager(1);
+  // 74% raw weekly = "soft", but resets in 5 days → pace burn-debt flips the
+  // PACE state to critical. The fix: gates use RAW state, so it stays usable.
+  am.accounts[0].quota.unified7d = 0.74;
+  am.accounts[0].quota.unified7dReset = Date.now() + 5 * 24 * 3600_000;
+  assert.equal(am._weeklyRawState(am.accounts[0]), 'soft');
+  assert.equal(am._isAvailable(am.accounts[0], { allowWeeklyReserve: true }), true);
+  assert.equal(am.hasAvailableRoute({ profile: 'claude' }), true);
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, true, 'oracle no longer benches it on pace');
+  assert.equal(plan.cause, 'available');
+});
+
+test('hold-vs-error oracle: all weekly-exhausted with KNOWN reset → finite retry (HOLD)', () => {
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.99;
+    a.quota.unified7dReset = Date.now() + 51 * 3600_000; // 51h out — the case the old kill rejected
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_exhausted');
+  assert.ok(Number.isFinite(plan.retryAfterMs) && plan.retryAfterMs > 0, 'finite reset → holdable');
+});
+
+test('hold-vs-error oracle: all accounts auth-dead → Infinity retry (ERROR FAST, never hold)', () => {
+  const am = manager(2);
+  for (const a of am.accounts) a.status = 'error';
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.retryAfterMs, Infinity, 'permanent → server errors fast, never parks the session');
+});
+
+test('sessionKey supersede: a client retry evicts its own prior ghost ticket', () => {
+  const am = manager(1);
+  am.registerQueuedRequest({}, { sessionKey: 'S', bytes: 100 });
+  assert.equal(am.queueState.waiting.length, 1);
+  assert.equal(am.queueState.bytes, 100);
+  am.registerQueuedRequest({}, { sessionKey: 'S', bytes: 250 }); // retry for same session
+  assert.equal(am.queueState.waiting.length, 1, 'old same-session ticket evicted, not stacked');
+  assert.equal(am.queueState.bytes, 250);
+  assert.equal(am.queueState.waiting[0].sessionKey, 'S');
+});
+
+test('ghost guard: a fresh session is not blocked by a superseded same-session ghost', () => {
+  const am = manager(1);
+  const lim = { maxConcurrentQueued: 2 };
+  am.registerQueuedRequest({}, { ...lim, sessionKey: 'S', bytes: 1 });
+  am.registerQueuedRequest({}, { ...lim, sessionKey: 'S', bytes: 1 }); // supersedes → still 1 in queue
+  const fresh = am.registerQueuedRequest({}, { ...lim, sessionKey: 'T', bytes: 1 });
+  assert.ok(fresh, 'distinct fresh session admitted (not rejected by a dead same-session duplicate)');
+  assert.equal(am.queueState.waiting.length, 2);
+});
+
+// ── council fixes: bug B (weekly-critical+5h hold) + bug C (ghost-only evict) ──
+
+test('bug B: weekly-critical + 5h-capped fleet HOLDS for the SOON 5h reset, not the far weekly reset', () => {
+  // The MAJOR oracle defect: _retryInfo keyed the hold on the 40h weekly reset
+  // even though the real blocker (the 5h cap) clears in 2h. A weekly-critical
+  // account is last-resort usable, so it frees the moment the 5h cap clears.
+  const am = manager(2);
+  const fiveHReset = Date.now() + 2 * 3600_000;
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.96;                          // raw weekly critical [0.95,0.985)
+    a.quota.unified7dReset = Date.now() + 40 * 3600_000;
+    a.quota.unified5h = 0.95;                          // ALSO 5h-capped (>= switchThreshold)
+    a.quota.unified5hReset = fiveHReset;
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.ok(Number.isFinite(plan.retryAfterMs), 'must HOLD (finite), not error-fast on Infinity');
+  // Holds for ~2h (the 5h cap), NOT ~40h (the weekly reset).
+  assert.ok(plan.retryAfterMs <= 2 * 3600_000 + 5000, `retry-after ${plan.retryAfterMs}ms must track the 2h 5h-cap, not the 40h weekly reset`);
+  assert.ok(plan.retryAfterMs >= 2 * 3600_000 - 60_000, 'retry-after must be ~2h, the real near-term recovery');
+  assert.equal(plan.cause, 'session_limit', 'reports the REAL short-term blocker, not weekly_critical');
+});
+
+test('bug B (blocker): weekly-critical + 5h-capped with UNKNOWN resets HOLDS finite, never Infinity-kills', () => {
+  // The BLOCKER: on cold-start / post-reset, a weekly-critical account can be
+  // 5h-capped with NO learned reset (unified5hReset null AND unified7dReset null).
+  // The old bucket gated on retry.retryAt being truthy → fell through to
+  // {retryAfterMs: Infinity} → killed the session — the exact regression this work
+  // set out to fix. A critical account is recoverable by definition: hold finite.
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.96;            // raw weekly critical
+    a.quota.unified7dReset = null;       // reset time unknown
+    a.quota.unified5h = 0.95;            // ALSO 5h-capped
+    a.quota.unified5hReset = null;       // 5h reset unknown too
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.ok(Number.isFinite(plan.retryAfterMs), 'MUST HOLD finite — never collapse to Infinity and kill the session');
+  assert.equal(plan.cause, 'weekly_critical');
+  assert.ok(plan.retryAfterMs > 0 && plan.retryAfterMs <= 60_000, 'bounded re-poll hold so the poll loop re-checks real availability');
+});
+
+test('bug (fairness): re-queuing clears a stale queueAdmitted so a resumed request cannot bypass the gate forever', () => {
+  // BLOCKER: queueAdmitted was set once at admission and never cleared. A resumed
+  // request that admitted (ticket consumed) but lost the race for the freed slot
+  // re-queues — and kept queueAdmitted=true forever, permanently bypassing the
+  // fairness gate and starving every other waiter. Re-queuing must consume it.
+  const am = manager(1);
+  const X = {};
+  am.registerQueuedRequest(X, { sessionKey: 'X', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am.canAdmitQueuedRequest(X), true, 'X at head is admitted');
+  assert.equal(X.queueTicket, null, 'admission consumes the ticket');
+  assert.equal(X.queueAdmitted, true, 'admission flag set');
+
+  // X failed to acquire the freed slot (lost the race) and RE-QUEUES.
+  am.registerQueuedRequest(X, { sessionKey: 'X', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(X.queueAdmitted, false, 're-queue consumed the stale admission — X is a fair FIFO waiter again');
+
+  // Behavioural proof: a ticketless, un-admitted X must be BLOCKED by the fairness
+  // gate while other waiters are queued (no permanent bypass).
+  X.queueTicket = null;
+  am.registerQueuedRequest({}, { sessionKey: 'Y', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am._matchesRequest(am.accounts[0], 'claude', X), false, 'ticketless un-admitted X gated behind the waiter');
+});
+
+test('major: an auth-dead account with a STALE critical quota error-fasts (Infinity), not a 60s spin', () => {
+  // A terminal account (status='error' / disabled) is NOT recoverable-by-definition.
+  // Its stale weekly-critical QUOTA reading must not shadow the terminal check into a
+  // finite weeklyCritical hold — that would spin the session up to streamHoldMaxMs (7d)
+  // instead of returning 429. _retryInfo must evaluate terminal status BEFORE weekly.
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.status = 'error';               // auth-dead (e.g. refresh failed)
+    a.lastError = 'invalid_grant';
+    a.quota.unified7d = 0.96;         // STALE raw-critical reading lingers
+    a.quota.unified7dReset = Date.now() + 40 * 3600_000;
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.retryAfterMs, Infinity, 'auth-dead fleet must ERROR FAST (Infinity), never hold finite');
+});
+
+test('minor: weekly-critical blocked only by the in-flight cap holds a bounded re-poll, not the 7d reset', () => {
+  // A weekly-critical account whose ONLY block is the per-account in-flight cap
+  // frees in seconds when a sibling completes — it must NOT report the ~7d weekly
+  // reset as its hold (which would error-fast a non-stream request for days).
+  const am = manager(1);
+  const a = am.accounts[0];
+  a.quota.unified7d = 0.96;                       // weekly critical, last-resort usable
+  a.quota.unified7dReset = Date.now() + 40 * 3600_000;
+  a.inFlight = am.scheduler.safetyMaxActivePerAccount; // sole block: concurrency cap
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_critical');
+  assert.ok(plan.retryAfterMs <= 60_000, `bounded re-poll (~60s), got ${plan.retryAfterMs}ms — must NOT be the 40h weekly reset`);
+});
+
+test('major: a HEALTHY account blocked only by the concurrency cap HOLDS finite, not Infinity error-fast', () => {
+  // Symmetry fix: a weekly-critical account at the in-flight cap already holds a
+  // bounded re-poll; a HEALTHY account in the identical concurrency-capped state
+  // used to fall through to Infinity and error-fast the request to 429 — even
+  // though a slot frees in seconds when a sibling completes.
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.10;        // healthy weekly
+    a.quota.unified5h = 0.10;        // healthy session
+    a.inFlight = am.scheduler.safetyMaxActivePerAccount; // sole block: per-account cap
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.ok(Number.isFinite(plan.retryAfterMs), 'concurrency-capped healthy fleet must HOLD, not error-fast on Infinity');
+  assert.equal(plan.cause, 'concurrency_cap');
+  assert.ok(plan.retryAfterMs <= 60_000, 'bounded re-poll hold');
+});
+
+test('minor (min-merge): a sibling weekly-exhausted 30min reset wins over a weekly-critical 3h short-term hold', () => {
+  // soonestTemporary must NOT hard-win over the weekly buckets: A is weekly-critical
+  // with a queueable 3h session_limit (→ soonestTemporary=3h); B is weekly-exhausted
+  // resetting in 30min. The emitted Retry-After must reflect B's sooner 30min recovery.
+  const am = manager(2);
+  const A = am.accounts[0], B = am.accounts[1];
+  A.quota.unified7d = 0.96;                       // critical
+  A.quota.unified7dReset = Date.now() + 40 * 3600_000;
+  A.quota.unified5h = 0.95;                       // queueable 3h session_limit
+  A.quota.unified5hReset = Date.now() + 3 * 3600_000;
+  B.quota.unified7d = 0.99;                       // exhausted
+  B.quota.unified7dReset = Date.now() + 30 * 60_000;
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_exhausted', 'the sooner sibling recovery (B) must win, not A 3h session_limit');
+  assert.ok(plan.retryAfterMs <= 30 * 60_000 + 5000 && plan.retryAfterMs >= 30 * 60_000 - 60_000,
+    `retry-after ${plan.retryAfterMs}ms must track B's ~30min reset, not A's 3h hold`);
+});
+
+test('bug B (masking): a sooner weekly-critical recovery wins over a far weekly-exhausted reset', () => {
+  // Mixed fleet: account A is weekly-EXHAUSTED with a far 40h reset; account B is
+  // weekly-CRITICAL (last-resort usable) recovering ~60s. The oracle used to
+  // return weekly_exhausted (40h) first, masking B's sooner recovery → a non-
+  // streaming request error-fasts (40h > its 5min window) and clients see a
+  // multi-day Retry-After. Min-merge must surface the SOONER critical recovery.
+  const am = manager(2);
+  const A = am.accounts[0], B = am.accounts[1];
+  A.quota.unified7d = 0.99;                       // exhausted (>= 0.985)
+  A.quota.unified7dReset = Date.now() + 40 * 3600_000;
+  B.quota.unified7d = 0.96;                       // critical [0.95, 0.985)
+  B.quota.unified7dReset = null;                  // reset unknown
+  B.quota.unified5h = 0.95;                       // ALSO 5h-capped, reset unknown
+  B.quota.unified5hReset = null;                  // → bounded ~60s weekly-critical hold
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.equal(plan.cause, 'weekly_critical', 'sooner critical recovery must win, not weekly_exhausted');
+  assert.ok(plan.retryAfterMs <= 60_000, `retry-after ${plan.retryAfterMs}ms must be the ~60s critical recovery, not 40h`);
+});
+
+test('bug C: a LIVE concurrent same-session request is NOT evicted (no starve)', () => {
+  const am = manager(1);
+  const r1 = {}; const r2 = {};
+  am.registerQueuedRequest(r1, { sessionKey: 'S', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  am.registerQueuedRequest(r2, { sessionKey: 'S', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am.queueState.waiting.length, 2, 'both live concurrent siblings held');
+  assert.ok(r1.queueTicket, 'first live sibling not orphaned');
+});
+
+test('bug C: an EPIPE half-dead ghost (socket destroyed, res not yet) IS superseded', () => {
+  // After a client RST the ServerResponse hasn't flipped destroyed/writableEnded
+  // yet (noticed only on the next write), but its socket is destroyed. The fast
+  // same-session supersede must still detect it so a retry isn't backpressure-
+  // rejected by its own undetected ghost before the heartbeat reaps it.
+  const am = manager(1);
+  const r1 = {}; const r2 = {};
+  am.registerQueuedRequest(r1, { sessionKey: 'S', bytes: 7, res: { destroyed: false, writableEnded: false, socket: { destroyed: true } } });
+  assert.equal(am.queueState.waiting.length, 1);
+  am.registerQueuedRequest(r2, { sessionKey: 'S', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am.queueState.waiting.length, 1, 'half-dead EPIPE ghost evicted, new live one remains');
+  assert.equal(r1.queueTicket, null, 'orphaned half-dead waiter freed');
+  assert.equal(am.queueState.bytes, 1, 'ghost bytes released');
+});
+
+test('bug C: a DEAD same-session hold IS superseded and its waiter freed', () => {
+  const am = manager(1);
+  const r1 = {}; const r2 = {};
+  am.registerQueuedRequest(r1, { sessionKey: 'S', bytes: 1, res: { destroyed: true } }); // ghost
+  assert.equal(am.queueState.waiting.length, 1);
+  am.registerQueuedRequest(r2, { sessionKey: 'S', bytes: 1, res: { destroyed: false } });
+  assert.equal(am.queueState.waiting.length, 1, 'dead ghost evicted, new live one remains');
+  assert.equal(r1.queueTicket, null, 'orphaned waiter freed so its loop exits fast');
+  assert.equal(am.queueState.bytes, 1, 'ghost bytes released');
+});
+
+// ── #1 session rebalancing: migrate a bound session off a HOT account onto fresh
+//    capacity, but ONLY on a thinking-safe request, and only on a clear win. ──
+
+function hot(account) {            // weekly reserve = hot but still usable
+  account.quota.unified7d = 0.90;
+  account.quota.unified7dReset = Date.now() + 2 * 24 * 3600 * 1000;
+}
+function fresh(account) {          // unknown weekly, idle = best migration target
+  account.quota.unified7d = null;
+  account.quota.unified7dReset = null;
+  account.inFlight = 0;
+}
+
+test('rebalance: a thinking-SAFE request migrates a bound session off a HOT account to fresh capacity', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(first.account.name, 'a1');           // bound to a1
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6;                          // a1 now hot + heavily loaded
+  fresh(a2);
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(next.account.name, 'a2', 'safe + hot + much-healthier alt → migrates');
+});
+
+test('rebalance: a request carrying signed thinking NEVER migrates (no invalid-signature break)', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  // Body carries a signed thinking block → must stay on a1.
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, requiresAnthropicThinkingIntegrity: true });
+  assert.equal(next.account.name, 'a1', 'signed-thinking request stays put');
+});
+
+test('rebalance: an UNSCANNED body fails closed (no migration)', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  // No bodyThinkingScanned (e.g. non-JSON / parse failure) → treated as unsafe.
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1' });
+  assert.equal(next.account.name, 'a1', 'unparsed body never migrates (fail-closed)');
+});
+
+test('rebalance: a HEALTHY bound account is never migrated away from', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  // a1 healthy (not hot), a2 fresh + idle (cheaper score) — must NOT migrate.
+  a1.quota.unified7d = 0.10; a1.inFlight = 2; fresh(a2);
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(next.account.name, 'a1', 'healthy bound account stays put (no churn)');
+});
+
+test('rebalance: suppressed while the request is consuming a queue admission', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, queueAdmitted: true });
+  assert.equal(next.account.name, 'a1', 'no migration mid queue-admission');
+});
+
+test('rebalance: does not flap — once on the fresh account it stays (HOT gate + re-home)', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  const moved = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(moved.account.name, 'a2');
+  am.releaseAccount(moved, { success: true, status: 200 });
+  // a2 now took load (higher concurrency score) but stays HEALTHY weekly; a1 still
+  // hot. The session must NOT ping-pong back to a1.
+  a2.inFlight = 6;
+  const again = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(again.account.name, 'a2', 'healthy current account is not hot → no migration back');
+});

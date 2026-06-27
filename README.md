@@ -58,13 +58,6 @@ maxpool server
 maxpool run
 ```
 
-You can also import existing Claude Code credentials instead of logging in:
-
-```bash
-claude /login           # Log into an account in Claude Code
-maxpool import       # Import its credentials
-```
-
 ## Recommended setup
 
 The cleanest way to use maxpool day-to-day: **keep your normal `claude` login untouched, and add a separate alias that routes through the pool.** Then plain `claude` still uses your default single account, and `ccmax` (call it whatever you like) spreads work across all your accounts.
@@ -121,20 +114,7 @@ Uses the same OAuth flow as Claude Code. Auto-detects the account email and subs
 
 You can add accounts while the server is running — press **s** in the TUI to sync immediately, or wait for automatic sync.
 
-### Import from Claude Code
-
-If you already have Claude Code set up, you can import its credentials directly:
-
-```bash
-claude /login           # Log into an account in Claude Code
-maxpool import       # Import its credentials
-```
-
-Re-importing the same account updates its credentials. You can also import from a custom path:
-
-```bash
-maxpool import --from /path/to/credentials.json
-```
+> **Note on adding accounts:** OAuth login adds whatever account you're currently signed into at claude.ai — there's no account picker. To add a *different* account, sign into that account at claude.ai first (or use a logged-out / incognito browser window), then run `maxpool login`. (Importing the Claude Code CLI's own local login was removed — it shares a single-use credential the CLI keeps rotating, which broke the pooled copy. Use browser login so maxpool holds its own independent grant.)
 
 ### API Key
 
@@ -175,8 +155,7 @@ The Accounts menu (`a`) lets you add and manage accounts without leaving the TUI
 
 | Key | Action |
 |-----|--------|
-| `i` | Import the account you're currently logged into Claude Code as |
-| `l` | Log in via browser — add *any* account, then name it |
+| `l` | Log in via browser — add an account, then name it |
 | `k` | Add an Anthropic API key account |
 | `n` | Rename the selected account |
 | `t` | Enable or disable the selected account |

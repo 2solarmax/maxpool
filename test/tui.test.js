@@ -313,3 +313,45 @@ test('TUI start returns false instead of throwing when raw mode fails', () => {
     process.stderr.write = originalWrite;
   }
 });
+
+// ── #5 TUI clarity: throttled countdown + clearer "Now" load label ──
+
+test('countdown shows seconds under a minute, coarser above, empty once elapsed', () => {
+  assert.equal(__tuiTest.countdown(Date.now() + 41_000), '41s');
+  assert.match(__tuiTest.countdown(Date.now() + 5 * 60_000), /^5m$/);
+  assert.equal(__tuiTest.countdown(Date.now() - 1000), '');
+  assert.equal(__tuiTest.countdown(null), '');
+  // Accepts an ISO string (the shape getStatus exposes rateLimitedUntil in).
+  assert.equal(__tuiTest.countdown(new Date(Date.now() + 30_000).toISOString()), '30s');
+});
+
+test('load label reads "Now N (Ww)" — distinct from the 15m/1h throughput counts', () => {
+  const text = __tuiTest.strip(__tuiTest.loadText({
+    current: { inFlight: 1, activeWeight: 26 },
+    last15m: { requests: 41, avgMs: 13000 },
+    last1h: { requests: 53 },
+  }));
+  assert.match(text, /Now 1 \(26w\)/);
+  assert.doesNotMatch(text, /Load /);   // the old cryptic label is gone
+  assert.match(text, /15m 41r/);
+  assert.match(text, /1h 53r/);
+});
+
+test('load label omits the weight parenthetical when idle', () => {
+  const text = __tuiTest.strip(__tuiTest.loadText({
+    current: { inFlight: 0, activeWeight: 0 },
+    last15m: {}, last1h: {},
+  }));
+  assert.match(text, /Now 0\b/);
+  assert.doesNotMatch(text, /\(/);
+});
+
+test('countdown stays single-unit <=3 chars even for multi-hour throttles (no column overflow)', () => {
+  // A 429 retry-after can be hours (clampRetryAfterSeconds allows up to 24h); the
+  // status countdown must NOT become "2h30m" and shift the quota bars.
+  for (const ms of [90 * 60_000, 150 * 60_000, 23 * 3_600_000, 30 * 3_600_000]) {
+    const cd = __tuiTest.countdown(Date.now() + ms);
+    assert.ok(cd.length <= 3, `"${cd}" must be <=3 chars to fit "throttled ${cd}" in the column`);
+    assert.match(cd, /^\d+[smhd]$/);
+  }
+});

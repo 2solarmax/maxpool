@@ -6,7 +6,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { Prober } from './prober.js';
-import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
@@ -32,10 +32,6 @@ switch (command) {
     break;
   case 'run':
     await runCommand();
-    break;
-  case 'import':
-    await importCommand();
-    process.exit(0);
     break;
   case 'login':
     await loginCommand();
@@ -419,7 +415,6 @@ async function serverWorkerCommand() {
   if (config.accounts.length === 0) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
-    console.error('  maxpool import           Import from Claude Code');
     console.error('  maxpool login            OAuth login via browser');
     console.error('  maxpool login --api      Add an API key');
     process.exit(1);
@@ -953,47 +948,6 @@ function logPlainServerStart({ host, port, accounts, threshold, config }) {
   console.log('');
 }
 
-// ── import ──────────────────────────────────────────────────
-
-async function importCommand() {
-  const config = await loadOrCreateConfig();
-
-  let name = argValue('--name');
-  const jsonStr = argValue('--json');
-
-  let creds;
-  if (jsonStr) {
-    // Accept raw JSON: --json '{"claudeAiOauth":{"accessToken":"...","refreshToken":"...","expiresAt":...}}'
-    // or flat: --json '{"accessToken":"...","refreshToken":"...","expiresAt":...}'
-    try {
-      const raw = JSON.parse(jsonStr);
-      const data = raw.claudeAiOauth || raw;
-      if (!data.accessToken) {
-        console.error('JSON must contain "accessToken" (directly or under "claudeAiOauth")');
-        process.exit(1);
-      }
-      creds = {
-        accessToken: data.accessToken,
-        refreshToken: data.refreshToken,
-        expiresAt: data.expiresAt,
-      };
-    } catch (err) {
-      console.error(`Failed to parse --json: ${err.message}`);
-      process.exit(1);
-    }
-  } else {
-    const fromPath = argValue('--from') || '~/.claude/.credentials.json';
-    try {
-      creds = await importCredentials(fromPath);
-    } catch (err) {
-      console.error(`Failed to import from ${fromPath}: ${err.message}`);
-      process.exit(1);
-    }
-  }
-
-  await upsertOAuthAccount(config, name, creds, 'import');
-}
-
 // ── login ───────────────────────────────────────────────────
 
 async function loginCommand() {
@@ -1059,6 +1013,9 @@ async function loginOAuthCommand() {
   let name = argValue('--name');
 
   console.log('Starting OAuth login...');
+  console.log('Note: this adds whatever account you are currently signed into at claude.ai —');
+  console.log('there is no account picker. To add a DIFFERENT account, sign into THAT account at');
+  console.log('claude.ai first (or use a logged-out / incognito browser window), then continue.');
   let creds;
   try {
     creds = await loginOAuth();
@@ -1066,7 +1023,6 @@ async function loginOAuthCommand() {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
     console.error('Alternatives:');
-    console.error('  maxpool import        Import from existing Claude Code credentials');
     console.error('  maxpool login --api   Add an API key instead');
     process.exit(1);
   }
@@ -1190,7 +1146,7 @@ async function accountsCommand() {
 
   if (config.accounts.length === 0) {
     console.log('No accounts configured.');
-    console.log('Add one with: maxpool import, maxpool login, or maxpool login --api');
+    console.log('Add one with: maxpool login (browser) or maxpool login --api');
     return;
   }
 
@@ -1401,8 +1357,7 @@ Usage: maxpool [command] [options]
 
 Commands:
   server              Start the proxy server (default)
-  import              Import credentials from Claude Code
-  login               OAuth login via browser
+  login               OAuth login via browser (adds the account you're signed into at claude.ai)
   login --api         Add an API key account
   env [--with-key]    Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
@@ -1414,10 +1369,7 @@ Commands:
   help                Show this help
 
 Options:
-  --name NAME         Set account name (import/login)
-  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json)
-  --json JSON         Import from inline JSON (import), e.g.:
-                      --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
+  --name NAME         Set account name (login)
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
   --with-key          Include proxy API key in maxpool env output
 
@@ -1511,14 +1463,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 
     // Existing account — resolve fresh credentials from disk
     let freshCred = null;
-    if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
-      try {
-        const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
-      } catch (err) {
-        console.error(`[Maxpool] Re-import failed for "${diskAcct.name}": ${err.message}`);
-      }
-    } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
+    if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
       freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
