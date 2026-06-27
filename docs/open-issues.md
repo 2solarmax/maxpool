@@ -45,10 +45,11 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 
 ---
 
-### 5. TUI clarity: "throttled" and "Load X/Y" under-communicate
-**Status:** logged (not started). Behavior is correct; the *display* is unclear.
-- **"throttled"** is a temporary auto-recovering cooldown (account hit a 429 → rested a few seconds → request failed over to another account → auto-flips back to active). The TUI shows bare `throttled` with no countdown, so it looks stuck. Fix: show `throttled Ns` (the `rateLimitedUntil` cooldown is known), like the other countdowns.
-- **"Load X/Y"** = X in-flight requests / Y their combined weight (~payload size). It's cryptic (weight denominator unexplained; "Load" collides with the 15m/1h throughput counts). Fix: clearer label and/or a one-line legend/help.
+### 5. TUI clarity: "throttled" and "Load X/Y" under-communicate — DONE
+**Status:** SHIPPED (v1.3.1).
+- **"throttled"** now renders `throttled Ns` (single-unit countdown from `rateLimitedUntil`, s/m/h/d, ≤3 chars so it never shifts the quota-bar columns) — reads as auto-recovering, not stuck.
+- **"Load X/Y"** → **`Now N (Ww)`**: N in-flight requests, W combined weight, clearly distinct from the `15m`/`1h` throughput counts that follow.
+- Focused code-review pass; red→green tests for the countdown + label + the multi-hour-overflow guard.
 
 ### 6. Seamless version upgrade — near-zero-downtime reload (single-writer baton)
 **Status:** designed (pre-mortem done); awaiting go to implement, then code-review/judge.
