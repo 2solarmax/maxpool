@@ -273,7 +273,9 @@ test('reload rollback: new worker fails readiness → old stays primary, zero EC
   child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } });
+    // 20s cap (not the default): a test must FAIL fast, never hang forever, if the
+    // supervisor can't come up (e.g. under OS resource pressure from sibling tests).
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
     child.kill('SIGHUP');
     await waitFor(() => /rolling back/.test(out), 20000);
 
@@ -331,7 +333,9 @@ test('reload-storm guard: reload worker skips the npm update check (only the col
   child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } });
+    // 20s cap (not the default): a test must FAIL fast, never hang forever, if the
+    // supervisor can't come up (e.g. under OS resource pressure from sibling tests).
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
     await waitFor(() => /UPDATE_CHECK_FIRED/.test(out), 20000);
     assert.equal((out.match(/UPDATE_CHECK_FIRED/g) || []).length, 1, 'cold start probed npm once');
 
@@ -361,7 +365,9 @@ test('killing the supervisor frees the port — a later connection gets clean EC
   let out = ''; child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } });
+    // 20s cap (not the default): a test must FAIL fast, never hang forever, if the
+    // supervisor can't come up (e.g. under OS resource pressure from sibling tests).
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
     killGroup(child);
     await new Promise(r => child.once('exit', r));
     await waitFor(async () => {
@@ -388,7 +394,9 @@ test('two consecutive reloads both cut over (supervisor re-wires monitoring to e
   child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } });
+    // 20s cap (not the default): a test must FAIL fast, never hang forever, if the
+    // supervisor can't come up (e.g. under OS resource pressure from sibling tests).
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
 
     // First reload.
     child.kill('SIGHUP');
@@ -491,7 +499,9 @@ test('M4: quota persistence keeps working after a reload (state generation advan
   child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } });
+    // 20s cap (not the default): a test must FAIL fast, never hang forever, if the
+    // supervisor can't come up (e.g. under OS resource pressure from sibling tests).
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
     // Force an initial state write (cold primary) so a baseline generation exists.
     child.kill('SIGUSR2'); // no-op if unhandled; primary persists on its own interval below
 

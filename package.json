@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test --test-concurrency=1",
+    "test": "bash scripts/run-tests.sh",
     "lint": "eslint src/ test/",
     "release": "bash scripts/release.sh"
   },
