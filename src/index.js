@@ -458,8 +458,13 @@ async function serverWorkerCommand() {
   // A worker without the lease writes NOTHING (no token rotation, no config
   // write, no state write, no probe). Only the lease holder may write.
   let hasLease = false;
-  const persistQuotaState = () => {
-    if (!hasLease) return Promise.resolve();
+  // `force` performs the FINAL flush during a baton release, AFTER releaseLease()
+  // has already flipped hasLease=false (and cleared the periodic interval, so no
+  // write races this one). Without force, this no-ops post-release and the reload's
+  // learned-quota flush is silently dropped — the new worker would boot from up-to-
+  // 60s-stale quota and the state generation would never advance across a reload.
+  const persistQuotaState = (force = false) => {
+    if (!hasLease && !force) return Promise.resolve();
     return saveState({ quota: accountManager.exportQuotaState() }, { expectedGeneration: stateGeneration })
       .then(written => { if (written != null) stateGeneration = written; })
       .catch(() => {});
@@ -661,7 +666,7 @@ async function serverWorkerCommand() {
     (async () => {
       await releaseLease();
       await accountManager.drainRefreshes();
-      await persistQuotaState();
+      await persistQuotaState(true); // force: lease already dropped above (else no-op)
       await flushConfigWrites();
       await flushStateWrites();
     })().catch(() => {});
@@ -848,8 +853,10 @@ async function serverWorkerCommand() {
       // 2) Await every in-flight OAuth token refresh that started before the lease
       //    dropped — the headline brick hazard (B1).
       await accountManager.drainRefreshes();
-      // 3) Final flush of learned quota.
-      await persistQuotaState();
+      // 3) Final flush of learned quota. FORCE it: releaseLease() above already
+      //    flipped hasLease=false, and persistQuotaState no-ops without the lease —
+      //    so an unforced call here silently drops the reload's final quota flush.
+      await persistQuotaState(true);
       // 4) Barrier: ensure every queued config write (a rotated-token persist is
       //    fire-and-forget) AND state write has actually hit disk before we hand
       //    off (M3 — otherwise the new worker boots from the invalidated token).
