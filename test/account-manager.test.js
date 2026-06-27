@@ -1248,3 +1248,93 @@ test('rebalance: does not flap — once on the fresh account it stays (HOT gate 
   const again = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   assert.equal(again.account.name, 'a2', 'healthy current account is not hot → no migration back');
 });
+
+// --- Regression: FIFO-fairness newcomer must HOLD, never error-fast (session-kill) ---
+// Reproduced bug (2026-06-27): a NEW request from a signed-thinking session arriving
+// while a FIFO queue already exists got retryAfterMs=Infinity / no_eligible_route and
+// the session was KILLED with "all N are at their 5h or weekly limit" — even with
+// fully-healthy accounts idle behind the queue. The fairness gate is TRANSIENT (the
+// newcomer queues the instant it registers a ticket); the hold-oracle wrongly read it
+// as terminal. These lock the correct behavior + prove no over-correction.
+
+function healthyPair() {
+  return new AccountManager([
+    { name: 'maxdubner', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    { name: '2solarmax', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+}
+
+test('FIFO-fairness: thinking newcomer behind a queue HOLDS finite, never error-fasts while healthy accounts idle', () => {
+  const am = healthyPair();
+  am.queueState.waiting.push({ id: 1 }); // an existing waiter ("queued 1")
+  const newcomer = { profile: 'claude', stream: true, sessionKey: 'newcomer', requiresAnthropicThinkingIntegrity: true };
+  const plan = am.nextRetryForRequest(newcomer);
+  assert.equal(am.acquireAccount(newcomer), null, 'newcomer still cannot JUMP the queue (selection FIFO preserved)');
+  assert.ok(Number.isFinite(plan.retryAfterMs), `must HOLD (finite), got ${plan.retryAfterMs}`);
+  assert.equal(plan.cause, 'queued_behind_fairness');
+  assert.ok(plan.retryAfterMs <= 60_000, 'bounded re-poll, not a multi-day hold');
+});
+
+test('FIFO-fairness: a registered thinking waiter advances via FIFO to served (forward progress, no hang)', () => {
+  const am = healthyPair();
+  const live = () => ({ destroyed: false, writableEnded: false });
+  // A real waiter is already at the head of the FIFO (distinct ticket id).
+  const ahead = { sessionKey: 'ahead' };
+  am.registerQueuedRequest(ahead, { bytes: 0, deadlineAt: Date.now() + 60_000, res: live() });
+  // Our thinking newcomer registers BEHIND it.
+  const newcomer = { profile: 'claude', stream: true, sessionKey: 'newcomer', requiresAnthropicThinkingIntegrity: true };
+  am.registerQueuedRequest(newcomer, { bytes: 0, deadlineAt: Date.now() + 60_000, res: live() });
+
+  // Not the head yet → cannot admit, but is HELD (finite), never error-fasted.
+  assert.equal(am.canAdmitQueuedRequest(newcomer), false, 'waits its FIFO turn behind the existing waiter');
+  assert.notEqual(am.nextRetryForRequest(newcomer).retryAfterMs, Infinity, 'a registered waiter is never terminal-Infinity');
+
+  // The waiter ahead drains (admitted) → the newcomer becomes head and is SERVED,
+  // proving forward progress rather than a wedge.
+  assert.equal(am.canAdmitQueuedRequest(ahead), true, 'head admits first (FIFO order preserved)');
+  assert.equal(am.canAdmitQueuedRequest(newcomer), true, 'newcomer now advances to head');
+  const lease = am.acquireAccount(newcomer);
+  assert.ok(lease && lease.account, 'newcomer acquires a healthy account once at the head — served, not killed');
+});
+
+test('FIFO-fairness: NON-thinking newcomer behind a queue still uses the provider (unchanged)', () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
+  ], 0.90);
+  am.queueState.waiting.push({ id: 1 });
+  const newcomer = { profile: 'all', stream: true, sessionKey: 'nc' }; // NOT thinking; 'all' permits provider
+  const plan = am.nextRetryForRequest(newcomer);
+  assert.equal(plan.available, true, 'provider fallback still available for a non-thinking newcomer');
+});
+
+test('NOT over-corrected: admissionPaused (restart/shutdown shed) stays terminal, does not hold', () => {
+  const am = healthyPair();
+  am.setAdmissionPaused(true);
+  const req = { profile: 'claude', stream: true, sessionKey: 's', requiresAnthropicThinkingIntegrity: true };
+  const plan = am.nextRetryForRequest(req);
+  assert.equal(plan.retryAfterMs, Infinity, 'restart/shutdown drain must shed new work, not hold it');
+});
+
+test('NOT over-corrected: a genuinely terminal fleet (all auth-dead) still error-fasts behind a queue', () => {
+  const am = healthyPair();
+  am.queueState.waiting.push({ id: 999 });
+  am.accounts.forEach(a => { a.status = 'error'; });
+  const req = { profile: 'claude', stream: true, sessionKey: 's', requiresAnthropicThinkingIntegrity: true };
+  const plan = am.nextRetryForRequest(req);
+  assert.equal(plan.retryAfterMs, Infinity, 'no healthy route exists → must still error-fast, not hold forever');
+});
+
+test('NOT over-corrected: thinking + ALL accounts weekly-exhausted behind a queue does not fake a 60s fairness hold', () => {
+  const am = healthyPair();
+  am.queueState.waiting.push({ id: 999 });
+  const reset = Date.now() + 3 * 24 * 60 * 60 * 1000; // days away
+  am.accounts.forEach(a => { a.quota = { unified7d: 0.99, unified7dReset: reset }; });
+  const req = { profile: 'claude', stream: true, sessionKey: 's', requiresAnthropicThinkingIntegrity: true };
+  const plan = am.nextRetryForRequest(req);
+  // _isAvailable fails the weekly-exhausted gate, so the new branch must NOT fire:
+  // promising a 60s "queued_behind_fairness" hold when the only reset is days away
+  // would be the very false-near-term-recovery this oracle exists to avoid.
+  assert.notEqual(plan.cause, 'queued_behind_fairness', 'must not fake a near-term fairness hold for a weekly-exhausted fleet');
+  assert.equal(plan.retryAfterMs, Infinity, 'no eligible route behind the queue → error-fast (unchanged by the fix)');
+});

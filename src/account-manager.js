@@ -251,7 +251,40 @@ export class AccountManager {
     for (const account of this.accounts) {
       if (excludedIndexes.has(account.index)) continue;
       if (!this._matchesRequest(account, profile, requestInfo)) {
-        if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) {
+        // A signed-thinking request behind the TRANSIENT FIFO queue-fairness gate
+        // (a queue already exists and this newcomer hasn't registered a ticket yet
+        // — the `!requestInfo.queueTicket` clause in _matchesRequest) must HOLD,
+        // not error-fast. Such a request has NO fallback: providers are barred
+        // (signed thinking), so shedding it with a 429 KILLS the session — the
+        // reproduced "all N are at their 5h or weekly limit" false kill
+        // (2026-06-27) while healthy accounts sat idle behind the queue. The
+        // instant it registers a ticket the gate lifts and it waits its FIFO turn
+        // behind the existing waiters (which drain as the healthy accounts finish),
+        // so a bounded re-poll hold is the right answer.
+        // Scoped to THINKING requests on purpose: a non-thinking request can fall
+        // back to a provider or be cheaply retried, so the fairness gate keeps
+        // shedding it as backpressure (never grow the queue past its cap under a
+        // pure-concurrency burst). admissionPaused (restart/shutdown shed) and
+        // upstream-throttle keep their existing behavior (throttle is handled by
+        // the early return above). NOTE: queueAndRetry does NOT special-case
+        // 'queued_behind_fairness' in its window switch, so a STREAMING thinking
+        // hold rides streamHoldMaxMs (kept alive by the heartbeat) — intended: a
+        // signed-thinking stream should wait its turn, bounded by the per-ticket
+        // deadlineAt + _reapStaleQueueHead + the client's own disconnect, not the
+        // 15-min concurrency-cap clamp.
+        const thinkingFairnessGated = this._requiresAnthropicThinkingIntegrity(requestInfo)
+          && !this.admissionPaused
+          && !this._isUpstreamThrottleBlocking()
+          && this.queueState.waiting.length > 0
+          && !requestInfo.queueTicket
+          && !requestInfo.queueAdmitted;
+        if (thinkingFairnessGated
+          && account.type !== 'provider'
+          && this._isRequestCompatible(account, profile, requestInfo)
+          && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+          soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
+          if (!boundedHoldCause) boundedHoldCause = 'queued_behind_fairness';
+        } else if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) {
           note('provider_fallback_disabled_signed_thinking');
         }
         continue;
