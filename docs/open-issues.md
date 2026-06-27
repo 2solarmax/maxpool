@@ -24,9 +24,14 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 - Eligibility gates on RAW weekly state (`_weeklyRawState`), so a raw-healthy fast-burner stays in the spread pool.
 - Screenshot-replay regression test: 6 concurrent over the 4-account state fans out across max@dubner.io + mk@gomokka, no account absorbs the burst.
 - `D=3` chosen from observed evidence (max@dubner.io throttled ~6 concurrent); tunable.
-**Phase 2-3 (deferred — only if Phase 1 leaves residual concentration/under-drain):**
-- Per-account `throttlePressure` (decaying ~90s) so the fleet steers *around* a freshly-429'd account (today the throttle is a single global pause — the router can't prefer the un-throttled account).
-- Load factor `L` (0..1, from in-flight vs soft target, recent weight, throttle heat) + a late, load-gated `drainBonus` (fires only in a window's final ~12% with quota left, and `×(1-L)` so it vanishes under load) = the "drain a near-reset account only when load is light" behavior.
+**Phase 2 — safe-point session rebalancing (DONE, v1.4.0):**
+- A bound session no longer sticks to a HOT account forever. `_selectNext` migrates it to a much-healthier account, but ONLY on a **thinking-safe** request (per-request body carries no signed `thinking` block; fail-closed on unparsed bodies) so Anthropic's non-retryable "invalid signature" can never fire.
+- Flap-stable: HOT = `_isNearQuota` (weekly reserve/critical or 5h-cap, NOT live in-flight); migrate only to a `normal/soft/unknown`-weekly alt that is ≥2× cheaper AND a strictly healthier tier; suppressed during queue admission; `_bindSession` re-homes on a same-priority *choice* migration but not on failover (snap-back-on-recovery preserved).
+- This is the fix for "I added an account mid-session but it didn't get picked up": added/cooled capacity now drains in-progress hot sessions at their next safe turn.
+- Pre-mortem (9 failure modes) + focused adversarial review (SHIP); red→green tests for migrate-when-safe-and-hot, never-on-signed-thinking, fail-closed-unparsed, never-when-healthy, queue-suppressed, no-flap, describeRequest fail-closed.
+**Phase 3 (remaining, optional — only if observed):**
+- Per-account `throttlePressure` (decaying ~90s) so the fleet steers *around* a freshly-429'd account (today the throttle is a single global pause).
+- Herd-jitter on the rebalance burst-drain: many sessions on one hot account + a fresh account appear → they migrate in a burst (self-damped by the score-margin backpressure, fine for a small pool, but un-staggered). Add a per-tick migration cap/jitter + a bounded-migrations-per-tick test if the account pool grows. Reviewer-flagged nit, not ship-blocking.
 **Open knob:** `D` (per-account concurrency where Anthropic 429s). Default 3; add telemetry to auto-tune from live 429-rate-vs-depth.
 
 ### 2. Hold the session on rate-limit instead of killing it (+ routing-oracle correctness) — DONE
