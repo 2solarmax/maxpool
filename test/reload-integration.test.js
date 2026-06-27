@@ -472,62 +472,6 @@ test('B2: steady-state full-request throughput is 100% worker-served (parent nev
   }
 });
 
-test('M4: quota persistence keeps working after a reload (state generation advances post-swap)', async () => {
-  const upstream = await startJsonUpstream();
-  const port = await getFreePort();
-  const apiKey = 'mp-test-key';
-  const dir = await mkdtemp(join(tmpdir(), 'maxpool-gen-'));
-  const configPath = join(dir, 'config.json');
-  const statePath = configPath.replace(/\.json$/, '.state.json');
-  await writeFile(configPath, JSON.stringify({
-    proxy: { host: '127.0.0.1', port, apiKey },
-    upstream: `http://127.0.0.1:${upstream.port}`,
-    updateCheck: false, switchThreshold: 0.90, shutdown: { drainTimeoutMs: 4000 },
-    // Short quota-save interval so the post-reload primary persists promptly.
-    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'sk-ant-stub' }],
-  }) + '\n');
-
-  const readStateGen = async () => {
-    try { return Number(JSON.parse(await readFile(statePath, 'utf-8'))._generation) || 0; } catch { return 0; }
-  };
-
-  let out = '';
-  const child = spawn(process.execPath, [cliPath, 'server'], {
-    env: { ...process.env, MAXPOOL_CONFIG: configPath, MAXPOOL_FORCE_SUPERVISOR: '1' },
-    stdio: ['ignore', 'pipe', 'pipe'], detached: true,
-  });
-  child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
-
-  try {
-    // 20s cap (not the default): a test must FAIL fast, never hang forever, if the
-    // supervisor can't come up (e.g. under OS resource pressure from sibling tests).
-    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
-    // Force an initial state write (cold primary) so a baseline generation exists.
-    child.kill('SIGUSR2'); // no-op if unhandled; primary persists on its own interval below
-
-    // Reload — the old worker flushes state (bumping the on-disk generation), the
-    // new primary must re-sync that generation (M4) so ITS writes aren't refused.
-    child.kill('SIGHUP');
-    await waitFor(() => /cutover complete/.test(out), 20000);
-    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
-
-    const genAfterReload = await readStateGen();
-
-    // The NEW primary must be able to ADVANCE the state generation. Trigger a
-    // fresh persist by reloading once more and confirming the generation grows
-    // beyond what the post-reload primary first saw (proves writes aren't wedged).
-    child.kill('SIGHUP');
-    await waitFor(() => (out.match(/cutover complete/g) || []).length >= 2, 20000);
-    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
-    // The second reload's release flush must bump the generation again — i.e. the
-    // post-first-reload primary successfully persisted (M4: not wedged forever).
-    await waitFor(async () => (await readStateGen()) > genAfterReload, 20000);
-
-    const finalGen = await readStateGen();
-    assert.ok(finalGen > genAfterReload, `state generation advanced after reload (${genAfterReload} -> ${finalGen}); persistence not wedged`);
-  } finally {
-    killGroup(child);
-    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
-    await new Promise(r => upstream.server.close(r));
-  }
-});
+// M4 (state-generation-across-reload) moved to reload-state-generation.test.js so
+// it runs in its OWN process with fresh OS resources (it does two sequential
+// reloads and is sensitive to port-pressure accumulated by the tests above).
