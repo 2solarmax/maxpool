@@ -93,15 +93,19 @@ function statusColor(status) {
   return String(status);
 }
 
-/** Short live countdown to a timestamp: seconds under a minute (the common
- *  throttle cooldown), else minute/hour/day granularity. '' once elapsed. */
+/** Short live countdown to a timestamp, SINGLE-unit so it stays ≤3 chars
+ *  ("41s"/"5m"/"23h"/"2d") and never overflows the status column: seconds under a
+ *  minute (the common throttle cooldown), then minute/hour/day. '' once elapsed.
+ *  Accepts a numeric ms timestamp (live account field) or an ISO string (snapshot). */
 function countdown(ts) {
   if (!ts) return '';
   const target = typeof ts === 'string' ? Date.parse(ts) : ts;
   const ms = target - Date.now();
   if (!Number.isFinite(ms) || ms <= 0) return '';
   if (ms < 60_000) return `${Math.ceil(ms / 1000)}s`;
-  return formatReset(target);
+  if (ms < 3_600_000) return `${Math.ceil(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.ceil(ms / 3_600_000)}h`;
+  return `${Math.ceil(ms / 86_400_000)}d`;
 }
 
 function loadText(load) {

@@ -345,3 +345,13 @@ test('load label omits the weight parenthetical when idle', () => {
   assert.match(text, /Now 0\b/);
   assert.doesNotMatch(text, /\(/);
 });
+
+test('countdown stays single-unit <=3 chars even for multi-hour throttles (no column overflow)', () => {
+  // A 429 retry-after can be hours (clampRetryAfterSeconds allows up to 24h); the
+  // status countdown must NOT become "2h30m" and shift the quota bars.
+  for (const ms of [90 * 60_000, 150 * 60_000, 23 * 3_600_000, 30 * 3_600_000]) {
+    const cd = __tuiTest.countdown(Date.now() + ms);
+    assert.ok(cd.length <= 3, `"${cd}" must be <=3 chars to fit "throttled ${cd}" in the column`);
+    assert.match(cd, /^\d+[smhd]$/);
+  }
+});
