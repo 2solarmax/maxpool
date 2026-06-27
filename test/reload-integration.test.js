@@ -210,7 +210,7 @@ test('seamless reload: in-flight stream survives, no ECONNREFUSED, supervisor st
     // Kill the whole process group (supervisor + any worker children).
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
     try { child.kill('SIGKILL'); } catch { /* already gone */ }
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => upstream.server.close(r));
   }
 });
@@ -288,7 +288,7 @@ test('reload rollback: new worker fails readiness → old stays primary, zero EC
     assert.equal(child.exitCode, null, 'supervisor still up after rollback');
   } finally {
     killGroup(child);
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => upstream.server.close(r));
   }
 });
@@ -314,7 +314,7 @@ test('crash-loop on boot backs off (not a tight fork loop) and never wedges the 
     assert.ok(after - before <= 8, `backoff bounded the crash rate (saw ${after - before} in 1.5s)`);
   } finally {
     killGroup(child);
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => upstream.server.close(r));
   }
 });
@@ -347,7 +347,7 @@ test('reload-storm guard: reload worker skips the npm update check (only the col
     assert.match(out, /UPDATE_CHECK_SKIPPED \(reload\)/, 'reload worker explicitly skipped the probe');
   } finally {
     killGroup(child);
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => upstream.server.close(r));
   }
 });
@@ -369,7 +369,7 @@ test('killing the supervisor frees the port — a later connection gets clean EC
     // supervisor can't come up (e.g. under OS resource pressure from sibling tests).
     await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
     killGroup(child);
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await waitFor(async () => {
       try { await proxyGet(port, apiKey, 1000); return false; }
       catch (e) { return e.code === 'ECONNREFUSED'; }
@@ -411,7 +411,7 @@ test('two consecutive reloads both cut over (supervisor re-wires monitoring to e
     assert.equal(child.exitCode, null, 'supervisor still up after two reloads');
   } finally {
     killGroup(child);
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => upstream.server.close(r));
   }
 });
@@ -467,7 +467,7 @@ test('B2: steady-state full-request throughput is 100% worker-served (parent nev
     assert.equal(pids.size, 1, `exactly one worker served all requests (saw pids ${[...pids]})`);
   } finally {
     killGroup(child);
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => upstream.server.close(r));
   }
 });
@@ -527,7 +527,7 @@ test('M4: quota persistence keeps working after a reload (state generation advan
     assert.ok(finalGen > genAfterReload, `state generation advanced after reload (${genAfterReload} -> ${finalGen}); persistence not wedged`);
   } finally {
     killGroup(child);
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => upstream.server.close(r));
   }
 });

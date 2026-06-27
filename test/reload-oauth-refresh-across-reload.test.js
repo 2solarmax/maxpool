@@ -191,7 +191,7 @@ test('in-flight OAuth refresh across a reload rotates the single-use token EXACT
   } finally {
     stub.releaseHeld();
     killGroup(child);
-    await new Promise(r => child.once('exit', r));
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => stub.server.close(r));
   }
 });
