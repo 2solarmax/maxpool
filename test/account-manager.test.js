@@ -1073,6 +1073,24 @@ test('minor: weekly-critical blocked only by the in-flight cap holds a bounded r
   assert.ok(plan.retryAfterMs <= 60_000, `bounded re-poll (~60s), got ${plan.retryAfterMs}ms — must NOT be the 40h weekly reset`);
 });
 
+test('major: a HEALTHY account blocked only by the concurrency cap HOLDS finite, not Infinity error-fast', () => {
+  // Symmetry fix: a weekly-critical account at the in-flight cap already holds a
+  // bounded re-poll; a HEALTHY account in the identical concurrency-capped state
+  // used to fall through to Infinity and error-fast the request to 429 — even
+  // though a slot frees in seconds when a sibling completes.
+  const am = manager(2);
+  for (const a of am.accounts) {
+    a.quota.unified7d = 0.10;        // healthy weekly
+    a.quota.unified5h = 0.10;        // healthy session
+    a.inFlight = am.scheduler.safetyMaxActivePerAccount; // sole block: per-account cap
+  }
+  const plan = am.nextRetryForRequest({ profile: 'claude' });
+  assert.equal(plan.available, false);
+  assert.ok(Number.isFinite(plan.retryAfterMs), 'concurrency-capped healthy fleet must HOLD, not error-fast on Infinity');
+  assert.equal(plan.cause, 'concurrency_cap');
+  assert.ok(plan.retryAfterMs <= 60_000, 'bounded re-poll hold');
+});
+
 test('minor (min-merge): a sibling weekly-exhausted 30min reset wins over a weekly-critical 3h short-term hold', () => {
   // soonestTemporary must NOT hard-win over the weekly buckets: A is weekly-critical
   // with a queueable 3h session_limit (→ soonestTemporary=3h); B is weekly-exhausted
@@ -1119,6 +1137,21 @@ test('bug C: a LIVE concurrent same-session request is NOT evicted (no starve)',
   am.registerQueuedRequest(r2, { sessionKey: 'S', bytes: 1, res: { destroyed: false, writableEnded: false } });
   assert.equal(am.queueState.waiting.length, 2, 'both live concurrent siblings held');
   assert.ok(r1.queueTicket, 'first live sibling not orphaned');
+});
+
+test('bug C: an EPIPE half-dead ghost (socket destroyed, res not yet) IS superseded', () => {
+  // After a client RST the ServerResponse hasn't flipped destroyed/writableEnded
+  // yet (noticed only on the next write), but its socket is destroyed. The fast
+  // same-session supersede must still detect it so a retry isn't backpressure-
+  // rejected by its own undetected ghost before the heartbeat reaps it.
+  const am = manager(1);
+  const r1 = {}; const r2 = {};
+  am.registerQueuedRequest(r1, { sessionKey: 'S', bytes: 7, res: { destroyed: false, writableEnded: false, socket: { destroyed: true } } });
+  assert.equal(am.queueState.waiting.length, 1);
+  am.registerQueuedRequest(r2, { sessionKey: 'S', bytes: 1, res: { destroyed: false, writableEnded: false } });
+  assert.equal(am.queueState.waiting.length, 1, 'half-dead EPIPE ghost evicted, new live one remains');
+  assert.equal(r1.queueTicket, null, 'orphaned half-dead waiter freed');
+  assert.equal(am.queueState.bytes, 1, 'ghost bytes released');
 });
 
 test('bug C: a DEAD same-session hold IS superseded and its waiter freed', () => {

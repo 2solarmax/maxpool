@@ -1598,6 +1598,102 @@ test('bug A: resumed stream has NO heartbeat comment interleaved between real ev
   }
 });
 
+test('major (lease): client disconnect during the resumed pre-stream window releases the account lease', async () => {
+  // A resumed forward acquires a lease (inFlight++) then awaits the upstream. If
+  // the client disconnects during that pre-first-byte window, the lease must be
+  // released promptly (abort the fetch), NOT pinned until the upstream resolves on
+  // its own (~undici timeout) — which would bench the scarce account it targets.
+  let upstreamReqs = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamReqs++;
+    // Hold the response open well past the client's disconnect.
+    setTimeout(() => { try { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {}\n\n'); } catch { /* client gone */ } }, 3000);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].lastError = 'rate_limited';
+  am.accounts[0].rateLimitedUntil = Date.now() + 100;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 8000, pollMs: 20, heartbeatMs: 1000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const ac = new AbortController();
+    const p = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: ac.signal,
+    }).catch(() => {});
+    // Let it queue, resume, acquire the lease, and enter the slow upstream fetch.
+    await new Promise(r => setTimeout(r, 600));
+    assert.ok(upstreamReqs >= 1, 'request resumed and reached the upstream (lease acquired)');
+    ac.abort();                       // client disconnects mid-fetch
+    await p;
+    await new Promise(r => setTimeout(r, 500));
+    assert.equal(am.accounts[0].inFlight, 0, 'lease released on client disconnect — inFlight not pinned by the 3s upstream');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('minor: a non-streaming resumed response is framed as an SSE error, not a raw data blob', async () => {
+  // After the heartbeat committed 200 text/event-stream, the resumed upstream
+  // returns a NON-streaming JSON body. It must be emitted as a proper SSE
+  // `event: error` (parseable), never a lone `data: {raw json}` that corrupts the
+  // client's SSE state machine (no message_start envelope).
+  let attempts = 0;
+  const upstream = http.createServer((_req, res) => {
+    attempts++;
+    if (attempts === 1) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'limit' } }));
+      return;
+    }
+    // Non-streaming JSON body for a stream request (an upstream contract quirk).
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'hi' }] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].lastError = 'rate_limited';
+  am.accounts[0].rateLimitedUntil = Date.now() + 120;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 8000, pollMs: 20, heartbeatMs: 1000, capacityMaxWaitMs: 8000 },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      signal: AbortSignal.timeout(7000),
+    });
+    const body = await res.text();
+    const after = body.slice(body.indexOf('data:') >= 0 ? body.indexOf('data:') : 0);
+    assert.match(body, /event: error/, 'non-streaming resume framed as a proper SSE error event');
+    // The raw upstream JSON must NOT appear as a bare data line (would corrupt the parser).
+    assert.ok(!/data: \{"type":"message"/.test(body), 'raw non-SSE JSON not written as a lone data blob');
+    void after;
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('major: a post-resume failover RE-HOLDS the session instead of dropping it', async () => {
   // The feature's core promise: a held stream that resumes onto a freed account,
   // and that account 529s on the very first forwarded request, must be RE-HELD

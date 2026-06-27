@@ -294,12 +294,30 @@ async function forwardRequest(
   // this request's failover chain.
   requestInfo.queueAdmitted = false;
 
+  // Abort the upstream fetch and release the lease if the CLIENT disconnects during
+  // the pre-response window (token refresh + connect + waiting for the upstream's
+  // first byte). Without this, a client that drops mid-flight leaves account.inFlight
+  // pinned until the fetch resolves on its own (~undici body timeout), benching
+  // scarce capacity — acute for the hold feature, which targets already-scarce
+  // accounts. The listener is removed once the response arrives; mid-stream
+  // disconnects are handled by streamResponse's res.destroyed checks.
+  const clientGone = new AbortController();
+  const onClientClose = () => clientGone.abort();
+  res.once('close', onClientClose);
+  const releaseOnClientGone = () => {
+    res.off('close', onClientClose);
+    accountManager.releaseAccount(lease);
+    clearQueueHeartbeat(requestInfo);
+    accountManager.removeQueuedRequest?.(requestInfo);
+  };
+
   // Track which account handles this request
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
   const tokenReady = await accountManager.ensureTokenFresh(account.index);
+  if (clientGone.signal.aborted) { releaseOnClientGone(); return; }
   if (!tokenReady) {
     accountManager.releaseAccount(lease);
     excludedIndexes.add(account.index);
@@ -388,7 +406,11 @@ async function forwardRequest(
       headers,
       body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
       redirect: 'manual',
+      signal: clientGone.signal,
     });
+    // Response arrived — the pre-response leak window is over. Stop guarding for
+    // client-disconnect via abort (streamResponse handles mid-stream disconnects).
+    res.off('close', onClientClose);
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -761,7 +783,20 @@ async function forwardRequest(
       if (requestInfo.queueHeartbeatActive) {
         clearQueueHeartbeat(requestInfo);
         if (!res.destroyed && !res.writableEnded) {
-          res.write(`data: ${buf.toString()}\n\n`);
+          // We already committed `200 text/event-stream` (the queue heartbeat), but
+          // the resumed upstream returned a NON-streaming body. Writing the raw JSON
+          // as a lone `data:` line corrupts the client's SSE parser (no message_start
+          // envelope, no message_stop). Frame it as a proper SSE error event so the
+          // client fails cleanly instead of hanging/mis-parsing. (Rare: an upstream
+          // honoring stream:true never lands here; reachable on a fallback upstream
+          // quirk.)
+          res.write(`event: error\ndata: ${JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'api_error',
+              message: `Upstream returned a non-streaming ${upstreamRes.status} response for a streaming request`,
+            },
+          })}\n\n`);
           res.end();
         }
       } else {
@@ -770,6 +805,14 @@ async function forwardRequest(
       }
     }
   } catch (err) {
+    res.off('close', onClientClose);
+    // Client disconnected mid-flight → we aborted the upstream fetch. Release the
+    // lease (free the scarce account) and STOP: no retry (the client is gone), no
+    // write (the socket is dead).
+    if (clientGone.signal.aborted) {
+      releaseOnClientGone();
+      return;
+    }
     console.error(`[Maxpool] Upstream error (account "${account.name}"):`, err.message);
 
     if (logDir) {

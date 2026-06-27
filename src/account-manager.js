@@ -1,12 +1,13 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 
-// Bounded hold for a weekly-critical account whose next-recovery time is genuinely
-// unknown (no short-term blocker reset AND no learned weekly reset — e.g. cold
-// start / post-reset / probe failure). A weekly-critical account is recoverable by
-// definition (still has some quota; usable as last resort), so it must HOLD finite
-// and let waitForAvailableRoute's poll loop re-check real availability, never
-// collapse to an Infinity session-kill.
-const WEEKLY_CRITICAL_UNKNOWN_HOLD_MS = 60_000;
+// Bounded re-poll hold for an account blocked ONLY by a transient, self-clearing
+// condition whose exact recovery time is unknown: (a) a weekly-critical account
+// (last-resort usable, no learned reset), or (b) an otherwise-healthy account at
+// its in-flight / global concurrency cap (a sibling completing frees a slot in
+// seconds). Both are recoverable by definition, so they must HOLD finite and let
+// waitForAvailableRoute's poll loop re-check real availability — never collapse to
+// an Infinity session-kill / error-fast.
+const BOUNDED_REPOLL_HOLD_MS = 60_000;
 
 function emptyQuota() {
   return {
@@ -212,7 +213,8 @@ export class AccountManager {
     let soonestTemporary = Infinity;
     let temporaryCause = null;
     let soonestWeekly = Infinity;
-    let soonestWeeklyCritical = Infinity; // weekly-critical (last-resort) accounts: always a bounded re-poll (known short-term resets route through soonestTemporary instead)
+    let soonestBoundedHold = Infinity;    // recoverable-transient accounts (weekly-critical last-resort, or concurrency-capped): always a bounded re-poll (known short-term resets route through soonestTemporary instead)
+    let boundedHoldCause = null;
     let weeklyUnknownReset = 0; // weekly-exhausted accounts whose reset time we don't know yet
     let matchingRoutes = 0;
     const reasons = {};
@@ -261,16 +263,19 @@ export class AccountManager {
           soonestTemporary = ms;
           temporaryCause = retry.cause;
         }
-      } else if (retry.weeklyCritical) {
-        // Last-resort admit failed AND there is no queueable short-term reset (the
-        // account is 5h-capped / cooling with an UNKNOWN reset, or purely critical).
-        // _retryInfo always reaches here with retryAt:null (a KNOWN short-term reset
-        // is queueable and routes through soonestTemporary above), so the hold is a
-        // bounded re-poll. A weekly-critical account is recoverable by definition —
-        // hold finite, never collapse to Infinity and KILL the session.
-        if (WEEKLY_CRITICAL_UNKNOWN_HOLD_MS < soonestWeeklyCritical) {
-          soonestWeeklyCritical = WEEKLY_CRITICAL_UNKNOWN_HOLD_MS;
-        }
+      } else if (retry.weeklyCritical || retry.transientCap) {
+        // A recoverable-transient block with no queueable short-term reset — a
+        // weekly-critical account (last-resort usable) or an otherwise-healthy
+        // account at its concurrency cap. _retryInfo always reaches here with
+        // retryAt:null (a KNOWN short-term reset is queueable and routes through
+        // soonestTemporary above), so the hold is a bounded re-poll. Recoverable by
+        // definition — hold finite, never collapse to Infinity and KILL the session.
+        soonestBoundedHold = BOUNDED_REPOLL_HOLD_MS;
+        // Label precedence: an account that is BOTH weekly-critical and short-term
+        // capped is fundamentally weekly_critical; concurrency_cap only labels the
+        // hold when no weekly-critical account contributed it.
+        if (retry.weeklyCritical) boundedHoldCause = 'weekly_critical';
+        else if (!boundedHoldCause) boundedHoldCause = 'concurrency_cap';
       } else if (retry.cause === 'weekly_exhausted' && retry.retryAt) {
         const ms = retry.retryAt - Date.now();
         if (ms < soonestWeekly) soonestWeekly = ms;
@@ -292,7 +297,7 @@ export class AccountManager {
     const recoveries = [
       { ms: soonestTemporary, cause: temporaryCause || 'temporary_unavailable' },
       { ms: soonestWeekly, cause: 'weekly_exhausted' },
-      { ms: soonestWeeklyCritical, cause: 'weekly_critical' },
+      { ms: soonestBoundedHold, cause: boundedHoldCause || 'weekly_critical' },
     ].filter(r => Number.isFinite(r.ms));
     if (recoveries.length) {
       const best = recoveries.reduce((a, b) => (b.ms < a.ms ? b : a));
@@ -659,7 +664,13 @@ export class AccountManager {
       // concurrent sibling: a single Claude Code process fires concurrent
       // requests under ONE session id (the main stream + the haiku title/summary
       // call + parallel subagents), and evicting a live one orphans it for days.
-      const dead = !t.res || t.res.destroyed || t.res.writableEnded;
+      // Catch a half-dead EPIPE ghost too: after a client RST the ServerResponse
+      // may not have flipped destroyed/writableEnded yet (it's noticed on the next
+      // write), but its underlying socket is destroyed / the stream is no longer
+      // writable. A LIVE sibling has writable===true and a live socket, so this
+      // never evicts one. (Mock-live res objects leave both undefined → not dead.)
+      const dead = !t.res || t.res.destroyed || t.res.writableEnded
+        || t.res.writable === false || t.res.socket?.destroyed === true;
       if (!dead) continue;
       if (t.requestInfo) t.requestInfo.queueTicket = null; // let its waiter exit fast
       t.dead = true;
@@ -890,13 +901,22 @@ export class AccountManager {
       // No short-term blocker → the only thing keeping it out of the last-resort
       // pool is a TRANSIENT cap (in-flight/concurrency, admission pause), which
       // clears in seconds when a sibling completes — NOT the 7d weekly reset. Hold
-      // a bounded re-poll (retryAt:null → WEEKLY_CRITICAL_UNKNOWN_HOLD_MS), never
-      // the far weekly reset, so a non-stream request isn't error-fasted for ~7d.
+      // a bounded re-poll (retryAt:null → BOUNDED_REPOLL_HOLD_MS), never the far
+      // weekly reset, so a non-stream request isn't error-fasted for ~7d.
       return { cause: 'weekly_critical', retryAt: null, queueable: false, weeklyCritical: true };
     }
 
     // Healthy / soft / reserve weekly: the ordinary short-term blocker, if any.
     if (shortTerm) return shortTerm;
+
+    // Otherwise-healthy but at the in-flight / global concurrency cap — a TRANSIENT,
+    // self-clearing block (a sibling completing frees a slot in seconds). HOLD a
+    // bounded re-poll rather than error-fasting (Infinity): the symmetric case to a
+    // concurrency-capped weekly-critical account, which already holds finite above.
+    if (account.inFlight >= this.scheduler.safetyMaxActivePerAccount
+        || this.getGlobalInFlight() >= this.scheduler.safetyMaxGlobalActive) {
+      return { cause: 'concurrency_cap', retryAt: null, queueable: false, transientCap: true };
+    }
 
     return { cause: 'unavailable', retryAt: null, queueable: false };
   }
