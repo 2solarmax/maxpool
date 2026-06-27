@@ -29,7 +29,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 echo "==> Running tests"
-node --test
+node --test --test-concurrency=1
 
 echo "==> Linting"
 npx eslint src/ || true   # warnings do not block a release
