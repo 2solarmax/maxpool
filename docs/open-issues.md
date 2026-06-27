@@ -29,10 +29,10 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 - Load factor `L` (0..1, from in-flight vs soft target, recent weight, throttle heat) + a late, load-gated `drainBonus` (fires only in a window's final ~12% with quota left, and `×(1-L)` so it vanishes under load) = the "drain a near-reset account only when load is light" behavior.
 **Open knob:** `D` (per-account concurrency where Anthropic 429s). Default 3; add telemetry to auto-tune from live 429-rate-vs-depth.
 
-### 2. Wait-don't-error for the short-term "Server is temporarily limiting requests" throttle
-**Status:** partially done — weekly-cap wait shipped in 1.1.0; the short-term throttle path is NOT yet covered the way the user wants.
-**Problem:** "Server is temporarily limiting requests (not your usage limit)" is Anthropic's shared/short-term throttle (request-wide 429s → `markUpstreamThrottled`). That path queues only `capacityMaxWaitMs` (15 min) and then errors, killing the session. It is NOT the 5h/weekly cap.
-**Plan:** confirm with real runtime evidence (the actual upstream status/headers), then make transient throttles wait+retry up to the user's tolerance instead of dying at 15 min — while keeping genuine "broken upstream" fast-fail distinct.
+### 2. Hold the session on rate-limit instead of killing it (+ routing-oracle correctness) — DONE
+**Status:** SHIPPED (v1.3.0, branch feat/hold-session-and-routing merged to main). 165 tests.
+**What shipped:** A rate-limited STREAMING session is now HELD ALIVE on an SSE heartbeat (up to `streamHoldMaxMs`, 7d) and resumed the instant any account frees — never killed. The hold-vs-error oracle (`nextRetryForRequest`/`_retryInfo`) error-fasts ONLY on genuinely-unrecoverable states (all accounts logged out / weekly-exhausted with unknown reset / no eligible route), and HOLDS finite for everything recoverable (weekly-critical last-resort, 5h cap, rate-limit, cooldown, concurrency cap). Retry-after now reflects the SOONEST real recovery (3-bucket min-merge), not a far weekly reset.
+**Rigor:** 5 full code-review council rounds + focused adversarial passes; every confirmed finding fixed with a red-before/green-after test. Fixes included: session-kill on weekly-critical+unknown-reset, fairness-gate starvation, misleading multi-day retry-after, auth-dead spin, Bug-A heartbeat SSE interleave, post-resume-failover drop, lease-leak on client disconnect, healthy-concurrency-cap symmetry + 15-min bound, non-SSE-resume framing, EPIPE ghost eviction.
 
 ### 3. Remove the import mechanic (browser login only)
 **Status:** agreed, not started.
