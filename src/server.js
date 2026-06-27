@@ -51,8 +51,25 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     mkdir(logDir, { recursive: true }).catch(() => {});
   }
 
+  // Reload drain flag. When the worker releases the baton it sets this so every
+  // remaining response carries `Connection: close`, retiring the client's
+  // keep-alive socket instead of letting it pipeline a NEW request onto a worker
+  // that's shutting down. `connection` is hop-by-hop so it's stripped from the
+  // upstream response headers — a setHeader here survives the later writeHead.
+  let draining = false;
+
+  // Identifies the WORKER process that served a response — proves the supervisor
+  // (which holds the socket but does not serve) never swallowed the request. Set
+  // before any writeHead; `x-maxpool-*` is informative-only and stripped from
+  // upstream-bound request headers elsewhere.
+  const workerStamp = String(process.pid);
+
   const server = http.createServer(async (req, res) => {
     try {
+      try { res.setHeader('x-maxpool-worker', workerStamp); } catch { /* headers sent */ }
+      if (draining) {
+        try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
+      }
       // Auth check — skip for localhost connections
       const clientKey = req.headers['x-api-key'];
       const remoteAddr = req.socket.remoteAddress;
@@ -186,6 +203,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       console.error('[Maxpool] Unhandled error:', err);
     }
   });
+
+  // Begin reload drain: every subsequent response gets `Connection: close` so
+  // keep-alive clients retire their socket and don't pipeline a new request onto
+  // this releasing worker.
+  server.maxpoolBeginDrain = () => { draining = true; };
 
   return server;
 }

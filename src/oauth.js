@@ -4,7 +4,10 @@ import { createInterface } from 'node:readline';
 import http from 'node:http';
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
-const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
+// Token endpoint is overridable via env so a stub OAuth server can be pointed at
+// for integration tests (e.g. the single-use-rotating-token reload torture test).
+const DEFAULT_TOKEN_ENDPOINT = process.env.MAXPOOL_OAUTH_TOKEN_ENDPOINT
+  || 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
 /**

@@ -171,11 +171,65 @@ export async function loadState() {
   }
 }
 
-export async function saveState(state) {
-  await atomicWrite(getStatePath(), JSON.stringify(state, null, 2) + '\n');
+/**
+ * Read just the `_generation` integer of an on-disk JSON file (config or state)
+ * without parsing it as a typed object. Returns 0 when the file is missing,
+ * unreadable, or carries no generation (legacy files), so a first write always
+ * advances to >=1. Never throws.
+ */
+export async function readGeneration(path) {
+  try {
+    const parsed = JSON.parse(await readFile(path, 'utf-8'));
+    const g = Number(parsed?._generation);
+    return Number.isFinite(g) && g > 0 ? g : 0;
+  } catch {
+    return 0;
+  }
 }
 
+/**
+ * Generation-guarded state write (defense-in-depth single-writer enforcement).
+ *
+ * `state.quota` carries the learned quota. We stamp a monotonic `_generation`
+ * and refuse to clobber a file whose on-disk generation is NEWER than the one
+ * we last observed — that means another writer (a stale ex-lease worker) raced
+ * us, and overwriting would revert fresher quota. The baton sequencing already
+ * guarantees a single writer; this guard catches a sequencing bug.
+ *
+ * Pass `{ expectedGeneration }` to assert the on-disk file is still at the
+ * generation you read; omit it to read-then-bump unconditionally (single-owner
+ * fast path). Returns the generation written, or null when refused.
+ */
+let _stateWriteChain = Promise.resolve();
+
+export function saveState(state, { expectedGeneration = null } = {}) {
+  // Serialize state writes (a 60s interval flush can otherwise race the final
+  // baton flush, read the same on-disk generation, and double-write).
+  const run = async () => {
+    const path = getStatePath();
+    const onDisk = await readGeneration(path);
+    if (expectedGeneration != null && onDisk > expectedGeneration) {
+      // A newer writer advanced the file under us — refuse the stale flush.
+      return null;
+    }
+    const next = onDisk + 1;
+    await atomicWrite(path, JSON.stringify({ ...state, _generation: next }, null, 2) + '\n');
+    return next;
+  };
+  const result = _stateWriteChain.then(run, run);
+  _stateWriteChain = result.then(() => {}, () => {});
+  return result;
+}
+
+/** Barrier: resolves once every queued state write has settled. */
+export const flushStateWrites = () => _stateWriteChain;
+
 let _configWriteChain = Promise.resolve();
+
+/** Barrier: resolves once every queued config write (e.g. a fire-and-forget
+ *  token-refresh persist) has settled. Awaited on baton release so a rotated
+ *  token can't be left unwritten when the new worker boots from disk (M3). */
+export const flushConfigWrites = () => _configWriteChain;
 
 /**
  * Serialize an in-process read-modify-write of the config so concurrent updates
@@ -183,16 +237,34 @@ let _configWriteChain = Promise.resolve();
  * (fire-and-forget) racing a TUI account add/delete. Each update re-reads the
  * latest config, applies updater(config), then saves atomically.
  *
+ * Defense-in-depth single-writer guard: the config carries a monotonic
+ * `_generation`. If `guardGeneration` is supplied and the on-disk generation is
+ * already NEWER than it, the write is REFUSED (a stale ex-lease worker raced the
+ * current writer). The updater additionally receives the on-disk generation as
+ * `config._generation` so a refresh updater can SKIP a token rotation it sees a
+ * fresher writer already performed. The generation is bumped on every write.
+ *
  * NOTE: this serializes writes within THIS process only. A separate
  * `maxpool import`/`login` process writing concurrently is not coordinated
  * (that would require a lockfile) — but those are short, rare, human-driven.
  */
-export function atomicConfigUpdate(updater) {
+export function atomicConfigUpdate(updater, { guardGeneration = null } = {}) {
   const run = async () => {
     const config = await loadConfig() || createDefaultConfig();
-    await updater(config);
+    const onDisk = Number(config._generation) || 0;
+    if (guardGeneration != null && onDisk > guardGeneration) {
+      // Refuse: a newer writer already advanced the config. Surface the live
+      // config so the caller can reconcile, but write nothing.
+      const refused = new Error('config generation advanced; stale write refused');
+      refused.code = 'STALE_GENERATION';
+      refused.onDiskGeneration = onDisk;
+      refused.config = config;
+      throw refused;
+    }
+    const result = await updater(config);
+    config._generation = onDisk + 1;
     await saveConfig(config);
-    return config;
+    return result === undefined ? config : result;
   };
   // Run after any in-flight update regardless of whether it resolved or
   // rejected, so one failure doesn't poison the chain; the caller still sees
