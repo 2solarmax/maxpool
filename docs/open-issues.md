@@ -15,7 +15,7 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 ## OPEN
 
 ### 1. Routing: spread-to-stay-healthy; use-it-or-lose-it only near reset  ⟵ CORE
-**Status:** Phase 1 SHIPPED (v1.2.0). Phases 2-3 deferred pending live observation.
+**Status:** Phase 1 SHIPPED (v1.2.0), Phase 2 SHIPPED (v1.4.0). Phase 3 CLOSED 2026-06-27 (not worth building — see below).
 **Problem:** The scheduler over-weighted pace + near-reset (`scarcity×6` was the dominant term), so it *concentrated* load on the single soonest-to-reset account and benched raw-healthy accounts (mk@gomokka at 69% raw) to last-resort "critical" via pace. Concentration is exactly what triggers the short-term throttle — the opposite of the goal.
 **Design:** 3-advocate council + lead-architect synthesis (2026-06-26). Continuous, load-gated additive scoring — no mode switches. Phased "prove-it" rollout.
 **Phase 1 (DONE, v1.2.0):**
@@ -29,10 +29,11 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 - Flap-stable: HOT = `_isNearQuota` (weekly reserve/critical or 5h-cap, NOT live in-flight); migrate only to a `normal/soft/unknown`-weekly alt that is ≥2× cheaper AND a strictly healthier tier; suppressed during queue admission; `_bindSession` re-homes on a same-priority *choice* migration but not on failover (snap-back-on-recovery preserved).
 - This is the fix for "I added an account mid-session but it didn't get picked up": added/cooled capacity now drains in-progress hot sessions at their next safe turn.
 - Pre-mortem (9 failure modes) + focused adversarial review (SHIP); red→green tests for migrate-when-safe-and-hot, never-on-signed-thinking, fail-closed-unparsed, never-when-healthy, queue-suppressed, no-flap, describeRequest fail-closed.
-**Phase 3 (remaining, optional — only if observed):**
-- Per-account `throttlePressure` (decaying ~90s) so the fleet steers *around* a freshly-429'd account (today the throttle is a single global pause).
-- Herd-jitter on the rebalance burst-drain: many sessions on one hot account + a fresh account appear → they migrate in a burst (self-damped by the score-margin backpressure, fine for a small pool, but un-staggered). Add a per-tick migration cap/jitter + a bounded-migrations-per-tick test if the account pool grows. Reviewer-flagged nit, not ship-blocking.
-**Open knob:** `D` (per-account concurrency where Anthropic 429s). Default 3; add telemetry to auto-tune from live 429-rate-vs-depth.
+**Phase 3 — CLOSED 2026-06-27 (not worth building; the premise didn't survive a code read):**
+- ~~Per-account `throttlePressure` so the fleet steers around a freshly-429'd account instead of a "single global pause".~~ FALSE PREMISE: a single 429 already benches only that account (`markRateLimited`, per-account). The global pause (`shouldPromoteUpstreamFailure`) opens ONLY when every eligible account fails the same request AND no healthy account is untried/recently-succeeded — those veto it. So healthy accounts are not swept into it. The only marginal add (de-prefer an account that JUST recovered) is minor tuning, not a correctness gap.
+- ~~Herd-jitter on the rebalance burst-drain.~~ Only bites with a much larger pool; already damped by the score-margin backpressure. Not worth it at ~22 accounts.
+- The "defer pending live observation" framing was hollow — nobody watches a passive metric. The TUI's `Anthropic upstream throttled` line + throttle count IS the live signal; if it recurs WITH healthy accounts idle, the fix would be to the global-pause/probe-recovery window, not these scoring tweaks. Re-open only against a concrete observed regression.
+**Open knob (kept):** `D` (per-account concurrency where Anthropic 429s). Default 3; tune from the TUI throttle signal if 429s cluster at a given depth.
 
 ### 2. Hold the session on rate-limit instead of killing it (+ routing-oracle correctness) — DONE
 **Status:** SHIPPED (v1.3.0, branch feat/hold-session-and-routing merged to main). 165 tests.
