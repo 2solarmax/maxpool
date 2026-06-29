@@ -855,7 +855,10 @@ async function forwardRequest(
         err.message.includes('terminated'));
 
     if (isTransient) {
-      accountManager.markTransientFailure(account.index, err.code || err.message || 'network_error');
+      // Network-class (ECONNRESET / fetch failed / timeout / terminated): short fixed
+      // cooldown, no exponential escalation — the fleet auto-recovers seconds after
+      // connectivity returns instead of being benched for up to 15 min.
+      accountManager.markTransientFailure(account.index, err.code || err.message || 'network_error', { network: true });
       accountManager.releaseAccount(lease);
       excludedIndexes.add(account.index);
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {

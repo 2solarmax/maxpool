@@ -17,6 +17,11 @@ const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT) {
   const maxRetries = 2;
   const baseDelayMs = 500;
+  // Bound each refresh POST so a hung connect during an outage can't pin the
+  // single-flight _refreshPromise indefinitely (which would stall that account's
+  // recovery). Comfortably above a normal refresh latency; a timeout is classified
+  // as a network error below and retried / short-cooled.
+  const perAttemptTimeoutMs = 10_000;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -37,6 +42,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           refresh_token: refreshToken,
           client_id: DEFAULT_CLIENT_ID,
         }),
+        signal: AbortSignal.timeout(perAttemptTimeoutMs),
       });
 
       if (!res.ok) {
@@ -60,6 +66,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
     } catch (err) {
       const isNetworkError = err instanceof Error &&
         (err.message.includes('fetch failed') ||
+          err.name === 'TimeoutError' || err.name === 'AbortError' ||
           (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
            err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT'));
 

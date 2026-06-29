@@ -1346,28 +1346,28 @@ test('NOT over-corrected: thinking + ALL accounts weekly-exhausted behind a queu
 // FIFO-fairness gate skipped the cooled accounts entirely, losing their real (finite)
 // cooldown reset. A thinking request must now HOLD for the soonest real recovery.
 
-test('network-blip: thinking newcomer behind a queue with ALL accounts cooled HOLDS for the real cooldown, never error-kills', () => {
+test('network-blip: thinking newcomer behind a queue with ALL accounts network-cooled HOLDS for the real cooldown, never error-kills', () => {
   const am = healthyPair();
-  am.accounts.forEach((_, i) => am.markTransientFailure(i, 'ECONNRESET')); // VPN/internet drop cooled both
+  am.accounts.forEach((_, i) => am.markTransientFailure(i, 'ECONNRESET', { network: true })); // VPN/internet drop → short fixed cooldown
   am.queueState.waiting.push({ id: 999 });
   const newcomer = { profile: 'claude', stream: true, sessionKey: 'nc', requiresAnthropicThinkingIntegrity: true };
   const plan = am.nextRetryForRequest(newcomer);
   assert.equal(plan.available, false);
   assert.ok(Number.isFinite(plan.retryAfterMs), `must HOLD, got ${plan.retryAfterMs}`);
   assert.equal(plan.cause, 'cooldown', 'holds on the REAL near-term cooldown reset, not a fake 60s fairness hold');
-  assert.ok(plan.retryAfterMs <= 30_000, 'bounded by the cooldown, ~30s');
+  assert.ok(plan.retryAfterMs <= 6_000, 'bounded by the SHORT network cooldown (~5s) → auto-recovers fast, not a 15-min bench');
 });
 
 test('network-blip: holds the SOONEST cooldown across mixed-cooldown accounts behind a queue', () => {
   const am = healthyPair();
-  am.markTransientFailure(0, 'ECONNRESET');        // ~30s default cooldown
-  am.accounts[1].cooldownUntil = Date.now() + 10_000; // sooner
-  am.accounts[1].consecutiveFailures = 1; am.accounts[1].lastError = 'ECONNRESET';
+  am.markTransientFailure(0, 'ECONNRESET', { network: true }); // ~5s network cooldown
+  am.accounts[1].cooldownUntil = Date.now() + 12_000;          // a longer cooldown
+  am.accounts[1].lastError = 'ECONNRESET';
   am.queueState.waiting.push({ id: 999 });
   const newcomer = { profile: 'claude', stream: true, sessionKey: 'nc', requiresAnthropicThinkingIntegrity: true };
   const plan = am.nextRetryForRequest(newcomer);
   assert.ok(Number.isFinite(plan.retryAfterMs));
-  assert.ok(plan.retryAfterMs <= 10_500 && plan.retryAfterMs > 8_000, `min-merges to the ~10s account, got ${plan.retryAfterMs}`);
+  assert.ok(plan.retryAfterMs <= 6_000 && plan.retryAfterMs > 3_000, `min-merges to the soonest (~5s) account, got ${plan.retryAfterMs}`);
 });
 
 test('oracle/selector agree: a fairness-gated thinking account is NEVER reported available (no busy-spin)', () => {
@@ -1379,4 +1379,84 @@ test('oracle/selector agree: a fairness-gated thinking account is NEVER reported
   // must agree, or the caller would loop forever (oracle says go, selector says no).
   assert.equal(plan.available, false, 'oracle never claims available for a gated account');
   assert.equal(am.acquireAccount(newcomer), null, 'selection refuses the gated newcomer (FIFO preserved)');
+});
+
+// --- Regression: network-class failures use a SHORT FIXED cooldown (2026-06-29 outage) ---
+// A 5-6h hotel-network outage expired every OAuth access token; refreshes failed with
+// `fetch failed`, and markTransientFailure's EXPONENTIAL backoff pinned every account at
+// the 15-min cap → the fleet stayed benched long after connectivity returned and needed a
+// manual restart. Network-class failures must instead recover automatically in seconds.
+
+function oauthExpired(name = 'a1') {
+  return { name, type: 'oauth', accessToken: 'at0', refreshToken: 'r0', expiresAt: Date.now() - 1000 };
+}
+
+test('network token-refresh failure → short FIXED cooldown, no escalation, no consecutiveFailures bump', async () => {
+  const refreshAccessToken = async () => { const e = new Error('fetch failed'); e.retryable = true; throw e; }; // no .status → network
+  const am = new AccountManager([oauthExpired()], 0.90,
+    { networkCooldownMs: 5000, cooldownMs: 30_000, maxCooldownMs: 900_000 },
+    { refreshAccessToken });
+  am.setWriterLease(true);
+  am.accounts[0].consecutiveFailures = 3; // a pre-existing REQUEST-health signal
+  const ok = await am.ensureTokenFresh(0, true);
+  const a = am.accounts[0];
+  const dt = a.cooldownUntil - Date.now();
+  assert.equal(ok, false);
+  assert.ok(dt > 3000 && dt <= 5500, `~5s fixed cooldown, not the 15-min bench; got ${dt}ms`);
+  assert.equal(a.consecutiveFailures, 3, 'a network blip must NOT poison the request-health counter');
+  assert.notEqual(a.status, 'error');
+});
+
+test('5xx token-refresh failure stays on the EXPONENTIAL backoff (server-side, not network)', async () => {
+  const refreshAccessToken = async () => { const e = new Error('Token refresh failed (503)'); e.status = 503; e.retryable = true; throw e; };
+  const am = new AccountManager([oauthExpired()], 0.90,
+    { networkCooldownMs: 5000, cooldownMs: 1000, maxCooldownMs: 900_000 },
+    { refreshAccessToken });
+  am.setWriterLease(true);
+  await am.ensureTokenFresh(0, true);
+  const a = am.accounts[0];
+  const dt = a.cooldownUntil - Date.now();
+  assert.equal(a.consecutiveFailures, 1, 'a real server error DOES count toward escalation');
+  assert.ok(dt > 500 && dt <= 1200, `exponential base (~1s), distinct from the 5s network path; got ${dt}ms`);
+});
+
+test('non-retryable refresh failure (invalid_grant 400) still DISABLES the account, never a 5s loop', async () => {
+  const refreshAccessToken = async () => { const e = new Error('invalid_grant'); e.status = 400; e.retryable = false; throw e; };
+  const am = new AccountManager([oauthExpired()], 0.90, {}, { refreshAccessToken });
+  am.setWriterLease(true);
+  await am.ensureTokenFresh(0, true);
+  assert.equal(am.accounts[0].status, 'error', 'a bricked/invalid grant must disable, not short-cool');
+  assert.equal(am.accounts[0].lastError, 'token_refresh_failed');
+});
+
+test('network cooldown is finite even with an EMPTY scheduler config (no NaN strand)', () => {
+  const am = new AccountManager([{ name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.90, {});
+  am.markTransientFailure(0, 'network_error', { network: true });
+  const a = am.accounts[0];
+  const dt = a.cooldownUntil - Date.now();
+  assert.ok(Number.isFinite(a.cooldownUntil) && dt > 0 && dt <= 6000, `default networkCooldownMs applies (~5s), not NaN; got ${dt}`);
+  assert.equal(a.status === 'throttled', false);
+  assert.equal(am._isAvailable(a), false, 'cooled now');
+  a.cooldownUntil = Date.now() - 1;
+  assert.equal(am._isAvailable(a), true, 'auto-recovers the instant the short cooldown elapses');
+});
+
+test('brick-safety: concurrent network-cadence refreshes coalesce to ONE rotation (no single-use double-spend)', async () => {
+  // The 5s cooldown narrows the gap between refresh attempts; the single-flight
+  // _refreshPromise must still serialize them so the old single-use token is never
+  // re-presented after a rotation (which Anthropic answers with invalid_grant → brick).
+  let current = 'r0', rotations = 0; const invalidated = new Set();
+  const refreshAccessToken = async (rt) => {
+    await new Promise(r => setTimeout(r, 20)); // refresh latency > the tiny cooldown
+    if (rt !== current || invalidated.has(rt)) { const e = new Error('invalid_grant'); e.status = 400; e.retryable = false; throw e; }
+    invalidated.add(current); rotations++; current = `r${rotations}`;
+    return { accessToken: `at${rotations}`, refreshToken: current, expiresAt: Date.now() + 3600_000 };
+  };
+  const am = new AccountManager([oauthExpired()], 0.90, { networkCooldownMs: 5 }, { refreshAccessToken });
+  am.setWriterLease(true);
+  const results = await Promise.all(Array.from({ length: 8 }, () => am.ensureTokenFresh(0, true)));
+  assert.ok(results.every(r => r === true), 'all 8 coalesced refreshes succeed');
+  assert.equal(rotations, 1, 'single-flight coalescing → exactly ONE rotation; old token never re-presented');
+  assert.equal(am.accounts[0].refreshToken, 'r1');
+  assert.notEqual(am.accounts[0].status, 'error', 'never bricked');
 });

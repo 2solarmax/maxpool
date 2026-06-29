@@ -680,7 +680,7 @@ test('queued streaming request HOLDS on a recovery network failure, then termina
     req.socket.destroy(); // recovery connection keeps failing (persistent outage)
   });
   const upstreamPort = await listen(upstream);
-  const am = new AccountManager(accounts(), 0.90);
+  const am = new AccountManager(accounts(), 0.90, { networkCooldownMs: 50 });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
@@ -1829,7 +1829,7 @@ test('network blip: a STREAMING request whose upstream connection RESETS holds t
     res.end('event: message\ndata: {"ok":true,"resumed":true}\n\n');
   });
   const upstreamPort = await listen(upstream);
-  const am = new AccountManager(accounts(), 0.90, { cooldownMs: 80, maxCooldownMs: 80 });
+  const am = new AccountManager(accounts(), 0.90, { cooldownMs: 80, maxCooldownMs: 80, networkCooldownMs: 80 });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
@@ -1858,7 +1858,7 @@ test('network blip: a NON-streaming request still fails fast (no keepalive to ho
   // die on the client's own timeout — fail fast with an honest connection error instead.
   const upstream = http.createServer((req) => { req.socket.destroy(); });
   const upstreamPort = await listen(upstream);
-  const am = new AccountManager(accounts(), 0.90, { cooldownMs: 80, maxCooldownMs: 80 });
+  const am = new AccountManager(accounts(), 0.90, { cooldownMs: 80, maxCooldownMs: 80, networkCooldownMs: 80 });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,

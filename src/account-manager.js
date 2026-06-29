@@ -48,6 +48,10 @@ const DEFAULT_SCHEDULER = {
   safetyMaxGlobalActive: 150,
   cooldownMs: 30_000,
   maxCooldownMs: 15 * 60_000,
+  // Fixed cooldown for NETWORK-class failures (lost connectivity / token-refresh
+  // fetch-failed). Short + non-escalating so the fleet auto-recovers seconds after
+  // connectivity returns, instead of the exponential maxCooldownMs bench.
+  networkCooldownMs: 5_000,
   weeklySoftThreshold: 0.65,
   weeklyReserveThreshold: 0.85,
   weeklyCriticalThreshold: 0.95,
@@ -1698,9 +1702,28 @@ export class AccountManager {
     console.log(`[Maxpool] Account "${account.name}" disabled after HTTP ${status} (${reason})`);
   }
 
-  markTransientFailure(accountIndex, reason = 'transient_error') {
+  markTransientFailure(accountIndex, reason = 'transient_error', { network = false } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    if (network) {
+      // A network-class failure (lost connectivity / token-refresh `fetch failed`)
+      // is a FLEET-WIDE condition, not this account's fault — every account fails at
+      // once. Use a SHORT FIXED cooldown so the whole fleet retries within seconds of
+      // connectivity returning and recovers AUTOMATICALLY, never the exponential
+      // 15-min bench that stranded the fleet long after a multi-hour outage and forced
+      // a manual restart (2026-06-29 hotel-network nightly cutoff). Deliberately does
+      // NOT bump consecutiveFailures: a network blip must not poison the scoring
+      // penalty (_scoreAccount) or prime the next REAL per-account failure for the max
+      // cooldown — so the counter stays a pure request-health signal and needs no reset.
+      account.failedRequests++;
+      account.lastError = reason;
+      account.lastErrorAt = Date.now();
+      account.cooldownUntil = Date.now() + this.scheduler.networkCooldownMs;
+      console.log(`[Maxpool] Account "${account.name}" cooling down for ${Math.ceil(this.scheduler.networkCooldownMs / 1000)}s after ${reason} (network — short fixed, auto-recovers)`);
+      return;
+    }
+
     const failures = Math.max(1, account.consecutiveFailures + 1);
     const cooldown = Math.min(
       this.scheduler.maxCooldownMs,
@@ -1812,7 +1835,11 @@ export class AccountManager {
         // a failed proactive refresh shouldn't kill a still-valid token
         if (!account.expiresAt || Date.now() >= account.expiresAt) {
           if (err.retryable) {
-            this.markTransientFailure(accountIndex, `token_refresh_${err.status || 'network'}`);
+            // A retryable refresh failure with NO HTTP status is a network/connectivity
+            // failure (fetch failed / timeout) → short fixed cooldown so it auto-recovers
+            // when the network returns. A retryable HTTP status (429 / 5xx from the OAuth
+            // endpoint) is server-side → keep the exponential backoff.
+            this.markTransientFailure(accountIndex, `token_refresh_${err.status || 'network'}`, { network: !err.status });
           } else {
             this.markAuthFailed(accountIndex, err.status || 401, 'token_refresh_failed');
           }

@@ -59,6 +59,10 @@ export function createDefaultConfig() {
       safetyMaxGlobalActive: 150,
       cooldownMs: 30_000,
       maxCooldownMs: 15 * 60_000,
+      // Fixed cooldown for network-class failures (lost connectivity / token-refresh
+      // fetch-failed) — short + non-escalating so the fleet auto-recovers seconds after
+      // connectivity returns, never the exponential maxCooldownMs bench.
+      networkCooldownMs: 5_000,
       // Weekly (7d) quota tiers — how aggressively to de-prioritise an account
       // as its weekly usage climbs. Each is a fraction (0..1) of the weekly
       // limit. Below soft = full speed; soft..reserve = mild penalty;
