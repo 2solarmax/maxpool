@@ -26,6 +26,23 @@ const SERVER_WORKER_ENV = 'MAXPOOL_SERVER_WORKER';
 // worker boots HEADLESS (plain logs, no writer lease) and waits for the baton.
 const SERVER_RELOAD_WORKER_ENV = 'MAXPOOL_RELOAD_WORKER';
 
+// Is maxpool attached to an interactive terminal? Governs SIGNAL semantics: in a
+// terminal a SIGHUP means "the window hung up → shut down" (never reload into a
+// headless orphan that outlives the terminal and squats the port); headless /
+// service mode keeps SIGHUP as the conventional reload trigger. MAXPOOL_FORCE_TTY
+// lets the (non-pty) test suite exercise the terminal-hangup path deterministically.
+function isInteractiveTerminal() {
+  return Boolean(process.stdout.isTTY) || process.env.MAXPOOL_FORCE_TTY === '1';
+}
+
+// Which reload path an in-process reload request takes. Interactive (a live TUI)
+// reloads via a FULL cold restart so the fresh worker re-renders the TUI — a
+// seamless reload worker boots headless and would strand the user in raw logs.
+// Headless/service keeps the zero-downtime baton (nothing visual to lose).
+function reloadStrategy({ supervised, useTUI }) {
+  return supervised && !useTUI ? 'seamless' : 'cold-restart';
+}
+
 switch (command) {
   case 'server':
     await serverCommand();
@@ -149,9 +166,18 @@ async function supervisorCommand() {
   const forwardSignal = sig => { try { activeWorker?.child.kill(sig); } catch { /* ignore */ } };
   process.on('SIGINT', () => { /* delivered to the worker by the TTY group */ });
   process.on('SIGTERM', () => { /* delivered to the worker by the TTY group */ });
-  // SIGHUP (from `kill -HUP <supervisor-pid>`) reaches ONLY the supervisor →
-  // forward it so the worker requests a seamless reload.
-  process.on('SIGHUP', () => forwardSignal('SIGHUP'));
+  // SIGHUP: in a terminal, a window hangup delivers SIGHUP to the whole foreground
+  // group, so the worker ALSO received it and (interactive) is already shutting
+  // itself down — the supervisor must NOT forward a second signal, or the worker
+  // gets a doubled signal that force-quits it mid-drain (non-zero exit → a fast
+  // exit is then misread as a crash → respawn into a headless orphan, the exact
+  // bug). Only forward in headless/service mode, where SIGHUP is the conventional
+  // reload trigger and reaches the supervisor alone.
+  process.on('SIGHUP', () => { if (!isInteractiveTerminal()) forwardSignal('SIGHUP'); });
+  // A dead controlling terminal (window closed) makes writes to stdout/stderr emit
+  // EPIPE/EIO — swallow them so a shutdown-time log can't crash the supervisor.
+  process.stdout.on('error', () => {});
+  process.stderr.on('error', () => {});
   // A spawn failure / stray rejection must NOT kill the supervisor (it would
   // wedge the port and drop the service). Log and let the supervision loop or
   // the reload's own error handling recover.
@@ -563,9 +589,15 @@ async function serverWorkerCommand() {
     console.error(`[Maxpool] Worker uncaughtException: ${err?.stack || err}`);
     restoreTerminal();
     // A reload worker must NEVER exit(1) (escapes the supervisor exit-75 loop).
-    // Stay alive so the supervisor's baton timeouts roll us back cleanly.
-    if (!isReloadWorker) process.exit(SERVER_RESTART_EXIT_CODE);
+    // Stay alive so the supervisor's baton timeouts roll us back cleanly. Also
+    // skip the exit-75 restart while DRAINING: a shutdown-time write to a dead
+    // terminal can throw here, and restarting then would respawn the very orphan
+    // a terminal-close shutdown is trying to avoid — let the drain finish instead.
+    if (!isReloadWorker && !draining) process.exit(SERVER_RESTART_EXIT_CODE);
   });
+  // Swallow EPIPE/EIO from writes to a hung-up terminal so they can't crash us.
+  process.stdout.on('error', () => {});
+  process.stderr.on('error', () => {});
   process.on('unhandledRejection', reason => {
     console.error(`[Maxpool] Worker unhandledRejection: ${reason}`);
   });
@@ -636,7 +668,17 @@ async function serverWorkerCommand() {
     // the respawned worker doesn't boot from a half-written state. Bounded so the
     // abrupt path stays fast even if a write hangs.
     Promise.race([
-      (async () => { await persistQuotaState(); await releaseLease(); await flushConfigWrites(); await flushStateWrites(); })(),
+      (async () => {
+        // Drain in-flight token refreshes before exit so the cold-respawned worker
+        // never boots mid-rotation of a single-use refresh token (→ invalid_grant
+        // → bricked account). Mirrors shutdownGracefully + the seamless baton's
+        // drainRefreshes — required now that interactive reload routes through here.
+        await releaseLease();
+        await accountManager.drainRefreshes();
+        await persistQuotaState(true);
+        await flushConfigWrites();
+        await flushStateWrites();
+      })(),
       delay(2000),
     ]).finally(() => process.exit(SERVER_RESTART_EXIT_CODE));
   };
@@ -646,7 +688,9 @@ async function serverWorkerCommand() {
   // (not supervised, no IPC), fall back to the abrupt restart.
   const requestReload = () => {
     if (draining) return;
-    if (supervised) {
+    // Interactive (live TUI) → full cold restart so the fresh worker re-renders the
+    // TUI; headless/service → zero-downtime seamless baton (nothing visual to lose).
+    if (reloadStrategy({ supervised, useTUI }) === 'seamless') {
       try {
         process.send({ type: MSG_RELOAD_REQUEST });
         return;
@@ -661,9 +705,15 @@ async function serverWorkerCommand() {
   });
 
   const shutdownGracefully = (reason, options = {}) => {
+    // A terminal-close shutdown must NEVER exit non-zero: the supervisor reads a
+    // fast non-zero exit as a crash and respawns a fresh worker — onto the now-dead
+    // terminal, re-creating the headless orphan. So even a drain-timeout or close
+    // error during a terminal close exits 0 (the terminal is gone; there's nothing
+    // to keep alive for).
+    const cleanExitCode = options.terminalClose ? 0 : 1;
     if (draining) {
       console.error(`\n[Maxpool] Force exiting with ${restartController.activeRequests.size} active request(s) still open.`);
-      process.exit(1);
+      process.exit(cleanExitCode);
     }
 
     draining = true;
@@ -704,14 +754,14 @@ async function serverWorkerCommand() {
 
     timeoutTimer = setTimeout(() => {
       console.error(`[Maxpool] Drain timeout after ${Math.ceil(drainTimeoutMs / 1000)}s; exiting with ${restartController.activeRequests.size} active request(s) still open.`);
-      finish(1);
+      finish(cleanExitCode);
     }, drainTimeoutMs);
     timeoutTimer.unref();
 
     server.close(err => {
       if (err) {
         console.error(`[Maxpool] Shutdown error: ${err.message}`);
-        finish(1);
+        finish(cleanExitCode);
         return;
       }
       console.log('[Maxpool] Shutdown complete.');
@@ -936,9 +986,11 @@ async function serverWorkerCommand() {
 
   process.on('SIGINT', () => shutdownGracefully('SIGINT'));
   process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
-  // SIGHUP requests a seamless reload (the conventional "reload" signal). Under
-  // the supervisor this runs the baton; otherwise it falls back to exit-75.
-  process.on('SIGHUP', () => requestReload());
+  // SIGHUP: in a terminal this means the controlling window hung up (closed) →
+  // drain + exit cleanly so we never reload into a headless orphan that outlives
+  // the terminal and squats the port. Headless/service mode keeps SIGHUP as the
+  // conventional reload signal (baton under the supervisor, else exit-75).
+  process.on('SIGHUP', () => { if (isInteractiveTerminal()) shutdownGracefully('SIGHUP', { terminalClose: true }); else requestReload(); });
 }
 
 function logPlainServerStart({ host, port, accounts, threshold, config }) {
