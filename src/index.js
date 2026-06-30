@@ -2,7 +2,8 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
+import { setEventLogPath, installConsoleMirror } from './event-log.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { Prober } from './prober.js';
@@ -33,6 +34,17 @@ const SERVER_RELOAD_WORKER_ENV = 'MAXPOOL_RELOAD_WORKER';
 // lets the (non-pty) test suite exercise the terminal-hangup path deterministically.
 function isInteractiveTerminal() {
   return Boolean(process.stdout.isTTY) || process.env.MAXPOOL_FORCE_TTY === '1';
+}
+
+// Wire up the persistent event log (default-on; disable with `eventLog: false` in
+// config). Sets the path + tees console.log/error to disk so routing, network
+// errors, cooldowns and reloads survive the in-memory TUI feed for later triage.
+function initEventLog(config, { manageRotation = false } = {}) {
+  if (config?.eventLog === false) return;
+  try {
+    setEventLogPath(getLogPath(), { manageRotation });
+    installConsoleMirror();
+  } catch { /* logging must never block startup */ }
 }
 
 // Which reload path an in-process reload request takes. Interactive (a live TUI)
@@ -127,6 +139,7 @@ async function serverCommand() {
 async function supervisorCommand() {
   const { createServer } = await import('node:net');
   const config = await loadOrCreateConfig();
+  initEventLog(config, { manageRotation: true }); // supervisor is the single rotation owner
   const port = config.proxy.port;
   const host = config.proxy.host || '127.0.0.1';
 
@@ -433,6 +446,8 @@ function delay(ms) {
 
 async function serverWorkerCommand() {
   const config = await loadOrCreateConfig();
+  // The lone unsupervised worker owns rotation; under a supervisor, the supervisor does.
+  initEventLog(config, { manageRotation: typeof process.send !== 'function' });
 
   // --log-to <dir>
   const logTo = argValue('--log-to');

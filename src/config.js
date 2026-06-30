@@ -28,6 +28,16 @@ export function getStatePath() {
   return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.state.json') : cfg + '.state';
 }
 
+/**
+ * Path to the persistent event log (a sibling of the config). Default-on; holds a
+ * rotating record of routing / network errors / cooldowns / reloads so incidents
+ * are investigable after the in-memory TUI feed has scrolled away.
+ */
+export function getLogPath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.log') : cfg + '.log';
+}
+
 export function createDefaultConfig() {
   return {
     proxy: {

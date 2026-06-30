@@ -874,6 +874,9 @@ async function forwardRequest(
       );
       if (queued) return;
       ctx.status = 503;
+      // Record the user-facing failure explicitly so it's greppable in the event
+      // log (the in-memory TUI feed scrolls away). `err` is the last network error.
+      console.error(`[Maxpool] Returned connection_unavailable (503) after network errors on all routes (last: "${account.name}" — ${err.code || err.message})`);
       sendErrorResponse(res, requestInfo, 503, {
         type: 'error',
         error: {

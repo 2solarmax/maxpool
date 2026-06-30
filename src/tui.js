@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline';
 import { fetchProfile, loginOAuth } from './oauth.js';
+import { appendEventLog } from './event-log.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -284,6 +285,9 @@ export class TUI {
 
   _addLog(msg) {
     msg = msg.replace(/^\[Maxpool\]\s*/, '');
+    // Persist too — in TUI mode console is re-pointed here, bypassing the console
+    // mirror, so this is where TUI-mode lines reach the on-disk event log.
+    appendEventLog(msg);
     this.log.unshift({ t: timestamp(), msg });
     if (this.log.length > 200) this.log.length = 200;
     if (this.running) this.render();
