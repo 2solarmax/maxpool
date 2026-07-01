@@ -1,6 +1,6 @@
 {
   "name": "maxpool",
-  "version": "1.5.5",
+  "version": "1.5.6",
   "description": "Multi-account Claude Code proxy with adaptive, rate-aware load balancing across Claude accounts",
   "type": "module",
   "main": "src/index.js",
