@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
 import { setEventLogPath, installConsoleMirror } from './event-log.js';
+import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { Prober } from './prober.js';
@@ -469,6 +470,14 @@ async function serverWorkerCommand() {
 
   const threshold = config.switchThreshold || 0.90;
   const accountManager = new AccountManager(accounts, threshold, config.scheduler || {});
+  // (macOS) Keep the system awake ONLY while there is work in flight or queued, so a
+  // long overnight streaming request survives Maintenance Sleep; the Mac sleeps
+  // normally when idle. Disable via `preventSleep: false` in config.
+  const sleepGuard = new SleepGuard({
+    enabled: config.preventSleep !== false && process.platform === 'darwin' && process.env.MAXPOOL_DISABLE_SLEEP_GUARD !== '1',
+    getWorkPending: () => accountManager.getGlobalInFlight() > 0 || accountManager.queueState.waiting.length > 0,
+    log: msg => console.log(`[Maxpool] ${msg}`),
+  });
   accountManager.setRoutingMode(
     config.routing?.mode,
     config.routing?.preferredAccount,
@@ -656,6 +665,7 @@ async function serverWorkerCommand() {
       quotaSaveInterval.unref?.();
     }
     prober.start();
+    sleepGuard.start(); // (macOS) keep the system awake while serving, so long streams survive Maintenance Sleep
   };
   // Stop scheduling writes and flip the lease. Returns a promise that settles
   // once any in-flight prober cycle has finished (so no probe-driven token
@@ -666,6 +676,7 @@ async function serverWorkerCommand() {
     hasLease = false;
     if (quotaSaveInterval) { clearInterval(quotaSaveInterval); quotaSaveInterval = null; }
     accountManager.setWriterLease(false);
+    sleepGuard.stop(); // release the wake — only the active lease-holder keeps the Mac awake
     await prober.stop(); // awaits any in-flight probe cycle (B1)
   };
 

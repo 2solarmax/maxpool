@@ -46,6 +46,10 @@ export function createDefaultConfig() {
       apiKey: 'mp-' + randomBytes(24).toString('base64url'),
     },
     upstream: 'https://api.anthropic.com',
+    // (macOS) Keep the system awake while requests are in flight so long overnight
+    // streams survive Maintenance Sleep; the Mac sleeps normally when idle. Set false
+    // to disable. AC power only; the display still sleeps (screen stays dark).
+    preventSleep: true,
     // On startup, check npm for a newer maxpool and notify. Set false to disable.
     updateCheck: true,
     // When true, a newer version is installed automatically (npm i -g maxpool@latest)

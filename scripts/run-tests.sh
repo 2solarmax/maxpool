@@ -11,6 +11,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Tests spawn real supervisor+worker subprocesses; on macOS the sleep-guard would
+# spawn `caffeinate` children (harmless — they die with their worker via -w — but
+# noisy and would keep the dev box awake during the run). Disable it for the suite.
+export MAXPOOL_DISABLE_SLEEP_GUARD=1
+
 # Fast, in-process tests (everything except the subprocess-spawning reload files).
 fast=()
 for f in test/*.test.js; do
