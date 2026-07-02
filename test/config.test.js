@@ -16,6 +16,39 @@ test('default config uses automatic routing', () => {
   });
 });
 
+test('quota prober is enabled by default', () => {
+  // Off-by-default left maxpool blind to idle / out-of-band-used accounts, which
+  // the scorer then preferred and drove to exhaustion. Probing must be on.
+  assert.equal(createDefaultConfig().quotaProbeSeconds, 60);
+});
+
+test('loadConfig backfills absent keys from current defaults (existing installs get new defaults)', async () => {
+  await withTempConfig(async (dir, path) => {
+    // A pre-existing config WITHOUT quotaProbeSeconds — exactly like the real
+    // on-disk file. Flipping the default alone must actually reach it.
+    await writeFile(path, JSON.stringify({
+      proxy: { port: 3456, host: '127.0.0.1', apiKey: 'mp-x' },
+      accounts: [{ name: 'one', type: 'apikey', apiKey: 'sk-1' }],
+    }));
+    const cfg = await loadConfig();
+    assert.equal(cfg.quotaProbeSeconds, 60, 'absent quotaProbeSeconds must inherit the default');
+    // Present keys are preserved untouched — an explicit user value always wins.
+    assert.equal(cfg.proxy.port, 3456);
+    assert.deepEqual(cfg.accounts.map(a => a.name), ['one']);
+  });
+});
+
+test('loadConfig never overrides an explicitly-set key with a default', async () => {
+  await withTempConfig(async (dir, path) => {
+    await writeFile(path, JSON.stringify({
+      proxy: { port: 3456, host: '127.0.0.1', apiKey: 'mp-x' },
+      accounts: [], quotaProbeSeconds: 0, // user deliberately disabled probing
+    }));
+    const cfg = await loadConfig();
+    assert.equal(cfg.quotaProbeSeconds, 0, 'an explicit 0 must be respected, not clobbered by the default');
+  });
+});
+
 async function withTempConfig(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-cfg-'));
   const path = join(dir, 'maxpool.json');

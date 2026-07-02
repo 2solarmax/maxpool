@@ -62,7 +62,11 @@ export function createDefaultConfig() {
     // Raise toward 0.97 to squeeze more out of accounts before rotating
     // (less margin, slightly higher 429 risk); lower to rotate more eagerly.
     switchThreshold: 0.90,
-    quotaProbeSeconds: 0, // background quota probe; 0 = off (opt-in)
+    // Background quota probe: poll every account's real 5h/7d utilization from the
+    // zero-spend usage endpoint every N seconds. ON by default — without it maxpool
+    // is blind to idle / out-of-band-used accounts and the scorer will pile traffic
+    // onto exactly the account it cannot see. 0 = off.
+    quotaProbeSeconds: 60,
     routing: {
       mode: 'automatic',
       preferredAccount: null,
@@ -135,8 +139,9 @@ export async function loadConfig() {
     if (err.code === 'ENOENT') return null;
     throw err;
   }
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch (err) {
     // With atomic temp+rename writes a torn read is impossible, so a parse
     // failure means genuine corruption. Surface it clearly rather than as a
@@ -144,6 +149,18 @@ export async function loadConfig() {
     // the file with defaults and lose recoverable OAuth credentials.
     throw new Error(`config at ${path} is not valid JSON (corrupt?): ${err.message}`);
   }
+  // Backfill top-level keys ABSENT from an older on-disk config with the current
+  // defaults, so a changed default (e.g. quotaProbeSeconds flipping on) actually
+  // reaches existing installs instead of shipping inert. A key that is present —
+  // even falsy, like an explicit `0` — is an intentional user choice and always
+  // wins; only genuinely-missing keys inherit the default.
+  if (parsed && typeof parsed === 'object') {
+    const defaults = createDefaultConfig();
+    for (const key of Object.keys(defaults)) {
+      if (!(key in parsed)) parsed[key] = defaults[key];
+    }
+  }
+  return parsed;
 }
 
 export async function loadOrCreateConfig() {

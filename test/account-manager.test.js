@@ -1460,3 +1460,29 @@ test('brick-safety: concurrent network-cadence refreshes coalesce to ONE rotatio
   assert.equal(am.accounts[0].refreshToken, 'r1');
   assert.notEqual(am.accounts[0].status, 'error', 'never bricked');
 });
+
+test('scorer never prefers an unknown-quota account over a known-empty one (no blind pile-on)', () => {
+  // Regression: a blind account (quota unknown because the prober is off / it is
+  // being burned in a direct out-of-band session) must NOT be scored as the most
+  // attractive routing target. Previously an unknown account got a -0.5 bonus AND
+  // zero pace cost, so maxpool preferentially piled traffic onto exactly the
+  // account it could not see — driving it to exhaustion while healthy ones idled.
+  const am = manager(2);
+  const now = Date.now();
+  // account 0: KNOWN + empty (0% util both windows, resets known-future)
+  Object.assign(am.accounts[0].quota, {
+    unified5h: 0, unified5hReset: now + 5 * 3600_000,
+    unified7d: 0, unified7dReset: now + 7 * 24 * 3600_000,
+  });
+  // account 1: fully UNKNOWN (all null)
+  Object.assign(am.accounts[1].quota, {
+    unified5h: null, unified5hReset: null, unified7d: null, unified7dReset: null,
+  });
+  const ctx = { now };
+  const knownScore = am._scoreAccount(am.accounts[0], { weight: 1 }, ctx);
+  const unknownScore = am._scoreAccount(am.accounts[1], { weight: 1 }, ctx);
+  assert.ok(
+    unknownScore >= knownScore,
+    `unknown-quota account must not be preferred over a known-empty one (unknown=${unknownScore}, known=${knownScore})`,
+  );
+});

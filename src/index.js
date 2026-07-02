@@ -530,8 +530,13 @@ async function serverWorkerCommand() {
   // Persist quota every minute; unref so it never keeps the process alive.
   let quotaSaveInterval = null;
 
-  // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
-  const prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
+  // Background quota probe (config.quotaProbeSeconds, default 60s). Keeps every
+  // account's real 5h/7d utilization fresh so the scorer is never blind to an idle
+  // or out-of-band-used account. MAXPOOL_DISABLE_QUOTA_PROBE=1 forces it off — used
+  // by spawned integration tests so a startup probe can't race their refresh/rotation
+  // assertions (mirrors MAXPOOL_DISABLE_SLEEP_GUARD).
+  const probeSeconds = process.env.MAXPOOL_DISABLE_QUOTA_PROBE === '1' ? 0 : (config.quotaProbeSeconds || 0);
+  const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000 });
 
   // Persist refreshed tokens back to config. Defense-in-depth: the updater reads
   // the on-disk refresh token and SKIPS the rotation if a fresher writer already

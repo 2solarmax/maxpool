@@ -1,10 +1,11 @@
-// Opt-in background quota probe.
+// Background quota probe.
 //
-// DISABLED BY DEFAULT. When enabled (config.quotaProbeSeconds > 0), periodically
+// ON BY DEFAULT (config.quotaProbeSeconds, default 60s; 0 = off). Periodically
 // reads each OAuth account's quota from the zero-spend /api/oauth/usage endpoint
-// so idle accounts' utilization/reset stay fresh without waiting to be rotated
-// to — and without consuming any message quota. This is the one sanctioned
-// active-upstream feature; the proxy is otherwise passive.
+// so idle / out-of-band-used accounts' utilization/reset stay fresh without waiting
+// to be rotated to — and without consuming any message quota. Without it the scorer
+// is blind to an account it isn't actively routing to and will pile traffic onto it.
+// This is the one sanctioned active-upstream feature; the proxy is otherwise passive.
 
 import { fetchUsage } from './oauth.js';
 

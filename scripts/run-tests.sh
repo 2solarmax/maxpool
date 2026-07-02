@@ -15,6 +15,10 @@ cd "$(dirname "$0")/.."
 # spawn `caffeinate` children (harmless — they die with their worker via -w — but
 # noisy and would keep the dev box awake during the run). Disable it for the suite.
 export MAXPOOL_DISABLE_SLEEP_GUARD=1
+# Quota probing is on by default in real installs, but a startup probe would fire a
+# token refresh / hit stubs and race the reload+refresh rotation-count assertions.
+# Disable it fleet-wide for spawned servers; quota-probe.test.js drives Prober directly.
+export MAXPOOL_DISABLE_QUOTA_PROBE=1
 
 # Fast, in-process tests (everything except the subprocess-spawning reload files).
 fast=()

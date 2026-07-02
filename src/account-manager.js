@@ -1432,11 +1432,15 @@ export class AccountManager {
 
     const ramp = this._recoveryRamp(account, now);
     const failurePenalty = account.consecutiveFailures * 5;
-    // Bias toward an account whose weekly quota is still unknown so it gets
-    // probed and learned (matches the legacy unknown-quota exploration nudge).
-    const explorationBonus = account.quota.unified7dReset == null ? -0.5 : 0;
+    // NO unknown-quota bonus. An account whose quota we cannot see must never be
+    // MORE attractive than a known-healthy one — the old -0.5 nudge (safe only
+    // while the prober quickly resolved "unknown") turned into a relentless pull
+    // toward blind accounts once probing was off, driving an out-of-band-burned
+    // account to exhaustion. Unknown now scores neutral; the prober (on by
+    // default) learns the real number within a cycle. `probing`/requalify still
+    // flags a never-seen account for learning — that path is unchanged.
 
-    return concurrency + capPenalty + paceCost + spread + ramp + failurePenalty + explorationBonus;
+    return concurrency + capPenalty + paceCost + spread + ramp + failurePenalty;
   }
 
   /**
