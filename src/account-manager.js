@@ -71,6 +71,14 @@ const DEFAULT_SCHEDULER = {
   recoveryRampWeight: 4,          // decaying penalty applied to a just-recovered account
   recoveryRampMs: 5 * 60_000,     // how long the post-recovery ramp lasts
   spreadWindowMs: 15 * 60_000,    // rolling window used to measure recent per-account load
+  // Allow a signed-thinking session to rebalance onto a DIFFERENT Claude account
+  // (never a provider — GLM/Kimi can't validate an Anthropic signature). Anthropic
+  // thinking-block signatures are content/model integrity, NOT account-bound —
+  // verified empirically 2026-07-02 (a `partnerships`-signed block replayed under
+  // `personal` returned 200). DEFAULT OFF until the revert-to-issuer fail-safe lands
+  // (issue #16): with it off, a heavy thinking session still can't strand an account,
+  // but it also can't poison a session if Anthropic ever changes the contract.
+  crossAccountThinkingMigration: false,
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -948,16 +956,31 @@ export class AccountManager {
    *  body signal only — never the session-sticky policy — and fails CLOSED on any
    *  body we couldn't fully scan (non-JSON / parse error → bodyThinkingScanned unset). */
   _migrationSafeForRequest(requestInfo = {}) {
-    return requestInfo.bodyThinkingScanned === true
-      && requestInfo.requiresAnthropicThinkingIntegrity !== true;
+    // Fail closed on any body we couldn't fully scan (non-JSON / parse error).
+    if (requestInfo.bodyThinkingScanned !== true) return false;
+    // A signed-thinking request is migration-safe when cross-account thinking
+    // migration is enabled: the signature is content/model integrity, not account-
+    // bound, and the rebalance candidate filter (_matchesRequest → _isRequestCompatible)
+    // already bars providers for thinking, so every eligible target is a Claude
+    // account. When the flag is off, keep the conservative bar (never migrate signed
+    // thinking) until the revert-to-issuer fail-safe lands (#16).
+    if (requestInfo.requiresAnthropicThinkingIntegrity === true) {
+      return this.scheduler.crossAccountThinkingMigration === true;
+    }
+    return true;
   }
 
-  /** Flap-stable "hot": weekly reserve/critical or 5h-cap pressure — signals that
-   *  do NOT flip the instant a request migrates (unlike live in-flight, left to the
-   *  score loop). A healthy bound account is never hot, so it never migrates → no
-   *  ping-pong. */
+  /** Flap-stable "hot": burn-PACE reserve/critical/exhausted, or immediate session-
+   *  quota pressure (5h cap or an API-key token/request limit via
+   *  `_isSessionQuotaUnavailable`).
+   *  Pace (not raw level) is the right trigger — it spreads a long/heavy session's
+   *  later load onto fresh capacity BEFORE it exhausts one account, while a light or
+   *  near-reset session (whose pace stays normal) never triggers → no churn. Does
+   *  NOT flip the instant a request migrates (unlike live in-flight, left to the
+   *  score loop), so a healthy bound account never ping-pongs. */
   _isBoundAccountHot(account) {
-    return this._isNearQuota(account);
+    return this._isSessionQuotaUnavailable(account)
+      || ['reserve', 'critical', 'exhausted'].includes(this._weeklyPaceState(account));
   }
 
   /** Decide whether a bound session should leave its (hot) account THIS request.
@@ -970,7 +993,11 @@ export class AccountManager {
     if (!this._isBoundAccountHot(bound)) return false;
 
     const boundScore = this._scoreAccount(bound, requestInfo, scoringCtx);
-    const boundTier = WEEKLY_TIER[this._weeklyRawState(bound)] ?? 0;
+    // Tier guard on the SAME axis as the trigger (pace, not raw). If the trigger is
+    // pace but the tier guard is raw, a pace-hot fast-burner whose RAW tier is still
+    // `normal` can never find a strictly-healthier raw tier → migration never fires
+    // for the exact account this is meant to relieve. Match the axes.
+    const boundTier = WEEKLY_TIER[this._weeklyPaceState(bound)] ?? 0;
 
     let bestScore = Infinity;
     let bestTier = Infinity;
@@ -983,7 +1010,7 @@ export class AccountManager {
       const score = this._scoreAccount(account, requestInfo, scoringCtx);
       if (score < bestScore) {
         bestScore = score;
-        bestTier = WEEKLY_TIER[this._weeklyRawState(account)] ?? 0;
+        bestTier = WEEKLY_TIER[this._weeklyPaceState(account)] ?? 0;
       }
     }
     if (!Number.isFinite(bestScore)) return false; // no healthy alternative

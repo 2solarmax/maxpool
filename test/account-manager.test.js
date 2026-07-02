@@ -1249,6 +1249,82 @@ test('rebalance: does not flap — once on the fresh account it stays (HOT gate 
   assert.equal(again.account.name, 'a2', 'healthy current account is not hot → no migration back');
 });
 
+// raw-normal (<0.65) but burning fast early in the week → pace reserve/critical.
+// The OLD raw-based trigger would NOT call this hot (so no migration); the pace
+// trigger does — spreading a heavy session's later load before it exhausts.
+function paceHot(account) {
+  account.quota.unified7d = 0.58;                                   // raw NORMAL (<0.65)
+  account.quota.unified7dReset = Date.now() + 7 * 24 * 3600 * 1000 - 60_000; // ~0% into week → high burn debt
+}
+
+test('rebalance: a fast-BURNER (raw-normal, pace-reserve) migrates — the raw trigger would have missed it', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+  paceHot(a1); a1.inFlight = 6; fresh(a2);
+  assert.equal(am._weeklyRawState(a1), 'normal', 'raw state is normal — old trigger would not fire');
+  assert.ok(['reserve', 'critical'].includes(am._weeklyPaceState(a1)), 'pace state is hot');
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(next.account.name, 'a2', 'pace-hot + much-healthier alt → migrates');
+});
+
+test('rebalance: signed thinking MIGRATES across Claude accounts when crossAccountThinkingMigration is on', () => {
+  const am = new AccountManager(
+    Array.from({ length: 2 }, (_, i) => ({
+      name: `a${i + 1}`, type: 'oauth', accessToken: `t${i + 1}`, refreshToken: `r${i + 1}`,
+      expiresAt: Date.now() + 3600_000,
+    })),
+    0.90,
+    { crossAccountThinkingMigration: true },
+  );
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  // Signed-thinking request: with the flag ON it may move to another CLAUDE account
+  // (signature is content/model integrity, not account-bound). Providers are still
+  // barred by _isRequestCompatible, so the target is guaranteed a Claude account.
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, requiresAnthropicThinkingIntegrity: true });
+  assert.equal(next.account.name, 'a2', 'signed-thinking session migrates to a healthy Claude account');
+});
+
+test('rebalance: signed thinking NEVER migrates to a PROVIDER even with the flag on', () => {
+  const am = new AccountManager(
+    [
+      { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+      { name: 'glm', type: 'provider', provider: 'glm', apiKey: 'k', model: 'glm-x' },
+    ],
+    0.90,
+    { crossAccountThinkingMigration: true },
+  );
+  const a1 = am.accounts[0], glm = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, requiresAnthropicThinkingIntegrity: true });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(glm);
+  // Only alternative is a provider — barred for signed thinking → stays on a1.
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, requiresAnthropicThinkingIntegrity: true });
+  assert.equal(next.account.name, 'a1', 'no Claude alternative → signed-thinking session stays; never lands on GLM');
+});
+
+test('rebalance: two equally-pace-hot accounts do not oscillate (equal tier → no migration)', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+  // Both accounts fast-burning at the SAME pace tier (reserve). a1 loaded so its
+  // score is worse, but the strictly-healthier-tier guard (equal pace tier) blocks
+  // the move — no ping-pong to an equally-stressed account.
+  paceHot(a1); a1.inFlight = 6;
+  paceHot(a2); a2.inFlight = 0;
+  assert.equal(am._weeklyPaceState(a1), am._weeklyPaceState(a2), 'same pace tier');
+  const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(next.account.name, 'a1', 'equal pace tier → no migration despite cheaper score');
+});
+
 // --- Regression: FIFO-fairness newcomer must HOLD, never error-fast (session-kill) ---
 // Reproduced bug (2026-06-27): a NEW request from a signed-thinking session arriving
 // while a FIFO queue already exists got retryAfterMs=Infinity / no_eligible_route and
