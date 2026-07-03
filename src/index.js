@@ -139,6 +139,10 @@ async function serverCommand() {
 
 async function supervisorCommand() {
   const { createServer } = await import('node:net');
+  // Test-only: the restart integration test delivers a GROUP SIGUSR2 to drive the
+  // worker's restart path; ignore it on the supervisor so the group signal doesn't
+  // kill it (default SIGUSR2 action is terminate). Gated — never active normally.
+  if (process.env.MAXPOOL_TEST_RESTART_SIGNAL === '1') process.on('SIGUSR2', () => {});
   const config = await loadOrCreateConfig();
   initEventLog(config, { manageRotation: true }); // supervisor is the single rotation owner
   const port = config.proxy.port;
@@ -733,7 +737,18 @@ async function serverWorkerCommand() {
   restartController = new RestartController({
     pauseAdmission: () => accountManager.setAdmissionPaused(true),
     restartNow: requestReload,
+    // Configurable so ops can tune the bounded pre-restart drain, and so the
+    // integration test can exercise the force-restart path without a 10s wait.
+    ...(Number.isFinite(config.restartDrainTimeoutMs) ? { drainTimeoutMs: config.restartDrainTimeoutMs } : {}),
   });
+
+  // Test-only: drive the real interactive restart path (the TUI `r` key) headless,
+  // so the end-to-end "restart while requests are in flight completes bounded and
+  // the server comes back" is provable without allocating a pty. Gated — never
+  // active in normal runs.
+  if (process.env.MAXPOOL_TEST_RESTART_SIGNAL === '1') {
+    process.on('SIGUSR2', () => restartController?.requestRestart());
+  }
 
   const shutdownGracefully = (reason, options = {}) => {
     // A terminal-close shutdown must NEVER exit non-zero: the supervisor reads a

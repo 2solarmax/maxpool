@@ -1159,11 +1159,12 @@ export class AccountManager {
     const profile = requestInfo.profile || 'claude';
     const scoringCtx = this._scoringContext();
 
-    // Fail-safe retry pin: force this ONE request onto a specific account (the
-    // pre-migration issuer, after a cross-account thinking replay was rejected).
-    // Honored ahead of everything else, but falls through to normal selection if
-    // that account is excluded/unavailable — a down issuer must never strand the
-    // request. See the thinking-signature fail-safe in server.js.
+    // Fail-safe retry pin: steer this request's remaining retry/queue chain onto a
+    // specific account (the pre-migration issuer, after a cross-account thinking
+    // replay was rejected). Honored ahead of everything else, but FALLS THROUGH to
+    // normal selection whenever that account is excluded/unavailable — a down issuer
+    // never strands the request (the retry then re-migrates and terminates via
+    // excludedIndexes + maxAttempts). See the thinking-signature fail-safe in server.js.
     if (requestInfo.pinnedAccountName) {
       const pinned = this.accounts.find(a => a.name === requestInfo.pinnedAccountName);
       if (pinned && !excludedIndexes.has(pinned.index)
