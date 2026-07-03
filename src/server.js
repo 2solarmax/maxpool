@@ -746,6 +746,24 @@ async function forwardRequest(
       }
       if (errorType === 'invalid_thinking_signature') {
         console.log(`[Maxpool] Non-retryable Anthropic thinking signature error on "${account.name}"`);
+        // Fail-safe: if this request had been MIGRATED to a different Claude account
+        // this turn (cross-account thinking rebalance), the rejected block was issued
+        // by the PRE-MIGRATION account. Revert the session there, exclude the failed
+        // target, and retry PINNED to the issuer — so a rejected cross-account replay
+        // self-heals instead of poisoning the session into a 400 loop. Signatures are
+        // portable in practice (verified 2026-07-02); this only fires if Anthropic
+        // ever account-binds them.
+        if (lease.migratedFromName && requestInfo.sessionKey
+          && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+          accountManager.revertSessionBinding(requestInfo.sessionKey, lease.migratedFromName);
+          excludedIndexes.add(account.index);
+          console.log(`[Maxpool] Thinking-signature fail-safe: reverting session to issuer "${lease.migratedFromName}" and retrying`);
+          return forwardRequest(
+            req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, { ...requestInfo, pinnedAccountName: lease.migratedFromName },
+            canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+          );
+        }
       }
 
       ctx.status = upstreamRes.status;

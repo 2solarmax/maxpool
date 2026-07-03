@@ -75,10 +75,12 @@ const DEFAULT_SCHEDULER = {
   // (never a provider — GLM/Kimi can't validate an Anthropic signature). Anthropic
   // thinking-block signatures are content/model integrity, NOT account-bound —
   // verified empirically 2026-07-02 (a `partnerships`-signed block replayed under
-  // `personal` returned 200). DEFAULT OFF until the revert-to-issuer fail-safe lands
-  // (issue #16): with it off, a heavy thinking session still can't strand an account,
-  // but it also can't poison a session if Anthropic ever changes the contract.
-  crossAccountThinkingMigration: false,
+  // `personal` returned 200). ON by default: a heavy thinking session can now spread
+  // its later load onto fresh accounts instead of stranding one. The revert-to-issuer
+  // fail-safe (server.js, on `invalid_thinking_signature` for a migrated request)
+  // makes this safe even if Anthropic ever account-binds signatures — a rejected
+  // replay self-heals to the issuer instead of poisoning the session.
+  crossAccountThinkingMigration: true,
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -438,6 +440,12 @@ export class AccountManager {
 
   acquireAccount(requestInfo = {}, excludedIndexes = new Set()) {
     this._noteRequestPolicy(requestInfo);
+    // Capture the session's prior account BEFORE selection, so the caller can tell
+    // whether this acquire MOVED the session (the thinking-signature fail-safe needs
+    // the pre-migration issuing account to revert to).
+    const prevCurrentName = requestInfo.sessionKey
+      ? this._sessionBinding(requestInfo.sessionKey)?.currentName
+      : null;
     const account = this.getActiveAccount(requestInfo, excludedIndexes);
     if (!account) return null;
 
@@ -449,7 +457,22 @@ export class AccountManager {
     account.inFlight++;
     account.activeWeight += weight;
     account.lastUsedAt = Date.now();
-    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe };
+    // Non-null only when this acquire moved the session off its prior account.
+    const migratedFromName = (prevCurrentName && account.name !== prevCurrentName) ? prevCurrentName : null;
+    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName };
+  }
+
+  /** Fail-safe: snap a session's binding back to the pre-migration issuing account
+   *  after a rejected cross-account thinking replay, so the retry (and future
+   *  requests) route to the account that actually generated the thinking blocks.
+   *  Defensive — signatures are portable in practice (verified 2026-07-02); this
+   *  only fires if Anthropic ever account-binds them. */
+  revertSessionBinding(sessionKey, name) {
+    if (!sessionKey || !name) return;
+    const binding = this._sessionBinding(sessionKey);
+    if (!binding) return;
+    binding.currentName = name;
+    this.sessionBindings.set(sessionKey, binding);
   }
 
   releaseAccount(lease, outcome = {}) {
@@ -1135,6 +1158,21 @@ export class AccountManager {
     let bestPriority = Infinity;
     const profile = requestInfo.profile || 'claude';
     const scoringCtx = this._scoringContext();
+
+    // Fail-safe retry pin: force this ONE request onto a specific account (the
+    // pre-migration issuer, after a cross-account thinking replay was rejected).
+    // Honored ahead of everything else, but falls through to normal selection if
+    // that account is excluded/unavailable — a down issuer must never strand the
+    // request. See the thinking-signature fail-safe in server.js.
+    if (requestInfo.pinnedAccountName) {
+      const pinned = this.accounts.find(a => a.name === requestInfo.pinnedAccountName);
+      if (pinned && !excludedIndexes.has(pinned.index)
+        && this._matchesRequest(pinned, profile, requestInfo)
+        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+        this.currentIndex = pinned.index;
+        return pinned;
+      }
+    }
 
     const hasBinding = Boolean(requestInfo.sessionKey && this.sessionBindings.has(requestInfo.sessionKey));
     const preferred = this._preferredAccount(profile, excludedIndexes, requestInfo);

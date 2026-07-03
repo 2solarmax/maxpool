@@ -1190,15 +1190,55 @@ test('rebalance: a thinking-SAFE request migrates a bound session off a HOT acco
   assert.equal(next.account.name, 'a2', 'safe + hot + much-healthier alt → migrates');
 });
 
-test('rebalance: a request carrying signed thinking NEVER migrates (no invalid-signature break)', () => {
-  const am = manager(2);
+test('rebalance: with crossAccountThinkingMigration OFF, signed thinking never migrates', () => {
+  const am = new AccountManager(
+    Array.from({ length: 2 }, (_, i) => ({
+      name: `a${i + 1}`, type: 'oauth', accessToken: `t${i + 1}`, refreshToken: `r${i + 1}`,
+      expiresAt: Date.now() + 3600_000,
+    })),
+    0.90,
+    { crossAccountThinkingMigration: false },
+  );
   const a1 = am.accounts[0], a2 = am.accounts[1];
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   am.releaseAccount(first, { success: true, status: 200 });
   hot(a1); a1.inFlight = 6; fresh(a2);
-  // Body carries a signed thinking block → must stay on a1.
+  // Flag OFF → a signed-thinking request must stay put even on a hot account.
   const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, requiresAnthropicThinkingIntegrity: true });
-  assert.equal(next.account.name, 'a1', 'signed-thinking request stays put');
+  assert.equal(next.account.name, 'a1', 'flag off → signed-thinking request stays put');
+});
+
+test('acquireAccount reports migratedFromName only when the session actually moved', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(first.account.name, 'a1');
+  assert.equal(first.migratedFromName, null, 'first bind is not a migration');
+  am.releaseAccount(first, { success: true, status: 200 });
+  hot(a1); a1.inFlight = 6; fresh(a2);
+  const moved = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(moved.account.name, 'a2');
+  assert.equal(moved.migratedFromName, 'a1', 'migration records the pre-migration issuer');
+});
+
+test('revertSessionBinding + pinnedAccountName route a request back to the issuer', () => {
+  const am = manager(3);
+  const a1 = am.accounts[0];
+  const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
+  assert.equal(first.account.name, 'a1');
+  am.releaseAccount(first, { success: true, status: 200 });
+  // Session drifted to a3; fail-safe reverts to the issuer a1 and pins the retry.
+  am.revertSessionBinding('s1', 'a1');
+  const pinned = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, pinnedAccountName: 'a1' });
+  assert.equal(pinned.account.name, 'a1', 'pinned retry lands on the issuing account');
+});
+
+test('pinnedAccountName falls through to normal selection when the issuer is unavailable', () => {
+  const am = manager(2);
+  const a1 = am.accounts[0], a2 = am.accounts[1];
+  am.markRateLimited(0, 60); // issuer a1 is down
+  const lease = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, pinnedAccountName: 'a1' });
+  assert.equal(lease.account.name, 'a2', 'a down issuer never strands the request — falls through');
 });
 
 test('rebalance: an UNSCANNED body fails closed (no migration)', () => {
