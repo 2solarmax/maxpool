@@ -136,9 +136,34 @@ export async function fetchProfile(accessToken) {
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
 
+/** Parse a reset timestamp (epoch-seconds, epoch-ms, or ISO string) to ms, or null. */
+export function parseResetTimestamp(rawReset) {
+  if (typeof rawReset === 'number') return rawReset < 1e12 ? rawReset * 1000 : rawReset;
+  if (typeof rawReset === 'string') {
+    const asNum = Number(rawReset);
+    if (Number.isFinite(asNum) && rawReset.trim() !== '') return asNum < 1e12 ? asNum * 1000 : asNum;
+    const parsed = Date.parse(rawReset);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+/** Map a model id or usage display name to a coarse family key, or null. Matches
+ *  BOTH request models (`claude-fable-5`) and usage `scope.model.display_name`
+ *  (`Fable`). Unmatched → null (caller treats as never model-scoped). */
+export function modelFamily(model) {
+  const s = String(model || '').toLowerCase();
+  if (s.includes('fable') || s.includes('mythos')) return 'fable';
+  if (s.includes('opus')) return 'opus';
+  if (s.includes('sonnet')) return 'sonnet';
+  if (s.includes('haiku')) return 'haiku';
+  return null;
+}
+
 /** Normalize one usage bucket from the /api/oauth/usage response to
  *  { utilization: 0..1, resetAt: ms-timestamp } (tolerant of field-name and
- *  percentage/epoch-vs-iso variations). */
+ *  percentage/epoch-vs-iso variations). Legacy top-level buckets only — the
+ *  `limits[]` path uses parseLimitEntry (clean 0-100 percent, no ambiguity). */
 export function normalizeUsageBucket(bucket) {
   if (!bucket || typeof bucket !== 'object') return null;
 
@@ -148,25 +173,26 @@ export function normalizeUsageBucket(bucket) {
     ? (parsedPct > 1 ? parsedPct / 100 : parsedPct)
     : null;
 
-  const rawReset = bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt;
-  let resetAt = null;
-  if (typeof rawReset === 'number') {
-    resetAt = rawReset < 1e12 ? rawReset * 1000 : rawReset;
-  } else if (typeof rawReset === 'string') {
-    const asNum = Number(rawReset);
-    if (Number.isFinite(asNum) && rawReset.trim() !== '') {
-      resetAt = asNum < 1e12 ? asNum * 1000 : asNum;
-    } else {
-      const parsed = Date.parse(rawReset);
-      if (Number.isFinite(parsed)) resetAt = parsed;
-    }
-  }
+  return { utilization, resetAt: parseResetTimestamp(bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt) };
+}
 
-  return { utilization, resetAt };
+/** Normalize one `limits[]` entry. `percent` is a clean 0-100 integer (unlike the
+ *  ambiguous top-level buckets), so utilization = percent/100 always. */
+export function parseLimitEntry(l) {
+  if (!l || typeof l !== 'object') return null;
+  const pct = typeof l.percent === 'number' ? l.percent : parseFloat(l.percent);
+  return {
+    utilization: Number.isFinite(pct) ? Math.max(0, Math.min(1, pct / 100)) : null,
+    resetAt: parseResetTimestamp(l.resets_at ?? l.resetsAt),
+    severity: typeof l.severity === 'string' ? l.severity : null,
+    isActive: l.is_active !== false,
+  };
 }
 
 /** Read an account's quota from the zero-spend /api/oauth/usage endpoint.
- *  Returns { fiveHour, sevenDay, sevenDaySonnet } buckets, or { error, status }. */
+ *  Returns { fiveHour, sevenDay, scopedWeekly } buckets, or { error, status }.
+ *  Per-model + unified limits now live in the `limits[]` array (the top-level
+ *  seven_day_opus / seven_day_sonnet keys are deprecated → always null). */
 export async function fetchUsage(accessToken) {
   try {
     const res = await fetch(USAGE_URL, {
@@ -189,10 +215,30 @@ export async function fetchUsage(accessToken) {
     }
 
     const data = await res.json();
+
+    // The `limits[]` array is the authoritative source: `session` (5h), unscoped
+    // `weekly_all` (unified 7d), and `weekly_scoped` entries carrying a
+    // `scope.model` — the PER-MODEL weekly sub-limits (e.g. Fable) Anthropic
+    // enforces separately from the unified weekly. Prefer it over the legacy
+    // top-level buckets (whose 0-100 percent misreads a genuine 1% as 100%).
+    const scopedWeekly = {};
+    let limitsSession = null;
+    let limitsWeeklyAll = null;
+    for (const l of (Array.isArray(data?.limits) ? data.limits : [])) {
+      if (l?.kind === 'weekly_scoped') {
+        const fam = l?.scope?.model?.display_name ? modelFamily(l.scope.model.display_name) : null;
+        if (fam) scopedWeekly[fam] = parseLimitEntry(l);
+      } else if (l?.kind === 'session') {
+        limitsSession = parseLimitEntry(l);
+      } else if (l?.kind === 'weekly_all') {
+        limitsWeeklyAll = parseLimitEntry(l);
+      }
+    }
+
     return {
-      fiveHour: normalizeUsageBucket(data?.five_hour),
-      sevenDay: normalizeUsageBucket(data?.seven_day),
-      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
+      fiveHour: limitsSession || normalizeUsageBucket(data?.five_hour),
+      sevenDay: limitsWeeklyAll || normalizeUsageBucket(data?.seven_day),
+      scopedWeekly,
     };
   } catch (err) {
     return { error: err.message || String(err), status: null };

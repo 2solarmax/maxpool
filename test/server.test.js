@@ -4,7 +4,45 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, __serverTest } from '../src/server.js';
 
-const { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, ensureQueueHeartbeat, clearQueueHeartbeat } = __serverTest;
+const { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, ensureQueueHeartbeat, clearQueueHeartbeat, classifyRateLimit } = __serverTest;
+
+const oauthAcct = { type: 'oauth', name: 'a1', provider: null };
+
+test('classifyRateLimit tags modelScope on a per-model weekly cap (long reset, unified healthy)', () => {
+  // Fable weekly maxed while unified 7d is 56% — the exact Curvo/2solarmax shape.
+  const headers = { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '0.56', 'anthropic-ratelimit-unified-5h-utilization': '0.11' };
+  const r = classifyRateLimit(oauthAcct, headers, '{"error":{"message":"usage limit reached"}}', { model: 'claude-fable-5', retryAfter: 2 * 24 * 3600 });
+  assert.equal(r.scope, 'account');
+  assert.equal(r.modelScope, 'fable');
+});
+
+test('classifyRateLimit does NOT model-scope a genuine UNIFIED weekly cap', () => {
+  const headers = { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '0.99' };
+  const r = classifyRateLimit(oauthAcct, headers, '{"error":{"message":"weekly limit reached"}}', { model: 'claude-fable-5', retryAfter: 2 * 24 * 3600 });
+  assert.equal(r.scope, 'account');
+  assert.equal(r.modelScope, null, 'unified is exhausted → whole-account bench, not model-scoped');
+});
+
+test('classifyRateLimit does NOT model-scope a SHORT throttle (not a weekly cap)', () => {
+  const headers = { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '0.56' };
+  const r = classifyRateLimit(oauthAcct, headers, '{"error":{"message":"usage limit reached"}}', { model: 'claude-fable-5', retryAfter: 120 });
+  assert.equal(r.modelScope, null, 'a 2-minute reset is a transient throttle, not a weekly model cap');
+});
+
+test('classifyRateLimit does NOT model-scope when the request has no model family', () => {
+  const headers = { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '0.56' };
+  const r = classifyRateLimit(oauthAcct, headers, '{"error":{"message":"usage limit reached"}}', { model: 'gpt-4o', retryAfter: 2 * 24 * 3600 });
+  assert.equal(r.modelScope, null);
+});
+
+test('classifyRateLimit does NOT model-scope a rejection with NO utilization headers (account-wide, safe)', () => {
+  // Missing headers must NOT be read as "unified has headroom" — a genuine
+  // account-wide cap with stripped headers has to bench the whole account.
+  const headers = { 'anthropic-ratelimit-unified-status': 'rejected' };
+  const r = classifyRateLimit(oauthAcct, headers, '{"error":{"message":"usage limit reached"}}', { model: 'claude-fable-5', retryAfter: 2 * 24 * 3600 });
+  assert.equal(r.scope, 'account');
+  assert.equal(r.modelScope, null);
+});
 
 test('hold window: a STREAMING capacity/throttle request holds for maxWaitMs, not the short 15m cap', () => {
   const cfg = { maxWaitMs: 24 * 3600_000, capacityMaxWaitMs: 15 * 60_000, nonStreamMaxWaitMs: 5 * 60_000, streamHoldMaxMs: 7 * 24 * 3600_000 };

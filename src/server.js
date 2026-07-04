@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { modelFamily } from './oauth.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -453,7 +454,7 @@ async function forwardRequest(
       const errorBody = await readErrorBody(upstreamRes);
       const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
-      const rateLimit = classifyRateLimit(account, rateLimitHeaders, errorBody);
+      const rateLimit = classifyRateLimit(account, rateLimitHeaders, errorBody, { model: requestInfo.model, retryAfter });
       if (rateLimit.scope === 'upstream') {
         const parsedError = parseJsonError(errorBody);
         const fingerprint = `429:${rateLimit.fingerprint || overloadFingerprint(errorBody, body)}`;
@@ -552,8 +553,9 @@ async function forwardRequest(
         status: 429,
         recordFailure: false,
         fingerprint: rateLimit.scope === 'unknown' ? rateLimit.fingerprint : null,
+        modelScope: rateLimit.modelScope || null,
       });
-      accountManager.releaseAccount(lease, { status: 429, error: 'rate_limited' });
+      accountManager.releaseAccount(lease, { status: 429, error: rateLimit.modelScope ? 'model_rate_limited' : 'rate_limited' });
 
       if (logDir) {
         logSections.push(`=== RESPONSE 429 — "${account.name}" rate-limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
@@ -1008,7 +1010,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1073,7 +1075,7 @@ function parseJsonError(body) {
   }
 }
 
-function classifyRateLimit(account, headers, body) {
+function classifyRateLimit(account, headers, body, opts = {}) {
   if (account.type === 'provider') return { scope: 'account', fingerprint: null };
 
   const parsed = parseJsonError(body);
@@ -1085,18 +1087,38 @@ function classifyRateLimit(account, headers, body) {
   const tokensRemaining = Number(headers['anthropic-ratelimit-tokens-remaining']);
   const requestsRemaining = Number(headers['anthropic-ratelimit-requests-remaining']);
 
+  // A PER-MODEL weekly sub-limit (e.g. Fable) rejects while the account's UNIFIED
+  // quota is healthy. We can't rely on a captured Fable-429 body shape, so detect
+  // by the CONTRADICTION: a weekly-class (long) reset AND both unified buckets NOT
+  // exhausted AND the request carries a known model family. Tagging modelScope
+  // makes the failover bench only (account, model) — not the whole account (which
+  // still has headroom for its other models). retryAfter is in SECONDS.
+  const fam = modelFamily(opts.model);
+  const retryAfter = Number(opts.retryAfter);
+  // Model-scope requires POSITIVE evidence the unified quota has headroom: at least
+  // one unified utilization header present AND both present ones below the floor. A
+  // rejection with NO utilization headers is treated as account-wide (safer — a
+  // genuine account cap with stripped headers must bench the whole account, not one
+  // model). Neither bucket may be at/above the exhaustion floor.
+  const haveUnifiedEvidence = Number.isFinite(weekly) || Number.isFinite(fiveHour);
+  const unifiedNotExhausted =
+    (!Number.isFinite(weekly) || weekly < 0.985) && (!Number.isFinite(fiveHour) || fiveHour < 0.985);
+  const modelScope =
+    (fam && haveUnifiedEvidence && unifiedNotExhausted && Number.isFinite(retryAfter) && retryAfter >= 30 * 60)
+      ? fam : null;
+
   const quotaHeaderExhaustion =
     unifiedStatus === 'rejected'
     || (Number.isFinite(fiveHour) && fiveHour >= 0.985)
     || (Number.isFinite(weekly) && weekly >= 0.985)
     || (headers['anthropic-ratelimit-tokens-remaining'] != null && tokensRemaining <= 0)
     || (headers['anthropic-ratelimit-requests-remaining'] != null && requestsRemaining <= 0);
-  if (quotaHeaderExhaustion) return { scope: 'account', fingerprint: null };
+  if (quotaHeaderExhaustion) return { scope: 'account', fingerprint: null, modelScope };
 
   const quotaBodyExhaustion =
     /\b(account|plan|session|weekly|quota)\b.{0,40}\b(exhausted|limit|exceeded|reached)\b/i.test(message)
     || /\busage\b.{0,40}\b(exhausted|exceeded|reached)\b/i.test(message);
-  if (quotaBodyExhaustion) return { scope: 'account', fingerprint: null };
+  if (quotaBodyExhaustion) return { scope: 'account', fingerprint: null, modelScope };
 
   const explicitSharedThrottle =
     message.includes('not your usage limit')

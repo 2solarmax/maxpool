@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, modelFamily } from './oauth.js';
 
 // Bounded re-poll hold for an account blocked ONLY by a transient, self-clearing
 // condition whose exact recovery time is unknown: (a) a weekly-critical account
@@ -36,8 +36,10 @@ function emptyQuota() {
     unified7dRaw: null,    // upstream-reported utilization before display clamp
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
-    unified7dSonnet: null,      // Sonnet-specific weekly utilization (from usage probe)
-    unified7dSonnetReset: null, // ms timestamp
+    // Per-model weekly sub-limits Anthropic enforces SEPARATELY from the unified
+    // weekly (e.g. Fable can be 100% while unified is 56%). Keyed by model family:
+    // { fable:{utilization,resetAt,severity,isActive}, opus:{...}, sonnet:{...} }.
+    scopedWeekly: {},
     unifiedStatus: null,   // allowed | allowed_warning | rejected
     resetsAt: null,
   };
@@ -91,7 +93,7 @@ const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 // (probing, requalify, rateLimitedUntil) and credentials are intentionally
 // excluded. A stale restored window is wiped on first use by _clearExpiredQuotas.
 const PERSISTED_QUOTA_FIELDS = [
-  'unified5h', 'unified7d', 'unified5hReset', 'unified7dReset', 'unifiedStatus',
+  'unified5h', 'unified7d', 'unified5hReset', 'unified7dReset', 'unifiedStatus', 'scopedWeekly',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
 ];
 
@@ -310,7 +312,7 @@ export class AccountManager {
       // finite hold. It must NEVER contribute the WEEKLY reset (days) — that is the
       // multi-day-hang the bounded path fences off; see the !fairnessOnlyBlock
       // guards on the weekly branches below.
-      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true })) {
+      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, model: requestInfo.model })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -319,15 +321,15 @@ export class AccountManager {
           matchingRoutes,
         };
       }
-      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
         soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
         if (!boundedHoldCause) boundedHoldCause = 'queued_behind_fairness';
         continue;
       }
 
-      const retry = this._retryInfo(account);
+      const retry = this._retryInfo(account, requestInfo.model);
       note(retry.cause);
-      if (!fairnessOnlyBlock && retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+      if (!fairnessOnlyBlock && retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -434,7 +436,7 @@ export class AccountManager {
     return weeklyPasses.some(options => this.accounts.some(account => {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
-      return this._isAvailable(account, options);
+      return this._isAvailable(account, { ...options, model: requestInfo.model });
     }));
   }
 
@@ -452,7 +454,7 @@ export class AccountManager {
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
     const upstreamThrottleProbe = account.type !== 'provider' && this._claimUpstreamThrottleProbe();
     if (requestInfo.sessionKey) {
-      this._bindSession(requestInfo.sessionKey, account);
+      this._bindSession(requestInfo.sessionKey, account, requestInfo.model);
     }
     account.inFlight++;
     account.activeWeight += weight;
@@ -491,6 +493,11 @@ export class AccountManager {
     }
 
     if (outcome.neutral) return;
+
+    // A per-model weekly cap is NOT an account failure — the account is healthy for
+    // every other model. Don't poison its failure counters / scoring penalty (mirror
+    // the network-blip carve-out); the scoped bench is already set in markRateLimited.
+    if (outcome.error === 'model_rate_limited') return;
 
     if (outcome.success) {
       account.completedRequests++;
@@ -558,6 +565,21 @@ export class AccountManager {
     };
   }
 
+  // True (with the scoped reset) when THIS request's model family has hit its
+  // per-model weekly sub-limit on this account — a block SEPARATE from the unified
+  // weekly (Fable can be 100% while unified is 56%). A model-agnostic request (no
+  // family) or an account with no scoped data fails OPEN (returns null), matching
+  // prior behavior. Gate: is_active AND (severity critical OR util ≥ exhausted).
+  _scopedExhausted(account, model) {
+    const fam = modelFamily(model);
+    if (!fam) return null;
+    const e = account.quota?.scopedWeekly?.[fam];
+    if (!e || e.isActive === false) return null;
+    const exhausted = e.severity === 'critical'
+      || (e.utilization != null && e.utilization >= this.scheduler.weeklyExhaustedThreshold);
+    return exhausted ? { resetAt: e.resetAt || null, family: fam } : null;
+  }
+
   _isAvailable(account, options = {}) {
     if (!account) return false;
     if (!account.enabled) return false;
@@ -605,6 +627,11 @@ export class AccountManager {
     if (weeklyState === 'exhausted') return false;
     if (weeklyState === 'critical' && !options.allowWeeklyCritical) return false;
     if (weeklyState === 'reserve' && !options.allowWeeklyReserve) return false;
+
+    // Per-model weekly cap for THIS request's model — unavailable for this request
+    // (but the account still serves its other models). options.model is threaded in
+    // by request-path callers; model-agnostic call sites skip this gate.
+    if (options.model && this._scopedExhausted(account, options.model)) return false;
 
     return true;
   }
@@ -873,6 +900,18 @@ export class AccountManager {
       changed = true;
     }
 
+    // Expire per-model weekly sub-limits on their own reset (a family whose scoped
+    // window has passed is usable again for that model, independent of unified).
+    if (q.scopedWeekly && typeof q.scopedWeekly === 'object') {
+      for (const [fam, e] of Object.entries(q.scopedWeekly)) {
+        if (e && e.resetAt && now >= e.resetAt) {
+          console.log(`[Maxpool] Account "${account.name}" ${fam} weekly sub-limit reset`);
+          delete q.scopedWeekly[fam];
+          changed = true;
+        }
+      }
+    }
+
     // Clear expired standard quotas
     if (q.resetsAt && now >= new Date(q.resetsAt).getTime()) {
       q.tokensRemaining = null;
@@ -1028,8 +1067,8 @@ export class AccountManager {
       if (account.index === bound.index) continue;
       if (excludedIndexes.has(account.index)) continue;
       if (!this._matchesRequest(account, profile, requestInfo)) continue;
-      // Genuinely-healthy alternatives only (normal/soft/unknown weekly).
-      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false })) continue;
+      // Genuinely-healthy alternatives only (normal/soft/unknown weekly + model headroom).
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model })) continue;
       const score = this._scoreAccount(account, requestInfo, scoringCtx);
       if (score < bestScore) {
         bestScore = score;
@@ -1043,7 +1082,7 @@ export class AccountManager {
       && bestTier < boundTier;
   }
 
-  _retryInfo(account) {
+  _retryInfo(account, model = null) {
     const now = Date.now();
     const q = account.quota || {};
 
@@ -1055,6 +1094,14 @@ export class AccountManager {
     if (!account.enabled) return { cause: 'disabled', retryAt: null, queueable: false };
     if (account.status === 'error') return { cause: 'error', retryAt: null, queueable: false };
     if (account.status === 'exhausted') return { cause: 'exhausted', retryAt: null, queueable: false };
+
+    // Per-model weekly cap for THIS request's model: a hard block until the scoped
+    // weekly reset (days), exactly like weekly_exhausted but scoped to one model —
+    // reuse that cause so the oracle's weekly-reset branches hold on the scoped
+    // reset consistently (agreeing with _isAvailable's model gate above; the oracle
+    // still returns available:true off any SIBLING account with model headroom).
+    const scoped = model ? this._scopedExhausted(account, model) : null;
+    if (scoped) return { cause: 'weekly_exhausted', retryAt: scoped.resetAt, queueable: false, modelScoped: true };
 
     // RAW weekly state, so the retry oracle agrees with _isAvailable's raw gate.
     // (Pace must NOT classify a raw-healthy account as weekly_critical here, or
@@ -1169,7 +1216,7 @@ export class AccountManager {
       const pinned = this.accounts.find(a => a.name === requestInfo.pinnedAccountName);
       if (pinned && !excludedIndexes.has(pinned.index)
         && this._matchesRequest(pinned, profile, requestInfo)
-        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true })) {
+        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
         this.currentIndex = pinned.index;
         return pinned;
       }
@@ -1182,7 +1229,7 @@ export class AccountManager {
         { allowWeeklyReserve: true, allowWeeklyCritical: false },
         { allowWeeklyReserve: true, allowWeeklyCritical: true },
       ];
-      if (preferredPasses.some(options => this._isAvailable(preferred, options))) {
+      if (preferredPasses.some(options => this._isAvailable(preferred, { ...options, model: requestInfo.model }))) {
         this.currentIndex = preferred.index;
         return preferred;
       }
@@ -1217,7 +1264,7 @@ export class AccountManager {
         const account = this.accounts[idx];
         if (excludedIndexes.has(account.index)) continue;
         if (!this._matchesRequest(account, profile, requestInfo)) continue;
-        if (!this._isAvailable(account, weeklyOptions)) continue;
+        if (!this._isAvailable(account, { ...weeklyOptions, model: requestInfo.model })) continue;
 
         const priority = Number.isFinite(account.priority) ? account.priority : 0;
         const score = this._scoreAccount(account, requestInfo, scoringCtx);
@@ -1296,11 +1343,11 @@ export class AccountManager {
     if (!account) return null;
     if (excludedIndexes.has(account.index)) return null;
     if (!this._matchesRequest(account, profile, requestInfo)) return null;
-    if (!this._isAvailable(account, options)) return null;
+    if (!this._isAvailable(account, { ...options, model: requestInfo.model })) return null;
     return account;
   }
 
-  _bindSession(sessionKey, account) {
+  _bindSession(sessionKey, account, model = null) {
     const priority = this._priority(account);
     const binding = this._sessionBinding(sessionKey) || {
       homeName: account.name,
@@ -1317,8 +1364,11 @@ export class AccountManager {
       // _boundAccount (which prefers homeName) doesn't snap the session straight
       // back to the hot home next request. If the old home is UNAVAILABLE this is a
       // FAILOVER → keep homeName so the session returns to it once it recovers.
+      // Model-aware: a move off a home that's capped for THIS model (but healthy
+      // for others) is a FAILOVER, not a by-choice rebalance — keep homeName so the
+      // session snaps back once the model's scoped cap resets.
       const oldHome = this.accounts.find(a => a.name === binding.homeName);
-      if (oldHome && this._isAvailable(oldHome, { allowWeeklyReserve: true })) {
+      if (oldHome && this._isAvailable(oldHome, { allowWeeklyReserve: true, model })) {
         binding.homeName = account.name;
       }
     }
@@ -1349,7 +1399,7 @@ export class AccountManager {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
       const priority = this._priority(account);
-      return priority < boundPriority && this._isAvailable(account, { allowWeeklyReserve: true });
+      return priority < boundPriority && this._isAvailable(account, { allowWeeklyReserve: true, model: requestInfo.model });
     });
   }
 
@@ -1619,9 +1669,21 @@ export class AccountManager {
       if (usage.sevenDay.utilization != null) q.unified7d = clamp01(usage.sevenDay.utilization);
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
-    if (usage.sevenDaySonnet) {
-      if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = clamp01(usage.sevenDaySonnet.utilization);
-      if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
+    // Per-model weekly sub-limits (Fable, Opus, ...). Replace wholesale with the
+    // fresh probe set so a family that dropped out of the response doesn't linger
+    // stale; expiry on reset is a backstop for the between-probe window.
+    if (usage.scopedWeekly && typeof usage.scopedWeekly === 'object') {
+      const fresh = {};
+      for (const [fam, e] of Object.entries(usage.scopedWeekly)) {
+        if (!e) continue;
+        fresh[fam] = {
+          utilization: e.utilization != null ? clamp01(e.utilization) : null,
+          resetAt: e.resetAt != null ? e.resetAt : null,
+          severity: e.severity || null,
+          isActive: e.isActive !== false,
+        };
+      }
+      q.scopedWeekly = fresh;
     }
 
     // If we just learned this account's weekly window while probing, re-evaluate
@@ -1745,6 +1807,27 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account) return;
     const retryAfter = clampRetryAfterSeconds(retryAfterSeconds);
+
+    // Model-scoped rate-limit: a per-model weekly cap (e.g. Fable) rejected this
+    // request while the account's UNIFIED quota is healthy. Record ONLY the scoped
+    // exhaustion — do NOT bench the whole account (its other models still have
+    // headroom). The just-429'd request fails over to a headroom account via the
+    // per-request excludedIndexes; future same-model requests are steered by the
+    // scoped gate; future other-model requests keep using this account.
+    if (options.modelScope) {
+      account.quota.scopedWeekly = account.quota.scopedWeekly || {};
+      account.quota.scopedWeekly[options.modelScope] = {
+        utilization: 1,
+        resetAt: Date.now() + (retryAfter * 1000),
+        severity: 'critical',
+        isActive: true,
+      };
+      account.lastStatus = options.status || 429;
+      account.lastErrorAt = Date.now();
+      console.log(`[Maxpool] Account "${account.name}" ${options.modelScope} weekly limit hit — scoped bench ${retryAfter}s (account stays active for other models)`);
+      return;
+    }
+
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfter * 1000);
     account.lastStatus = options.status || 429;
@@ -2099,6 +2182,16 @@ export class AccountManager {
       // could otherwise pin the account unavailable until the first live response.
       if (account.quota.unified5hReset == null) account.quota.unified5h = null;
       if (account.quota.unified7dReset == null) account.quota.unified7d = null;
+      // Drop restored scoped entries lacking a clearable reset window — they can't
+      // be expired by _clearExpiredQuotas and would otherwise pin an account
+      // unavailable-for-family until the first live probe.
+      if (account.quota.scopedWeekly && typeof account.quota.scopedWeekly === 'object') {
+        for (const [fam, e] of Object.entries(account.quota.scopedWeekly)) {
+          if (!e || e.resetAt == null) delete account.quota.scopedWeekly[fam];
+        }
+      } else {
+        account.quota.scopedWeekly = {};
+      }
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
     }

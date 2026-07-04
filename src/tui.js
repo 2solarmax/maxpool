@@ -986,6 +986,15 @@ export class TUI {
     }
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
+    // Per-model weekly caps (e.g. Fable maxed while the unified weekly still has
+    // headroom) — surfaced separately so a capped model on an otherwise-healthy
+    // account is visible, and routing away from it is explained.
+    const exhaustedFloor = this.am.scheduler?.weeklyExhaustedThreshold ?? 0.985;
+    const capped = Object.entries(q.scopedWeekly || {})
+      .filter(([, e]) => e && e.isActive !== false
+        && (e.severity === 'critical' || (e.utilization != null && e.utilization >= exhaustedFloor)))
+      .map(([fam]) => fam.charAt(0).toUpperCase() + fam.slice(1));
+    if (capped.length) line += `  ${red(`${capped.join(',')} maxed`)}`;
     line += `  ${dim(loadText(this._accountLoad(a)))}`;
     return line;
   }
