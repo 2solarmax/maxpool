@@ -4,7 +4,39 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, __serverTest } from '../src/server.js';
 
-const { unavailableMessage, isRetriableUpstreamStatus, ensureQueueHeartbeat, clearQueueHeartbeat } = __serverTest;
+const { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, ensureQueueHeartbeat, clearQueueHeartbeat } = __serverTest;
+
+test('hold window: a STREAMING capacity/throttle request holds for maxWaitMs, not the short 15m cap', () => {
+  const cfg = { maxWaitMs: 24 * 3600_000, capacityMaxWaitMs: 15 * 60_000, nonStreamMaxWaitMs: 5 * 60_000, streamHoldMaxMs: 7 * 24 * 3600_000 };
+  // THE FIX: a streaming "temporarily limiting requests" throttle (cause='capacity')
+  // must be held on the heartbeat up to maxWaitMs, so a session-cap (~3h) or a
+  // sustained throttle recovers instead of failing after 15m.
+  assert.equal(
+    computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'session_limit', ...cfg }),
+    cfg.maxWaitMs,
+    'streaming capacity holds 24h, not the 15m capacity cap (the bug)',
+  );
+  // Ordinary per-account quota 429 already held 7d — unchanged.
+  assert.equal(
+    computeQueueWindowMs({ cause: 'quota', stream: true, retryPlanCause: 'session_limit', ...cfg }),
+    cfg.streamHoldMaxMs,
+  );
+  // Non-streaming has no heartbeat → still short-capped under capacity.
+  assert.equal(
+    computeQueueWindowMs({ cause: 'capacity', stream: false, retryPlanCause: 'session_limit', ...cfg }),
+    Math.min(cfg.nonStreamMaxWaitMs, cfg.capacityMaxWaitMs),
+  );
+  assert.equal(
+    computeQueueWindowMs({ cause: 'quota', stream: false, retryPlanCause: 'session_limit', ...cfg }),
+    cfg.nonStreamMaxWaitMs,
+  );
+  // A pure concurrency-cap block stays short even for streaming (local transient).
+  assert.equal(
+    computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'concurrency_cap', ...cfg }),
+    cfg.capacityMaxWaitMs,
+    'concurrency-cap is clamped short even for a streaming request',
+  );
+});
 
 test('bug (ghost-leak): heartbeat reap releases the queue slot+bytes when the held client write throws EPIPE', async () => {
   // Binding test for reapDead: the heartbeat is the liveness probe. When the

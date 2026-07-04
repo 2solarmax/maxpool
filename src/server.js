@@ -952,6 +952,38 @@ function formatRetryDuration(seconds) {
   return `${s}s`;
 }
 
+/**
+ * Hold-window ceiling for a queued request. The soonest-recovery oracle
+ * (nextRetryForRequest) is the real governor — this is the backstop ceiling that
+ * bounds how long a request may WAIT for that recovery.
+ *
+ *   non-streaming (no heartbeat)  → short cap (would die on the client's own timeout)
+ *   streaming + capacity/429/throttle → maxWaitMs (24h): HELD on the SSE heartbeat
+ *       until an account frees. This is the "hold, don't fail" fix — a throttle clears
+ *       in seconds and a 5h session-cap in hours, both far under 24h; only a multi-day
+ *       weekly reset exceeds it and error-fasts with the honest "add an account"
+ *       message. Previously capped at the short capacityMaxWaitMs (15m), which failed
+ *       the MOST-clearly-temporary throttle sooner than an ordinary per-account 429.
+ *   streaming + other (quota)     → streamHoldMaxMs (7d)
+ *   retryPlanCause==='concurrency_cap' → clamped to the short capacity window (a LOCAL
+ *       transient: a slot frees in seconds; never spin a multi-day hold on it).
+ */
+function computeQueueWindowMs({
+  cause, stream, retryPlanCause,
+  maxWaitMs, capacityMaxWaitMs, nonStreamMaxWaitMs, streamHoldMaxMs,
+}) {
+  let windowMs;
+  if (!stream) {
+    windowMs = cause === 'capacity' ? Math.min(nonStreamMaxWaitMs, capacityMaxWaitMs) : nonStreamMaxWaitMs;
+  } else if (cause === 'capacity') {
+    windowMs = maxWaitMs;
+  } else {
+    windowMs = streamHoldMaxMs;
+  }
+  if (retryPlanCause === 'concurrency_cap') windowMs = Math.min(windowMs, capacityMaxWaitMs);
+  return windowMs;
+}
+
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRecoverSoon = true) {
   const thinking = requestInfo.requiresAnthropicThinkingIntegrity
     || accountManager._requiresAnthropicThinkingIntegrity?.(requestInfo);
@@ -976,7 +1008,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1231,33 +1263,15 @@ async function queueAndRetry(
   const streamHoldMaxMs = queueConfig.streamHoldMaxMs == null
     ? 7 * 24 * 60 * 60 * 1000
     : Math.max(0, Number(queueConfig.streamHoldMaxMs) || 0);
-  // Pick the hold ceiling:
-  //   capacity (upstream 529/overload) → its own short cap, never a long hold
-  //   non-streaming (no heartbeat)      → short cap (would die on client timeout)
-  //   streaming                         → up to streamHoldMaxMs (7d), kept alive
-  //                                       by the heartbeat
-  let queueWindowMs;
-  if (cause === 'capacity') {
-    queueWindowMs = Math.min(maxWaitMs, capacityMaxWaitMs);
-  } else if (!requestInfo.stream) {
-    queueWindowMs = nonStreamMaxWaitMs;
-  } else {
-    queueWindowMs = streamHoldMaxMs;
-  }
-  // A non-streaming request has no heartbeat regardless of cause, so it must
-  // never outlast nonStreamMaxWaitMs even under capacity (it would occupy a
-  // slot 3x its documented cap with nothing to reap it).
-  if (!requestInfo.stream) queueWindowMs = Math.min(queueWindowMs, nonStreamMaxWaitMs);
-
-  // A pure concurrency-cap block (every account healthy but all in-flight/global
-  // slots busy — NOT a quota/rate-limit reset) is a LOCAL capacity transient. Bound
-  // it by the short capacity window, never the multi-day streaming hold: a slot
-  // frees as active requests finish (seconds–minutes), and if the fleet stays
-  // saturated past the window the request sheds load (error-fast) instead of
-  // spinning a queue slot for up to streamHoldMaxMs (7d) — the soft-deadlock guard.
-  if (retryPlan.cause === 'concurrency_cap') {
-    queueWindowMs = Math.min(queueWindowMs, capacityMaxWaitMs);
-  }
+  const queueWindowMs = computeQueueWindowMs({
+    cause,
+    stream: Boolean(requestInfo.stream),
+    retryPlanCause: retryPlan.cause,
+    maxWaitMs,
+    capacityMaxWaitMs,
+    nonStreamMaxWaitMs,
+    streamHoldMaxMs,
+  });
 
   if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
 

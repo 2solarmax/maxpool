@@ -925,8 +925,19 @@ export class TUI {
     if (a.enabled !== false && upstreamBlocking && a.status === 'active') {
       effectiveStatus = a.inFlight > 0 ? 'probing' : 'waiting';
     }
+    // Anthropic is actively REJECTING this account right now (e.g. a per-model weekly
+    // sub-limit the general utilization % doesn't expose). It's unusable — surface
+    // that instead of a benign green "active", so a low weekly % (the bar keeps its
+    // true value) is never misread as available headroom.
+    // Keys on a.status (not effectiveStatus) so a rejected account reads 'blocked'
+    // even inside an upstream-throttle window (where it would otherwise show
+    // probing/waiting) — a rejected account is unusable, not part of the recovery.
+    if (a.enabled !== false && a.quota?.unifiedStatus === 'rejected' && a.status === 'active') {
+      effectiveStatus = 'blocked';
+    }
     switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
+      case 'blocked':   status = red('blocked'); break;
       case 'probing':   status = green('probing'); break;
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;

@@ -111,7 +111,7 @@ export function createDefaultConfig() {
       enabled: true,
       maxWaitMs: 24 * 60 * 60 * 1000,    // hard ceiling for non-streaming/capacity holds; streaming uses streamHoldMaxMs
       autoMaxWaitMs: null,               // 5h/session-cap hold (null = maxWaitMs)
-      capacityMaxWaitMs: 15 * 60 * 1000, // upstream 529/overload — stays short, never governed by the others
+      capacityMaxWaitMs: 15 * 60 * 1000, // short cap for NON-streaming capacity holds + the concurrency-cap clamp. A STREAMING capacity/throttle hold uses maxWaitMs (held on the heartbeat until capacity frees), NOT this.
       weeklyMaxWaitMs: 24 * 60 * 60 * 1000, // legacy bound; streaming holds use streamHoldMaxMs
       // Streaming hold ceiling: how long a streaming session is held ALIVE on the
       // heartbeat waiting for any account to free up. 7d so a session is never
