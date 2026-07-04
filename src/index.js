@@ -156,10 +156,20 @@ async function supervisorCommand() {
   // supervisor's acceptor is only LIVE during the brief cutover gap (it stops
   // once a worker confirms it is the sole acceptor). A bare handler is required
   // so the rare gap-accepted socket isn't left dangling.
-  const relistenMaster = () => new Promise((resolve, reject) => {
+  const relistenMaster = (retriesOnBusy = 20) => new Promise((resolve, reject) => {
     if (masterServer.listening) { resolve(); return; }
-    const onErr = err => { masterServer.removeListener('listening', onListen); reject(err); };
     const onListen = () => { masterServer.removeListener('error', onErr); resolve(); };
+    const onErr = err => {
+      masterServer.removeListener('listening', onListen);
+      // A just-SIGKILLed worker (seamless-reload fallback) may not have released the
+      // listening fd yet — SIGKILL is async; the port frees within a few ms. Retry
+      // bounded (~1s) rather than crashing the supervisor via handleServerListenError.
+      if (err.code === 'EADDRINUSE' && retriesOnBusy > 0) {
+        setTimeout(() => relistenMaster(retriesOnBusy - 1).then(resolve, reject), 50);
+        return;
+      }
+      reject(err);
+    };
     masterServer.once('error', onErr);
     masterServer.once('listening', onListen);
     masterServer.listen(port, host);
@@ -347,6 +357,19 @@ async function supervisorCommand() {
 
   try {
     while (true) {
+      // Ensure the master socket is LISTENING before handing it to a cold worker.
+      // After the previous primary worker sent MSG_PRIMARY the supervisor ran
+      // closeMasterAccept() (masterServer.close()), and the exiting worker released
+      // the last fd — so on every respawn masterServer is closed. Without this,
+      // spawnWorker sends a dead handle, the worker ignores it (falsy-handle guard),
+      // and never becomes primary → the interactive `r` restart hangs blank. Idempotent
+      // (no-op when already listening, e.g. the very first iteration after line 172).
+      try {
+        await relistenMaster();
+      } catch (err) {
+        handleServerListenError(err, host, port);
+        return;
+      }
       const worker = spawnWorker({ reload: false });
       const startedAt = Date.now();
       const result = await superviseTurn(worker);
@@ -725,7 +748,10 @@ async function serverWorkerCommand() {
     if (draining) return;
     // Interactive (live TUI) → full cold restart so the fresh worker re-renders the
     // TUI; headless/service → zero-downtime seamless baton (nothing visual to lose).
-    if (reloadStrategy({ supervised, useTUI }) === 'seamless') {
+    // Test-only: force the interactive cold-restart path headless (a pty can't be
+    // allocated in-suite), so the exit-75 respawn is exercised without a real TUI.
+    const forceCold = process.env.MAXPOOL_TEST_FORCE_COLD_RESTART === '1';
+    if (!forceCold && reloadStrategy({ supervised, useTUI }) === 'seamless') {
       try {
         process.send({ type: MSG_RELOAD_REQUEST });
         return;
@@ -991,6 +1017,12 @@ async function serverWorkerCommand() {
           // Cold start: take the socket and go primary immediately.
           await listenOnHandle(handle);
           await becomePrimary({ viaTakeover: false });
+        } else if (msg?.type === MSG_LISTEN && !handle) {
+          // Defense-in-depth for the stale-handle hang: if the supervisor ever hands
+          // a cold worker a dead/absent socket, fail LOUD and exit-75 so it respawns —
+          // never sit alive-but-not-primary (the blank-screen `r`-restart hang).
+          console.error('[Maxpool] Cold worker received MSG_LISTEN with no socket handle — exiting for respawn.');
+          process.exit(SERVER_RESTART_EXIT_CODE);
         } else if (msg?.type === MSG_PROBE_READY) {
           // Headless reload worker: we've booted the new code and restored quota
           // in memory. Confirm readiness (we are NOT yet accepting / writing).
@@ -1013,9 +1045,13 @@ async function serverWorkerCommand() {
           await releaseBatonAndDrain();
         }
       } catch (err) {
-        // A failed reload worker must NOT exit(1) (kills the supervisor loop).
-        // Report failure so the supervisor rolls back; stay alive harmlessly.
-        console.error(`[Maxpool] Reload worker error: ${err.message}`);
+        console.error(`[Maxpool] Worker message error: ${err.message}`);
+        // A COLD worker that failed to listen / become primary has no baton to roll
+        // back to — it would strand blank. Exit-75 so the supervisor respawns it
+        // (closes the silent-non-primary hang class). A RELOAD worker mid-baton must
+        // NOT exit (that kills the supervisor loop) — report MSG_FAILED so the
+        // supervisor rolls back and the old worker stays primary (zero disruption).
+        if (!isReloadWorker) process.exit(SERVER_RESTART_EXIT_CODE);
         try { process.send({ type: MSG_FAILED, reason: err.message }); } catch { /* ignore */ }
       }
     });
