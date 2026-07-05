@@ -1617,10 +1617,27 @@ export class AccountManager {
     return 'normal';
   }
 
+  // True only when the account is REJECTED ACCOUNT-WIDE — a 'rejected' unified
+  // status CORROBORATED by an actually-exhausted unified bucket. A bare 'rejected'
+  // with healthy unified buckets is a PER-MODEL sub-limit rejection (e.g. Fable
+  // weekly, tracked in scopedWeekly) that Anthropic reports on the unified-status
+  // header — it must NOT bench or "block" the whole account, which still has
+  // headroom for its other models. Guards both routing (_weeklyRawState) and the
+  // TUI "blocked" label against the per-model→account-wide conflation. NOTE: this
+  // is a display/inter-429 hint, not the primary bench — a genuinely-dead account
+  // is benched account-wide by markRateLimited (status='throttled') on its next 429.
+  _isAccountWideRejected(account) {
+    const q = account?.quota || {};
+    if (q.unifiedStatus !== 'rejected') return false;
+    const floor = this.scheduler.weeklyExhaustedThreshold;
+    return (Number.isFinite(q.unified5h) && q.unified5h >= floor)
+      || (Number.isFinite(q.unified7d) && q.unified7d >= floor);
+  }
+
   _weeklyRawState(account) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
-    if (q.unifiedStatus === 'rejected') return 'exhausted';
+    if (this._isAccountWideRejected(account)) return 'exhausted';
     if (q.unified7d == null) return 'unknown';
 
     const used = clamp01(q.unified7d);
@@ -1727,7 +1744,18 @@ export class AccountManager {
     }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
-    if (uStatus) account.quota.unifiedStatus = uStatus;
+    if (uStatus) {
+      // 'rejected' with HEALTHY unified buckets is a PER-MODEL sub-limit rejection
+      // (e.g. Fable weekly) — Anthropic surfaces it on the account-wide status
+      // header, but recording it account-wide would bench the account for EVERY
+      // model and render it "blocked" (the per-model cap is tracked in scopedWeekly).
+      // Only honor 'rejected' when a unified bucket corroborates a real account block.
+      const floor = this.scheduler.weeklyExhaustedThreshold;
+      const unifiedExhausted =
+        (Number.isFinite(account.quota.unified5h) && account.quota.unified5h >= floor)
+        || (Number.isFinite(account.quota.unified7d) && account.quota.unified7d >= floor);
+      account.quota.unifiedStatus = (uStatus === 'rejected' && !unifiedExhausted) ? 'allowed' : uStatus;
+    }
 
     // Standard rate limits (API key accounts)
     const tokensLimit = parseInt(headers['anthropic-ratelimit-tokens-limit'], 10);

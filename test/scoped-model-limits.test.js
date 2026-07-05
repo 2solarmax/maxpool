@@ -86,6 +86,48 @@ test('an inactive scoped cap (is_active:false) does NOT bench the model', () => 
   assert.equal(am._isAvailable(am.accounts[0], { allowWeeklyReserve: true, model: 'claude-fable-5' }), true);
 });
 
+// ── per-model rejection must NOT block the account account-wide ─────────────
+
+test('a Fable-only rejection (unified-status:rejected, unified healthy) does NOT bench the account for other models', () => {
+  const am = manager(2);
+  // Fable is capped (scoped) AND Anthropic returned unified-status:rejected on the
+  // Fable 429 — but the unified weekly is only 72%. This must NOT block the account.
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 1, severity: 'critical', isActive: true, resetAt: Date.now() + DAY } } });
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-7d-utilization': '0.72',
+    'anthropic-ratelimit-unified-5h-utilization': '0',
+  });
+  const a1 = am.accounts[0];
+
+  assert.equal(am._isAccountWideRejected(a1), false, 'a per-model rejection is NOT account-wide');
+  assert.notEqual(am._weeklyRawState(a1), 'exhausted', '72% weekly must not read as exhausted');
+  assert.equal(am._isAvailable(a1, { allowWeeklyReserve: true, model: 'claude-opus-4-8' }), true, 'Opus still served');
+  assert.equal(am._isAvailable(a1, { allowWeeklyReserve: true, model: 'claude-fable-5' }), false, 'Fable still benched (scoped)');
+});
+
+test('a GENUINE account-wide rejection (rejected + unified exhausted) still blocks everything', () => {
+  const am = manager(2);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-7d-utilization': '0.99',
+  });
+  const a1 = am.accounts[0];
+  assert.equal(am._isAccountWideRejected(a1), true);
+  assert.equal(am._weeklyRawState(a1), 'exhausted');
+  assert.equal(am._isAvailable(a1, { allowWeeklyReserve: true, model: 'claude-opus-4-8' }), false);
+});
+
+test('a restored stale per-model rejected (low unified) is treated as NOT account-wide', () => {
+  // The exact post-restart symptom: persisted unifiedStatus:rejected + low unified.
+  const am = manager(1);
+  am.accounts[0].quota.unifiedStatus = 'rejected';
+  am.accounts[0].quota.unified7d = 0.72;
+  am.accounts[0].quota.unified7dReset = Date.now() + DAY;
+  assert.equal(am._isAccountWideRejected(am.accounts[0]), false);
+  assert.equal(am._isAvailable(am.accounts[0], { allowWeeklyReserve: true, model: 'claude-opus-4-8' }), true);
+});
+
 // ── oracle/selection consistency (no spin-loop) ─────────────────────────────
 
 test('all accounts Fable-capped: oracle holds finite for Fable, Opus still routes', () => {
