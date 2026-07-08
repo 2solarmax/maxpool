@@ -736,8 +736,14 @@ async function forwardRequest(
 
     if (upstreamRes.status >= 400 && upstreamRes.status < 500) {
       const errorBody = await readErrorBody(upstreamRes);
+      // A transcript a lenient provider (GLM/Kimi) produced can be rejected by
+      // Anthropic on replay (a non-srvtoolu_ server_tool_use id, or a thinking
+      // signature it can't validate). Detect it on an Anthropic account so we can
+      // self-heal onto a provider instead of surfacing the 400.
+      const anthropicIncompat = account.type !== 'provider' && isAnthropicIncompatBody(errorBody);
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
         ? 'invalid_thinking_signature'
+        : anthropicIncompat ? 'anthropic_incompatible_transcript'
         : `HTTP ${upstreamRes.status}`;
       accountManager.releaseAccount(lease, { status: upstreamRes.status, error: errorType });
 
@@ -766,6 +772,24 @@ async function forwardRequest(
             canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
           );
         }
+      }
+
+      // React-and-heal: this transcript can't run on Claude (foreign server_tool_use
+      // id / thinking Anthropic can't validate). The 400 is pre-stream and the body
+      // is buffered, so latch the session Anthropic-incompatible (sticky → once per
+      // session) and retry PROVIDER-only, rather than surfacing the 400. Only worth
+      // it when a provider can actually serve it (profile=all with a GLM/Kimi token).
+      const providerAvailable = accountManager.accounts?.some(a => a.type === 'provider' && a.enabled !== false);
+      if (anthropicIncompat && requestInfo.sessionKey && providerAvailable
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        accountManager.markSessionIncompatible?.(requestInfo.sessionKey, requestInfo.homeProvider);
+        excludedIndexes.add(account.index);
+        console.log(`[Maxpool] Anthropic rejected this transcript (server_tool_use/thinking); pinning session to GLM/Kimi and retrying`);
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, { ...requestInfo, anthropicIncompatible: true },
+          canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+        );
       }
 
       ctx.status = upstreamRes.status;
@@ -987,15 +1011,15 @@ function computeQueueWindowMs({
 }
 
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRecoverSoon = true) {
-  const origin = accountManager._effectiveOrigin?.(requestInfo) || { class: null, provider: null };
+  const incompat = accountManager._effectiveIncompatible?.(requestInfo) || { incompatible: false, homeProvider: null };
 
-  // A foreign (GLM/Kimi)-origin session is pinned to provider accounts — Anthropic
-  // would 400 on its tool-use ids. "All Claude at limit" would be the wrong story
-  // (the Claude accounts are irrelevant to it); say what actually blocks it.
-  if (origin.class === 'foreign') {
-    const fam = origin.provider === 'zai' ? 'GLM' : origin.provider === 'kimi' ? 'Kimi' : 'GLM/Kimi';
+  // An Anthropic-incompatible session is pinned to provider accounts — Anthropic
+  // 400s on its server_tool_use id / foreign thinking. "All Claude at limit" would
+  // be the wrong story (Claude is irrelevant to it); say what actually blocks it.
+  if (incompat.incompatible) {
+    const fam = incompat.homeProvider === 'zai' ? 'GLM' : incompat.homeProvider === 'kimi' ? 'Kimi' : 'GLM/Kimi';
     const eta = Number.isFinite(retryAfter) && retryAfter > 0 ? ` Retry in ${retryAfter}s.` : '';
-    return `This session started on ${fam}, so only GLM/Kimi can serve it (a GLM/Kimi transcript can't run on Claude — Anthropic rejects its tool-call ids). No GLM/Kimi provider is available right now.${eta} Check the x-maxpool-zai-token / x-maxpool-kimi-token headers, or resume this session with 'cc glm'/'cc kimi'.`;
+    return `This session's transcript can only run on GLM/Kimi — Claude rejects its server-tool ids/thinking on replay. No GLM/Kimi provider is available right now.${eta} Check the x-maxpool-zai-token / x-maxpool-kimi-token headers, or resume with 'cc ${incompat.homeProvider === 'kimi' ? 'kimi' : 'glm'}'.`;
   }
 
   const thinking = requestInfo.requiresAnthropicThinkingIntegrity
@@ -1021,7 +1045,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1489,15 +1513,13 @@ function describeRequest(req, body) {
     // rebalancing); an unparsed body leaves this false → treated as NOT safe
     // (fail-closed) so we never replay a signed thinking block to a new account.
     info.bodyThinkingScanned = true;
-    // Home-provider origin of the resumed transcript (from tool-use id shapes).
-    // A 'foreign' (GLM/Kimi) session can NEVER be replayed to an Anthropic account
-    // (Anthropic 400s on a non-srvtoolu_ server_tool_use id) — routing pins it to
-    // provider accounts. A missing originClass = no tool blocks yet (ambiguous) OR
-    // an unparsed body; both fail OPEN in routing (never stranded), and stickiness
-    // (once a foreign id is seen) keeps a latched session pinned regardless.
+    // Whether the resumed transcript can replay to a Claude account. A session with
+    // a foreign server_tool_use id CANNOT (Anthropic 400s) → routing pins it to
+    // providers. Everything else stays Claude-eligible (Kimi/GLM without server-tools
+    // replay fine); a rare rejected-thinking 400 self-heals via react-and-heal.
     const origin = detectTranscriptOrigin(json);
-    if (origin.class) info.originClass = origin.class;
-    if (origin.provider) info.originProvider = origin.provider;
+    if (origin.anthropicIncompatible) info.anthropicIncompatible = true;
+    if (origin.homeProvider) info.homeProvider = origin.homeProvider;
   } catch {
     // Non-JSON requests are rare; body size still gives a useful load signal.
   }
@@ -1517,39 +1539,57 @@ function requiresAnthropicThinkingIntegrity(json) {
 // anything NOT matching this is treated as foreign (fail-closed classification).
 const ANTHROPIC_TOOL_ID = /^(toolu|srvtoolu)_/;
 
-// Classify a resumed transcript's HOME PROVIDER from the tool-use id shapes in its
-// replayed `messages`. Returns { class: 'foreign' | 'anthropic' | null, provider:
-// 'zai' | 'kimi' | null }. ANY non-Anthropic tool-use / server_tool_use / tool_result
-// id ⇒ 'foreign' (that session can never be replayed to Anthropic). 'anthropic' if
-// only Anthropic ids seen; null if no tool blocks at all (ambiguous — a fresh session
-// with no incompatible history yet). The request MODEL is NOT used — Claude Code
-// rewrites it to claude-opus-4-8 on resume, so only the transcript is trustworthy.
+// Decide whether a resumed transcript can replay to an Anthropic (Claude) account,
+// from the tool-use id shapes in its `messages`. Returns { anthropicIncompatible,
+// homeProvider }.
+//   anthropicIncompatible = the transcript has a `server_tool_use` id NOT matching
+//     ^srvtoolu_ — the ONE DETERMINISTIC incompatibility (Anthropic 400s on replay,
+//     the reported bug). Anthropic validates a client `tool_use.id` LOOSELY
+//     (^[a-zA-Z0-9_-]+$), so GLM `call_…` / Kimi `tool_…` client ids PASS and a
+//     Kimi/GLM session without server-tools is FINE on Claude — we do NOT predict
+//     those (a rejected thinking signature, if it ever happens, self-heals via the
+//     4xx react-and-heal in forwardRequest). server_tool_use is rare (GLM ~15%,
+//     Kimi 0%), so most sessions are compatible.
+//   homeProvider = the first foreign tool-use id shape (call_→zai, tool_→kimi), a
+//     SOFT hint for the 'never' same-family preference only; ambiguous/none → null.
+// The request MODEL is not used — Claude Code rewrites it to opus on resume.
 function detectTranscriptOrigin(json) {
-  if (!json || typeof json !== 'object') return { class: null, provider: null };
-  let sawAnthropic = false;
-  let foreignProvider = null; // 'zai' | 'kimi' | 'foreign'
-  const classifyForeign = id =>
-    id.startsWith('call_') ? 'zai' : id.startsWith('tool_') ? 'kimi' : 'foreign';
+  if (!json || typeof json !== 'object') return { anthropicIncompatible: false, homeProvider: null };
+  let incompatible = false;
+  let homeProvider = null;
+  const fam = id => id.startsWith('call_') ? 'zai' : id.startsWith('tool_') ? 'kimi' : null;
+  const noteForeign = id => { if (!homeProvider) homeProvider = fam(id); };
   const visit = value => {
-    if (foreignProvider) return; // one foreign id is decisive — early-exit the walk
-    if (Array.isArray(value)) { for (const v of value) { visit(v); if (foreignProvider) return; } return; }
+    if (incompatible) return; // server_tool_use is decisive — stop
+    if (Array.isArray(value)) { for (const v of value) { visit(v); if (incompatible) return; } return; }
     if (!value || typeof value !== 'object') return;
     const t = value.type;
-    if ((t === 'tool_use' || t === 'server_tool_use') && typeof value.id === 'string') {
-      if (ANTHROPIC_TOOL_ID.test(value.id)) sawAnthropic = true;
-      else { foreignProvider = classifyForeign(value.id); return; }
+    if (t === 'server_tool_use' && typeof value.id === 'string' && !ANTHROPIC_TOOL_ID.test(value.id)) {
+      incompatible = true; noteForeign(value.id); return;
     }
-    if (t === 'tool_result' && typeof value.tool_use_id === 'string') {
-      if (ANTHROPIC_TOOL_ID.test(value.tool_use_id)) sawAnthropic = true;
-      else { foreignProvider = classifyForeign(value.tool_use_id); return; }
-    }
+    if (t === 'tool_use' && typeof value.id === 'string' && !ANTHROPIC_TOOL_ID.test(value.id)) noteForeign(value.id);
+    if (t === 'tool_result' && typeof value.tool_use_id === 'string' && !ANTHROPIC_TOOL_ID.test(value.tool_use_id)) noteForeign(value.tool_use_id);
     if (value.content) visit(value.content);
     if (value.messages) visit(value.messages);
   };
   visit(json.messages);
-  if (foreignProvider) return { class: 'foreign', provider: foreignProvider === 'foreign' ? null : foreignProvider };
-  if (sawAnthropic) return { class: 'anthropic', provider: null };
-  return { class: null, provider: null };
+  return { anthropicIncompatible: incompatible, homeProvider };
+}
+
+// Does this upstream 4xx error body indicate the transcript is un-replayable to
+// Anthropic (a lenient GLM/Kimi provider produced content Anthropic rejects on
+// replay)? Matches the three known shapes: a non-srvtoolu_ server_tool_use id, or a
+// thinking-block signature Anthropic can't validate (invalid OR missing). Used to
+// self-heal onto a provider instead of surfacing the 400.
+function isAnthropicIncompatBody(body) {
+  if (!body) return false;
+  // The deterministic server-tool-id 400, the known invalid-signature error, or a
+  // thinking-block signature VALIDATION error (missing/invalid) — the last gated on
+  // a validation verb so a user message merely echoing "thinking"/"signature" can't
+  // false-latch the session provider-pinned for life.
+  return /srvtoolu_|server_tool_use/.test(body)
+    || /invalid `signature` in `thinking`/i.test(body)
+    || (/thinking/.test(body) && /signature/.test(body) && /(should match|required|invalid|expected|must )/i.test(body));
 }
 
 function containsThinkingBlock(value) {

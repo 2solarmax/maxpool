@@ -1353,7 +1353,7 @@ test('all profile adds runtime GLM fallback and rewrites provider request', asyn
   }
 });
 
-test('thinking history disables provider fallback in all profile', async () => {
+test('thinking history now FALLS BACK to GLM under when-exhausted (a lenient provider accepts an Anthropic signature)', async () => {
   const claudeSeen = [];
   const glmSeen = [];
 
@@ -1404,12 +1404,68 @@ test('thinking history disables provider fallback in all profile', async () => {
         ],
       }),
     });
-    assert.equal(res.status, 429);
+    // Claude 429'd and the default policy (when-exhausted) now lets the signed-thinking
+    // session fall to the GLM provider — Claude was tried first, GLM served it.
+    assert.equal(res.status, 200);
+    assert.deepEqual(claudeSeen, ['Bearer tc'], 'Claude was tried first');
+    assert.deepEqual(glmSeen, ['Bearer zg'], 'then the signed-thinking session fell to GLM');
+    assert.equal(am.getStatus().sessions.thinkingProtected, 1, 'still tracked (for Claude-only migration)');
+  } finally {
+    await close(proxy);
+    await close(claudeUpstream);
+    await close(glmUpstream);
+  }
+});
+
+test('react-and-heal: a transcript Claude 400s on (server_tool_use id) self-heals onto GLM, no 400 to the client', async () => {
+  const claudeSeen = [];
+  const glmSeen = [];
+  // Claude rejects the replayed foreign server_tool_use id (the exact reported 400).
+  const claudeUpstream = http.createServer(async (req, res) => {
+    for await (const _c of req) {}
+    claudeSeen.push(req.headers.authorization);
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: "messages.9.content.3.server_tool_use.id: String should match pattern '^srvtoolu_[a-zA-Z0-9_]+$'" } }));
+  });
+  const glmUpstream = http.createServer(async (req, res) => {
+    for await (const _c of req) {}
+    glmSeen.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, served: 'glm' }));
+  });
+  const claudePort = await listen(claudeUpstream);
+  const glmPort = await listen(glmUpstream);
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000 },
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${claudePort}`,
+    retry: { maxAttemptsPerRequest: 3 },
+    queue: { enabled: false },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    // A body with a foreign server_tool_use — but pretend detection missed it (send a
+    // plain body) so we exercise the REACT path, not the predict path.
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-maxpool-profile': 'all',
+        'x-maxpool-session': 'heal-session',
+        'x-maxpool-zai-token': 'zg',
+        'x-maxpool-zai-base-url': `http://127.0.0.1:${glmPort}`,
+      },
+      body: JSON.stringify({ model: 'claude-sonnet-test', messages: [{ role: 'user', content: 'go' }] }),
+    });
     const body = await res.json();
-    assert.match(body.error.message, /Non-Claude fallback is disabled/i);
-    assert.deepEqual(claudeSeen, ['Bearer tc']);
-    assert.deepEqual(glmSeen, []);
-    assert.equal(am.getStatus().sessions.thinkingProtected, 1);
+    assert.equal(res.status, 200, 'client never sees the 400 — it self-healed');
+    assert.equal(body.served, 'glm', 'GLM served the retry');
+    assert.deepEqual(claudeSeen, ['Bearer tc'], 'Claude was tried once');
+    assert.deepEqual(glmSeen, ['Bearer zg'], 'then it healed onto GLM');
+    assert.equal(am.getStatus().sessions.providerPinned, 1, 'the session is now latched provider-pinned');
   } finally {
     await close(proxy);
     await close(claudeUpstream);

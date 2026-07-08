@@ -334,23 +334,26 @@ test('provider traffic cannot claim or clear the Anthropic recovery probe', () =
   assert.ok(am.upstreamThrottle.until);
 });
 
-test('shared Anthropic throttle keeps thinking-protected sessions queued', () => {
-  const am = new AccountManager([
+test('shared Anthropic throttle: a thinking session falls to GLM under when-exhausted, but queues under "never"', () => {
+  const mk = policy => new AccountManager([
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
     { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
-  ], 0.90);
-  am.markUpstreamThrottled(60, 'temporary server limit');
+  ], 0.90, { crossProviderFallbackPolicy: policy });
+  const req = { profile: 'all', sessionKey: 'thinking-session', requiresAnthropicThinkingIntegrity: true };
 
-  assert.equal(am.acquireAccount({
-    profile: 'all',
-    sessionKey: 'thinking-session',
-    requiresAnthropicThinkingIntegrity: true,
-  }), null);
-  assert.equal(am.nextRetryForRequest({
-    profile: 'all',
-    sessionKey: 'thinking-session',
-    requiresAnthropicThinkingIntegrity: true,
-  }).cause, 'upstream_throttle');
+  // Default (when-exhausted): Claude is throttle-blocked; the compatible direction
+  // (Anthropic thinking → lenient GLM) is now allowed, so it uses the available GLM
+  // provider instead of stranding — "send to GLM/Kimi if no Claude is available".
+  const am = mk('when-exhausted');
+  am.markUpstreamThrottled(60, 'temporary server limit');
+  assert.equal(am.acquireAccount({ ...req }).account.name, 'glm-fallback');
+
+  // 'never' keeps the session Claude-only → it queues on the throttle (the user's
+  // strict, stay-on-Claude opt-out).
+  const am2 = mk('never');
+  am2.markUpstreamThrottled(60, 'temporary server limit');
+  assert.equal(am2.acquireAccount({ ...req }), null);
+  assert.equal(am2.nextRetryForRequest({ ...req }).cause, 'upstream_throttle');
 });
 
 test('temporary expired-token refresh failure cools down and remains retryable', async () => {

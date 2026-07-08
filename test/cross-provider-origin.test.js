@@ -1,8 +1,10 @@
-// Cross-provider session-origin pinning: a resumed GLM/Kimi ('cc glm') session must
-// NEVER route to an Anthropic account (Anthropic 400s on its non-srvtoolu_ tool ids),
-// a Claude session prefers Claude with policy-gated provider fallback, and the whole
-// thing is controlled by scheduler.crossProviderFallbackPolicy. Also proves the fix
-// to the inverted-thinking misroute (GLM thinking blocks were force-pinning to Claude).
+// Cross-provider compatibility (v2 — narrowed): Claude/GLM/Kimi INTEROPERATE for
+// ordinary sessions (regular tool_use ids pass Anthropic's loose validation). The
+// ONLY hard, predicted-ahead incompatibility is a foreign `server_tool_use` id
+// (Anthropic 400s on ^srvtoolu_ — the reported bug); everything uncertain self-heals
+// via react-and-heal (a pre-stream 400 → latch incompatible → retry provider-only).
+// A Kimi session (or GLM without server-tools) CAN run on Claude, and a Claude
+// session (incl. signed thinking) can fall to GLM/Kimi when Claude is unavailable.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +12,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { __serverTest } from '../src/server.js';
 import { createDefaultConfig } from '../src/config.js';
 
-const { detectTranscriptOrigin, unavailableMessage, describeRequest } = __serverTest;
+const { detectTranscriptOrigin, unavailableMessage, describeRequest, isAnthropicIncompatBody } = __serverTest;
 
 function withProviders(policy = 'when-exhausted') {
   const am = new AccountManager([
@@ -25,184 +27,168 @@ const oauthOf = am => am.accounts.find(a => a.type === 'oauth');
 const glmOf = am => am.accounts.find(a => a.provider === 'zai');
 const kimiOf = am => am.accounts.find(a => a.provider === 'kimi');
 const disableOauth = am => am.accounts.filter(a => a.type === 'oauth').forEach(a => { a.enabled = false; });
+const asst = block => ({ messages: [{ role: 'assistant', content: [block] }] });
 
-// ── detector unit ───────────────────────────────────────────────────────────
+// ── detector: ONLY foreign server_tool_use is incompatible ────────────────────
 
-test('detectTranscriptOrigin classifies by tool-use id shape', () => {
-  const mk = (id, type = 'tool_use') => ({ messages: [{ role: 'assistant', content: [{ type, id, name: 'x', input: {} }] }] });
-  assert.deepEqual(detectTranscriptOrigin(mk('call_00e9')), { class: 'foreign', provider: 'zai' });
-  assert.deepEqual(detectTranscriptOrigin(mk('tool_j5x')), { class: 'foreign', provider: 'kimi' });
-  assert.deepEqual(detectTranscriptOrigin(mk('toolu_01A')), { class: 'anthropic', provider: null });
-  assert.deepEqual(detectTranscriptOrigin(mk('srvtoolu_9', 'server_tool_use')), { class: 'anthropic', provider: null });
-  assert.deepEqual(detectTranscriptOrigin(mk('weird_9', 'server_tool_use')), { class: 'foreign', provider: null });
-  assert.deepEqual(detectTranscriptOrigin({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }), { class: null, provider: null });
-  // tool_result carries the paired id — same signal
-  assert.deepEqual(detectTranscriptOrigin({ messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_z', content: 'ok' }] }] }), { class: 'foreign', provider: 'zai' });
-  // ANY foreign id wins even if Anthropic ids are also present (mixed = poisoned)
-  assert.equal(detectTranscriptOrigin({ messages: [
-    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'a', input: {} }] },
-    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_2', name: 'b', input: {} }] },
-  ] }).class, 'foreign');
-  // non-object / empty → null (fail-open at detection; nothing to bar)
-  assert.deepEqual(detectTranscriptOrigin(null), { class: null, provider: null });
-  assert.deepEqual(detectTranscriptOrigin({}), { class: null, provider: null });
+test('detectTranscriptOrigin flags ONLY a foreign server_tool_use id as anthropicIncompatible', () => {
+  // The hard 400: a server_tool_use id not matching ^srvtoolu_.
+  assert.deepEqual(detectTranscriptOrigin(asst({ type: 'server_tool_use', id: 'call_x', name: 'web', input: {} })), { anthropicIncompatible: true, homeProvider: 'zai' });
+  assert.deepEqual(detectTranscriptOrigin(asst({ type: 'server_tool_use', id: 'srvtoolu_ok', name: 'web', input: {} })), { anthropicIncompatible: false, homeProvider: null });
+  // Regular tool_use ids are NOT incompatible (Anthropic accepts call_/tool_ loosely)
+  // — only a homeProvider hint is recorded.
+  assert.deepEqual(detectTranscriptOrigin(asst({ type: 'tool_use', id: 'call_g', name: 'x', input: {} })), { anthropicIncompatible: false, homeProvider: 'zai' });
+  assert.deepEqual(detectTranscriptOrigin(asst({ type: 'tool_use', id: 'tool_k', name: 'x', input: {} })), { anthropicIncompatible: false, homeProvider: 'kimi' });
+  assert.deepEqual(detectTranscriptOrigin(asst({ type: 'tool_use', id: 'toolu_1', name: 'x', input: {} })), { anthropicIncompatible: false, homeProvider: null });
+  // No tool blocks → compatible.
+  assert.deepEqual(detectTranscriptOrigin({ messages: [{ role: 'user', content: 'hi' }] }), { anthropicIncompatible: false, homeProvider: null });
+  assert.deepEqual(detectTranscriptOrigin(null), { anthropicIncompatible: false, homeProvider: null });
 });
 
-// ── the reported bug: a GLM session must NOT route to Anthropic (the 400) ──────
+// ── THE USER'S CORRECTION: Kimi / GLM-without-server-tools can run on Claude ───
 
-test('a foreign (GLM) request never selects an Anthropic account and picks a provider', () => {
+test('a Kimi session (tool_ ids, no server_tool_use) is Claude-compatible and PREFERS Claude', () => {
+  const am = withProviders('when-exhausted');
+  // homeProvider=kimi hint, but NOT incompatible → all account types eligible, Claude preferred (priority 0).
+  const req = { profile: 'all', model: 'claude-opus-4-8', homeProvider: 'kimi', sessionKey: 'k1' };
+  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', req), true, 'Claude eligible for a Kimi session');
+  const l = am.acquireAccount(req);
+  assert.equal(l.account.type, 'oauth', 'a Kimi session runs on Claude (preferred) — not force-pinned to a provider');
+});
+
+test('a GLM session WITHOUT server-tools reaches Claude; a GLM session WITH a foreign server_tool_use does NOT', () => {
   const am = withProviders();
-  const req = { profile: 'all', model: 'claude-opus-4-8', originClass: 'foreign', originProvider: 'zai', sessionKey: 's1' };
-  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', req), false, 'oauth barred for foreign');
-  assert.equal(am._isRequestCompatible(glmOf(am), 'all', req), true, 'glm allowed');
-  assert.equal(am._isRequestCompatible(kimiOf(am), 'all', req), true, 'kimi allowed (sibling, when-exhausted)');
-  for (let i = 0; i < 20; i++) {
-    const l = am.acquireAccount(req);
-    assert.ok(l, 'a provider is always available');
-    assert.equal(l.account.type, 'provider', 'never routes a foreign session to Anthropic');
-    am.releaseAccount(l, { success: true });
+  const plain = { profile: 'all', homeProvider: 'zai', sessionKey: 'g-plain' };
+  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', plain), true, 'plain GLM session can use Claude');
+  const incompat = { profile: 'all', homeProvider: 'zai', anthropicIncompatible: true, sessionKey: 'g-srv' };
+  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', incompat), false, 'GLM-with-server_tool_use barred from Claude (the 400)');
+  const l = am.acquireAccount(incompat);
+  assert.equal(l.account.type, 'provider', 'server_tool_use session pinned to a provider');
+});
+
+// ── the reported bug still fixed ──────────────────────────────────────────────
+
+test('an anthropicIncompatible session never selects Claude across ALL policies', () => {
+  for (const policy of ['never', 'when-exhausted', 'always']) {
+    const am = withProviders(policy);
+    const req = { profile: 'all', anthropicIncompatible: true, homeProvider: 'zai', sessionKey: `s-${policy}` };
+    for (let i = 0; i < 12; i++) {
+      const l = am.acquireAccount(req);
+      assert.equal(l.account.type, 'provider', `policy ${policy}: never routes an incompatible session to Claude`);
+      am.releaseAccount(l, { success: true });
+    }
   }
 });
 
-test('THE MISROUTE FIX: a foreign request WITH thinking blocks still routes to a provider (not force-pinned to Claude)', () => {
-  const am = withProviders();
-  // GLM transcripts carry (unsigned) thinking → requiresAnthropicThinkingIntegrity=true.
-  // Pre-fix this barred providers and forced the GLM request onto Anthropic → 400.
-  const req = { profile: 'all', originClass: 'foreign', originProvider: 'zai', requiresAnthropicThinkingIntegrity: true, sessionKey: 's2' };
-  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', req), false, 'oauth still barred (foreign wins over thinking)');
-  assert.equal(am._isRequestCompatible(glmOf(am), 'all', req), true, 'provider allowed despite the thinking flag');
-  const l = am.acquireAccount(req);
-  assert.equal(l.account.type, 'provider');
-});
+// ── Claude → provider fallback (the "use Kimi if no Claude" direction) ─────────
 
-// ── Claude-origin: prefer Claude, policy-gated fallback ───────────────────────
-
-test('a Claude-origin request prefers oauth and falls to a provider only when Claude is exhausted (when-exhausted)', () => {
+test('a Claude session falls to a provider only when Claude is exhausted (when-exhausted default)', () => {
   const am = withProviders('when-exhausted');
-  const req = { profile: 'all', originClass: 'anthropic', sessionKey: 's3' };
-  const l1 = am.acquireAccount(req);
-  assert.equal(l1.account.type, 'oauth', 'oauth preferred while available');
-  am.releaseAccount(l1, { success: true });
+  const req = { profile: 'all', sessionKey: 'c1' };
+  assert.equal(am.acquireAccount(req).account.type, 'oauth', 'Claude preferred while available');
   disableOauth(am);
-  const l2 = am.acquireAccount(req);
-  assert.equal(l2.account.type, 'provider', 'falls to a provider once all Claude are down');
+  assert.equal(am.acquireAccount(req).account.type, 'provider', 'falls to a provider once Claude is down');
 });
 
-test("policy 'never' bars providers for a Claude session entirely (no cross-provider fallback)", () => {
+test("policy 'never' keeps a Claude session on Claude (no provider fallback)", () => {
   const am = withProviders('never');
-  const req = { profile: 'all', originClass: 'anthropic', sessionKey: 's4' };
+  const req = { profile: 'all', sessionKey: 'c2' };
   assert.equal(am._isRequestCompatible(glmOf(am), 'all', req), false);
   disableOauth(am);
-  assert.equal(am.getActiveAccount(req), null, 'no route — never crosses to a provider');
+  assert.equal(am.getActiveAccount(req), null, 'never crosses to a provider');
 });
 
-test("policy 'always' makes providers peer with oauth (priority 0) for a Claude/unknown session", () => {
+test("policy 'always' peers providers with Claude for a compatible session", () => {
   const am = withProviders('always');
-  assert.equal(am._effectivePriority(glmOf(am), { originClass: 'anthropic' }), 0, 'provider peers under always');
-  assert.equal(am._effectivePriority(glmOf(am), { originClass: 'foreign', originProvider: 'zai' }), 10, 'foreign session keeps provider fallback priority');
-  const am2 = withProviders('when-exhausted');
-  assert.equal(am2._effectivePriority(glmOf(am2), { originClass: 'anthropic' }), 10, 'when-exhausted keeps provider as fallback');
+  assert.equal(am._effectivePriority(glmOf(am), { profile: 'all' }), 0, 'provider peers under always');
+  assert.equal(am._effectivePriority(glmOf(am), { anthropicIncompatible: true }), 10, 'incompatible session keeps fallback priority');
 });
 
-test('a signed-thinking Claude session never uses a provider (unchanged existing behavior)', () => {
+// ── signed thinking: fallback allowed, MIGRATION stays Claude-only ────────────
+
+test('a signed-thinking Claude session CAN fall to a provider (when-exhausted), but its live migration stays Claude-only', () => {
   const am = withProviders('when-exhausted');
-  const req = { profile: 'all', originClass: 'anthropic', requiresAnthropicThinkingIntegrity: true };
-  assert.equal(am._isRequestCompatible(glmOf(am), 'all', req), false);
-  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', req), true);
+  const req = { profile: 'all', requiresAnthropicThinkingIntegrity: true, sessionKey: 't1' };
+  // Loosened: a provider is eligible for a thinking session (lenient providers accept the signature).
+  assert.equal(am._isRequestCompatible(glmOf(am), 'all', req), true);
+  // 'never' keeps it Claude-only.
+  const strict = withProviders('never');
+  assert.equal(strict._isRequestCompatible(glmOf(strict), 'all', req), false);
 });
 
-// ── foreign same-provider pin under 'never' ───────────────────────────────────
+// ── sticky incompatible latch + react-and-heal marker ─────────────────────────
 
-test("policy 'never' pins a foreign session to its ORIGIN provider (GLM→GLM, not Kimi)", () => {
-  const am = withProviders('never');
-  const req = { profile: 'all', originClass: 'foreign', originProvider: 'zai', sessionKey: 's5' };
-  assert.equal(am._isRequestCompatible(glmOf(am), 'all', req), true, 'same provider allowed');
-  assert.equal(am._isRequestCompatible(kimiOf(am), 'all', req), false, 'sibling provider barred under never');
-  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', req), false, 'oauth always barred for foreign');
-});
-
-// ── sticky latch (R2: selector + oracle both read it) ─────────────────────────
-
-test('foreign origin latches per session: a later no-origin follow-up still bars oauth (selector AND oracle agree)', () => {
+test('incompatible latches per session: a later no-tell follow-up still bars Claude (selector + oracle agree)', () => {
   const am = withProviders('when-exhausted');
-  const first = { profile: 'all', originClass: 'foreign', originProvider: 'zai', sessionKey: 's6' };
-  const lease = am.acquireAccount(first); // _noteRequestPolicy latches foreign on s6
-  am.releaseAccount(lease, { success: true });
-
-  const followup = { profile: 'all', sessionKey: 's6' }; // no originClass this turn
-  assert.equal(am._effectiveOrigin(followup).class, 'foreign', 'sticky foreign wins');
-  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', followup), false, 'oauth stays barred via sticky mark');
-
-  // Selector and oracle MUST agree: with providers down, selection returns null and
-  // the oracle must NOT claim an oauth route is available (the desync/spin class).
+  am.acquireAccount({ profile: 'all', anthropicIncompatible: true, homeProvider: 'zai', sessionKey: 's6' }); // _noteRequestPolicy latches
+  const followup = { profile: 'all', sessionKey: 's6' };
+  assert.equal(am._effectiveIncompatible(followup).incompatible, true, 'sticky incompatible wins');
+  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', followup), false);
   am.accounts.filter(a => a.type === 'provider').forEach(a => { a.enabled = false; });
-  assert.equal(am.getActiveAccount(followup), null, 'no oauth leak on a sticky-foreign followup');
-  const retry = am.nextRetryForRequest(followup);
-  assert.notEqual(retry.cause, 'available', 'oracle does not offer an oauth route to a foreign-pinned session');
+  assert.equal(am.getActiveAccount(followup), null, 'no Claude leak on a sticky-incompatible followup');
+  assert.notEqual(am.nextRetryForRequest(followup).cause, 'available', 'oracle agrees with selector');
 });
 
-test('foreign never downgrades: an Anthropic-looking followup on a latched-foreign session stays foreign', () => {
-  const am = withProviders();
-  am.acquireAccount({ profile: 'all', originClass: 'foreign', originProvider: 'zai', sessionKey: 's7' });
-  assert.equal(am._effectiveOrigin({ profile: 'all', originClass: 'anthropic', sessionKey: 's7' }).class, 'foreign');
+test('markSessionIncompatible (react-and-heal) latches + is exposed in getStatus', () => {
+  const am = withProviders('when-exhausted');
+  am.markSessionIncompatible('healed', 'kimi');
+  assert.equal(am._effectiveIncompatible({ sessionKey: 'healed' }).incompatible, true);
+  assert.equal(am.getStatus().sessions.providerPinned, 1);
 });
 
-// ── policy setter + reader validation ─────────────────────────────────────────
+// ── policy setter + honest error + config + describeRequest seam ───────────────
 
-test('setCrossProviderFallbackPolicy validates the enum; unknown values read as when-exhausted', () => {
+test('setCrossProviderFallbackPolicy validates the enum; invalid persisted value reads as when-exhausted', () => {
   const am = withProviders('when-exhausted');
   assert.equal(am.setCrossProviderFallbackPolicy('bogus'), false);
-  assert.equal(am._crossProviderFallbackPolicy(), 'when-exhausted');
   assert.equal(am.setCrossProviderFallbackPolicy('never'), true);
   assert.equal(am._crossProviderFallbackPolicy(), 'never');
-  assert.equal(am.setCrossProviderFallbackPolicy('always'), true);
-  assert.equal(am._crossProviderFallbackPolicy(), 'always');
-  am.scheduler.crossProviderFallbackPolicy = 'garbage-on-disk';
-  assert.equal(am._crossProviderFallbackPolicy(), 'when-exhausted', 'invalid persisted value falls back to default');
+  am.scheduler.crossProviderFallbackPolicy = 'garbage';
+  assert.equal(am._crossProviderFallbackPolicy(), 'when-exhausted');
 });
 
-test('getStatus exposes the policy + foreign-pinned session count', () => {
-  const am = withProviders('never');
-  am.acquireAccount({ profile: 'all', originClass: 'foreign', originProvider: 'zai', sessionKey: 's8' });
-  const st = am.getStatus();
-  assert.equal(st.routing.crossProviderFallbackPolicy, 'never');
-  assert.equal(st.sessions.foreignPinned, 1);
-});
-
-// ── unknown origin (fresh session) fails OPEN — never stranded ─────────────────
-
-test('unknown-origin request (no tool blocks yet) routes normally (fail-open, oauth preferred)', () => {
+test('unavailableMessage is honest for an incompatible-pinned session (not the misleading Claude message)', () => {
   const am = withProviders('when-exhausted');
-  const req = { profile: 'all', originClass: undefined, sessionKey: 's-fresh' };
-  const l = am.acquireAccount(req);
-  assert.equal(l.account.type, 'oauth', 'no positive foreign signal ⇒ normal Claude routing');
-});
-
-// ── honest error (R3) + config default ────────────────────────────────────────
-
-test('unavailableMessage is honest for a foreign-pinned session (not the misleading Claude message)', () => {
-  const am = withProviders('when-exhausted');
-  am.acquireAccount({ profile: 'all', originClass: 'foreign', originProvider: 'zai', sessionKey: 's-msg' });
+  am.markSessionIncompatible('s-msg', 'zai');
   const msg = unavailableMessage(am, { profile: 'all', sessionKey: 's-msg' }, 30, true);
-  assert.match(msg, /GLM/, 'names the real (provider) blocker');
-  assert.doesNotMatch(msg, /5h or weekly|all \d+ (are|accounts)/i, 'does not blame Claude quota');
-  assert.doesNotMatch(msg, /signed thinking/i, 'does not blame signed thinking');
+  assert.match(msg, /GLM/);
+  assert.doesNotMatch(msg, /5h or weekly|all \d+ (are|accounts)/i);
 });
 
 test('createDefaultConfig ships the cross-provider policy default', () => {
   assert.equal(createDefaultConfig().scheduler.crossProviderFallbackPolicy, 'when-exhausted');
 });
 
-// ── the SEAM: describeRequest → requestInfo.originClass (what the gate actually reads) ──
+test('isAnthropicIncompatBody matches the 3 real shapes but NOT a generic 400 echoing the words', () => {
+  assert.equal(isAnthropicIncompatBody("server_tool_use.id: String should match pattern '^srvtoolu_'"), true);
+  assert.equal(isAnthropicIncompatBody('Invalid `signature` in `thinking` block'), true);
+  assert.equal(isAnthropicIncompatBody('messages.4.content.0.thinking.signature: Field required'), true);
+  // A user prompt that merely mentions the words must NOT latch the session provider-pinned.
+  assert.equal(isAnthropicIncompatBody('Please explain your thinking and the signature style of Bach.'), false);
+  assert.equal(isAnthropicIncompatBody('max_tokens: must be greater than 0'), false);
+  assert.equal(isAnthropicIncompatBody(''), false);
+});
 
-test('describeRequest wires transcript origin onto requestInfo (the seam routing reads)', () => {
+test('react-and-heal does NOT trigger when no provider exists (profile=claude) — the 400 surfaces, session not stranded', () => {
+  // With no provider account, an incompatible request has no compatible route: it must
+  // yield a route-less verdict rather than a phantom retry. (The HTTP surface-the-400
+  // path is covered in server.test.js; here we assert the routing verdict.)
+  const am = new AccountManager([
+    { name: 'claude1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
+  const req = { profile: 'all', anthropicIncompatible: true, homeProvider: 'zai', sessionKey: 'no-prov' };
+  assert.equal(am.getActiveAccount(req), null, 'no provider ⇒ no route (honest), never a Claude account');
+});
+
+test('describeRequest wires anthropicIncompatible/homeProvider onto requestInfo (the seam routing reads)', () => {
   const req = { method: 'POST', url: '/v1/messages' };
   const body = obj => Buffer.from(JSON.stringify(obj));
-  const glm = describeRequest(req, body({ model: 'claude-opus-4-8', messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'call_abc', name: 'x', input: {} }] }] }));
-  assert.equal(glm.originClass, 'foreign', 'a GLM (call_) transcript resolves to foreign on requestInfo');
-  assert.equal(glm.originProvider, 'zai');
-  const ant = describeRequest(req, body({ model: 'claude-opus-4-8', messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'x', input: {} }] }] }));
-  assert.equal(ant.originClass, 'anthropic');
+  const srv = describeRequest(req, body(asst({ type: 'server_tool_use', id: 'call_x', name: 'web', input: {} })));
+  assert.equal(srv.anthropicIncompatible, true);
+  assert.equal(srv.homeProvider, 'zai');
+  const kimi = describeRequest(req, body(asst({ type: 'tool_use', id: 'tool_k', name: 'x', input: {} })));
+  assert.equal(kimi.anthropicIncompatible, undefined, 'a Kimi client tool_use is NOT incompatible');
+  assert.equal(kimi.homeProvider, 'kimi', 'but the home-provider hint is recorded');
   const fresh = describeRequest(req, body({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'hi' }] }));
-  assert.equal(fresh.originClass, undefined, 'no tool blocks ⇒ originClass unset (routing fails open)');
+  assert.equal(fresh.anthropicIncompatible, undefined);
 });

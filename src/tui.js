@@ -864,6 +864,11 @@ export class TUI {
       lines.push(yellow('  No accounts configured. Press [a] to add one.'));
     } else {
       lines.push('');
+      // Column legend — the per-row numbers are otherwise cryptic. Ses/Wk are the
+      // two quota bars; Now is live concurrency; 15m/1h are recent throughput.
+      if (W >= 88) {
+        lines.push(' ' + dim('Ses/Wk = 5h/7d quota (used% · resets-in) · Now = in-flight (weight) · 15m/1h = requests served (avg latency · Nf=fails)'));
+      }
       const showBoth = W >= 70;
       const bw = showBoth
         ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))

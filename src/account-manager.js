@@ -1034,16 +1034,16 @@ export class AccountManager {
   _migrationSafeForRequest(requestInfo = {}) {
     // Fail closed on any body we couldn't fully scan (non-JSON / parse error).
     if (requestInfo.bodyThinkingScanned !== true) return false;
-    // A foreign (GLM/Kimi) session is provider-pinned; the only cross it could make
-    // is GLM↔Kimi, whose mismatched thinking formats risk a reasoning-loop — keep it
-    // on its bound provider rather than rebalancing.
-    if (this._effectiveOrigin(requestInfo).class === 'foreign') return false;
+    // An Anthropic-incompatible (provider-pinned) session's only possible cross is
+    // GLM↔Kimi, whose mismatched thinking formats risk a reasoning-loop — keep it on
+    // its bound provider rather than rebalancing.
+    if (this._effectiveIncompatible(requestInfo).incompatible) return false;
     // A signed-thinking request is migration-safe when cross-account thinking
     // migration is enabled: the signature is content/model integrity, not account-
-    // bound, and the rebalance candidate filter (_matchesRequest → _isRequestCompatible)
-    // already bars providers for thinking, so every eligible target is a Claude
-    // account. When the flag is off, keep the conservative bar (never migrate signed
-    // thinking) until the revert-to-issuer fail-safe lands (#16).
+    // bound. The rebalance candidate loop (_shouldRebalanceBoundSession) additionally
+    // skips PROVIDER targets for a signed-thinking request, so every migration target
+    // stays a Claude account (a signed block isn't shuttled to a provider mid-session).
+    // When the flag is off, keep the conservative bar (never migrate signed thinking).
     if (requestInfo.requiresAnthropicThinkingIntegrity === true) {
       return this.scheduler.crossAccountThinkingMigration === true;
     }
@@ -1084,6 +1084,10 @@ export class AccountManager {
     for (const account of this.accounts) {
       if (account.index === bound.index) continue;
       if (excludedIndexes.has(account.index)) continue;
+      // Keep a signed-thinking session's live migration on Claude accounts only —
+      // don't shuttle an Anthropic-signed block onto a provider mid-session even
+      // though _isRequestCompatible now allows providers for thinking under policy.
+      if (requestInfo.requiresAnthropicThinkingIntegrity === true && account.type === 'provider') continue;
       if (!this._matchesRequest(account, profile, requestInfo)) continue;
       // Genuinely-healthy alternatives only (normal/soft/unknown weekly + model headroom).
       if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model })) continue;
@@ -1493,7 +1497,7 @@ export class AccountManager {
     const base = Number.isFinite(account.priority) ? account.priority : 0;
     if (account.type === 'provider'
         && this._crossProviderFallbackPolicy() === 'always'
-        && this._effectiveOrigin(requestInfo).class !== 'foreign') {
+        && !this._effectiveIncompatible(requestInfo).incompatible) {
       return 0;
     }
     return base;
@@ -1506,53 +1510,45 @@ export class AccountManager {
     return true;
   }
 
-  // Effective home-provider origin for a request: the request's own transcript
-  // classification, OR a sticky 'foreign' latch on the session (which never
-  // downgrades — once a GLM/Kimi tool-use id is seen, later no-tool follow-up turns
-  // of that session stay provider-pinned). Both the selector AND the retry oracle
-  // read this so they never disagree (foreign-barred here == foreign-barred there).
-  _effectiveOrigin(requestInfo = {}) {
+  // Effective Anthropic-incompatibility for a request: the request's own transcript
+  // verdict, OR a sticky latch on the session — set once a foreign server_tool_use
+  // id is seen, or once Anthropic REJECTED the transcript on replay (react-and-heal
+  // in server.js). Never downgrades, so a later no-tool follow-up turn stays
+  // provider-pinned. Both the selector AND the retry oracle read this so they never
+  // disagree. homeProvider is a SOFT hint (first foreign id shape) for 'never' only.
+  _effectiveIncompatible(requestInfo = {}) {
     const sticky = requestInfo.sessionKey ? this.sessionPolicies.get(requestInfo.sessionKey) : null;
-    if (sticky?.originClass === 'foreign') {
-      return { class: 'foreign', provider: sticky.originProvider || requestInfo.originProvider || null };
-    }
-    if (requestInfo.originClass === 'foreign') {
-      return { class: 'foreign', provider: requestInfo.originProvider || null };
-    }
     return {
-      class: requestInfo.originClass || sticky?.originClass || null,
-      provider: requestInfo.originProvider || sticky?.originProvider || null,
+      incompatible: Boolean(requestInfo.anthropicIncompatible || sticky?.anthropicIncompatible),
+      homeProvider: requestInfo.homeProvider || sticky?.homeProvider || null,
     };
   }
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
     if (!this._matchesProfile(account, profile)) return false;
 
-    const origin = this._effectiveOrigin(requestInfo);
+    const { incompatible, homeProvider } = this._effectiveIncompatible(requestInfo);
+    const policy = this._crossProviderFallbackPolicy();
 
-    if (origin.class === 'foreign') {
-      // HARD, policy-INDEPENDENT: a GLM/Kimi transcript can never replay to an
-      // Anthropic account (400 on the non-`srvtoolu_` id). Provider accounts only.
-      // This branch also SUPERSEDES the Anthropic-thinking bar below — a foreign
-      // session's (unsigned) thinking must go BACK to its provider, never be
-      // force-pinned to Claude (the misroute that caused the reported 400).
+    if (incompatible) {
+      // The transcript can't replay to Claude (a foreign server_tool_use id, or
+      // content Anthropic rejected on replay) — provider accounts ONLY, regardless
+      // of policy. Providers are lenient and accept each other's ids (GLM↔Kimi is
+      // fine); 'never' pins to the detected home provider when known.
       if (account.type !== 'provider') return false;
-      // 'never' pins to the ORIGIN provider family when known (GLM→GLM, Kimi→Kimi).
-      // 'when-exhausted'/'always' let the sibling provider serve too (priority 10<20
-      // keeps it a fallback). Unknown origin provider ⇒ any provider allowed.
-      if (this._crossProviderFallbackPolicy() === 'never'
-          && origin.provider && account.provider !== origin.provider) return false;
+      if (policy === 'never' && homeProvider && account.provider !== homeProvider) return false;
       return true;
     }
 
-    // Anthropic-origin or unknown: oauth (Claude) is always eligible. Provider
-    // fallback (Claude→GLM/Kimi, the SAFE direction) is policy-gated and still
-    // barred for signed thinking (an Anthropic signature can't be validated by a
-    // provider). 'never' = Claude session uses Claude only.
-    if (account.type === 'provider') {
-      if (this._crossProviderFallbackPolicy() === 'never') return false;
-      if (this._requiresAnthropicThinkingIntegrity(requestInfo)) return false;
-    }
+    // Compatible session — includes Kimi and GLM-without-server-tools, whose regular
+    // tool_use ids pass Anthropic's loose validation, AND ordinary Claude sessions.
+    // Claude is eligible + preferred (priority 0). Provider fallback is the SAFE
+    // direction (lenient providers accept Anthropic ids/signatures) and is
+    // policy-gated ONLY: 'never' keeps a Claude session on Claude; 'when-exhausted'
+    // lets providers serve as a priority-fallback; 'always' peers them
+    // (_effectivePriority). Signed thinking no longer bars providers here — but its
+    // live MIGRATION stays Claude-only (see the rebalance guard).
+    if (account.type === 'provider' && policy === 'never') return false;
     return true;
   }
 
@@ -1561,33 +1557,34 @@ export class AccountManager {
     if (requestInfo.requiresAnthropicThinkingIntegrity) {
       this.markSessionThinkingProtected(requestInfo.sessionKey, requestInfo.model);
     }
-    if (requestInfo.originClass === 'foreign') {
-      this.markSessionOrigin(requestInfo.sessionKey, 'foreign', requestInfo.originProvider);
+    if (requestInfo.anthropicIncompatible) {
+      this.markSessionIncompatible(requestInfo.sessionKey, requestInfo.homeProvider);
     }
   }
 
-  // Latch a session's foreign (GLM/Kimi) origin. Only 'foreign' is sticky — an
-  // Anthropic classification never bars anything, and never-downgrade keeps a
-  // provider-pinned session correct across a later no-tool follow-up turn.
-  markSessionOrigin(sessionKey, originClass, originProvider = null) {
-    if (!sessionKey || originClass !== 'foreign') return;
+  // Latch a session as Anthropic-incompatible (a foreign server_tool_use id, or a
+  // transcript Anthropic rejected on replay). Sticky + never-downgrades so the
+  // session stays provider-pinned across later follow-up turns.
+  markSessionIncompatible(sessionKey, homeProvider = null) {
+    if (!sessionKey) return;
     const existing = this.sessionPolicies.get(sessionKey) || {};
-    if (existing.originClass !== 'foreign') {
-      console.log(`[Maxpool] Session "${sessionKey}" is ${originProvider || 'provider'}-origin (foreign transcript) — pinned to provider accounts`);
+    if (!existing.anthropicIncompatible) {
+      console.log(`[Maxpool] Session "${sessionKey}" is Anthropic-incompatible (${homeProvider || 'provider'} transcript) — pinned to GLM/Kimi`);
     }
     this.sessionPolicies.set(sessionKey, {
       ...existing,
-      originClass: 'foreign',
-      originProvider: existing.originProvider || originProvider || null,
+      anthropicIncompatible: true,
+      homeProvider: existing.homeProvider || homeProvider || null,
     });
   }
 
+  // Marks a session as containing Anthropic signed thinking. This no longer bars
+  // provider fallback (a lenient provider accepts an Anthropic signature) — it only
+  // keeps the session's live cross-account MIGRATION on Claude (the rebalance guard),
+  // so a signed block isn't needlessly shuttled to a provider mid-session.
   markSessionThinkingProtected(sessionKey, model = null) {
     if (!sessionKey) return;
     const existing = this.sessionPolicies.get(sessionKey) || {};
-    if (!existing.requiresAnthropicThinkingIntegrity) {
-      console.log(`[Maxpool] Session "${sessionKey}" contains Anthropic signed thinking; provider fallback disabled`);
-    }
     this.sessionPolicies.set(sessionKey, {
       ...existing,
       requiresAnthropicThinkingIntegrity: true,
@@ -2416,7 +2413,7 @@ export class AccountManager {
       sessions: {
         stickyBindings: this.sessionBindings.size,
         thinkingProtected: [...this.sessionPolicies.values()].filter(p => p.requiresAnthropicThinkingIntegrity).length,
-        foreignPinned: [...this.sessionPolicies.values()].filter(p => p.originClass === 'foreign').length,
+        providerPinned: [...this.sessionPolicies.values()].filter(p => p.anthropicIncompatible).length,
       },
     };
   }
