@@ -7,13 +7,14 @@
 // is blind to an account it isn't actively routing to and will pile traffic onto it.
 // This is the one sanctioned active-upstream feature; the proxy is otherwise passive.
 
-import { fetchUsage } from './oauth.js';
+import { fetchUsage, fetchProviderUsage } from './oauth.js';
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = intervalMs;
     this.probeFn = probeFn;
+    this.providerProbeFn = providerProbeFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
     this.timer = null;
@@ -49,21 +50,37 @@ export class Prober {
     if (this._inflight) { try { await this._inflight; } catch { /* swallow */ } }
   }
 
-  /** Probe every OAuth account once. Overlapping cycles are skipped. The active
-   *  cycle is tracked on `_inflight` so stop() can await it. */
+  /** Probe every OAuth account (usage endpoint) and every provider account with a
+   *  pollable/known quota source (z.ai monitor; Kimi → console-only marker) once.
+   *  Overlapping cycles are skipped. The active cycle is tracked on `_inflight` so
+   *  stop() can await it. */
   probeAll() {
     if (this._running) return this._inflight || Promise.resolve();
     this._running = true;
     this._inflight = (async () => {
       try {
-        const accounts = this.am.accounts.filter(a => a.type === 'oauth' && a.credential);
-        await Promise.all(accounts.map(a => this.probeOne(a)));
+        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential);
+        const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);
+        await Promise.all([
+          ...oauth.map(a => this.probeOne(a)),
+          ...providers.map(a => this.probeProvider(a)),
+        ]);
       } finally {
         this._running = false;
         this._inflight = null;
       }
     })();
     return this._inflight;
+  }
+
+  /** Probe one PROVIDER account. Provider tokens are static API keys (no OAuth
+   *  refresh). Best-effort; never throws. */
+  async probeProvider(account) {
+    try {
+      const usage = await this._withTimeout(this.providerProbeFn(account));
+      if (!usage) return; // timed out — try again next cycle
+      this.am.applyProviderUsage(account.index, usage);
+    } catch { /* best-effort; never let a probe throw */ }
   }
 
   async probeOne(account) {

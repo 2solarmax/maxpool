@@ -42,6 +42,19 @@ function emptyQuota() {
     scopedWeekly: {},
     unifiedStatus: null,   // allowed | allowed_warning | rejected
     resetsAt: null,
+    // Provider (z.ai / Kimi) quota — kept SEPARATE from unified* so a provider
+    // reading never leaks into the OAuth quota gates (_isAvailable / _weeklyRawState
+    // / _accountScarcity read unified* only). z.ai is pollable; Kimi is not.
+    providerSes: null,          // utilization 0-1 (z.ai 5h token window)
+    providerSesReset: null,     // ms
+    providerWk: null,           // utilization 0-1 (z.ai weekly), null if plan has none
+    providerWkReset: null,      // ms
+    providerQuotaSource: null,  // 'zai' (pollable) | 'console-only' (kimi) | null
+    // Freshness: last time a background usage PROBE succeeded for this account
+    // (oauth fetchUsage OR provider fetchProviderUsage). Drives the TUI staleness
+    // marker — a swallowed failing probe no longer silently freezes a stale tag.
+    // Header-driven updates do NOT stamp this (headers can't refresh scoped/provider).
+    lastProbeOkAt: null,        // ms
   };
 }
 
@@ -589,8 +602,14 @@ export class AccountManager {
     if (!fam) return null;
     const e = account.quota?.scopedWeekly?.[fam];
     if (!e || e.isActive === false) return null;
-    const exhausted = e.severity === 'critical'
-      || (e.utilization != null && e.utilization >= this.scheduler.weeklyExhaustedThreshold);
+    // Bench ONLY at genuine exhaustion (>= weeklyExhaustedThreshold). Anthropic
+    // labels a scoped weekly `severity:'critical'` well before it's actually
+    // capped (~90%), where the model still has headroom and is still served — a
+    // hard bench there strands the remainder and mislabels the account "maxed".
+    // A real scoped 429 writes utilization:1 (markRateLimited), so genuine
+    // exhaustion is still caught by the threshold. Same predicate drives the TUI
+    // `maxed` tag, so "maxed" renders iff the model is actually benched.
+    const exhausted = e.utilization != null && e.utilization >= this.scheduler.weeklyExhaustedThreshold;
     return exhausted ? { resetAt: e.resetAt || null, family: fam } : null;
   }
 
@@ -1648,6 +1667,16 @@ export class AccountManager {
     // soft de-preference of accounts burning ahead of an even pace. Never a bench.
     const paceCost = this._accountScarcity(account, now) * this.scheduler.paceCostWeight;
 
+    // Per-model weekly de-preference: an account whose scoped weekly for THIS
+    // request's model (e.g. Fable) is high-but-not-exhausted is a poor pick for
+    // that model — shed its load toward healthier accounts BEFORE the hard bench
+    // at weeklyExhaustedThreshold, so it's chosen only as overflow (rarely
+    // re-429ing). Scoped weekly is otherwise absent from scoring. Soft, never a
+    // bench; 0 below reserve and for models with no scoped cap.
+    const scopedPace = requestInfo.model
+      ? this._scopedScarcity(account, requestInfo.model, now) * this.scheduler.paceCostWeight
+      : 0;
+
     const fleetRecentWeight = ctx?.fleetRecentWeight ?? 0;
     const recentWeight = this._loadSummary(account, this.scheduler.spreadWindowMs, now).weight;
     const share = fleetRecentWeight > 0 ? recentWeight / fleetRecentWeight : 0;
@@ -1663,7 +1692,22 @@ export class AccountManager {
     // default) learns the real number within a cycle. `probing`/requalify still
     // flags a never-seen account for learning — that path is unchanged.
 
-    return concurrency + capPenalty + paceCost + spread + ramp + failurePenalty;
+    return concurrency + capPenalty + paceCost + scopedPace + spread + ramp + failurePenalty;
+  }
+
+  /**
+   * Per-model weekly pace-overage for `model`'s family, or 0 when the account has
+   * no scoped cap for it, the cap is inactive, or it's below the reserve tier
+   * (plenty of headroom → no steering). Same pace discount as _windowScarcity, so
+   * a scoped window about to reset is cheap to spend.
+   */
+  _scopedScarcity(account, model, now = Date.now()) {
+    const fam = modelFamily(model);
+    if (!fam) return 0;
+    const e = account.quota?.scopedWeekly?.[fam];
+    if (!e || e.isActive === false || e.utilization == null) return 0;
+    if (e.utilization < this.scheduler.weeklyReserveThreshold) return 0;
+    return this._windowScarcity(e.utilization, e.resetAt, WEEK_MS, now);
   }
 
   /**
@@ -1795,8 +1839,15 @@ export class AccountManager {
     }
     // Per-model weekly sub-limits (Fable, Opus, ...). Replace wholesale with the
     // fresh probe set so a family that dropped out of the response doesn't linger
-    // stale; expiry on reset is a backstop for the between-probe window.
+    // stale; expiry on reset is a backstop for the between-probe window. EXCEPTION:
+    // a `reactive` scoped-429 bench is authoritative-high — while its resetAt is
+    // still future, a lagging probe may neither lower it nor drop it (a probe that
+    // omits the family, or reports the pre-429 level, would otherwise un-bench it
+    // and trigger an immediate re-429 flap). _clearExpiredQuotas self-clears it at
+    // resetAt even if probes die.
     if (usage.scopedWeekly && typeof usage.scopedWeekly === 'object') {
+      const now = Date.now();
+      const prev = (q.scopedWeekly && typeof q.scopedWeekly === 'object') ? q.scopedWeekly : {};
       const fresh = {};
       for (const [fam, e] of Object.entries(usage.scopedWeekly)) {
         if (!e) continue;
@@ -1807,8 +1858,20 @@ export class AccountManager {
           isActive: e.isActive !== false,
         };
       }
+      for (const [fam, pe] of Object.entries(prev)) {
+        if (!pe || !pe.reactive || pe.resetAt == null || pe.resetAt <= now) continue;
+        const f = fresh[fam];
+        // Probe absent, null, or LOWER than the reactive bench → keep the bench.
+        // Probe CONFIRMS >= the reactive level → take the fresh reading (still >=
+        // threshold, so still exhausted; no stickiness needed).
+        if (!f || f.utilization == null || f.utilization < (pe.utilization ?? 0)) {
+          fresh[fam] = { ...pe };
+        }
+      }
       q.scopedWeekly = fresh;
     }
+
+    q.lastProbeOkAt = Date.now();
 
     // If we just learned this account's weekly window while probing, re-evaluate
     // selection (same path as learning it from a live response).
@@ -1816,6 +1879,55 @@ export class AccountManager {
       account.probing = false;
       account.requalify = true;
     }
+  }
+
+  /**
+   * Update a PROVIDER account's quota from a provider usage probe
+   * (fetchProviderUsage). z.ai maps to Ses/Wk token windows; Kimi has no pollable
+   * source and only sets a `console-only` marker. Writes ONLY the provider* fields
+   * (never the unified or scopedWeekly fields) so a provider reading can't reach
+   * the OAuth quota gates.
+   */
+  applyProviderUsage(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage) return;
+    const q = account.quota;
+    if (usage.error) {
+      // Distinguish "no pollable quota" (Kimi) from a transient probe failure.
+      // Never clear existing values on a transient error — let them age into the
+      // staleness marker instead of blanking the bars.
+      if (usage.source === 'console-only') q.providerQuotaSource = 'console-only';
+      return;
+    }
+    q.providerQuotaSource = usage.source || 'zai';
+    if (usage.ses) {
+      if (usage.ses.utilization != null) q.providerSes = clamp01(usage.ses.utilization);
+      if (usage.ses.resetAt != null) q.providerSesReset = usage.ses.resetAt;
+    }
+    if (usage.wk) {
+      if (usage.wk.utilization != null) q.providerWk = clamp01(usage.wk.utilization);
+      if (usage.wk.resetAt != null) q.providerWkReset = usage.wk.resetAt;
+    } else {
+      // Weekly window absent from this plan/response — clear so a stale weekly
+      // reading doesn't linger after a plan/window change.
+      q.providerWk = null;
+      q.providerWkReset = null;
+    }
+    q.lastProbeOkAt = Date.now();
+  }
+
+  /**
+   * True when the background quota probe hasn't succeeded in > 2× its interval —
+   * the last-known scoped/provider values are aging with no confirmation. Returns
+   * false when the probe is off (nothing to be stale against) or has never yet
+   * succeeded (startup — shown as "no data", not "stale").
+   */
+  _quotaProbeStale(account, now = Date.now()) {
+    const interval = this.quotaProbeIntervalMs;
+    if (!interval || interval <= 0) return false;
+    const last = account?.quota?.lastProbeOkAt;
+    if (last == null) return false;
+    return (now - last) > Math.max(2 * interval, 120_000);
   }
 
   /**
@@ -1956,6 +2068,10 @@ export class AccountManager {
         resetAt: Date.now() + (retryAfter * 1000),
         severity: 'critical',
         isActive: true,
+        // Authoritative-high: a real reject. A lagging 60s probe reporting the
+        // pre-429 level (e.g. 0.96) must NOT lower/drop this before resetAt, else
+        // the account un-benches and immediately re-429s — a per-probe flap.
+        reactive: true,
       };
       account.lastStatus = options.status || 429;
       account.lastErrorAt = Date.now();

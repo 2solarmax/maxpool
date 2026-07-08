@@ -984,7 +984,7 @@ export class TUI {
     status = rpad(status, 13);
 
     if (a.type === 'provider') {
-      return this._renderProviderAcct(sel, cur, name, type, status, a);
+      return this._renderProviderAcct(sel, cur, name, type, status, a, bw, showBoth);
     }
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
@@ -1013,25 +1013,53 @@ export class TUI {
     }
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
-    // Per-model weekly caps (e.g. Fable maxed while the unified weekly still has
-    // headroom) — surfaced separately so a capped model on an otherwise-healthy
-    // account is visible, and routing away from it is explained.
+    // Per-model weekly caps (e.g. Fable, while the unified weekly still has
+    // headroom). Show the ACTUAL utilization — "Fable 90%" (yellow) while high but
+    // still usable, "Fable maxed" (red) ONLY at genuine exhaustion. This is the
+    // SAME predicate the router benches on (_scopedExhausted), so "maxed" renders
+    // iff the model is actually benched — 90%/critical is no longer mislabelled.
     const exhaustedFloor = this.am.scheduler?.weeklyExhaustedThreshold ?? 0.985;
-    const capped = Object.entries(q.scopedWeekly || {})
-      .filter(([, e]) => e && e.isActive !== false
-        && (e.severity === 'critical' || (e.utilization != null && e.utilization >= exhaustedFloor)))
-      .map(([fam]) => fam.charAt(0).toUpperCase() + fam.slice(1));
-    if (capped.length) line += `  ${red(`${capped.join(',')} maxed`)}`;
+    const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85;
+    const scopedTags = [];
+    for (const [fam, e] of Object.entries(q.scopedWeekly || {})) {
+      if (!e || e.isActive === false || e.utilization == null) continue;
+      if (e.utilization < reserveFloor) continue;
+      const Fam = fam.charAt(0).toUpperCase() + fam.slice(1);
+      scopedTags.push(e.utilization >= exhaustedFloor
+        ? red(`${Fam} maxed`)
+        : yellow(`${Fam} ${Math.round(e.utilization * 100)}%`));
+    }
+    if (scopedTags.length) line += `  ${scopedTags.join(' ')}`;
+    // Freshness: scoped caps are refreshed ONLY by the background probe (response
+    // headers don't carry them). If the probe has gone stale (> 2× interval since
+    // last success), say so rather than imply the last-known value is current.
+    if (this.am._quotaProbeStale?.(a)) line += `  ${dim('stale')}`;
     line += `  ${dim(loadText(this._accountLoad(a)))}`;
     return line;
   }
 
-  _renderProviderAcct(sel, cur, name, type, status, a) {
+  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true) {
     const completed = a.completedRequests || 0;
     const failed = a.failedRequests || 0;
     const active = a.inFlight || 0;
     const last = a.lastStatus ? `${statusColor(a.lastStatus)} ${formatMs(a.lastResponseMs)}` : '-';
     const q = a.quota || {};
+
+    // Quota segment. z.ai has a pollable monitor endpoint → real Ses/Wk token bars,
+    // same rendering as OAuth accounts. Kimi (Moonshot coding key) has NO pollable
+    // quota (web console only) → an honest label, never a fake bar. Fields are the
+    // SEPARATE provider* set, so a provider reading never leaks into an OAuth bar.
+    let quotaSeg = '';
+    if (q.providerSes != null || q.providerWk != null) {
+      quotaSeg = `  Ses ${bar(q.providerSes, bw, q.providerSesReset)}`;
+      if (showBoth && q.providerWk != null) quotaSeg += `  Wk ${bar(q.providerWk, bw, q.providerWkReset)}`;
+      if (this.am._quotaProbeStale?.(a)) quotaSeg += `  ${dim('stale')}`;
+    } else if (q.providerQuotaSource === 'console-only') {
+      quotaSeg = `  ${dim('Quota console-only')}`;
+    } else if (q.providerQuotaSource === 'zai') {
+      quotaSeg = `  ${dim('Ses/Wk probing')}`;
+    }
+
     let limit = '';
     if (q.genericLimit != null && q.genericRemaining != null) {
       const used = q.genericLimit - q.genericRemaining;
@@ -1039,7 +1067,7 @@ export class TUI {
       limit = `  Lim ${used}/${q.genericLimit}${reset ? ` ${reset}` : ''}`;
     }
     const err = a.lastError ? `  Err ${String(a.lastError).slice(0, 18)}` : '';
-    return ` ${sel}${cur} ${name} ${type} ${status} Act ${String(active).padStart(2)}  OK ${String(completed).padStart(3)}  Fail ${String(failed).padStart(2)}  Last ${last}  ${dim(loadText(this._accountLoad(a)))}${limit}${err}`;
+    return ` ${sel}${cur} ${name} ${type} ${status} Act ${String(active).padStart(2)}  OK ${String(completed).padStart(3)}  Fail ${String(failed).padStart(2)}  Last ${last}${quotaSeg}  ${dim(loadText(this._accountLoad(a)))}${limit}${err}`;
   }
 
   _accountLoad(account) {

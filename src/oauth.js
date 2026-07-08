@@ -245,6 +245,61 @@ export async function fetchUsage(accessToken) {
   }
 }
 
+// z.ai quota monitor — a DIFFERENT host/path than the message upstream
+// (account.upstream is the Anthropic-compat endpoint). Zero-spend read.
+const ZAI_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
+
+/** Classify one z.ai `limits[]` entry into a Ses (5h) or Wk (weekly) TOKEN window.
+ *  Only `TOKENS_LIMIT` maps to the quota bars; `TIME_LIMIT` is a tool-call cap
+ *  (web-search/reader counts) and is intentionally ignored. `unit` is z.ai's
+ *  window enum (3 = 5-hour session, 6 = weekly); we fall back to reset-distance
+ *  when the code is unfamiliar so a new plan tier still classifies sanely. */
+export function classifyZaiLimit(l, now = Date.now()) {
+  if (!l || l.type !== 'TOKENS_LIMIT') return null;
+  const reset = Number(l.nextResetTime);
+  const resetAt = Number.isFinite(reset) && reset > 0 ? reset : null;
+  const pct = typeof l.percentage === 'number' ? l.percentage : parseFloat(l.percentage);
+  const utilization = Number.isFinite(pct) ? Math.max(0, Math.min(1, pct / 100)) : null;
+  let bucket;
+  if (l.unit === 3) bucket = 'ses';
+  else if (l.unit === 6) bucket = 'wk';
+  else if (resetAt) bucket = (resetAt - now) <= 12 * 60 * 60 * 1000 ? 'ses' : 'wk';
+  else bucket = 'ses';
+  return { bucket, utilization, resetAt };
+}
+
+/** Read a provider account's quota. z.ai has a pollable monitor endpoint mapped
+ *  to Ses/Wk token windows; Kimi (Moonshot coding key) has NO pollable quota
+ *  (web console only), so it returns a `console-only` marker instead of fake
+ *  bars. Returns { ses, wk, level } | { error, status?, source? }. */
+export async function fetchProviderUsage(account) {
+  const provider = account?.provider;
+  const token = account?.credential;
+  if (provider === 'kimi') return { error: 'unsupported', source: 'console-only' };
+  if (provider !== 'zai' || !token) return { error: 'unsupported', source: null };
+  try {
+    const res = await fetch(ZAI_QUOTA_URL, {
+      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+    });
+    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
+    const data = await res.json();
+    if (data?.code !== 200 || !data?.data) {
+      return { error: `bad_envelope${data?.code != null ? ' code=' + data.code : ''}` };
+    }
+    const now = Date.now();
+    let ses = null, wk = null;
+    for (const l of (Array.isArray(data.data.limits) ? data.data.limits : [])) {
+      const c = classifyZaiLimit(l, now);
+      if (!c) continue;
+      if (c.bucket === 'ses') ses = { utilization: c.utilization, resetAt: c.resetAt };
+      else if (c.bucket === 'wk') wk = { utilization: c.utilization, resetAt: c.resetAt };
+    }
+    return { ses, wk, level: data.data.level || null, source: 'zai' };
+  } catch (err) {
+    return { error: err.message || String(err), status: null };
+  }
+}
+
 // OAuth config (extracted from Claude Code)
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';

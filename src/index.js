@@ -564,6 +564,9 @@ async function serverWorkerCommand() {
   // assertions (mirrors MAXPOOL_DISABLE_SLEEP_GUARD).
   const probeSeconds = process.env.MAXPOOL_DISABLE_QUOTA_PROBE === '1' ? 0 : (config.quotaProbeSeconds || 0);
   const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000 });
+  // Tell the AM the probe cadence so the TUI can flag a scoped/provider tag whose
+  // background probe has gone stale (> 2× interval since last success).
+  accountManager.quotaProbeIntervalMs = probeSeconds * 1000;
 
   // Persist refreshed tokens back to config. Defense-in-depth: the updater reads
   // the on-disk refresh token and SKIPS the rotation if a fresher writer already
