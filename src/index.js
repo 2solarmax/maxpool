@@ -850,6 +850,16 @@ async function serverWorkerCommand() {
           mode: config.routing?.mode || 'automatic',
           preferredAccount: config.routing?.preferredAccount || null,
         };
+        // Persist live-toggled scheduler policy (e.g. the cross-provider fallback
+        // policy cycled with the TUI 'f' key). Without this, the toggle takes effect
+        // in memory but silently reverts on the next config write / restart. Merge
+        // onto the existing disk scheduler block so other scheduler keys survive.
+        if (config.scheduler?.crossProviderFallbackPolicy) {
+          diskConfig.scheduler = {
+            ...diskConfig.scheduler,
+            crossProviderFallbackPolicy: config.scheduler.crossProviderFallbackPolicy,
+          };
+        }
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
         // Use live tokens from AccountManager (not the stale config.accounts copy).

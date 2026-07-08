@@ -415,9 +415,23 @@ export class TUI {
       );
     } else if (k === 'p' && this.am.accounts.some(account => account.type !== 'provider')) {
       this._startSelection('prefer');
+    } else if (k === 'f') {
+      // Cycle the cross-provider fallback policy in place — reversible + non-destructive,
+      // so no confirm dialog (unlike restart/delete).
+      this._cycleCrossProviderPolicy();
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
+  }
+
+  async _cycleCrossProviderPolicy() {
+    const order = ['never', 'when-exhausted', 'always'];
+    const cur = this.am._crossProviderFallbackPolicy();
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    this.am.setCrossProviderFallbackPolicy(next);
+    this.config.scheduler = { ...(this.config.scheduler || {}), crossProviderFallbackPolicy: next };
+    await this.saveConfig(this.config);
+    this._addLog(`Cross-provider fallback: ${next}`);
   }
 
   _keySelect(k) {
@@ -820,7 +834,17 @@ export class TUI {
     const routing = this.am.routingMode === 'preferred'
       ? `Manual preference: ${this.am.preferredAccountName} (automatic failover)`
       : 'Automatic load balancing';
-    lines.push(` Routing  ${cyan(routing)}`);
+    // Cross-provider fallback policy — only meaningful when GLM/Kimi providers are in
+    // the pool (profile=all). never=strict pin (yellow), when-exhausted=default (cyan),
+    // always=peer (green).
+    const hasProviders = this.am.accounts.some(a => a.type === 'provider');
+    let xpText = '';
+    if (hasProviders) {
+      const p = this.am._crossProviderFallbackPolicy?.() || 'when-exhausted';
+      const pc = p === 'never' ? yellow(p) : p === 'always' ? green(p) : cyan(p);
+      xpText = `  ${dim('·')}  ${dim('Cross-provider:')} ${pc}`;
+    }
+    lines.push(` Routing  ${cyan(routing)}${xpText}`);
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     if (this.am._isUpstreamThrottleBlocking?.() || queuedCount) {
       const throttle = this.am.upstreamThrottle;
@@ -1034,7 +1058,7 @@ export class TUI {
       case 'accounts':
         return ` ${bold('l')} Login (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'routing':
-        return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('Esc')} Back`;
+        return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('f')} Cross-provider fallback  ${bold('Esc')} Back`;
       case 'select': {
         const act = this.selAction === 'prefer'
           ? 'prefer'

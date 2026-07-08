@@ -987,6 +987,17 @@ function computeQueueWindowMs({
 }
 
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRecoverSoon = true) {
+  const origin = accountManager._effectiveOrigin?.(requestInfo) || { class: null, provider: null };
+
+  // A foreign (GLM/Kimi)-origin session is pinned to provider accounts — Anthropic
+  // would 400 on its tool-use ids. "All Claude at limit" would be the wrong story
+  // (the Claude accounts are irrelevant to it); say what actually blocks it.
+  if (origin.class === 'foreign') {
+    const fam = origin.provider === 'zai' ? 'GLM' : origin.provider === 'kimi' ? 'Kimi' : 'GLM/Kimi';
+    const eta = Number.isFinite(retryAfter) && retryAfter > 0 ? ` Retry in ${retryAfter}s.` : '';
+    return `This session started on ${fam}, so only GLM/Kimi can serve it (a GLM/Kimi transcript can't run on Claude — Anthropic rejects its tool-call ids). No GLM/Kimi provider is available right now.${eta} Check the x-maxpool-zai-token / x-maxpool-kimi-token headers, or resume this session with 'cc glm'/'cc kimi'.`;
+  }
+
   const thinking = requestInfo.requiresAnthropicThinkingIntegrity
     || accountManager._requiresAnthropicThinkingIntegrity?.(requestInfo);
   const n = accountManager.accounts.length;
@@ -1010,7 +1021,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1478,6 +1489,15 @@ function describeRequest(req, body) {
     // rebalancing); an unparsed body leaves this false → treated as NOT safe
     // (fail-closed) so we never replay a signed thinking block to a new account.
     info.bodyThinkingScanned = true;
+    // Home-provider origin of the resumed transcript (from tool-use id shapes).
+    // A 'foreign' (GLM/Kimi) session can NEVER be replayed to an Anthropic account
+    // (Anthropic 400s on a non-srvtoolu_ server_tool_use id) — routing pins it to
+    // provider accounts. A missing originClass = no tool blocks yet (ambiguous) OR
+    // an unparsed body; both fail OPEN in routing (never stranded), and stickiness
+    // (once a foreign id is seen) keeps a latched session pinned regardless.
+    const origin = detectTranscriptOrigin(json);
+    if (origin.class) info.originClass = origin.class;
+    if (origin.provider) info.originProvider = origin.provider;
   } catch {
     // Non-JSON requests are rare; body size still gives a useful load signal.
   }
@@ -1489,6 +1509,47 @@ function requiresAnthropicThinkingIntegrity(json) {
   if (!json || typeof json !== 'object') return false;
   if (json.thinking || json.effort) return true;
   return containsThinkingBlock(json.messages);
+}
+
+// Anthropic tool-use ids: client tool_use is 'toolu_…', server_tool_use is 'srvtoolu_…'
+// (the latter is REQUIRED — Anthropic 400s on replay of any other shape). GLM (z.ai)
+// emits OpenAI-style 'call_…'; Kimi (moonshot) emits 'tool_…'. Allowlist, not denylist:
+// anything NOT matching this is treated as foreign (fail-closed classification).
+const ANTHROPIC_TOOL_ID = /^(toolu|srvtoolu)_/;
+
+// Classify a resumed transcript's HOME PROVIDER from the tool-use id shapes in its
+// replayed `messages`. Returns { class: 'foreign' | 'anthropic' | null, provider:
+// 'zai' | 'kimi' | null }. ANY non-Anthropic tool-use / server_tool_use / tool_result
+// id ⇒ 'foreign' (that session can never be replayed to Anthropic). 'anthropic' if
+// only Anthropic ids seen; null if no tool blocks at all (ambiguous — a fresh session
+// with no incompatible history yet). The request MODEL is NOT used — Claude Code
+// rewrites it to claude-opus-4-8 on resume, so only the transcript is trustworthy.
+function detectTranscriptOrigin(json) {
+  if (!json || typeof json !== 'object') return { class: null, provider: null };
+  let sawAnthropic = false;
+  let foreignProvider = null; // 'zai' | 'kimi' | 'foreign'
+  const classifyForeign = id =>
+    id.startsWith('call_') ? 'zai' : id.startsWith('tool_') ? 'kimi' : 'foreign';
+  const visit = value => {
+    if (foreignProvider) return; // one foreign id is decisive — early-exit the walk
+    if (Array.isArray(value)) { for (const v of value) { visit(v); if (foreignProvider) return; } return; }
+    if (!value || typeof value !== 'object') return;
+    const t = value.type;
+    if ((t === 'tool_use' || t === 'server_tool_use') && typeof value.id === 'string') {
+      if (ANTHROPIC_TOOL_ID.test(value.id)) sawAnthropic = true;
+      else { foreignProvider = classifyForeign(value.id); return; }
+    }
+    if (t === 'tool_result' && typeof value.tool_use_id === 'string') {
+      if (ANTHROPIC_TOOL_ID.test(value.tool_use_id)) sawAnthropic = true;
+      else { foreignProvider = classifyForeign(value.tool_use_id); return; }
+    }
+    if (value.content) visit(value.content);
+    if (value.messages) visit(value.messages);
+  };
+  visit(json.messages);
+  if (foreignProvider) return { class: 'foreign', provider: foreignProvider === 'foreign' ? null : foreignProvider };
+  if (sawAnthropic) return { class: 'anthropic', provider: null };
+  return { class: null, provider: null };
 }
 
 function containsThinkingBlock(value) {

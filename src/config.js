@@ -91,6 +91,17 @@ export function createDefaultConfig() {
       weeklyReserveThreshold: 0.85,
       weeklyCriticalThreshold: 0.95,
       weeklyExhaustedThreshold: 0.985,
+      // Cross-PROVIDER fallback policy for 'cc all' (profile=all): whether a session
+      // may be served by a provider family other than its home (Claude ↔ GLM ↔ Kimi).
+      //   'never'         — strict pin (Claude→Claude, GLM→GLM, Kimi→Kimi).
+      //   'when-exhausted'— (default) home family preferred; cross only once it's
+      //                     exhausted (a Claude session falls to GLM/Kimi when all
+      //                     Claude accounts are unavailable).
+      //   'always'        — providers peer with Claude for a Claude/unknown session.
+      // A GLM/Kimi-origin session NEVER routes to Anthropic under ANY policy — that
+      // direction 400s on the non-`srvtoolu_` tool-use id and is unfixable. Toggle
+      // live in the TUI (Routing sub-mode, 'f' key).
+      crossProviderFallbackPolicy: 'when-exhausted',
     },
     retry: {
       maxAttemptsPerRequest: 0,

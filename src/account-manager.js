@@ -83,6 +83,20 @@ const DEFAULT_SCHEDULER = {
   // makes this safe even if Anthropic ever account-binds signatures — a rejected
   // replay self-heals to the issuer instead of poisoning the session.
   crossAccountThinkingMigration: true,
+  // Cross-PROVIDER fallback policy for 'cc all' (profile=all), i.e. whether a session
+  // may be served by a provider FAMILY other than its home (Claude ↔ GLM ↔ Kimi).
+  //   'never'         — strict pin: a Claude session uses Claude only; a GLM session
+  //                     uses GLM only; a Kimi session uses Kimi only.
+  //   'when-exhausted'— (default) home family preferred; a Claude session falls back
+  //                     to GLM/Kimi only once all Claude accounts are unavailable
+  //                     (providers are already lower-priority fallback), and a GLM
+  //                     session may fall to Kimi once GLM is exhausted.
+  //   'always'        — providers peer with Claude for a Claude/unknown session
+  //                     (load-balanced, not last-resort).
+  // INVARIANT (all policies): a GLM/Kimi-origin session NEVER routes to an Anthropic
+  // account — Anthropic 400s on a non-`srvtoolu_` server_tool_use id; that direction
+  // is unfixable, not policy-tunable.
+  crossProviderFallbackPolicy: 'when-exhausted',
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1020,6 +1034,10 @@ export class AccountManager {
   _migrationSafeForRequest(requestInfo = {}) {
     // Fail closed on any body we couldn't fully scan (non-JSON / parse error).
     if (requestInfo.bodyThinkingScanned !== true) return false;
+    // A foreign (GLM/Kimi) session is provider-pinned; the only cross it could make
+    // is GLM↔Kimi, whose mismatched thinking formats risk a reasoning-loop — keep it
+    // on its bound provider rather than rebalancing.
+    if (this._effectiveOrigin(requestInfo).class === 'foreign') return false;
     // A signed-thinking request is migration-safe when cross-account thinking
     // migration is enabled: the signature is content/model integrity, not account-
     // bound, and the rebalance candidate filter (_matchesRequest → _isRequestCompatible)
@@ -1266,7 +1284,7 @@ export class AccountManager {
         if (!this._matchesRequest(account, profile, requestInfo)) continue;
         if (!this._isAvailable(account, { ...weeklyOptions, model: requestInfo.model })) continue;
 
-        const priority = Number.isFinite(account.priority) ? account.priority : 0;
+        const priority = this._effectivePriority(account, requestInfo);
         const score = this._scoreAccount(account, requestInfo, scoringCtx);
         if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
           bestPriority = priority;
@@ -1461,15 +1479,107 @@ export class AccountManager {
     return true;
   }
 
+  _crossProviderFallbackPolicy() {
+    const p = this.scheduler.crossProviderFallbackPolicy;
+    return (p === 'never' || p === 'always') ? p : 'when-exhausted';
+  }
+
+  // Selection priority with the 'always' cross-provider policy applied: a provider
+  // account peers with oauth (priority 0) for an Anthropic/unknown session so a
+  // Claude session load-balances across Claude+GLM+Kimi rather than using providers
+  // only as last-resort. 'never'/'when-exhausted' keep the provider's own priority
+  // (10/20) → fallback-only. A foreign session is provider-only regardless.
+  _effectivePriority(account, requestInfo = {}) {
+    const base = Number.isFinite(account.priority) ? account.priority : 0;
+    if (account.type === 'provider'
+        && this._crossProviderFallbackPolicy() === 'always'
+        && this._effectiveOrigin(requestInfo).class !== 'foreign') {
+      return 0;
+    }
+    return base;
+  }
+
+  setCrossProviderFallbackPolicy(policy) {
+    if (!['never', 'when-exhausted', 'always'].includes(policy)) return false;
+    this.scheduler.crossProviderFallbackPolicy = policy;
+    console.log(`[Maxpool] Cross-provider fallback policy set to "${policy}"`);
+    return true;
+  }
+
+  // Effective home-provider origin for a request: the request's own transcript
+  // classification, OR a sticky 'foreign' latch on the session (which never
+  // downgrades — once a GLM/Kimi tool-use id is seen, later no-tool follow-up turns
+  // of that session stay provider-pinned). Both the selector AND the retry oracle
+  // read this so they never disagree (foreign-barred here == foreign-barred there).
+  _effectiveOrigin(requestInfo = {}) {
+    const sticky = requestInfo.sessionKey ? this.sessionPolicies.get(requestInfo.sessionKey) : null;
+    if (sticky?.originClass === 'foreign') {
+      return { class: 'foreign', provider: sticky.originProvider || requestInfo.originProvider || null };
+    }
+    if (requestInfo.originClass === 'foreign') {
+      return { class: 'foreign', provider: requestInfo.originProvider || null };
+    }
+    return {
+      class: requestInfo.originClass || sticky?.originClass || null,
+      provider: requestInfo.originProvider || sticky?.originProvider || null,
+    };
+  }
+
   _isRequestCompatible(account, profile, requestInfo = {}) {
     if (!this._matchesProfile(account, profile)) return false;
-    if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) return false;
+
+    const origin = this._effectiveOrigin(requestInfo);
+
+    if (origin.class === 'foreign') {
+      // HARD, policy-INDEPENDENT: a GLM/Kimi transcript can never replay to an
+      // Anthropic account (400 on the non-`srvtoolu_` id). Provider accounts only.
+      // This branch also SUPERSEDES the Anthropic-thinking bar below — a foreign
+      // session's (unsigned) thinking must go BACK to its provider, never be
+      // force-pinned to Claude (the misroute that caused the reported 400).
+      if (account.type !== 'provider') return false;
+      // 'never' pins to the ORIGIN provider family when known (GLM→GLM, Kimi→Kimi).
+      // 'when-exhausted'/'always' let the sibling provider serve too (priority 10<20
+      // keeps it a fallback). Unknown origin provider ⇒ any provider allowed.
+      if (this._crossProviderFallbackPolicy() === 'never'
+          && origin.provider && account.provider !== origin.provider) return false;
+      return true;
+    }
+
+    // Anthropic-origin or unknown: oauth (Claude) is always eligible. Provider
+    // fallback (Claude→GLM/Kimi, the SAFE direction) is policy-gated and still
+    // barred for signed thinking (an Anthropic signature can't be validated by a
+    // provider). 'never' = Claude session uses Claude only.
+    if (account.type === 'provider') {
+      if (this._crossProviderFallbackPolicy() === 'never') return false;
+      if (this._requiresAnthropicThinkingIntegrity(requestInfo)) return false;
+    }
     return true;
   }
 
   _noteRequestPolicy(requestInfo = {}) {
-    if (!requestInfo.sessionKey || !requestInfo.requiresAnthropicThinkingIntegrity) return;
-    this.markSessionThinkingProtected(requestInfo.sessionKey, requestInfo.model);
+    if (!requestInfo.sessionKey) return;
+    if (requestInfo.requiresAnthropicThinkingIntegrity) {
+      this.markSessionThinkingProtected(requestInfo.sessionKey, requestInfo.model);
+    }
+    if (requestInfo.originClass === 'foreign') {
+      this.markSessionOrigin(requestInfo.sessionKey, 'foreign', requestInfo.originProvider);
+    }
+  }
+
+  // Latch a session's foreign (GLM/Kimi) origin. Only 'foreign' is sticky — an
+  // Anthropic classification never bars anything, and never-downgrade keeps a
+  // provider-pinned session correct across a later no-tool follow-up turn.
+  markSessionOrigin(sessionKey, originClass, originProvider = null) {
+    if (!sessionKey || originClass !== 'foreign') return;
+    const existing = this.sessionPolicies.get(sessionKey) || {};
+    if (existing.originClass !== 'foreign') {
+      console.log(`[Maxpool] Session "${sessionKey}" is ${originProvider || 'provider'}-origin (foreign transcript) — pinned to provider accounts`);
+    }
+    this.sessionPolicies.set(sessionKey, {
+      ...existing,
+      originClass: 'foreign',
+      originProvider: existing.originProvider || originProvider || null,
+    });
   }
 
   markSessionThinkingProtected(sessionKey, model = null) {
@@ -2236,6 +2346,7 @@ export class AccountManager {
       routing: {
         mode: this.routingMode,
         preferredAccount: this.preferredAccountName,
+        crossProviderFallbackPolicy: this._crossProviderFallbackPolicy(),
       },
       accounts: this.accounts.map(a => ({
         name: a.name,
@@ -2305,6 +2416,7 @@ export class AccountManager {
       sessions: {
         stickyBindings: this.sessionBindings.size,
         thinkingProtected: [...this.sessionPolicies.values()].filter(p => p.requiresAnthropicThinkingIntegrity).length,
+        foreignPinned: [...this.sessionPolicies.values()].filter(p => p.originClass === 'foreign').length,
       },
     };
   }
