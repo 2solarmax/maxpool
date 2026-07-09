@@ -448,6 +448,10 @@ export class AccountManager {
   hasAvailableRoute(requestInfo = {}, excludedIndexes = new Set()) {
     this.refreshExpiredQuotas();
     const profile = requestInfo.profile || 'claude';
+    // Route-EXISTENCE check only (order-independent `.some`): unlike the acquire
+    // path's re-home loop, pass ORDER doesn't matter here — the bound 2-entry set
+    // covers the same accounts (reserve+critical) — so it intentionally is NOT
+    // unified to the healthy-first ladder. Do not "sync" these.
     const hasBinding = Boolean(requestInfo.sessionKey && this.sessionBindings.has(requestInfo.sessionKey));
     const weeklyPasses = hasBinding
       ? [
@@ -1106,6 +1110,11 @@ export class AccountManager {
       // Keep a signed-thinking session's live migration on Claude accounts only —
       // don't shuttle an Anthropic-signed block onto a provider mid-session even
       // though _isRequestCompatible now allows providers for thinking under policy.
+      // LOAD-BEARING for the absolute-near-cap `return true` below: it's what
+      // guarantees that path only fires with a CLAUDE target present (a signed
+      // session with no healthy Claude alt → bestScore stays Infinity → return
+      // false → stays on its Claude account, never re-homed to a provider). Do not
+      // remove assuming the fall-through protects signed thinking — it does not.
       if (requestInfo.requiresAnthropicThinkingIntegrity === true && account.type === 'provider') continue;
       if (!this._matchesRequest(account, profile, requestInfo)) continue;
       // Genuinely-healthy alternatives only (normal/soft/unknown weekly + model headroom).
@@ -1116,8 +1125,26 @@ export class AccountManager {
         bestTier = WEEKLY_TIER[this._weeklyPaceState(account)] ?? 0;
       }
     }
-    if (!Number.isFinite(bestScore)) return false; // no healthy alternative
+    if (!Number.isFinite(bestScore)) return false; // no RAW-healthy alternative → don't move (no stranding)
 
+    // Absolute near-cap: the bound account is genuinely low on weekly headroom
+    // (RAW reserve+, not merely burning fast). Every candidate the loop kept is RAW
+    // normal/soft, so this is a STRICT absolute-headroom improvement and flap-stable
+    // (a reserve account can never be a target → no bounce-back). Skip the
+    // concurrency-relief margin: it's calibrated for moving off a LOADED account and
+    // is UNSATISFIABLE for an idle near-cap one — an idle boundScore ≈ the ~2
+    // concurrency floor, so boundScore*0.5 ≈ 1 sits below every account's minimum
+    // score, pinning the session to the near-exhausted account. Preserving the thin
+    // remaining weekly headroom dominates concurrency spread; the per-request
+    // candidate loop lands on the least-loaded healthy account, spreading the move.
+    if ((WEEKLY_TIER[this._weeklyRawState(bound)] ?? 0) >= WEEKLY_TIER.reserve) return true;
+
+    // Otherwise the trigger was PACE-only on a RAW-healthy account — a fast-burner
+    // that still has real absolute headroom (RAW soft but pace reserve/critical,
+    // e.g. 79% used resetting in ~3.5d). Keep the conservative gate so it isn't
+    // churned off an account that's genuinely fine: move only for a clearly-cheaper,
+    // strictly-healthier-pace-tier target. (A RAW-soft/pace-normal fast-burner with
+    // lots of headroom never even reaches here — _isBoundAccountHot gates it out.)
     return bestScore <= boundScore * REBALANCE_SCORE_MARGIN
       && (boundScore - bestScore) >= REBALANCE_MIN_ABS_GAP
       && bestTier < boundTier;
@@ -1263,7 +1290,6 @@ export class AccountManager {
       }
     }
 
-    const hasBinding = Boolean(requestInfo.sessionKey && this.sessionBindings.has(requestInfo.sessionKey));
     const preferred = this._preferredAccount(profile, excludedIndexes, requestInfo);
     if (preferred) {
       const preferredPasses = [
@@ -1284,16 +1310,17 @@ export class AccountManager {
     // Else fall through to the candidate score loop, which re-homes the session
     // onto the best healthy account via _bindSession on acquire.
 
-    const weeklyPasses = hasBinding
-      ? [
-          { allowWeeklyReserve: true, allowWeeklyCritical: false },
-          { allowWeeklyReserve: true, allowWeeklyCritical: true },
-        ]
-      : [
-          { allowWeeklyReserve: false, allowWeeklyCritical: false },
-          { allowWeeklyReserve: true, allowWeeklyCritical: false },
-          { allowWeeklyReserve: true, allowWeeklyCritical: true },
-        ];
+    // Healthy-first ladder for BOTH bound and unbound sessions. A bound session
+    // only reaches this loop once we've decided to LEAVE its account (rebalance
+    // fired / a higher-priority account is available / the bound account is down) —
+    // the sticky "stay put" path returns above without reaching here — so re-homing
+    // must prefer a genuinely-healthy account and fall back to reserve/critical only
+    // if none exists, never re-pick the idle reserve account it's leaving.
+    const weeklyPasses = [
+      { allowWeeklyReserve: false, allowWeeklyCritical: false },
+      { allowWeeklyReserve: true, allowWeeklyCritical: false },
+      { allowWeeklyReserve: true, allowWeeklyCritical: true },
+    ];
 
     for (const weeklyOptions of weeklyPasses) {
       best = null;
