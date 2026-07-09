@@ -974,14 +974,50 @@ export class AccountManager {
    */
   refreshExpiredQuotas() {
     let changed = false;
+    const now = Date.now();
     const sessionReset = [];
     for (const account of this.accounts) {
       const r = this._clearExpiredQuotas(account);
       if (r.changed) changed = true;
       if (r.session) sessionReset.push(account);
+      this._clearRecoveredNetworkError(account, now);
     }
     if (sessionReset.length) this._switchOnSessionReset(sessionReset);
     return changed;
+  }
+
+  /**
+   * Clear a fully-healed transient error so a long-gone blip stops showing as a
+   * phantom "Err" in the TUI. A network blip (markTransientFailure network:true)
+   * and an expired upstream_throttled window both set `lastError` WITHOUT bumping
+   * `consecutiveFailures`; once the account is active again with no live backoff
+   * window, that error is history. Runs for EVERY account on the display/request
+   * refresh — required (not just `_isAvailable`, which never evaluates an idle
+   * fallback provider that Claude-health keeps out of the candidate set, so its
+   * blip lingered ~100 min until restart). Mirrors the rate_limited /
+   * upstream_throttled recovery clears in `_isAvailable`.
+   *
+   * The `consecutiveFailures > 0` guard is load-bearing: a genuinely-flaky account
+   * (markResult failure — windowless, status active, counter bumped) must KEEP its
+   * error visible. Only the fleet-wide-blip paths leave the counter at 0.
+   */
+  _clearRecoveredNetworkError(account, now = Date.now()) {
+    if (!account.lastError) return;
+    if (account.status !== 'active') return;         // throttled / error / exhausted keep their error
+    if (account.consecutiveFailures > 0) return;     // an ongoing per-account fault stays visible
+    const blocked = Math.max(
+      account.cooldownUntil || 0,
+      account.rateLimitedUntil || 0,
+      account.provisionalUpstreamUntil || 0,
+    );
+    if (blocked && now < blocked) return;            // still in a backoff window → keep showing why
+    account.lastError = null;
+    account.lastErrorAt = null;
+    // Mirror _isAvailable's recovery: drop the now-past backoff windows + fingerprint
+    // so getStatus() doesn't emit a stale past cooldown and no fingerprint dangles.
+    account.cooldownUntil = null;
+    account.provisionalUpstreamUntil = null;
+    account.provisionalUpstreamFingerprint = null;
   }
 
   /**
