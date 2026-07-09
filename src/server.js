@@ -1019,7 +1019,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   if (incompat.incompatible) {
     const fam = incompat.homeProvider === 'zai' ? 'GLM' : incompat.homeProvider === 'kimi' ? 'Kimi' : 'GLM/Kimi';
     const eta = Number.isFinite(retryAfter) && retryAfter > 0 ? ` Retry in ${retryAfter}s.` : '';
-    return `This session's transcript can only run on GLM/Kimi — Claude rejects its server-tool ids/thinking on replay. No GLM/Kimi provider is available right now.${eta} Check the x-maxpool-zai-token / x-maxpool-kimi-token headers, or resume with 'cc ${incompat.homeProvider === 'kimi' ? 'kimi' : 'glm'}'.`;
+    return `This session's transcript can only run on ${fam} — Claude rejects its server-tool ids/thinking on replay. No ${fam} provider is available right now.${eta} Check the x-maxpool-zai-token / x-maxpool-kimi-token headers, or resume with 'cc ${incompat.homeProvider === 'kimi' ? 'kimi' : 'glm'}'.`;
   }
 
   const thinking = requestInfo.requiresAnthropicThinkingIntegrity
