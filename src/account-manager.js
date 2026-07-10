@@ -2439,6 +2439,47 @@ export class AccountManager {
   }
 
   /**
+   * Serialize runtime (client-supplied) PROVIDER accounts so they survive a
+   * restart. They're created lazily from `cc all` request headers
+   * (prepareRuntimeProviders), NOT from config — so without persistence a cold boot
+   * / reload shows only the config OAuth accounts until the next `cc all` request
+   * re-sends the tokens. Persisted to state.json (0600, same protection as the
+   * OAuth-token-bearing config) alongside quota.
+   */
+  exportRuntimeProviders() {
+    return this.accounts
+      .filter(a => a.runtime && a.type === 'provider' && a.credential)
+      .map(a => ({
+        name: a.name,
+        type: a.type,
+        provider: a.provider,
+        authToken: a.credential,
+        upstream: a.upstream,
+        authHeader: a.authHeader,
+        profiles: a.profiles,
+        priority: a.priority,
+        model: a.model,
+        modelMap: a.modelMap,
+        stripBetaHeaders: a.stripBetaHeaders,
+      }));
+  }
+
+  /**
+   * Restore persisted runtime providers on boot, via the SAME upsert the header
+   * path uses (so a restored provider is byte-identical to a header-created one). A
+   * live `cc all` request refreshes the token before routing (prepareRuntimeProviders
+   * runs ahead of account selection), so a stale restored token never serves a
+   * request. Idempotent — upsertRuntimeAccount matches by name.
+   */
+  restoreRuntimeProviders(list) {
+    if (!Array.isArray(list)) return;
+    for (const p of list) {
+      if (!p || !p.name || !(p.authToken || p.credential)) continue;
+      this.upsertRuntimeAccount({ ...p, authToken: p.authToken || p.credential });
+    }
+  }
+
+  /**
    * Remove an account by index.
    */
   removeAccount(index) {

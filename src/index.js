@@ -528,6 +528,15 @@ async function serverWorkerCommand() {
   // lease holder); a cold/direct worker reads the on-disk state file.
   const savedState = await loadState();
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  // Runtime fallback providers (glm-fallback/kimi-fallback) are created lazily from
+  // `cc all` request headers, not config — so without restoring them here a restart
+  // shows only the config OAuth accounts until the next `cc all` request re-sends the
+  // tokens. NOTE: a SEAMLESS reload worker reads state at spawn (before the outgoing
+  // worker's final flush), so a provider created <60s before that reload (not yet
+  // interval-flushed) is missed until the next `cc all` request — the same
+  // self-healing window as an abrupt SIGKILL. A cold restart reads the clean-shutdown
+  // final flush and restores fully (the reported zero-request case).
+  if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
   // Track the state-file generation we last observed so a stale flush is refused.
   let stateGeneration = Number(savedState?._generation) || 0;
 
@@ -550,7 +559,15 @@ async function serverWorkerCommand() {
     // flush REFUSED (dropping the final quota snapshot). The guard only exists to
     // serialize CROSS-worker writes; the final flush is provably intra-worker.
     const expectedGeneration = force ? null : stateGeneration;
-    return saveState({ quota: accountManager.exportQuotaState() }, { expectedGeneration })
+    return saveState(
+      {
+        quota: accountManager.exportQuotaState(),
+        // Runtime providers so glm-fallback/kimi-fallback survive a restart (they're
+        // header-derived, not in config). Empty [] when none — harmless.
+        runtimeProviders: accountManager.exportRuntimeProviders(),
+      },
+      { expectedGeneration },
+    )
       .then(written => { if (written != null) stateGeneration = written; })
       .catch(() => {});
   };
