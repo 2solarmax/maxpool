@@ -92,13 +92,42 @@ test('a z.ai provider account renders real Ses/Wk bars from provider fields', ()
   assert.match(line, /61%/);
 });
 
-test('a z.ai account with no weekly window shows Ses only (no fabricated Wk)', () => {
+test('a z.ai account with no weekly (z.ai omits it) shows real Ses + an honest "—" Wk placeholder', () => {
   const am = providerAM();
   am.applyProviderUsage(1, { source: 'zai', ses: { utilization: 0.07, resetAt: Date.now() + 3600_000 } });
   const tui = new TUI({ accountManager: am });
   const line = strip(tui._renderAcct(1, 11, true));
   assert.match(line, /Ses/);
   assert.match(line, /7%/);
+  assert.match(line, /Wk\s+—/, 'weekly shows an aligned "—" placeholder, not a fabricated data bar');
+  assert.doesNotMatch(line, /Wk\s+\d+%/, 'never a fake Wk percentage');
+});
+
+// ── the reported visual bug: provider Ses/Wk bars must align with OAuth rows ───
+
+test('provider Ses/Wk bars sit in the SAME column as OAuth rows (alignment)', () => {
+  const am = providerAM();
+  // OAuth account with unified quota + z.ai provider with a real Ses bar.
+  am.applyUsageData(0, { fiveHour: { utilization: 0.3, resetAt: Date.now() + 3600_000 }, sevenDay: { utilization: 0.4, resetAt: Date.now() + 3 * DAY } });
+  am.applyProviderUsage(1, { source: 'zai', ses: { utilization: 0.42, resetAt: Date.now() + 3600_000 } });
+  const tui = new TUI({ accountManager: am });
+  const oauthLine = strip(tui._renderAcct(0, 11, true));
+  const providerLine = strip(tui._renderAcct(1, 11, true));
+  // The "Ses " column must start at the same character offset on both rows.
+  assert.equal(providerLine.indexOf('Ses '), oauthLine.indexOf('Ses '),
+    'Ses column misaligned between provider and OAuth rows');
+  // And the "Wk" column too.
+  assert.equal(providerLine.indexOf(' Wk '), oauthLine.indexOf(' Wk '),
+    'Wk column misaligned between provider and OAuth rows');
+});
+
+test('narrow terminal (showBoth=false) drops the provider Wk column — no overflow', () => {
+  const am = providerAM();
+  am.applyProviderUsage(1, { source: 'zai', ses: { utilization: 0.42, resetAt: Date.now() + 3600_000 } });
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(1, 11, false));
+  assert.match(line, /Ses/);
+  assert.doesNotMatch(line, /\bWk\b/, 'Wk column hidden on a narrow terminal, like OAuth rows');
 });
 
 test('a Kimi account shows an honest console-only label, never a fake bar', () => {

@@ -183,7 +183,18 @@ function bar(ratio, w = 10, resetTs) {
   return out;
 }
 
-export const __tuiTest = { formatReset, quotaLabel, bar, strip, loadText, countdown };
+// A gray placeholder the EXACT visible width of a bar(), for a quota that's absent
+// or unpollable (label "—" / "n/a" / "probing"). Mirrors bar()'s no-data branch so
+// provider rows stay column-aligned with OAuth rows.
+function emptyBar(label, w = 10) {
+  const text = String(label).slice(0, w);
+  const pad = Math.max(0, w - text.length);
+  const lp = Math.floor(pad / 2);
+  const rp = pad - lp;
+  return `${ESC}100m${' '.repeat(lp)}${text}${' '.repeat(rp)}${RESET}`;
+}
+
+export const __tuiTest = { formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -940,8 +951,10 @@ export class TUI {
     const rawName = a.name.slice(0, 12).padEnd(12);
     const name = isSel ? bold(rawName) : rawName;
 
-    // Type
-    const type = gray(a.type.padEnd(7));
+    // Type — pad to 8 so "provider" (8 chars) doesn't overflow a 7-wide column and
+    // shift the whole provider row (incl. its quota bars) 1 char out of alignment
+    // with the "oauth"/"apikey" rows.
+    const type = gray(a.type.padEnd(8));
 
     // Status
     let status;
@@ -1039,35 +1052,44 @@ export class TUI {
   }
 
   _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true) {
-    const completed = a.completedRequests || 0;
-    const failed = a.failedRequests || 0;
-    const active = a.inFlight || 0;
-    const last = a.lastStatus ? `${statusColor(a.lastStatus)} ${formatMs(a.lastResponseMs)}` : '-';
     const q = a.quota || {};
 
-    // Quota segment. z.ai has a pollable monitor endpoint → real Ses/Wk token bars,
-    // same rendering as OAuth accounts. Kimi (Moonshot coding key) has NO pollable
-    // quota (web console only) → an honest label, never a fake bar. Fields are the
-    // SEPARATE provider* set, so a provider reading never leaks into an OAuth bar.
-    let quotaSeg = '';
+    // Ses/Wk bars in the SAME columns as OAuth rows (right after status) so the
+    // whole table's bars line up. z.ai exposes a 5-hour token window (Ses) and —
+    // when its monitor endpoint includes it — a weekly (Wk, intermittently absent →
+    // "—"). Kimi's coding key has NO pollable quota (web console only) → "n/a" both
+    // + a "console-only" note; not-yet-probed → "probing". Fields are the SEPARATE
+    // provider* set, so a provider reading never leaks into an OAuth bar.
+    let sesCell, wkCell, note = '';
     if (q.providerSes != null || q.providerWk != null) {
-      quotaSeg = `  Ses ${bar(q.providerSes, bw, q.providerSesReset)}`;
-      if (showBoth && q.providerWk != null) quotaSeg += `  Wk ${bar(q.providerWk, bw, q.providerWkReset)}`;
-      if (this.am._quotaProbeStale?.(a)) quotaSeg += `  ${dim('stale')}`;
+      sesCell = q.providerSes != null ? bar(q.providerSes, bw, q.providerSesReset) : emptyBar('—', bw);
+      wkCell = q.providerWk != null ? bar(q.providerWk, bw, q.providerWkReset) : emptyBar('—', bw);
+      if (this.am._quotaProbeStale?.(a)) note = `  ${dim('stale')}`;
     } else if (q.providerQuotaSource === 'console-only') {
-      quotaSeg = `  ${dim('Quota console-only')}`;
-    } else if (q.providerQuotaSource === 'zai') {
-      quotaSeg = `  ${dim('Ses/Wk probing')}`;
+      sesCell = emptyBar('n/a', bw);
+      wkCell = emptyBar('n/a', bw);
+      note = `  ${dim('console-only')}`;
+    } else {
+      sesCell = emptyBar('probing', bw);
+      wkCell = emptyBar('probing', bw);
     }
 
-    let limit = '';
+    let line = ` ${sel}${cur} ${name} ${type} ${status} Ses ${sesCell}`;
+    if (showBoth) line += `  Wk  ${wkCell}`;
+    line += note;
+    // Same recent-load columns as OAuth (providers track inFlight + load events),
+    // plus a compact Last <status> <ms> — the one signal that matters for a
+    // rarely-hit fallback (loadText reads 0r when idle).
+    line += `  ${dim(loadText(this._accountLoad(a)))}`;
+    if (a.lastStatus) line += `  ${dim('Last')} ${statusColor(a.lastStatus)} ${dim(formatMs(a.lastResponseMs))}`;
+    // Header-derived generic rate-limit (distinct from the monitor-endpoint quota),
+    // if the provider upstream returns x-ratelimit-* headers — only when present.
     if (q.genericLimit != null && q.genericRemaining != null) {
-      const used = q.genericLimit - q.genericRemaining;
       const reset = formatReset(q.genericReset);
-      limit = `  Lim ${used}/${q.genericLimit}${reset ? ` ${reset}` : ''}`;
+      line += `  ${dim(`Lim ${q.genericLimit - q.genericRemaining}/${q.genericLimit}${reset ? ' ' + reset : ''}`)}`;
     }
-    const err = a.lastError ? `  Err ${String(a.lastError).slice(0, 18)}` : '';
-    return ` ${sel}${cur} ${name} ${type} ${status} Act ${String(active).padStart(2)}  OK ${String(completed).padStart(3)}  Fail ${String(failed).padStart(2)}  Last ${last}${quotaSeg}  ${dim(loadText(this._accountLoad(a)))}${limit}${err}`;
+    if (a.lastError) line += `  ${red('Err ' + String(a.lastError).slice(0, 18))}`;
+    return line;
   }
 
   _accountLoad(account) {
