@@ -402,8 +402,8 @@ export class TUI {
       };
     } else if (k === 'l') {
       this._confirm(
-        'Log in via browser?',
-        'Opens a browser to add any Claude account; you name it afterward.',
+        'Log in / re-authenticate via browser?',
+        'Opens a browser. Logging into an account that\'s already added RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Otherwise a new account is added.',
         () => this._doLogin(),
       );
     } else if (k === 'n' && this.am.accounts.length > 0) {
@@ -577,8 +577,10 @@ export class TUI {
     }
   }
 
-  // Browser OAuth login: any Claude account, named afterward. Suspends the TUI
-  // around the interactive flow (browser + name prompt), then resumes.
+  // Browser OAuth login — the SAME flow re-authenticates an existing account (matched
+  // by accountUuid) or adds a new one. When the login is for an account already added,
+  // we say so, keep its name, and skip the "name this account" prompt — so it's clear
+  // it's a RE-AUTH in place (revives a dead-refresh/reauth account), not a duplicate.
   async _doLogin() {
     const wasRunning = this.running;
     if (wasRunning) this.stop();
@@ -586,14 +588,26 @@ export class TUI {
       process.stdout.write('\nOpening browser to log into Claude…\n');
       const creds = await loginOAuth();
       const profile = await fetchProfile(creds.accessToken);
-      const suggested = profile?.email
-        || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
-      const answer = await new Promise(resolve => rl.question(`Name this account [${suggested}]: `, resolve));
-      rl.close();
-      const name = String(answer || '').trim() || suggested;
-      await this._upsertOAuthAccount({ creds, profile, name, source: 'login', verb: 'Added' });
-      process.stdout.write(`\nAdded account "${name}". Returning to maxpool…\n`);
+      const existing = this._findExistingOAuthAccount(profile);
+      let name;
+      if (existing) {
+        process.stdout.write(`\nThis Claude account is already added as "${existing.name}" — re-authenticating it in place (no duplicate).\n`);
+        name = existing.name;
+      } else {
+        const suggested = profile?.email
+          || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const answer = await new Promise(resolve => rl.question(`Name this NEW account [${suggested}]: `, resolve));
+        rl.close();
+        name = String(answer || '').trim() || suggested;
+      }
+      // Message honors the ACTUAL result: if a manually-typed name collided with a
+      // different existing account, upsert updates in place → "Re-authenticated", never
+      // a false "Added new account".
+      const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
+      process.stdout.write(updated
+        ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
+        : `\nAdded new account "${name}". Returning to maxpool…\n`);
     } catch (e) {
       process.stdout.write(`\nLogin failed: ${e.message}\n`);
     } finally {
@@ -671,6 +685,7 @@ export class TUI {
         if (amAcct.status === 'error') amAcct.status = 'active';
       }
       this._addLog(`Updated account "${name}"`);
+      return { updated: true, name };
     } else {
       this.config.accounts.push(entry);
       try {
@@ -681,7 +696,19 @@ export class TUI {
       }
       this.am.addAccount(entry);
       this._addLog(`${verb} account "${name}"`);
+      return { updated: false, name };
     }
+  }
+
+  // Find an already-configured OAuth account matching a fresh browser-login profile —
+  // by accountUuid (primary), then name===email — the SAME precedence _upsertOAuthAccount
+  // dedupes on, so the login flow can honestly say "re-authenticating" vs "adding new".
+  _findExistingOAuthAccount(profile) {
+    const uuid = profile?.accountUuid || null;
+    const email = profile?.email || null;
+    let acct = uuid ? this.config.accounts.find(a => a.type === 'oauth' && a.accountUuid === uuid) : null;
+    if (!acct && email) acct = this.config.accounts.find(a => a.type === 'oauth' && a.name === email);
+    return acct || null;
   }
 
   async _doAddKey(apiKey) {
@@ -1120,7 +1147,7 @@ export class TUI {
       case 'normal':
         return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
       case 'accounts':
-        return ` ${bold('l')} Login (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('l')} Login/re-auth (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'routing':
         return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('f')} Cross-provider fallback  ${bold('Esc')} Back`;
       case 'select': {
