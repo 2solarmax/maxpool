@@ -2276,6 +2276,11 @@ export class AccountManager {
     // for the bounded drain; the lease holder owns all rotation.
     if (!this.writerLease) return true;
 
+    // A dead refresh token (invalid_grant) is PERMANENT until browser re-auth —
+    // never auto-retry it. Without this the prober re-POSTs the rejected token every
+    // ~60s forever (hammering Anthropic's OAuth endpoint). Cleared on re-login.
+    if (account.refreshDead) return false;
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return true;
 
     // Coalesce concurrent refreshes
@@ -2309,6 +2314,11 @@ export class AccountManager {
             this.markTransientFailure(accountIndex, `token_refresh_${err.status || 'network'}`, { network: !err.status });
           } else {
             this.markAuthFailed(accountIndex, err.status || 401, 'token_refresh_failed');
+            // The refresh TOKEN itself was rejected (invalid_grant) — permanent until
+            // browser re-auth. Latch so ensureTokenFresh + the prober stop retrying a
+            // dead token. Set ONLY here (a rejected refresh), never in markAuthFailed
+            // (shared with provider auth failures).
+            account.refreshDead = true;
           }
           return false;
         }
@@ -2350,6 +2360,7 @@ export class AccountManager {
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
+    account.refreshDead = false;  // fresh tokens from re-auth revive a dead-refresh account
     if (account.status === 'error') account.status = 'active';
     console.log(`[Maxpool] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
@@ -2434,6 +2445,7 @@ export class AccountManager {
       account.lastError = null;
       account.lastErrorAt = null;
       account.consecutiveFailures = 0;
+      account.refreshDead = false;
     }
     return idx;
   }
@@ -2575,6 +2587,7 @@ export class AccountManager {
         priority: a.priority,
         runtime: a.runtime,
         status: a.status,
+        refreshDead: Boolean(a.refreshDead),
         inFlight: a.inFlight,
         activeWeight: a.activeWeight,
         completedRequests: a.completedRequests,

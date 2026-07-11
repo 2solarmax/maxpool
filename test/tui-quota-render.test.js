@@ -103,6 +103,16 @@ test('a z.ai account with no weekly (z.ai omits it) shows real Ses + an honest "
   assert.doesNotMatch(line, /Wk\s+\d+%/, 'never a fake Wk percentage');
 });
 
+test('a dead-refresh account renders "reauth" (not a generic error), status stays error', () => {
+  const am = oauthAM(1);
+  am.accounts[0].status = 'error';   // routing/eligibility must still exclude it
+  am.accounts[0].refreshDead = true;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /reauth/, 'tells the user to re-login');
+  assert.equal(am.accounts[0].status, 'error', 'display-only — the model status is untouched');
+});
+
 // ── the reported visual bug: provider Ses/Wk bars must align with OAuth rows ───
 
 test('provider Ses/Wk bars sit in the SAME column as OAuth rows (alignment)', () => {

@@ -664,6 +664,10 @@ export class TUI {
         amAcct.expiresAt = creds.expiresAt;
         amAcct.accountUuid = entry.accountUuid;
         amAcct.name = name;
+        // Fresh tokens from re-auth revive a dead-refresh account. This in-place
+        // update is the actual re-login path (the index.js reconcile sees no change
+        // and never calls updateAccountTokens), so refreshDead MUST be cleared here.
+        amAcct.refreshDead = false;
         if (amAcct.status === 'error') amAcct.status = 'active';
       }
       this._addLog(`Updated account "${name}"`);
@@ -975,8 +979,13 @@ export class TUI {
     if (a.enabled !== false && a.status === 'active' && this.am._isAccountWideRejected?.(a)) {
       effectiveStatus = 'blocked';
     }
+    // A dead refresh token surfaces as "reauth" (re-login needed) rather than a
+    // generic "error", so the user knows the fix. Display-only — account.status
+    // stays 'error' so routing/eligibility still exclude it.
+    if (a.enabled !== false && a.refreshDead) effectiveStatus = 'reauth';
     switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
+      case 'reauth':    status = yellow('reauth'); break;
       case 'blocked':   status = red('blocked'); break;
       case 'probing':   status = green('probing'); break;
       case 'waiting':   status = yellow('waiting'); break;

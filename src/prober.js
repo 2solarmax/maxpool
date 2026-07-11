@@ -59,7 +59,9 @@ export class Prober {
     this._running = true;
     this._inflight = (async () => {
       try {
-        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential);
+        // Skip auth-dead accounts (dead refresh token): probing them just re-POSTs
+        // the rejected token every cycle — a 400 storm. They recover only on re-auth.
+        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential && !a.refreshDead);
         const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);
         await Promise.all([
           ...oauth.map(a => this.probeOne(a)),
