@@ -37,6 +37,6 @@
     "url": "https://github.com/2solarmax/maxpool/issues"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.3.0"
   }
 }

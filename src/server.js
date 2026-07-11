@@ -15,6 +15,16 @@ const DEFAULT_RETRY = {
   maxRetryBufferBytes: 10 * 1024 * 1024,
 };
 
+// Upstream-hang guards. A half-open upstream (headers then silence, never closes)
+// would block the request forever and LEAK its in-flight lease — the account climbs
+// to safetyMaxActivePerAccount and is falsely "full", breaking routing (the "106
+// phantom active" incident). Env-overridable with conservative defaults: this path
+// serves EVERY provider (Anthropic/GLM/Kimi), so the idle gap is generous enough
+// that a legitimately-slow-but-alive stream is never cut (each chunk resets it).
+const UPSTREAM_TTFB_MS = Math.max(5_000, Number(process.env.MAXPOOL_TTFB_MS) || 120_000);        // headers must arrive within this
+const STREAM_IDLE_MS = Math.max(30_000, Number(process.env.MAXPOOL_STREAM_IDLE_MS) || 300_000);  // max gap BETWEEN streamed chunks (reset per chunk)
+const UPSTREAM_BODY_MS = Math.max(30_000, Number(process.env.MAXPOOL_BODY_MS) || 300_000);       // non-streaming body read
+
 const DEFAULT_QUEUE = {
   enabled: true,
   maxWaitMs: 24 * 60 * 60 * 1000,
@@ -429,14 +439,31 @@ async function forwardRequest(
     }
   }
 
+  // TTFB guard: an upstream that accepts the connection but never sends response
+  // headers would hang `await fetch` forever (signal only covers client-disconnect)
+  // and leak the lease. Abort via a DEDICATED controller (so the caller can tell a
+  // TTFB timeout apart from a client-gone abort) and CLEAR it the moment headers
+  // arrive — the streaming body is then governed by the per-chunk idle guard, never
+  // this fixed clock, so a long healthy stream is never cut.
+  const ttfbController = new AbortController();
+  const ttfbTimer = setTimeout(
+    () => ttfbController.abort(Object.assign(new Error('upstream TTFB timeout'), { code: 'UPSTREAM_TTFB' })),
+    UPSTREAM_TTFB_MS,
+  );
+  ttfbTimer.unref?.();
   try {
-    const upstreamRes = await fetch(upstreamUrl, {
-      method,
-      headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
-      redirect: 'manual',
-      signal: clientGone.signal,
-    });
+    let upstreamRes;
+    try {
+      upstreamRes = await fetch(upstreamUrl, {
+        method,
+        headers,
+        body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
+        redirect: 'manual',
+        signal: AbortSignal.any([clientGone.signal, ttfbController.signal]),
+      });
+    } finally {
+      clearTimeout(ttfbTimer);
+    }
     // Response arrived — the pre-response leak window is over. Stop guarding for
     // client-disconnect via abort (streamResponse handles mid-stream disconnects).
     res.off('close', onClientClose);
@@ -840,7 +867,26 @@ async function forwardRequest(
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      // Bound the non-streaming body read so a mid-body upstream stall can't hang
+      // the request forever and leak the lease (same class as the streaming idle
+      // guard). On timeout → UPSTREAM_BODY → the caller frees the lease.
+      const bodyP = upstreamRes.arrayBuffer();
+      bodyP.catch(() => {});
+      let bodyTimer;
+      const bodyTimeout = new Promise((_, reject) => {
+        bodyTimer = setTimeout(
+          () => reject(Object.assign(new Error('upstream body timeout'), { code: 'UPSTREAM_BODY' })),
+          UPSTREAM_BODY_MS,
+        );
+        bodyTimer.unref?.();
+      });
+      let arr;
+      try {
+        arr = await Promise.race([bodyP, bodyTimeout]);
+      } finally {
+        clearTimeout(bodyTimer);
+      }
+      const buf = Buffer.from(arr);
       extractUsageFromBody(buf, account.index, accountManager);
       markThinkingFromResponse(buf, accountManager, requestInfo);
       accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
@@ -896,6 +942,11 @@ async function forwardRequest(
       (err.message.includes('fetch failed') ||
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
         err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        // Upstream-hang guards: a stalled connection is network-class, not the
+        // account's fault → 5s cooldown + release + (pre-headers) retry elsewhere;
+        // once committed, isTransient falls through to sendErrorResponse which ends
+        // the client's SSE cleanly (frees the lease AND unhangs the client).
+        err.code === 'UPSTREAM_TTFB' || err.code === 'UPSTREAM_IDLE' || err.code === 'UPSTREAM_BODY' ||
         err.message.includes('terminated'));
 
     if (isTransient) {
@@ -1045,7 +1096,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, streamResponse };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1696,7 +1747,7 @@ function mappedModel(originalModel, account) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog, requestInfo = {}) {
+async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog, requestInfo = {}, idleMs = STREAM_IDLE_MS) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -1711,9 +1762,39 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   // pre-byte failover can still re-hold the session via queueAndRetry.
   clearQueueHeartbeat(requestInfo);
 
+  // Client left mid-stream: the caller drops its disconnect-abort once headers
+  // arrive, and the loop below only checks res.destroyed AFTER a read resolves — so
+  // a BLOCKED read() would never notice. Cancel the reader on 'close' to unblock it
+  // (resolves the pending read as done) → the loop breaks → the lease frees instead
+  // of leaking until the (maybe never) upstream close.
+  const onClose = () => { reader.cancel().catch(() => {}); };
+  res.once('close', onClose);
+
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      // Idle guard: a half-open upstream (headers, then silence, never closes) would
+      // block reader.read() forever → the whole request handler hangs → neither the
+      // lease nor onRequestEnd is released (the "106 phantom active" leak). Bound each
+      // read by a per-chunk idle timeout, RESET every chunk so a healthy slow stream
+      // is never cut; on a real stall, UPSTREAM_IDLE → the caller frees the lease and
+      // ends the client SSE cleanly (isTransient → sendErrorResponse).
+      const readP = reader.read();
+      readP.catch(() => {});  // race-loser must not surface as an unhandled rejection
+      let idleTimer;
+      const idle = new Promise((_, reject) => {
+        idleTimer = setTimeout(
+          () => reject(Object.assign(new Error('upstream idle timeout'), { code: 'UPSTREAM_IDLE' })),
+          idleMs,
+        );
+        idleTimer.unref?.();
+      });
+      let result;
+      try {
+        result = await Promise.race([readP, idle]);
+      } finally {
+        clearTimeout(idleTimer);  // single live timer at a time — no per-chunk timer accumulation
+      }
+      const { done, value } = result;
       if (done) break;
 
       // Client disconnected — stop reading from upstream
@@ -1760,6 +1841,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
     readFailed = true;
     throw err;
   } finally {
+    res.off('close', onClose);
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
     if (!readFailed) {

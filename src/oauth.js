@@ -268,14 +268,92 @@ export function classifyZaiLimit(l, now = Date.now()) {
   return { bucket, utilization, resetAt };
 }
 
-/** Read a provider account's quota. z.ai has a pollable monitor endpoint mapped
- *  to Ses/Wk token windows; Kimi (Moonshot coding key) has NO pollable quota
- *  (web console only), so it returns a `console-only` marker instead of fake
- *  bars. Returns { ses, wk, level } | { error, status?, source? }. */
+// Kimi Coding Plan usage — the coding key (sk-kimi-…) reads its own quota at
+// <base>/v1/usages (the community `kimi-code-usage` tool's endpoint). NOTE the
+// User-Agent: the endpoint is served by the Kimi Code platform, not the Open
+// Platform (whose /users/me/balance 401s a coding key). Best-effort, non-load-
+// bearing UA — the failure path degrades to last-known + the staleness marker.
+const KIMI_USAGE_UA = 'KimiCLI/1.6';
+
+/** ms of one Kimi limit `window`, normalized from its timeUnit so the SHORTEST
+ *  window (the 5h session) is picked regardless of unit. null when unknown. */
+export function kimiWindowMs(window) {
+  const dur = Number(window?.duration);
+  if (!Number.isFinite(dur) || dur <= 0) return null;
+  const unit = String(window?.timeUnit || window?.time_unit || '').toUpperCase();
+  const mult = unit.includes('SECOND') ? 1e3
+    : unit.includes('MINUTE') ? 60e3
+    : unit.includes('HOUR') ? 3600e3
+    : unit.includes('DAY') ? 86400e3
+    : unit.includes('WEEK') ? 7 * 86400e3
+    : unit.includes('MONTH') ? 30 * 86400e3
+    : null;
+  return mult == null ? null : dur * mult;
+}
+
+/** Normalize a Kimi usage row {limit,used,remaining,resetTime} (values are STRINGS)
+ *  to { utilization, resetAt }. CRITICAL: utilization is `null` — never a computed
+ *  NaN — when the inputs are absent or limit<=0, because clamp01(NaN)=0 downstream
+ *  would render a blind account as "0% used = fully available" and route real
+ *  traffic onto quota we can't see. */
+export function parseKimiRow(d) {
+  if (!d || typeof d !== 'object') return null;
+  const limit = Number(d.limit ?? d.limit_amount);
+  let used = d.used != null ? Number(d.used ?? d.used_amount) : null;
+  const remaining = d.remaining != null ? Number(d.remaining) : null;
+  if (used == null && remaining != null && Number.isFinite(limit)) used = limit - remaining;
+  const utilization = (Number.isFinite(limit) && limit > 0 && used != null && Number.isFinite(used))
+    ? Math.max(0, Math.min(1, used / limit))
+    : null;
+  const resetRaw = d.resetTime || d.reset_at || d.reset_time;
+  const parsed = resetRaw ? Date.parse(resetRaw) : NaN;
+  return { utilization, resetAt: Number.isFinite(parsed) ? parsed : null };
+}
+
+/** Read the Kimi Coding Plan quota → { ses, wk, source:'kimi' } | { error, status? }.
+ *  Weekly = the top-level `usage` rolling window; Ses (5h) = the shortest `limits[]`
+ *  window. A transient/partial response returns {error} or null buckets so
+ *  applyProviderUsage keeps the last-known values (never a phantom 0%). */
+export async function fetchKimiUsage(account) {
+  const token = account?.credential;
+  if (!token) return { error: 'unsupported', source: null };
+  const base = String(account.upstream || 'https://api.kimi.com/coding').replace(/\/+$/, '');
+  const headers = { 'Authorization': `Bearer ${token}`, 'User-Agent': KIMI_USAGE_UA, 'Accept': 'application/json' };
+  try {
+    let res = await fetch(`${base}/v1/usages`, { headers, signal: AbortSignal.timeout(10_000) });
+    if (res.status === 404) res = await fetch(`${base}/v1/usage`, { headers, signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
+    const data = await res.json();
+    // Weekly = top-level `usage` (ALWAYS present in a valid coding-plan response).
+    // If it's missing, the response is partial/malformed → return an error so
+    // applyProviderUsage keeps the last-known weekly instead of the falsy-wk branch
+    // BLANKING it (unlike z.ai, where a missing weekly genuinely means "no weekly").
+    const wkRow = parseKimiRow(data?.usage);
+    if (!wkRow || wkRow.utilization == null) return { error: 'partial_response', source: 'kimi' };
+    const wk = wkRow;
+    // Ses = the shortest limits[] window (the 5h). Fall back to first if durations unknown.
+    let ses = null, sesMs = Infinity;
+    for (const l of (Array.isArray(data?.limits) ? data.limits : [])) {
+      const detail = l && typeof l.detail === 'object' ? l.detail : l;
+      const row = parseKimiRow(detail);
+      if (!row || row.utilization == null) continue;
+      const ms = kimiWindowMs(l?.window);
+      if (ms != null && ms < sesMs) { sesMs = ms; ses = row; }
+      else if (ses == null && ms == null) ses = row;
+    }
+    return { ses, wk, source: 'kimi', level: data?.user?.membership?.level || null };
+  } catch (err) {
+    return { error: err.message || String(err), status: null };
+  }
+}
+
+/** Read a provider account's quota. z.ai and Kimi both have a pollable coding-plan
+ *  usage endpoint mapped to Ses/Wk windows. Returns { ses, wk, source } |
+ *  { error, status?, source? }. */
 export async function fetchProviderUsage(account) {
   const provider = account?.provider;
   const token = account?.credential;
-  if (provider === 'kimi') return { error: 'unsupported', source: 'console-only' };
+  if (provider === 'kimi') return fetchKimiUsage(account);
   if (provider !== 'zai' || !token) return { error: 'unsupported', source: null };
   try {
     const res = await fetch(ZAI_QUOTA_URL, {

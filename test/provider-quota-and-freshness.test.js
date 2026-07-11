@@ -114,7 +114,7 @@ test('applyProviderUsage clears a weekly that dropped out of the response', () =
   assert.equal(am.accounts[1].quota.providerWk, null, 'stale weekly cleared when plan/window has none');
 });
 
-test('Kimi (no pollable quota) records a console-only marker, no fake bars', () => {
+test('applyProviderUsage records a console-only marker defensively (generic; Kimi is now pollable)', () => {
   const am = mixedAM();
   am.applyProviderUsage(2, { error: 'unsupported', source: 'console-only' });
   const q = am.accounts[2].quota;
@@ -208,7 +208,7 @@ test('classifyZaiLimit maps TOKENS_LIMIT to Ses/Wk and ignores TIME_LIMIT', () =
   assert.equal(classifyZaiLimit({ type: 'TOKENS_LIMIT', unit: 99, percentage: 10, nextResetTime: now + 5 * DAY }, now).bucket, 'wk');
 });
 
-test('fetchProviderUsage parses a live-shaped z.ai envelope; Kimi is console-only', async () => {
+test('fetchProviderUsage parses a live-shaped z.ai envelope (Kimi covered in kimi-usage.test.js)', async () => {
   const now = Date.now();
   const origFetch = globalThis.fetch;
   globalThis.fetch = async () => ({
@@ -229,9 +229,6 @@ test('fetchProviderUsage parses a live-shaped z.ai envelope; Kimi is console-onl
     assert.equal(u.source, 'zai');
     assert.equal(u.ses.utilization, 0.07);
     assert.equal(u.wk, null, 'weekly absent from this plan → null (no fake bar)');
-
-    const k = await fetchProviderUsage({ provider: 'kimi', credential: 'kt' });
-    assert.deepEqual(k, { error: 'unsupported', source: 'console-only' });
   } finally {
     globalThis.fetch = origFetch;
   }
