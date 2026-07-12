@@ -8,7 +8,7 @@ import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { Prober } from './prober.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
@@ -595,46 +595,63 @@ async function serverWorkerCommand() {
   // baton hands off and the new worker boots from the now-invalidated on-disk
   // token (B1/M3). New refreshes can't start without the lease (ensureTokenFresh
   // no-ops), so every callback here is from a legitimate lease-era refresh.
-  const persistTokenRefresh = (idx, newTokens) => {
+  //
+  // BULLETPROOF CONTRACT: ensureTokenFresh now AWAITs this (persist-before-serve),
+  // so it must NEVER throw or reject. A throw here — including from the synchronous
+  // prologue (findConfigAccount / addAccount) — would land in ensureTokenFresh's
+  // refresh-FAILURE catch and latch `refreshDead` on an account whose refresh POST
+  // actually SUCCEEDED (bricking a working account — strictly worse than the window
+  // this fix closes). So the ENTIRE body is wrapped, prologue included, and every
+  // exit resolves. Returns the awaitable persist promise.
+  const persistTokenRefresh = async (idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
-    // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-    const memIdx = findConfigAccount(config, account);
-    if (memIdx >= 0) {
-      config.accounts[memIdx].accessToken = newTokens.accessToken;
-      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
-      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
-    }
-    atomicConfigUpdate(diskConfig => {
-      // Pick up any new accounts from disk so index matching stays correct
-      // (only add, don't refresh credentials — we're about to write the authoritative tokens)
-      for (const diskAcct of diskConfig.accounts) {
-        const known = (diskAcct.accountUuid && config.accounts.some(a => a.accountUuid === diskAcct.accountUuid))
-          || config.accounts.some(a => a.name === diskAcct.name);
-        if (!known) {
-          config.accounts.push(diskAcct);
-          accountManager.addAccount(diskAcct);
-        }
+    try {
+      // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
+      const memIdx = findConfigAccount(config, account);
+      if (memIdx >= 0) {
+        config.accounts[memIdx].accessToken = newTokens.accessToken;
+        config.accounts[memIdx].refreshToken = newTokens.refreshToken;
+        config.accounts[memIdx].expiresAt = newTokens.expiresAt;
       }
-      // Match by UUID first, then by name — index may have shifted
-      const cfgIdx = findConfigAccount(diskConfig, account);
-      if (cfgIdx >= 0) {
+      let skipped = false; // guard-skip or account-not-on-disk → nothing was persisted
+      await atomicConfigUpdate(diskConfig => {
+        // Pick up any new accounts from disk so index matching stays correct
+        // (only add, don't refresh credentials — we're about to write the authoritative tokens)
+        for (const diskAcct of diskConfig.accounts) {
+          const known = (diskAcct.accountUuid && config.accounts.some(a => a.accountUuid === diskAcct.accountUuid))
+            || config.accounts.some(a => a.name === diskAcct.name);
+          if (!known) {
+            config.accounts.push(diskAcct);
+            accountManager.addAccount(diskAcct);
+          }
+        }
+        // Match by UUID first, then by name — index may have shifted
+        const cfgIdx = findConfigAccount(diskConfig, account);
+        if (cfgIdx < 0) { skipped = true; return; }
         const onDisk = diskConfig.accounts[cfgIdx];
         // Generation guard: if the on-disk refresh token already advanced past
         // the token we rotated FROM, another writer beat us — skip the write so
         // we don't revert a fresher single-use token (the brick-the-account case).
         if (onDisk.refreshToken && onDisk.refreshToken !== account._refreshedFrom &&
             onDisk.refreshToken !== newTokens.refreshToken) {
+          skipped = true;
           return;
         }
         onDisk.accessToken = newTokens.accessToken;
         onDisk.refreshToken = newTokens.refreshToken;
         onDisk.expiresAt = newTokens.expiresAt;
+      });
+      // Monitoring: the rotated token is now DURABLE on disk. Correlate this fp
+      // with a later "REJECTED sent fp=" line to tell a lost-rotation double-spend
+      // (no matching Persisted line) from an upstream revocation (fp matches).
+      if (!skipped) {
+        console.log(`[Maxpool] Persisted rotated token for "${account.name}" (fp=${tokenFingerprint(newTokens.refreshToken)})`);
       }
-    }).catch(err => {
+    } catch (err) {
       if (err?.code === 'STALE_GENERATION') return; // another writer advanced; benign
-      console.error(`[Maxpool] Failed to save refreshed token: ${err.message}`);
-    });
+      console.error(`[Maxpool] Failed to save refreshed token for "${account.name}" (fp=${tokenFingerprint(newTokens?.refreshToken)}): ${err?.message || err}`);
+    }
   };
   accountManager.onTokenRefresh(persistTokenRefresh);
 

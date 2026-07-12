@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon, modelFamily } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
 
 // Bounded re-poll hold for an account blocked ONLY by a transient, self-clearing
 // condition whose exact recovery time is unknown: (a) a weekly-critical account
@@ -2298,8 +2298,24 @@ export class AccountManager {
         account.expiresAt = newTokens.expiresAt;
         account.status = 'active';
         account.cooldownUntil = null;
-        console.log(`[Maxpool] Token refreshed for account "${account.name}"`);
-        this._onTokenRefresh?.(accountIndex, newTokens);
+        console.log(`[Maxpool] Token refreshed for account "${account.name}" (rotated ${tokenFingerprint(account._refreshedFrom)} → ${tokenFingerprint(newTokens.refreshToken)})`);
+        // Persist-before-serve: the rotated single-use refresh token must be
+        // DURABLE on disk before we return true (before this request serves on the
+        // new access token). A non-graceful kill (SIGKILL/crash/OOM/terminal-close)
+        // between here and the disk write would otherwise leave the now-CONSUMED
+        // token on disk → next boot POSTs it → invalid_grant → forced re-auth.
+        // This minimizes the loss window to the write duration (it cannot be zero —
+        // the upstream consumes the old token the instant the POST returns); the
+        // fingerprint audit trail makes the irreducible residual diagnosable.
+        // persistTokenRefresh is bulletproofed to never throw, but the refresh has
+        // ALREADY succeeded — a persist anomaly must never be re-classified as a
+        // refresh failure (which would latch refreshDead on a working account), so
+        // guard the await too.
+        try {
+          await this._onTokenRefresh?.(accountIndex, newTokens);
+        } catch (persistErr) {
+          console.error(`[Maxpool] Token persist raised unexpectedly for "${account.name}": ${persistErr?.message || persistErr}`);
+        }
         return true;
       } catch (err) {
         console.error(`[Maxpool] Token refresh failed for "${account.name}": ${err.message}`);
@@ -2319,6 +2335,11 @@ export class AccountManager {
             // dead token. Set ONLY here (a rejected refresh), never in markAuthFailed
             // (shared with provider auth failures).
             account.refreshDead = true;
+            // Monitoring: name the exact token that was rejected + how to diagnose it
+            // from the persistent event log next time this recurs. (fp= is safe from
+            // the log's secret-redactor; refresh_token= would be redacted.)
+            const rejFp = tokenFingerprint(account._refreshedFrom);
+            console.error(`[Maxpool] Token refresh REJECTED for "${account.name}" (invalid_grant) — the refresh token maxpool sent (fp=${rejFp}) was not accepted. Diagnose from the event log: an earlier "rotated → ${rejFp}" that WAS "Persisted" ⇒ upstream revocation; NO persisted line for ${rejFp} ⇒ the rotation was lost across a restart (double-spend); the SAME source fp in two "rotated" lines in one window ⇒ two writers double-spent it. Re-login via the TUI ('l' key).`);
           }
           return false;
         }

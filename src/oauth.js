@@ -11,6 +11,19 @@ const DEFAULT_TOKEN_ENDPOINT = process.env.MAXPOOL_OAUTH_TOKEN_ENDPOINT
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
 /**
+ * A short, NON-REVERSIBLE fingerprint of a refresh token, for audit logging of
+ * the single-use-token rotation lifecycle. NEVER log the token itself — an
+ * 8-char sha256 prefix is irreversible yet enough to correlate a rotation
+ * ("rotated → fp / Persisted fp") with the token later rejected on boot
+ * ("REJECTED sent fp"), which is what distinguishes a lost-rotation double-spend
+ * from an upstream revocation. Returns 'none' for a falsy token.
+ */
+export function tokenFingerprint(token) {
+  if (!token) return 'none';
+  return createHash('sha256').update(String(token)).digest('hex').slice(0, 8);
+}
+
+/**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
  */
