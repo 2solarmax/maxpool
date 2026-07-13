@@ -99,6 +99,19 @@ export async function rotateIfNeeded() {
  * output (stdout in plain mode; the TUI separately re-points console at its ring
  * buffer, whose _addLog also calls appendEventLog, so TUI-mode lines persist too).
  */
+let stdoutSuppressed = false;
+
+/**
+ * Suppress the console mirror's STDOUT passthrough (the event-log append still
+ * runs). Used during a seamless TUI reload so a worker that doesn't currently own
+ * the terminal — the new worker before its takeover, or the old worker draining
+ * after it handed the TTY off — can't paint plain log lines over the live TUI of
+ * the worker that DOES own it. Per-process (each worker has its own module state),
+ * so it never affects the other worker. Read live inside the mirror, so lifting it
+ * takes effect immediately even for a console wrapper captured earlier.
+ */
+export function setConsoleStdoutSuppressed(v) { stdoutSuppressed = !!v; }
+
 export function installConsoleMirror() {
   if (origConsole) return; // idempotent
   origConsole = { log: console.log.bind(console), error: console.error.bind(console) };
@@ -106,7 +119,7 @@ export function installConsoleMirror() {
     const orig = origConsole[method];
     console[method] = (...args) => {
       try { appendEventLog(args.map(a => (typeof a === 'string' ? a : String(a))).join(' ')); } catch { /* never */ }
-      orig(...args);
+      if (!stdoutSuppressed) orig(...args);
     };
   }
 }
@@ -118,5 +131,5 @@ export const flushEventLog = () => writeChain;
 export function __resetEventLogForTest() {
   if (origConsole) { console.log = origConsole.log; console.error = origConsole.error; origConsole = null; }
   if (rotationTimer) { clearInterval(rotationTimer); rotationTimer = null; }
-  logPath = null; manageRotation = false; writeChain = Promise.resolve(); queued = 0; dropped = 0;
+  logPath = null; manageRotation = false; writeChain = Promise.resolve(); queued = 0; dropped = 0; stdoutSuppressed = false;
 }

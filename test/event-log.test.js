@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   setEventLogPath, appendEventLog, flushEventLog, redactSecrets,
-  installConsoleMirror, rotateIfNeeded, __resetEventLogForTest,
+  installConsoleMirror, setConsoleStdoutSuppressed, rotateIfNeeded, __resetEventLogForTest,
 } from '../src/event-log.js';
 
 async function tmpLog() {
@@ -21,6 +21,33 @@ test('appendEventLog writes a timestamped, redacted, newline-terminated line', a
   await flushEventLog();
   const text = await readFile(path, 'utf-8');
   assert.match(text, /^\d{4}-\d\d-\d\dT[\d:.]+Z .*Switched to account "personal"\n$/);
+  __resetEventLogForTest();
+});
+
+test('setConsoleStdoutSuppressed mutes the mirror STDOUT passthrough but keeps the event-log append', async () => {
+  // Powers the seamless TUI reload: a worker that doesn't own the terminal must not
+  // paint stdout, but its lines must still persist to the on-disk log.
+  const path = await tmpLog();
+  setEventLogPath(path);
+  const realWrite = process.stdout.write.bind(process.stdout);
+  let stdoutHits = 0;
+  process.stdout.write = (...a) => { stdoutHits++; return realWrite(...a); };
+  installConsoleMirror();
+  try {
+    setConsoleStdoutSuppressed(true);
+    console.log('[Maxpool] muzzled-line-should-not-hit-stdout');
+    const hitsWhileSuppressed = stdoutHits;
+    setConsoleStdoutSuppressed(false);
+    console.log('[Maxpool] audible-line');
+    assert.equal(hitsWhileSuppressed, 0, 'suppressed → zero stdout writes');
+    assert.ok(stdoutHits > 0, 'lifted → stdout writes resume');
+  } finally {
+    process.stdout.write = realWrite;
+    await flushEventLog();
+  }
+  const text = await readFile(path, 'utf-8');
+  assert.match(text, /muzzled-line-should-not-hit-stdout/, 'the suppressed line STILL reached the event log');
+  assert.match(text, /audible-line/);
   __resetEventLogForTest();
 });
 

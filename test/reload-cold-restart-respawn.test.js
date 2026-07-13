@@ -6,10 +6,10 @@
 // listens, never becomes primary, never renders the TUI. The user saw a blank
 // hang after "Restarting server now" / "Idle" and had to close the terminal.
 //
-// The existing reload-restart-integration test can't catch this: headless →
-// useTUI=false → reloadStrategy returns 'seamless', not the interactive
-// 'cold-restart'. MAXPOOL_TEST_FORCE_COLD_RESTART forces the cold path so the
-// exit-75 respawn is exercised without a real pty.
+// The existing reload-restart-integration test can't catch this: a supervised
+// worker now always resolves reloadStrategy → 'seamless' (TUI and headless alike).
+// MAXPOOL_TEST_FORCE_COLD_RESTART forces the cold path so the exit-75 respawn is
+// exercised without a real pty.
 //
 // This asserts the SECOND boot banner appears AND the port serves a request
 // again after the cold restart — with the bug, the respawned worker never binds

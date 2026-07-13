@@ -3,7 +3,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
-import { setEventLogPath, installConsoleMirror } from './event-log.js';
+import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed } from './event-log.js';
 import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
@@ -48,12 +48,16 @@ function initEventLog(config, { manageRotation = false } = {}) {
   } catch { /* logging must never block startup */ }
 }
 
-// Which reload path an in-process reload request takes. Interactive (a live TUI)
-// reloads via a FULL cold restart so the fresh worker re-renders the TUI — a
-// seamless reload worker boots headless and would strand the user in raw logs.
-// Headless/service keeps the zero-downtime baton (nothing visual to lose).
-function reloadStrategy({ supervised, useTUI }) {
-  return supervised && !useTUI ? 'seamless' : 'cold-restart';
+// Which reload path an in-process reload request takes. ALL supervised reloads —
+// TUI and headless alike — use the zero-downtime baton so the listening socket
+// never closes (no ECONNREFUSED for the ~5 other sessions routing through us). A
+// TUI reload additionally hands the terminal off worker→worker (the new worker
+// re-renders the TUI at takeover; the old worker's terminalHandedOff guard stops
+// it clobbering the shared TTY on exit). Only an UNsupervised process cold-restarts.
+// The user escape hatch MAXPOOL_TUI_COLD_RESTART=1 forces the old cold path (see
+// requestReload) if the TTY handoff ever misbehaves on their terminal.
+function reloadStrategy({ supervised }) {
+  return supervised ? 'seamless' : 'cold-restart';
 }
 
 switch (command) {
@@ -657,20 +661,36 @@ async function serverWorkerCommand() {
 
   const port = config.proxy.port;
   const host = config.proxy.host || '127.0.0.1';
-  // A headless reload worker NEVER drives the TUI (single-owner terminal); it
-  // takes the TUI only on baton takeover. Cold/direct workers use it if on a TTY.
-  const useTUI = process.stdout.isTTY && process.stdin.isTTY && !isReloadWorker;
+  // A reload worker constructs a TUI when on a TTY but only START()s it on baton
+  // takeover (becomePrimary) — single-owner terminal, enforced by the baton order
+  // (old worker's tui.stop() precedes MSG_RELEASED precedes the new worker's
+  // MSG_TAKEOVER→tui.start()). It boots headless-silent until then (stdout muzzled
+  // just below), so its boot logs can't paint over the old worker's live TUI.
+  const useTUI = process.stdout.isTTY && process.stdin.isTTY;
+
+  // A reload worker with a TUI must not write plain logs to the shared terminal
+  // (still owned by the old worker's TUI) while booting toward takeover; suppress
+  // stdout (event-log append still runs). Lifted in becomePrimary at takeover.
+  if (isReloadWorker && useTUI) setConsoleStdoutSuppressed(true);
 
   let tui = null;
   let server = null;
   let syncTimer = null;
   let draining = false;
   let restartController = null;
+  // Set once this worker hands the terminal to a new worker during a seamless TUI
+  // reload; makes this (now non-owner) worker's exit-path restoreTerminal a NO-OP
+  // so it can't flip the shared TTY's raw-mode/alt-screen back and clobber the new
+  // worker's live TUI. Only the current terminal owner (or the supervisor) restores.
+  let terminalHandedOff = false;
 
   // Best-effort terminal restore on ANY abnormal exit path (uncaughtException,
   // a bare process.exit, a crash) so the user's shell is never left in raw mode
   // or the alt-screen. Idempotent and safe even when no TUI was running.
   const restoreTerminal = () => {
+    // Handed the TTY to a new worker (seamless TUI reload) → the new worker owns
+    // it now; restoring here would clobber its live TUI. No-op.
+    if (terminalHandedOff) return;
     try {
       if (tui?.running) { tui.stop(); return; }
       if (process.stdout.isTTY) process.stdout.write('\x1b[?25h\x1b[?1049l');
@@ -783,12 +803,14 @@ async function serverWorkerCommand() {
   // (not supervised, no IPC), fall back to the abrupt restart.
   const requestReload = () => {
     if (draining) return;
-    // Interactive (live TUI) → full cold restart so the fresh worker re-renders the
-    // TUI; headless/service → zero-downtime seamless baton (nothing visual to lose).
-    // Test-only: force the interactive cold-restart path headless (a pty can't be
-    // allocated in-suite), so the exit-75 respawn is exercised without a real TUI.
-    const forceCold = process.env.MAXPOOL_TEST_FORCE_COLD_RESTART === '1';
-    if (!forceCold && reloadStrategy({ supervised, useTUI }) === 'seamless') {
+    // Supervised → zero-downtime seamless baton (socket never closes; TUI hands the
+    // terminal off worker→worker). Unsupervised → cold restart.
+    // Escape hatches force the cold path: MAXPOOL_TEST_FORCE_COLD_RESTART (in-suite,
+    // no pty) and the USER-facing MAXPOOL_TUI_COLD_RESTART=1 (revert to the old
+    // brief-ECONNREFUSED cold restart if the seamless TTY handoff ever misbehaves).
+    const forceCold = process.env.MAXPOOL_TEST_FORCE_COLD_RESTART === '1'
+      || process.env.MAXPOOL_TUI_COLD_RESTART === '1';
+    if (!forceCold && reloadStrategy({ supervised }) === 'seamless') {
       try {
         process.send({ type: MSG_RELOAD_REQUEST });
         return;
@@ -954,6 +976,10 @@ async function serverWorkerCommand() {
   // baton (a reload) — freeze the update check so a reload doesn't re-probe npm
   // (only a cold supervisor start self-updates).
   const becomePrimary = async ({ viaTakeover }) => {
+    // We're taking the terminal now (or are the cold-start primary). Lift the
+    // reload-worker boot muzzle so the TUI's first render + any plain-mode fallback
+    // logs reach stdout. (No-op for a worker that never suppressed.)
+    setConsoleStdoutSuppressed(false);
     if (tui) {
       if (tui.start()) {
         console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
@@ -1041,6 +1067,13 @@ async function serverWorkerCommand() {
       await flushStateWrites();
 
       if (tui?.running) tui.stop(); // restore terminal before the new worker takes it
+      // The terminal is now HANDED OFF: the incoming worker will take the TTY at
+      // MSG_TAKEOVER. Arm the guard UNCONDITIONALLY (even if the TUI was already
+      // stopped) so this worker's later exit(0) restoreTerminal can't clobber the
+      // new worker's TUI. Also muzzle our own remaining drain-time logs (in-flight
+      // requests completing) so they don't paint the new worker's alt-screen.
+      terminalHandedOff = true;
+      setConsoleStdoutSuppressed(true);
       try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ }
 
       // Drain bounded in-flight on EXISTING access tokens (no refresh needed),
@@ -1568,6 +1601,11 @@ Options:
   --name NAME         Set account name (login)
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
   --with-key          Include proxy API key in maxpool env output
+
+Env:
+  MAXPOOL_TUI_COLD_RESTART=1   Reload (r) via a full cold restart instead of the
+                               zero-downtime seamless handoff — a fallback if the
+                               terminal ever misbehaves after a reload.
 
 Config: ${getConfigPath()}
 `);
