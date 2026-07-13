@@ -24,6 +24,7 @@ const DEFAULT_RETRY = {
 const UPSTREAM_TTFB_MS = Math.max(5_000, Number(process.env.MAXPOOL_TTFB_MS) || 120_000);        // headers must arrive within this
 const STREAM_IDLE_MS = Math.max(30_000, Number(process.env.MAXPOOL_STREAM_IDLE_MS) || 300_000);  // max gap BETWEEN streamed chunks (reset per chunk)
 const UPSTREAM_BODY_MS = Math.max(30_000, Number(process.env.MAXPOOL_BODY_MS) || 300_000);       // non-streaming body read
+const CLIENT_DRAIN_MS = Math.max(5_000, Number(process.env.MAXPOOL_DRAIN_MS) || 60_000);         // max wait for a backpressured client to drain (half-open client → free the lease)
 
 const DEFAULT_QUEUE = {
   enabled: true,
@@ -167,32 +168,40 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      // Buffer request body (needed for retry on 429)
-      const bodyChunks = [];
-      for await (const chunk of req) {
-        bodyChunks.push(chunk);
-      }
-      const body = Buffer.concat(bodyChunks);
-      const retryConfig = { ...DEFAULT_RETRY, ...(config.retry || {}) };
-      const queueConfig = { ...DEFAULT_QUEUE, ...(config.queue || {}) };
-      const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
-      const requestInfo = describeRequest(req, body);
-      const maxQueuedBodyBytes = queueConfig.maxQueuedBodyBytes == null
-        ? Infinity
-        : Math.max(0, Number(queueConfig.maxQueuedBodyBytes) || 0);
-      const canQueueBufferedBody = body.length <= maxQueuedBodyBytes;
-      if (!canQueueBufferedBody) {
-        requestInfo.queueBlockedReason = `request body ${body.length} bytes exceeds queue.maxQueuedBodyBytes ${maxQueuedBodyBytes}`;
-      }
-      requestInfo.profile = getMaxpoolProfile(req.headers);
-      requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
-      if (requestInfo.requiresAnthropicThinkingIntegrity && requestInfo.profile === 'all') {
-        console.log('[Maxpool] Anthropic thinking detected; provider fallback disabled for this session/request');
-      }
-      prepareRuntimeProviders(accountManager, req.headers);
-
+      // The request is now TRACKED (onRequestStart accepted → tui.active +
+      // restartController.activeRequests both hold it). EVERYTHING that can throw —
+      // including body buffering — must run inside the try whose finally fires
+      // onRequestEnd, or a client that dies mid-body-read throws to the OUTER catch
+      // and leaks the active entry AND the restart drain counter (hangs a reload's
+      // drain). requestInfo starts as {} so the error path never dereferences an
+      // undefined (a body-read throw lands before describeRequest runs).
       const ctx = { account: null, status: null };
+      let requestInfo = {};
       try {
+        // Buffer request body (needed for retry on 429)
+        const bodyChunks = [];
+        for await (const chunk of req) {
+          bodyChunks.push(chunk);
+        }
+        const body = Buffer.concat(bodyChunks);
+        const retryConfig = { ...DEFAULT_RETRY, ...(config.retry || {}) };
+        const queueConfig = { ...DEFAULT_QUEUE, ...(config.queue || {}) };
+        const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
+        requestInfo = describeRequest(req, body);
+        const maxQueuedBodyBytes = queueConfig.maxQueuedBodyBytes == null
+          ? Infinity
+          : Math.max(0, Number(queueConfig.maxQueuedBodyBytes) || 0);
+        const canQueueBufferedBody = body.length <= maxQueuedBodyBytes;
+        if (!canQueueBufferedBody) {
+          requestInfo.queueBlockedReason = `request body ${body.length} bytes exceeds queue.maxQueuedBodyBytes ${maxQueuedBodyBytes}`;
+        }
+        requestInfo.profile = getMaxpoolProfile(req.headers);
+        requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
+        if (requestInfo.requiresAnthropicThinkingIntegrity && requestInfo.profile === 'all') {
+          console.log('[Maxpool] Anthropic thinking detected; provider fallback disabled for this session/request');
+        }
+        prepareRuntimeProviders(accountManager, req.headers);
+
         await forwardRequest(
           req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set(),
@@ -200,10 +209,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[Maxpool] Unhandled error:', err);
-        sendErrorResponse(res, requestInfo, 502, {
-          type: 'error',
-          error: { type: 'proxy_error', message: 'Internal proxy error' },
-        });
+        // Only attempt an error body if the socket is still writable — a client
+        // that aborted during body-read leaves res destroyed; writing then throws.
+        if (!res.destroyed && !res.writableEnded && !res.headersSent) {
+          sendErrorResponse(res, requestInfo, 502, {
+            type: 'error',
+            error: { type: 'proxy_error', message: 'Internal proxy error' },
+          });
+        }
       } finally {
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
@@ -1822,14 +1835,37 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         parseSSEEvent(event, accountIndex, accountManager, requestInfo);
       }
 
-      // Handle backpressure — also bail out if client disconnects,
-      // because 'drain' will never fire on a destroyed socket
+      // Handle backpressure — bail out if the client disconnects OR goes silently
+      // half-open. A vanished peer (laptop sleep / Wi-Fi drop / lost TCP FIN) leaves
+      // the send buffer full so this branch is entered, but sends no FIN ('close'
+      // never fires) and never ACKs ('drain' never fires) — so a bare await here
+      // hangs FOREVER, pinning the account lease and never firing onRequestEnd (the
+      // phantom-"N active" leak). Bound it: if the client can't drain a small SSE
+      // chunk within CLIENT_DRAIN_MS it's gone → break (same disposition as a
+      // destroyed socket: the finally runs reader.cancel()+res.end(), the lease
+      // frees with success:true, onRequestEnd fires). A legit slow client drains
+      // each episode well within this window; the timer is per-episode, never summed.
       if (!ok) {
-        await new Promise(resolve => {
-          res.once('drain', resolve);
-          res.once('close', resolve);
+        let drainTimer, onDrain, onClose2;
+        const settled = new Promise(resolve => {
+          onDrain = () => resolve(true);
+          onClose2 = () => resolve(true);
+          res.once('drain', onDrain);
+          res.once('close', onClose2);
+          // Bound the wait by the drain cap, but never longer than this stream's
+          // idle bound (keeps it injectable for tests; prod = min(300s, 60s) = 60s).
+          drainTimer = setTimeout(() => resolve(false), Math.min(idleMs, CLIENT_DRAIN_MS));
+          drainTimer.unref?.();
         });
-        if (res.destroyed) break;
+        let drained;
+        try {
+          drained = await settled;
+        } finally {
+          clearTimeout(drainTimer);
+          res.off('drain', onDrain);
+          res.off('close', onClose2);
+        }
+        if (!drained || res.destroyed) break; // client gone/stalled → stop, clean up in finally
       }
     }
 
