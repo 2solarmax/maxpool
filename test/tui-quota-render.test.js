@@ -156,3 +156,55 @@ test('a z.ai account whose probe has not landed yet shows "probing", not a fake 
   const line = strip(tui._renderAcct(1, 11, true));
   assert.match(line, /probing/);
 });
+
+// ── the reported UX bug: the top header must ALIGN to the columns it names ─────
+
+test('the column header sits exactly over the Account/Type/Status/Quota columns', () => {
+  const am = oauthAM();
+  am.applyUsageData(0, {
+    fiveHour: { utilization: 0.3, resetAt: Date.now() + 3600_000 },
+    sevenDay: { utilization: 0.4, resetAt: Date.now() + 3 * DAY },
+  });
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  assert.equal(hdr.indexOf('Account'), 4, 'Account over the name column');
+  assert.equal(hdr.indexOf('Type'), 17, 'Type over the type column');
+  assert.equal(hdr.indexOf('Status'), 26, 'Status over the status column');
+  // the Quota group label lands exactly on the inline Ses/Tok quota label
+  assert.equal(hdr.indexOf('Quota'), row.indexOf('Ses '), 'Quota over the quota bars');
+});
+
+test('the header aligns for an API-key row too (Quota group label over Tok, not mislabeled)', () => {
+  const am = oauthAM(1);
+  // API-key-style quota (Tok/Req bars instead of Ses/Wk).
+  am.accounts[0].quota.tokensLimit = 1000;
+  am.accounts[0].quota.tokensRemaining = 700;
+  am.accounts[0].quota.requestsLimit = 100;
+  am.accounts[0].quota.requestsRemaining = 90;
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  assert.equal(hdr.indexOf('Quota'), row.indexOf('Tok '), 'group label sits over Tok — a single "Quota" is honest for both row types');
+});
+
+test('narrow mode: the header still aligns and shrinks Quota to avoid overflow', () => {
+  const wide = strip(__tuiTest.acctHeader(100));
+  const narrow = strip(__tuiTest.acctHeader(72));
+  assert.equal(narrow.indexOf('Account'), 4);
+  assert.equal(narrow.indexOf('Status'), 26);
+  assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
+  assert.equal(narrow.indexOf('Quota'), 40);
+  assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
+});
+
+test('an extreme-narrow header clips WITHOUT bleeding the underline into later lines', () => {
+  // The header renders whenever W>=40; the 45-char short header exceeds W in the
+  // 40<=W<45 window. It must go through fitLine like the real _render pipeline and
+  // still terminate its underline (\x1b[0m) so it can't bleed onto the rows below.
+  const RESET = '\x1b[0m';
+  const headerLine = '\x1b[2;4m' + __tuiTest.acctHeader(42) + RESET; // dim+underline, as _render builds it
+  const fitted = __tuiTest.fitLine(headerLine, 42);
+  assert.ok(__tuiTest.strip(fitted).length <= 42, 'truncated to the terminal width');
+  assert.ok(fitted.endsWith(RESET), 'RESET still terminates the underline after truncation');
+});

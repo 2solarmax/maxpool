@@ -18,10 +18,37 @@ const yellow = s => fg(33, s);
 const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
+const dimUnderline = s => `${ESC}2;4m${s}${RESET}`;
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
 const vw = s => strip(s).length;
+
+// ── Accounts-table columns ───────────────────────────────────
+// Fixed column widths shared by the header row (acctHeader) AND every data row, so
+// the header labels stay aligned with the columns they name. The Account/Type/
+// Status/Quota start offsets (4/17/26/40) are pure functions of these widths + the
+// 4-col row prefix, independent of the quota-bar width.
+const NAME_W = 12;         // a.name.slice(0, NAME_W).padEnd(NAME_W)
+const TYPE_W = 8;          // a.type.padEnd(TYPE_W) — fits "provider"
+const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
+const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
+
+/**
+ * Aligned column header for the accounts table. Names the three columns that carry
+ * NO inline label (Account / Type / Status) plus a group label over the two quota
+ * bars (Quota). The per-bar naming (Ses/Wk for OAuth, Tok/Req for API keys) and the
+ * load fields (Now/15m/1h) stay inline per row — they're row-type-dependent and
+ * begin at a variable offset — so the header stops after the Quota group label.
+ */
+function acctHeader(W) {
+  const quota = W >= 88 ? 'Quota (used% · resets-in)' : 'Quota';
+  return ROW_PREFIX
+    + 'Account'.padEnd(NAME_W) + ' '
+    + 'Type'.padEnd(TYPE_W) + ' '
+    + 'Status'.padEnd(STATUS_W) + ' '
+    + quota;
+}
 
 function rpad(s, w) {
   const gap = w - vw(s);
@@ -194,7 +221,7 @@ function emptyBar(label, w = 10) {
   return `${ESC}100m${' '.repeat(lp)}${text}${' '.repeat(rp)}${RESET}`;
 }
 
-export const __tuiTest = { formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown };
+export const __tuiTest = { formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -663,12 +690,14 @@ export class TUI {
       const previous = this.config.accounts[idx];
       entry.enabled = previous.enabled;
       this.config.accounts[idx] = entry;
-      try {
-        await this.saveConfig(this.config);
-      } catch (error) {
-        this.config.accounts[idx] = previous;
-        throw error;
-      }
+      // Update the AccountManager to the FRESH tokens BEFORE persisting. The
+      // saveConfig writer (index.js) derives the ON-DISK tokens from the
+      // AccountManager, not from config.accounts — so persisting first writes the
+      // STALE pre-re-auth token (typically the dead one we're re-authing away from)
+      // to disk. The account then works in memory but boots DEAD on the next restart
+      // (a just-re-authed token rejected as invalid_grant). A later refresh does NOT
+      // heal disk (persistTokenRefresh's generation guard skips a disk token that
+      // != _refreshedFrom), so disk must be made correct right here.
       const amAcct = this.am.accounts.find(account =>
         (entry.accountUuid && account.accountUuid === entry.accountUuid) || account.name === name
       );
@@ -683,6 +712,17 @@ export class TUI {
         // and never calls updateAccountTokens), so refreshDead MUST be cleared here.
         amAcct.refreshDead = false;
         if (amAcct.status === 'error') amAcct.status = 'active';
+      }
+      try {
+        await this.saveConfig(this.config);
+      } catch (error) {
+        // Persist failed (e.g. disk full). The browser re-auth genuinely SUCCEEDED,
+        // so KEEP the AccountManager on the fresh tokens — reverting it to the dead
+        // token would brick a working in-memory account. Roll back only the
+        // config.accounts mirror and surface the error; disk self-heals on the next
+        // saveConfig (the AM-derived writer re-writes the fresh token).
+        this.config.accounts[idx] = previous;
+        throw error;
       }
       this._addLog(`Updated account "${name}"`);
       return { updated: true, name };
@@ -906,10 +946,13 @@ export class TUI {
       lines.push(yellow('  No accounts configured. Press [a] to add one.'));
     } else {
       lines.push('');
-      // Column legend — the per-row numbers are otherwise cryptic. Ses/Wk are the
-      // two quota bars; Now is live concurrency; 15m/1h are recent throughput.
+      // Aligned column header (dim + underline so it reads as chrome, not data). It
+      // labels the fixed columns that have no inline label; the Ses/Wk/Tok/Req and
+      // Now/15m/1h labels stay inline per row. A short glossary below expands the
+      // abbreviations the header + inline labels can't spell out.
+      lines.push(dimUnderline(acctHeader(W)));
       if (W >= 88) {
-        lines.push(' ' + dim('Ses/Wk = 5h/7d quota (used% · resets-in) · Now = in-flight (weight) · 15m/1h = requests served (avg latency · Nf=fails)'));
+        lines.push(' ' + dim('Ses 5h · Wk 7d · Now in-flight (weight) · 15m/1h served (avg · f fails)'));
       }
       const showBoth = W >= 70;
       const bw = showBoth
@@ -979,13 +1022,13 @@ export class TUI {
     const cur = isCur ? green('►') : ' ';
 
     // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    const rawName = a.name.slice(0, NAME_W).padEnd(NAME_W);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type — pad to 8 so "provider" (8 chars) doesn't overflow a 7-wide column and
     // shift the whole provider row (incl. its quota bars) 1 char out of alignment
     // with the "oauth"/"apikey" rows.
-    const type = gray(a.type.padEnd(8));
+    const type = gray(a.type.padEnd(TYPE_W));
 
     // Status
     let status;
@@ -1030,7 +1073,7 @@ export class TUI {
       default:          status = a.status || 'ready';
     }
     // Widened from 10 to fit "throttled 59s" so the quota bars stay column-aligned.
-    status = rpad(status, 13);
+    status = rpad(status, STATUS_W);
 
     if (a.type === 'provider') {
       return this._renderProviderAcct(sel, cur, name, type, status, a, bw, showBoth);
