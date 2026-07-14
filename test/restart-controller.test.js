@@ -6,11 +6,29 @@ function controller() {
   const events = [];
   const rc = new RestartController({
     pauseAdmission: () => events.push('paused'),
+    resumeAdmission: () => events.push('resumed'),
     restartNow: () => events.push('restarted'),
     log: message => events.push(message),
   });
   return { rc, events };
 }
+
+test('cancelRestart un-latches a rolled-back reload + resumes serving (the rollback self-heal)', () => {
+  const { rc, events } = controller();
+  rc.requestRestart();                       // 0 in-flight → immediate _restart
+  assert.equal(rc.restarting, true);
+  assert.equal(rc.requestStarted('a'), false, 'latched → every request rejected');
+  assert.ok(events.includes('paused'));
+
+  const cancelled = rc.cancelRestart();       // simulate: new worker rolled back, we were never released
+  assert.equal(cancelled, true);
+  assert.equal(rc.restarting, false);
+  assert.equal(rc.pending, false);
+  assert.equal(events.at(-1), 'resumed', 'admission resumed');
+  assert.equal(rc.requestStarted('b'), true, 'serving again — not 503-ing forever');
+
+  assert.equal(rc.cancelRestart(), false, 'idempotent no-op when no restart is in progress');
+});
 
 test('restart ignores queued requests and waits for existing upstream work', () => {
   const { rc, events } = controller();

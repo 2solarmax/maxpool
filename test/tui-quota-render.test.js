@@ -198,6 +198,34 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
+test('the abbreviation glossary is a FOOTER below the rows, never between the header and the data', () => {
+  // Regression guard for the reported "header not aligned" — a left-aligned glossary
+  // sentence sandwiched between the aligned header and the aligned rows reads as a
+  // broken second header. It must sit AFTER the rows.
+  const am = oauthAM(2);
+  am.applyUsageData(0, { fiveHour: { utilization: 0.3, resetAt: Date.now() + 3600_000 }, sevenDay: { utilization: 0.4, resetAt: Date.now() + 3 * DAY } });
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } } });
+
+  const origCols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  const origWrite = process.stdout.write;
+  let out = '';
+  try {
+    Object.defineProperty(process.stdout, 'columns', { value: 120, configurable: true });
+    process.stdout.write = (s) => { out += s; return true; };
+    tui._render(); // render() no-ops unless running; _render does the actual frame build
+  } finally {
+    process.stdout.write = origWrite;
+    if (origCols) Object.defineProperty(process.stdout, 'columns', origCols);
+  }
+  const flat = strip(out);
+  const iHeader = flat.indexOf('Account');
+  const iRow = flat.indexOf('a1');          // first account row
+  const iGlossary = flat.indexOf('Ses 5h'); // the DISTINCTIVE glossary substring (not bare 'Ses', a row bar label)
+  assert.ok(iHeader >= 0 && iRow >= 0 && iGlossary >= 0, 'header, a row, and the glossary all render');
+  assert.ok(iHeader < iRow, 'header sits above the rows');
+  assert.ok(iRow < iGlossary, 'the glossary is a FOOTER below the rows — never between header and data');
+});
+
 test('an extreme-narrow header clips WITHOUT bleeding the underline into later lines', () => {
   // The header renders whenever W>=40; the 45-char short header exceeds W in the
   // 40<=W<45 window. It must go through fitLine like the real _render pipeline and

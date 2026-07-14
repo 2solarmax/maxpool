@@ -64,7 +64,10 @@ test('restart requires confirmation and explains drain behavior', () => {
   assert.equal(restarted, false);
 
   tui._keyConfirm('y');
-  assert.equal(stopped, true);
+  // The keypress must NOT stop the TUI itself — the reload path owns the stop (cold:
+  // restartWorkerNow, seamless: releaseBatonAndDrain). If it stopped here and the
+  // reload rolled back, the TUI would be stranded in plain-log mode. Only onRestart fires.
+  assert.equal(stopped, false, 'r must not stop the TUI directly (reload path owns it, so a rollback keeps the TUI)');
   assert.equal(restarted, true);
 });
 

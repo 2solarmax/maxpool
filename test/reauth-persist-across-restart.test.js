@@ -52,6 +52,35 @@ test('re-auth persists the FRESH token to disk, not the stale AccountManager tok
   assert.equal(am.accounts[0].status, 'active');
 });
 
+test('a successful re-auth logs a persist-confirmation whose fp matches the fresh token', async () => {
+  const { tokenFingerprint } = await import('../src/oauth.js');
+  const dead = {
+    name: 'personal', type: 'oauth', accountUuid: 'uuid-p',
+    accessToken: 'DEAD-a', refreshToken: 'DEAD-r', expiresAt: Date.now() - 1000, enabled: true,
+  };
+  const am = new AccountManager([{ ...dead }], 0.90);
+  am.accounts[0].status = 'error'; am.accounts[0].refreshDead = true;
+  const config = { accounts: [{ ...dead }] };
+  const disk = { accounts: [] };
+  const tui = new TUI({ accountManager: am, config, saveConfig: amDerivedSaveConfig(config, am, disk) });
+
+  const origLog = console.log;
+  let logged = '';
+  console.log = (...a) => { logged += a.join(' ') + '\n'; };
+  try {
+    await tui._upsertOAuthAccount({
+      creds: { accessToken: 'FRESH-a', refreshToken: 'FRESH-refresh', expiresAt: Date.now() + 3600_000 },
+      profile: { accountUuid: 'uuid-p', email: 'personal' }, name: 'personal', source: 'login',
+    });
+  } finally { console.log = origLog; }
+
+  const fp = tokenFingerprint('FRESH-refresh');
+  assert.match(logged, /Re-authenticated "personal" — fresh token persisted/);
+  assert.match(logged, new RegExp(`fp=${fp}`), 'the confirmation fp names the token that is now on disk');
+  // And it truly matches what a restart would read.
+  assert.equal(tokenFingerprint(disk.accounts.find(a => a.name === 'personal').refreshToken), fp);
+});
+
 test('adding a NEW account persists its token to disk (AM-derived writer sees it)', async () => {
   const am = new AccountManager([{
     name: 'existing', type: 'oauth', accountUuid: 'uuid-e',

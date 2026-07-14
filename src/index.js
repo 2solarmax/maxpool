@@ -23,6 +23,10 @@ import {
 const args = process.argv.slice(2);
 const command = args[0];
 const SERVER_RESTART_EXIT_CODE = 75;
+// If a seamless reload doesn't release us (→ take over) within this window, the new
+// worker rolled back — self-heal admission so we don't 503 forever. > the baton
+// readiness timeout (10s) + margin.
+const RELOAD_ROLLBACK_SELFHEAL_MS = Math.max(15_000, Number(process.env.MAXPOOL_RELOAD_SELFHEAL_MS) || 30_000);
 const SERVER_WORKER_ENV = 'MAXPOOL_SERVER_WORKER';
 // Set by the supervisor when it spawns a worker for a seamless reload: that
 // worker boots HEADLESS (plain logs, no writer lease) and waits for the baton.
@@ -683,6 +687,9 @@ async function serverWorkerCommand() {
   // so it can't flip the shared TTY's raw-mode/alt-screen back and clobber the new
   // worker's live TUI. Only the current terminal owner (or the supervisor) restores.
   let terminalHandedOff = false;
+  // Self-heal timer for a seamless reload that rolls back (new worker fails to boot,
+  // we're never released). Cleared on MSG_RELEASE; fires cancelRestart otherwise.
+  let reloadWatchdog = null;
 
   // Best-effort terminal restore on ANY abnormal exit path (uncaughtException,
   // a bare process.exit, a crash) so the user's shell is never left in raw mode
@@ -813,6 +820,20 @@ async function serverWorkerCommand() {
     if (!forceCold && reloadStrategy({ supervised }) === 'seamless') {
       try {
         process.send({ type: MSG_RELOAD_REQUEST });
+        // Arm the rollback self-heal: restartController already latched
+        // pending/restarting + paused admission (in _restart, before we got here).
+        // On a SUCCESSFUL reload the supervisor sends MSG_RELEASE (→ releaseBaton­
+        // AndDrain clears this) then we exit. On a ROLLBACK we're never released and
+        // never exit — so if this fires, resume serving instead of 503-ing forever.
+        if (reloadWatchdog) clearTimeout(reloadWatchdog);
+        reloadWatchdog = setTimeout(() => {
+          reloadWatchdog = null;
+          if (draining) return; // MSG_RELEASE already arrived → a real reload, not a rollback
+          if (restartController?.cancelRestart()) {
+            console.log('[Maxpool] Reload rolled back (new worker never took over) — resumed serving.');
+          }
+        }, RELOAD_ROLLBACK_SELFHEAL_MS);
+        reloadWatchdog.unref?.();
         return;
       } catch { /* IPC gone — fall through to abrupt restart */ }
     }
@@ -821,6 +842,7 @@ async function serverWorkerCommand() {
 
   restartController = new RestartController({
     pauseAdmission: () => accountManager.setAdmissionPaused(true),
+    resumeAdmission: () => accountManager.setAdmissionPaused(false),
     restartNow: requestReload,
     // Configurable so ops can tune the bounded pre-restart drain, and so the
     // integration test can exercise the force-restart path without a 10s wait.
@@ -1044,6 +1066,9 @@ async function serverWorkerCommand() {
     const releaseBatonAndDrain = async () => {
       if (draining) { try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ } return; }
       draining = true;
+      // MSG_RELEASE arrived → the new worker booted OK and this reload is really
+      // proceeding (not a rollback). Disarm the rollback self-heal.
+      if (reloadWatchdog) { clearTimeout(reloadWatchdog); reloadWatchdog = null; }
       if (syncTimer) clearInterval(syncTimer);
       // Stop accepting NEW connections; KEEP in-flight requests alive.
       server.maxpoolBeginDrain?.();

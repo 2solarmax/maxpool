@@ -3,7 +3,52 @@ import assert from 'node:assert/strict';
 import { ReadableStream } from 'node:stream/web';
 import { __serverTest } from '../src/server.js';
 
-const { streamResponse } = __serverTest;
+const { streamResponse, startIdleRequestReaper } = __serverTest;
+
+// A fake interval clock so the reaper can be driven deterministically without wall time.
+function fakeClock() {
+  let t = 0; const tasks = [];
+  return {
+    now: () => t,
+    setIntervalFn: (fn, ms) => { const task = { fn, ms, next: ms }; tasks.push(task); return { _task: task, unref() {} }; },
+    advance(ms) {
+      t += ms;
+      for (const task of tasks) while (t >= task.next) { task.next += task.ms; task.fn(); }
+    },
+  };
+}
+
+// ── the backstop reaper: idle-keyed via bytesWritten, never age-keyed ──────────
+
+test('reaper force-aborts a request making ZERO write progress past the idle window', () => {
+  const clk = fakeClock();
+  let destroyed = false;
+  const res = { socket: { bytesWritten: 0 }, writableEnded: false, destroyed: false, destroy() { destroyed = true; this.destroyed = true; } };
+  startIdleRequestReaper(res, 1, 10_000, clk);
+  clk.advance(9_000);
+  assert.equal(destroyed, false, 'not yet — inside the idle window');
+  clk.advance(2_000); // 11s total, no bytes written
+  assert.equal(destroyed, true, 'stuck request (no write progress) is reaped');
+});
+
+test('reaper NEVER trips a heartbeating hold (bytesWritten advances) — the legit 24h/7d hold', () => {
+  const clk = fakeClock();
+  let destroyed = false;
+  const res = { socket: { bytesWritten: 0 }, writableEnded: false, destroyed: false, destroy() { destroyed = true; } };
+  startIdleRequestReaper(res, 2, 10_000, clk);
+  // Simulate an SSE heartbeat advancing the socket every 8s for a "long" hold.
+  for (let i = 0; i < 20; i++) { res.socket.bytesWritten += 30; clk.advance(8_000); }
+  assert.equal(destroyed, false, 'a heartbeating hold advances bytesWritten → its idle clock resets → never reaped');
+});
+
+test('reaper does NOT destroy an already-finished response', () => {
+  const clk = fakeClock();
+  let destroyed = false;
+  const res = { socket: { bytesWritten: 0 }, writableEnded: true, destroyed: false, destroy() { destroyed = true; } };
+  startIdleRequestReaper(res, 3, 10_000, clk);
+  clk.advance(30_000);
+  assert.equal(destroyed, false, 'writableEnded → nothing to abort');
+});
 const mockAM = { updateUsage() {}, updateQuota() {}, markThinkingProtected() {}, markSessionIncompatible() {}, markSessionThinkingProtected() {} };
 
 // A ref'd keepalive so the process loop stays alive while we observe a would-be

@@ -25,6 +25,11 @@ const UPSTREAM_TTFB_MS = Math.max(5_000, Number(process.env.MAXPOOL_TTFB_MS) || 
 const STREAM_IDLE_MS = Math.max(30_000, Number(process.env.MAXPOOL_STREAM_IDLE_MS) || 300_000);  // max gap BETWEEN streamed chunks (reset per chunk)
 const UPSTREAM_BODY_MS = Math.max(30_000, Number(process.env.MAXPOOL_BODY_MS) || 300_000);       // non-streaming body read
 const CLIENT_DRAIN_MS = Math.max(5_000, Number(process.env.MAXPOOL_DRAIN_MS) || 60_000);         // max wait for a backpressured client to drain (half-open client → free the lease)
+// Backstop reaper idle ceiling. Floored WELL above the longest a legit NON-streaming
+// request can go silent (no heartbeat there): TTFB 120s + nonStreamMaxWaitMs 300s +
+// UPSTREAM_BODY_MS 300s ≈ 720s — so a slow-but-alive non-streaming request is never
+// reaped at completion. Streaming holds heartbeat, so they're safe at any ceiling.
+const REQUEST_IDLE_MAX_MS = Math.max(900_000, Number(process.env.MAXPOOL_REQUEST_IDLE_MAX_MS) || 1_200_000);
 
 const DEFAULT_QUEUE = {
   enabled: true,
@@ -177,6 +182,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // undefined (a body-read throw lands before describeRequest runs).
       const ctx = { account: null, status: null };
       let requestInfo = {};
+      // Backstop reaper (defense-in-depth for any UNKNOWN future hang the specific
+      // TTFB/idle/body/drain guards don't cover). See startIdleRequestReaper.
+      const reaperTimer = startIdleRequestReaper(res, reqId, REQUEST_IDLE_MAX_MS);
       try {
         // Buffer request body (needed for retry on 429)
         const bodyChunks = [];
@@ -218,6 +226,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
         }
       } finally {
+        clearInterval(reaperTimer);
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
           account: ctx.account, status: ctx.status,
@@ -1109,7 +1118,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, streamResponse };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, streamResponse, startIdleRequestReaper };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1760,6 +1769,30 @@ function mappedModel(originalModel, account) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
+/**
+ * Backstop reaper for a single request: force-abort it if it makes ZERO client-write
+ * progress for idleMs. IDLE-keyed via res.socket.bytesWritten (a legit streaming HOLD
+ * heartbeats → bytesWritten advances → never trips; only a genuinely stuck request
+ * with no writes is reaped). res.destroy() routes into the normal onClose→finally
+ * cleanup so the account lease + onRequestEnd release — never a direct releaseAccount
+ * (which has no idempotency guard). Clock/timer injectable for tests. Returns the
+ * interval handle (caller clearInterval()s it in the request's finally).
+ */
+function startIdleRequestReaper(res, reqId, idleMs, { now = Date.now, setIntervalFn = setInterval } = {}) {
+  let lastBytes = res.socket?.bytesWritten ?? 0;
+  let lastProgressAt = now();
+  const timer = setIntervalFn(() => {
+    const bytes = res.socket?.bytesWritten ?? lastBytes;
+    if (bytes !== lastBytes) { lastBytes = bytes; lastProgressAt = now(); return; }
+    if (now() - lastProgressAt >= idleMs && !res.writableEnded && !res.destroyed) {
+      console.error(`[Maxpool] Request ${reqId} — no write progress for ${Math.round(idleMs / 1000)}s (backstop reaper); force-aborting a stuck request to free its account slot`);
+      res.destroy();
+    }
+  }, Math.min(60_000, idleMs));
+  timer.unref?.();
+  return timer;
+}
+
 async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog, requestInfo = {}, idleMs = STREAM_IDLE_MS) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();

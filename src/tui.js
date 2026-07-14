@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { fetchProfile, loginOAuth } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint } from './oauth.js';
 import { appendEventLog } from './event-log.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -398,7 +398,12 @@ export class TUI {
       this._confirm(
         'Restart Maxpool?',
         'Pause new requests, drain active work, then start the updated server.',
-        () => { this.stop(); this.onRestart?.(); },
+        // Do NOT stop the TUI here — let the reload path own it: cold restart stops
+        // it in restartWorkerNow, a seamless reload in releaseBatonAndDrain (on
+        // MSG_RELEASE). If the reload ROLLS BACK (new worker fails to boot), neither
+        // fires, so the TUI keeps rendering instead of being stranded in plain-log
+        // mode. (The worker also self-heals admission — see index.js reload watchdog.)
+        () => { this.onRestart?.(); },
       );
     } else if (k === 'a') {
       this.mode = 'accounts';
@@ -725,6 +730,13 @@ export class TUI {
         throw error;
       }
       this._addLog(`Updated account "${name}"`);
+      // Confirm the fresh token actually reached DISK (saveConfig awaited above +
+      // the AM was updated before it, so disk now holds creds.refreshToken). This
+      // is the verifiable proof a re-auth "stuck" — its fp must match the on-disk
+      // token; a later "REJECTED sent fp=<other>" then means an upstream revocation,
+      // not a lost persist. console.log (not _addLog) so it's VISIBLE during the
+      // stopped-TUI login flow, mirroring the sibling "Persisted rotated token" line.
+      console.log(`[Maxpool] Re-authenticated "${name}" — fresh token persisted (fp=${tokenFingerprint(creds.refreshToken)})`);
       return { updated: true, name };
     } else {
       this.config.accounts.push(entry);
@@ -948,12 +960,11 @@ export class TUI {
       lines.push('');
       // Aligned column header (dim + underline so it reads as chrome, not data). It
       // labels the fixed columns that have no inline label; the Ses/Wk/Tok/Req and
-      // Now/15m/1h labels stay inline per row. A short glossary below expands the
-      // abbreviations the header + inline labels can't spell out.
+      // Now/15m/1h labels stay inline per row. It sits DIRECTLY above the rows — the
+      // abbreviation glossary is a FOOTER below the rows (a caption), never between
+      // the header and the data (a left-aligned sentence there reads as a broken,
+      // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
-      if (W >= 88) {
-        lines.push(' ' + dim('Ses 5h · Wk 7d · Now in-flight (weight) · 15m/1h served (avg · f fails)'));
-      }
       const showBoth = W >= 70;
       const bw = showBoth
         ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
@@ -961,6 +972,11 @@ export class TUI {
 
       for (let i = 0; i < this.am.accounts.length; i++) {
         lines.push(this._renderAcct(i, bw, showBoth));
+      }
+      // Glossary FOOTER (expands the abbreviations the header + inline labels can't
+      // spell out). Below the rows so it never breaks the header↔column alignment.
+      if (W >= 88) {
+        lines.push(' ' + dim('Ses 5h · Wk 7d · Now in-flight (weight) · 15m/1h served (avg · f fails)'));
       }
     }
 

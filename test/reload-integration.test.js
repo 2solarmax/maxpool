@@ -309,6 +309,48 @@ test('reload rollback: new worker fails readiness → old stays primary, zero EC
   }
 });
 
+test('rollback via the LATCHING r-key path (SIGUSR2) self-heals admission: worker serves 200 again, not 503 forever', async () => {
+  // The r-key/SIGUSR2 restart goes through restartController.requestRestart → it
+  // PAUSES admission + latches `restarting` BEFORE the reload. If the new worker then
+  // fails readiness (rollback), the old worker is never released and — without the
+  // self-heal — those flags stay latched, so it returns 503 restart_in_progress to
+  // EVERY request forever. The self-heal watchdog must reset them. WITHOUT it, the
+  // "recover to 200" wait below times out (503 forever); WITH it, it recovers.
+  const upstream = await startJsonUpstream();
+  const port = await getFreePort();
+  const apiKey = 'mp-test-key';
+  const configPath = await writeReloadConfig(port, upstream.port, apiKey);
+
+  let out = '';
+  const child = spawn(process.execPath, [cliPath, 'server'], {
+    env: {
+      ...process.env, MAXPOOL_CONFIG: configPath, MAXPOOL_FORCE_SUPERVISOR: '1',
+      MAXPOOL_TEST_FAIL_RELOAD_WORKER: '1',   // new worker fails readiness → rollback
+      MAXPOOL_TEST_RESTART_SIGNAL: '1',       // SIGUSR2 → the LATCHING requestRestart
+      MAXPOOL_RELOAD_SELFHEAL_MS: '2000',     // short so the test doesn't wait 30s
+    },
+    stdio: ['ignore', 'pipe', 'pipe'], detached: true,
+  });
+  child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
+
+  try {
+    await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
+    process.kill(-child.pid, 'SIGUSR2'); // group signal → worker requestRestart (pauses admission, latches)
+    await waitFor(() => /rolling back/.test(out), 20000);
+    // The self-heal fires (~2s) and logs it.
+    await waitFor(() => /resumed serving/.test(out), 20000);
+    // And the worker actually serves again — the 503-forever latch is cleared.
+    let status = 0;
+    await waitFor(async () => { try { status = (await proxyGet(port, apiKey)).status; return status === 200; } catch { return false; } }, 15000);
+    assert.equal(status, 200, 'after the rollback self-heal, the worker serves 200 — not 503 restart_in_progress forever');
+    assert.equal(child.exitCode, null, 'supervisor still up after the rolled-back reload');
+  } finally {
+    killGroup(child);
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
+    await new Promise(r => upstream.server.close(r));
+  }
+});
+
 test('crash-loop on boot backs off (not a tight fork loop) and never wedges the port', async () => {
   const upstream = await startJsonUpstream();
   const port = await getFreePort();

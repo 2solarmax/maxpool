@@ -3,6 +3,7 @@ const NON_UPSTREAM_ROUTES = new Set(['(queued)', '(none available)']);
 export class RestartController {
   constructor({
     pauseAdmission,
+    resumeAdmission = () => {},
     restartNow,
     log = console.log,
     // Bounded drain: wait at most this long for in-flight upstream requests to
@@ -15,6 +16,7 @@ export class RestartController {
     clearTimeoutFn = clearTimeout,
   }) {
     this.pauseAdmission = pauseAdmission;
+    this.resumeAdmission = resumeAdmission;
     this.restartNow = restartNow;
     this.log = log;
     this.drainTimeoutMs = drainTimeoutMs;
@@ -30,6 +32,23 @@ export class RestartController {
   requestStarted(id) {
     if (this.pending || this.restarting) return false;
     this.activeRequests.add(id);
+    return true;
+  }
+
+  /**
+   * Abort a restart that was requested but never completed because the process is
+   * STILL ALIVE — a seamless reload that rolled back (the new worker failed to boot,
+   * so the old worker was never released and never exited). Without this the latched
+   * `pending`/`restarting` flags make requestStarted() return false forever → the
+   * worker 503s EVERY request until a manual restart. Reset the flags + resume
+   * admission so it keeps serving. No-op if no restart is in progress.
+   */
+  cancelRestart() {
+    if (!this.pending && !this.restarting) return false;
+    this.pending = false;
+    this.restarting = false;
+    if (this._drainTimer) { this.clearTimeoutFn(this._drainTimer); this._drainTimer = null; }
+    this.resumeAdmission();
     return true;
   }
 
