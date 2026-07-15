@@ -1593,6 +1593,9 @@ function describeRequest(req, body) {
     const origin = detectTranscriptOrigin(json);
     if (origin.anthropicIncompatible) info.anthropicIncompatible = true;
     if (origin.homeProvider) info.homeProvider = origin.homeProvider;
+    // Image content (incl. tool_result-nested screenshots) keeps a request off Kimi
+    // (Moonshot 400s on some images GLM/Anthropic accept, and a 400 is terminal).
+    if (containsImageBlock(json.messages)) info.hasImage = true;
   } catch {
     // Non-JSON requests are rare; body size still gives a useful load signal.
   }
@@ -1676,6 +1679,21 @@ function containsThinkingBlock(value) {
 
   if (value.content && containsThinkingBlock(value.content)) return true;
   if (value.messages && containsThinkingBlock(value.messages)) return true;
+  return false;
+}
+
+// True if any message carries an `{type:'image'}` content block at ANY nesting
+// depth — including images nested inside a `tool_result` block (the primary
+// Claude Code image path: a browser/Playwright tool returning a screenshot). A
+// shallow 2-level scan misses those. Used to keep image requests off Kimi, whose
+// decoder 400s on images Anthropic/GLM accept.
+function containsImageBlock(value) {
+  if (!value) return false;
+  if (Array.isArray(value)) return value.some(containsImageBlock);
+  if (typeof value !== 'object') return false;
+  if (value.type === 'image') return true;
+  if (value.content && containsImageBlock(value.content)) return true;
+  if (value.messages && containsImageBlock(value.messages)) return true;
   return false;
 }
 

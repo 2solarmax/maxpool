@@ -1609,6 +1609,13 @@ export class AccountManager {
   _isRequestCompatible(account, profile, requestInfo = {}) {
     if (!this._matchesProfile(account, profile)) return false;
 
+    // Kimi (Moonshot) 400s on images Anthropic/GLM accept ("failed to decode
+    // image") — and a provider 400 is TERMINAL (not retried to another account), so
+    // an image request that fell back to Kimi FAILS the whole request. Keep image
+    // requests off Kimi; they still route to GLM (handles images) + OAuth. If those
+    // are all unavailable the request HOLDS/queues (recoverable) rather than 400ing.
+    if (requestInfo.hasImage && account.provider === 'kimi') return false;
+
     const { incompatible, homeProvider } = this._effectiveIncompatible(requestInfo);
     const policy = this._crossProviderFallbackPolicy();
 
