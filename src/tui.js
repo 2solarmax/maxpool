@@ -982,8 +982,15 @@ export class TUI {
 
     // ── Activity header
     lines.push('');
+    // "N active" reads as "N sessions" — but this is in-flight REQUESTS (Claude Code
+    // fans out many parallel subagent requests per session). Label it "in-flight" and
+    // show the distinct SESSION count (subagents of one terminal share one session key)
+    // so a busy 1-2 sessions firing dozens of requests isn't mistaken for a leak.
     const ac = this.active.size;
-    const acTag = ac > 0 ? `  ${cyan(ac + ' active')}` : '';
+    const sessions = new Set([...this.active.values()].map(r => r.sessionKey).filter(Boolean)).size;
+    const acTag = ac > 0
+      ? `  ${cyan(ac + ' in-flight')}${sessions ? dim(` · ${sessions} session${sessions === 1 ? '' : 's'}`) : ''}`
+      : '';
     const aHdr = ` Activity${acTag} `;
     lines.push(aHdr + dim('─'.repeat(Math.max(1, W - vw(aHdr)))));
 

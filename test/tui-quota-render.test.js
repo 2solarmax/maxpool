@@ -198,6 +198,45 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
+test('the Activity header shows in-flight REQUESTS + distinct SESSION count (not "N active")', () => {
+  const am = oauthAM(2);
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } } });
+  // 4 in-flight requests spanning 2 distinct sessions (sessA fans out ×2 — the subagent
+  // case) + 1 with no session header (must not inflate the session count).
+  tui.onRequestStart(1, { method: 'POST', path: '/v1/messages', sessionKey: 'sessA' });
+  tui.onRequestStart(2, { method: 'POST', path: '/v1/messages', sessionKey: 'sessA' });
+  tui.onRequestStart(3, { method: 'POST', path: '/v1/messages', sessionKey: 'sessB' });
+  tui.onRequestStart(4, { method: 'POST', path: '/v1/messages' }); // header-less → not a session
+
+  const origCols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  const origWrite = process.stdout.write;
+  let out = '';
+  try {
+    Object.defineProperty(process.stdout, 'columns', { value: 120, configurable: true });
+    process.stdout.write = (s) => { out += s; return true; };
+    tui._render();
+  } finally {
+    process.stdout.write = origWrite;
+    if (origCols) Object.defineProperty(process.stdout, 'columns', origCols);
+  }
+  const activity = strip(out).split('\n').find(l => /Activity/.test(l)) || '';
+  assert.match(activity, /4 in-flight/, 'counts in-flight REQUESTS');
+  assert.match(activity, /2 sessions/, 'distinct sessions among them (sessA×2 + sessB; the keyless one excluded)');
+  assert.doesNotMatch(activity, /\d+ active/, 'header no longer labels the count "active" (which read as sessions)');
+});
+
+test('the Activity header uses the singular "1 session" for a single session', () => {
+  const tui = new TUI({ accountManager: oauthAM(1), config: { proxy: { port: 3456 } } });
+  tui.onRequestStart(1, { method: 'POST', path: '/v1/messages', sessionKey: 'only' });
+  tui.onRequestStart(2, { method: 'POST', path: '/v1/messages', sessionKey: 'only' });
+  const ow = process.stdout.write; const oc = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  let out = '';
+  try { Object.defineProperty(process.stdout, 'columns', { value: 120, configurable: true }); process.stdout.write = s => { out += s; return true; }; tui._render(); }
+  finally { process.stdout.write = ow; if (oc) Object.defineProperty(process.stdout, 'columns', oc); }
+  const activity = strip(out).split('\n').find(l => /Activity/.test(l)) || '';
+  assert.match(activity, /2 in-flight · 1 session\b/, 'singular "session" for one session, no trailing s');
+});
+
 test('the abbreviation glossary is a FOOTER below the rows, never between the header and the data', () => {
   // Regression guard for the reported "header not aligned" — a left-aligned glossary
   // sentence sandwiched between the aligned header and the aligned rows reads as a

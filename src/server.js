@@ -123,7 +123,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
         const reqId = ++requestCounter;
         const ctx = { account: '(oauth relay)', status: null };
-        const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+        const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session') });
         if (accepted === false) {
           res.writeHead(503, {
             'Content-Type': 'application/json',
@@ -156,7 +156,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       // Track request
       const reqId = ++requestCounter;
-      const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+      // sessionKey (from the per-terminal x-maxpool-session header) lets the TUI show
+      // how many distinct client sessions the in-flight requests span — so "N in-flight"
+      // isn't misread as "N sessions" (subagents of one terminal share one session key).
+      const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session') });
       if (accepted === false) {
         res.writeHead(503, {
           'Content-Type': 'application/json',
