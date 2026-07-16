@@ -132,7 +132,7 @@ test('a transient provider probe error does not blank existing bars', () => {
 
 // ── freshness / staleness ─────────────────────────────────────────────────────
 
-test('_quotaProbeStale: off when probe disabled, false when fresh, true past 2x interval', () => {
+test('_quotaProbeStale: off when probe disabled, false when fresh, true past 3x interval', () => {
   const am = oauthAM(1);
   const a = am.accounts[0];
 
@@ -144,11 +144,31 @@ test('_quotaProbeStale: off when probe disabled, false when fresh, true past 2x 
   a.quota.lastProbeOkAt = Date.now() - 30_000;
   assert.equal(am._quotaProbeStale(a), false, 'probed 30s ago → fresh');
 
+  // The probe rolls through accounts one at a time now, so a healthy account can be
+  // ~50-90s between refreshes — that must NOT read as stale (the old 2× / 120s
+  // threshold sat right under that cadence and never fired).
+  a.quota.lastProbeOkAt = Date.now() - 90_000;
+  assert.equal(am._quotaProbeStale(a), false, 'probed 90s ago with a rolling 60s probe → still fresh');
+
   a.quota.lastProbeOkAt = Date.now() - 5 * 60_000;
   assert.equal(am._quotaProbeStale(a), true, 'probed 5m ago with a 60s cadence → stale');
 
   a.quota.lastProbeOkAt = null;
   assert.equal(am._quotaProbeStale(a), false, 'never probed (startup) → "no data", not "stale"');
+});
+
+test('recordProbeError surfaces a failing probe; applyUsageData clears it', () => {
+  const am = oauthAM(1);
+  const q = am.accounts[0].quota;
+
+  am.recordProbeError(0, 'HTTP 429: rate_limit', 429);
+  assert.equal(q.lastProbeErrorStatus, 429);
+  assert.ok(q.lastProbeError.includes('429'));
+  assert.ok(q.lastProbeErrorAt > 0);
+
+  am.applyUsageData(0, { sevenDay: { utilization: 0.5, resetAt: Date.now() + DAY } });
+  assert.equal(q.lastProbeError, null, 'a successful probe clears the recorded error');
+  assert.equal(q.lastProbeErrorStatus, null);
 });
 
 test('applyUsageData stamps lastProbeOkAt (freshness confirmed on every successful probe)', () => {

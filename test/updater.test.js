@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compareVersions, checkForUpdate } from '../src/updater.js';
+import { compareVersions, checkForUpdate, maybeCheckForUpdate } from '../src/updater.js';
 
 test('compareVersions orders semver correctly', () => {
   assert.equal(compareVersions('1.0.1', '1.0.0'), 1);
@@ -32,4 +32,37 @@ test('checkForUpdate is failure-safe (returns null on network error)', async () 
   } finally {
     globalThis.fetch = orig;
   }
+});
+
+test('maybeCheckForUpdate always reports version info (feeds the header indicator)', async () => {
+  const orig = globalThis.fetch;
+  // Newer published version → hasUpdate true, and the indicator carries latest.
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ version: '999.0.0' }) });
+  let info = null;
+  try {
+    await maybeCheckForUpdate({ updateCheck: true }, () => {}, i => { info = i; });
+  } finally {
+    globalThis.fetch = orig;
+  }
+  assert.ok(info, 'onVersionInfo invoked');
+  assert.equal(typeof info.current, 'string', 'running version known');
+  assert.equal(info.latest, '999.0.0');
+  assert.equal(info.hasUpdate, true);
+  assert.ok(Number.isFinite(info.checkedAt));
+});
+
+test('maybeCheckForUpdate reports version info even when update checks are off (no npm call)', async () => {
+  const orig = globalThis.fetch;
+  let fetched = false;
+  globalThis.fetch = async () => { fetched = true; return { ok: true, json: async () => ({ version: '999.0.0' }) }; };
+  let info = null;
+  try {
+    await maybeCheckForUpdate({ updateCheck: false }, () => {}, i => { info = i; });
+  } finally {
+    globalThis.fetch = orig;
+  }
+  assert.equal(fetched, false, 'updateCheck:false skips the npm round-trip');
+  assert.ok(info && typeof info.current === 'string', 'still reports the running version');
+  assert.equal(info.latest, null);
+  assert.equal(info.hasUpdate, false);
 });

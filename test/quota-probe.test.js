@@ -50,6 +50,62 @@ test('a transient probe error leaves quota untouched', async () => {
   assert.equal(am.accounts[0].quota.unified7d, null);
 });
 
+test('probeAll de-bursts oauth probes (paced, one at a time)', async () => {
+  const am = manager(3);
+  const starts = [];
+  let concurrent = 0, maxConcurrent = 0;
+  const probeFn = async () => {
+    concurrent++; maxConcurrent = Math.max(maxConcurrent, concurrent);
+    starts.push(Date.now());
+    await new Promise(r => setTimeout(r, 5));
+    concurrent--;
+    return { sevenDay: { utilization: 0.4, resetAt: WEEK_OUT() } };
+  };
+  // The old Promise.all fired all three at once → the shared usage endpoint 429'd
+  // all but one. Paced, at most one is ever in flight and they're spread by the gap.
+  const prober = new Prober(am, { probeFn, usageGapMs: 40, log: () => {} });
+  await prober.probeAll();
+
+  assert.equal(starts.length, 3, 'all three probed');
+  assert.equal(maxConcurrent, 1, 'never two usage probes in flight at once');
+  assert.ok(starts[1] - starts[0] >= 30, `2nd probe paced after 1st (${starts[1] - starts[0]}ms)`);
+  assert.ok(starts[2] - starts[1] >= 30, `3rd probe paced after 2nd (${starts[2] - starts[1]}ms)`);
+});
+
+test('a 429 is recorded (not swallowed) and backs off the usage gap', async () => {
+  const am = manager(1);
+  const prober = new Prober(am, { probeFn: async () => ({ error: 'HTTP 429', status: 429 }), usageGapMs: 20, log: () => {} });
+  await prober.probeAll();
+
+  assert.equal(am.accounts[0].quota.unified7d, null, 'quota untouched on 429');
+  assert.equal(am.accounts[0].quota.lastProbeErrorStatus, 429, 'error surfaced, not swallowed');
+  assert.ok(prober._usageGapMs > 20, `gap widened after 429 (${prober._usageGapMs}ms)`);
+});
+
+test('_baseUsageGap derives the probe spacing from the interval (interval/6, clamped 6-20s)', () => {
+  const g = im => new Prober(manager(1), { intervalMs: im, log: () => {} })._baseUsageGap();
+  assert.equal(g(60_000), 10_000, '60s interval → 10s spacing');
+  assert.equal(g(6_000), 6_000, 'tiny interval clamps up to the 6s floor');
+  assert.equal(g(600_000), 20_000, 'huge interval clamps down to the 20s cap');
+  assert.equal(g(0), 0, 'probe off → no pacing');
+  // An explicit gap overrides the derivation (the test knob).
+  assert.equal(new Prober(manager(1), { intervalMs: 60_000, usageGapMs: 123, log: () => {} })._baseUsageGap(), 123);
+});
+
+test('stop() aborts an in-flight pacing wait quickly', async () => {
+  const am = manager(3);
+  const prober = new Prober(am, {
+    probeFn: async () => ({ sevenDay: { utilization: 0.4, resetAt: WEEK_OUT() } }),
+    usageGapMs: 5000, // long gap so the sweep is mid-pace when we stop it
+    log: () => {},
+  });
+  const cycle = prober.probeAll();
+  const t0 = Date.now();
+  await prober.stop(); // must not block for the full 5s pacing gap
+  await cycle;
+  assert.ok(Date.now() - t0 < 1000, `stop() returned promptly (${Date.now() - t0}ms), not after the 5s gap`);
+});
+
 test('a 401 forces a token refresh and retries once', async () => {
   const am = manager(1);
   let forced = false;

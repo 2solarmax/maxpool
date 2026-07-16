@@ -920,7 +920,12 @@ export class TUI {
     const lines = [];
 
     // ── Header
-    const left = bold(' Maxpool');
+    const v = this.am.versionInfo;
+    const verStr = v?.current ? ` ${dim('v' + v.current)}` : '';
+    // "↑ vX.Y.Z" when a newer npm version is published; nothing when on latest or
+    // the check hasn't resolved yet (so the header never falsely implies up-to-date).
+    const updStr = (v?.hasUpdate && v?.latest) ? `  ${yellow('↑ v' + v.latest)}` : '';
+    const left = bold(' Maxpool') + verStr + updStr;
     const port = this.config.proxy?.port || 3456;
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
@@ -1146,11 +1151,24 @@ export class TUI {
     }
     if (scopedTags.length) line += `  ${scopedTags.join(' ')}`;
     // Freshness: scoped caps are refreshed ONLY by the background probe (response
-    // headers don't carry them). If the probe has gone stale (> 2× interval since
-    // last success), say so rather than imply the last-known value is current.
-    if (this.am._quotaProbeStale?.(a)) line += `  ${dim('stale')}`;
+    // headers don't carry them). If the probe has gone stale, say so — and name the
+    // cause (e.g. rate-limited) when a probe failure is on record — rather than imply
+    // the last-known value is current.
+    line += this._probeHealthNote(a);
     line += `  ${dim(loadText(this._accountLoad(a)))}`;
     return line;
+  }
+
+  /** Freshness suffix for an account row. Empty when the probe is current. When
+   *  stale, names the cause from the last recorded probe failure (e.g. a 429 from
+   *  the usage endpoint) so a self-throttling probe reads as "rate-limited" rather
+   *  than an unexplained "stale". Leading spaces included so callers append raw. */
+  _probeHealthNote(a) {
+    if (!this.am._quotaProbeStale?.(a)) return '';
+    const s = a?.quota?.lastProbeErrorStatus;
+    if (s === 429) return `  ${yellow('stale·rate-limited')}`;
+    if (s) return `  ${yellow('stale·probe ' + s)}`;
+    return `  ${dim('stale')}`;
   }
 
   _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true) {
@@ -1166,7 +1184,7 @@ export class TUI {
     if (q.providerSes != null || q.providerWk != null) {
       sesCell = q.providerSes != null ? bar(q.providerSes, bw, q.providerSesReset) : emptyBar('—', bw);
       wkCell = q.providerWk != null ? bar(q.providerWk, bw, q.providerWkReset) : emptyBar('—', bw);
-      if (this.am._quotaProbeStale?.(a)) note = `  ${dim('stale')}`;
+      note = this._probeHealthNote(a);
     } else if (q.providerQuotaSource === 'console-only') {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);

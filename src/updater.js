@@ -73,11 +73,28 @@ export async function selfUpdate({ timeoutMs = 120_000 } = {}) {
  * (config.autoUpdate). Never auto-restarts a running proxy — the new version
  * applies on the next restart, so in-flight sessions are never interrupted.
  * Fire-and-forget; all failures are swallowed.
+ *
+ * `onVersionInfo` (optional) is ALWAYS invoked with { current, latest, hasUpdate,
+ * checkedAt } — even when up-to-date, offline, or updateCheck is off — so the TUI
+ * header / status can show the running version + whether an update is available.
  */
-export async function maybeCheckForUpdate(config, notify) {
-  if (config?.updateCheck === false) return;
+export async function maybeCheckForUpdate(config, notify, onVersionInfo) {
   const current = await getCurrentVersion();
-  const result = await checkForUpdate(current);
+  // Skip the npm round-trip when the user disabled update checks, but still report
+  // the running version so the indicator can show it.
+  const result = config?.updateCheck === false ? null : await checkForUpdate(current);
+
+  if (onVersionInfo) {
+    try {
+      onVersionInfo({
+        current,
+        latest: result?.latest ?? null,
+        hasUpdate: Boolean(result?.hasUpdate),
+        checkedAt: Date.now(),
+      });
+    } catch { /* the indicator is best-effort; never break startup */ }
+  }
+
   if (!result || !result.hasUpdate) return;
 
   notify(`Update available: ${result.current} → ${result.latest}`);

@@ -55,6 +55,13 @@ function emptyQuota() {
     // marker — a swallowed failing probe no longer silently freezes a stale tag.
     // Header-driven updates do NOT stamp this (headers can't refresh scoped/provider).
     lastProbeOkAt: null,        // ms
+    // Last background probe FAILURE — surfaced in the TUI/status so a persistently
+    // failing probe (e.g. the usage endpoint rate-limiting us) is VISIBLE instead of
+    // silently swallowed (which let a stale weekly keep looking fresh). Cleared on
+    // the next successful probe. Not persisted (transient).
+    lastProbeError: null,       // string
+    lastProbeErrorAt: null,     // ms
+    lastProbeErrorStatus: null, // http status (429, 500, …) or null
   };
 }
 
@@ -1942,6 +1949,10 @@ export class AccountManager {
     }
 
     q.lastProbeOkAt = Date.now();
+    // A successful probe clears any recorded failure — freshness confirmed.
+    q.lastProbeError = null;
+    q.lastProbeErrorAt = null;
+    q.lastProbeErrorStatus = null;
 
     // If we just learned this account's weekly window while probing, re-evaluate
     // selection (same path as learning it from a live response).
@@ -1949,6 +1960,22 @@ export class AccountManager {
       account.probing = false;
       account.requalify = true;
     }
+  }
+
+  /**
+   * Record a background probe FAILURE for an account (called by the prober instead
+   * of swallowing the error). Surfaced in getStatus()/the TUI so a persistently
+   * failing probe is visible; the stored quota values are left untouched (they age
+   * into the staleness marker rather than being blanked — see applyUsageData's
+   * `!= null` guards, which are load-bearing for weekly routing).
+   */
+  recordProbeError(accountIndex, message, status = null) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    const q = account.quota;
+    q.lastProbeError = message ? String(message).slice(0, 160) : 'probe failed';
+    q.lastProbeErrorAt = Date.now();
+    q.lastProbeErrorStatus = Number.isFinite(status) ? status : null;
   }
 
   /**
@@ -1987,7 +2014,7 @@ export class AccountManager {
   }
 
   /**
-   * True when the background quota probe hasn't succeeded in > 2× its interval —
+   * True when the background quota probe hasn't succeeded in > 3× its interval —
    * the last-known scoped/provider values are aging with no confirmation. Returns
    * false when the probe is off (nothing to be stale against) or has never yet
    * succeeded (startup — shown as "no data", not "stale").
@@ -1997,7 +2024,10 @@ export class AccountManager {
     if (!interval || interval <= 0) return false;
     const last = account?.quota?.lastProbeOkAt;
     if (last == null) return false;
-    return (now - last) > Math.max(2 * interval, 120_000);
+    // 3× interval (min 3 min): the probe now rolls through accounts one at a time
+    // (a full sweep ~ N × interval/6), so a healthy account refreshes well inside
+    // this window — the marker only fires on a genuine multi-sweep probe failure.
+    return (now - last) > Math.max(3 * interval, 180_000);
   }
 
   /**
@@ -2598,6 +2628,9 @@ export class AccountManager {
   getStatus() {
     const now = Date.now();
     return {
+      // Running version + npm update state (set at startup by maybeCheckForUpdate).
+      // null until the check resolves; `current` is known even offline.
+      version: this.versionInfo || null,
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       routing: {

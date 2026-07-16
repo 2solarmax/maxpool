@@ -12,7 +12,7 @@ import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, toke
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
-import { maybeCheckForUpdate } from './updater.js';
+import { maybeCheckForUpdate, getCurrentVersion } from './updater.js';
 import {
   runReloadBaton,
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
@@ -590,8 +590,15 @@ async function serverWorkerCommand() {
   const probeSeconds = process.env.MAXPOOL_DISABLE_QUOTA_PROBE === '1' ? 0 : (config.quotaProbeSeconds || 0);
   const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000 });
   // Tell the AM the probe cadence so the TUI can flag a scoped/provider tag whose
-  // background probe has gone stale (> 2× interval since last success).
+  // background probe has gone stale (> 3× interval since last success).
   accountManager.quotaProbeIntervalMs = probeSeconds * 1000;
+
+  // Seed the running version immediately so the TUI header always shows it, even
+  // before (or without) the npm update check. The cold worker's update check below
+  // fills in latest/hasUpdate.
+  getCurrentVersion()
+    .then(v => { accountManager.versionInfo ||= { current: v, latest: null, hasUpdate: false, checkedAt: null }; })
+    .catch(() => {});
 
   // Persist refreshed tokens back to config. Defense-in-depth: the updater reads
   // the on-disk refresh token and SKIPS the rotation if a fresher writer already
@@ -1040,7 +1047,7 @@ async function serverWorkerCommand() {
     if (!viaTakeover && !isReloadWorker) {
       if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') console.log('[Maxpool] UPDATE_CHECK_FIRED');
       const notify = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
-      maybeCheckForUpdate(config, notify).catch(() => {});
+      maybeCheckForUpdate(config, notify, info => { accountManager.versionInfo = info; }).catch(() => {});
     } else if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') {
       console.log('[Maxpool] UPDATE_CHECK_SKIPPED (reload)');
     }
