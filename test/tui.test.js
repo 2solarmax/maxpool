@@ -41,6 +41,7 @@ test('normal footer uses mnemonic top-level actions', () => {
 
   const footer = __tuiTest.strip(tui._renderFooter());
   assert.match(footer, /a Accounts/);
+  assert.match(footer, /t On\/off/);
   assert.match(footer, /m Routing/);
   assert.match(footer, /s Sync/);
   assert.match(footer, /r Restart/);
@@ -153,6 +154,30 @@ test('account disable is confirmed and persisted without deleting credentials', 
   assert.equal(am.accounts[0].enabled, false);
   assert.equal(config.accounts[0].enabled, false);
   assert.equal(config.accounts[0].accessToken, 'secret');
+});
+
+test('top-level "t" (advertised in the normal footer) disables an account end-to-end', async () => {
+  const accounts = [{ name: 'personal', type: 'oauth', status: 'active', enabled: true, inFlight: 0 }];
+  const am = accountManager(accounts);
+  const config = {
+    accounts: [{ name: 'personal', type: 'oauth', accessToken: 'secret' }],
+    routing: { mode: 'automatic', preferredAccount: null },
+  };
+  const tui = new TUI({ accountManager: am, config, saveConfig: async () => {} });
+
+  // Straight from the top level — NOT via 'a' Accounts first. This is the wiring
+  // the footer promises; a footer-only change would advertise a dead key.
+  tui._keyNormal('t');
+  assert.equal(tui.mode, 'select', 'normal-mode "t" opens the account picker');
+  assert.equal(tui.selAction, 'toggle');
+
+  tui._keySelect('enter');
+  assert.match(tui.confirmDetail, /Stop assigning new requests/i);
+  tui._keyConfirm('y');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(am.accounts[0].enabled, false);
+  assert.equal(config.accounts[0].enabled, false);
 });
 
 test('API key input is masked', () => {

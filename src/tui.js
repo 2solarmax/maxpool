@@ -415,6 +415,10 @@ export class TUI {
         'Reload account credentials and newly added accounts from the config file.',
         () => this._doSync(),
       );
+    } else if (k === 't' && this.am.accounts.length > 0) {
+      // Manual on/off toggle straight from the top level (also under a → Accounts).
+      // select → confirm → returns to 'normal', so this never strands the user.
+      this._startSelection('toggle');
     }
   }
 
@@ -1164,6 +1168,12 @@ export class TUI {
    *  the usage endpoint) so a self-throttling probe reads as "rate-limited" rather
    *  than an unexplained "stale". Leading spaces included so callers append raw. */
   _probeHealthNote(a) {
+    // A dead account (reauth / disabled) already surfaces its state in the status
+    // column, and its quota reading is frozen and moot — the prober skips it, so a
+    // "stale·probe 401" here is just the perpetual echo of the 401 that killed it.
+    // Only annotate probe-staleness for LIVE accounts, where a failing probe
+    // (e.g. a 429) is a real, actionable signal.
+    if (a?.refreshDead || a?.enabled === false) return '';
     if (!this.am._quotaProbeStale?.(a)) return '';
     const s = a?.quota?.lastProbeErrorStatus;
     if (s === 429) return `  ${yellow('stale·rate-limited')}`;
@@ -1229,7 +1239,7 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
+        return ` ${bold('a')} Accounts  ${bold('t')} On/off  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
       case 'accounts':
         return ` ${bold('l')} Login/re-auth (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'routing':

@@ -29,7 +29,8 @@ const CLIENT_DRAIN_MS = Math.max(5_000, Number(process.env.MAXPOOL_DRAIN_MS) || 
 // request can go silent (no heartbeat there): TTFB 120s + nonStreamMaxWaitMs 300s +
 // UPSTREAM_BODY_MS 300s ≈ 720s — so a slow-but-alive non-streaming request is never
 // reaped at completion. Streaming holds heartbeat, so they're safe at any ceiling.
-const REQUEST_IDLE_MAX_MS = Math.max(900_000, Number(process.env.MAXPOOL_REQUEST_IDLE_MAX_MS) || 1_200_000);
+// Exported so index.js sizes RELOAD_DRAIN_MS off the SAME value (no drift).
+export const REQUEST_IDLE_MAX_MS = Math.max(900_000, Number(process.env.MAXPOOL_REQUEST_IDLE_MAX_MS) || 1_200_000);
 
 const DEFAULT_QUEUE = {
   enabled: true,

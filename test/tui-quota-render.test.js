@@ -75,6 +75,30 @@ test('a stale probe marks the scoped tag "stale"; a fresh one does not', () => {
   assert.match(strip(tui._renderAcct(0, 11, true)), /stale/, 'aged probe → explicit stale marker');
 });
 
+test('a refreshDead (reauth) account suppresses the redundant stale·probe echo', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.11, severity: 'normal', isActive: true, resetAt: Date.now() + 3 * DAY } } });
+  // The death: the expired-token probe recorded a 401, the probe is now stale, and
+  // the account is refreshDead → the prober skips it, so that 401 never clears.
+  am.accounts[0].quota.lastProbeErrorStatus = 401;
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
+  am.accounts[0].refreshDead = true;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.doesNotMatch(line, /stale/, 'the "reauth" status already tells the story — no stale·probe echo');
+});
+
+test('a LIVE account still surfaces a real failing-probe signal (not over-suppressed)', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.11, severity: 'normal', isActive: true, resetAt: Date.now() + 3 * DAY } } });
+  am.accounts[0].quota.lastProbeErrorStatus = 429;
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
+  // NOT refreshDead, NOT disabled → a self-throttling probe is a real signal.
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /stale·rate-limited/, 'a live account keeps its actionable probe signal');
+});
+
 // ── Ask A: providers show Ses/Wk like the rest ────────────────────────────────
 
 test('a z.ai provider account renders real Ses/Wk bars from provider fields', () => {

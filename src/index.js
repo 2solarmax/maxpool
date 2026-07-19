@@ -6,7 +6,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed } from './event-log.js';
 import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
-import { createProxyServer } from './server.js';
+import { createProxyServer, REQUEST_IDLE_MAX_MS } from './server.js';
 import { Prober } from './prober.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint } from './oauth.js';
 import { TUI } from './tui.js';
@@ -27,6 +27,18 @@ const SERVER_RESTART_EXIT_CODE = 75;
 // worker rolled back — self-heal admission so we don't 503 forever. > the baton
 // readiness timeout (10s) + margin.
 const RELOAD_ROLLBACK_SELFHEAL_MS = Math.max(15_000, Number(process.env.MAXPOOL_RELOAD_SELFHEAL_MS) || 30_000);
+// Seamless-reload drain cap. On a seamless reload the NEW worker already serves
+// ALL new traffic while the OLD worker only finishes its own in-flight requests,
+// so a long old-worker drain has zero request-facing cost — let a long streaming
+// response complete instead of getting cut ("Connection closed mid-response").
+// Sized ABOVE the per-request idle reaper (REQUEST_IDLE_MAX_MS, imported from
+// server.js so both sizes share ONE source of truth) so an actively-progressing
+// stream is never cut mid-flight; the reaper bounds a truly-stuck request, and
+// this flat cap is only the last-resort ceiling. Quit/Ctrl-C keeps the short
+// drainTimeoutMs (the user wants to exit now). An explicit MAXPOOL_RELOAD_DRAIN_MS
+// override is honored down to a 60s floor (a shorter drain trades stream-
+// completeness for faster reloads); leave it unset to auto-track the reaper +60s.
+const RELOAD_DRAIN_MS = Math.max(60_000, Number(process.env.MAXPOOL_RELOAD_DRAIN_MS) || (REQUEST_IDLE_MAX_MS + 60_000));
 const SERVER_WORKER_ENV = 'MAXPOOL_SERVER_WORKER';
 // Set by the supervisor when it spawns a worker for a seamless reload: that
 // worker boots HEADLESS (plain logs, no writer lease) and waits for the baton.
@@ -325,7 +337,7 @@ async function supervisorCommand() {
         // sent PRIMARY during the baton; re-assert the master-accept close.
         monitorAsActive(newWorker);
         closeMasterAccept().catch(() => {});
-        reapOldWorker(oldWorker, config);
+        reapOldWorker(oldWorker);
         return;
       }
 
@@ -415,17 +427,20 @@ async function supervisorCommand() {
 
 // Drain + reap a released worker. The worker exits itself once its bounded
 // in-flight finishes; the supervisor SIGKILLs it if it outlives the drain cap.
-function reapOldWorker(worker, config) {
+function reapOldWorker(worker) {
   if (!worker) return;
-  const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
+  // +30s grace over the worker's own RELOAD_DRAIN_MS hardCap so its clean exit(0)
+  // (fired while its streaming socket keeps the loop alive) always wins the race —
+  // SIGKILL only ever reaps a genuinely wedged worker, never cuts a live stream.
+  const cap = RELOAD_DRAIN_MS + 30_000;
   let reaped = false;
   const finish = () => { if (reaped) return; reaped = true; clearTimeout(timer); };
   const timer = setTimeout(() => {
     if (reaped) return;
-    console.error(`[Maxpool] Old worker outlived ${Math.ceil(drainTimeoutMs / 1000)}s drain cap; SIGKILL.`);
+    console.error(`[Maxpool] Old worker outlived ${Math.ceil(cap / 1000)}s reload-drain cap; SIGKILL.`);
     try { worker.child.kill('SIGKILL'); } catch { /* ignore */ }
     finish();
-  }, drainTimeoutMs);
+  }, cap);
   timer.unref?.();
   worker.child.once('exit', finish);
 }
@@ -1108,17 +1123,28 @@ async function serverWorkerCommand() {
       setConsoleStdoutSuppressed(true);
       try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ }
 
-      // Drain bounded in-flight on EXISTING access tokens (no refresh needed),
-      // then exit(0). The supervisor SIGKILLs us if we outlive its drain cap.
+      // (macOS) releaseLease() above dropped the wake-lock, but we still stream our
+      // in-flight requests for up to RELOAD_DRAIN_MS. Re-arm the guard so an idle
+      // Mac can't Maintenance-Sleep mid-drain and cut a long overnight stream (the
+      // exact case the guard exists for). It re-checks getGlobalInFlight and
+      // releases on its own once we're idle; caffeinate -w <pid> dies with us
+      // regardless. Started AFTER the stdout muzzle so its log can't paint the new
+      // worker's screen. No-op off macOS / when disabled.
+      sleepGuard.start();
+
+      // Drain bounded in-flight on EXISTING access tokens (no refresh needed), then
+      // exit(0). Cap = RELOAD_DRAIN_MS (above the idle reaper) so a long streaming
+      // response finishes instead of being cut; the supervisor SIGKILLs us only if
+      // we outlive its (slightly longer) cap.
       const waitForDrain = () => {
         if (restartController.activeRequests.size === 0) { process.exit(0); return; }
       };
       const drainPoll = setInterval(waitForDrain, 200);
       drainPoll.unref?.();
       const hardCap = setTimeout(() => {
-        console.error(`[Maxpool] Released worker drain cap reached with ${restartController.activeRequests.size} active; exiting.`);
+        console.error(`[Maxpool] Released worker reload-drain cap reached with ${restartController.activeRequests.size} active; exiting.`);
         process.exit(0);
-      }, drainTimeoutMs);
+      }, RELOAD_DRAIN_MS);
       hardCap.unref?.();
       waitForDrain();
     };
