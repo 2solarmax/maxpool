@@ -1,0 +1,42 @@
+name: Publish
+
+# Trusted Publishing (npm OIDC) — NO stored token, nothing to expire, no 2FA bypass.
+# npm exchanges this workflow's short-lived GitHub OIDC identity for publish rights,
+# so the `id-token: write` permission below IS the credential.
+#
+# One-time npm-side setup (npmjs.com → the `maxpool` package → Settings →
+# Trusted Publishing → add a GitHub Actions publisher):
+#   Organization or user: 2solarmax
+#   Repository:           maxpool
+#   Workflow filename:    publish.yml
+#   Environment:          (leave blank)
+#
+# Trigger: a `vX.Y.Z` tag push (release.sh does this) OR a manual run
+# (workflow_dispatch → publishes the version currently in package.json on main).
+# Tests are NOT re-run here on purpose: release.sh runs the full suite locally
+# before it creates the tag, and ci.yml runs it again on the same push — a third
+# run here would only add a flaky-block between a green tag and its publish.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC identity for Trusted Publishing — the credential
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Node 22 ships npm 10.x; Trusted Publishing needs npm >= 11.5.1.
+      - name: Upgrade npm to a Trusted-Publishing-capable version
+        run: npm install -g npm@latest
+      - name: Publish to npm (OIDC — no token)
+        run: npm publish --provenance --access public
