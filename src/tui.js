@@ -1040,13 +1040,16 @@ export class TUI {
 
   _renderAcct(idx, bw, showBoth) {
     const a = this.am.accounts[idx];
-    // Highlight the currently-active account. In manual mode that's the
-    // preferred account; in automatic mode it's the one most recently routed
-    // to (currentIndex). Previously only manual mode highlighted anything, so
-    // in automatic load-balancing no row was ever marked current.
+    // Highlight the ACTIVE account(s) — drives BOTH the ► marker and the green
+    // "active" status color. In manual mode that's the single pinned account (all
+    // traffic goes there). In automatic load-balancing there is no single "current"
+    // account, so mark every account SERVING a request right now (inFlight > 0) —
+    // an honest live view of what's working. When idle, nothing is marked; a
+    // throttled/idle provider is never falsely flagged (the old "most recently
+    // routed to" currentIndex could land the marker on an idle fallback).
     const isCur = this.am.routingMode === 'preferred'
       ? a.name === this.am.preferredAccountName
-      : idx === this.am.currentIndex;
+      : a.inFlight > 0;
     const isSel = this.mode === 'select' && idx === this.selIdx;
 
     // Prefix: selection marker + current marker

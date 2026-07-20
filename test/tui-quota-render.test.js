@@ -123,6 +123,28 @@ test('a probe-only scoped cap still reads stale on a stale probe even when the u
   assert.match(line, /stale·rate-limited/, 'a displayed scoped cap is probe-only → still warn');
 });
 
+test('automatic mode marks accounts SERVING right now (inFlight>0) with ►, not the last-routed idle one', () => {
+  const am = oauthAM();
+  am.routingMode = 'automatic';
+  am.accounts[0].inFlight = 2;   // actively serving
+  am.accounts[1].inFlight = 0;   // idle
+  am.currentIndex = 1;           // "most recently routed to" is the IDLE account (the old misleading marker)
+  const tui = new TUI({ accountManager: am });
+  assert.match(strip(tui._renderAcct(0, 11, true)), /►/, 'a serving account (inFlight 2) is marked active');
+  assert.doesNotMatch(strip(tui._renderAcct(1, 11, true)), /►/, 'an idle account is NOT marked, even though it is currentIndex');
+});
+
+test('preferred (manual) mode still marks exactly the pinned account, regardless of inFlight', () => {
+  const am = oauthAM();
+  am.routingMode = 'preferred';
+  am.preferredAccountName = 'a1';
+  am.accounts[0].inFlight = 0;   // pinned but idle
+  am.accounts[1].inFlight = 5;   // busy but not pinned
+  const tui = new TUI({ accountManager: am });
+  assert.match(strip(tui._renderAcct(0, 11, true)), /►/, 'the pinned account is marked even while idle');
+  assert.doesNotMatch(strip(tui._renderAcct(1, 11, true)), /►/, 'a busy non-pinned account is NOT marked in manual mode');
+});
+
 test('a provider account stays probe-only — a stale probe still reads stale, header-freshness never applies', () => {
   const am = providerAM();
   am.quotaProbeIntervalMs = 60_000;
