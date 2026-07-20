@@ -985,7 +985,7 @@ export class TUI {
       // Glossary FOOTER (expands the abbreviations the header + inline labels can't
       // spell out). Below the rows so it never breaks the header↔column alignment.
       if (W >= 88) {
-        lines.push(' ' + dim('Ses 5h · Wk 7d · Now in-flight (weight) · 15m/1h served (avg · f fails)'));
+        lines.push(' ' + dim('Legend  Ses = 5h · Wk = 7d · Now = in-flight (weight) · 15m/1h = served (avg · f = fails)'));
       }
     }
 
@@ -1174,8 +1174,24 @@ export class TUI {
     // Only annotate probe-staleness for LIVE accounts, where a failing probe
     // (e.g. a 429) is a real, actionable signal.
     if (a?.refreshDead || a?.enabled === false) return '';
-    if (!this.am._quotaProbeStale?.(a)) return '';
-    const s = a?.quota?.lastProbeErrorStatus;
+    if (!this.am._quotaProbeStale?.(a)) return '';   // probe fresh (or off) → nothing to flag; interval>0 after this
+    // The background probe IS stale — but only flag it if something DISPLAYED is
+    // actually stale. An OAuth account's Ses/Wk bars come from unified5h/7d, which
+    // response headers refresh on every served request (updateQuota → lastHeaderQuotaAt);
+    // so a BUSY oauth account with a header-fresh reading and no probe-only scoped
+    // cap is NOT stale, even if its background probe is 429-throttled. Provider bars
+    // and per-model scoped caps ARE probe-only, so for those a stale probe genuinely
+    // means stale data → keep flagging.
+    const q = a.quota || {};
+    const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85; // mirrors _renderAcct's scoped-tag gate
+    const hasDisplayedScopedCap = Object.values(q.scopedWeekly || {}).some(
+      e => e && e.isActive !== false && e.utilization != null && e.utilization >= reserveFloor);
+    if (a.type !== 'provider' && !hasDisplayedScopedCap) {
+      const interval = this.am.quotaProbeIntervalMs; // > 0 here (else _quotaProbeStale returned false)
+      const headerFresh = q.lastHeaderQuotaAt && (Date.now() - q.lastHeaderQuotaAt) <= Math.max(3 * interval, 180_000);
+      if (headerFresh) return '';
+    }
+    const s = q.lastProbeErrorStatus;
     if (s === 429) return `  ${yellow('stale·rate-limited')}`;
     if (s) return `  ${yellow('stale·probe ' + s)}`;
     return `  ${dim('stale')}`;

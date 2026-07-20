@@ -94,9 +94,44 @@ test('a LIVE account still surfaces a real failing-probe signal (not over-suppre
   am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.11, severity: 'normal', isActive: true, resetAt: Date.now() + 3 * DAY } } });
   am.accounts[0].quota.lastProbeErrorStatus = 429;
   am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
-  // NOT refreshDead, NOT disabled → a self-throttling probe is a real signal.
+  // NOT refreshDead, NOT disabled, no live response-header traffic → a self-throttling
+  // probe is a real signal (this is the idle / no-recent-header case).
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
   assert.match(line, /stale·rate-limited/, 'a live account keeps its actionable probe signal');
+});
+
+test('a busy OAuth account (bars fresh from response headers) is NOT flagged stale when only its background probe is 429-throttled', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.accounts[0].quota.unified5h = 0.44;
+  am.accounts[0].quota.unified7d = 0.10;
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;  // background probe stale
+  am.accounts[0].quota.lastProbeErrorStatus = 429;
+  am.accounts[0].quota.lastHeaderQuotaAt = Date.now();           // live traffic just refreshed the bars
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.doesNotMatch(line, /stale/, 'header-fresh bars + no probe-only scoped cap → no misleading stale marker');
+});
+
+test('a probe-only scoped cap still reads stale on a stale probe even when the unified bars are header-fresh', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.90, severity: 'critical', isActive: true, resetAt: Date.now() + 3 * DAY } } });
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;  // the shown Fable 90% is now unconfirmed
+  am.accounts[0].quota.lastProbeErrorStatus = 429;
+  am.accounts[0].quota.lastHeaderQuotaAt = Date.now();           // unified bars fresh, but Fable% is probe-ONLY
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /stale·rate-limited/, 'a displayed scoped cap is probe-only → still warn');
+});
+
+test('a provider account stays probe-only — a stale probe still reads stale, header-freshness never applies', () => {
+  const am = providerAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.applyProviderUsage(1, { source: 'zai', ses: { utilization: 0.42, resetAt: Date.now() + 3600_000 }, wk: { utilization: 0.61, resetAt: Date.now() + 3 * DAY } });
+  am.accounts[1].quota.lastProbeOkAt = Date.now() - 5 * 60_000;  // provider probe stale
+  am.accounts[1].quota.lastProbeErrorStatus = 429;
+  am.accounts[1].quota.lastHeaderQuotaAt = Date.now();           // must be IGNORED for a provider (bars are probe-only)
+  const line = strip(new TUI({ accountManager: am })._renderAcct(1, 11, true));
+  assert.match(line, /stale·rate-limited/, 'provider bars are probe-only → header stamp must not suppress');
 });
 
 // ── Ask A: providers show Ses/Wk like the rest ────────────────────────────────
@@ -283,10 +318,16 @@ test('the abbreviation glossary is a FOOTER below the rows, never between the he
   const flat = strip(out);
   const iHeader = flat.indexOf('Account');
   const iRow = flat.indexOf('a1');          // first account row
-  const iGlossary = flat.indexOf('Ses 5h'); // the DISTINCTIVE glossary substring (not bare 'Ses', a row bar label)
-  assert.ok(iHeader >= 0 && iRow >= 0 && iGlossary >= 0, 'header, a row, and the glossary all render');
+  const iGlossary = flat.indexOf('Legend'); // the DISTINCTIVE legend label (not a bare row bar label)
+  assert.ok(iHeader >= 0 && iRow >= 0 && iGlossary >= 0, 'header, a row, and the legend all render');
   assert.ok(iHeader < iRow, 'header sits above the rows');
-  assert.ok(iRow < iGlossary, 'the glossary is a FOOTER below the rows — never between header and data');
+  assert.ok(iRow < iGlossary, 'the legend is a FOOTER below the rows — never between header and data');
+  // Explicitly labeled + spells out each abbreviation, so it doesn't read as an orphan sentence.
+  const legend = flat.slice(iGlossary);
+  assert.match(legend, /Ses = 5h/);
+  assert.match(legend, /Wk = 7d/);
+  assert.match(legend, /Now = in-flight \(weight\)/);
+  assert.match(legend, /15m\/1h = served \(avg · f = fails\)/);
 });
 
 test('an extreme-narrow header clips WITHOUT bleeding the underline into later lines', () => {

@@ -62,6 +62,11 @@ function emptyQuota() {
     lastProbeError: null,       // string
     lastProbeErrorAt: null,     // ms
     lastProbeErrorStatus: null, // http status (429, 500, …) or null
+    // Last time the DISPLAYED bars (unified5h/7d for OAuth, tokens/requests for
+    // API-key) were refreshed from a RESPONSE HEADER (updateQuota). Lets the TUI
+    // staleness marker tell "probe stale but bars fresh from live traffic" (a busy
+    // account — NOT stale) from "genuinely nothing refreshed it" (idle — stale).
+    lastHeaderQuotaAt: null,    // ms
   };
 }
 
@@ -2117,6 +2122,15 @@ export class AccountManager {
     if (genericLimit != null) account.quota.genericLimit = genericLimit;
     if (genericRemaining != null) account.quota.genericRemaining = genericRemaining;
     if (genericReset != null) account.quota.genericReset = genericReset;
+
+    // Stamp header-freshness ONLY when a real quota header actually arrived — so a
+    // header-less response never falsely marks the bars fresh. Drives the TUI's
+    // "busy account isn't stale even if its background probe is 429-throttled".
+    const gotQuotaHeader = !isNaN(u5h) || !isNaN(u7d)
+      || !isNaN(tokensLimit) || !isNaN(tokensRemaining)
+      || !isNaN(requestsLimit) || !isNaN(requestsRemaining)
+      || genericLimit != null || genericRemaining != null;
+    if (gotQuotaHeader) account.quota.lastHeaderQuotaAt = Date.now();
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
