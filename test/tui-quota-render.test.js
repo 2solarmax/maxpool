@@ -145,6 +145,52 @@ test('preferred (manual) mode still marks exactly the pinned account, regardless
   assert.doesNotMatch(strip(tui._renderAcct(1, 11, true)), /►/, 'a busy non-pinned account is NOT marked in manual mode');
 });
 
+test('a provider-routed request is tagged with its session id in the event-log line', () => {
+  const am = oauthAM();
+  am.accounts.push({ name: 'glm-fallback', type: 'provider', quota: {}, inFlight: 0 });
+  const tui = new TUI({ accountManager: am });
+  const logged = [];
+  tui._addLog = (m) => logged.push(m);   // capture; avoids the on-disk appendEventLog
+  tui.onRequestStart(1, { method: 'POST', path: '/v1/messages', sessionKey: '2e30989e-aaaa-bbbb-cccc-ddddeeeeffff' });
+  tui.onRequestEnd(1, { account: 'glm-fallback', status: 200 });
+  assert.match(logged[0], /→ glm-fallback \(200, .+s\) {2}\[sess 2e30989e\]/, 'provider request tagged with the 8-char session id');
+});
+
+test('a header-less provider request does NOT emit an empty [sess ] tag (truthiness guard)', () => {
+  const am = oauthAM();
+  am.accounts.push({ name: 'glm-fallback', type: 'provider', quota: {}, inFlight: 0 });
+  const tui = new TUI({ accountManager: am });
+  const logged = [];
+  tui._addLog = (m) => logged.push(m);
+  tui.onRequestStart(2, { method: 'POST', path: '/v1/messages', sessionKey: '' }); // server.js headerValue → '' for a missing header (the real production value)
+  tui.onRequestEnd(2, { account: 'glm-fallback', status: 200 });
+  assert.doesNotMatch(logged[0], /\[sess/, 'no empty session tag when the header is absent (empty-string sessionKey)');
+});
+
+test('an OAuth-routed request is NOT tagged (only provider requests carry the session id)', () => {
+  const am = oauthAM();
+  const tui = new TUI({ accountManager: am });
+  const logged = [];
+  tui._addLog = (m) => logged.push(m);
+  tui.onRequestStart(3, { method: 'POST', path: '/v1/messages', sessionKey: 'abcd1234-aaaa-bbbb-cccc-ddddeeeeffff' });
+  tui.onRequestEnd(3, { account: 'a1', status: 200 });
+  assert.doesNotMatch(logged[0], /\[sess/, 'OAuth line unchanged — no session tag');
+});
+
+test('routing header surfaces provider overflow volume when GLM/Kimi took traffic in the last 15m', () => {
+  const am = oauthAM();
+  const now = Date.now();
+  am.accounts.push({ name: 'glm-fallback', type: 'provider', quota: {}, inFlight: 0, loadEvents: [
+    { at: now - 60_000, durationMs: 5000, weight: 1, success: true, status: 200 },
+    { at: now - 120_000, durationMs: 8000, weight: 1, success: true, status: 200 },
+  ] });
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } } });
+  let out = ''; const ow = process.stdout.write; const oc = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  try { Object.defineProperty(process.stdout, 'columns', { value: 120, configurable: true }); process.stdout.write = s => { out += s; return true; }; tui._render(); }
+  finally { process.stdout.write = ow; if (oc) Object.defineProperty(process.stdout, 'columns', oc); }
+  assert.match(strip(out), /providers: 2 req\/15m/, 'the routing header shows the 15m provider request volume');
+});
+
 test('a provider account stays probe-only — a stale probe still reads stale, header-freshness never applies', () => {
   const am = providerAM();
   am.quotaProbeIntervalMs = 60_000;

@@ -318,7 +318,14 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)`);
+    // Tag PROVIDER-routed requests with the maxpool session id so provider traffic
+    // (when-exhausted overflow, or an incompatible-session pin) is traceable back to
+    // the session that caused it: grep the event log for `→ glm-fallback … [sess X]`,
+    // then `ps eww -p <pid> | grep x-maxpool-session` to find the terminal. Truthiness
+    // guard — a header-less request has sessionKey '' (server.js headerValue) → no tag.
+    const isProvider = this.am.accounts.find(a => a.name === acct)?.type === 'provider';
+    const tag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
+    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tag}`);
   }
 
   _addLog(msg) {
@@ -946,6 +953,15 @@ export class TUI {
       const p = this.am._crossProviderFallbackPolicy?.() || 'when-exhausted';
       const pc = p === 'never' ? yellow(p) : p === 'always' ? green(p) : cyan(p);
       xpText = `  ${dim('·')}  ${dim('Cross-provider:')} ${pc}`;
+      // Overflow visibility: when GLM/Kimi actually served requests recently, surface the
+      // volume so provider traffic isn't a mystery — it's overflow that spilled here while
+      // OAuth was saturated. Reuses the SAME 15m load window as the per-row "15m Nr" column.
+      const now = Date.now();
+      let provReq = 0;
+      for (const a of this.am.accounts) {
+        if (a.type === 'provider') provReq += this.am._loadSummary?.(a, 15 * 60_000, now)?.requests || 0;
+      }
+      if (provReq > 0) xpText += `  ${dim('·')}  ${yellow(`providers: ${provReq} req/15m`)}`;
     }
     lines.push(` Routing  ${cyan(routing)}${xpText}`);
     const queuedCount = this.am.queueState?.waiting?.length || 0;
