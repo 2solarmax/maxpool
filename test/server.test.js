@@ -1597,7 +1597,7 @@ test('Kimi 429 body wait hint controls provider cooldown when retry-after is mis
   }
 });
 
-test('provider 403 disables fallback and is not counted as success', async () => {
+test('provider 403 → RECOVERABLE cooldown (not a permanent disable), fails over, un-benches after cooldown', async () => {
   const kimiUpstream = http.createServer((_req, res) => {
     res.writeHead(403, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
@@ -1633,11 +1633,17 @@ test('provider 403 disables fallback and is not counted as success', async () =>
     assert.equal(body.error.type, 'provider_auth_error');
 
     const account = am.accounts.find(a => a.name === 'kimi-fallback');
-    assert.equal(account.status, 'error');
-    assert.equal(account.lastError, 'forbidden');
-    assert.equal(account.completedRequests, 0);
-    assert.equal(account.failedRequests, 1);
+    // A 403 is quota/plan exhaustion, not a bad key → a RECOVERABLE cooldown, never a
+    // permanent 'error' disable that would strand the provider until a restart.
+    assert.equal(account.status, 'throttled');
+    assert.ok(account.rateLimitedUntil > Date.now(), 'cooled down with a recovery timer');
     assert.equal(account.lastStatus, 403);
+    assert.equal(account.completedRequests, 0, 'not counted as a success');
+    assert.equal(account.failedRequests, 0, 'neutral release — a transient quota-403 does not poison scoring');
+    // Auto-recovery: once the cooldown elapses, the provider is available again with NO restart.
+    account.rateLimitedUntil = Date.now() - 1;
+    assert.equal(am._isAvailable(account), true, 'un-benches itself after the cooldown expires');
+    assert.equal(account.status, 'active');
   } finally {
     await close(proxy);
     await close(kimiUpstream);

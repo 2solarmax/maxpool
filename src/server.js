@@ -25,6 +25,11 @@ const UPSTREAM_TTFB_MS = Math.max(5_000, Number(process.env.MAXPOOL_TTFB_MS) || 
 const STREAM_IDLE_MS = Math.max(30_000, Number(process.env.MAXPOOL_STREAM_IDLE_MS) || 300_000);  // max gap BETWEEN streamed chunks (reset per chunk)
 const UPSTREAM_BODY_MS = Math.max(30_000, Number(process.env.MAXPOOL_BODY_MS) || 300_000);       // non-streaming body read
 const CLIENT_DRAIN_MS = Math.max(5_000, Number(process.env.MAXPOOL_DRAIN_MS) || 60_000);         // max wait for a backpressured client to drain (half-open client → free the lease)
+// A provider 403 is (unlike a 401) almost always transient QUOTA/PLAN exhaustion — cool
+// the provider down RECOVERABLY for this window, then re-probe, instead of permanently
+// disabling it. Short (not reset-length) so a provider-pinned session's hold window
+// isn't blown, and a still-exhausted provider just re-benches on the next single retry.
+const PROVIDER_FORBIDDEN_COOLDOWN_SEC = Math.max(60, Number(process.env.MAXPOOL_PROVIDER_403_COOLDOWN_SEC) || 1800);
 // Backstop reaper idle ceiling. Floored WELL above the longest a legit NON-streaming
 // request can go silent (no heartbeat there): TTFB 120s + nonStreamMaxWaitMs 300s +
 // UPSTREAM_BODY_MS 300s ≈ 720s — so a slow-but-alive non-streaming request is never
@@ -659,16 +664,27 @@ async function forwardRequest(
 
     if (account.type === 'provider' && isProviderAuthStatus(upstreamRes.status)) {
       const errorBody = await readErrorBody(upstreamRes);
-      const reason = upstreamRes.status === 401 ? 'auth_failed' : 'forbidden';
-      accountManager.markAuthFailed(account.index, upstreamRes.status, reason);
-      accountManager.releaseAccount(lease, { status: upstreamRes.status, error: reason });
+      const forbidden = upstreamRes.status === 403;
+      if (forbidden) {
+        // 403 = almost always QUOTA/PLAN exhaustion (e.g. Kimi Coding-Plan weekly maxed),
+        // NOT bad credentials — the usage probe still succeeds with the same key. Cool it
+        // down RECOVERABLY (rides the rate-limit recovery in _isAvailable → auto-un-benches
+        // at expiry) instead of the permanent auth-disable that stranded it until restart.
+        // `neutral` release so a transient quota-403 doesn't bump failure/scoring counters.
+        accountManager.markRateLimited(account.index, PROVIDER_FORBIDDEN_COOLDOWN_SEC, { status: 403, recordFailure: false });
+        accountManager.releaseAccount(lease, { neutral: true });
+      } else {
+        // 401 = genuinely bad/missing credentials → permanent disable (needs re-auth).
+        accountManager.markAuthFailed(account.index, upstreamRes.status, 'auth_failed');
+        accountManager.releaseAccount(lease, { status: upstreamRes.status, error: 'auth_failed' });
+      }
       excludedIndexes.add(account.index);
 
       if (logDir) {
-        logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" disabled (${reason}), failing over ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" ${forbidden ? `cooled down ${PROVIDER_FORBIDDEN_COOLDOWN_SEC}s (quota/forbidden)` : 'disabled (auth)'}, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
         if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
       }
-      console.log(`[Maxpool] ${upstreamRes.status} on provider "${account.name}" — disabled and failing over before first byte`);
+      console.log(`[Maxpool] ${upstreamRes.status} on provider "${account.name}" — ${forbidden ? `cooled down ${PROVIDER_FORBIDDEN_COOLDOWN_SEC}s (recoverable)` : 'disabled'} and failing over before first byte`);
 
       if (
         canRetryBufferedBody &&
