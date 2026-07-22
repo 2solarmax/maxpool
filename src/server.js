@@ -84,6 +84,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   const server = http.createServer(async (req, res) => {
     try {
+      // Disable Nagle on the client socket: flush each SSE event immediately instead
+      // of coalescing small writes into bursts. Smooths streaming cadence toward the
+      // HTTP/2-direct shape, reducing how often a client terminal's re-render churns
+      // on long streams. Same underlying socket as res, so this covers the write path.
+      try { req.socket?.setNoDelay(true); } catch { /* socket may already be gone */ }
       try { res.setHeader('x-maxpool-worker', workerStamp); } catch { /* headers sent */ }
       if (draining) {
         try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
