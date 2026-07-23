@@ -111,3 +111,31 @@ test('U1 the running version is shown in the header', () => {
   const { text } = captureRender(tui);
   assert.ok(text.includes('Maxpool v1.5.39'), 'header shows the running version');
 });
+
+// ── Restart feedback: R→Yes must not look frozen while requests drain ─────────────
+
+test('restart feedback: a paused-for-restart admission shows a live draining banner', () => {
+  const am = mgr();
+  const tui = tuiFor(am);
+  am.admissionPaused = true;                       // what requestRestart() sets
+  tui.active.set('r1', { sessionKey: 's', account: 'personal', started: Date.now(), t: '00:00:00', method: 'POST', path: '/v1/messages' });
+  const { text } = captureRender(tui);
+  assert.ok(text.includes('Restarting'), 'the screen is no longer a frozen dashboard — it says Restarting');
+  assert.match(text, /draining 1 active request\b/, 'shows the live drain count so the user knows it is working');
+});
+
+test('restart feedback: with nothing in flight the banner shows "finishing up"', () => {
+  const am = mgr();
+  const tui = tuiFor(am);
+  am.admissionPaused = true;
+  const { text } = captureRender(tui);
+  assert.ok(text.includes('Restarting'), 'still shows a restarting indicator with 0 in-flight');
+  assert.ok(text.includes('finishing up'), 'no misleading "draining 0" — reads "finishing up"');
+});
+
+test('restart feedback: NO restarting banner during normal operation', () => {
+  const am = mgr();
+  const tui = tuiFor(am);
+  const { text } = captureRender(tui);
+  assert.ok(!text.includes('Restarting'), 'no restart banner when admission is not paused');
+});

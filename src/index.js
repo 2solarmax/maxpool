@@ -1111,7 +1111,6 @@ async function serverWorkerCommand() {
       if (reloadWatchdog) { clearTimeout(reloadWatchdog); reloadWatchdog = null; }
       if (syncTimer) clearInterval(syncTimer);
       if (updateTimer) clearInterval(updateTimer);
-    if (updateTimer) clearInterval(updateTimer);
       // Stop accepting NEW connections; KEEP in-flight requests alive.
       server.maxpoolBeginDrain?.();
       server.close(() => {});

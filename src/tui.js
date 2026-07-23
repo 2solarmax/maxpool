@@ -975,6 +975,18 @@ export class TUI {
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
+    // Restart/reload in progress: admission is paused while active requests drain, then
+    // the process swaps. Without live feedback the screen looks FROZEN (identical
+    // dashboard, nothing moving) from R→Yes until the swap — the reported bug. Show an
+    // animated draining indicator. It clears when the swap completes (fresh worker
+    // renders) or a rollback resumes admission (admissionPaused → false).
+    if (this.am.admissionPaused) {
+      const inflight = this.active.size;
+      const detail = inflight > 0
+        ? `draining ${inflight} active request${inflight === 1 ? '' : 's'}…`
+        : 'finishing up…';
+      lines.push(` ${cyan(SPINNER[this.frame])} ${yellow('Restarting')}  ${dim(detail)}`);
+    }
     // Update reminder: a prominent, actionable banner when a newer npm version is
     // published — nothing when on latest or the check hasn't resolved (no permanent
     // blank line). The persistent banner IS the reminder; a long-lived session's
