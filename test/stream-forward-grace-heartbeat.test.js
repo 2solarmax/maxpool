@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { __serverTest } from '../src/server.js';
 
-const { ensureQueueHeartbeat, clearQueueHeartbeat } = __serverTest;
+const { ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat } = __serverTest;
 
 // W1 — proactive streaming keep-alive during the forward window. The grace timer in
 // forwardRequest calls ensureQueueHeartbeat from an ASYNC context (no synchronous
@@ -87,4 +87,38 @@ test('W1 no-op on a second call while already active (no duplicate heartbeat)', 
   ensureQueueHeartbeat(res, requestInfo, { heartbeatMs: 10_000 }, { removeQueuedRequest() {} });
   assert.equal(requestInfo.queueHeartbeatTimer, firstTimer, 'the second call is a no-op (same timer)');
   clearQueueHeartbeat(requestInfo);
+});
+
+// ── the grace-timer callback logic itself (the W1 feature, extracted for testing) ──
+
+test('W1 grace callback: a live streaming socket → commits the SSE stream + heartbeat', () => {
+  const res = liveRes();
+  const requestInfo = { stream: true };
+  commitStreamGraceHeartbeat(res, requestInfo, { heartbeatMs: 10_000 }, { removeQueuedRequest() {} });
+  assert.equal(res._status, 200, 'a slow upstream past the grace commits the stream');
+  assert.equal(requestInfo.queueHeartbeatActive, true);
+  assert.ok(res.writes[0].includes(': maxpool queued'));
+  clearQueueHeartbeat(requestInfo);
+});
+
+test('W1 grace callback: a client that vanished mid-window → reaps the slot, never touches the dead socket', () => {
+  const res = liveRes();
+  res.destroyed = true;                 // the async-race the pre-mortem flagged
+  res.writeHead = () => { throw new Error('must not be called on a destroyed socket'); };
+  const requestInfo = { stream: true };
+  let reaped = 0;
+  assert.doesNotThrow(
+    () => commitStreamGraceHeartbeat(res, requestInfo, { heartbeatMs: 10_000 }, { removeQueuedRequest: () => { reaped++; } }),
+    'the callback must guard destroyed BEFORE any write — this is the worker-bounce race',
+  );
+  assert.ok(!requestInfo.queueHeartbeatActive, 'no commit on a dead socket');
+  assert.equal(reaped, 1, 'reaps the queue slot instead');
+});
+
+test('W1 grace callback: an already-committed stream → no double-commit, reaps stale slot', () => {
+  const res = liveRes();
+  res.headersSent = true;               // a re-forward after an earlier commit
+  const requestInfo = { stream: true };
+  commitStreamGraceHeartbeat(res, requestInfo, { heartbeatMs: 10_000 }, { removeQueuedRequest() {} });
+  assert.equal(res.writes.length, 0, 'must not write again once headers are committed');
 });

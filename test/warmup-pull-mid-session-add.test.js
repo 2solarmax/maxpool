@@ -146,6 +146,25 @@ test('W4 an IDLE bound account (no recent load) is not warmup-pulled (no needles
   assert.equal(lease.account.name, 'a1', 'an idle bound session is left alone (nothing to relieve)');
 });
 
+// ── the intentional precedence: warmup-pull is checked before the bound-leave gates ─
+
+test('W4 warmup-pull takes precedence over a higher-priority available account (bounded window)', () => {
+  // A negative-priority account normally pulls a bound session (higher priority). The
+  // warmup-pull is checked FIRST in _selectNext's bound block, so for the bounded
+  // onboarding window the fresh account still wins. (An EXPLICIT manual preference —
+  // routingMode 'preferred' — is resolved earlier and is NOT overridden.)
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    { name: 'vip', type: 'oauth', priority: -1, accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  makeCarrier(am, 0);
+  makeCarrier(am, 1);
+  addFresh(am, 'fresh');
+  am._bindSession('sessV', am.accounts[0], 'claude-sonnet-5');
+  const lease = am.acquireAccount(req({ sessionKey: 'sessV' }));
+  assert.equal(lease.account.name, 'fresh', 'warmup-pull wins over a higher-priority account for the bounded window');
+});
+
 // ── Invariant 5: existing hot-rebalance is unchanged when no warming account exists ─
 
 test('W4.5 with NO warming account, an idle near-cap bound session still hot-rebalances (unchanged)', () => {

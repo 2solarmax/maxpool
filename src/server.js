@@ -519,19 +519,10 @@ async function forwardRequest(
   if (requestInfo.stream && !res.headersSent) {
     requestInfo.streamGraceDeadline ??= Date.now() + streamForwardGraceMs;
     const graceDelay = Math.max(0, requestInfo.streamGraceDeadline - Date.now());
-    streamGraceTimer = setTimeout(() => {
-      // Client-abort-safe: an async timer has no synchronous liveness precondition,
-      // so NEVER touch a dead/committed socket here. If the client vanished during
-      // the forward window (or the stream is already committed), reap the queue slot
-      // and bail — do not commit (ensureQueueHeartbeat is itself hardened, but this
-      // is the cheaper first line of defense against the worker-bounce race).
-      if (res.destroyed || res.writableEnded || res.headersSent) {
-        clearQueueHeartbeat(requestInfo);
-        accountManager.removeQueuedRequest?.(requestInfo);
-        return;
-      }
-      ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
-    }, graceDelay);
+    streamGraceTimer = setTimeout(
+      () => commitStreamGraceHeartbeat(res, requestInfo, queueConfig, accountManager),
+      graceDelay,
+    );
     streamGraceTimer.unref?.();
   }
   try {
@@ -1198,7 +1189,7 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, streamResponse, startIdleRequestReaper };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, streamResponse, startIdleRequestReaper };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1550,6 +1541,23 @@ async function queueAndRetry(
     req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
     retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set(),
   ).then(() => true);
+}
+
+// The stream-forward grace-timer callback (extracted so its logic is unit-testable
+// in isolation). Fires when a STREAMING request's upstream is slow to first byte:
+// commits the SSE stream + heartbeat so the client never idle-times-out. Client-
+// abort-safe — an async timer has NO synchronous liveness precondition (unlike the
+// queue caller), so if the client vanished during the forward window (or the stream
+// is already committed) it reaps the queue slot and bails WITHOUT touching the dead
+// socket. ensureQueueHeartbeat is itself hardened against a throwing write, but this
+// guard is the cheaper first line of defense against the worker-bounce race.
+function commitStreamGraceHeartbeat(res, requestInfo, queueConfig, accountManager) {
+  if (res.destroyed || res.writableEnded || res.headersSent) {
+    clearQueueHeartbeat(requestInfo);
+    accountManager.removeQueuedRequest?.(requestInfo);
+    return;
+  }
+  ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
 }
 
 function ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager) {

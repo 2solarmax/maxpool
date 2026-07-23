@@ -1167,6 +1167,10 @@ export class AccountManager {
    *  actually carrying recent load — relieving a real carrier onto the fresh account,
    *  never churning fresh↔fresh or re-homing an idle session. */
   _warmupPullTarget(bound, profile, excludedIndexes, requestInfo, now = Date.now()) {
+    // Cheapest early-out first: the overwhelmingly common steady state has NO warming
+    // account, so bail before the migration-safety / load / fleet-scoring work. This
+    // runs on every bound request's selection — keep the no-warming path near-free.
+    if (!this.accounts.some(a => this._isWarming(a, now))) return null;
     if (!this._migrationSafeForRequest(requestInfo)) return null;
     if (requestInfo.queueTicket || requestInfo.queueAdmitted) return null;
     if (this._isWarming(bound, now)) return null;
