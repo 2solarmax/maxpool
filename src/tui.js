@@ -26,13 +26,26 @@ const vw = s => strip(s).length;
 
 // ── Accounts-table columns ───────────────────────────────────
 // Fixed column widths shared by the header row (acctHeader) AND every data row, so
-// the header labels stay aligned with the columns they name. The Account/Type/
-// Status/Quota start offsets (4/17/26/40) are pure functions of these widths + the
+// the header labels stay aligned with the columns they name. The Account/Provider/
+// Status/Quota start offsets (4/17/27/41) are pure functions of these widths + the
 // 4-col row prefix, independent of the quota-bar width.
 const NAME_W = 12;         // a.name.slice(0, NAME_W).padEnd(NAME_W)
-const TYPE_W = 8;          // a.type.padEnd(TYPE_W) — fits "provider"
+const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
+
+// Human provider name for the accounts-table "Provider" column. account.provider
+// is 'anthropic' for oauth/apikey accounts (they ARE Anthropic — the oauth-vs-key
+// billing split is still shown by the Ses/Wk vs Tok/Req quota-bar labels, not here),
+// and 'zai'/'kimi' for the GLM/Kimi fallback providers. Explicit map + a graceful
+// Titlecase default so a future provider (Codex/Grok) renders sanely; truncated to
+// the column width so a long name can never misalign the row.
+const PROVIDER_LABELS = { anthropic: 'Anthropic', zai: 'z.ai', kimi: 'Moonshot', openai: 'OpenAI', codex: 'Codex', grok: 'Grok', xai: 'Grok' };
+function providerLabel(a) {
+  const key = a.provider || (a.type === 'provider' ? 'provider' : 'anthropic');
+  const label = PROVIDER_LABELS[key] || (key.charAt(0).toUpperCase() + key.slice(1));
+  return label.slice(0, PROVIDER_W);
+}
 
 /**
  * Aligned column header for the accounts table. Names the three columns that carry
@@ -45,7 +58,7 @@ function acctHeader(W) {
   const quota = W >= 88 ? 'Quota (used% · resets-in)' : 'Quota';
   return ROW_PREFIX
     + 'Account'.padEnd(NAME_W) + ' '
-    + 'Type'.padEnd(TYPE_W) + ' '
+    + 'Provider'.padEnd(PROVIDER_W) + ' '
     + 'Status'.padEnd(STATUS_W) + ' '
     + quota;
 }
@@ -221,7 +234,7 @@ function emptyBar(label, w = 10) {
   return `${ESC}100m${' '.repeat(lp)}${text}${' '.repeat(rp)}${RESET}`;
 }
 
-export const __tuiTest = { formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine };
+export const __tuiTest = { formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -554,9 +567,25 @@ export class TUI {
     this.selIdx = selectable.includes(this.am.currentIndex) ? this.am.currentIndex : selectable[0];
   }
 
+  // Real am.accounts indices in DISPLAY order: non-provider (Claude/OAuth/apikey)
+  // accounts first, providers (GLM/Kimi fallback) last, stable within each group.
+  // The single source of truth for row order — the render loop AND selection nav
+  // both iterate it, so the highlight can never desync from the visible list. The
+  // canonical am.accounts array order is never mutated (routing/index actions safe).
+  _displayOrder() {
+    const nonProv = [];
+    const prov = [];
+    this.am.accounts.forEach((a, i) => (a.type === 'provider' ? prov : nonProv).push(i));
+    return [...nonProv, ...prov];
+  }
+
   _selectableIndexes(action) {
-    return this.am.accounts
-      .map((account, index) => ({ account, index }))
+    // Map over _displayOrder() BEFORE filtering so the nav array is in DISPLAY order
+    // with the existing selectability filter intact — _keySelect steps this array, so
+    // visual order == nav order automatically and it can never land on a provider
+    // (prefer) or a non-configurable runtime account.
+    return this._displayOrder()
+      .map(index => ({ account: this.am.accounts[index], index }))
       .filter(({ account }) => {
         if (action === 'prefer') return account.type !== 'provider' && account.enabled;
         return this._configAccountIndex(account) >= 0;
@@ -991,11 +1020,17 @@ export class TUI {
       // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
       const showBoth = W >= 70;
+      // 57/46 = the fixed pre-bar column span (prefix + Account + Provider + Status +
+      // gaps); grew by 1 with the Provider column (was 56/45 under the 8-wide Type col).
       const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
+        ? Math.max(5, Math.min(20, Math.floor((W - 57) / 2)))
+        : Math.max(5, Math.min(20, W - 46));
 
-      for (let i = 0; i < this.am.accounts.length; i++) {
+      // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
+      // display order over the canonical am.accounts array (which stays untouched so
+      // routing/index-keyed actions are unaffected). Selection navigation shares the
+      // SAME order via _selectableIndexes → _displayOrder.
+      for (const i of this._displayOrder()) {
         lines.push(this._renderAcct(i, bw, showBoth));
       }
       // Glossary FOOTER (expands the abbreviations the header + inline labels can't
@@ -1076,10 +1111,11 @@ export class TUI {
     const rawName = a.name.slice(0, NAME_W).padEnd(NAME_W);
     const name = isSel ? bold(rawName) : rawName;
 
-    // Type — pad to 8 so "provider" (8 chars) doesn't overflow a 7-wide column and
-    // shift the whole provider row (incl. its quota bars) 1 char out of alignment
-    // with the "oauth"/"apikey" rows.
-    const type = gray(a.type.padEnd(TYPE_W));
+    // Provider column — the real vendor (Anthropic / z.ai / Moonshot), padded to
+    // PROVIDER_W so "Anthropic" (9 chars) never overflows and shifts the row (incl.
+    // its quota bars) out of alignment with the shorter provider labels. This single
+    // cell is reused by both the oauth/apikey row below and _renderProviderAcct.
+    const type = gray(providerLabel(a).padEnd(PROVIDER_W));
 
     // Status
     let status;

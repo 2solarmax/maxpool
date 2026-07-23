@@ -56,6 +56,17 @@ const DEFAULT_QUEUE = {
   // Non-streaming requests have no SSE heartbeat to keep them alive, so a long
   // hold would die on the client timeout anyway. Cap their wait conservatively.
   nonStreamMaxWaitMs: 5 * 60 * 1000,
+  // Proactive streaming keep-alive: a STREAMING request gets ZERO client bytes
+  // while maxpool selects a route, cycles failover, and waits for the upstream's
+  // first byte (up to UPSTREAM_TTFB_MS=120s) — the queue heartbeat only starts
+  // once a request is QUEUED. If that client-silent window exceeds the client's
+  // own idle timeout (Claude Code aborts "Stream idle timeout - no chunks
+  // received", observed as low as ~23s), the client gives up on a request maxpool
+  // is still patiently serving. If the upstream hasn't delivered bytes within this
+  // grace, commit the SSE stream + start the heartbeat so the client never idles
+  // out. Kept above a normal fast TTFB (1-5s → common case never early-commits,
+  // behavior unchanged) and well below the client idle floor. Env-overridable.
+  streamForwardGraceMs: Math.max(1000, Number(process.env.MAXPOOL_STREAM_FORWARD_GRACE_MS) || 10000),
   // count_tokens is cheap non-streaming metadata — cap its queue wait VERY low so it
   // fast-fails with a retryable 429 instead of hanging silently past the client's idle
   // window. Kept well under any plausible client idle timeout (observed errors as low
@@ -492,6 +503,37 @@ async function forwardRequest(
     UPSTREAM_TTFB_MS,
   );
   ttfbTimer.unref?.();
+  // Proactive streaming keep-alive. UPSTREAM_TTFB_MS (120s) is FAR above the
+  // client's own idle timeout (~23-60s), and the queue heartbeat only starts once
+  // a request is QUEUED — so a streaming request whose selected upstream is slow to
+  // first byte, or that burns the client's timeout cycling failover, sends the
+  // client ZERO bytes and is aborted ("Stream idle timeout - no chunks received")
+  // on a request maxpool is still serving. If bytes haven't arrived within the
+  // grace, commit the SSE stream + heartbeat so the client stays alive. The
+  // deadline is anchored ONCE per request (??=) so it also bounds CUMULATIVE
+  // failover time across re-forwards, not each attempt independently.
+  const streamForwardGraceMs = queueConfig?.streamForwardGraceMs == null
+    ? 10000
+    : Math.max(0, Number(queueConfig.streamForwardGraceMs) || 0);
+  let streamGraceTimer = null;
+  if (requestInfo.stream && !res.headersSent) {
+    requestInfo.streamGraceDeadline ??= Date.now() + streamForwardGraceMs;
+    const graceDelay = Math.max(0, requestInfo.streamGraceDeadline - Date.now());
+    streamGraceTimer = setTimeout(() => {
+      // Client-abort-safe: an async timer has no synchronous liveness precondition,
+      // so NEVER touch a dead/committed socket here. If the client vanished during
+      // the forward window (or the stream is already committed), reap the queue slot
+      // and bail — do not commit (ensureQueueHeartbeat is itself hardened, but this
+      // is the cheaper first line of defense against the worker-bounce race).
+      if (res.destroyed || res.writableEnded || res.headersSent) {
+        clearQueueHeartbeat(requestInfo);
+        accountManager.removeQueuedRequest?.(requestInfo);
+        return;
+      }
+      ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
+    }, graceDelay);
+    streamGraceTimer.unref?.();
+  }
   try {
     let upstreamRes;
     try {
@@ -504,6 +546,9 @@ async function forwardRequest(
       });
     } finally {
       clearTimeout(ttfbTimer);
+      // Stop the grace timer for THIS attempt — but LEAVE streamGraceDeadline set so
+      // a re-forward (failover) re-arms for the REMAINING time to the shared deadline.
+      if (streamGraceTimer) clearTimeout(streamGraceTimer);
     }
     // Response arrived — the pre-response leak window is over. Stop guarding for
     // client-disconnect via abort (streamResponse handles mid-stream disconnects).
@@ -1510,23 +1555,36 @@ async function queueAndRetry(
 function ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager) {
   if (!requestInfo.stream || requestInfo.queueHeartbeatActive || res.headersSent) return;
   const heartbeatMs = Math.max(1000, Number(queueConfig.heartbeatMs) || 10_000);
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
-  res.flushHeaders?.();
-  res.write(': maxpool queued\n\n');
-  requestInfo.queueHeartbeatActive = true;
   // The heartbeat is the liveness probe: if the client is gone (socket
-  // destroyed/ended, or the write throws EPIPE/ERR_STREAM_DESTROYED), release
+  // destroyed/ended, or a write throws EPIPE/ERR_STREAM_DESTROYED), release
   // the queue slot + bytes IMMEDIATELY rather than letting a dead ticket occupy
   // the queue until its (up to 7d) deadline — the ghost-leak guard.
   const reapDead = () => {
     clearQueueHeartbeat(requestInfo);
     accountManager?.removeQueuedRequest?.(requestInfo);
   };
+  // The INITIAL commit can throw if the socket died between the caller's last
+  // liveness check and here. The synchronous queue caller (queueAndRetry) bails
+  // on res.destroyed right before calling, but the ASYNC stream-forward grace
+  // timer has no such precondition — the client can vanish mid-window. An
+  // unguarded throw here has NO 'error' listener → uncaughtException → the worker
+  // process.exits and bounces EVERY in-flight stream. Guard the initial write
+  // exactly like the interval callback below so ensureQueueHeartbeat is safe from
+  // ANY caller, sync or async.
+  try {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders?.();
+    res.write(': maxpool queued\n\n');
+  } catch {
+    reapDead();
+    return;
+  }
+  requestInfo.queueHeartbeatActive = true;
   requestInfo.queueHeartbeatTimer = setInterval(() => {
     if (res.destroyed || res.writableEnded) { reapDead(); return; }
     try {

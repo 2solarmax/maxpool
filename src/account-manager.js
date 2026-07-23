@@ -15,6 +15,15 @@ const BOUNDED_REPOLL_HOLD_MS = 60_000;
 // session can never ping-pong between two similarly-loaded accounts.
 const REBALANCE_SCORE_MARGIN = 0.5;   // candidate score must be ≤ 50% of the bound account's
 const REBALANCE_MIN_ABS_GAP = 0.5;    // …with a small absolute floor so near-zero scores don't micro-churn
+// Warmup-pull: a freshly-ADDED account (mid-session, no reload) would otherwise idle
+// until a reload clears bindings, because bound sessions only leave a HOT account. So
+// for a bounded window pull migration-safe sessions onto it. Keyed on the account's
+// own onboarding state (addedAt + completedRequests), NOT relative load — so it
+// PROVABLY TERMINATES (once it has served WARMUP_REQUESTS, or WARMUP_MS elapses, it
+// stops warming and never fires again) and cannot oscillate for any #sessions/#accounts
+// ratio, unlike a share/concurrency-gap rebalance (which flaps on the lagging load signal).
+const WARMUP_MS = 5 * 60 * 1000;      // a just-added account stays "warming" this long…
+const WARMUP_REQUESTS = 5;            // …or until it has served this many requests, whichever comes first
 // Weekly-pressure tiers, healthiest first. A fresh (unknown) account is the best
 // migration target; migration requires the candidate be a STRICTLY healthier tier.
 const WEEKLY_TIER = { unknown: 0, normal: 0, soft: 1, reserve: 2, critical: 3, exhausted: 4 };
@@ -1138,6 +1147,50 @@ export class AccountManager {
    *  All gates must hold: thinking-safe + not mid queue-admission + bound is hot +
    *  a genuinely-healthy alternative that is BOTH much cheaper AND a strictly
    *  healthier weekly tier (so concurrency jitter alone can never trigger a move). */
+  /** Is this account still in its post-add onboarding window? A freshly-ADDED
+   *  account (addedAt set only by addAccount, never on boot) that has served fewer
+   *  than WARMUP_REQUESTS within WARMUP_MS. Providers are never "warming" targets. */
+  _isWarming(account, now = Date.now()) {
+    if (!account || account.type === 'provider') return false;
+    if (account.addedAt == null) return false;                 // boot/config account → never warming
+    if (account.completedRequests >= WARMUP_REQUESTS) return false; // onboarded → terminates the pull
+    return (now - account.addedAt) < WARMUP_MS;
+  }
+
+  /** Warmup-pull target: the best (lowest-score) healthy, migration-eligible,
+   *  still-WARMING NON-provider account to onboard a freshly-added account WITHOUT a
+   *  reload, or null. Returned DIRECTLY (not via the score-loop fallthrough) so the
+   *  destination is GUARANTEED non-provider even under 'always' cross-provider policy
+   *  — a signed-thinking session can never be shuttled onto a provider here (which
+   *  the shared candidate loop, keyed only on _matchesRequest, would not prevent).
+   *  Fires only when the bound account is itself established (not warming) AND is
+   *  actually carrying recent load — relieving a real carrier onto the fresh account,
+   *  never churning fresh↔fresh or re-homing an idle session. */
+  _warmupPullTarget(bound, profile, excludedIndexes, requestInfo, now = Date.now()) {
+    if (!this._migrationSafeForRequest(requestInfo)) return null;
+    if (requestInfo.queueTicket || requestInfo.queueAdmitted) return null;
+    if (this._isWarming(bound, now)) return null;
+    if (this._loadSummary(bound, this.scheduler.spreadWindowMs, now).weight <= 0) return null;
+    const ctx = this._scoringContext();
+    let best = null;
+    let bestScore = Infinity;
+    for (const account of this.accounts) {
+      if (account.index === bound.index) continue;
+      if (account.type === 'provider') continue;               // GUARANTEED non-provider destination
+      if (excludedIndexes.has(account.index)) continue;
+      if (!this._isWarming(account, now)) continue;
+      if (!this._matchesRequest(account, profile, requestInfo)) continue;
+      // Genuinely-healthy target only (same bar as the hot-rebalance candidate scan).
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model })) continue;
+      const score = this._scoreAccount(account, requestInfo, ctx);
+      if (score < bestScore) {
+        bestScore = score;
+        best = account;
+      }
+    }
+    return best;
+  }
+
   _shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx) {
     if (!this._migrationSafeForRequest(requestInfo)) return false;
     if (requestInfo.queueTicket || requestInfo.queueAdmitted) return false;
@@ -1350,10 +1403,24 @@ export class AccountManager {
       }
     }
     const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo);
-    if (bound
-      && !this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)
-      && !this._shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx)) {
-      return bound;
+    if (bound) {
+      // Warmup-pull: onboard a freshly-ADDED account (added mid-session, no reload)
+      // by DIRECTLY re-homing this migration-safe session onto the warming account,
+      // before the sticky "stay bound" return. Directed (not via the score loop) so
+      // the destination is guaranteed non-provider. Bounded + self-terminating via
+      // _isWarming; each session re-homes at most once → no flap. Skipped for a
+      // preferred/pinned request (handled above) and any non-migration-safe request.
+      const warmupTarget = this._warmupPullTarget(
+        bound, profile, excludedIndexes, requestInfo, scoringCtx?.now,
+      );
+      if (warmupTarget) {
+        this.currentIndex = warmupTarget.index;
+        return warmupTarget;   // _bindSession re-homes the session on acquire
+      }
+      if (!this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)
+        && !this._shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx)) {
+        return bound;
+      }
     }
     // Else fall through to the candidate score loop, which re-homes the session
     // onto the best healthy account via _bindSession on acquire.
@@ -2488,6 +2555,10 @@ export class AccountManager {
       provisionalRateLimitFingerprint: null,
       recoveredAt: null,
       lastQuotaLogKey: null,
+      // Onboarding clock for the warmup-pull — set ONLY here (mid-session add),
+      // never on the boot/config construction path, so an established fleet account
+      // is never "warming". Lets a just-added account draw load without a reload.
+      addedAt: Date.now(),
     });
     return index;
   }

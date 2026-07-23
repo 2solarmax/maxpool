@@ -286,7 +286,7 @@ test('a z.ai account whose probe has not landed yet shows "probing", not a fake 
 
 // ── the reported UX bug: the top header must ALIGN to the columns it names ─────
 
-test('the column header sits exactly over the Account/Type/Status/Quota columns', () => {
+test('the column header sits exactly over the Account/Provider/Status/Quota columns', () => {
   const am = oauthAM();
   am.applyUsageData(0, {
     fiveHour: { utilization: 0.3, resetAt: Date.now() + 3600_000 },
@@ -296,8 +296,8 @@ test('the column header sits exactly over the Account/Type/Status/Quota columns'
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
   assert.equal(hdr.indexOf('Account'), 4, 'Account over the name column');
-  assert.equal(hdr.indexOf('Type'), 17, 'Type over the type column');
-  assert.equal(hdr.indexOf('Status'), 26, 'Status over the status column');
+  assert.equal(hdr.indexOf('Provider'), 17, 'Provider over the provider column');
+  assert.equal(hdr.indexOf('Status'), 27, 'Status over the status column (shifted +1 by the 9-wide Provider col)');
   // the Quota group label lands exactly on the inline Ses/Tok quota label
   assert.equal(hdr.indexOf('Quota'), row.indexOf('Ses '), 'Quota over the quota bars');
 });
@@ -319,9 +319,9 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   const wide = strip(__tuiTest.acctHeader(100));
   const narrow = strip(__tuiTest.acctHeader(72));
   assert.equal(narrow.indexOf('Account'), 4);
-  assert.equal(narrow.indexOf('Status'), 26);
+  assert.equal(narrow.indexOf('Status'), 27);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  assert.equal(narrow.indexOf('Quota'), 40);
+  assert.equal(narrow.indexOf('Quota'), 41);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
