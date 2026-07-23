@@ -981,6 +981,9 @@ export class TUI {
     // animated draining indicator. It clears when the swap completes (fresh worker
     // renders) or a rollback resumes admission (admissionPaused → false).
     if (this.am.admissionPaused) {
+      // Total TUI in-flight — an honest, user-meaningful "your work is finishing" count.
+      // (The reload gates its drain on UPSTREAM requests only, so this can read slightly
+      // higher than the controller's gating count; queued/idle ones reconnect, not lost.)
       const inflight = this.active.size;
       const detail = inflight > 0
         ? `draining ${inflight} active request${inflight === 1 ? '' : 's'}…`
