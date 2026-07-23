@@ -56,6 +56,11 @@ const DEFAULT_QUEUE = {
   // Non-streaming requests have no SSE heartbeat to keep them alive, so a long
   // hold would die on the client timeout anyway. Cap their wait conservatively.
   nonStreamMaxWaitMs: 5 * 60 * 1000,
+  // count_tokens is cheap non-streaming metadata — cap its queue wait VERY low so it
+  // fast-fails with a retryable 429 instead of hanging silently past the client's idle
+  // window. Kept well under any plausible client idle timeout (observed errors as low
+  // as ~23s). Env-overridable for tuning as the "Stream idle timeout" reports resolve.
+  countTokensMaxWaitMs: Math.max(1000, Number(process.env.MAXPOOL_COUNT_TOKENS_MAX_WAIT_MS) || 8000),
   // Backpressure: holds used to be 0ms, now they can be hours. Bound the queue
   // so 22 retrying agents can't grow the heap without limit.
   maxConcurrentQueued: 64,
@@ -1095,6 +1100,7 @@ function formatRetryDuration(seconds) {
 function computeQueueWindowMs({
   cause, stream, retryPlanCause,
   maxWaitMs, capacityMaxWaitMs, nonStreamMaxWaitMs, streamHoldMaxMs,
+  isCountTokens, countTokensMaxWaitMs,
 }) {
   let windowMs;
   if (!stream) {
@@ -1105,6 +1111,10 @@ function computeQueueWindowMs({
     windowMs = streamHoldMaxMs;
   }
   if (retryPlanCause === 'concurrency_cap') windowMs = Math.min(windowMs, capacityMaxWaitMs);
+  // count_tokens: cap the QUEUE wait low (bounds only the wait-for-an-account, never
+  // the upstream processing once acquired) so a non-heartbeated metadata call fast-
+  // fails with a retryable 429 instead of hanging past the client's idle window.
+  if (isCountTokens && countTokensMaxWaitMs != null) windowMs = Math.min(windowMs, countTokensMaxWaitMs);
   return windowMs;
 }
 
@@ -1392,6 +1402,9 @@ async function queueAndRetry(
   const nonStreamMaxWaitMs = queueConfig.nonStreamMaxWaitMs == null
     ? 5 * 60_000
     : Math.max(0, Number(queueConfig.nonStreamMaxWaitMs) || 0);
+  const countTokensMaxWaitMs = queueConfig.countTokensMaxWaitMs == null
+    ? 8000
+    : Math.max(0, Number(queueConfig.countTokensMaxWaitMs) || 0);
   const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {
     retryAfterMs: Infinity,
     cause: 'unavailable',
@@ -1426,6 +1439,8 @@ async function queueAndRetry(
     capacityMaxWaitMs,
     nonStreamMaxWaitMs,
     streamHoldMaxMs,
+    isCountTokens: Boolean(requestInfo.isCountTokens),
+    countTokensMaxWaitMs,
   });
 
   if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
@@ -1596,6 +1611,11 @@ function describeRequest(req, body) {
     path: req.url,
     bodyBytes: body.length,
     weight,
+    // count_tokens is cheap non-streaming metadata with NO SSE heartbeat, so a long
+    // queue-hold just dies on the client's idle window ("Stream idle timeout - no
+    // chunks received"). Flag it (URL-based, so it's set regardless of body parse) to
+    // cap its queue wait short and fast-fail with a retryable 429 instead of hanging.
+    isCountTokens: /\/v1\/messages\/count_tokens\b/.test(req.url),
   };
   try {
     const json = JSON.parse(body.toString());

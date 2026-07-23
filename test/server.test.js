@@ -74,6 +74,14 @@ test('hold window: a STREAMING capacity/throttle request holds for maxWaitMs, no
     cfg.capacityMaxWaitMs,
     'concurrency-cap is clamped short even for a streaming request',
   );
+  // count_tokens: capped to the tiny countTokensMaxWaitMs regardless of the (non-stream,
+  // 5-min) quota window — so it fast-fails with a 429 instead of hanging past the client
+  // idle window. This is the "Stream idle timeout" fix.
+  assert.equal(
+    computeQueueWindowMs({ cause: 'quota', stream: false, retryPlanCause: 'session_limit', isCountTokens: true, countTokensMaxWaitMs: 8000, ...cfg }),
+    8000,
+    'count_tokens queue wait is capped low, not the 5-min non-stream window',
+  );
 });
 
 test('bug (ghost-leak): heartbeat reap releases the queue slot+bytes when the held client write throws EPIPE', async () => {
@@ -1938,6 +1946,7 @@ test('describeRequest marks bodyThinkingScanned only on a fully-scanned body (mi
   const plain = describeRequest(req, Buffer.from(JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }] })));
   assert.equal(plain.bodyThinkingScanned, true);
   assert.notEqual(plain.requiresAnthropicThinkingIntegrity, true);
+  assert.ok(!plain.isCountTokens, 'plain /v1/messages is not count_tokens');
   // Body carrying a signed thinking block → scanned but NOT migration-safe.
   const thinking = describeRequest(req, Buffer.from(JSON.stringify({ model: 'x', messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: '…', signature: 'sig' }] }] })));
   assert.equal(thinking.bodyThinkingScanned, true);
@@ -1945,6 +1954,16 @@ test('describeRequest marks bodyThinkingScanned only on a fully-scanned body (mi
   // Non-JSON body → NOT scanned → fails closed (never migrates).
   const garbage = describeRequest(req, Buffer.from('not json at all'));
   assert.notEqual(garbage.bodyThinkingScanned, true);
+});
+
+test('describeRequest flags count_tokens by URL (drives the short queue cap)', () => {
+  const { describeRequest } = __serverTest;
+  const body = Buffer.from(JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }] }));
+  assert.equal(describeRequest({ method: 'POST', url: '/v1/messages/count_tokens?beta=true' }, body).isCountTokens, true);
+  assert.equal(describeRequest({ method: 'POST', url: '/v1/messages/count_tokens' }, body).isCountTokens, true);
+  assert.ok(!describeRequest({ method: 'POST', url: '/v1/messages?beta=true' }, body).isCountTokens, 'plain messages is not count_tokens');
+  // No false-positive on a lookalike path.
+  assert.ok(!describeRequest({ method: 'POST', url: '/v1/messages/count_tokens_extra' }, body).isCountTokens, 'word-boundary: not a prefix match');
 });
 
 test('network blip: a STREAMING request whose upstream connection RESETS holds then resumes (not a 503 kill)', async () => {
