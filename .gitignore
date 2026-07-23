@@ -2,3 +2,4 @@ node_modules/
 config.json
 *.log
 package-lock.json
+.claude/settings.local.json

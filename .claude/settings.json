@@ -1,0 +1,16 @@
+{
+  "$comment": "Project-level Claude Code settings, committed so they travel with the repo. The SessionStart hook injects the project-memory head (docs/CONTEXT.md Current focus + unreleased commits) at session open, so a fresh session reliably picks up where the last left off. Personal overrides go in .claude/settings.local.json (gitignored).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/session-start-context.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
