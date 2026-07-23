@@ -5,11 +5,22 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.38] - 2026-07-23
 
 ### Changed
 
 - Build release notes from commit log, not PRs
+- Generate in-repo CHANGELOG.md from commits via git-cliff
+- Add project-context + self-updating memory harness
+- Address code-review nits — extract+test grace callback, warmup-pull hot-path short-circuit, doc refresh
+
+### Documentation
+
+- Mark release-hygiene + builder harness shipped; npm 2FA done
+
+### Fixed
+
+- Streaming idle-timeout keep-alive + TUI provider column/order + warmup-pull for mid-session-added accounts
 
 ## [1.5.37] - 2026-07-23
 
