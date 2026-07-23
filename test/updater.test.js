@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compareVersions, checkForUpdate, maybeCheckForUpdate, __resetUpdaterState } from '../src/updater.js';
+import { compareVersions, checkForUpdate, maybeCheckForUpdate, __resetUpdaterState, markApplied } from '../src/updater.js';
 
 test('compareVersions orders semver correctly', () => {
   assert.equal(compareVersions('1.0.1', '1.0.0'), 1);
@@ -88,34 +88,53 @@ function harness({ running, latest, installOk = true }) {
 }
 const CFG_AUTO = { autoUpdate: true, autoApply: true };
 
+// Model the index.js CALLER: it applies (markApplied + "reload") iff applicable & autoApply.
+// The mark is the caller's action — maybeCheckForUpdate has no side effect on the floor.
+async function checkAndMaybeApply(cfg, deps) {
+  const r = await maybeCheckForUpdate(cfg, () => {}, null, deps);
+  const applied = Boolean(r.applicable && cfg.autoApply);
+  if (applied) markApplied(r.installedVersion);   // caller marks BEFORE the reload
+  return { ...r, applied };
+}
+
 test('I1 auto-apply fires ONCE, then quiescent after the reload', async () => {
   __resetUpdaterState();
   const h = harness({ running: '1.0.0', latest: '1.0.1' });
-  const r1 = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h.deps);
-  assert.equal(r1.selfUpdated, true, 'applies 1.0.1 once');
+  const r1 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r1.applied, true, 'applies 1.0.1 once');
   assert.equal(r1.installedVersion, '1.0.1');
   __resetUpdaterState();                              // the seamless reload → a new process now runs 1.0.1
   const h2 = harness({ running: '1.0.1', latest: '1.0.1' });
-  const r2 = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h2.deps);
+  const r2 = await checkAndMaybeApply(CFG_AUTO, h2.deps);
   assert.equal(r2.hasUpdate, false, 'now on latest');
-  assert.equal(r2.selfUpdated, false, 'no further reload');
+  assert.equal(r2.applied, false, 'no further reload');
 });
 
 test('I2 a boot-broken version is attempted ONCE, never loops (rollback → quarantine)', async () => {
   __resetUpdaterState();
   const h = harness({ running: '1.0.0', latest: '1.0.1' });
-  const r1 = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h.deps);
-  assert.equal(r1.selfUpdated, true, 'first attempt applies 1.0.1');
+  const r1 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r1.applied, true, 'first attempt applies 1.0.1');
   // Reload ROLLED BACK: SAME process still runs 1.0.0 (no reset), disk is 1.0.1.
-  const r2 = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h.deps);
-  assert.equal(r2.selfUpdated, false, 'the rolled-back version is quarantined — no 2nd apply');
-  const r3 = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h.deps);
-  assert.equal(r3.selfUpdated, false, 'still no loop on the next check');
+  const r2 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r2.applied, false, 'the rolled-back version is quarantined — no 2nd apply');
+  const r3 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r3.applied, false, 'still no loop on the next check');
   // A genuinely NEWER release breaks the quarantine.
   h.setLatest('1.0.2');
-  const r4 = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h.deps);
-  assert.equal(r4.selfUpdated, true, 'a newer 1.0.2 still auto-applies');
+  const r4 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r4.applied, true, 'a newer 1.0.2 still auto-applies');
   assert.equal(r4.installedVersion, '1.0.2');
+});
+
+test('S1 an ignored `applicable` return never strands the version (no internal marking)', async () => {
+  __resetUpdaterState();
+  const h = harness({ running: '1.0.0', latest: '1.0.1' });
+  // This is the exact M1 shape: a caller that discards the result (never markApplied).
+  const r1 = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h.deps);
+  assert.equal(r1.applicable, true, '1.0.1 is applicable');
+  const r2 = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h.deps);
+  assert.equal(r2.applicable, true, 'STILL applicable — an ignored return cannot poison the quarantine floor');
 });
 
 test('I3 no reinstall churn: selfUpdate runs once across many checks (autoApply off)', async () => {
@@ -128,19 +147,19 @@ test('I3 no reinstall churn: selfUpdate runs once across many checks (autoApply 
   assert.equal(installs, 1, 'downloaded once, not once per check');
 });
 
-test('I5 advance-only: a failed self-install never signals apply', async () => {
+test('I5 advance-only: a failed self-install is never applicable', async () => {
   __resetUpdaterState();
   const h = harness({ running: '1.0.0', latest: '1.0.1', installOk: false });
   const r = await maybeCheckForUpdate(CFG_AUTO, () => {}, null, h.deps);
-  assert.equal(r.selfUpdated, false, 'npm failed → no reload');
+  assert.equal(r.applicable, false, 'npm failed → nothing to apply');
 });
 
-test('autoApply off downloads but never signals apply', async () => {
+test('autoApply off downloads but the caller never applies', async () => {
   __resetUpdaterState();
   const h = harness({ running: '1.0.0', latest: '1.0.1' });
-  const r = await maybeCheckForUpdate({ autoUpdate: true, autoApply: false }, () => {}, null, h.deps);
+  const r = await checkAndMaybeApply({ autoUpdate: true, autoApply: false }, h.deps);
   assert.equal(r.hasUpdate, true);
-  assert.equal(r.selfUpdated, false);
+  assert.equal(r.applied, false);
   assert.equal(h.getDisk(), '1.0.1', 'still downloaded in the background');
 });
 

@@ -12,7 +12,7 @@ import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, toke
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
-import { maybeCheckForUpdate, getCurrentVersion } from './updater.js';
+import { maybeCheckForUpdate, getCurrentVersion, markApplied } from './updater.js';
 import {
   runReloadBaton,
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
@@ -1025,6 +1025,19 @@ async function serverWorkerCommand() {
   // would permanently disable all future update detection. It only refreshes
   // versionInfo (the persistent TUI banner is the reminder, so no repeated log spam);
   // autoUpdate progress lines still surface. unref so it never blocks a clean exit.
+  const notifyUpdate = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
+  // Fully-automatic apply (opt-in autoApply): mark the version attempted, THEN seamlessly
+  // reload into the freshly-installed code (sessions survive). Marking here — at the
+  // moment we act — is what makes the quarantine truthful: a boot-broken release is
+  // attempted once, then blocked until an even newer version appears (no reload loop, no
+  // stranded download). Shared by the startup one-shot AND the periodic timer.
+  const applyUpdateIfReady = r => {
+    if (r?.applicable && config?.autoApply && restartController) {
+      markApplied(r.installedVersion);
+      notifyUpdate('Applying update — seamless reload…');
+      restartController.requestRestart();
+    }
+  };
   const updateIntervalMs = Math.max(60_000, Number(process.env.MAXPOOL_UPDATE_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000);
   updateTimer = setInterval(() => {
     // ONLY the lease-holding primary self-installs — the timer is unconditional across
@@ -1032,19 +1045,10 @@ async function serverWorkerCommand() {
     // two `npm i -g` racing during a reload overlap (global-package corruption). A
     // headless reload worker never holds the lease, so it never installs/auto-applies.
     if (config?.updateCheck === false || !hasLease) return;
-    const notify = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
     // announce:false — the persistent TUI banner is the passive reminder; only real
     // actions (installing / applying) log here, so a pending update never churns the log.
-    maybeCheckForUpdate(config, notify, info => { accountManager.versionInfo = info; }, { announce: false })
-      .then(r => {
-        // Fully-automatic apply: seamlessly reload into the freshly-installed version
-        // (sessions survive). The loop guard (_lastAttemptedTarget in updater.js) makes
-        // this a bounded, one-shot event per version — a boot-broken release can't loop.
-        if (r?.selfUpdated && config?.autoApply) {
-          notify('Applying update — seamless reload…');
-          restartController?.requestRestart();
-        }
-      })
+    maybeCheckForUpdate(config, notifyUpdate, info => { accountManager.versionInfo = info; }, { announce: false })
+      .then(applyUpdateIfReady)
       .catch(() => {});
   }, updateIntervalMs);
   updateTimer.unref();
@@ -1095,8 +1099,11 @@ async function serverWorkerCommand() {
     // A reload-spawned/takeover worker must NEVER re-probe (1x not 2x traffic).
     if (!viaTakeover && !isReloadWorker) {
       if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') console.log('[Maxpool] UPDATE_CHECK_FIRED');
-      const notify = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
-      maybeCheckForUpdate(config, notify, info => { accountManager.versionInfo = info; }).catch(() => {});
+      // Cold-start-behind: download AND (autoApply) self-apply via the SAME helper as the
+      // periodic path — so the version is applied, not marked-attempted-then-stranded.
+      maybeCheckForUpdate(config, notifyUpdate, info => { accountManager.versionInfo = info; })
+        .then(applyUpdateIfReady)
+        .catch(() => {});
     } else if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') {
       console.log('[Maxpool] UPDATE_CHECK_SKIPPED (reload)');
     }

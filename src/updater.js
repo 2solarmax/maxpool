@@ -85,17 +85,28 @@ let _lastAttemptedTarget = null;
 /** Test-only: reset the module's version-tracking state between cases. */
 export function __resetUpdaterState() { _bootVersion = undefined; _lastAttemptedTarget = null; }
 
+/** Mark a version as ATTEMPTED-to-apply. The caller calls this at the moment it triggers
+ *  the reload — BEFORE the reload — so a rolled-back target is quarantined (advance-only).
+ *  Kept as the caller's action (not a side effect of maybeCheckForUpdate) so a caller that
+ *  ignores `applicable` can never strand a version or poison the quarantine floor. */
+export function markApplied(version) {
+  if (version && (!_lastAttemptedTarget || compareVersions(version, _lastAttemptedTarget) > 0)) {
+    _lastAttemptedTarget = version;
+  }
+}
+
 /**
  * Check for an update; with `config.autoUpdate` also self-install; with
  * `config.autoApply` SIGNAL that the caller should seamlessly reload to APPLY it
- * (returns `selfUpdated:true`). All failures swallowed. Deps are injectable for tests.
+ * (returns `applicable:true` — the CALLER then markApplied()+reloads). Failures swallowed.
+ * Deps are injectable for tests.
  *
  * `onVersionInfo` is ALWAYS invoked with { current, latest, hasUpdate, checkedAt } —
  * current + hasUpdate keyed on the RUNNING version (so the banner stays accurate after a
  * background download, until the reload). `deps.announce===false` suppresses the passive
  * "Update available" line (the periodic path — the persistent banner already shows it).
  *
- * Returns { hasUpdate, selfUpdated, installedVersion? }.
+ * Returns { hasUpdate, applicable, installedVersion? }.
  */
 export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = {}) {
   const _get = deps.getCurrentVersion || getCurrentVersion;
@@ -114,12 +125,12 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
     } catch { /* indicator is best-effort; never break startup */ }
   }
 
-  if (!hasUpdate) return { hasUpdate: false, selfUpdated: false };
+  if (!hasUpdate) return { hasUpdate: false, applicable: false };
   if (announce) notify(`Update available: ${result.current} → ${result.latest}`);
 
   if (!config?.autoUpdate) {
     if (announce) notify(`Run 'npm i -g ${PACKAGE}' to update, or set "autoUpdate": true in your config.`);
-    return { hasUpdate: true, selfUpdated: false };
+    return { hasUpdate: true, applicable: false };
   }
 
   // Skip the reinstall if the latest is ALREADY on disk (a prior check downloaded it) —
@@ -130,27 +141,26 @@ export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = 
     const r = await _self();
     if (!r.ok) {
       notify(`Auto-update failed: ${r.error}. Run: npm i -g ${PACKAGE}`);
-      return { hasUpdate: true, selfUpdated: false };
+      return { hasUpdate: true, applicable: false };
     }
   }
 
   const installed = await _get();
-  // Loop/quarantine guard — apply only a version strictly newer than the newest we've
-  // already booted-as OR already tried to apply.
+  // Loop/quarantine guard — a version is "applicable" only if it is strictly newer than
+  // the newest we've already booted-as OR already ATTEMPTED to apply (markApplied). This
+  // function has NO side effect on that floor: the CALLER marks it when it triggers the
+  // reload, so a caller that ignores `applicable` can't strand a version or poison state.
   const floor = (_lastAttemptedTarget && compareVersions(_lastAttemptedTarget, current) > 0)
     ? _lastAttemptedTarget : current;
-  const canApply = Boolean(installed) && compareVersions(installed, floor) > 0;
+  const advanced = Boolean(installed) && compareVersions(installed, current) > 0;
+  const applicable = advanced && compareVersions(installed, floor) > 0;
 
-  if (config?.autoApply && canApply) {
-    _lastAttemptedTarget = installed;   // mark BEFORE the reload so a rollback can't re-trigger
-    notify(`Updated to ${installed}. Applying now (seamless reload)…`);
-    return { hasUpdate: true, selfUpdated: true, installedVersion: installed };
+  // Passive notices only. The "Applying now…" line + the reload are the caller's (it
+  // logs them exactly when it acts), so nothing here can claim an apply that didn't happen.
+  if (advanced && !applicable) {
+    if (announce) notify(`Update ${installed} already attempted — staying on ${current}; will retry only a newer release.`);
+  } else if (advanced && !config?.autoApply) {
+    if (announce) notify(`Updated to ${installed}. Restart maxpool to apply (sessions are not interrupted).`);
   }
-  if (config?.autoApply && installed && _lastAttemptedTarget
-      && compareVersions(installed, _lastAttemptedTarget) <= 0) {
-    notify(`Update ${installed} already attempted and rolled back — staying on ${current}; will retry only a newer release.`);
-  } else if (announce) {
-    notify(`Updated to ${installed || result.latest}. Restart maxpool to apply (sessions are not interrupted).`);
-  }
-  return { hasUpdate: true, selfUpdated: false, installedVersion: installed };
+  return { hasUpdate: true, installedVersion: installed, applicable };
 }

@@ -31,3 +31,6 @@
 
 ## Startup auto-apply UX
 On a cold start where you're behind: startup check → self-install → auto-apply reload → new worker (reload-guarded, no re-check) runs the new version. One brief self-reload at launch; the user opted into fully-automatic. Acceptable + desired.
+
+## Marking lives at the CALLER (fixes the code-review M1)
+`maybeCheckForUpdate` is a pure reporter — it installs and returns `applicable` (a genuinely-newer version is on disk, not yet attempted) but has NO side effect on the quarantine floor. The floor is advanced by the exported `markApplied(version)`, which the CALLER calls at the instant it triggers the reload. So BOTH the startup one-shot (cold only) and the periodic timer use the SAME `applyUpdateIfReady(r)` helper: `if (r.applicable && autoApply) { markApplied(r.installedVersion); reload; }`. A caller that ignores `applicable` can never mark-then-strand a version (the M1 bug: the old code marked internally on the fire-and-forget startup call, then the periodic path quarantined a never-applied version). Test S1 locks this.
