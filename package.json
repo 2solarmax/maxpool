@@ -15,7 +15,8 @@
     "start": "node src/index.js",
     "test": "bash scripts/run-tests.sh",
     "lint": "eslint src/ test/",
-    "release": "bash scripts/release.sh"
+    "release": "bash scripts/release.sh",
+    "version": "bash scripts/update-changelog.sh"
   },
   "keywords": [
     "claude",
@@ -38,5 +39,8 @@
   },
   "engines": {
     "node": ">=20.3.0"
+  },
+  "devDependencies": {
+    "git-cliff": "2.13.1"
   }
 }

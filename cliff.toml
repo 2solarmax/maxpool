@@ -1,0 +1,78 @@
+# git-cliff configuration — generates CHANGELOG.md from the Conventional-Commit
+# history. This is the SINGLE in-repo changelog source; it is regenerated on
+# every `npm version` bump by the package.json "version" lifecycle hook, so the
+# CHANGELOG.md folds into the release commit + tag.
+#
+# The GitHub Release BODY is produced separately by .github/workflows/publish.yml
+# (from the same commit log). Both derive from the same Conventional Commits, so
+# they stay consistent; this file is the browsable, committed record.
+#
+# Format: Keep a Changelog 1.1.0 (https://keepachangelog.com/en/1.1.0/).
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to maxpool are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+# Tera template (trim=false → explicit whitespace). Keep-a-Changelog spacing:
+# one blank line before each ## release and ### category heading.
+body = """
+{%- if version %}
+
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{%- else %}
+
+## [Unreleased]
+{%- endif %}
+{%- for group, commits in commits | group_by(attribute="group") %}
+
+### {{ group | upper_first }}
+
+{% for commit in commits -%}
+- {{ commit.message | split(pat="\\n") | first | upper_first | trim }}
+{% endfor -%}
+{%- endfor %}
+"""
+footer = ""
+trim = false
+
+[git]
+conventional_commits = true
+# Keep non-conventional commits too, so older mixed history is NOT silently
+# dropped from the record (they land in "Changed" via the catch-all below).
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "oldest"
+
+# Order matters: first match wins. Skip release-chore + merge noise; map the
+# rest onto Keep-a-Changelog categories; a catch-all keeps everything recorded.
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore: release", skip = true },
+  { message = "^[Mm]erge ", skip = true },
+  # Old pre-Conventional-Commit bump commits whose whole subject is a version
+  # number (e.g. "1.0.2") — skip so they don't leak as raw "- 1.0.2" line items.
+  { message = "^v?[0-9]+\\.[0-9]+\\.[0-9]+", skip = true },
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^security", group = "Security" },
+  { message = "^revert", group = "Removed" },
+  { message = "^perf", group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^style", group = "Changed" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^test", group = "Changed" },
+  { message = "^ci", group = "Changed" },
+  { message = "^build", group = "Changed" },
+  { message = "^chore", group = "Changed" },
+  { message = "^deps", group = "Changed" },
+  { message = ".*", group = "Changed" },
+]
