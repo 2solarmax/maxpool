@@ -18,12 +18,16 @@
 
 ## Current focus
 
-Release hygiene + a reusable project-context harness were just added (2026-07-23):
+Release hygiene + a reusable project-context harness shipped 2026-07-23 (pushed to
+`private/main` @ `02d9f9b`; judge verdict SHIP):
 - `CHANGELOG.md` is now auto-generated from Conventional Commits (git-cliff) and
-  folds into each release via the package.json `version` hook.
+  folds into each release via the package.json `version` hook. It regenerates on
+  the NEXT `npm run release` (nothing releases on its own).
 - This repo now has a committed Claude Code harness: `CLAUDE.md` (durable facts +
   invariants), this file (`docs/CONTEXT.md`, living memory), a SessionStart read
   hook, and the `/maxpool-builder` skill (memory ritual + reuse seed).
+- npm account hardened: 2FA on + package publishing set to "require 2FA and
+  disallow tokens" (OIDC publish unaffected).
 
 No open feature work owned by this thread. Ongoing product roadmap lives in
 `docs/open-issues.md` (rate-aware load balancing is the core problem).
@@ -74,7 +78,8 @@ can be revisited.
 **Decision:** Enable "Require two-factor authentication and disallow tokens" on
 the npm account. OIDC publishing keeps working with this on.
 **Consequences:** Removes long-lived publish tokens as an attack surface.
-**Status:** Manual step on npmjs.com (account settings) — owner action, pending.
+**Status:** Done 2026-07-23 — 2FA enabled + `maxpool` package publishing access
+set to "require 2FA and disallow tokens"; OIDC publish unaffected.
 
 ### 2026-07-23 · #1 — Release-record posture: forward-only + in-repo, log-not-announce
 
