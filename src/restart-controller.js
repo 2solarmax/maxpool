@@ -67,7 +67,10 @@ export class RestartController {
   }
 
   requestRestart() {
-    if (this.restarting) return;
+    // Idempotent against a restart ALREADY in progress — restarting OR pending (drain).
+    // Without the `pending` guard a second call (e.g. auto-apply firing while a manual
+    // restart is draining) would orphan the first _drainTimer and re-log.
+    if (this.restarting || this.pending) return;
     this.pauseAdmission();
     if (this.upstreamRequests.size === 0) {
       this._restart();

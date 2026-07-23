@@ -1027,9 +1027,25 @@ async function serverWorkerCommand() {
   // autoUpdate progress lines still surface. unref so it never blocks a clean exit.
   const updateIntervalMs = Math.max(60_000, Number(process.env.MAXPOOL_UPDATE_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000);
   updateTimer = setInterval(() => {
-    if (config?.updateCheck === false) return;
-    const autoNotify = msg => { if (config?.autoUpdate) (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`)); };
-    maybeCheckForUpdate(config, autoNotify, info => { accountManager.versionInfo = info; }).catch(() => {});
+    // ONLY the lease-holding primary self-installs — the timer is unconditional across
+    // EVERY worker (incl. a headless reload worker), so gate on hasLease here to avoid
+    // two `npm i -g` racing during a reload overlap (global-package corruption). A
+    // headless reload worker never holds the lease, so it never installs/auto-applies.
+    if (config?.updateCheck === false || !hasLease) return;
+    const notify = msg => (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`));
+    // announce:false — the persistent TUI banner is the passive reminder; only real
+    // actions (installing / applying) log here, so a pending update never churns the log.
+    maybeCheckForUpdate(config, notify, info => { accountManager.versionInfo = info; }, { announce: false })
+      .then(r => {
+        // Fully-automatic apply: seamlessly reload into the freshly-installed version
+        // (sessions survive). The loop guard (_lastAttemptedTarget in updater.js) makes
+        // this a bounded, one-shot event per version — a boot-broken release can't loop.
+        if (r?.selfUpdated && config?.autoApply) {
+          notify('Applying update — seamless reload…');
+          restartController?.requestRestart();
+        }
+      })
+      .catch(() => {});
   }, updateIntervalMs);
   updateTimer.unref();
 

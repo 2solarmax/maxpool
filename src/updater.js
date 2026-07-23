@@ -68,43 +68,89 @@ export async function selfUpdate({ timeoutMs = 120_000 } = {}) {
   }
 }
 
+// The version of the CODE currently EXECUTING, captured ONCE before any self-install.
+// getCurrentVersion() reads package.json FROM DISK, which `npm i -g` rewrites — so
+// after a background self-install the disk version != the running version. Every
+// "am I behind?" and loop-guard decision keys on THIS fixed value, not the disk read.
+let _bootVersion;
+// The newest version this process has already ATTEMPTED to auto-apply. The loop guard:
+// a version that installs fine but fails to BOOT rolls back to the old worker, which is
+// still running _bootVersion with its timer armed — without this it would re-detect the
+// on-disk version every check and re-apply forever (a boot-broken release → infinite
+// reload loop, ~30s of refused admission each cycle). We apply only versions strictly
+// newer than max(_bootVersion, _lastAttemptedTarget), so a rolled-back target is
+// quarantined until an even newer release appears.
+let _lastAttemptedTarget = null;
+
+/** Test-only: reset the module's version-tracking state between cases. */
+export function __resetUpdaterState() { _bootVersion = undefined; _lastAttemptedTarget = null; }
+
 /**
- * Startup hook: check for an update and either notify (default) or self-install
- * (config.autoUpdate). Never auto-restarts a running proxy — the new version
- * applies on the next restart, so in-flight sessions are never interrupted.
- * Fire-and-forget; all failures are swallowed.
+ * Check for an update; with `config.autoUpdate` also self-install; with
+ * `config.autoApply` SIGNAL that the caller should seamlessly reload to APPLY it
+ * (returns `selfUpdated:true`). All failures swallowed. Deps are injectable for tests.
  *
- * `onVersionInfo` (optional) is ALWAYS invoked with { current, latest, hasUpdate,
- * checkedAt } — even when up-to-date, offline, or updateCheck is off — so the TUI
- * header / status can show the running version + whether an update is available.
+ * `onVersionInfo` is ALWAYS invoked with { current, latest, hasUpdate, checkedAt } —
+ * current + hasUpdate keyed on the RUNNING version (so the banner stays accurate after a
+ * background download, until the reload). `deps.announce===false` suppresses the passive
+ * "Update available" line (the periodic path — the persistent banner already shows it).
+ *
+ * Returns { hasUpdate, selfUpdated, installedVersion? }.
  */
-export async function maybeCheckForUpdate(config, notify, onVersionInfo) {
-  const current = await getCurrentVersion();
-  // Skip the npm round-trip when the user disabled update checks, but still report
-  // the running version so the indicator can show it.
-  const result = config?.updateCheck === false ? null : await checkForUpdate(current);
+export async function maybeCheckForUpdate(config, notify, onVersionInfo, deps = {}) {
+  const _get = deps.getCurrentVersion || getCurrentVersion;
+  const _check = deps.checkForUpdate || checkForUpdate;
+  const _self = deps.selfUpdate || selfUpdate;
+  const announce = deps.announce !== false;
+
+  if (_bootVersion === undefined) _bootVersion = await _get();
+  const current = _bootVersion;
+  const result = config?.updateCheck === false ? null : await _check(current);
+  const hasUpdate = Boolean(result?.hasUpdate);
 
   if (onVersionInfo) {
     try {
-      onVersionInfo({
-        current,
-        latest: result?.latest ?? null,
-        hasUpdate: Boolean(result?.hasUpdate),
-        checkedAt: Date.now(),
-      });
-    } catch { /* the indicator is best-effort; never break startup */ }
+      onVersionInfo({ current, latest: result?.latest ?? null, hasUpdate, checkedAt: Date.now() });
+    } catch { /* indicator is best-effort; never break startup */ }
   }
 
-  if (!result || !result.hasUpdate) return;
+  if (!hasUpdate) return { hasUpdate: false, selfUpdated: false };
+  if (announce) notify(`Update available: ${result.current} → ${result.latest}`);
 
-  notify(`Update available: ${result.current} → ${result.latest}`);
-  if (config?.autoUpdate) {
+  if (!config?.autoUpdate) {
+    if (announce) notify(`Run 'npm i -g ${PACKAGE}' to update, or set "autoUpdate": true in your config.`);
+    return { hasUpdate: true, selfUpdated: false };
+  }
+
+  // Skip the reinstall if the latest is ALREADY on disk (a prior check downloaded it) —
+  // otherwise every periodic check re-runs `npm i -g` + re-logs until a manual restart.
+  const onDisk = await _get();
+  if (!onDisk || compareVersions(onDisk, result.latest) < 0) {
     notify(`Auto-updating to ${result.latest}…`);
-    const r = await selfUpdate();
-    notify(r.ok
-      ? `Updated to ${result.latest}. Restart maxpool to apply (running sessions are not interrupted).`
-      : `Auto-update failed: ${r.error}. Run: npm i -g ${PACKAGE}`);
-  } else {
-    notify(`Run 'npm i -g ${PACKAGE}' to update, or set "autoUpdate": true in your config.`);
+    const r = await _self();
+    if (!r.ok) {
+      notify(`Auto-update failed: ${r.error}. Run: npm i -g ${PACKAGE}`);
+      return { hasUpdate: true, selfUpdated: false };
+    }
   }
+
+  const installed = await _get();
+  // Loop/quarantine guard — apply only a version strictly newer than the newest we've
+  // already booted-as OR already tried to apply.
+  const floor = (_lastAttemptedTarget && compareVersions(_lastAttemptedTarget, current) > 0)
+    ? _lastAttemptedTarget : current;
+  const canApply = Boolean(installed) && compareVersions(installed, floor) > 0;
+
+  if (config?.autoApply && canApply) {
+    _lastAttemptedTarget = installed;   // mark BEFORE the reload so a rollback can't re-trigger
+    notify(`Updated to ${installed}. Applying now (seamless reload)…`);
+    return { hasUpdate: true, selfUpdated: true, installedVersion: installed };
+  }
+  if (config?.autoApply && installed && _lastAttemptedTarget
+      && compareVersions(installed, _lastAttemptedTarget) <= 0) {
+    notify(`Update ${installed} already attempted and rolled back — staying on ${current}; will retry only a newer release.`);
+  } else if (announce) {
+    notify(`Updated to ${installed || result.latest}. Restart maxpool to apply (sessions are not interrupted).`);
+  }
+  return { hasUpdate: true, selfUpdated: false, installedVersion: installed };
 }
