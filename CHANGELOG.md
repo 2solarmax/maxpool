@@ -5,6 +5,20 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.39] - 2026-07-23
+
+### Added
+
+- Update reminder + visible disabled + cross-provider footer + wider name + login-flood fix
+
+### Documentation
+
+- Note restart drain-count semantics; open-issues #46
+
+### Fixed
+
+- Live 'Restarting — draining N…' feedback on R→Yes (no more frozen screen) + dedup teardown
+
 ## [1.5.38] - 2026-07-23
 
 ### Changed
