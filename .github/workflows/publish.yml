@@ -40,12 +40,34 @@ jobs:
         run: npm install -g npm@latest
       - name: Publish to npm (OIDC — no token)
         run: npm publish --provenance --access public
-      # A git tag is not a browsable release. Cut a GitHub Release per version tag,
-      # with notes auto-generated from the conventional-commit history since the last
+      # A git tag is not a browsable release. Cut a GitHub Release per version
       # tag — the public "what changed" that npm links back to. Tag pushes only
       # (a workflow_dispatch runs on a branch ref, which has no version to release).
+      #
+      # Notes are built from the COMMIT LOG since the previous tag, not from
+      # `--generate-notes`: that flag lists merged PRs, and maxpool commits
+      # straight to main (no PRs) — so it yields empty notes. The commit
+      # subjects (conventional-commit style) ARE the changelog here.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes --verify-tag
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          if [ -n "$PREV" ]; then
+            # Commit subjects since the previous tag, minus the release-chore commit.
+            NOTES="$(git log "${PREV}..${TAG}" --no-merges --pretty=format:'- %s' \
+              | grep -vE '^- chore: release ' || true)"
+            {
+              echo "## What changed"
+              echo ""
+              if [ -n "$NOTES" ]; then echo "$NOTES"; else echo "- (no notable changes)"; fi
+              echo ""
+              echo "**Full changelog:** https://github.com/${{ github.repository }}/compare/${PREV}...${TAG}"
+            } > /tmp/release-notes.md
+            gh release create "$TAG" --title "$TAG" --notes-file /tmp/release-notes.md --verify-tag
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+          fi
