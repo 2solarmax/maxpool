@@ -1,6 +1,6 @@
 import { createInterface } from 'node:readline';
 import { fetchProfile, loginOAuth, tokenFingerprint } from './oauth.js';
-import { appendEventLog } from './event-log.js';
+import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -27,9 +27,9 @@ const vw = s => strip(s).length;
 // ── Accounts-table columns ───────────────────────────────────
 // Fixed column widths shared by the header row (acctHeader) AND every data row, so
 // the header labels stay aligned with the columns they name. The Account/Provider/
-// Status/Quota start offsets (4/17/27/41) are pure functions of these widths + the
+// Status/Quota start offsets (4/21/31/45) are pure functions of these widths + the
 // 4-col row prefix, independent of the quota-bar width.
-const NAME_W = 12;         // a.name.slice(0, NAME_W).padEnd(NAME_W)
+const NAME_W = 16;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — wide enough for a full email
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
@@ -435,11 +435,9 @@ export class TUI {
         'Reload account credentials and newly added accounts from the config file.',
         () => this._doSync(),
       );
-    } else if (k === 't' && this.am.accounts.length > 0) {
-      // Manual on/off toggle straight from the top level (also under a → Accounts).
-      // select → confirm → returns to 'normal', so this never strands the user.
-      this._startSelection('toggle');
     }
+    // Enable/disable lives ONLY under [a] Accounts now (with rename/delete/login) —
+    // one home for every account mutation, instead of a duplicate top-level toggle.
   }
 
   _keyAccounts(k) {
@@ -482,9 +480,9 @@ export class TUI {
       );
     } else if (k === 'p' && this.am.accounts.some(account => account.type !== 'provider')) {
       this._startSelection('prefer');
-    } else if (k === 'f') {
+    } else if (k === 'f' || k === 'F') {
       // Cycle the cross-provider fallback policy in place — reversible + non-destructive,
-      // so no confirm dialog (unlike restart/delete).
+      // so no confirm dialog (unlike restart/delete). Accept F too (Shift-f muscle memory).
       this._cycleCrossProviderPolicy();
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
@@ -656,6 +654,12 @@ export class TUI {
   async _doLogin() {
     const wasRunning = this.running;
     if (wasRunning) this.stop();
+    // Mute the console-log MIRROR to stdout during the interactive prompt so routing
+    // logs (console.log, e.g. the glm-fallback 429 churn) don't flood over the readline
+    // "Name this account" prompt. The prompts + errors use process.stdout.write, which
+    // BYPASSES the mirror, so they stay visible. Login runs only on the terminal-owning
+    // primary (mirror baseline false), so the finally restores it to false.
+    setConsoleStdoutSuppressed(true);
     try {
       process.stdout.write('\nOpening browser to log into Claude…\n');
       const creds = await loginOAuth();
@@ -673,6 +677,9 @@ export class TUI {
         rl.close();
         name = String(answer || '').trim() || suggested;
       }
+      // Lift the mute BEFORE the upsert so its persist-confirmation (a console.log,
+      // deliberately visible during the stopped-TUI login) reaches the user.
+      setConsoleStdoutSuppressed(false);
       // Message honors the ACTUAL result: if a manually-typed name collided with a
       // different existing account, upsert updates in place → "Re-authenticated", never
       // a false "Added new account".
@@ -683,6 +690,7 @@ export class TUI {
     } catch (e) {
       process.stdout.write(`\nLogin failed: ${e.message}\n`);
     } finally {
+      setConsoleStdoutSuppressed(false);   // restore on every path (incl. the catch)
       if (wasRunning) this.start();
     }
   }
@@ -962,14 +970,19 @@ export class TUI {
     // ── Header
     const v = this.am.versionInfo;
     const verStr = v?.current ? ` ${dim('v' + v.current)}` : '';
-    // "↑ vX.Y.Z" when a newer npm version is published; nothing when on latest or
-    // the check hasn't resolved yet (so the header never falsely implies up-to-date).
-    const updStr = (v?.hasUpdate && v?.latest) ? `  ${yellow('↑ v' + v.latest)}` : '';
-    const left = bold(' Maxpool') + verStr + updStr;
+    const left = bold(' Maxpool') + verStr;
     const port = this.config.proxy?.port || 3456;
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
+    // Update reminder: a prominent, actionable banner when a newer npm version is
+    // published — nothing when on latest or the check hasn't resolved (no permanent
+    // blank line). The persistent banner IS the reminder; a long-lived session's
+    // periodic re-check keeps it current (index.js updateTimer refreshes versionInfo).
+    if (v?.hasUpdate && v?.latest) {
+      lines.push('  ' + yellow(`↑ Update available: v${v.current} → v${v.latest}`)
+        + dim("  ·  run 'npm i -g maxpool', then press r"));
+    }
     const routing = this.am.routingMode === 'preferred'
       ? `Manual preference: ${this.am.preferredAccountName} (automatic failover)`
       : 'Automatic load balancing';
@@ -1020,11 +1033,11 @@ export class TUI {
       // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
       const showBoth = W >= 70;
-      // 57/46 = the fixed pre-bar column span (prefix + Account + Provider + Status +
-      // gaps); grew by 1 with the Provider column (was 56/45 under the 8-wide Type col).
+      // 61/50 = the fixed pre-bar column span (prefix + Account + Provider + Status +
+      // gaps); grew by +4 with the wider 16-col Account column (was 57/46 at NAME_W 12).
       const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 57) / 2)))
-        : Math.max(5, Math.min(20, W - 46));
+        ? Math.max(5, Math.min(20, Math.floor((W - 61) / 2)))
+        : Math.max(5, Math.min(20, W - 50));
 
       // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
       // display order over the canonical am.accounts array (which stays untouched so
@@ -1109,7 +1122,10 @@ export class TUI {
 
     // Name (bold if selected)
     const rawName = a.name.slice(0, NAME_W).padEnd(NAME_W);
-    const name = isSel ? bold(rawName) : rawName;
+    // A disabled account reads as "off" — dim the whole name. Applied as a SINGLE SGR
+    // (never dim(bold(...)) — bold()'s trailing RESET would cancel the dim mid-string),
+    // so a disabled row is never also bold-selected.
+    const name = a.enabled === false ? dim(rawName) : (isSel ? bold(rawName) : rawName);
 
     // Provider column — the real vendor (Anthropic / z.ai / Moonshot), padded to
     // PROVIDER_W so "Anthropic" (9 chars) never overflows and shifts the row (incl.
@@ -1147,7 +1163,7 @@ export class TUI {
       case 'probing':   status = green('probing'); break;
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
-      case 'disabled':  status = gray('disabled'); break;
+      case 'disabled':  status = red('✕ disabled'); break;
       case 'throttled': {
         // A transient auto-recovering cooldown — show the remaining time (from
         // rateLimitedUntil) so it reads as "recovering in Ns", not stuck.
@@ -1310,11 +1326,16 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('t')} On/off  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
       case 'accounts':
         return ` ${bold('l')} Login/re-auth (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
-      case 'routing':
-        return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('f')} Cross-provider fallback  ${bold('Esc')} Back`;
+      case 'routing': {
+        // Show the CURRENT cross-provider policy inline so pressing f visibly changes it
+        // right here at the footer (the policy also renders in the header, far from the
+        // keypress — the "f does nothing" report).
+        const xp = this.am._crossProviderFallbackPolicy?.() || 'when-exhausted';
+        return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('f')} Cross-provider: ${cyan(xp)} ↻  ${bold('Esc')} Back`;
+      }
       case 'select': {
         const act = this.selAction === 'prefer'
           ? 'prefer'

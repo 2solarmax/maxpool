@@ -41,7 +41,8 @@ test('normal footer uses mnemonic top-level actions', () => {
 
   const footer = __tuiTest.strip(tui._renderFooter());
   assert.match(footer, /a Accounts/);
-  assert.match(footer, /t On\/off/);
+  // On/off consolidated into [a] Accounts — no longer a top-level footer action.
+  assert.doesNotMatch(footer, /On\/off/);
   assert.match(footer, /m Routing/);
   assert.match(footer, /s Sync/);
   assert.match(footer, /r Restart/);
@@ -156,7 +157,7 @@ test('account disable is confirmed and persisted without deleting credentials', 
   assert.equal(config.accounts[0].accessToken, 'secret');
 });
 
-test('top-level "t" (advertised in the normal footer) disables an account end-to-end', async () => {
+test('enable/disable is consolidated under [a] Accounts (top-level "t" is inert)', async () => {
   const accounts = [{ name: 'personal', type: 'oauth', status: 'active', enabled: true, inFlight: 0 }];
   const am = accountManager(accounts);
   const config = {
@@ -165,10 +166,16 @@ test('top-level "t" (advertised in the normal footer) disables an account end-to
   };
   const tui = new TUI({ accountManager: am, config, saveConfig: async () => {} });
 
-  // Straight from the top level — NOT via 'a' Accounts first. This is the wiring
-  // the footer promises; a footer-only change would advertise a dead key.
+  // Top-level "t" no longer toggles — enable/disable was consolidated into the
+  // Accounts submenu (and dropped from the normal footer, so no dead key is advertised).
   tui._keyNormal('t');
-  assert.equal(tui.mode, 'select', 'normal-mode "t" opens the account picker');
+  assert.equal(tui.mode, 'normal', 'top-level "t" is inert after consolidation');
+
+  // The toggle still works end-to-end via [a] Accounts → [t].
+  tui._keyNormal('a');
+  assert.equal(tui.mode, 'accounts', '"a" opens Accounts');
+  tui._keyAccounts('t');
+  assert.equal(tui.mode, 'select', 'Accounts "t" opens the account picker');
   assert.equal(tui.selAction, 'toggle');
 
   tui._keySelect('enter');

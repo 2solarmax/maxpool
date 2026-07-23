@@ -296,8 +296,8 @@ test('the column header sits exactly over the Account/Provider/Status/Quota colu
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
   assert.equal(hdr.indexOf('Account'), 4, 'Account over the name column');
-  assert.equal(hdr.indexOf('Provider'), 17, 'Provider over the provider column');
-  assert.equal(hdr.indexOf('Status'), 27, 'Status over the status column (shifted +1 by the 9-wide Provider col)');
+  assert.equal(hdr.indexOf('Provider'), 21, 'Provider over the provider column (shifted by the 16-wide Account col)');
+  assert.equal(hdr.indexOf('Status'), 31, 'Status over the status column');
   // the Quota group label lands exactly on the inline Ses/Tok quota label
   assert.equal(hdr.indexOf('Quota'), row.indexOf('Ses '), 'Quota over the quota bars');
 });
@@ -319,9 +319,9 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   const wide = strip(__tuiTest.acctHeader(100));
   const narrow = strip(__tuiTest.acctHeader(72));
   assert.equal(narrow.indexOf('Account'), 4);
-  assert.equal(narrow.indexOf('Status'), 27);
+  assert.equal(narrow.indexOf('Status'), 31);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  assert.equal(narrow.indexOf('Quota'), 41);
+  assert.equal(narrow.indexOf('Quota'), 45);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
@@ -399,8 +399,8 @@ test('the abbreviation glossary is a FOOTER below the rows, never between the he
 });
 
 test('an extreme-narrow header clips WITHOUT bleeding the underline into later lines', () => {
-  // The header renders whenever W>=40; the 45-char short header exceeds W in the
-  // 40<=W<45 window. It must go through fitLine like the real _render pipeline and
+  // The header renders whenever W>=40; the 50-char short header exceeds W in the
+  // 40<=W<50 window. It must go through fitLine like the real _render pipeline and
   // still terminate its underline (\x1b[0m) so it can't bleed onto the rows below.
   const RESET = '\x1b[0m';
   const headerLine = '\x1b[2;4m' + __tuiTest.acctHeader(42) + RESET; // dim+underline, as _render builds it

@@ -702,6 +702,7 @@ async function serverWorkerCommand() {
   let tui = null;
   let server = null;
   let syncTimer = null;
+  let updateTimer = null;
   let draining = false;
   let restartController = null;
   // Set once this worker hands the terminal to a new worker during a seamless TUI
@@ -805,6 +806,7 @@ async function serverWorkerCommand() {
     if (draining) return;
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
+    if (updateTimer) clearInterval(updateTimer);
     if (tui?.running) { tui.stop(); }
     console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
@@ -893,6 +895,7 @@ async function serverWorkerCommand() {
 
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
+    if (updateTimer) clearInterval(updateTimer);
     if (tui?.running) tui.stop();
     // Best-effort final flush + settle writes (fire-and-forget; the drain timeout
     // below bounds total quit time, and write barriers protect the on-disk state).
@@ -1015,6 +1018,21 @@ async function serverWorkerCommand() {
   }, syncIntervalMs);
   syncTimer.unref();
 
+  // Periodic update re-check. The startup probe (in becomePrimary) is one-shot, but a
+  // long-lived session (days) must still be reminded of versions published AFTER it
+  // started. This timer is UNCONDITIONAL (NOT reload-guarded) so it survives a seamless
+  // `r`-reload — otherwise taking an update (which the banner tells users to do via `r`)
+  // would permanently disable all future update detection. It only refreshes
+  // versionInfo (the persistent TUI banner is the reminder, so no repeated log spam);
+  // autoUpdate progress lines still surface. unref so it never blocks a clean exit.
+  const updateIntervalMs = Math.max(60_000, Number(process.env.MAXPOOL_UPDATE_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000);
+  updateTimer = setInterval(() => {
+    if (config?.updateCheck === false) return;
+    const autoNotify = msg => { if (config?.autoUpdate) (tui?._addLog ? tui._addLog(msg) : console.log(`[Maxpool] ${msg}`)); };
+    maybeCheckForUpdate(config, autoNotify, info => { accountManager.versionInfo = info; }).catch(() => {});
+  }, updateIntervalMs);
+  updateTimer.unref();
+
   // Become the live primary: start serving UI/logs, take the writer lease, run
   // the update check. `viaTakeover` true means we acquired the socket through the
   // baton (a reload) — freeze the update check so a reload doesn't re-probe npm
@@ -1092,6 +1110,8 @@ async function serverWorkerCommand() {
       // proceeding (not a rollback). Disarm the rollback self-heal.
       if (reloadWatchdog) { clearTimeout(reloadWatchdog); reloadWatchdog = null; }
       if (syncTimer) clearInterval(syncTimer);
+      if (updateTimer) clearInterval(updateTimer);
+    if (updateTimer) clearInterval(updateTimer);
       // Stop accepting NEW connections; KEEP in-flight requests alive.
       server.maxpoolBeginDrain?.();
       server.close(() => {});
