@@ -1348,16 +1348,22 @@ function classifyRateLimit(account, headers, body, opts = {}) {
   // genuine account cap with stripped headers must bench the whole account, not one
   // model). Neither bucket may be at/above the exhaustion floor.
   const haveUnifiedEvidence = Number.isFinite(weekly) || Number.isFinite(fiveHour);
+  // Exhaustion floor for 429-SCOPE classification — kept in sync with the scheduler's
+  // weeklyExhaustedThreshold (0.999, use-it-or-lose-it). A 429 whose unified buckets are
+  // still below the floor isn't weekly-exhaustion, so a model-family + long-retry-after
+  // 429 benches only that model, not the whole (still-usable) account — matching routing,
+  // which now treats 0.95-0.999 as usable (critical), not benched.
+  const EXHAUSTION_FLOOR = 0.999;
   const unifiedNotExhausted =
-    (!Number.isFinite(weekly) || weekly < 0.985) && (!Number.isFinite(fiveHour) || fiveHour < 0.985);
+    (!Number.isFinite(weekly) || weekly < EXHAUSTION_FLOOR) && (!Number.isFinite(fiveHour) || fiveHour < EXHAUSTION_FLOOR);
   const modelScope =
     (fam && haveUnifiedEvidence && unifiedNotExhausted && Number.isFinite(retryAfter) && retryAfter >= 30 * 60)
       ? fam : null;
 
   const quotaHeaderExhaustion =
     unifiedStatus === 'rejected'
-    || (Number.isFinite(fiveHour) && fiveHour >= 0.985)
-    || (Number.isFinite(weekly) && weekly >= 0.985)
+    || (Number.isFinite(fiveHour) && fiveHour >= EXHAUSTION_FLOOR)
+    || (Number.isFinite(weekly) && weekly >= EXHAUSTION_FLOOR)
     || (headers['anthropic-ratelimit-tokens-remaining'] != null && tokensRemaining <= 0)
     || (headers['anthropic-ratelimit-requests-remaining'] != null && requestsRemaining <= 0);
   if (quotaHeaderExhaustion) return { scope: 'account', fingerprint: null, modelScope };

@@ -91,7 +91,12 @@ const DEFAULT_SCHEDULER = {
   weeklySoftThreshold: 0.65,
   weeklyReserveThreshold: 0.85,
   weeklyCriticalThreshold: 0.95,
-  weeklyExhaustedThreshold: 0.985,
+  // Use-it-or-lose-it (2026-07-24): bench only at 99.9%, not 98.5% — the weekly quota
+  // resets, so reserving the top ~1.5% just wastes it. The thin 0.1% floor is the ONE
+  // remaining guard: don't fire a request at an account whose own header already says
+  // it's essentially full (a near-guaranteed-waste hard-429). A real 429 sets util≈1.0
+  // and still benches here. Critical (0.95-0.999) stays last-resort-only (pass 2).
+  weeklyExhaustedThreshold: 0.999,
   weeklyBurnDebtWeight: 0.6,
   // Routing-cost tuning (lower cost = preferred). The goal is to AVOID
   // short-term (rate/concurrency) throttling by spreading load across healthy

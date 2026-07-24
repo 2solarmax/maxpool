@@ -270,7 +270,7 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
     "weeklySoftThreshold": 0.65,
     "weeklyReserveThreshold": 0.85,
     "weeklyCriticalThreshold": 0.95,
-    "weeklyExhaustedThreshold": 0.985,
+    "weeklyExhaustedThreshold": 0.999,
     "weeklyBurnDebtWeight": 0.6
   },
   "retry": {

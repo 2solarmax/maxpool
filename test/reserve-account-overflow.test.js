@@ -30,7 +30,7 @@ test('_reserveCost is 0 for normal/soft/critical/exhausted, non-zero only in the
     { name: 'soft', weekly: 0.70 },
     { name: 'reserve', weekly: 0.88, resetInMs: 2 * DAY },
     { name: 'critical', weekly: 0.96 },
-    { name: 'exhausted', weekly: 0.99 },
+    { name: 'exhausted', weekly: 0.9995 },   // >= 0.999 exhausted threshold
   ]);
   const [normal, soft, reserve, critical, exhausted] = am.accounts;
   assert.equal(am._reserveCost(normal), 0, 'normal not softened');

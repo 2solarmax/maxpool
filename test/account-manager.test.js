@@ -940,7 +940,7 @@ test('raw-healthy but pace-critical account stays available (routing consistency
 test('hold-vs-error oracle: all weekly-exhausted with KNOWN reset → finite retry (HOLD)', () => {
   const am = manager(2);
   for (const a of am.accounts) {
-    a.quota.unified7d = 0.99;
+    a.quota.unified7d = 0.9995;                          // exhausted (>= 0.999)
     a.quota.unified7dReset = Date.now() + 51 * 3600_000; // 51h out — the case the old kill rejected
   }
   const plan = am.nextRetryForRequest({ profile: 'claude' });
@@ -987,7 +987,7 @@ test('bug B: weekly-critical + 5h-capped fleet HOLDS for the SOON 5h reset, not 
   const am = manager(2);
   const fiveHReset = Date.now() + 2 * 3600_000;
   for (const a of am.accounts) {
-    a.quota.unified7d = 0.96;                          // raw weekly critical [0.95,0.985)
+    a.quota.unified7d = 0.96;                          // raw weekly critical [0.95,0.999)
     a.quota.unified7dReset = Date.now() + 40 * 3600_000;
     a.quota.unified5h = 0.95;                          // ALSO 5h-capped (>= switchThreshold)
     a.quota.unified5hReset = fiveHReset;
@@ -1104,7 +1104,7 @@ test('minor (min-merge): a sibling weekly-exhausted 30min reset wins over a week
   A.quota.unified7dReset = Date.now() + 40 * 3600_000;
   A.quota.unified5h = 0.95;                       // queueable 3h session_limit
   A.quota.unified5hReset = Date.now() + 3 * 3600_000;
-  B.quota.unified7d = 0.99;                       // exhausted
+  B.quota.unified7d = 0.9995;                     // exhausted (>= 0.999)
   B.quota.unified7dReset = Date.now() + 30 * 60_000;
   const plan = am.nextRetryForRequest({ profile: 'claude' });
   assert.equal(plan.available, false);
@@ -1121,9 +1121,9 @@ test('bug B (masking): a sooner weekly-critical recovery wins over a far weekly-
   // multi-day Retry-After. Min-merge must surface the SOONER critical recovery.
   const am = manager(2);
   const A = am.accounts[0], B = am.accounts[1];
-  A.quota.unified7d = 0.99;                       // exhausted (>= 0.985)
+  A.quota.unified7d = 0.9995;                     // exhausted (>= 0.999)
   A.quota.unified7dReset = Date.now() + 40 * 3600_000;
-  B.quota.unified7d = 0.96;                       // critical [0.95, 0.985)
+  B.quota.unified7d = 0.96;                       // critical [0.95, 0.999)
   B.quota.unified7dReset = null;                  // reset unknown
   B.quota.unified5h = 0.95;                       // ALSO 5h-capped, reset unknown
   B.quota.unified5hReset = null;                  // → bounded ~60s weekly-critical hold
@@ -1448,7 +1448,7 @@ test('NOT over-corrected: thinking + ALL accounts weekly-exhausted behind a queu
   const am = healthyPair();
   am.queueState.waiting.push({ id: 999 });
   const reset = Date.now() + 3 * 24 * 60 * 60 * 1000; // days away
-  am.accounts.forEach(a => { a.quota = { unified7d: 0.99, unified7dReset: reset }; });
+  am.accounts.forEach(a => { a.quota = { unified7d: 0.9995, unified7dReset: reset }; }); // exhausted (>= 0.999)
   const req = { profile: 'claude', stream: true, sessionKey: 's', requiresAnthropicThinkingIntegrity: true };
   const plan = am.nextRetryForRequest(req);
   // _isAvailable fails the weekly-exhausted gate, so the new branch must NOT fire:

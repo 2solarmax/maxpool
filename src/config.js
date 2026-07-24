@@ -90,7 +90,9 @@ export function createDefaultConfig() {
       weeklySoftThreshold: 0.65,
       weeklyReserveThreshold: 0.85,
       weeklyCriticalThreshold: 0.95,
-      weeklyExhaustedThreshold: 0.985,
+      // Use-it-or-lose-it: bench only at 99.9% (the weekly quota resets, so reserving
+      // the top ~1.5% wastes it). A real 429 sets util≈1.0 and still benches.
+      weeklyExhaustedThreshold: 0.999,
       // Cross-PROVIDER fallback policy for 'cc all' (profile=all): whether a session
       // may be served by a provider family other than its home (Claude → GLM/Kimi).
       //   'never'         — (DEFAULT) a Claude Code session stays on Anthropic; no

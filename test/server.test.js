@@ -17,7 +17,9 @@ test('classifyRateLimit tags modelScope on a per-model weekly cap (long reset, u
 });
 
 test('classifyRateLimit does NOT model-scope a genuine UNIFIED weekly cap', () => {
-  const headers = { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '0.99' };
+  // 0.9995 = genuinely unified-exhausted under the 0.999 floor (use-it-or-lose-it); at
+  // this the rejection is account-wide, not a per-model cap on a still-healthy account.
+  const headers = { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '0.9995' };
   const r = classifyRateLimit(oauthAcct, headers, '{"error":{"message":"weekly limit reached"}}', { model: 'claude-fable-5', retryAfter: 2 * 24 * 3600 });
   assert.equal(r.scope, 'account');
   assert.equal(r.modelScope, null, 'unified is exhausted → whole-account bench, not model-scoped');

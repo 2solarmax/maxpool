@@ -35,9 +35,9 @@ test('scoped tag renders the real % at 90% (not "maxed")', () => {
   assert.doesNotMatch(line, /maxed/, '90% is not maxed');
 });
 
-test('scoped tag renders "maxed" only at genuine exhaustion (>= 0.985)', () => {
+test('scoped tag renders "maxed" only at genuine exhaustion (>= 0.999)', () => {
   const am = oauthAM();
-  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.99, severity: 'critical', isActive: true, resetAt: Date.now() + 3 * DAY } } });
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.9995, severity: 'critical', isActive: true, resetAt: Date.now() + 3 * DAY } } });
   const tui = new TUI({ accountManager: am });
   const line = strip(tui._renderAcct(0, 11, true));
   assert.match(line, /Fable maxed/);

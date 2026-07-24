@@ -1294,7 +1294,7 @@ export class TUI {
     // still usable, "Fable maxed" (red) ONLY at genuine exhaustion. This is the
     // SAME predicate the router benches on (_scopedExhausted), so "maxed" renders
     // iff the model is actually benched — 90%/critical is no longer mislabelled.
-    const exhaustedFloor = this.am.scheduler?.weeklyExhaustedThreshold ?? 0.985;
+    const exhaustedFloor = this.am.scheduler?.weeklyExhaustedThreshold ?? 0.999;
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85;
     const scopedTags = [];
     for (const [fam, e] of Object.entries(q.scopedWeekly || {})) {

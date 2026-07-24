@@ -35,17 +35,17 @@ test('a scoped weekly at 90% with severity:critical is NOT benched (the "Fable m
   assert.equal(am._isAvailable(a1, { allowWeeklyReserve: true, model: 'claude-fable-5' }), true, 'Fable still served at 90%');
 });
 
-test('the SAME predicate benches at genuine exhaustion (>= 0.985) and on a real 429 (util:1)', () => {
+test('the SAME predicate benches at genuine exhaustion (>= 0.999) and on a real 429 (util:1)', () => {
   const am = oauthAM(2);
-  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.99, severity: 'critical', isActive: true, resetAt: Date.now() + 3 * DAY } } });
-  assert.ok(am._scopedExhausted(am.accounts[0], 'claude-fable-5'), '99% is exhausted → benched');
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.9995, severity: 'critical', isActive: true, resetAt: Date.now() + 3 * DAY } } });
+  assert.ok(am._scopedExhausted(am.accounts[0], 'claude-fable-5'), '99.95% is exhausted → benched');
 
   const am2 = oauthAM(2);
   am2.markRateLimited(0, 3600, { modelScope: 'fable', status: 429 }); // util:1
   assert.ok(am2._scopedExhausted(am2.accounts[0], 'claude-fable-5'), 'a real 429 (util:1) still benches');
 });
 
-test('just below exhaustion (0.98) is still not benched — only >= 0.985', () => {
+test('a below-floor value (0.98) is still not benched — only >= 0.999', () => {
   const am = oauthAM(2);
   am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.98, severity: 'critical', isActive: true, resetAt: Date.now() + DAY } } });
   assert.equal(am._scopedExhausted(am.accounts[0], 'claude-fable-5'), null);
