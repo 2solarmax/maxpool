@@ -296,8 +296,8 @@ test('the column header sits exactly over the Account/Provider/Status/Quota colu
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
   assert.equal(hdr.indexOf('Account'), 4, 'Account over the name column');
-  assert.equal(hdr.indexOf('Provider'), 21, 'Provider over the provider column (shifted by the 16-wide Account col)');
-  assert.equal(hdr.indexOf('Status'), 31, 'Status over the status column');
+  assert.equal(hdr.indexOf('Provider'), 25, 'Provider over the provider column (shifted by the 20-wide Account col)');
+  assert.equal(hdr.indexOf('Status'), 35, 'Status over the status column');
   // the Quota group label lands exactly on the inline Ses/Tok quota label
   assert.equal(hdr.indexOf('Quota'), row.indexOf('Ses '), 'Quota over the quota bars');
 });
@@ -319,9 +319,9 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   const wide = strip(__tuiTest.acctHeader(100));
   const narrow = strip(__tuiTest.acctHeader(72));
   assert.equal(narrow.indexOf('Account'), 4);
-  assert.equal(narrow.indexOf('Status'), 31);
+  assert.equal(narrow.indexOf('Status'), 35);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  assert.equal(narrow.indexOf('Quota'), 45);
+  assert.equal(narrow.indexOf('Quota'), 49);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 

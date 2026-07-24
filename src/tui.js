@@ -27,9 +27,9 @@ const vw = s => strip(s).length;
 // ── Accounts-table columns ───────────────────────────────────
 // Fixed column widths shared by the header row (acctHeader) AND every data row, so
 // the header labels stay aligned with the columns they name. The Account/Provider/
-// Status/Quota start offsets (4/21/31/45) are pure functions of these widths + the
+// Status/Quota start offsets (4/25/35/49) are pure functions of these widths + the
 // 4-col row prefix, independent of the quota-bar width.
-const NAME_W = 16;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — wide enough for a full email
+const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
@@ -250,6 +250,9 @@ export class TUI {
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
+    // Set by index.js after construction (a deferred closure, not a constructor literal —
+    // avoids the const TDZ on applyUpdateIfReady, which is defined after `new TUI`).
+    this.checkNow = null;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -400,6 +403,7 @@ export class TUI {
       case 'normal': this._keyNormal(k); break;
       case 'accounts': this._keyAccounts(k); break;
       case 'routing': this._keyRouting(k); break;
+      case 'updates': this._keyUpdates(k); break;
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
       case 'confirm': this._keyConfirm(k); break;
@@ -435,9 +439,50 @@ export class TUI {
         'Reload account credentials and newly added accounts from the config file.',
         () => this._doSync(),
       );
+    } else if (k === 'u') {
+      this.mode = 'updates';
     }
     // Enable/disable lives ONLY under [a] Accounts now (with rename/delete/login) —
     // one home for every account mutation, instead of a duplicate top-level toggle.
+  }
+
+  // Automatic updates are "on" only when the whole chain is enabled: check npm →
+  // install to disk → seamlessly reload. Any one off means a release won't land hands-free.
+  _autoUpdateOn() {
+    const c = this.config || {};
+    return c.updateCheck !== false && c.autoUpdate === true && c.autoApply === true;
+  }
+
+  _keyUpdates(k) {
+    if (k === 'c') {
+      // Check & apply now — the dance-killer: pull the latest + seamless-reload in place,
+      // no quit/relaunch. index.js wires this.checkNow (applies regardless of autoApply).
+      this.mode = 'normal';
+      if (this.checkNow) this.checkNow();
+      else this._addLog('Update check unavailable on this worker');
+    } else if (k === 't') {
+      this._toggleAutoUpdate();
+    } else if (k === 'esc' || k === 'q') {
+      this.mode = 'normal';
+    }
+  }
+
+  async _toggleAutoUpdate() {
+    const turnOn = !this._autoUpdateOn();
+    // ON = the full hands-free chain; OFF = keep checking (banner still shows) but never
+    // install/reload without the user. Mutating this.config (=== the object index.js's
+    // update timer reads) takes effect live; saveConfig persists it (index.js writes these
+    // three keys) so it survives a restart.
+    this.config.updateCheck = true;
+    this.config.autoUpdate = turnOn;
+    this.config.autoApply = turnOn;
+    try {
+      await this.saveConfig(this.config);
+      this._addLog(`Automatic updates ${turnOn ? 'on' : 'off'}`);
+    } catch (error) {
+      this._addLog(`Could not save update setting: ${error.message}`);
+    }
+    this.mode = 'normal';
   }
 
   _keyAccounts(k) {
@@ -984,7 +1029,12 @@ export class TUI {
     // ── Header
     const v = this.am.versionInfo;
     const verStr = v?.current ? ` ${dim('v' + v.current)}` : '';
-    const left = bold(' Maxpool') + verStr;
+    // Auto-update state next to the version, so it's obvious whether a published release
+    // lands hands-free (green "auto-update on") or needs a manual 'u' (dim "off").
+    const auto = this._autoUpdateOn()
+      ? green('· auto-update on')
+      : dim('· auto-update off');
+    const left = bold(' Maxpool') + verStr + ' ' + auto;
     const port = this.config.proxy?.port || 3456;
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
@@ -1009,8 +1059,10 @@ export class TUI {
     // blank line). The persistent banner IS the reminder; a long-lived session's
     // periodic re-check keeps it current (index.js updateTimer refreshes versionInfo).
     if (v?.hasUpdate && v?.latest) {
-      lines.push('  ' + yellow(`↑ Update available: v${v.current} → v${v.latest}`)
-        + dim("  ·  run 'npm i -g maxpool', then press r"));
+      // No more "run npm i -g, then press r" — that manual dance is what the Updates menu
+      // kills. Auto-update ON: it applies itself; either way 'u' pulls + reloads in place.
+      const how = this._autoUpdateOn() ? 'applying automatically · or press u now' : 'press u to update now';
+      lines.push('  ' + yellow(`↑ Update available: v${v.current} → v${v.latest}`) + dim(`  ·  ${how}`));
     }
     const routing = this.am.routingMode === 'preferred'
       ? `Manual preference: ${this.am.preferredAccountName} (automatic failover)`
@@ -1062,11 +1114,11 @@ export class TUI {
       // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
       const showBoth = W >= 70;
-      // 61/50 = the fixed pre-bar column span (prefix + Account + Provider + Status +
-      // gaps); grew by +4 with the wider 16-col Account column (was 57/46 at NAME_W 12).
+      // 65/54 = the fixed pre-bar column span (prefix + Account + Provider + Status +
+      // gaps); grew by +4 with the wider 20-col Account column (was 61/50 at NAME_W 16).
       const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 61) / 2)))
-        : Math.max(5, Math.min(20, W - 50));
+        ? Math.max(5, Math.min(20, Math.floor((W - 65) / 2)))
+        : Math.max(5, Math.min(20, W - 54));
 
       // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
       // display order over the canonical am.accounts array (which stays untouched so
@@ -1355,7 +1407,11 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('r')} Restart  ${bold('q')} Stop`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop`;
+      case 'updates': {
+        const state = this._autoUpdateOn() ? green('on') : dim('off');
+        return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
+      }
       case 'accounts':
         return ` ${bold('l')} Login/re-auth (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'routing': {

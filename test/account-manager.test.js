@@ -310,7 +310,7 @@ test('shared Anthropic throttle leaves eligible providers available', () => {
   const am = new AccountManager([
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
     { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   am.markUpstreamThrottled(60, 'temporary server limit');
 
   assert.equal(am.acquireAccount({ profile: 'claude' }), null);
@@ -322,7 +322,7 @@ test('provider traffic cannot claim or clear the Anthropic recovery probe', () =
   const am = new AccountManager([
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
     { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   am.markUpstreamThrottled(60, 'temporary server limit');
   am.upstreamThrottle.until = Date.now() - 1;
   am.registerQueuedRequest({});
@@ -468,7 +468,7 @@ test('session affinity returns fallback sessions to higher-priority routes', () 
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
     { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
     { name: 'kimi-fallback', type: 'provider', provider: 'kimi', authToken: 'kk', upstream: 'http://kimi', profiles: ['all'], priority: 20 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
 
   am.markRateLimited(0, 60);
   const fallback = am.acquireAccount({ profile: 'all', sessionKey: 'session-1' });
@@ -484,7 +484,7 @@ test('thinking-protected sessions do not stay bound to provider fallback', () =>
   const am = new AccountManager([
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
     { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
 
   am.markRateLimited(0, 60);
   const fallback = am.acquireAccount({ profile: 'all', sessionKey: 'session-1' });
@@ -653,7 +653,7 @@ test('scheduler keeps provider fallbacks out of claude-only profile', () => {
       profiles: ['all'],
       priority: 10,
     },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
 
   am.markRateLimited(0, 60);
   assert.equal(am.acquireAccount({ profile: 'claude' }), null);
@@ -665,7 +665,7 @@ test('all profile only uses lower-priority providers after higher-priority accou
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
     { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
     { name: 'kimi-fallback', type: 'provider', provider: 'kimi', authToken: 'kk', upstream: 'http://kimi', profiles: ['all'], priority: 20 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
 
   let lease = am.acquireAccount({ profile: 'all' });
   assert.equal(lease.account.name, 'claude');
@@ -685,7 +685,7 @@ test('all profile uses provider before weekly-critical Claude account', () => {
   const am = new AccountManager([
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000, profiles: ['claude', 'all'], priority: 0 },
     { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   am.accounts[0].quota.unified7d = 0.96;
 
   const lease = am.acquireAccount({ profile: 'all' });
@@ -1420,7 +1420,7 @@ test('FIFO-fairness: NON-thinking newcomer behind a queue still uses the provide
   const am = new AccountManager([
     { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
     { name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'zg', upstream: 'http://glm', profiles: ['all'], priority: 10 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   am.queueState.waiting.push({ id: 1 });
   const newcomer = { profile: 'all', stream: true, sessionKey: 'nc' }; // NOT thinking; 'all' permits provider
   const plan = am.nextRetryForRequest(newcomer);

@@ -172,3 +172,25 @@ test('hasUpdate keys on the RUNNING version — banner stays accurate after a ba
   assert.equal(info.current, '1.0.0', 'current = RUNNING version, not the downloaded disk version');
   assert.equal(info.hasUpdate, true, 'banner still shows the update until a restart applies it');
 });
+
+test('the MANUAL apply path installs even when autoUpdate is off (the forceInstall shim)', async () => {
+  // index.js "check & apply now" passes { ...config, autoUpdate: true } so the manual
+  // action downloads+applies regardless of the user's automatic-update choice — else
+  // maybeCheckForUpdate short-circuits before installing and the user is stuck on the old
+  // version (the quit/relaunch dance). This locks that boundary.
+  __resetUpdaterState();
+  let installed = false;
+  const deps = {
+    getCurrentVersion: async () => (installed ? '2.0.0' : '1.0.0'),
+    checkForUpdate: async () => ({ latest: '2.0.0', current: '1.0.0', hasUpdate: true }),
+    selfUpdate: async () => { installed = true; return { ok: true, output: '' }; },
+  };
+  // AUTO path with autoUpdate:false → respects the choice, no npm install, not applicable.
+  const auto = await maybeCheckForUpdate({ updateCheck: true, autoUpdate: false }, () => {}, () => {}, deps);
+  assert.equal(installed, false, 'auto path honors autoUpdate:false');
+  assert.equal(auto.applicable, false);
+  // MANUAL path (index.js forces autoUpdate:true) → installs + becomes applicable→reload.
+  const manual = await maybeCheckForUpdate({ updateCheck: true, autoUpdate: true }, () => {}, () => {}, deps);
+  assert.equal(installed, true, 'the forced manual path installs despite the base config being autoUpdate:false');
+  assert.equal(manual.applicable, true, 'so applyNow (autoApply-agnostic) will seamless-reload');
+});

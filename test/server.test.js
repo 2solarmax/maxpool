@@ -516,7 +516,10 @@ test('provider 529 remains provider-scoped and fails over', async () => {
       profiles: ['all'],
       priority: 1,
     },
-  ], 0.90, { cooldownMs: 100, maxCooldownMs: 100 });
+    // Provider-only fleet exercising provider→provider 529 failover — needs the
+    // cross-provider fallback ON (the default is now 'never', which keeps a compatible
+    // session off providers entirely).
+  ], 0.90, { cooldownMs: 100, maxCooldownMs: 100, crossProviderFallbackPolicy: 'when-exhausted' });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
@@ -1352,7 +1355,7 @@ test('all profile adds runtime GLM fallback and rewrites provider request', asyn
   const glmPort = await listen(glmUpstream);
   const am = new AccountManager([
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${claudePort}`,
@@ -1414,7 +1417,7 @@ test('thinking history now FALLS BACK to GLM under when-exhausted (a lenient pro
   const glmPort = await listen(glmUpstream);
   const am = new AccountManager([
     { name: 'claude', type: 'oauth', accessToken: 'tc', refreshToken: 'rc', expiresAt: Date.now() + 3600_000 },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${claudePort}`,
@@ -1566,7 +1569,7 @@ test('Z.AI 429 body reset hint controls provider cooldown when retry-after is mi
     }));
   });
   const zaiPort = await listen(zaiUpstream);
-  const am = new AccountManager([], 0.90);
+  const am = new AccountManager([], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: 'http://127.0.0.1:1',
@@ -1610,7 +1613,7 @@ test('Kimi 429 body wait hint controls provider cooldown when retry-after is mis
     }));
   });
   const kimiPort = await listen(kimiUpstream);
-  const am = new AccountManager([], 0.90);
+  const am = new AccountManager([], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: 'http://127.0.0.1:1',
@@ -1650,7 +1653,7 @@ test('provider 403 → RECOVERABLE cooldown (not a permanent disable), fails ove
     }));
   });
   const kimiPort = await listen(kimiUpstream);
-  const am = new AccountManager([], 0.90);
+  const am = new AccountManager([], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: 'http://127.0.0.1:1',

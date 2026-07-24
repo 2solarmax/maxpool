@@ -966,6 +966,13 @@ async function serverWorkerCommand() {
             crossProviderFallbackPolicy: config.scheduler.crossProviderFallbackPolicy,
           };
         }
+        // Persist live-toggled automatic-update flags (the TUI 'u' Updates menu). Same
+        // reason as the policy above: without this the toggle takes effect in memory but
+        // silently reverts on the next config write / restart. Only write keys defined
+        // in-memory so a disk value is never clobbered with undefined.
+        for (const key of ['updateCheck', 'autoUpdate', 'autoApply']) {
+          if (config[key] !== undefined) diskConfig[key] = config[key];
+        }
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
         // Use live tokens from AccountManager (not the stale config.accounts copy).
@@ -1038,18 +1045,55 @@ async function serverWorkerCommand() {
       restartController.requestRestart();
     }
   };
+  // Manual apply (the TUI 'u' → check & apply now): reload into a freshly-installed
+  // newer version REGARDLESS of autoApply — the user asked for it explicitly, so it must
+  // NOT no-op just because the AUTOMATIC path is off (that no-op is exactly the "relaunch
+  // still shows the old version" pain this menu exists to kill).
+  const applyNow = r => {
+    if (r?.applicable && restartController) {
+      markApplied(r.installedVersion);
+      notifyUpdate('Applying update — seamless reload…');
+      restartController.requestRestart();
+    }
+  };
+  // ONE in-flight latch shared by the periodic timer, the cold-start probe, AND the
+  // manual action, so two `npm i -g` can never race (global-package corruption). hasLease
+  // already blocks CROSS-worker races; this blocks same-worker timer-vs-manual overlap.
+  let updateInFlight = false;
+  const runUpdateCheck = async ({ announce, apply, forceInstall = false }) => {
+    if (updateInFlight || !hasLease || config?.updateCheck === false) return undefined;
+    updateInFlight = true;
+    try {
+      // The MANUAL action forces the install (autoUpdate:true) so pressing 'u' → 'c'
+      // actually downloads + reloads even when AUTOMATIC updates are off. Without this,
+      // maybeCheckForUpdate short-circuits before installing when config.autoUpdate is
+      // false (the default) and just tells the user to run `npm i -g` by hand — the exact
+      // quit/relaunch dance this menu exists to kill. The periodic + cold-start paths
+      // pass the real config so they still respect the user's autoUpdate choice.
+      const cfg = forceInstall ? { ...config, autoUpdate: true } : config;
+      const r = await maybeCheckForUpdate(cfg, notifyUpdate, info => { accountManager.versionInfo = info; }, { announce });
+      apply(r);
+      return r;
+    } catch { return undefined; /* update path is best-effort; never break the proxy */ }
+    finally { updateInFlight = false; }
+  };
+  // 'u' → check & apply now: force an immediate check + install + seamless reload so the
+  // user never has to quit/relaunch to pick up a release. Reports the up-to-date case too.
+  const checkForUpdatesNow = async () => {
+    if (updateInFlight) { notifyUpdate('Update check already running'); return; }
+    if (!hasLease) { notifyUpdate('Updates run on the primary worker only'); return; }
+    if (config?.updateCheck === false) { notifyUpdate('Update checks are disabled in config'); return; }
+    notifyUpdate('Checking for updates…');
+    const r = await runUpdateCheck({ announce: true, apply: applyNow, forceInstall: true });
+    if (r && !r.hasUpdate) notifyUpdate('Already on the latest version');
+  };
+  if (tui) tui.checkNow = checkForUpdatesNow;
   const updateIntervalMs = Math.max(60_000, Number(process.env.MAXPOOL_UPDATE_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000);
   updateTimer = setInterval(() => {
-    // ONLY the lease-holding primary self-installs — the timer is unconditional across
-    // EVERY worker (incl. a headless reload worker), so gate on hasLease here to avoid
-    // two `npm i -g` racing during a reload overlap (global-package corruption). A
-    // headless reload worker never holds the lease, so it never installs/auto-applies.
-    if (config?.updateCheck === false || !hasLease) return;
     // announce:false — the persistent TUI banner is the passive reminder; only real
-    // actions (installing / applying) log here, so a pending update never churns the log.
-    maybeCheckForUpdate(config, notifyUpdate, info => { accountManager.versionInfo = info; }, { announce: false })
-      .then(applyUpdateIfReady)
-      .catch(() => {});
+    // actions (installing / applying) log. runUpdateCheck's latch + hasLease gate prevent
+    // racing installs (a headless reload worker never holds the lease, so never installs).
+    runUpdateCheck({ announce: false, apply: applyUpdateIfReady });
   }, updateIntervalMs);
   updateTimer.unref();
 
@@ -1099,11 +1143,10 @@ async function serverWorkerCommand() {
     // A reload-spawned/takeover worker must NEVER re-probe (1x not 2x traffic).
     if (!viaTakeover && !isReloadWorker) {
       if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') console.log('[Maxpool] UPDATE_CHECK_FIRED');
-      // Cold-start-behind: download AND (autoApply) self-apply via the SAME helper as the
-      // periodic path — so the version is applied, not marked-attempted-then-stranded.
-      maybeCheckForUpdate(config, notifyUpdate, info => { accountManager.versionInfo = info; })
-        .then(applyUpdateIfReady)
-        .catch(() => {});
+      // Cold-start-behind: download AND (autoApply) self-apply via the SAME latched helper
+      // as the periodic path — so the version is applied, not marked-attempted-then-stranded,
+      // and it can't race the periodic timer's install.
+      runUpdateCheck({ announce: true, apply: applyUpdateIfReady });
     } else if (process.env.MAXPOOL_TEST_LOG_UPDATE_CHECK === '1') {
       console.log('[Maxpool] UPDATE_CHECK_SKIPPED (reload)');
     }

@@ -103,6 +103,18 @@ const DEFAULT_SCHEDULER = {
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
   paceCostWeight: 1.5,            // soft de-preference of accounts burning ahead of pace (was the ×6 term)
   scarcityWeight: 6,              // legacy; superseded by paceCostWeight (kept so old configs don't error)
+  // Reserve-account OVERFLOW model. A weekly-RESERVE account (util 0.85-0.95) used to
+  // sit idle behind a healthy-only first pass; now it's eligible in the first pass but
+  // ranked BELOW healthy accounts by _reserveCost (so healthy stays first-pick). Among
+  // reserve accounts the SOONEST-to-reset is cheapest (use-it-or-lose-it); the further
+  // into the band, the costlier (preserve). Critical (≥0.95)/exhausted stay hard-benched
+  // in the second pass, never softened. See _reserveCost + _selectNext's 2-pass ladder.
+  reserveFloorCost: 5,            // base overflow cost — keeps any reserve account behind an idle healthy one (~2)
+  reserveBandWeight: 8,           // ×(util-0.85)/0.10: deeper into the reserve band ⇒ costlier ⇒ consumed later
+  reserveScarcityWeight: 6,       // ×weekly _windowScarcity: reset-timing weight, ON TOP of the global paceCost, so
+                                  // a near-reset reserve account is used freely and a far-from-reset one is used last
+  reserveConcurrencyTarget: 2,    // tighter in-flight cap for reserve (capPenalty bites at inflight>2 ⇒ load fans out
+                                  // across the fleet before any single reserve account is dogpiled toward a 429)
   spreadShareWeight: 3,           // multiplies an account's share of recent fleet load (0..1)
   recoveryRampWeight: 4,          // decaying penalty applied to a just-recovered account
   recoveryRampMs: 5 * 60_000,     // how long the post-recovery ramp lasts
@@ -121,16 +133,25 @@ const DEFAULT_SCHEDULER = {
   // may be served by a provider FAMILY other than its home (Claude ↔ GLM ↔ Kimi).
   //   'never'         — strict pin: a Claude session uses Claude only; a GLM session
   //                     uses GLM only; a Kimi session uses Kimi only.
-  //   'when-exhausted'— (default) home family preferred; a Claude session falls back
-  //                     to GLM/Kimi only once all Claude accounts are unavailable
-  //                     (providers are already lower-priority fallback), and a GLM
-  //                     session may fall to Kimi once GLM is exhausted.
+  //   'when-exhausted'— home family preferred; a Claude session falls back to GLM/Kimi
+  //                     only once all Claude accounts are unavailable, and a GLM session
+  //                     may fall to Kimi once GLM is exhausted.
   //   'always'        — providers peer with Claude for a Claude/unknown session
   //                     (load-balanced, not last-resort).
+  // DEFAULT is 'never' (2026-07-24): a Claude Code session stays on Anthropic. Routing
+  // Claude→GLM/Kimi proved unreliable (the coding legs 403/429 + ignore the model id),
+  // so cross-routing OUT of Claude is OFF by default; re-enable via the TUI routing
+  // cycle or config. This governs ONLY the Claude→provider direction.
   // INVARIANT (all policies): a GLM/Kimi-origin session NEVER routes to an Anthropic
   // account — Anthropic 400s on a non-`srvtoolu_` server_tool_use id; that direction
   // is unfixable, not policy-tunable.
-  crossProviderFallbackPolicy: 'when-exhausted',
+  crossProviderFallbackPolicy: 'never',
+  // The OTHER cross direction, independent of the policy above: may a provider-origin
+  // (GLM/Kimi) session cross to the OTHER provider (GLM↔Kimi)? Default ON — both legs are
+  // lenient and accept each other's ids, and it's the reliable direction the user wants
+  // kept even while Claude→provider is 'never'. Only has effect under policy:'never' (the
+  // 'when-exhausted'/'always' paths never pinned to home). Set false for a strict home-pin.
+  providerCrossFallback: true,
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1429,14 +1450,16 @@ export class AccountManager {
     // Else fall through to the candidate score loop, which re-homes the session
     // onto the best healthy account via _bindSession on acquire.
 
-    // Healthy-first ladder for BOTH bound and unbound sessions. A bound session
-    // only reaches this loop once we've decided to LEAVE its account (rebalance
-    // fired / a higher-priority account is available / the bound account is down) —
-    // the sticky "stay put" path returns above without reaching here — so re-homing
-    // must prefer a genuinely-healthy account and fall back to reserve/critical only
-    // if none exists, never re-pick the idle reserve account it's leaving.
+    // Two-pass ladder for BOTH bound and unbound sessions. Pass 1 admits healthy AND
+    // reserve accounts together; the reserve accounts carry _reserveCost so a healthy
+    // account is preferred whenever one is comparably loaded — but a reserve account
+    // CAN outrank a badly-slammed healthy one (its capPenalty is unbounded), which is
+    // intended load-spread, not a regression. Pass 2 adds critical only when pass 1 is
+    // empty (the untouched hard fallback). A bound session reaches this loop only once
+    // we've decided to LEAVE its account (the sticky "stay put" path returns above); it
+    // may now re-home onto a lightly-loaded reserve account rather than a slammed
+    // healthy one — deliberate, since the whole point is to USE reserve accounts.
     const weeklyPasses = [
-      { allowWeeklyReserve: false, allowWeeklyCritical: false },
       { allowWeeklyReserve: true, allowWeeklyCritical: false },
       { allowWeeklyReserve: true, allowWeeklyCritical: true },
     ];
@@ -1715,9 +1738,13 @@ export class AccountManager {
       // The transcript can't replay to Claude (a foreign server_tool_use id, or
       // content Anthropic rejected on replay) — provider accounts ONLY, regardless
       // of policy. Providers are lenient and accept each other's ids (GLM↔Kimi is
-      // fine); 'never' pins to the detected home provider when known.
+      // fine). Under 'never' we keep the session on its home provider ONLY when
+      // providerCrossFallback is explicitly off; by default GLM↔Kimi crossing stays
+      // allowed even under 'never' (that reliable direction is governed separately
+      // from the Claude→provider policy).
       if (account.type !== 'provider') return false;
-      if (policy === 'never' && homeProvider && account.provider !== homeProvider) return false;
+      if (policy === 'never' && homeProvider && account.provider !== homeProvider
+        && this.scheduler.providerCrossFallback === false) return false;
       return true;
     }
 
@@ -1843,9 +1870,16 @@ export class AccountManager {
     const concurrency = inflight * this.scheduler.concurrencyWeight;
 
     // Steep soft cap past depth D — the throttle safety floor. No single
-    // account absorbs a deep concurrent burst no matter how "cheap" it looks.
+    // account absorbs a deep concurrent burst no matter how "cheap" it looks. A
+    // RESERVE account gets a tighter D (reserveConcurrencyTarget) so its capPenalty
+    // bites sooner — load fans out across the fleet before a low-quota account is
+    // dogpiled toward a 429.
+    const weeklyState = this._weeklyRawState(account);
+    const concTarget = weeklyState === 'reserve'
+      ? this.scheduler.reserveConcurrencyTarget
+      : this.scheduler.perAccountConcurrencyTarget;
     const capPenalty = this.scheduler.capPenaltyWeight
-      * Math.max(0, inflight - this.scheduler.perAccountConcurrencyTarget);
+      * Math.max(0, inflight - concTarget);
 
     // Burn-pace COST only (demoted from the old dominant scarcity×6 term): a
     // soft de-preference of accounts burning ahead of an even pace. Never a bench.
@@ -1867,6 +1901,7 @@ export class AccountManager {
     const spread = share * this.scheduler.spreadShareWeight;
 
     const ramp = this._recoveryRamp(account, now);
+    const reserveCost = this._reserveCost(account, now, weeklyState);
     const failurePenalty = account.consecutiveFailures * 5;
     // NO unknown-quota bonus. An account whose quota we cannot see must never be
     // MORE attractive than a known-healthy one — the old -0.5 nudge (safe only
@@ -1876,7 +1911,7 @@ export class AccountManager {
     // default) learns the real number within a cycle. `probing`/requalify still
     // flags a never-seen account for learning — that path is unchanged.
 
-    return concurrency + capPenalty + paceCost + scopedPace + spread + ramp + failurePenalty;
+    return concurrency + capPenalty + paceCost + scopedPace + spread + ramp + reserveCost + failurePenalty;
   }
 
   /**
@@ -1927,6 +1962,31 @@ export class AccountManager {
     const remainingMs = Math.max(0, resetMs - now);
     const elapsedFrac = clamp01((windowLen - remainingMs) / windowLen);
     return Math.max(0, used - elapsedFrac);
+  }
+
+  /**
+   * Overflow cost for a weekly-RESERVE account (util 0.85-0.95). 0 for every other
+   * tier — normal/soft aren't softened, and critical/exhausted are hard-benched by the
+   * pass gate (never made cheaper here). This is what lets a reserve account be eligible
+   * in the FIRST selection pass yet still rank below healthy accounts: floor keeps it
+   * strictly behind an idle healthy pick, the band term makes deeper-into-reserve costlier
+   * (consumed later / preserved), and the reset-timing term makes the soonest-to-reset the
+   * cheapest reserve pick (use-it-or-lose-it). A slammed HEALTHY account can still score
+   * above a lightly-loaded reserve one (its capPenalty is unbounded) — that's intended
+   * load-spread, not a violation of "healthy first".
+   */
+  _reserveCost(account, now = Date.now(), weeklyState = this._weeklyRawState(account)) {
+    if (weeklyState !== 'reserve') return 0;
+    const q = account.quota;
+    const util = clamp01(q.unified7d);
+    const band = clamp01(
+      (util - this.scheduler.weeklyReserveThreshold)
+      / Math.max(1e-6, this.scheduler.weeklyCriticalThreshold - this.scheduler.weeklyReserveThreshold),
+    );
+    const pace = this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now);
+    return this.scheduler.reserveFloorCost
+      + this.scheduler.reserveBandWeight * band
+      + this.scheduler.reserveScarcityWeight * pace;
   }
 
   /**

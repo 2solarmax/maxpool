@@ -6,12 +6,15 @@ import { __serverTest } from '../src/server.js';
 const { isContextLengthError, unavailableMessage } = __serverTest;
 
 function fleet() {
-  // 'all' profile so providers are eligible; default cross-provider policy = when-exhausted.
+  // 'all' profile + explicit 'when-exhausted' so providers are eligible for a Claude
+  // session (the DEFAULT is now 'never'). The large-context heal must bench providers
+  // even when they'd otherwise be eligible, so the fallback must be ON for the test to
+  // prove anything.
   return new AccountManager([
     { name: 'oauth1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
     { name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://api.z.ai/api/anthropic' },
     { name: 'kimi', type: 'provider', provider: 'kimi', authToken: 'k', upstream: 'https://api.kimi.com/coding' },
-  ], 0.90);
+  ], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
 }
 
 // ── isContextLengthError: the provider "request too big for me" signature ──────

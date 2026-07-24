@@ -92,16 +92,22 @@ export function createDefaultConfig() {
       weeklyCriticalThreshold: 0.95,
       weeklyExhaustedThreshold: 0.985,
       // Cross-PROVIDER fallback policy for 'cc all' (profile=all): whether a session
-      // may be served by a provider family other than its home (Claude ↔ GLM ↔ Kimi).
-      //   'never'         — strict pin (Claude→Claude, GLM→GLM, Kimi→Kimi).
-      //   'when-exhausted'— (default) home family preferred; cross only once it's
-      //                     exhausted (a Claude session falls to GLM/Kimi when all
-      //                     Claude accounts are unavailable).
+      // may be served by a provider family other than its home (Claude → GLM/Kimi).
+      //   'never'         — (DEFAULT) a Claude Code session stays on Anthropic; no
+      //                     GLM/Kimi fallback. Routing Claude→providers proved unreliable
+      //                     (the coding legs 403/429 + ignore the model id), so it's OFF
+      //                     by default — re-enable here or via the TUI 'f' key.
+      //   'when-exhausted'— home family preferred; a Claude session falls to GLM/Kimi
+      //                     only once all Claude accounts are unavailable.
       //   'always'        — providers peer with Claude for a Claude/unknown session.
       // A GLM/Kimi-origin session NEVER routes to Anthropic under ANY policy — that
       // direction 400s on the non-`srvtoolu_` tool-use id and is unfixable. Toggle
       // live in the TUI (Routing sub-mode, 'f' key).
-      crossProviderFallbackPolicy: 'when-exhausted',
+      crossProviderFallbackPolicy: 'never',
+      // The OTHER cross direction (independent of the policy above): may a provider-origin
+      // (GLM/Kimi) session cross to the OTHER provider (GLM↔Kimi)? Default ON — reliable,
+      // both legs accept each other's ids. Only has effect under policy:'never'.
+      providerCrossFallback: true,
     },
     retry: {
       maxAttemptsPerRequest: 0,

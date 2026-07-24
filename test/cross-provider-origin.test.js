@@ -80,6 +80,34 @@ test('an anthropicIncompatible session never selects Claude across ALL policies'
   }
 });
 
+// ── providerCrossFallback: GLM↔Kimi crossing under the default 'never' policy ──
+
+function providerFleet(schedulerOpts) {
+  const am = new AccountManager(
+    [{ name: 'claude1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 }],
+    0.90, { crossProviderFallbackPolicy: 'never', ...schedulerOpts },
+  );
+  am.upsertRuntimeAccount({ name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', authHeader: 'authorization', profiles: ['all'], priority: 10, modelMap: { opus: 'glm-5.2', default: 'glm-5.2' } });
+  am.upsertRuntimeAccount({ name: 'kimi-fallback', type: 'provider', provider: 'kimi', authToken: 'k', upstream: 'https://k', authHeader: 'authorization', profiles: ['all'], priority: 20, model: 'kimi-k2.7' });
+  return am;
+}
+
+test("under 'never', a GLM-origin session STILL crosses to Kimi by default (providerCrossFallback on) — the reliable direction", () => {
+  const am = providerFleet();                                   // providerCrossFallback defaults true
+  const req = { profile: 'all', anthropicIncompatible: true, homeProvider: 'zai', sessionKey: 'glm-x' };
+  assert.equal(am._isRequestCompatible(kimiOf(am), 'all', req), true, 'GLM→Kimi allowed under never (default)');
+  assert.equal(am._isRequestCompatible(glmOf(am), 'all', req), true, 'its home GLM still eligible too');
+  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', req), false, 'but NEVER Claude (the 400 direction)');
+});
+
+test("under 'never' with providerCrossFallback:false, a GLM-origin session is strictly home-pinned to GLM", () => {
+  const am = providerFleet({ providerCrossFallback: false });
+  const req = { profile: 'all', anthropicIncompatible: true, homeProvider: 'zai', sessionKey: 'glm-pin' };
+  assert.equal(am._isRequestCompatible(glmOf(am), 'all', req), true, 'home GLM eligible');
+  assert.equal(am._isRequestCompatible(kimiOf(am), 'all', req), false, 'strict pin: no GLM→Kimi crossing');
+  assert.equal(am._isRequestCompatible(oauthOf(am), 'all', req), false, 'still never Claude');
+});
+
 // ── Claude → provider fallback (the "use Kimi if no Claude" direction) ─────────
 
 test('a Claude session falls to a provider only when Claude is exhausted (when-exhausted default)', () => {
@@ -155,8 +183,10 @@ test('unavailableMessage is honest for an incompatible-pinned session (not the m
   assert.doesNotMatch(msg, /5h or weekly|all \d+ (are|accounts)/i);
 });
 
-test('createDefaultConfig ships the cross-provider policy default', () => {
-  assert.equal(createDefaultConfig().scheduler.crossProviderFallbackPolicy, 'when-exhausted');
+test('createDefaultConfig ships the cross-provider policy default (never — Claude stays on Anthropic)', () => {
+  assert.equal(createDefaultConfig().scheduler.crossProviderFallbackPolicy, 'never');
+  // The other direction (GLM↔Kimi) ships ON.
+  assert.equal(createDefaultConfig().scheduler.providerCrossFallback, true);
 });
 
 test('isAnthropicIncompatBody matches the 3 real shapes but NOT a generic 400 echoing the words', () => {
