@@ -84,6 +84,21 @@ test('hold window: a STREAMING capacity/throttle request holds for maxWaitMs, no
   );
 });
 
+test('hold window: streamClientToleranceMs clamps EVERY streaming cause (the Stream-idle fix)', () => {
+  const tol = 3 * 3600_000; // 3h — the client-tolerance ceiling
+  const cfg = { maxWaitMs: 24 * 3600_000, capacityMaxWaitMs: 15 * 60_000, nonStreamMaxWaitMs: 5 * 60_000, streamHoldMaxMs: 7 * 24 * 3600_000, streamClientToleranceMs: tol };
+  // capacity (was 24h) AND quota/throttle (was 7d) both clamp down to the tolerance —
+  // maxpool can't hold a stream past the client's own watchdog, so a 24h/7d park is moot.
+  assert.equal(computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'session_limit', ...cfg }), tol);
+  assert.equal(computeQueueWindowMs({ cause: 'quota', stream: true, retryPlanCause: 'session_limit', ...cfg }), tol);
+  // concurrency-cap (15m) is already below the tolerance → stays 15m.
+  assert.equal(computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'concurrency_cap', ...cfg }), cfg.capacityMaxWaitMs);
+  // NON-streaming is untouched by the streaming tolerance.
+  assert.equal(computeQueueWindowMs({ cause: 'quota', stream: false, retryPlanCause: 'session_limit', ...cfg }), cfg.nonStreamMaxWaitMs);
+  // A tolerance ABOVE a cause's natural window never inflates it (min, not max).
+  assert.equal(computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'session_limit', ...cfg, streamClientToleranceMs: 48 * 3600_000 }), cfg.maxWaitMs);
+});
+
 test('bug (ghost-leak): heartbeat reap releases the queue slot+bytes when the held client write throws EPIPE', async () => {
   // Binding test for reapDead: the heartbeat is the liveness probe. When the
   // held client's socket is gone, res.write throws and the reap MUST release the
@@ -133,11 +148,19 @@ test('unavailableMessage tells the truth when no account will recover soon', () 
   // Recoverable soon -> a retry hint is honest.
   assert.match(unavailableMessage(am, {}, 60, true), /Retry in 60s/);
 
-  // Not recoverable soon (every account at its 5h/weekly limit) -> no fake retry.
+  // Not recoverable soon (every account + both providers at their limit) -> no fake retry.
   const exhausted = unavailableMessage(am, {}, 60, false);
-  assert.match(exhausted, /at their 5h or weekly limit/);
+  assert.match(exhausted, /at their limit/);
+  assert.match(exhausted, /GLM\/Kimi/, 'names the providers too — thinking is NOT barred from them');
   assert.doesNotMatch(exhausted, /Retry in 60s/);
   assert.doesNotMatch(exhausted, /accounts exhausted\. Retry/);
+});
+
+test('unavailableMessage no longer falsely claims GLM/Kimi is barred for a signed-thinking session', () => {
+  const am = { accounts: [{}, {}], _requiresAnthropicThinkingIntegrity: () => true };
+  const thinkingSoon = unavailableMessage(am, { requiresAnthropicThinkingIntegrity: true }, 45, true);
+  assert.doesNotMatch(thinkingSoon, /fallback is disabled|fallback is unavailable/i, 'thinking sessions DO fall back to providers');
+  assert.match(thinkingSoon, /Retry in 45s/);
 });
 
 test('500 is treated as a retriable upstream status', () => {

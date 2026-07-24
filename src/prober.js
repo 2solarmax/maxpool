@@ -70,7 +70,11 @@ export class Prober {
     this._stopping = false;
     this._inflight = (async () => {
       try {
-        // Skip auth-dead accounts (dead refresh token): probing them just re-POSTs
+        // DISABLED accounts are INTENTIONALLY still probed (no `a.enabled` filter):
+        // a user often disables an account precisely BECAUSE it's exhausted, and still
+        // wants to see its quota recover — so keep refreshing its usage for visibility
+        // even though routing skips it. Do NOT add an enabled gate here.
+        // Skip only auth-dead accounts (dead refresh token): probing them just re-POSTs
         // the rejected token every cycle — a 400 storm. They recover only on re-auth.
         const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential && !a.refreshDead);
         const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);

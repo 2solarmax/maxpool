@@ -53,6 +53,16 @@ const DEFAULT_QUEUE = {
   // resets idle-gap client timeouts; if a client uses a wall-clock total-request
   // deadline, lower this to just under it.
   streamHoldMaxMs: 7 * 24 * 60 * 60 * 1000,
+  // HARD ceiling on EVERY streaming hold (capacity/quota/throttle/concurrency alike).
+  // maxpool CANNOT keep a client alive past its own stream watchdog — Claude Code aborts
+  // "Stream idle timeout - no chunks received" after CLAUDE_STREAM_IDLE_TIMEOUT_MS of no
+  // real content EVENTS, and it drops SSE ping/comment keep-alives before the watchdog
+  // sees them (anthropic-sdk-typescript#998). So a 7-day/24h server-side hold only parks
+  // a request the client already abandoned. Bound it to the wait the user actually wants
+  // (front-loaded work waiting for a free account ≈ a few hours) so beyond that the
+  // request error-fasts with an honest retryable 429 instead of a silent multi-day park.
+  // Pair with a raised client watchdog (the cc launch sets CLAUDE_STREAM_IDLE_TIMEOUT_MS).
+  streamClientToleranceMs: Math.max(60_000, Number(process.env.MAXPOOL_STREAM_CLIENT_TOLERANCE_MS) || 3 * 60 * 60 * 1000),
   // Non-streaming requests have no SSE heartbeat to keep them alive, so a long
   // hold would die on the client timeout anyway. Cap their wait conservatively.
   nonStreamMaxWaitMs: 5 * 60 * 1000,
@@ -235,9 +245,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         }
         requestInfo.profile = getMaxpoolProfile(req.headers);
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
-        if (requestInfo.requiresAnthropicThinkingIntegrity && requestInfo.profile === 'all') {
-          console.log('[Maxpool] Anthropic thinking detected; provider fallback disabled for this session/request');
-        }
+        // (Removed a FALSE "provider fallback disabled for signed thinking" log here: it
+        // fired on every thinking `all` request but was untrue under the default
+        // when-exhausted/always policies — providers DO serve thinking requests — and it
+        // repeatedly misdirected diagnosis of the "Stream idle timeout" reports.)
         prepareRuntimeProviders(accountManager, req.headers);
 
         await forwardRequest(
@@ -1135,7 +1146,7 @@ function formatRetryDuration(seconds) {
  */
 function computeQueueWindowMs({
   cause, stream, retryPlanCause,
-  maxWaitMs, capacityMaxWaitMs, nonStreamMaxWaitMs, streamHoldMaxMs,
+  maxWaitMs, capacityMaxWaitMs, nonStreamMaxWaitMs, streamHoldMaxMs, streamClientToleranceMs,
   isCountTokens, countTokensMaxWaitMs,
 }) {
   let windowMs;
@@ -1147,6 +1158,12 @@ function computeQueueWindowMs({
     windowMs = streamHoldMaxMs;
   }
   if (retryPlanCause === 'concurrency_cap') windowMs = Math.min(windowMs, capacityMaxWaitMs);
+  // Bound EVERY streaming cause to the client-tolerance ceiling — the client's own
+  // watchdog kills the stream well before a 24h/7d server hold, so anything past this
+  // just parks an abandoned request. A finite reset WITHIN the ceiling still holds +
+  // resumes (via the nextRetryForRequest oracle); a reset beyond it error-fasts (a real
+  // retryable 429 at the pre-heartbeat gate) instead of hanging.
+  if (stream && streamClientToleranceMs != null) windowMs = Math.min(windowMs, streamClientToleranceMs);
   // count_tokens: cap the QUEUE wait low (bounds only the wait-for-an-account, never
   // the upstream processing once acquired) so a non-heartbeated metadata call fast-
   // fails with a retryable 429 instead of hanging past the client's idle window.
@@ -1166,8 +1183,6 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
     return `This session's transcript can only run on ${fam} — Claude rejects its server-tool ids/thinking on replay. No ${fam} provider is available right now.${eta} Check the x-maxpool-zai-token / x-maxpool-kimi-token headers, or resume with 'cc ${incompat.homeProvider === 'kimi' ? 'kimi' : 'glm'}'.`;
   }
 
-  const thinking = requestInfo.requiresAnthropicThinkingIntegrity
-    || accountManager._requiresAnthropicThinkingIntegrity?.(requestInfo);
   const n = accountManager.accounts.length;
 
   // No route is expected to recover within the queue window — i.e. every Claude
@@ -1177,16 +1192,16 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
     const eta = Number.isFinite(retryAfter) && retryAfter > 0
       ? ` Soonest reset in ~${formatRetryDuration(retryAfter)}, beyond the hold window.`
       : '';
-    const base = `No Claude account can take this request — all ${n} are at their 5h or weekly limit.${eta} Add another Claude account or wait for a quota reset.`;
-    return thinking
-      ? `${base} GLM/Kimi fallback is unavailable because this session contains Anthropic signed thinking blocks; start a fresh non-thinking session to use them.`
-      : base;
+    const base = `No account can take this request — all ${n} Claude accounts and the GLM/Kimi providers are at their limit.${eta} Add another Claude account or wait for a quota reset.`;
+    // (thinking sessions are NOT barred from GLM/Kimi under the default policy — the old
+    // "fallback unavailable because signed thinking" suffix was false and is dropped.)
+    return base;
   }
 
-  if (thinking) {
-    return `No Claude account could accept this request. Non-Claude fallback is disabled because this session contains Anthropic signed thinking blocks. Retry in ${retryAfter}s, wait for Claude capacity, or start a fresh non-thinking session to use GLM/Kimi.`;
-  }
-  return `All ${n} accounts exhausted. Retry in ${retryAfter}s.`;
+  // Every Claude account AND both providers are momentarily saturated (a thinking session
+  // DOES fall back to GLM/Kimi — the old "fallback disabled because signed thinking"
+  // message was false).
+  return `No account can take this request right now — all ${n} Claude accounts and the GLM/Kimi providers are momentarily at their limit. Retry in ${retryAfter}s.`;
 }
 
 export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, streamResponse, startIdleRequestReaper };
@@ -1467,6 +1482,9 @@ async function queueAndRetry(
   const streamHoldMaxMs = queueConfig.streamHoldMaxMs == null
     ? 7 * 24 * 60 * 60 * 1000
     : Math.max(0, Number(queueConfig.streamHoldMaxMs) || 0);
+  const streamClientToleranceMs = queueConfig.streamClientToleranceMs == null
+    ? 3 * 60 * 60 * 1000
+    : Math.max(0, Number(queueConfig.streamClientToleranceMs) || 0);
   const queueWindowMs = computeQueueWindowMs({
     cause,
     stream: Boolean(requestInfo.stream),
@@ -1475,6 +1493,7 @@ async function queueAndRetry(
     capacityMaxWaitMs,
     nonStreamMaxWaitMs,
     streamHoldMaxMs,
+    streamClientToleranceMs,
     isCountTokens: Boolean(requestInfo.isCountTokens),
     countTokensMaxWaitMs,
   });

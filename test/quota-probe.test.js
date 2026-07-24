@@ -29,6 +29,21 @@ test('probeAll applies usage to every oauth account', async () => {
   assert.equal(am.accounts[1].quota.unified7d, 0.50);
 });
 
+test('a DISABLED account is still probed — quota stays visible while benched', async () => {
+  const am = manager(2);
+  am.setAccountEnabled(1, false);   // user disables a2 because it looked exhausted
+  assert.equal(am.accounts[1].enabled, false);
+  const probeFn = async () => ({
+    fiveHour: { utilization: 0.20, resetAt: Date.now() + 3600_000 },
+    sevenDay: { utilization: 0.40, resetAt: WEEK_OUT() },
+  });
+  const prober = new Prober(am, { probeFn, log: () => {} });
+  await prober.probeAll();
+  // The disabled account's quota still refreshes, so the user sees it recover.
+  assert.equal(am.accounts[1].quota.unified7d, 0.40, 'disabled account quota is still refreshed');
+  assert.equal(am.accounts[1].enabled, false, 'probing does not re-enable it');
+});
+
 test('overlapping probe cycles are skipped', async () => {
   const am = manager(2);
   let calls = 0;

@@ -282,7 +282,7 @@ test('failed API key persistence does not leave a routable phantom account', asy
   assert.equal(am.accounts.length, 0);
 });
 
-test('unsupported runtime providers are excluded from account action selection', () => {
+test('runtime providers are excluded from prefer/delete, but INCLUDED for enable/disable (W-D)', () => {
   const accounts = [
     { name: 'runtime-provider', type: 'provider', runtime: true, enabled: true },
     { name: 'claude', type: 'oauth', enabled: true },
@@ -292,9 +292,12 @@ test('unsupported runtime providers are excluded from account action selection',
     config: { accounts: [{ name: 'claude', type: 'oauth' }] },
   });
 
+  // prefer + delete stay config-account-only (provider at idx 0 excluded).
   assert.deepEqual(tui._selectableIndexes('prefer'), [1]);
   assert.deepEqual(tui._selectableIndexes('delete'), [1]);
-  assert.deepEqual(tui._selectableIndexes('toggle'), [1]);
+  // toggle now includes the runtime provider so GLM/Kimi can be enabled/disabled
+  // (display order lists the non-provider account first).
+  assert.deepEqual(tui._selectableIndexes('toggle'), [1, 0]);
 });
 
 test('delete removes account from routing before awaiting persistence', async () => {

@@ -133,6 +133,23 @@ test('restart feedback: with nothing in flight the banner shows "finishing up"',
   assert.ok(text.includes('finishing up'), 'no misleading "draining 0" — reads "finishing up"');
 });
 
+// ── W-D: enable/disable GLM/Kimi providers in the TUI (was Claude-only) ───────────
+
+test('W-D a runtime GLM/Kimi provider is selectable for enable/disable and toggles in-session', async () => {
+  const am = mgr(['claude1']);                                             // 1 oauth (in config)
+  am.addAccount({ name: 'glm-fallback', type: 'provider', provider: 'zai', apiKey: 'zk' }); // runtime provider, idx 1
+  const config = { proxy: { port: 3456 }, accounts: [{ name: 'claude1', type: 'oauth', accessToken: 't0' }] };
+  const tui = new TUI({ accountManager: am, config, saveConfig: async () => {} });
+
+  // Previously runtime providers were excluded from the toggle picker (Claude-only).
+  assert.ok(tui._selectableIndexes('toggle').includes(1), 'the GLM provider is selectable for enable/disable');
+
+  await tui._doToggle(1, false);
+  assert.equal(am.accounts[1].enabled, false, 'the provider is disabled in the running manager (session-only)');
+  await tui._doToggle(1, true);
+  assert.equal(am.accounts[1].enabled, true, 're-enable works too');
+});
+
 test('restart feedback: NO restarting banner during normal operation', () => {
   const am = mgr();
   const tui = tuiFor(am);

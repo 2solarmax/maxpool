@@ -586,6 +586,9 @@ export class TUI {
       .map(index => ({ account: this.am.accounts[index], index }))
       .filter(({ account }) => {
         if (action === 'prefer') return account.type !== 'provider' && account.enabled;
+        // Enable/disable also works on runtime providers (GLM/Kimi) — a session-only
+        // toggle, since they're not in config. Rename/delete stay config-account-only.
+        if (action === 'toggle') return this._configAccountIndex(account) >= 0 || account.type === 'provider';
         return this._configAccountIndex(account) >= 0;
       })
       .map(({ index }) => index);
@@ -872,7 +875,17 @@ export class TUI {
     if (!account) return;
     const configIndex = this._configAccountIndex(account);
     if (configIndex < 0) {
-      this._addLog(`Cannot ${enabled ? 'enable' : 'disable'} runtime provider "${account.name}" here`);
+      // A runtime provider (GLM/Kimi) isn't in config — it's re-created from the `cc all`
+      // request headers — so its enabled state is session-only. Toggle it in memory so
+      // the user can pause/resume routing to it right now (e.g. bench an exhausted
+      // provider), and say plainly that it resets on the next restart / cc-all request.
+      if (account.type === 'provider') {
+        this.am.setAccountEnabled(idx, enabled);
+        if (!enabled && this.am.preferredAccountName === account.name) this.am.setRoutingMode?.('automatic');
+        this._addLog(`${enabled ? 'Enabled' : 'Disabled'} provider "${account.name}" (this session only — resets on restart)`);
+        return;
+      }
+      this._addLog(`Cannot ${enabled ? 'enable' : 'disable'} "${account.name}" here (not in config)`);
       return;
     }
     const previous = this.config.accounts[configIndex].enabled;
