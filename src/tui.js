@@ -876,13 +876,14 @@ export class TUI {
     const configIndex = this._configAccountIndex(account);
     if (configIndex < 0) {
       // A runtime provider (GLM/Kimi) isn't in config — it's re-created from the `cc all`
-      // request headers — so its enabled state is session-only. Toggle it in memory so
-      // the user can pause/resume routing to it right now (e.g. bench an exhausted
-      // provider), and say plainly that it resets on the next restart / cc-all request.
+      // request headers — but its enable/disable IS durable: the flag persists in memory
+      // across `cc all` requests (the header upsert never re-enables it) and to state.json
+      // on the next save, so it stays benched across a restart too. Re-enable it here the
+      // same way whenever the user wants it back — there's no "removed forever" state.
       if (account.type === 'provider') {
         this.am.setAccountEnabled(idx, enabled);
         if (!enabled && this.am.preferredAccountName === account.name) this.am.setRoutingMode?.('automatic');
-        this._addLog(`${enabled ? 'Enabled' : 'Disabled'} provider "${account.name}" (this session only — resets on restart)`);
+        this._addLog(`${enabled ? 'Enabled' : 'Disabled'} provider "${account.name}" — ${enabled ? 'routing resumed' : 'benched (stays off across cc all + restart; re-enable here anytime)'}`);
         return;
       }
       this._addLog(`Cannot ${enabled ? 'enable' : 'disable'} "${account.name}" here (not in config)`);

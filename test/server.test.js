@@ -143,17 +143,28 @@ test('bug (ghost-leak): heartbeat reap releases the queue slot+bytes when the he
 });
 
 test('unavailableMessage tells the truth when no account will recover soon', () => {
-  const am = { accounts: [{}, {}], _requiresAnthropicThinkingIntegrity: () => false };
+  // cc all: the pool HAS GLM/Kimi providers → name them (thinking is NOT barred from them).
+  const withProviders = {
+    accounts: [{}, {}, { type: 'provider', provider: 'zai' }, { type: 'provider', provider: 'kimi' }],
+    _requiresAnthropicThinkingIntegrity: () => false,
+  };
 
   // Recoverable soon -> a retry hint is honest.
-  assert.match(unavailableMessage(am, {}, 60, true), /Retry in 60s/);
+  assert.match(unavailableMessage(withProviders, {}, 60, true), /Retry in 60s/);
 
-  // Not recoverable soon (every account + both providers at their limit) -> no fake retry.
-  const exhausted = unavailableMessage(am, {}, 60, false);
+  // Not recoverable soon -> no fake retry; counts only the Claude accounts + names providers.
+  const exhausted = unavailableMessage(withProviders, {}, 60, false);
   assert.match(exhausted, /at their limit/);
-  assert.match(exhausted, /GLM\/Kimi/, 'names the providers too — thinking is NOT barred from them');
+  assert.match(exhausted, /2 Claude accounts/, 'counts only the 2 Claude accounts, not the providers');
+  assert.match(exhausted, /GLM\/Kimi/, 'names the providers when present');
   assert.doesNotMatch(exhausted, /Retry in 60s/);
   assert.doesNotMatch(exhausted, /accounts exhausted\. Retry/);
+
+  // cc ma (Claude-only): NO providers in the pool → must NOT invent them.
+  const claudeOnly = { accounts: [{}, {}], _requiresAnthropicThinkingIntegrity: () => false };
+  const exhaustedMa = unavailableMessage(claudeOnly, {}, 60, false);
+  assert.match(exhaustedMa, /2 Claude accounts are at their limit/);
+  assert.doesNotMatch(exhaustedMa, /GLM\/Kimi/, 'no providers in the pool → do not name them');
 });
 
 test('unavailableMessage no longer falsely claims GLM/Kimi is barred for a signed-thinking session', () => {

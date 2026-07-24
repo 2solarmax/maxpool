@@ -136,6 +136,36 @@ test('providers survive a real saveState → loadState → restore cycle', async
   }
 });
 
+// ── W-D durability: a TUI-disabled provider stays benched across restart + cc all ─
+
+test('a disabled provider round-trips through the state export/restore still disabled', () => {
+  const before = oauthAM(1);
+  addGlm(before, 'zai-tok');
+  addKimi(before, 'kimi-tok');
+  // User benches GLM in the TUI (setAccountEnabled false).
+  const glmIdx = before.accounts.findIndex(a => a.name === 'glm-fallback');
+  before.setAccountEnabled(glmIdx, false);
+
+  const persisted = JSON.parse(JSON.stringify(before.exportRuntimeProviders()));
+  const glmExp = persisted.find(p => p.name === 'glm-fallback');
+  assert.equal(glmExp.enabled, false, 'export carries the disabled flag (without it, restore defaults enabled)');
+
+  const after = oauthAM(1);
+  after.restoreRuntimeProviders(persisted);
+  assert.equal(after.accounts.find(a => a.name === 'glm-fallback').enabled, false, 'GLM restored still benched');
+  assert.equal(after.accounts.find(a => a.name === 'kimi-fallback').enabled, true, 'Kimi (never disabled) restored enabled');
+});
+
+test('a re-sent `cc all` header (upsert without enabled) does NOT re-enable a benched provider', () => {
+  const am = oauthAM(1);
+  addGlm(am, 'zai-tok');
+  const idx = am.accounts.findIndex(a => a.name === 'glm-fallback');
+  am.setAccountEnabled(idx, false);              // user disabled it
+  addGlm(am, 'zai-tok-refreshed');               // next `cc all` request re-sends the token (no enabled key)
+  assert.equal(am.accounts[idx].enabled, false, 'still benched — the header path never silently re-enables');
+  assert.equal(am.accounts[idx].credential, 'zai-tok-refreshed', 'token still refreshes while benched');
+});
+
 test('a pre-fix state.json (no runtimeProviders key) restores cleanly — backward compatible', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-rtp-'));
   const prev = process.env.MAXPOOL_CONFIG;

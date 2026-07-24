@@ -1699,6 +1699,15 @@ export class AccountManager {
     // are all unavailable the request HOLDS/queues (recoverable) rather than 400ing.
     if (requestInfo.hasImage && account.provider === 'kimi') return false;
 
+    // A large-context session: a provider already rejected this request with a
+    // context-length 400. The GLM/Kimi *coding* endpoints serve a fixed model capped
+    // at ~256K and IGNORE the model id (so a K3/GLM 1M PLAN doesn't lift the coding
+    // leg's ceiling). Only a 1M-context Claude account can hold it — bench the
+    // providers for this session so it routes to Claude, or HOLDS for one, instead of
+    // re-404ing on a too-small leg. Sticky per session (context only grows turn over
+    // turn), so no follow-up turn re-pays the wasted attempt.
+    if (account.type === 'provider' && this._isSessionLargeContext(requestInfo)) return false;
+
     const { incompatible, homeProvider } = this._effectiveIncompatible(requestInfo);
     const policy = this._crossProviderFallbackPolicy();
 
@@ -1732,6 +1741,9 @@ export class AccountManager {
     if (requestInfo.anthropicIncompatible) {
       this.markSessionIncompatible(requestInfo.sessionKey, requestInfo.homeProvider);
     }
+    if (requestInfo.largeContext) {
+      this.markSessionLargeContext(requestInfo.sessionKey);
+    }
   }
 
   // Latch a session as Anthropic-incompatible (a foreign server_tool_use id, or a
@@ -1748,6 +1760,25 @@ export class AccountManager {
       anthropicIncompatible: true,
       homeProvider: existing.homeProvider || homeProvider || null,
     });
+  }
+
+  // Latch a session as large-context: a provider (the GLM/Kimi coding endpoint, fixed
+  // ~256K) rejected a request with a context-length 400 that only a 1M Claude can hold.
+  // Sticky + never-downgrades so every follow-up turn (context only grows) skips the
+  // too-small providers instead of re-paying a wasted 400. Cleared only by a new session.
+  markSessionLargeContext(sessionKey) {
+    if (!sessionKey) return;
+    const existing = this.sessionPolicies.get(sessionKey) || {};
+    if (!existing.largeContext) {
+      console.log(`[Maxpool] Session "${sessionKey}" exceeds provider context limits — pinned to Claude (GLM/Kimi benched for this session)`);
+    }
+    this.sessionPolicies.set(sessionKey, { ...existing, largeContext: true });
+  }
+
+  _isSessionLargeContext(requestInfo = {}) {
+    if (requestInfo.largeContext) return true;
+    if (!requestInfo.sessionKey) return false;
+    return Boolean(this.sessionPolicies.get(requestInfo.sessionKey)?.largeContext);
   }
 
   // Marks a session as containing Anthropic signed thinking. This no longer bars
@@ -2587,6 +2618,10 @@ export class AccountManager {
     account.modelMap = acctData.modelMap || account.modelMap;
     account.stripBetaHeaders = Boolean(acctData.stripBetaHeaders);
     account.runtime = true;
+    // Restore path carries an explicit enabled (persisted disable); honor it. The `cc
+    // all` header path (prepareRuntimeProviders) omits enabled, so a re-sent token
+    // NEVER silently re-enables a provider the user benched in the TUI.
+    if (acctData.enabled !== undefined) account.enabled = acctData.enabled !== false;
     if (account.status === 'error' && changed) {
       account.status = 'active';
       account.lastError = null;
@@ -2620,6 +2655,10 @@ export class AccountManager {
         model: a.model,
         modelMap: a.modelMap,
         stripBetaHeaders: a.stripBetaHeaders,
+        // Persist the user's enable/disable so a provider they benched in the TUI stays
+        // benched across a restart — without this an intentionally-disabled GLM/Kimi
+        // silently comes back enabled on the next boot (restore defaults enabled:true).
+        enabled: a.enabled,
       }));
   }
 
@@ -2797,6 +2836,7 @@ export class AccountManager {
         stickyBindings: this.sessionBindings.size,
         thinkingProtected: [...this.sessionPolicies.values()].filter(p => p.requiresAnthropicThinkingIntegrity).length,
         providerPinned: [...this.sessionPolicies.values()].filter(p => p.anthropicIncompatible).length,
+        largeContextPinned: [...this.sessionPolicies.values()].filter(p => p.largeContext).length,
       },
     };
   }

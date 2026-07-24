@@ -867,9 +867,15 @@ async function forwardRequest(
       // signature it can't validate). Detect it on an Anthropic account so we can
       // self-heal onto a provider instead of surfacing the 400.
       const anthropicIncompat = account.type !== 'provider' && isAnthropicIncompatBody(errorBody);
+      // A provider (GLM ~200K / Kimi 256K context) rejecting an oversized request that
+      // only a large-context Claude (1M) can hold — e.g. "exceeded model token limit:
+      // 262144". Detect it ONLY on a provider (a Claude account's context-length 400 is
+      // terminal — nothing bigger to fall to) so we can pin the session to Claude.
+      const providerTooSmall = account.type === 'provider' && isContextLengthError(errorBody);
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
         ? 'invalid_thinking_signature'
         : anthropicIncompat ? 'anthropic_incompatible_transcript'
+        : providerTooSmall ? 'provider_context_too_small'
         : `HTTP ${upstreamRes.status}`;
       accountManager.releaseAccount(lease, { status: upstreamRes.status, error: errorType });
 
@@ -914,6 +920,33 @@ async function forwardRequest(
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, { ...requestInfo, anthropicIncompatible: true },
+          canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+        );
+      }
+
+      // React-and-heal: a PROVIDER (GLM/Kimi coding endpoint, fixed ~256K context)
+      // rejected an oversized request only a 1M-context Claude can hold — e.g. Kimi's
+      // "exceeded model token limit: 262144 (requested: 643557)". The coding leg IGNORES
+      // the model id, so a K3/GLM-1M plan doesn't lift its ceiling. Latch the session
+      // large-context (so its follow-up turns skip the too-small providers) and retry
+      // EXCLUDING every provider → routes to Claude, or HOLDS for a Claude account,
+      // instead of surfacing a 400 the client just retry-loops on. Only worth it when a
+      // Claude account exists to serve it; with none, the 400 surfaces (nothing bigger).
+      const claudeAvailable = accountManager.accounts?.some(a => a.type !== 'provider' && a.enabled !== false);
+      if (providerTooSmall && requestInfo.sessionKey && claudeAvailable
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        accountManager.markSessionLargeContext?.(requestInfo.sessionKey);
+        // Bench EVERY provider: today's GLM + Kimi coding legs both cap at ~256K, so once
+        // one 400s on size the others can't hold it either. If a genuine 1M-context
+        // provider is ever added, make this exclusion context-limit-aware instead of
+        // type-wide (the _isRequestCompatible gate would need the same treatment).
+        for (const a of (accountManager.accounts || [])) {
+          if (a.type === 'provider') excludedIndexes.add(a.index);
+        }
+        console.log(`[Maxpool] Provider "${account.name}" context too small for this request; pinning session to Claude and retrying`);
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, { ...requestInfo, largeContext: true },
           canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
@@ -1183,7 +1216,22 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
     return `This session's transcript can only run on ${fam} — Claude rejects its server-tool ids/thinking on replay. No ${fam} provider is available right now.${eta} Check the x-maxpool-zai-token / x-maxpool-kimi-token headers, or resume with 'cc ${incompat.homeProvider === 'kimi' ? 'kimi' : 'glm'}'.`;
   }
 
-  const n = accountManager.accounts.length;
+  // A large-context session (a provider already 400'd it as too big for its ~256K leg):
+  // only a 1M-context Claude can hold it — the providers are structurally BARRED, not
+  // merely "at their limit". Say the oversized truth + the two real ways out (wait for a
+  // Claude account, or /compact), instead of the misleading "providers at limit" line.
+  if (accountManager._isSessionLargeContext?.(requestInfo)) {
+    const eta = Number.isFinite(retryAfter) && retryAfter > 0
+      ? ` A Claude account should free in ~${formatRetryDuration(retryAfter)}.` : '';
+    return `This session is too large for the GLM/Kimi fallbacks (their ~256K limit) — it needs a 1M-context Claude account, and they're all busy right now.${eta} It sends as soon as one frees; /compact shortens the session if you'd rather not wait.`;
+  }
+
+  const claudeCount = accountManager.accounts.filter(a => a.type !== 'provider').length;
+  // Only name the providers when this pool actually HAS them (`cc all`). On `cc ma`
+  // (Claude-only) there are none, so the old hardcoded "and the GLM/Kimi providers"
+  // was a lie. When present they DO serve (not barred), so they're saturated too.
+  const providersClause = accountManager.accounts.some(a => a.type === 'provider')
+    ? ' and the GLM/Kimi providers' : '';
 
   // No route is expected to recover within the queue window — i.e. every Claude
   // account is at its own 5h/weekly limit. A short "retry in Ns" would be a lie;
@@ -1192,19 +1240,24 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
     const eta = Number.isFinite(retryAfter) && retryAfter > 0
       ? ` Soonest reset in ~${formatRetryDuration(retryAfter)}, beyond the hold window.`
       : '';
-    const base = `No account can take this request — all ${n} Claude accounts and the GLM/Kimi providers are at their limit.${eta} Add another Claude account or wait for a quota reset.`;
-    // (thinking sessions are NOT barred from GLM/Kimi under the default policy — the old
-    // "fallback unavailable because signed thinking" suffix was false and is dropped.)
-    return base;
+    return `No account can take this request — all ${claudeCount} Claude accounts${providersClause} are at their limit.${eta} Add another Claude account or wait for a quota reset.`;
   }
 
-  // Every Claude account AND both providers are momentarily saturated (a thinking session
-  // DOES fall back to GLM/Kimi — the old "fallback disabled because signed thinking"
-  // message was false).
-  return `No account can take this request right now — all ${n} Claude accounts and the GLM/Kimi providers are momentarily at their limit. Retry in ${retryAfter}s.`;
+  return `No account can take this request right now — all ${claudeCount} Claude accounts${providersClause} are momentarily at their limit. Retry in ${retryAfter}s.`;
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, streamResponse, startIdleRequestReaper };
+// A provider (GLM/Kimi) rejecting a request whose token count exceeds its context
+// window — Kimi's coding leg ("exceeded model token limit: 262144"), GLM's, or an
+// OpenAI-style "maximum context length". Kept narrow (specific context-overflow
+// phrasings, NOT a bare "token limit" which a rate-limit body also carries) so the
+// pin-to-Claude heal only fires on a genuine size overflow, not any 400. Rate-limit
+// 429s are intercepted earlier (classifyRateLimit) and never reach this check.
+function isContextLengthError(errorBody) {
+  if (!errorBody) return false;
+  return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
+}
+
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
