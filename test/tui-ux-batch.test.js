@@ -59,15 +59,51 @@ test('A1 an ENABLED account is NOT dimmed', () => {
 
 // ── A3: the routing footer shows the CURRENT cross-provider policy inline ─────────
 
-test('A3 the routing footer shows the live cross-provider policy (updates at the keypress)', () => {
+test('A3 the routing footer shows GLM and Kimi SEPARATELY and updates at the keypress', () => {
   const am = mgr();
   am.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
+  am.addAccount({ name: 'kimi', type: 'provider', provider: 'kimi', apiKey: 'kk' });
   const tui = tuiFor(am);
   tui.mode = 'routing';
-  am.setCrossProviderFallbackPolicy('always');
-  assert.ok(strip(tui._renderFooter()).includes('Cross-provider: always'), 'footer reflects the active policy');
+
+  // Unset per-provider ⇒ inherits the global policy (no shadowing).
   am.setCrossProviderFallbackPolicy('never');
-  assert.ok(strip(tui._renderFooter()).includes('Cross-provider: never'), 'footer updates when the policy cycles');
+  let f = strip(tui._renderFooter());
+  assert.match(f, /GLM: never/);
+  assert.match(f, /Kimi: never/);
+
+  // Steering ONE provider must not move the other — the whole point of the split.
+  am.setClaudeFallbackForProvider('zai', 'when-exhausted');
+  f = strip(tui._renderFooter());
+  assert.match(f, /GLM: when-exhausted/, 'GLM updated');
+  assert.match(f, /Kimi: never/, 'Kimi is independent');
+});
+
+test('A3 per-provider gate: GLM eligible for a Claude session while Kimi stays barred', () => {
+  const am = mgr();
+  am.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
+  am.addAccount({ name: 'kimi', type: 'provider', provider: 'kimi', apiKey: 'kk' });
+  am.setCrossProviderFallbackPolicy('never');
+  const glm = am.accounts.find(a => a.provider === 'zai');
+  const kimi = am.accounts.find(a => a.provider === 'kimi');
+  const req = { profile: 'all', sessionKey: 's1' };
+
+  assert.equal(am._isRequestCompatible(glm, 'all', req), false, 'both off by default');
+  assert.equal(am._isRequestCompatible(kimi, 'all', req), false);
+
+  am.setClaudeFallbackForProvider('zai', 'when-exhausted');
+  assert.equal(am._isRequestCompatible(glm, 'all', req), true, 'GLM now allowed');
+  assert.equal(am._isRequestCompatible(kimi, 'all', req), false, 'Kimi still barred — independent');
+});
+
+test('A3 an unset provider INHERITS the global policy (no two-gate trap)', () => {
+  const am = mgr();
+  am.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
+  const glm = am.accounts.find(a => a.provider === 'zai');
+  // Cycling the legacy global knob must still work when no per-provider entry exists.
+  am.setCrossProviderFallbackPolicy('when-exhausted');
+  assert.equal(am._claudeFallbackFor('zai'), 'when-exhausted', 'inherits the global');
+  assert.equal(am._isRequestCompatible(glm, 'all', { profile: 'all' }), true);
 });
 
 // ── A7: the wider Account column fits a full email ───────────────────────────────

@@ -354,6 +354,18 @@ async function forwardRequest(
   const configuredAttempts = Number(retryConfig.maxAttemptsPerRequest) || accountManager.accounts.length;
   const maxAttempts = Math.max(1, configuredAttempts);
 
+  // PRE-STRIP a session already known to carry provider-authored thinking. The client
+  // resends the whole poisoned history every turn, so without this each turn pays another
+  // rejected round-trip before the reactive repair kicks in. Latched by the first repair.
+  if (retryCount === 0 && !requestInfo.thinkingStripped
+    && accountManager.isSessionThinkingContaminated?.(requestInfo.sessionKey)) {
+    const pre = stripForeignThinkingBlocks(body);
+    if (pre.body) {
+      body = pre.body;
+      requestInfo = { ...requestInfo, thinkingStripped: true };
+    }
+  }
+
   // Select account
   const lease = accountManager.acquireAccount(requestInfo, excludedIndexes);
   const account = lease?.account;
@@ -896,8 +908,14 @@ async function forwardRequest(
       // for the strip-and-recover retry below. Deliberately NOT the fuzzy
       // isAnthropicIncompatBody heuristic, so a merely malformed request can never cause
       // us to rewrite a user's transcript.
+      // Two deterministic shapes, both repairable by stripping: a signature Anthropic
+      // can't validate, AND a provider block that carries NO signature field at all
+      // ("messages.4.content.0.thinking.signature: Field required"). The second variant
+      // used to fall straight through to a PERMANENT provider pin even though stripping
+      // fixes it. Still deterministic — never the fuzzy isAnthropicIncompatBody heuristic.
       const isSignatureRejection = account.type !== 'provider'
-        && /invalid `signature` in `thinking`/i.test(errorBody);
+        && (/invalid `signature` in `thinking`/i.test(errorBody)
+          || /content\.\d+\.thinking\.signature/i.test(errorBody));
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
         ? 'invalid_thinking_signature'
         : anthropicIncompat ? 'anthropic_incompatible_transcript'
@@ -943,6 +961,9 @@ async function forwardRequest(
         && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
         const { body: cleanBody, removed } = stripForeignThinkingBlocks(body);
         if (cleanBody) {
+          // Latch it so EVERY later turn is stripped up front instead of re-paying this
+          // rejected round-trip (the client resends the full poisoned history each turn).
+          accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
           console.log(`[Maxpool] Recovering session on Claude: stripped ${removed} provider-authored thinking block(s) Anthropic rejected`);
           return forwardRequest(
             req, res, cleanBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,

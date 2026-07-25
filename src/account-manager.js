@@ -136,8 +136,9 @@ const DEFAULT_SCHEDULER = {
   crossAccountThinkingMigration: true,
   // Cross-PROVIDER fallback policy for 'cc all' (profile=all), i.e. whether a session
   // may be served by a provider FAMILY other than its home (Claude ↔ GLM ↔ Kimi).
-  //   'never'         — strict pin: a Claude session uses Claude only; a GLM session
-  //                     uses GLM only; a Kimi session uses Kimi only.
+  //   'never'         — (DEFAULT) a Claude session never spills onto a provider. NOTE:
+  //                     this governs the Claude→provider direction ONLY — it is NOT a
+  //                     same-family pin (a provider-origin session still reaches Claude).
   //   'when-exhausted'— home family preferred; a Claude session falls back to GLM/Kimi
   //                     only once all Claude accounts are unavailable, and a GLM session
   //                     may fall to Kimi once GLM is exhausted.
@@ -157,6 +158,18 @@ const DEFAULT_SCHEDULER = {
   // kept even while Claude→provider is 'never'. Only has effect under policy:'never' (the
   // 'when-exhausted'/'always' paths never pinned to home). Set false for a strict home-pin.
   providerCrossFallback: true,
+  // PER-PROVIDER Claude→provider control. One knob per provider so GLM and Kimi are
+  // steered independently (their reliability and quota differ). Each takes the same
+  // 'never' | 'when-exhausted' | 'always'. Undefined ⇒ inherit crossProviderFallbackPolicy,
+  // so an existing config upgrades to byte-identical behavior. Default 'never': letting a
+  // Claude session finish on a provider contaminates its transcript (BOTH providers emit
+  // thinking blocks Anthropic rejects — measured 2026-07-25), and while Maxpool now repairs
+  // that automatically, a provider server-tool call is NOT repairable.
+  // Ships EMPTY on purpose: an unset provider INHERITS crossProviderFallbackPolicy (whose
+  // default is already 'never'), so off-by-default holds without a per-provider entry
+  // shadowing the global one. Seeding explicit values here would mean cycling the global
+  // policy silently did nothing — the two-gate trap.
+  providers: {},
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 // Consecutive failed recovery probes before we stop trusting the SHARED breaker and
@@ -1717,7 +1730,7 @@ export class AccountManager {
   _effectivePriority(account, requestInfo = {}) {
     const base = Number.isFinite(account.priority) ? account.priority : 0;
     if (account.type === 'provider'
-        && this._crossProviderFallbackPolicy() === 'always'
+        && this._claudeFallbackFor(account.provider) === 'always'
         && !this._effectiveIncompatible(requestInfo).incompatible) {
       return 0;
     }
@@ -1743,6 +1756,23 @@ export class AccountManager {
       incompatible: Boolean(requestInfo.anthropicIncompatible || sticky?.anthropicIncompatible),
       homeProvider: requestInfo.homeProvider || sticky?.homeProvider || null,
     };
+  }
+
+  /** Claude→provider policy for ONE provider. Falls back to the legacy global policy when
+   *  unset, so an existing config keeps its exact behavior on upgrade. */
+  _claudeFallbackFor(providerKey) {
+    const per = this.scheduler.providers?.[providerKey]?.claudeFallback;
+    const valid = new Set(['never', 'when-exhausted', 'always']);
+    return valid.has(per) ? per : this._crossProviderFallbackPolicy();
+  }
+
+  setClaudeFallbackForProvider(providerKey, policy) {
+    const valid = new Set(['never', 'when-exhausted', 'always']);
+    if (!providerKey || !valid.has(policy)) return false;
+    const providers = { ...(this.scheduler.providers || {}) };
+    providers[providerKey] = { ...(providers[providerKey] || {}), claudeFallback: policy };
+    this.scheduler.providers = providers;
+    return true;
   }
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
@@ -1789,7 +1819,9 @@ export class AccountManager {
     // lets providers serve as a priority-fallback; 'always' peers them
     // (_effectivePriority). Signed thinking no longer bars providers here — but its
     // live MIGRATION stays Claude-only (see the rebalance guard).
-    if (account.type === 'provider' && policy === 'never') return false;
+    // PER-PROVIDER Claude→provider gate (GLM and Kimi steer independently). Unset ⇒
+    // inherits the legacy global policy, so behavior is unchanged on upgrade.
+    if (account.type === 'provider' && this._claudeFallbackFor(account.provider) === 'never') return false;
     return true;
   }
 
@@ -1833,6 +1865,25 @@ export class AccountManager {
       console.log(`[Maxpool] Session "${sessionKey}" exceeds provider context limits — pinned to Claude (GLM/Kimi benched for this session)`);
     }
     this.sessionPolicies.set(sessionKey, { ...existing, largeContext: true });
+  }
+
+  // Latch a session whose transcript carries provider-authored thinking blocks Anthropic
+  // rejects. Without this the repair is per-REQUEST: the client resends the whole poisoned
+  // history every turn, so each turn pays another rejected round-trip before the strip
+  // (measured: ~9 rejections per contaminated session). Sticky → later turns are stripped
+  // BEFORE the first attempt. In-memory only, like the other session policies.
+  markSessionThinkingContaminated(sessionKey) {
+    if (!sessionKey) return;
+    const existing = this.sessionPolicies.get(sessionKey) || {};
+    if (!existing.thinkingContaminated) {
+      console.log(`[Maxpool] Session "${sessionKey}" carries provider-authored thinking — stripping it up front from now on`);
+    }
+    this.sessionPolicies.set(sessionKey, { ...existing, thinkingContaminated: true });
+  }
+
+  isSessionThinkingContaminated(sessionKey) {
+    if (!sessionKey) return false;
+    return Boolean(this.sessionPolicies.get(sessionKey)?.thinkingContaminated);
   }
 
   _isSessionLargeContext(requestInfo = {}) {

@@ -559,6 +559,8 @@ export class TUI {
       );
     } else if (k === 'p' && this.am.accounts.some(account => account.type !== 'provider')) {
       this._startSelection('prefer');
+    } else if (k === 'g' || k === 'k') {
+      this._cycleProviderClaudeFallback(k === 'g' ? 'zai' : 'kimi');
     } else if (k === 'f' || k === 'F') {
       // Cycle the cross-provider fallback policy in place — reversible + non-destructive,
       // so no confirm dialog (unlike restart/delete). Accept F too (Shift-f muscle memory).
@@ -566,6 +568,34 @@ export class TUI {
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
+  }
+
+  /** Cycle ONE provider's Claude→provider setting. Turning it ON is the risky direction
+   *  (a Claude session can finish on that provider), so it asks first; turning it back off
+   *  is always safe and never prompts. */
+  _cycleProviderClaudeFallback(providerKey) {
+    const order = ['never', 'when-exhausted', 'always'];
+    const label = providerKey === 'zai' ? 'GLM' : 'Kimi';
+    const cur = this.am._claudeFallbackFor?.(providerKey) || 'never';
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    const apply = async () => {
+      this.am.setClaudeFallbackForProvider?.(providerKey, next);
+      const sched = { ...(this.config.scheduler || {}) };
+      sched.providers = { ...(sched.providers || {}) };
+      sched.providers[providerKey] = { ...(sched.providers[providerKey] || {}), claudeFallback: next };
+      this.config.scheduler = sched;
+      try { await this.saveConfig(this.config); } catch (e) { this._addLog(`Could not save: ${e.message}`); }
+      this._addLog(`${label} takes over when Claude is out: ${next}`);
+    };
+    if (cur === 'never') {
+      this._confirm(
+        `Let ${label} take over when Claude is out?`,
+        `A session that starts on Claude can finish on ${label}. Most move back to Claude fine. If ${label} runs a web search, that session stays on ${label} until you start a new one.`,
+        apply,
+      );
+      return;
+    }
+    apply();
   }
 
   async _cycleCrossProviderPolicy() {
@@ -1459,8 +1489,9 @@ export class TUI {
         // Show the CURRENT cross-provider policy inline so pressing f visibly changes it
         // right here at the footer (the policy also renders in the header, far from the
         // keypress — the "f does nothing" report).
-        const xp = this.am._crossProviderFallbackPolicy?.() || 'when-exhausted';
-        return ` ${bold('a')} Automatic  ${bold('p')} Manual preference  ${bold('f')} Cross-provider: ${cyan(xp)} ↻  ${bold('Esc')} Back`;
+        const g = this.am._claudeFallbackFor?.('zai') || 'never';
+        const k = this.am._claudeFallbackFor?.('kimi') || 'never';
+        return ` ${bold('a')} Automatic  ${bold('p')} Preference  ${bold('g')} GLM: ${cyan(g)} ↻  ${bold('k')} Kimi: ${cyan(k)} ↻  ${bold('Esc')} Back`;
       }
       case 'select': {
         const act = this.selAction === 'prefer'
