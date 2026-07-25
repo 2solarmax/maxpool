@@ -402,6 +402,11 @@ async function forwardRequest(
   res.once('close', onClientClose);
   const releaseOnClientGone = () => {
     res.off('close', onClientClose);
+    // The client vanished — we never got an upstream answer, so this carries ZERO
+    // evidence about Anthropic's health. Hand the recovery probe back instead of
+    // letting releaseAccount score it as a FAILED probe (which would re-arm the
+    // fleet-wide throttle for 5s on every disconnect — a second deadlock amplifier).
+    accountManager.relinquishUpstreamProbe?.(lease);
     accountManager.releaseAccount(lease);
     clearQueueHeartbeat(requestInfo);
     accountManager.removeQueuedRequest?.(requestInfo);
@@ -421,6 +426,9 @@ async function forwardRequest(
     // (MaxListenersExceededWarning + leak); the recursive/resumed frame registers
     // its own.
     res.off('close', onClientClose);
+    // Token refresh failed — the request never reached Anthropic, so this is no
+    // evidence about upstream health. Relinquish rather than fail the probe.
+    accountManager.relinquishUpstreamProbe?.(lease);
     accountManager.releaseAccount(lease);
     excludedIndexes.add(account.index);
     if (
@@ -562,6 +570,18 @@ async function forwardRequest(
       rateLimitHeaders[key] = value;
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
+
+    // SETTLE THE SHARED BREAKER AT THE HEADER BOUNDARY. Anthropic ANSWERED, so unless
+    // the status is itself a capacity signal, the upstream is provably reachable and
+    // serving — a per-request verdict (400 bad transcript, 401, 404, 413, 422) says
+    // NOTHING about capacity and must never keep the fleet-wide throttle armed.
+    // Without this, a poisoned request (e.g. a provider-authored thinking block that
+    // Anthropic 400s) claimed the recovery probe, "failed" it, re-armed the shared
+    // throttle every 5s, and benched EVERY healthy account indefinitely — a hard
+    // production-down deadlock (2026-07-25: 6 of 13 re-arms were client-side 400s
+    // while accounts sat at 2%/11%/25% weekly). confirmUpstreamProbe also clears
+    // lease.upstreamThrottleProbe, so the releaseAccount probe branch below no-ops.
+    if (!isCapacitySignalStatus(upstreamRes.status)) accountManager.confirmUpstreamProbe?.(lease);
 
     // Retry/failover can only happen before response bytes are sent. Once a
     // streaming response starts, rerouting would corrupt Claude Code's stream.
@@ -872,6 +892,12 @@ async function forwardRequest(
       // 262144". Detect it ONLY on a provider (a Claude account's context-length 400 is
       // terminal — nothing bigger to fall to) so we can pin the session to Claude.
       const providerTooSmall = account.type === 'provider' && isContextLengthError(errorBody);
+      // DETERMINISTIC signature rejection (exact Anthropic wording) — the only trigger
+      // for the strip-and-recover retry below. Deliberately NOT the fuzzy
+      // isAnthropicIncompatBody heuristic, so a merely malformed request can never cause
+      // us to rewrite a user's transcript.
+      const isSignatureRejection = account.type !== 'provider'
+        && /invalid `signature` in `thinking`/i.test(errorBody);
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
         ? 'invalid_thinking_signature'
         : anthropicIncompat ? 'anthropic_incompatible_transcript'
@@ -901,6 +927,26 @@ async function forwardRequest(
           return forwardRequest(
             req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, { ...requestInfo, pinnedAccountName: lease.migratedFromName },
+            canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+      }
+
+      // RECOVER-ON-CLAUDE (preferred over the provider pin below): the transcript
+      // carries provider-authored thinking blocks whose signature Anthropic rejects.
+      // Strip exactly those blocks and retry on Claude, so a session that took even one
+      // GLM/Kimi fallback turn is NOT bricked (or exiled to a provider) for the rest of
+      // its life. Verified against the real API — the stripped history returns 200, with
+      // text + tool_use preserved. Tried once per request (thinkingStripped guard); if it
+      // still fails, the provider pin below is the fallback.
+      if (isSignatureRejection && !requestInfo.thinkingStripped
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        const { body: cleanBody, removed } = stripForeignThinkingBlocks(body);
+        if (cleanBody) {
+          console.log(`[Maxpool] Recovering session on Claude: stripped ${removed} provider-authored thinking block(s) Anthropic rejected`);
+          return forwardRequest(
+            req, res, cleanBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, { ...requestInfo, thinkingStripped: true },
             canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
           );
         }
@@ -951,13 +997,44 @@ async function forwardRequest(
         );
       }
 
+      // Nothing could heal it — replace the cryptic upstream 400 with the real cause and
+      // the actual way out. This is what the user saw for hours as a bare
+      // "400 messages.51.content.8: Invalid `signature` in `thinking` block".
+      // Trigger on the DETERMINISTIC signature rejection only — never the fuzzy
+      // isAnthropicIncompatBody heuristic, so an unrelated malformed request keeps its
+      // own upstream error instead of being mislabelled a provider-contamination.
+      if (isSignatureRejection && !res.headersSent) {
+        const provs = (accountManager.accounts || []).filter(a => a.type === 'provider');
+        // Say only what ACTUALLY happened. `thinkingStripped` is set only when the strip
+        // ran; without it we found nothing provider-shaped, so claiming we stripped —
+        // or blaming GLM/Kimi — would misdirect the user.
+        const what = requestInfo.thinkingStripped
+          ? 'This session ran on GLM/Kimi earlier and Anthropic rejects the thinking blocks they wrote. Maxpool removed them and retried on Claude, but Anthropic still rejected the history.'
+          : "Anthropic rejected a thinking block in this session's history, and maxpool could not identify it as provider-authored, so it could not be repaired automatically.";
+        const hint = provs.length === 0
+          ? ''
+          : provs.every(a => a.enabled === false)
+            ? ' If this session previously ran on GLM/Kimi, re-enabling that provider in the maxpool TUI (a → t) lets it continue there.'
+            : '';
+        ctx.status = 400;
+        sendErrorResponse(res, requestInfo, 400, {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: `Start a new session to keep working — this one cannot continue. ${what}${hint}`,
+          },
+        });
+        return;
+      }
+
       ctx.status = upstreamRes.status;
       sendErrorBody(res, requestInfo, upstreamRes.status, errorBody, upstreamRes.headers);
       return;
     }
 
     if (upstreamRes.status < 400) {
-      accountManager.confirmUpstreamProbe?.(lease);
+      // (the probe was already settled at the header boundary above — this only
+      // records the account-level "upstream accepted us" signal)
       accountManager.markUpstreamAccepted?.(account.index);
     }
 
@@ -1257,7 +1334,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, isCapacitySignalStatus, isForeignThinkingSignature, stripForeignThinkingBlocks, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1431,6 +1508,80 @@ function secondsUntilParsedTime(value) {
     return Math.min(Math.max(Math.ceil((ms - Date.now()) / 1000), 1), 24 * 60 * 60);
   }
   return null;
+}
+
+// An Anthropic thinking `signature` is a long base64 protobuf blob (200+ chars, e.g.
+// "Eo8DCpQBCBAYAipAqutr+oAB…"). GLM's Anthropic-compatible endpoint emits a SHORT hex
+// digest instead (verified 2026-07-25: "8f8840affff743118e1f569d", 24 hex chars) — which
+// Anthropic rejects with `Invalid \`signature\` in \`thinking\` block`, permanently
+// bricking any session that took even ONE provider turn. Detect the foreign shape
+// conservatively: only a missing / short / pure-hex signature counts, so a genuine
+// Anthropic block is never stripped.
+function isForeignThinkingSignature(sig) {
+  if (typeof sig !== 'string' || sig.length === 0) return true;
+  if (sig.length < 60) return true;
+  return /^[0-9a-f]+$/i.test(sig);
+}
+
+/**
+ * Recovery for a provider-contaminated transcript: drop the assistant `thinking` /
+ * `redacted_thinking` blocks whose signature Anthropic can't validate, so the session
+ * can CONTINUE ON CLAUDE instead of being pinned to a provider forever.
+ *
+ * Empirically verified 2026-07-25 against the real API: replaying a GLM-authored
+ * thinking block to Anthropic returns 400; the SAME history with those blocks removed
+ * returns 200 — including an assistant turn carrying `tool_use` followed by a
+ * `tool_result` (thinking blocks are not required on replay for a new turn). Text and
+ * tool_use blocks are preserved, so no conversation content or tool wiring is lost.
+ *
+ * Returns { body, removed } — `body` is null when nothing needed stripping.
+ */
+function stripForeignThinkingBlocks(body) {
+  try {
+    const json = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body));
+    if (!Array.isArray(json?.messages)) return { body: null, removed: 0 };
+    let removed = 0;
+    const messages = [];
+    for (const msg of json.messages) {
+      if (msg?.role !== 'assistant' || !Array.isArray(msg.content)) { messages.push(msg); continue; }
+      let localRemoved = 0;
+      const kept = msg.content.filter(block => {
+        // ONLY `thinking`. NEVER `redacted_thinking`: a genuine one carries `data` and
+        // legitimately has NO signature, so signature-based judging would strip 100% of
+        // them (verified against the live API). GLM's contamination is always a
+        // `thinking` block with a hex signature.
+        if (block?.type !== 'thinking') return true;
+        if (!isForeignThinkingSignature(block.signature)) return true;
+        localRemoved++;
+        return false;
+      });
+      removed += localRemoved;
+      if (!localRemoved) { messages.push(msg); continue; }
+      // A turn that stripping empties is DROPPED, not left with its poisoned block:
+      // leaving it would resend the exact body that just 400'd while reporting success
+      // and burning the single recovery attempt. Verified against the live API — the
+      // resulting consecutive user messages are accepted (200 OK).
+      if (kept.length === 0) continue;
+      messages.push({ ...msg, content: kept });
+    }
+    if (!removed) return { body: null, removed: 0 };
+    json.messages = messages;
+    return { body: Buffer.from(JSON.stringify(json)), removed };
+  } catch {
+    return { body: null, removed: 0 };   // non-JSON / unparseable → no rewrite
+  }
+}
+
+/**
+ * Is this status a CAPACITY signal (i.e. evidence the upstream can't serve us right
+ * now), as opposed to a per-request verdict? Only these may keep the shared Anthropic
+ * throttle armed. 403 is included deliberately: on these plans a 403 is almost always
+ * quota/plan exhaustion, NOT bad credentials (see the provider-auth handler). 408 is a
+ * latency/capacity signal. Everything else in 4xx (400/401/404/413/422…) means Anthropic
+ * answered a specific request — the upstream is alive.
+ */
+function isCapacitySignalStatus(status) {
+  return status === 429 || status === 403 || status === 408 || status >= 500;
 }
 
 function isRetriableUpstreamStatus(status) {

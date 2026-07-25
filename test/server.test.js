@@ -1317,10 +1317,48 @@ test('nonretryable 400 is recorded as failure and passed through', async () => {
     });
     assert.equal(res.status, 400);
     const body = await res.json();
-    assert.match(body.error.message, /Invalid `signature`/);
+    // The raw upstream text ("messages.41.content.0: Invalid `signature`…") is now
+    // replaced with the actionable cause + way out — a bare 400 left the user stuck for
+    // hours on 2026-07-25. Status + failure accounting are unchanged.
+    // No strip ran here (empty messages), so the message must NOT claim one — it states
+    // only what actually happened and leads with the guaranteed remedy.
+    assert.match(body.error.message, /Start a new session/, 'leads with the way out');
+    assert.match(body.error.message, /could not identify it as provider-authored/,
+      'honest: does not fabricate a GLM/Kimi story when nothing was stripped');
     assert.equal(am.accounts[0].failedRequests, 1);
     assert.equal(am.accounts[0].lastError, 'invalid_thinking_signature');
     assert.equal(am.accounts[1].usage.totalRequests, 0);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('a NON-signature 400 is still passed through verbatim (the rewrite is narrowly scoped)', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'messages: field required' },
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 2000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [] }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error.message, 'messages: field required', 'upstream text preserved exactly');
+    assert.doesNotMatch(body.error.message, /GLM\/Kimi|new session/, 'no contamination story on an unrelated 400');
   } finally {
     await close(proxy);
     await close(upstream);

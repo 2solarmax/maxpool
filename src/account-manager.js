@@ -159,6 +159,10 @@ const DEFAULT_SCHEDULER = {
   providerCrossFallback: true,
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
+// Consecutive failed recovery probes before we stop trusting the SHARED breaker and
+// fall back to per-account handling. Bounds any future "poisoned probe" from becoming
+// an indefinite fleet-wide outage (2026-07-25 incident).
+const MAX_FAILED_PROBES = 4;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
@@ -734,6 +738,7 @@ export class AccountManager {
     this.upstreamThrottle.until = Math.max(this.upstreamThrottle.until || 0, until);
     this.upstreamThrottle.reason = reason;
     this.upstreamThrottle.probeInFlight = false;
+    this.upstreamThrottle.failedProbes = 0;   // fresh breaker → fresh probe budget
     this.upstreamThrottle.count++;
     this.upstreamThrottle.lastAt = Date.now();
     console.log(`[Maxpool] Anthropic upstream temporarily limiting requests for ${retryAfter}s; pausing Claude routes`);
@@ -744,6 +749,7 @@ export class AccountManager {
     this.upstreamThrottle.until = null;
     this.upstreamThrottle.reason = null;
     this.upstreamThrottle.probeInFlight = false;
+    this.upstreamThrottle.failedProbes = 0;
     this.queueState.rampUntil = Date.now() + 5000;
     this.queueState.lastAdmissionAt = Date.now();
     console.log(`[Maxpool] Anthropic upstream throttle cleared (${reason})`);
@@ -755,14 +761,36 @@ export class AccountManager {
     lease.upstreamThrottleProbe = false;
   }
 
+  /** Hand the recovery probe back UNUSED — the request never got an upstream answer
+   *  (client disconnected, token refresh failed), so it is no evidence either way.
+   *  Leaves the window open so the very next request can claim the probe, instead of
+   *  scoring a failure that would re-arm the fleet-wide throttle. */
+  relinquishUpstreamProbe(lease) {
+    if (!lease?.upstreamThrottleProbe) return;
+    lease.upstreamThrottleProbe = false;
+    this.upstreamThrottle.probeInFlight = false;
+  }
+
   deferUpstreamThrottleProbe(retryAfterSeconds = 5, reason = 'probe_failed') {
     if (!this.upstreamThrottle.until && !this.upstreamThrottle.probeInFlight) return;
-    const retryAfter = clampRetryAfterSeconds(retryAfterSeconds);
+    // PROBE BUDGET. A flat 5s retry with unbounded repetition is what let a single
+    // poisoned request hold the whole fleet down forever. Escalate the backoff, and
+    // after MAX_FAILED_PROBES consecutive failures give up on the shared breaker and
+    // fall back to per-account handling — the fleet then retries for real, and if
+    // Anthropic genuinely is throttling, shouldPromoteUpstreamFailure re-arms it.
+    // (This is a circuit breaker's half-open state, paced by the backoff.)
+    this.upstreamThrottle.failedProbes = (this.upstreamThrottle.failedProbes || 0) + 1;
+    if (this.upstreamThrottle.failedProbes >= MAX_FAILED_PROBES) {
+      this.clearUpstreamThrottle(`probe budget exhausted after ${this.upstreamThrottle.failedProbes} failures (${reason}) — deferring to per-account handling`);
+      return;
+    }
+    const backoff = Math.min(60, retryAfterSeconds * 2 ** (this.upstreamThrottle.failedProbes - 1));
+    const retryAfter = clampRetryAfterSeconds(backoff);
     this.upstreamThrottle.until = Date.now() + retryAfter * 1000;
     this.upstreamThrottle.reason = reason;
     this.upstreamThrottle.probeInFlight = false;
     this.upstreamThrottle.lastAt = Date.now();
-    console.log(`[Maxpool] Anthropic recovery probe failed; retrying in ${retryAfter}s (${reason})`);
+    console.log(`[Maxpool] Anthropic recovery probe failed (${this.upstreamThrottle.failedProbes}/${MAX_FAILED_PROBES}); retrying in ${retryAfter}s (${reason})`);
   }
 
   noteAmbiguousRateLimit(accountIndex, fingerprint, _retryAfterSeconds) {
