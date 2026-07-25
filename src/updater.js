@@ -95,6 +95,14 @@ export function markApplied(version) {
   }
 }
 
+/** Clear the applied-version quarantine floor. The AUTO path quarantines a version it
+ *  ATTEMPTED (markApplied, before the reload) so a genuinely boot-broken release can't
+ *  reload-loop — but a reload that rolled back for a NON-version reason (e.g. a slow
+ *  readiness handshake on a loaded machine) then wrongly strands a perfectly-good version
+ *  ("already attempted — will retry only a newer release"). An EXPLICIT manual apply calls
+ *  this first so the user can always re-attempt the current latest. */
+export function clearQuarantine() { _lastAttemptedTarget = null; }
+
 /**
  * Check for an update; with `config.autoUpdate` also self-install; with
  * `config.autoApply` SIGNAL that the caller should seamlessly reload to APPLY it

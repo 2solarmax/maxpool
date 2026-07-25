@@ -194,3 +194,25 @@ test('the MANUAL apply path installs even when autoUpdate is off (the forceInsta
   assert.equal(installed, true, 'the forced manual path installs despite the base config being autoUpdate:false');
   assert.equal(manual.applicable, true, 'so applyNow (autoApply-agnostic) will seamless-reload');
 });
+
+test('clearQuarantine lets a manual apply re-attempt a version a prior rolled-back auto-reload stranded', async () => {
+  // Reproduce the bug: an auto-apply markApplied(1.5.43) BEFORE a reload that then ROLLED
+  // BACK (slow readiness on a loaded machine). The version is now quarantined, so a manual
+  // 'u'→'c' would dead-end on "already attempted". clearQuarantine (called by the manual
+  // path) must un-strand it.
+  const { clearQuarantine } = await import('../src/updater.js');
+  __resetUpdaterState();
+  let onDisk = '1.5.42';                              // running version; the install rewrites it
+  const deps = {
+    getCurrentVersion: async () => onDisk,
+    checkForUpdate: async () => ({ latest: '1.5.43', current: '1.5.42', hasUpdate: true }),
+    selfUpdate: async () => { onDisk = '1.5.43'; return { ok: true, output: '' }; },
+  };
+  markApplied('1.5.43');                              // the pre-reload mark that then rolled back
+  const stranded = await maybeCheckForUpdate({ updateCheck: true, autoUpdate: true }, () => {}, () => {}, deps);
+  assert.equal(stranded.applicable, false, 'quarantined: auto path will NOT re-apply a rolled-back version');
+
+  clearQuarantine();                                  // what the manual 'u'→'c' path now does first
+  const retry = await maybeCheckForUpdate({ updateCheck: true, autoUpdate: true }, () => {}, () => {}, deps);
+  assert.equal(retry.applicable, true, 'after clearQuarantine the manual apply re-attempts 1.5.43');
+});

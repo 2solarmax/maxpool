@@ -12,7 +12,7 @@ import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, toke
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
-import { maybeCheckForUpdate, getCurrentVersion, markApplied } from './updater.js';
+import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine } from './updater.js';
 import {
   runReloadBaton,
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
@@ -23,10 +23,20 @@ import {
 const args = process.argv.slice(2);
 const command = args[0];
 const SERVER_RESTART_EXIT_CODE = 75;
+// Reload readiness handshake budget. On a loaded machine (Bitdefender, many node procs,
+// a local LLM) a fresh worker can need well over 10s to boot + signal ready; too tight →
+// the seamless reload rolls back and the update/restart silently never lands. Generous +
+// env-tunable; covers BOTH the ready and the takeover waits in runReloadBaton.
+const RELOAD_READY_MS = Math.max(10_000, Number(process.env.MAXPOOL_RELOAD_READY_MS) || 30_000);
 // If a seamless reload doesn't release us (→ take over) within this window, the new
-// worker rolled back — self-heal admission so we don't 503 forever. > the baton
-// readiness timeout (10s) + margin.
-const RELOAD_ROLLBACK_SELFHEAL_MS = Math.max(15_000, Number(process.env.MAXPOOL_RELOAD_SELFHEAL_MS) || 30_000);
+// worker rolled back — self-heal admission so we don't 503 forever. Must sit ABOVE the
+// baton readiness budget + margin so it never fires WHILE the baton is still handshaking.
+// Default (RELOAD_READY_MS + 20s = 50s) sits comfortably above the readiness budget, so
+// the self-heal never fires mid-handshake. An explicit MAXPOOL_RELOAD_SELFHEAL_MS override
+// is honored down to a 15s floor (used by the reload integration test) — a sub-ready
+// override only risks a spurious "rolled back" log + brief admission flap (no corruption:
+// the new worker holds no lease until takeover), never a false double-writer.
+const RELOAD_ROLLBACK_SELFHEAL_MS = Math.max(15_000, Number(process.env.MAXPOOL_RELOAD_SELFHEAL_MS) || RELOAD_READY_MS + 20_000);
 // Seamless-reload drain cap. On a seamless reload the NEW worker already serves
 // ALL new traffic while the OLD worker only finishes its own in-flight requests,
 // so a long old-worker drain has zero request-facing cost — let a long streaming
@@ -326,6 +336,10 @@ async function supervisorCommand() {
         // listener to cover the cutover gap, then hand THAT live handle to the
         // new worker. The new worker's MSG_PRIMARY then closes it again.
         prepareHandle: async () => { await relistenMaster(); return masterServer; },
+        // Generous, env-tunable readiness/takeover budgets — the 10s default rolled back
+        // on this user's loaded Mac (the update never landed). See RELOAD_READY_MS.
+        readyTimeoutMs: RELOAD_READY_MS,
+        takeoverTimeoutMs: RELOAD_READY_MS,
         log: msg => console.log(`[Maxpool] ${msg}`),
       });
 
@@ -1083,6 +1097,10 @@ async function serverWorkerCommand() {
     if (updateInFlight) { notifyUpdate('Update check already running'); return; }
     if (!hasLease) { notifyUpdate('Updates run on the primary worker only'); return; }
     if (config?.updateCheck === false) { notifyUpdate('Update checks are disabled in config'); return; }
+    // An EXPLICIT manual apply always re-attempts — clear any quarantine a prior auto-reload
+    // left (e.g. a rollback from a too-tight readiness timeout), so 'u'→'c' can't dead-end on
+    // "already attempted — will retry only a newer release".
+    clearQuarantine();
     notifyUpdate('Checking for updates…');
     const r = await runUpdateCheck({ announce: true, apply: applyNow, forceInstall: true });
     if (r && !r.hasUpdate) notifyUpdate('Already on the latest version');
