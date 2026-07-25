@@ -253,6 +253,7 @@ export class TUI {
     // Set by index.js after construction (a deferred closure, not a constructor literal —
     // avoids the const TDZ on applyUpdateIfReady, which is defined after `new TUI`).
     this.checkNow = null;
+    this.updateBusy = null;   // live progress text while an update check/apply runs
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -456,15 +457,48 @@ export class TUI {
   _keyUpdates(k) {
     if (k === 'c') {
       // Check & apply now — the dance-killer: pull the latest + seamless-reload in place,
-      // no quit/relaunch. index.js wires this.checkNow (applies regardless of autoApply).
-      this.mode = 'normal';
-      if (this.checkNow) this.checkNow();
-      else this._addLog('Update check unavailable on this worker');
+      // no quit/relaunch. STAY on this screen and show live progress: bouncing straight
+      // back to the dashboard was indistinguishable from "nothing happened".
+      if (!this.checkNow) { this._addLog('Update check unavailable on this worker'); return; }
+      if (this.updateBusy) return;                       // already running
+      this.updateBusy = 'Checking npm…';
+      this.render();
+      Promise.resolve(this.checkNow())
+        .catch(() => {})
+        .finally(() => {
+          // If an update was found+applied, the seamless reload replaces this worker and
+          // this never renders. Otherwise report the outcome in place.
+          this.updateBusy = null;
+          if (this.mode === 'updates') this.render();
+        });
     } else if (k === 't') {
       this._toggleAutoUpdate();
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
+  }
+
+  /** The visible Updates panel. Answers, at a glance: what am I running, is anything
+   *  newer, is it automatic, and what is happening right now. */
+  _renderUpdatesDetail() {
+    const v = this.am.versionInfo;
+    const running = v?.current ? `v${v.current}` : 'unknown';
+    const auto = this._autoUpdateOn();
+    const out = [];
+    out.push(` ${bold('Updates')}`);
+    if (!v) {
+      out.push(` ${dim('Running')} ${running}   ${dim('· checking npm for a newer version…')}`);
+    } else if (v.hasUpdate && v.latest) {
+      out.push(` ${dim('Running')} ${running}   ${yellow(`v${v.latest} is available`)}`);
+      out.push(auto
+        ? ` ${dim('It installs itself automatically. Press')} ${bold('c')} ${dim('to get it right now.')}`
+        : ` ${dim('Automatic updates are off. Press')} ${bold('c')} ${dim('to install it now, or')} ${bold('t')} ${dim('to turn automatic on.')}`);
+    } else {
+      out.push(` ${dim('Running')} ${running}   ${green('up to date')}`);
+      out.push(` ${dim(auto ? 'New versions install themselves.' : 'Automatic updates are off — press t to turn them on.')}`);
+    }
+    if (this.updateBusy) out.push(` ${cyan(SPINNER[this.frame])} ${dim(this.updateBusy)}`);
+    return out;
   }
 
   async _toggleAutoUpdate() {
@@ -1158,7 +1192,10 @@ export class TUI {
     }
 
     // Completed log
-    const footerH = this.mode === 'confirm' ? 3 : 2;
+    // 2 = separator + footer; confirm adds its detail line; updates adds its detail block.
+    const footerH = this.mode === 'confirm' ? 3
+      : this.mode === 'updates' ? 2 + this._renderUpdatesDetail().length
+      : 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
       lines.push(`   ${gray(this.log[i].t)}  ${this.log[i].msg}`);
@@ -1170,6 +1207,10 @@ export class TUI {
     // ── Footer
     lines.push(' ' + dim('─'.repeat(W - 2)));
     if (this.mode === 'confirm') lines.push(` ${this.confirmDetail}`);
+    // Updates DETAIL — without this, pressing 'u' changed only the one-line footer at the
+    // very bottom of a busy screen, which reads as "nothing happened" (reported twice).
+    // Every other mode draws something visible; this one must too.
+    if (this.mode === 'updates') lines.push(...this._renderUpdatesDetail());
     lines.push(this._renderFooter());
 
     // Write buffer

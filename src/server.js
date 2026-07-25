@@ -1334,7 +1334,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, isCapacitySignalStatus, isForeignThinkingSignature, stripForeignThinkingBlocks, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1510,17 +1510,16 @@ function secondsUntilParsedTime(value) {
   return null;
 }
 
-// An Anthropic thinking `signature` is a long base64 protobuf blob (200+ chars, e.g.
-// "Eo8DCpQBCBAYAipAqutr+oAB…"). GLM's Anthropic-compatible endpoint emits a SHORT hex
-// digest instead (verified 2026-07-25: "8f8840affff743118e1f569d", 24 hex chars) — which
-// Anthropic rejects with `Invalid \`signature\` in \`thinking\` block`, permanently
-// bricking any session that took even ONE provider turn. Detect the foreign shape
-// conservatively: only a missing / short / pure-hex signature counts, so a genuine
-// Anthropic block is never stripped.
-function isForeignThinkingSignature(sig) {
-  if (typeof sig !== 'string' || sig.length === 0) return true;
-  if (sig.length < 60) return true;
-  return /^[0-9a-f]+$/i.test(sig);
+// Provider thinking signatures CANNOT be told apart from Anthropic's by shape — measured
+// against the live APIs 2026-07-25: Anthropic ~200-400 char base64, GLM a 24-char hex
+// digest, Kimi(K3) a 12,946-char base64 blob. A shape heuristic tuned to GLM silently
+// missed Kimi entirely. So the repair below does NOT guess: it strips EVERY `thinking`
+// block. That is safe precisely because it only ever runs in response to Anthropic's own
+// signature-rejection 400 — a healthy Claude-only session never reaches it — and a history
+// with thinking removed is accepted (200 OK, verified, incl. tool_use → tool_result).
+// `redacted_thinking` is never touched: it legitimately carries `data` and no signature.
+function isStrippableThinkingBlock(block) {
+  return block?.type === 'thinking';
 }
 
 /**
@@ -1546,12 +1545,7 @@ function stripForeignThinkingBlocks(body) {
       if (msg?.role !== 'assistant' || !Array.isArray(msg.content)) { messages.push(msg); continue; }
       let localRemoved = 0;
       const kept = msg.content.filter(block => {
-        // ONLY `thinking`. NEVER `redacted_thinking`: a genuine one carries `data` and
-        // legitimately has NO signature, so signature-based judging would strip 100% of
-        // them (verified against the live API). GLM's contamination is always a
-        // `thinking` block with a hex signature.
-        if (block?.type !== 'thinking') return true;
-        if (!isForeignThinkingSignature(block.signature)) return true;
+        if (!isStrippableThinkingBlock(block)) return true;
         localRemoved++;
         return false;
       });

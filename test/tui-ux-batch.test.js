@@ -161,16 +161,54 @@ test('B [t] turns automatic updates OFF but keeps checking (banner still shows)'
   assert.equal(config.autoApply, false);
 });
 
-test('B [c] check & apply now calls the wired checkNow (the in-place update, no relaunch)', () => {
+test('B [c] runs checkNow and STAYS on the Updates screen showing live progress', async () => {
+  const am = mgr();
+  let called = 0;
+  let release;
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } }, saveConfig: async () => {} });
+  tui.render = () => {};
+  tui.checkNow = () => { called += 1; return new Promise(r => { release = r; }); };
+  tui.mode = 'updates';
+  tui._keyUpdates('c');
+
+  assert.equal(called, 1, 'c triggers the immediate check+apply');
+  // Bouncing straight back to the dashboard was indistinguishable from "nothing
+  // happened" — the reported bug. Stay put and show what's happening.
+  assert.equal(tui.mode, 'updates', 'stays on the Updates screen');
+  assert.ok(tui.updateBusy, 'shows live progress while it runs');
+  assert.match(strip(tui._renderUpdatesDetail().join(' ')), /Checking npm/);
+
+  release();
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+  assert.equal(tui.updateBusy, null, 'progress clears when the check finishes');
+});
+
+test('B a second [c] while a check is already running is ignored (no double npm install)', () => {
   const am = mgr();
   let called = 0;
   const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } }, saveConfig: async () => {} });
   tui.render = () => {};
-  tui.checkNow = () => { called += 1; };
+  tui.checkNow = () => { called += 1; return new Promise(() => {}); };
   tui.mode = 'updates';
   tui._keyUpdates('c');
-  assert.equal(called, 1, 'c triggers the immediate check+apply');
-  assert.equal(tui.mode, 'normal', 'returns to the dashboard');
+  tui._keyUpdates('c');
+  assert.equal(called, 1, 'the in-flight check is not restarted');
+});
+
+test('B the Updates screen is VISIBLE: it draws a panel, not just a footer line', () => {
+  // The whole reported bug: pressing u changed one line at the very bottom, which reads
+  // as nothing happening. The panel must name the running version and what to press.
+  const am = mgr();
+  am.versionInfo = { current: '1.5.45', latest: '1.5.46', hasUpdate: true, checkedAt: Date.now() };
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } }, saveConfig: async () => {} });
+  tui._keyNormal('u');
+  assert.equal(tui.mode, 'updates');
+  const panel = strip(tui._renderUpdatesDetail().join('\n'));
+  assert.match(panel, /Updates/);
+  assert.match(panel, /v1\.5\.45/, 'shows what is running');
+  assert.match(panel, /v1\.5\.46 is available/, 'shows what is available');
+  assert.ok(tui._renderUpdatesDetail().length >= 2, 'more than a single line');
 });
 
 test('B the header shows the auto-update state (on green / off)', () => {

@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { __serverTest } from '../src/server.js';
 
-const { isCapacitySignalStatus, isForeignThinkingSignature, stripForeignThinkingBlocks } = __serverTest;
+const { isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks } = __serverTest;
 
-// REAL signatures captured from the live APIs on 2026-07-25.
-const ANTHROPIC_SIG = 'Eo8DCpQBCBAYAipAqutr+oABLfouNt1pOLV7Bp+M' + 'x'.repeat(180); // long base64 blob
-const GLM_SIG = '8f8840affff743118e1f569d';                                          // 24-char hex digest
+// REAL signature shapes measured against the live APIs on 2026-07-25. They are NOT
+// separable by shape — which is exactly why the repair strips every thinking block
+// rather than guessing.
+const ANTHROPIC_SIG = 'Eo8DCpQBCBAYAipAqutr+oABLfouNt1pOLV7Bp+M' + 'x'.repeat(180); // ~220 chars base64
+const GLM_SIG = '8f8840affff743118e1f569d';                                          // 24 chars, hex
+const KIMI_SIG = 'BfcsDPIyLJp20J1ot9Wy+/ouQyqN+iOQxa7oRWrOGB+VqgSit4' + 'z'.repeat(12896); // 12,946 chars
 
 // ── the deadlock breaker: which statuses may keep the SHARED breaker armed ─────
 
@@ -59,11 +62,31 @@ test('relinquishing an unused probe does NOT re-arm the breaker (client-gone / t
 
 // ── the recovery: strip provider-authored thinking so the session runs on Claude ─
 
-test('isForeignThinkingSignature separates a real Anthropic blob from GLM\'s hex digest', () => {
-  assert.equal(isForeignThinkingSignature(ANTHROPIC_SIG), false, 'genuine Anthropic signature is kept');
-  assert.equal(isForeignThinkingSignature(GLM_SIG), true, "GLM's short hex digest is foreign");
-  assert.equal(isForeignThinkingSignature(''), true);
-  assert.equal(isForeignThinkingSignature(undefined), true);
+test('every thinking block is strippable regardless of provider; redacted_thinking never is', () => {
+  // The GLM-tuned shape heuristic this replaced (missing/<60/hex) silently MISSED Kimi's
+  // 12,946-char signature, so Kimi-contaminated sessions were never repaired.
+  for (const sig of [ANTHROPIC_SIG, GLM_SIG, KIMI_SIG, '', undefined]) {
+    assert.equal(isStrippableThinkingBlock({ type: 'thinking', signature: sig }), true);
+  }
+  assert.equal(isStrippableThinkingBlock({ type: 'redacted_thinking', data: 'abc' }), false,
+    'redacted_thinking legitimately has no signature — never touch it');
+  assert.equal(isStrippableThinkingBlock({ type: 'text', text: 'hi' }), false);
+  assert.equal(isStrippableThinkingBlock({ type: 'tool_use', id: 'toolu_1' }), false);
+});
+
+test('a KIMI-contaminated transcript is repaired too (the gap the shape heuristic left)', () => {
+  const body = Buffer.from(JSON.stringify({
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: [
+        { type: 'thinking', thinking: 'kimi reasoning', signature: KIMI_SIG },
+        { type: 'text', text: 'answer' },
+      ] },
+    ],
+  }));
+  const { body: out, removed } = stripForeignThinkingBlocks(body);
+  assert.equal(removed, 1, 'Kimi block removed');
+  assert.ok(!out.toString().includes(KIMI_SIG.slice(0, 40)), 'the Kimi signature is gone');
 });
 
 test('strip removes ONLY the provider-authored thinking, preserving text + tool_use', () => {
@@ -86,19 +109,16 @@ test('strip removes ONLY the provider-authored thinking, preserving text + tool_
   assert.equal(json.messages[2].content[0].tool_use_id, 'toolu_1', 'tool_result still pairs');
 });
 
-test('strip is a NO-OP for a clean Anthropic transcript (never rewrites a healthy session)', () => {
+test('a transcript with NO thinking blocks is left completely untouched', () => {
+  // The safety property that matters: strip only ever runs in response to Anthropic's own
+  // signature-rejection 400, and it rewrites nothing when there is nothing to remove.
   const body = Buffer.from(JSON.stringify({
     messages: [
       { role: 'user', content: 'hi' },
-      { role: 'assistant', content: [
-        { type: 'thinking', thinking: 'claude reasoning', signature: ANTHROPIC_SIG },
-        { type: 'text', text: 'answer' },
-      ] },
+      { role: 'assistant', content: [{ type: 'text', text: 'answer' }] },
     ],
   }));
-  const { body: out, removed } = stripForeignThinkingBlocks(body);
-  assert.equal(removed, 0);
-  assert.equal(out, null, 'no rewrite → the original body is forwarded untouched');
+  assert.deepEqual(stripForeignThinkingBlocks(body), { body: null, removed: 0 });
 });
 
 test('a thinking-ONLY turn is DROPPED, never left carrying the poisoned block', () => {
@@ -141,18 +161,18 @@ test('removed is counted per-message and reports the truth across mixed turns', 
   const body = Buffer.from(JSON.stringify({
     messages: [
       { role: 'user', content: 'a' },
-      { role: 'assistant', content: [                                   // 1 stripped, survives
+      { role: 'assistant', content: [
         { type: 'thinking', thinking: 'x', signature: GLM_SIG }, { type: 'text', text: 't' }] },
       { role: 'user', content: 'b' },
-      { role: 'assistant', content: [                                   // clean → untouched
-        { type: 'thinking', thinking: 'y', signature: ANTHROPIC_SIG }, { type: 'text', text: 'u' }] },
+      { role: 'assistant', content: [
+        { type: 'redacted_thinking', data: 'zzz' }, { type: 'text', text: 'u' }] },  // preserved
     ],
   }));
   const { body: out, removed } = stripForeignThinkingBlocks(body);
-  assert.equal(removed, 1, 'exactly one block was actually removed');
+  assert.equal(removed, 1, 'only the thinking block counts — redacted_thinking is not removed');
   const json = JSON.parse(out.toString());
   assert.deepEqual(json.messages[1].content.map(b => b.type), ['text']);
-  assert.deepEqual(json.messages[3].content.map(b => b.type), ['thinking', 'text'], 'clean turn untouched');
+  assert.deepEqual(json.messages[3].content.map(b => b.type), ['redacted_thinking', 'text']);
 });
 
 test('strip tolerates a non-JSON body without throwing', () => {
