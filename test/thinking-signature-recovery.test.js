@@ -231,3 +231,75 @@ test('a foreign tool RESULT carried on the following user turn is converted too'
   assert.equal(converted, 2, 'the result is converted even on a non-assistant turn');
   assert.ok(!out.toString().includes('web_search_tool_result'));
 });
+
+// ── rejected effort level: a hard failure that killed every web search ─────────
+
+const { classifyEffortRejection, repairEffort } = __serverTest;
+
+test('effort rejections are classified by the THREE real shapes seen live', () => {
+  // Measured against the live API 2026-07-26 on three models.
+  assert.equal(classifyEffortRejection("This model does not support effort level 'xhigh'. Supported levels: high, low, medium."), 'downgrade');
+  assert.equal(classifyEffortRejection("output_config.effort 'xhigh' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking."), 'downgrade');
+  assert.equal(classifyEffortRejection('This model does not support the effort parameter.'), 'drop');
+  assert.equal(classifyEffortRejection('messages: field required'), null, 'unrelated 400s are untouched');
+  assert.equal(classifyEffortRejection('Invalid `signature` in `thinking` block'), null);
+});
+
+test('downgrade picks the best level the error itself advertises', () => {
+  const body = Buffer.from(JSON.stringify({ model: 'm', output_config: { effort: 'xhigh' }, messages: [] }));
+  const r = repairEffort(body, 'downgrade', "does not support effort level 'xhigh'. Supported levels: high, low, medium.");
+  assert.equal(r.effort, 'high', 'highest advertised level wins');
+  assert.equal(JSON.parse(r.body.toString()).output_config.effort, 'high');
+});
+
+test('downgrade falls back to high when the error lists nothing', () => {
+  const body = Buffer.from(JSON.stringify({ model: 'm', output_config: { effort: 'xhigh' }, messages: [] }));
+  const r = repairEffort(body, 'downgrade', "'xhigh' is not supported when thinking is disabled on this model.");
+  assert.equal(r.effort, 'high');
+});
+
+test('drop removes effort — and the empty output_config with it', () => {
+  const body = Buffer.from(JSON.stringify({ model: 'm', output_config: { effort: 'xhigh' }, messages: [] }));
+  const r = repairEffort(body, 'drop', 'This model does not support the effort parameter.');
+  const json = JSON.parse(r.body.toString());
+  assert.equal(r.effort, null);
+  assert.ok(!('output_config' in json), 'no empty object left behind');
+});
+
+test('drop keeps other output_config keys intact', () => {
+  const body = Buffer.from(JSON.stringify({ model: 'm', output_config: { effort: 'xhigh', other: 1 }, messages: [] }));
+  const json = JSON.parse(repairEffort(body, 'drop', 'x').body.toString());
+  assert.deepEqual(json.output_config, { other: 1 });
+});
+
+test('effort repair is a no-op when there is no effort field at all', () => {
+  const body = Buffer.from(JSON.stringify({ model: 'm', messages: [] }));
+  assert.deepEqual(repairEffort(body, 'downgrade', 'x'), { body: null, effort: null });
+});
+
+test('a downgrade never retries the SAME level — it steps strictly below', () => {
+  // Retrying the value the model just rejected burns a full transcript upload for nothing.
+  const high = Buffer.from(JSON.stringify({ model: 'm', output_config: { effort: 'high' }, messages: [] }));
+  assert.equal(repairEffort(high, 'downgrade', 'unhelpful message').effort, 'medium');
+  // A ceiling named in the message is honoured ("Use effort 'medium' or below").
+  const xh = Buffer.from(JSON.stringify({ model: 'm', output_config: { effort: 'xhigh' }, messages: [] }));
+  assert.equal(repairEffort(xh, 'downgrade', "Use effort 'medium' or below, or enable thinking.").effort, 'medium');
+  // Nothing below the floor -> genuinely no repair, falls through to the real error.
+  const low = Buffer.from(JSON.stringify({ model: 'm', output_config: { effort: 'low' }, messages: [] }));
+  assert.deepEqual(repairEffort(low, 'downgrade', 'x'), { body: null, effort: null });
+});
+
+test('an invalid effort VALUE from the client is repaired, not surfaced', () => {
+  assert.equal(classifyEffortRejection("output_config.effort: Input should be 'low', 'medium', 'high', 'xhigh' or 'max'"), 'downgrade');
+});
+
+test('the working effort level is LATCHED per session+model (later turns skip the 400)', async () => {
+  const { AccountManager: AM } = await import('../src/account-manager.js');
+  const am = new AM([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 }], 0.9);
+  am.markSessionEffort('s1', 'claude-opus-4-5', 'high');
+  assert.deepEqual(am.getSessionEffort('s1', 'claude-opus-4-5'), { model: 'claude-opus-4-5', effort: 'high' });
+  // Model-scoped: opus-4-5 accepts 'high' while opus-4-1 accepts no effort at all, so a
+  // latch from one model must never be applied to another.
+  assert.equal(am.getSessionEffort('s1', 'claude-opus-4-1'), undefined);
+  assert.equal(am.getSessionEffort('other-session', 'claude-opus-4-5'), undefined);
+});

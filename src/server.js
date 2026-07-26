@@ -357,6 +357,20 @@ async function forwardRequest(
   // PRE-STRIP a session already known to carry provider-authored thinking. The client
   // resends the whole poisoned history every turn, so without this each turn pays another
   // rejected round-trip before the reactive repair kicks in. Latched by the first repair.
+  // Apply the effort level this session's model already proved it accepts, so later turns
+  // skip the rejected round-trip entirely (the client resends the same setting every turn).
+  if (retryCount === 0 && !requestInfo.effortRepaired) {
+    const latched = accountManager.getSessionEffort?.(requestInfo.sessionKey, requestInfo.model);
+    if (latched) {
+      const pre = repairEffort(body, latched.effort ? 'downgrade' : 'drop',
+        latched.effort ? `Supported levels: ${latched.effort}` : '');
+      if (pre.body) {
+        body = pre.body;
+        requestInfo = { ...requestInfo, effortRepaired: true };
+      }
+    }
+  }
+
   // ALSO repairs a transcript maxpool predicts Anthropic will reject (a provider web
   // search). That prediction happens BEFORE any request is sent and bars every Claude
   // account, so the reactive repair in the 4xx handler could never be reached for it —
@@ -936,12 +950,27 @@ async function forwardRequest(
           // '^srvtoolu_…'`. Repairable by converting the pair to text (verified 200 OK) —
           // it used to fall through to a PERMANENT provider pin.
           || /server_tool_use\.id: String should match pattern/i.test(errorBody));
+      // LOG THE ACTUAL REASON. Previously a 4xx recorded only "HTTP 400" and the upstream
+      // message was never written anywhere, so a whole class of failures (e.g. a rejected
+      // effort level breaking every web search) was invisible in the log — you could not
+      // even grep for it. Truncated so a huge validation dump can't wall the file.
+      if (upstreamRes.status >= 400 && upstreamRes.status !== 429) {
+        const why = (() => {
+          try { return JSON.parse(errorBody)?.error?.message || errorBody; } catch { return errorBody; }
+        })();
+        console.log(`[Maxpool] ${upstreamRes.status} from "${account.name}": ${String(why).slice(0, 300)}`);
+      }
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
         ? 'invalid_thinking_signature'
         : anthropicIncompat ? 'anthropic_incompatible_transcript'
         : providerTooSmall ? 'provider_context_too_small'
         : `HTTP ${upstreamRes.status}`;
-      accountManager.releaseAccount(lease, { status: upstreamRes.status, error: errorType });
+      const effortMode = classifyEffortRejection(errorBody);
+      // A rejected effort level is a REQUEST-shaped fault, not an account-health signal —
+      // release neutral so it never charges a consecutive-failure to a healthy account.
+      accountManager.releaseAccount(lease, effortMode
+        ? { status: upstreamRes.status, error: errorType, neutral: true }
+        : { status: upstreamRes.status, error: errorType });
 
       if (logDir) {
         logSections.push(`=== RESPONSE ${upstreamRes.status} — non-retryable client error from "${account.name}" ===\n${formatHeaders(upstreamRes.headers)}`);
@@ -965,6 +994,25 @@ async function forwardRequest(
           return forwardRequest(
             req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, { ...requestInfo, pinnedAccountName: lease.migratedFromName },
+            canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+      }
+
+      // EFFORT REPAIR. A rejected output_config.effort is a hard failure of whatever the
+      // client was doing (a web search, a tool call) — worth healing rather than surfacing.
+      if (effortMode && !requestInfo.effortRepaired
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        const fix = repairEffort(body, effortMode, errorBody);
+        if (fix.body) {
+          // Latch it so LATER turns apply the working level up front: the client resends the
+          // same rejected setting every turn, and each rejection would otherwise charge a
+          // consecutive-failure to a healthy account and deprioritise it in the router.
+          accountManager.markSessionEffort?.(requestInfo.sessionKey, requestInfo.model, fix.effort);
+          console.log(`[Maxpool] "${requestInfo.model || 'model'}" rejected effort "${requestInfo.effort || 'xhigh'}" (via ${account.name}); retrying with ${fix.effort ? `effort "${fix.effort}"` : 'the effort setting removed'}`);
+          return forwardRequest(
+            req, res, fix.body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, { ...requestInfo, effortRepaired: true },
             canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
           );
         }
@@ -1375,7 +1423,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1582,6 +1630,57 @@ function isStrippableThinkingBlock(block) {
 // But converting the pair into plain TEXT is accepted (200 OK) and keeps what the search
 // actually found, so the session survives with its information intact. This is what made
 // the web-search case look permanently unrepairable.
+// Claude Code can send an `output_config.effort` the target model won't take — usually
+// after the session's model changes (a resume/fallback) while the effort setting stays.
+// It is a HARD error: the tool call just fails, which is what killed the user's web
+// searches. Three shapes seen live 2026-07-26, all repairable:
+//   "does not support effort level 'xhigh'. Supported levels: high, low, medium" -> downgrade
+//   "'xhigh' is not supported when thinking is disabled … Use effort 'high' or below" -> downgrade
+//   "does not support the effort parameter."                                       -> drop it
+function classifyEffortRejection(errorBody) {
+  if (!/effort/i.test(errorBody)) return null;
+  if (/does not support the effort parameter/i.test(errorBody)) return 'drop';
+  if (/does not support effort level|is not supported when thinking is disabled/i.test(errorBody)
+    || /output_config\.effort: Input should be/i.test(errorBody)) {   // invalid value from the client
+    return 'downgrade';
+  }
+  return null;
+}
+
+/** Rewrite the request's effort so the model accepts it. 'downgrade' picks the best level
+ *  the error itself advertises (falling back to 'high'); 'drop' removes the field. */
+function repairEffort(body, mode, errorBody = '') {
+  try {
+    const json = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body));
+    const cur = json?.output_config?.effort;
+    if (!cur) return { body: null, effort: null };
+    if (mode === 'drop') {
+      delete json.output_config.effort;
+      if (Object.keys(json.output_config).length === 0) delete json.output_config;
+      return { body: Buffer.from(JSON.stringify(json)), effort: null };
+    }
+    // Prefer a level the error explicitly lists, else 'high' (what the message recommends).
+    const rank = ['max', 'xhigh', 'high', 'medium', 'low'];
+    const listed = /supported levels:\s*([a-z, ']+)/i.exec(errorBody)?.[1];
+    let allowed = listed ? listed.split(',').map(x => x.trim().replace(/'/g, '').toLowerCase()).filter(Boolean) : [];
+    // The other real shape names a ceiling instead of a list: "Use effort 'high' or below".
+    const ceiling = /use effort '([a-z]+)' or below/i.exec(errorBody)?.[1]?.toLowerCase();
+    if (!allowed.length && ceiling) allowed = rank.slice(rank.indexOf(ceiling)).filter(Boolean);
+    let next = rank.find(r => allowed.includes(r));
+    // Nothing usable advertised (or it names the level we already sent) — step strictly
+    // BELOW the current level rather than giving up, so we never retry the same value.
+    if (!next || next === cur) {
+      const below = rank.slice(rank.indexOf(cur) + 1);
+      next = below.find(r => !allowed.length || allowed.includes(r)) || below[0];
+    }
+    if (!next || next === cur) return { body: null, effort: null };
+    json.output_config.effort = next;
+    return { body: Buffer.from(JSON.stringify(json)), effort: next };
+  } catch {
+    return { body: null, effort: null };
+  }
+}
+
 /** Collect foreign server-tool ids across the WHOLE transcript first — a call sits on the
  *  assistant turn but its result is often carried on the FOLLOWING user turn, so a
  *  per-message scan would leave that result behind (and it alone still 400s). */

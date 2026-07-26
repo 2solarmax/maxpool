@@ -1893,6 +1893,23 @@ export class AccountManager {
     console.log(`[Maxpool] Session "${sessionKey}" repaired — Claude routes re-enabled`);
   }
 
+  /** Remember the effort level a MODEL actually accepted for this session, so later turns
+   *  apply it up front. The client resends the same rejected setting every turn, so without
+   *  this each turn pays a rejected round-trip AND charges a consecutive-failure to whichever
+   *  account ate it — deprioritising a perfectly healthy account for a client-side setting.
+   *  Keyed by model: opus-4-5 takes 'high' while opus-4-1 takes no effort at all. */
+  markSessionEffort(sessionKey, model, effort) {
+    if (!sessionKey || !model) return;
+    const existing = this.sessionPolicies.get(sessionKey) || {};
+    this.sessionPolicies.set(sessionKey, { ...existing, effortFix: { model, effort } });
+  }
+
+  getSessionEffort(sessionKey, model) {
+    if (!sessionKey || !model) return undefined;
+    const fix = this.sessionPolicies.get(sessionKey)?.effortFix;
+    return fix && fix.model === model ? fix : undefined;
+  }
+
   isSessionThinkingContaminated(sessionKey) {
     if (!sessionKey) return false;
     return Boolean(this.sessionPolicies.get(sessionKey)?.thinkingContaminated);

@@ -1334,6 +1334,50 @@ test('nonretryable 400 is recorded as failure and passed through', async () => {
   }
 });
 
+test('a rejected effort level is healed end-to-end: client sees 200, retry carries the new level', async () => {
+  // The reported bug: every WebSearch in a session died on
+  // "output_config.effort 'xhigh' is not supported when thinking is disabled".
+  const bodies = [];
+  const upstream = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', () => {
+      bodies.push(JSON.parse(raw || '{}'));
+      if (bodies.length === 1) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',
+          message: "output_config.effort 'xhigh' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking." } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'msg_1', type: 'message', role: 'assistant', content: [] }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 2000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [], output_config: { effort: 'xhigh' } }),
+    });
+    assert.equal(res.status, 200, 'the client never sees the 400 — the tool call succeeds');
+    assert.equal(bodies.length, 2, 'exactly one repair retry, no loop');
+    assert.equal(bodies[0].output_config.effort, 'xhigh', 'first attempt used what the client sent');
+    assert.equal(bodies[1].output_config.effort, 'high', 'the retry carries the repaired level');
+    // A request-shaped fault must not be charged against account health.
+    assert.equal(am.accounts[0].consecutiveFailures, 0, 'healthy account not penalised for a client setting');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
 test('a NON-signature 400 is still passed through verbatim (the rewrite is narrowly scoped)', async () => {
   const upstream = http.createServer((_req, res) => {
     res.writeHead(400, { 'content-type': 'application/json' });
@@ -2100,6 +2144,53 @@ test('network blip: a NON-streaming request still fails fast (no keepalive to ho
       body: JSON.stringify({ model: 'test', messages: [] }), // NOT streaming
     });
     assert.ok(res.status === 503 || res.status === 502, `non-streaming network failure fails fast, got ${res.status}`);
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('the latched effort level is applied UP FRONT on later turns (no repeat 400)', async () => {
+  // Without the latch every turn of the session re-pays a rejected round-trip.
+  const bodies = [];
+  let rejectOnce = true;
+  const upstream = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', () => {
+      const json = JSON.parse(raw || '{}');
+      bodies.push(json);
+      if (rejectOnce && json.output_config?.effort === 'xhigh') {
+        rejectOnce = false;
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',
+          message: "This model does not support effort level 'xhigh'. Supported levels: high, low, medium." } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'm', type: 'message', role: 'assistant', content: [] }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, maxWaitMs: 2000, pollMs: 25 },
+  });
+  const proxyPort = await listen(proxy);
+  const turn = () => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-maxpool-session': 'sess-effort' },
+    body: JSON.stringify({ model: 'test', messages: [], output_config: { effort: 'xhigh' } }),
+  });
+  try {
+    assert.equal((await turn()).status, 200, 'turn 1 heals');
+    const afterFirst = bodies.length;                 // 2: the 400 + the repaired retry
+    assert.equal(afterFirst, 2);
+    assert.equal((await turn()).status, 200, 'turn 2 succeeds');
+    assert.equal(bodies.length, afterFirst + 1, 'turn 2 costs ONE upstream call, not two');
+    assert.equal(bodies[bodies.length - 1].output_config.effort, 'high',
+      'the latched level was applied before sending — the 400 never happens again');
   } finally {
     await close(proxy);
     await close(upstream);
