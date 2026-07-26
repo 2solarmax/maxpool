@@ -14,6 +14,11 @@
 
 // Supervisor → worker
 export const MSG_LISTEN = 'listen';       // (with handle) accept on this socket + take TUI/lease
+// Tells the surviving old worker WHY a reload rolled back. 'timeout' = the new worker
+// was merely slow to signal ready (a loaded machine) — safe to retry with a cold
+// restart. 'failed' = it reported failure or died before ready — a cold restart there
+// would commit to a build that cannot boot and leave NO working proxy.
+export const MSG_ROLLED_BACK = 'rolled-back';
 export const MSG_RELEASE = 'release';     // stop accepting, stop writing, flush, give up TUI
 export const MSG_TAKEOVER = 'takeover';   // (with handle) start accepting + acquire writer lease + TUI
 export const MSG_PROBE_READY = 'probe-ready'; // ask a headless worker to confirm it booted OK
@@ -70,11 +75,13 @@ export async function runReloadBaton({
     ready = await newWorker.waitFor([MSG_READY, MSG_FAILED], readyTimeoutMs);
   } catch (err) {
     log(`reload: readiness wait failed (${err.message}); rolling back`);
+    try { oldWorker.send({ type: MSG_ROLLED_BACK, reason: 'timeout' }); } catch { /* old worker gone */ }
     return RELOAD_ROLLED_BACK;
   }
   // (b) New worker did not come up cleanly → roll back fully, old stays primary.
   if (!ready || ready.type === MSG_FAILED) {
     log(`reload: new worker reported failed (${ready?.reason || 'no ready'}); rolling back`);
+    try { oldWorker.send({ type: MSG_ROLLED_BACK, reason: 'failed' }); } catch { /* old worker gone */ }
     return RELOAD_ROLLED_BACK;
   }
 

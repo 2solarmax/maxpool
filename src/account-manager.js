@@ -1881,6 +1881,18 @@ export class AccountManager {
     this.sessionPolicies.set(sessionKey, { ...existing, thinkingContaminated: true });
   }
 
+  /** Release a session pinned provider-only by an earlier turn. The incompatible latch is
+   *  deliberately sticky (it never downgrades), which is right while the transcript really
+   *  is unrepairable — but a repaired body IS replayable on Claude, so the pin must lift
+   *  or every previously-broken session stays exiled forever. */
+  clearSessionIncompatible(sessionKey) {
+    if (!sessionKey) return;
+    const existing = this.sessionPolicies.get(sessionKey);
+    if (!existing?.anthropicIncompatible) return;
+    this.sessionPolicies.set(sessionKey, { ...existing, anthropicIncompatible: false });
+    console.log(`[Maxpool] Session "${sessionKey}" repaired — Claude routes re-enabled`);
+  }
+
   isSessionThinkingContaminated(sessionKey) {
     if (!sessionKey) return false;
     return Boolean(this.sessionPolicies.get(sessionKey)?.thinkingContaminated);

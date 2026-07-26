@@ -17,7 +17,7 @@ import {
   runReloadBaton,
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
   MSG_LISTEN, MSG_RELEASE, MSG_TAKEOVER, MSG_PROBE_READY,
-  MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY,
+  MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
 } from './reload-protocol.js';
 
 const args = process.argv.slice(2);
@@ -626,7 +626,9 @@ async function serverWorkerCommand() {
   // before (or without) the npm update check. The cold worker's update check below
   // fills in latest/hasUpdate.
   getCurrentVersion()
-    .then(v => { accountManager.versionInfo ||= { current: v, latest: null, hasUpdate: false, checkedAt: null }; })
+    .then(v => {
+      accountManager.versionInfo ||= { current: v, latest: null, hasUpdate: false, checkedAt: null };
+    })
     .catch(() => {});
 
   // Persist refreshed tokens back to config. Defense-in-depth: the updater reads
@@ -727,6 +729,10 @@ async function serverWorkerCommand() {
   // Self-heal timer for a seamless reload that rolls back (new worker fails to boot,
   // we're never released). Cleared on MSG_RELEASE; fires cancelRestart otherwise.
   let reloadWatchdog = null;
+  // One cold-restart fallback per reload request — see the rollback watchdog below.
+  let coldFallbackUsed = false;
+  let reloadIsForUpdate = false;
+  let lastRollbackReason = null;
 
   // Best-effort terminal restore on ANY abnormal exit path (uncaughtException,
   // a bare process.exit, a crash) so the user's shell is never left in raw mode
@@ -857,6 +863,8 @@ async function serverWorkerCommand() {
       || process.env.MAXPOOL_TUI_COLD_RESTART === '1';
     if (!forceCold && reloadStrategy({ supervised }) === 'seamless') {
       try {
+        coldFallbackUsed = false;   // fresh reload → fresh cold-fallback budget
+        lastRollbackReason = null;
         process.send({ type: MSG_RELOAD_REQUEST });
         // Arm the rollback self-heal: restartController already latched
         // pending/restarting + paused admission (in _restart, before we got here).
@@ -868,7 +876,29 @@ async function serverWorkerCommand() {
           reloadWatchdog = null;
           if (draining) return; // MSG_RELEASE already arrived → a real reload, not a rollback
           if (restartController?.cancelRestart()) {
-            console.log('[Maxpool] Reload rolled back (new worker never took over) — resumed serving.');
+            console.log('[Maxpool] Reload rolled back (new worker never took over).');
+          }
+          // FALL BACK TO A COLD RESTART — but ONLY when a newer build is actually on disk
+          // waiting to be picked up. Resuming the old worker is what made "press u → c"
+          // look like nothing happened: the graceful swap failed under machine load and
+          // the update was abandoned, forever. Gating on a real pending update preserves
+          // the safety property that a plain failed reload leaves a HEALTHY worker serving
+          // (never kill a working process for nothing), while an update still lands.
+          // One attempt per reload request, so a build that cannot boot can't crash-loop.
+          // Cold-restart ONLY when the new build was merely SLOW to signal ready (a
+          // loaded machine — the reported case). If it reported failure or died before
+          // ready, the build cannot boot: restarting into it would leave the user with no
+          // working proxy at all, strictly worse than the bug being fixed. Absent reason
+          // (older supervisor) is treated as unsafe.
+          const swapWasSlowNotBroken = lastRollbackReason === 'timeout';
+          if (reloadIsForUpdate && swapWasSlowNotBroken && !coldFallbackUsed) {
+            coldFallbackUsed = true;
+            console.log('[Maxpool] Applying the update with a full restart instead — one moment.');
+            restartWorkerNow();
+          } else if (reloadIsForUpdate && !swapWasSlowNotBroken) {
+            console.log('[Maxpool] The new version failed to start — resumed serving on the current version. Update NOT applied.');
+          } else {
+            console.log('[Maxpool] Rollback complete — resumed serving on the current version.');
           }
         }, RELOAD_ROLLBACK_SELFHEAL_MS);
         reloadWatchdog.unref?.();
@@ -1060,6 +1090,11 @@ async function serverWorkerCommand() {
     if (r?.applicable && config?.autoApply && restartController) {
       markApplied(r.installedVersion);
       notifyUpdate('Applying update — seamless reload…');
+      // Mark this reload as UPDATE-driven: if the seamless swap rolls back (machine
+      // under load), the watchdog cold-restarts so the update actually lands instead of
+      // silently resuming the old build. A plain 'r' restart never does that — there a
+      // rollback should leave the healthy worker serving.
+      reloadIsForUpdate = true;
       restartController.requestRestart();
     }
   };
@@ -1071,6 +1106,11 @@ async function serverWorkerCommand() {
     if (r?.applicable && restartController) {
       markApplied(r.installedVersion);
       notifyUpdate('Applying update — seamless reload…');
+      // Mark this reload as UPDATE-driven: if the seamless swap rolls back (machine
+      // under load), the watchdog cold-restarts so the update actually lands instead of
+      // silently resuming the old build. A plain 'r' restart never does that — there a
+      // rollback should leave the healthy worker serving.
+      reloadIsForUpdate = true;
       restartController.requestRestart();
     }
   };
@@ -1284,6 +1324,9 @@ async function serverWorkerCommand() {
           // sends MSG_PRIMARY (the baton waits on it).
           await listenOnHandle(handle);
           await becomePrimary({ viaTakeover: true });
+        } else if (msg?.type === MSG_ROLLED_BACK) {
+          // Why the swap failed decides whether a cold restart is safe (see the watchdog).
+          lastRollbackReason = msg.reason || null;
         } else if (msg?.type === MSG_RELEASE) {
           // Baton release: stop accepting NEW (keep in-flight), retire keep-alive
           // sockets with Connection: close, stop writing, flush once, drop TUI.

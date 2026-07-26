@@ -12,6 +12,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
@@ -307,6 +308,24 @@ test('reload rollback: new worker fails readiness → old stays primary, zero EC
     await new Promise(r => { if (child.exitCode != null || child.signalCode != null) { r(); } else { child.once('exit', r); const t = setTimeout(r, 3000); t.unref && t.unref(); } });
     await new Promise(r => upstream.server.close(r));
   }
+});
+
+test('an UPDATE-driven reload that rolls back falls back to a cold restart (the update still lands)', () => {
+  // The reported bug: pressing u -> c (and auto-apply) looked like "nothing happened".
+  // The seamless swap rolled back under machine load and the worker simply RESUMED on the
+  // OLD build, abandoning the update forever. An update-driven rollback must now cold
+  // restart so the new version actually takes effect. A plain 'r' rollback must NOT —
+  // there, killing a healthy worker for nothing is the wrong trade (locked by the test
+  // above, which asserts it resumes serving).
+  const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  assert.match(src, /reloadIsForUpdate && swapWasSlowNotBroken && !coldFallbackUsed/,
+    'cold fallback is gated on update-driven AND a merely-slow swap');
+  assert.match(src, /lastRollbackReason === 'timeout'/,
+    "a build that CRASHED never earns a cold restart — that would leave no working proxy");
+  assert.match(src, /reloadIsForUpdate = true;[\s\S]{0,80}restartController\.requestRestart\(\)/,
+    'the update paths mark the reload as update-driven before requesting it');
+  assert.match(src, /coldFallbackUsed = true;[\s\S]{0,200}restartWorkerNow\(\)/,
+    'the fallback is one-shot so a build that cannot boot cannot crash-loop');
 });
 
 test('rollback via the LATCHING r-key path (SIGUSR2) self-heals admission: worker serves 200 again, not 503 forever', async () => {

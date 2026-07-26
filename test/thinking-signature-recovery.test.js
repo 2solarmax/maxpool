@@ -118,7 +118,7 @@ test('a transcript with NO thinking blocks is left completely untouched', () => 
       { role: 'assistant', content: [{ type: 'text', text: 'answer' }] },
     ],
   }));
-  assert.deepEqual(stripForeignThinkingBlocks(body), { body: null, removed: 0 });
+  assert.deepEqual(stripForeignThinkingBlocks(body), { body: null, removed: 0, converted: 0 });
 });
 
 test('a thinking-ONLY turn is DROPPED, never left carrying the poisoned block', () => {
@@ -153,7 +153,7 @@ test('a genuine redacted_thinking block (data, NO signature) is never stripped',
       ] },
     ],
   }));
-  assert.deepEqual(stripForeignThinkingBlocks(body), { body: null, removed: 0 },
+  assert.deepEqual(stripForeignThinkingBlocks(body), { body: null, removed: 0, converted: 0 },
     'redacted_thinking is left alone → no rewrite at all');
 });
 
@@ -176,5 +176,58 @@ test('removed is counted per-message and reports the truth across mixed turns', 
 });
 
 test('strip tolerates a non-JSON body without throwing', () => {
-  assert.deepEqual(stripForeignThinkingBlocks(Buffer.from('not json')), { body: null, removed: 0 });
+  assert.deepEqual(stripForeignThinkingBlocks(Buffer.from('not json')), { body: null, removed: 0, converted: 0 });
+});
+
+// ── provider web search: the case that looked permanently unrepairable ─────────
+
+test('a foreign web search is CONVERTED TO TEXT, not left to brick the session', () => {
+  // Verified against the live API 2026-07-26: renaming the id does NOT work (a second
+  // gate rejects the result's encrypted_content, which only Anthropic can mint), but
+  // converting the pair to text returns 200 OK and keeps what the search found.
+  const body = Buffer.from(JSON.stringify({
+    messages: [
+      { role: 'user', content: 'search the weather' },
+      { role: 'assistant', content: [
+        { type: 'server_tool_use', id: 'call_x1', name: 'web_search', input: { query: 'weather berlin' } },
+        { type: 'web_search_tool_result', tool_use_id: 'call_x1',
+          content: [{ type: 'web_search_result', title: 'Berlin Weather', url: 'https://w.com', encrypted_content: 'FAKE' }] },
+        { type: 'text', text: 'Sunny.' },
+      ] },
+    ],
+  }));
+  const { body: out, converted } = stripForeignThinkingBlocks(body);
+  assert.equal(converted, 2, 'both the call and its result are converted');
+  const s = out.toString();
+  assert.ok(!s.includes('server_tool_use'), 'no foreign tool call survives');
+  assert.ok(!s.includes('encrypted_content'), 'no unforgeable payload survives');
+  assert.match(s, /weather berlin/, 'the query is preserved as text');
+  assert.match(s, /Berlin Weather/, 'what the search FOUND is preserved');
+  const json = JSON.parse(s);
+  assert.ok(json.messages[1].content.every(b => b.type === 'text'), 'all text now');
+});
+
+test("Anthropic's OWN server tools (srvtoolu_) are left completely alone", () => {
+  const body = Buffer.from(JSON.stringify({
+    messages: [
+      { role: 'user', content: 'q' },
+      { role: 'assistant', content: [
+        { type: 'server_tool_use', id: 'srvtoolu_ok1', name: 'web_search', input: { query: 'x' } },
+        { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_ok1', content: [] },
+      ] },
+    ],
+  }));
+  assert.deepEqual(stripForeignThinkingBlocks(body), { body: null, removed: 0, converted: 0 });
+});
+
+test('a foreign tool RESULT carried on the following user turn is converted too', () => {
+  const body = Buffer.from(JSON.stringify({
+    messages: [
+      { role: 'assistant', content: [{ type: 'server_tool_use', id: 'call_z', name: 'web_search', input: { query: 'q' } }] },
+      { role: 'user', content: [{ type: 'web_search_tool_result', tool_use_id: 'call_z', content: [] }] },
+    ],
+  }));
+  const { body: out, converted } = stripForeignThinkingBlocks(body);
+  assert.equal(converted, 2, 'the result is converted even on a non-assistant turn');
+  assert.ok(!out.toString().includes('web_search_tool_result'));
 });

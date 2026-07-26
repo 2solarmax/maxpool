@@ -357,12 +357,28 @@ async function forwardRequest(
   // PRE-STRIP a session already known to carry provider-authored thinking. The client
   // resends the whole poisoned history every turn, so without this each turn pays another
   // rejected round-trip before the reactive repair kicks in. Latched by the first repair.
+  // ALSO repairs a transcript maxpool predicts Anthropic will reject (a provider web
+  // search). That prediction happens BEFORE any request is sent and bars every Claude
+  // account, so the reactive repair in the 4xx handler could never be reached for it —
+  // the session stayed exiled to GLM/Kimi, or got NO ROUTE AT ALL when they're disabled
+  // (8 healthy Claude accounts idle while the user is told nothing is available).
+  // Repairing here, ahead of routing, is what makes that case recoverable.
   if (retryCount === 0 && !requestInfo.thinkingStripped
-    && accountManager.isSessionThinkingContaminated?.(requestInfo.sessionKey)) {
+    && (requestInfo.anthropicIncompatible
+      || accountManager.isSessionThinkingContaminated?.(requestInfo.sessionKey))) {
     const pre = stripForeignThinkingBlocks(body);
     if (pre.body) {
       body = pre.body;
       requestInfo = { ...requestInfo, thinkingStripped: true };
+      if (pre.converted) {
+        // The body now replays cleanly on Claude, so drop the predictive verdict —
+        // otherwise routing still exiles it and _noteRequestPolicy latches it sticky.
+        requestInfo = { ...requestInfo, anthropicIncompatible: false };
+        // And un-latch a session pinned by an EARLIER turn: the sticky policy is ORed in
+        // and never downgrades, so without this the user's already-broken sessions stay
+        // pinned forever even though we can now repair them.
+        accountManager.clearSessionIncompatible?.(requestInfo.sessionKey);
+      }
     }
   }
 
@@ -915,7 +931,11 @@ async function forwardRequest(
       // fixes it. Still deterministic — never the fuzzy isAnthropicIncompatBody heuristic.
       const isSignatureRejection = account.type !== 'provider'
         && (/invalid `signature` in `thinking`/i.test(errorBody)
-          || /content\.\d+\.thinking\.signature/i.test(errorBody));
+          || /content\.\d+\.thinking\.signature/i.test(errorBody)
+          // A provider web search: `server_tool_use.id: String should match pattern
+          // '^srvtoolu_…'`. Repairable by converting the pair to text (verified 200 OK) —
+          // it used to fall through to a PERMANENT provider pin.
+          || /server_tool_use\.id: String should match pattern/i.test(errorBody));
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
         ? 'invalid_thinking_signature'
         : anthropicIncompat ? 'anthropic_incompatible_transcript'
@@ -959,12 +979,12 @@ async function forwardRequest(
       // still fails, the provider pin below is the fallback.
       if (isSignatureRejection && !requestInfo.thinkingStripped
         && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
-        const { body: cleanBody, removed } = stripForeignThinkingBlocks(body);
+        const { body: cleanBody, removed, converted } = stripForeignThinkingBlocks(body);
         if (cleanBody) {
           // Latch it so EVERY later turn is stripped up front instead of re-paying this
           // rejected round-trip (the client resends the full poisoned history each turn).
           accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
-          console.log(`[Maxpool] Recovering session on Claude: stripped ${removed} provider-authored thinking block(s) Anthropic rejected`);
+          console.log(`[Maxpool] Recovering session on Claude: stripped ${removed} provider thinking block(s), converted ${converted} provider search block(s) to text`);
           return forwardRequest(
             req, res, cleanBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, { ...requestInfo, thinkingStripped: true },
@@ -1030,8 +1050,8 @@ async function forwardRequest(
         // ran; without it we found nothing provider-shaped, so claiming we stripped —
         // or blaming GLM/Kimi — would misdirect the user.
         const what = requestInfo.thinkingStripped
-          ? 'This session ran on GLM/Kimi earlier and Anthropic rejects the thinking blocks they wrote. Maxpool removed them and retried on Claude, but Anthropic still rejected the history.'
-          : "Anthropic rejected a thinking block in this session's history, and maxpool could not identify it as provider-authored, so it could not be repaired automatically.";
+          ? 'This session ran on GLM/Kimi earlier, and Anthropic will not accept parts of what they wrote. Maxpool repaired what it could and retried on Claude, but Anthropic still rejected the history.'
+          : "Anthropic rejected part of this session's history that maxpool could not repair automatically.";
         const hint = provs.length === 0
           ? ''
           : provs.every(a => a.enabled === false)
@@ -1556,22 +1576,96 @@ function isStrippableThinkingBlock(block) {
  *
  * Returns { body, removed } — `body` is null when nothing needed stripping.
  */
+// A provider's web search leaves a `server_tool_use` id Anthropic rejects (it demands
+// ^srvtoolu_). Verified 2026-07-26 against the live API: renaming the id is NOT enough —
+// a second gate rejects the result's `encrypted_content`, which only Anthropic can mint.
+// But converting the pair into plain TEXT is accepted (200 OK) and keeps what the search
+// actually found, so the session survives with its information intact. This is what made
+// the web-search case look permanently unrepairable.
+/** Collect foreign server-tool ids across the WHOLE transcript first — a call sits on the
+ *  assistant turn but its result is often carried on the FOLLOWING user turn, so a
+ *  per-message scan would leave that result behind (and it alone still 400s). */
+function collectForeignServerToolIds(messages) {
+  const ids = new Set();
+  const clientIds = new Set();
+  const walk = (blocks) => {
+    if (!Array.isArray(blocks)) return;
+    for (const b of blocks) {
+      if (b?.type === 'tool_use' && b.id) clientIds.add(b.id);
+      if (b?.type === 'server_tool_use' && !ANTHROPIC_TOOL_ID.test(String(b.id || ''))) ids.add(b.id);
+      if (Array.isArray(b?.content)) walk(b.content);   // nested, mirrors detectTranscriptOrigin
+    }
+  };
+  for (const msg of messages) walk(msg?.content);
+  // NEVER treat an id that a real client tool_use also owns as foreign: converting its
+  // tool_result would orphan that tool_use and Anthropic 400s ("tool_use ids without
+  // tool_result"), which the sticky pre-strip would then re-inflict every turn — a
+  // permanent loop. Providers with per-turn counters (call_0, call_1) make the collision
+  // likely, not theoretical.
+  for (const id of clientIds) ids.delete(id);
+  return ids;
+}
+
+function convertForeignServerTools(content, foreignIds) {
+  if (!foreignIds || foreignIds.size === 0) return { content, converted: 0 };
+  let converted = 0;
+  const out = [];
+  for (const b of content) {
+    if (b?.type === 'server_tool_use' && foreignIds.has(b.id)) {
+      const q = b.input?.query;
+      out.push({ type: 'text', text: q ? `[searched the web for: ${q}]` : `[used ${b.name || 'a tool'}]` });
+      converted++;
+      continue;
+    }
+    // Any result block referring to a foreign call — web_search_tool_result and friends.
+    if (b?.tool_use_id && foreignIds.has(b.tool_use_id)) {
+      const rows = Array.isArray(b.content) ? b.content : [];
+      // Fall back through the shapes a PROVIDER may use — the point of converting rather
+      // than dropping is to keep what the search found; assuming Anthropic's {title,url}
+      // would silently discard a GLM row that carries text instead.
+      const found = rows
+        .map(r => [r?.title, r?.url].filter(Boolean).join(' — ')
+          || (typeof r === 'string' ? r : (r?.text ?? r?.content ?? r?.snippet ?? '')))
+        .map(t => (typeof t === 'string' ? t.slice(0, 300) : ''))
+        .filter(Boolean).slice(0, 10);
+      out.push({ type: 'text', text: found.length ? `[search results: ${found.join(' | ')}]` : '[search returned no usable results]' });
+      converted++;
+      continue;
+    }
+    out.push(b);
+  }
+  return { content: out, converted };
+}
+
 function stripForeignThinkingBlocks(body) {
   try {
     const json = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body));
     if (!Array.isArray(json?.messages)) return { body: null, removed: 0 };
     let removed = 0;
+    let converted = 0;
+    const foreignToolIds = collectForeignServerToolIds(json.messages);
     const messages = [];
     for (const msg of json.messages) {
-      if (msg?.role !== 'assistant' || !Array.isArray(msg.content)) { messages.push(msg); continue; }
+      if (!Array.isArray(msg?.content)) { messages.push(msg); continue; }
+      // Foreign server-tool pairs are converted on EVERY role: the call sits on the
+      // assistant turn but its result can be carried on the following user turn.
+      const tools = convertForeignServerTools(msg.content, foreignToolIds);
+      converted += tools.converted;
+      if (msg.role !== 'assistant') {
+        messages.push(tools.converted ? { ...msg, content: tools.content } : msg);
+        continue;
+      }
       let localRemoved = 0;
-      const kept = msg.content.filter(block => {
+      const kept = tools.content.filter(block => {
         if (!isStrippableThinkingBlock(block)) return true;
         localRemoved++;
         return false;
       });
       removed += localRemoved;
-      if (!localRemoved) { messages.push(msg); continue; }
+      if (!localRemoved) {
+        messages.push(tools.converted ? { ...msg, content: tools.content } : msg);
+        continue;
+      }
       // A turn that stripping empties is DROPPED, not left with its poisoned block:
       // leaving it would resend the exact body that just 400'd while reporting success
       // and burning the single recovery attempt. Verified against the live API — the
@@ -1579,11 +1673,11 @@ function stripForeignThinkingBlocks(body) {
       if (kept.length === 0) continue;
       messages.push({ ...msg, content: kept });
     }
-    if (!removed) return { body: null, removed: 0 };
+    if (!removed && !converted) return { body: null, removed: 0, converted: 0 };
     json.messages = messages;
-    return { body: Buffer.from(JSON.stringify(json)), removed };
+    return { body: Buffer.from(JSON.stringify(json)), removed, converted };
   } catch {
-    return { body: null, removed: 0 };   // non-JSON / unparseable → no rewrite
+    return { body: null, removed: 0, converted: 0 };   // non-JSON / unparseable → no rewrite
   }
 }
 

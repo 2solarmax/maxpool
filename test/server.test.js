@@ -1323,8 +1323,8 @@ test('nonretryable 400 is recorded as failure and passed through', async () => {
     // No strip ran here (empty messages), so the message must NOT claim one — it states
     // only what actually happened and leads with the guaranteed remedy.
     assert.match(body.error.message, /Start a new session/, 'leads with the way out');
-    assert.match(body.error.message, /could not identify it as provider-authored/,
-      'honest: does not fabricate a GLM/Kimi story when nothing was stripped');
+    assert.match(body.error.message, /could not repair automatically/,
+      'honest: does not fabricate a GLM/Kimi story when nothing was repaired');
     assert.equal(am.accounts[0].failedRequests, 1);
     assert.equal(am.accounts[0].lastError, 'invalid_thinking_signature');
     assert.equal(am.accounts[1].usage.totalRequests, 0);
