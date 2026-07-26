@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.50] - 2026-07-26
+
+### Added
+
+- Check for updates every 30 minutes instead of every 6 hours
+
 ## [1.5.49] - 2026-07-26
 
 ### Fixed
