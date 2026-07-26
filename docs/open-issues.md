@@ -324,3 +324,18 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 - README setup guide + FAQ + account-risk/ToS disclaimer (1.0.6 / 1.0.7).
 - Queue: weekly caps now wait+retry instead of fail-fast; non-stream cap, capacity clamp, backpressure, stale-head reaper, poll jitter, honest messages (1.1.0).
 - ToS review (4-advocate council + judge): personal use = contested gray area; public promotion = do-not. Launch held.
+
+## Flaky: `in-flight OAuth refresh across a reload` under full-suite parallel load
+
+`test/reload-oauth-refresh-across-reload.test.js` passes **6/6 in isolation** but
+intermittently fails when the whole suite runs in parallel on a loaded machine
+(observed 2026-07-26; also seen 2026-07-25). It spawns real worker processes and
+asserts a single-use refresh token rotates exactly once, so it is sensitive to
+scheduling latency — the same machine-load condition that made the seamless reload
+roll back in production before v1.5.44 raised the readiness budget.
+
+Not a logic defect (it touches none of the repair/effort/update code paths), but it
+makes the suite non-deterministic, which erodes the signal every other fix relies on.
+Fix by making its waits deadline-based rather than fixed-duration, or by giving the
+spawned workers an explicit generous readiness budget like the reload-integration
+tests already do.

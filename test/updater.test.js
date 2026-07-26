@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { compareVersions, checkForUpdate, maybeCheckForUpdate, __resetUpdaterState, markApplied } from '../src/updater.js';
 
 test('compareVersions orders semver correctly', () => {
@@ -215,4 +216,16 @@ test('clearQuarantine lets a manual apply re-attempt a version a prior rolled-ba
   clearQuarantine();                                  // what the manual 'u'→'c' path now does first
   const retry = await maybeCheckForUpdate({ updateCheck: true, autoUpdate: true }, () => {}, () => {}, deps);
   assert.equal(retry.applicable, true, 'after clearQuarantine the manual apply re-attempts 1.5.43');
+});
+
+test('the update check cadence is 30 minutes, env-tunable, floored at 60s', () => {
+  // A 6-hour default meant a fix published minutes ago could sit unapplied for hours —
+  // indistinguishable from "auto-update is broken" (2026-07-26: it worked, but a 4h gap
+  // between publish and pickup was the whole complaint).
+  const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  const m = /const updateIntervalMs = Math\.max\(60_000, Number\(process\.env\.MAXPOOL_UPDATE_CHECK_INTERVAL_MS\) \|\| ([^)]+)\);/.exec(src);
+  assert.ok(m, 'the interval expression is where the test expects it');
+  // eslint-disable-next-line no-eval
+  assert.equal(eval(m[1].replace(/_/g, '')), 30 * 60 * 1000, 'default is 30 minutes');
+  assert.match(m[0], /Math\.max\(60_000/, 'still floored at 60s so a bad env value cannot hammer npm');
 });

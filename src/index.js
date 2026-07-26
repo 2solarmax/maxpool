@@ -1150,7 +1150,12 @@ async function serverWorkerCommand() {
     if (r && !r.hasUpdate) notifyUpdate('Already on the latest version');
   };
   if (tui) tui.checkNow = checkForUpdatesNow;
-  const updateIntervalMs = Math.max(60_000, Number(process.env.MAXPOOL_UPDATE_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000);
+  // 30 minutes, not 6 hours. At 6h a fix published minutes ago could sit unapplied until
+  // the evening, which reads as "auto-update is broken" even when it works perfectly (it
+  // did — a 4h gap between publish and pickup was the entire complaint). The check is one
+  // cheap npm registry probe, and applying is a seamless reload, so a tighter cadence
+  // costs almost nothing. Still env-tunable; still floored at 60s.
+  const updateIntervalMs = Math.max(60_000, Number(process.env.MAXPOOL_UPDATE_CHECK_INTERVAL_MS) || 30 * 60 * 1000);
   updateTimer = setInterval(() => {
     // announce:false — the persistent TUI banner is the passive reminder; only real
     // actions (installing / applying) log. runUpdateCheck's latch + hasLease gate prevent
