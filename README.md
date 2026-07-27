@@ -170,6 +170,34 @@ Routing modes:
 
 Routing changes do not move requests already in flight.
 
+#### Run it as a background service (macOS)
+
+Running `maxpool server` in a terminal window means the proxy exists only as long as that
+window does. Nothing brings it back after a reboot, and every Claude Code session pointed at
+it fails on its first message with a connection error — which looks like Claude being down
+rather than a local proxy being absent.
+
+```bash
+./scripts/install-service.sh
+```
+
+That installs a launchd job (`com.mokka.maxpool`) which starts the proxy at login and
+restarts it if it exits. Safe to run while a terminal `maxpool server` is already up: the
+service waits for the port to be free and takes over only when the terminal one exits.
+
+```bash
+launchctl list | grep com.mokka.maxpool          # is it alive?
+tail -f ~/.config/maxpool-service/service.log    # what has it been doing?
+launchctl kickstart -k gui/$(id -u) com.mokka.maxpool   # restart it
+launchctl bootout gui/$(id -u)/com.mokka.maxpool        # stop and uninstall
+```
+
+Two things change once it is installed. Starting a second `maxpool server` by hand will fail
+with `address already in use` — the service owns the port, so use `maxpool status` and the
+log instead of a TUI window. And if the proxy ever fails to stay up, the wrapper notices
+repeated restarts and runs `~/.config/maxpool-service/on-crashloop` (any executable you put
+there, passed the restart count) so a crash loop isn't silent.
+
 ### Run Claude Code through the proxy
 
 ```bash
