@@ -57,7 +57,7 @@ test('W1 happy path: a live socket commits the SSE stream + starts the heartbeat
   assert.equal(res._status, 200, 'commits 200');
   assert.equal(res._headers['Content-Type'], 'text/event-stream', 'as an SSE stream');
   assert.equal(res._flushed, true, 'flushes headers so the client sees bytes immediately');
-  assert.ok(res.writes[0].includes(': maxpool queued'), 'sends an immediate keep-alive comment');
+  assert.ok(res.writes[0].includes('event: ping'), 'sends an immediate keep-alive EVENT (a comment would not reset the client watchdog)');
   assert.equal(requestInfo.queueHeartbeatActive, true, 'marks the heartbeat active');
   clearQueueHeartbeat(requestInfo);
   assert.ok(!requestInfo.queueHeartbeatActive, 'clearQueueHeartbeat tears it down');
@@ -97,7 +97,7 @@ test('W1 grace callback: a live streaming socket → commits the SSE stream + he
   commitStreamGraceHeartbeat(res, requestInfo, { heartbeatMs: 10_000 }, { removeQueuedRequest() {} });
   assert.equal(res._status, 200, 'a slow upstream past the grace commits the stream');
   assert.equal(requestInfo.queueHeartbeatActive, true);
-  assert.ok(res.writes[0].includes(': maxpool queued'));
+  assert.ok(res.writes[0].includes('event: ping'));
   clearQueueHeartbeat(requestInfo);
 });
 

@@ -22,7 +22,25 @@ const DEFAULT_RETRY = {
 // serves EVERY provider (Anthropic/GLM/Kimi), so the idle gap is generous enough
 // that a legitimately-slow-but-alive stream is never cut (each chunk resets it).
 const UPSTREAM_TTFB_MS = Math.max(5_000, Number(process.env.MAXPOOL_TTFB_MS) || 120_000);        // headers must arrive within this
-const STREAM_IDLE_MS = Math.max(30_000, Number(process.env.MAXPOOL_STREAM_IDLE_MS) || 300_000);  // max gap BETWEEN streamed chunks (reset per chunk)
+// A real SSE EVENT, not a `:` comment. Claude Code's stall watchdog is reset only when its
+// SSE iterator YIELDS an event; per the spec a comment line is discarded by the parser and
+// never yields, so a comment keepalive resets nothing. That is why held requests died at
+// EXACTLY 300.0s — the client's floor — despite a 10s heartbeat (60 such deaths in 2.4
+// days). `ping` is an unknown event type the client ignores semantically while still
+// counting as traffic.
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT',
+  'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'ECONNABORTED', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT',
+]);
+const isNetworkCode = c => Boolean(c) && NETWORK_ERROR_CODES.has(c);
+const QUEUE_KEEPALIVE = 'event: ping\ndata: {}\n\n';
+// 240s, strictly BELOW Claude Code's hard 300s stall floor. At the old 300_000 the two
+// timers were a dead heat and the client always won — maxpool's clock starts when a chunk
+// is READ from upstream, strictly before the client parses it. Result: `upstream idle
+// timeout` fired 0 times in 2.4 days while 60 requests died silently client-side. Below the
+// floor maxpool wins and turns a silent stall into a labelled error. Anthropic pings during
+// extended thinking, so real gaps never approach 4 minutes.
+const STREAM_IDLE_MS = Math.max(30_000, Number(process.env.MAXPOOL_STREAM_IDLE_MS) || 240_000);  // max gap BETWEEN streamed chunks (reset per chunk)
 const UPSTREAM_BODY_MS = Math.max(30_000, Number(process.env.MAXPOOL_BODY_MS) || 300_000);       // non-streaming body read
 const CLIENT_DRAIN_MS = Math.max(5_000, Number(process.env.MAXPOOL_DRAIN_MS) || 60_000);         // max wait for a backpressured client to drain (half-open client → free the lease)
 // A provider 403 is (unlike a 401) almost always transient QUOTA/PLAN exhaustion — cool
@@ -62,7 +80,14 @@ const DEFAULT_QUEUE = {
   // (front-loaded work waiting for a free account ≈ a few hours) so beyond that the
   // request error-fasts with an honest retryable 429 instead of a silent multi-day park.
   // Pair with a raised client watchdog (the cc launch sets CLAUDE_STREAM_IDLE_TIMEOUT_MS).
-  streamClientToleranceMs: Math.max(60_000, Number(process.env.MAXPOOL_STREAM_CLIENT_TOLERANCE_MS) || 3 * 60 * 60 * 1000),
+  // Only trust a long hold when the client's watchdog was ACTUALLY raised. The `cc` alias
+  // exports CLAUDE_STREAM_IDLE_TIMEOUT_MS=3h, but a session started any other way keeps the
+  // 300s floor — holding its request for hours just parks a caller that left at 5 minutes.
+  // Derive from the env we can observe; otherwise stay under the real floor.
+  streamClientToleranceMs: Math.max(60_000, Number(process.env.MAXPOOL_STREAM_CLIENT_TOLERANCE_MS)
+    || (Number(process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS) > 300_000
+      ? Math.floor(Number(process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS) * 0.8)
+      : 240_000)),
   // Non-streaming requests have no SSE heartbeat to keep them alive, so a long
   // hold would die on the client timeout anyway. Cap their wait conservatively.
   nonStreamMaxWaitMs: 5 * 60 * 1000,
@@ -1226,10 +1251,24 @@ async function forwardRequest(
     // lease (free the scarce account) and STOP: no retry (the client is gone), no
     // write (the socket is dead).
     if (clientGone.signal.aborted) {
+      // LOG IT. This silent return hid every client-side give-up: 60 requests in 2.4 days
+      // died here leaving only an indistinguishable `(null, 300.0s)` line. `committed`
+      // separates "the user saw a partial answer" (real harm, unretryable) from "the user
+      // was still waiting" — and the elapsed time is what exposes a client watchdog firing
+      // at its floor while maxpool was still happily holding the request.
+      const heldMs = Date.now() - (requestInfo.startedAt || Date.now());
+      console.log(`[Maxpool] Client left after ${(heldMs / 1000).toFixed(1)}s on "${account.name}" `
+        + `(${res.headersSent ? 'mid-response — output already sent' : 'still waiting, nothing sent'})`);
       releaseOnClientGone();
       return;
     }
-    console.error(`[Maxpool] Upstream error (account "${account.name}"):`, err.message);
+    // undici reports every socket/DNS/TLS failure as the bare string "fetch failed" and
+    // hangs the REAL reason off err.cause. Logging err.message alone threw that away: 588
+    // "fetch failed" lines and ZERO ECONNRESET/ENOTFOUND/UND_ERR in the whole log, leaving
+    // every incident unattributable (DNS? TLS? socket exhaustion?).
+    const rootCause = err.cause?.code || err.cause?.message || err.code || '';
+    console.error(`[Maxpool] Upstream error (account "${account.name}"):`, err.message
+      + (rootCause && !String(err.message).includes(rootCause) ? ` (cause: ${rootCause})` : ''));
 
     if (logDir) {
       logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
@@ -1238,8 +1277,10 @@ async function forwardRequest(
 
     const isTransient = err instanceof Error &&
       (err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        // Read BOTH: on an undici fetch rejection err.code is undefined and the code lives
+        // on err.cause, so the bare err.code branches were dead — only the 'fetch failed'
+        // string match kept this classification alive.
+        isNetworkCode(err.code) || isNetworkCode(err.cause?.code) ||
         // Upstream-hang guards: a stalled connection is network-class, not the
         // account's fault → 5s cooldown + release + (pre-headers) retry elsewhere;
         // once committed, isTransient falls through to sendErrorResponse which ends
@@ -1803,8 +1844,14 @@ function sendErrorResponse(res, requestInfo, status, payload, headers = {}) {
   if (requestInfo.queueHeartbeatActive || res.headersSent) {
     clearQueueHeartbeat(requestInfo);
     if (!res.destroyed && !res.writableEnded) {
-      res.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
-      res.end();
+      // Guarded: a write onto a half-dead socket throws, and there is no res.on('error')
+      // anywhere here — an uncaught one reaches the worker's uncaughtException handler,
+      // which process.exit()s and bounces EVERY other in-flight stream. ensureQueueHeartbeat
+      // already guards its identical write; this one did not.
+      try {
+        res.write(`event: error\ndata: ${JSON.stringify(payload)}\n\n`);
+      } catch { /* peer vanished mid-write — nothing to deliver, fall through to end() */ }
+      try { res.end(); } catch { /* already torn down */ }
     }
     return;
   }
@@ -1972,7 +2019,7 @@ async function queueAndRetry(
   // committed stream and DROP the held session. Keeping the heartbeat active lets
   // it re-hold. The heartbeat is instead stopped the instant real upstream bytes
   // start flowing, inside streamResponse — that prevents the Bug A interleave
-  // (': maxpool queued' comments injected between real SSE events) without losing
+  // (queue keepalive pings injected between real SSE events) without losing
   // re-holdability on a post-resume failover.
   return forwardRequest(
     req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir,
@@ -2024,7 +2071,7 @@ function ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager) {
       'X-Accel-Buffering': 'no',
     });
     res.flushHeaders?.();
-    res.write(': maxpool queued\n\n');
+    res.write(QUEUE_KEEPALIVE);
   } catch {
     reapDead();
     return;
@@ -2033,7 +2080,7 @@ function ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager) {
   requestInfo.queueHeartbeatTimer = setInterval(() => {
     if (res.destroyed || res.writableEnded) { reapDead(); return; }
     try {
-      res.write(': maxpool queued\n\n');
+      res.write(QUEUE_KEEPALIVE);
     } catch {
       reapDead();
     }
@@ -2369,7 +2416,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   // We're now committed to streaming a real upstream response body onto this
   // response — there is no more failover for this forward. Stop the queue
   // heartbeat (if this was a resumed held stream) BEFORE the first real byte, so
-  // the setInterval can't inject ': maxpool queued' comments between live SSE
+  // the setInterval can't inject queue keepalive pings between live SSE
   // events (Bug A). It is deliberately NOT cleared earlier (on resume), so a
   // pre-byte failover can still re-hold the session via queueAndRetry.
   clearQueueHeartbeat(requestInfo);

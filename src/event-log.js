@@ -7,7 +7,11 @@
 
 import { appendFile, stat, rename, chmod } from 'node:fs/promises';
 
-const MAX_BYTES = 5 * 1024 * 1024;   // rotate at ~5 MB (one .1 backup kept)
+const MAX_BYTES = 5 * 1024 * 1024;   // rotate at ~5 MB
+// Keep 5 generations (~30 MB total), not 1. With a single backup the log rotated away the
+// evidence MID-INVESTIGATION on 2026-07-28 — the reported error's own line was already gone
+// before it could be read. Diagnosing a stall needs hours of history, not minutes.
+const MAX_GENERATIONS = Math.max(1, Number(process.env.MAXPOOL_LOG_GENERATIONS) || 5);
 const ROTATE_CHECK_MS = 2000;        // rotation-owner size-check cadence
 // Cap each line below the platform PIPE_BUF (512 B on macOS) so concurrent
 // O_APPEND writes from coexisting processes during a reload stay atomic (never
@@ -91,7 +95,13 @@ export async function rotateIfNeeded() {
   const path = logPath;
   if (!path) return;
   const st = await stat(path).catch(() => null);
-  if (st && st.size > MAX_BYTES) await rename(path, `${path}.1`).catch(() => {});
+  if (st && st.size > MAX_BYTES) {
+    // Cascade .N-1 -> .N (oldest first) so N generations survive instead of one.
+    for (let i = MAX_GENERATIONS - 1; i >= 1; i--) {
+      await rename(`${path}.${i}`, `${path}.${i + 1}`).catch(() => {});
+    }
+    await rename(path, `${path}.1`).catch(() => {});
+  }
 }
 
 /**

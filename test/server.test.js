@@ -127,7 +127,7 @@ test('bug (ghost-leak): heartbeat reap releases the queue slot+bytes when the he
     destroyed: false,
     writableEnded: false,
     write(chunk) {
-      if (chunk.includes('maxpool queued') && headersSent && this._ticked) {
+      if (chunk.includes('event: ping') && headersSent && this._ticked) {
         const e = new Error('write EPIPE'); e.code = 'EPIPE'; throw e;
       }
       this._ticked = true;
@@ -718,9 +718,9 @@ test('queued streaming request receives heartbeats and then the recovered upstre
     });
     assert.equal(res.status, 200);
     const text = await res.text();
-    assert.match(text, /: maxpool queued/);
+    assert.match(text, /event: ping/);
     assert.match(text, /"type":"message_delta"/);
-    assert.ok(text.match(/: maxpool queued/g).length >= 2);
+    assert.ok(text.match(/event: ping/g).length >= 2);
     assert.equal(am.getStatus().upstreamThrottle.active, false);
   } finally {
     await close(proxy);
@@ -766,7 +766,7 @@ test('queued streaming request terminates with SSE error when recovery returns 4
       signal: AbortSignal.timeout(4000),
     });
     const text = await res.text();
-    assert.match(text, /: maxpool queued/);
+    assert.match(text, /event: ping/);
     assert.match(text, /event: error/);
     assert.match(text, /invalid_request_error/);
     assert.equal(am.getStatus().upstreamThrottle.probeInFlight, false);
@@ -816,7 +816,7 @@ test('queued streaming request HOLDS on a recovery network failure, then termina
       signal: AbortSignal.timeout(6000),
     });
     const text = await res.text();
-    assert.match(text, /: maxpool queued/, 'was held (queued) first');
+    assert.match(text, /event: ping/, 'was held (queued) first');
     assert.match(text, /event: error/, 'terminates with an SSE error once the outage persists');
     assert.match(text, /internet|connect/i, 'network-honest give-up message');
     assert.doesNotMatch(text, /5h or weekly limit/, 'must NOT misattribute a network outage to quota');
@@ -1821,7 +1821,7 @@ test('bug A: resumed stream has NO heartbeat comment interleaved between real ev
   // ensureQueueHeartbeat floors heartbeatMs to 1000ms (Math.max(1000, ...)), so
   // the timer only ticks mid-stream when the upstream's inter-event gap exceeds
   // ~1s. The upstream below spaces message_delta 1300ms after message_start, so a
-  // surviving heartbeat WOULD inject `: maxpool queued` between them. With the fix
+  // surviving heartbeat WOULD inject an `event: ping` frame between them. With the fix
   // the heartbeat is stopped at resume → clean stream. (Verified RED on the
   // pre-fix code, GREEN here — this defeats the old tautological 240ms test.)
   const upstream = http.createServer((_req, res) => {
@@ -1858,7 +1858,7 @@ test('bug A: resumed stream has NO heartbeat comment interleaved between real ev
     // Heartbeat comments may appear BEFORE the first real event (while queued),
     // but NEVER after — interleaving mid-stream is the corruption bug.
     const after = body.slice(body.indexOf('data:'));
-    assert.ok(!after.includes(': maxpool queued'),
+    assert.ok(!after.includes('event: ping'),
       'no heartbeat comment interleaved into the live SSE body after the first event');
   } finally {
     await close(proxy);
