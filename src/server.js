@@ -60,6 +60,13 @@ const DEFAULT_QUEUE = {
   maxWaitMs: 24 * 60 * 60 * 1000,
   autoMaxWaitMs: null,
   capacityMaxWaitMs: 15 * 60 * 1000,
+  // NETWORK-cause hold ceiling. A quota/capacity hold is worth waiting out — a reset is
+  // genuinely coming. A NETWORK hold is not: the connection is dead, and holding it just
+  // parks the caller on a socket nothing is watching. On 2026-07-28 a request was held
+  // 10,445s (2h54m) having produced ZERO bytes; nothing aborted it until the user touched
+  // the keyboard. Give up quickly instead and return a retryable 429, so the client
+  // reconnects on a FRESH connection — which is what actually self-heals a dead route.
+  networkMaxWaitMs: 2 * 60 * 1000,
   weeklyMaxWaitMs: 24 * 60 * 60 * 1000, // legacy bound; streaming holds use streamHoldMaxMs
   // STREAMING hold ceiling: how long a streaming request may be HELD ALIVE on
   // the SSE heartbeat waiting for any account to free up. Defaults to 7d (the
@@ -1387,7 +1394,7 @@ function formatRetryDuration(seconds) {
 function computeQueueWindowMs({
   cause, stream, retryPlanCause,
   maxWaitMs, capacityMaxWaitMs, nonStreamMaxWaitMs, streamHoldMaxMs, streamClientToleranceMs,
-  isCountTokens, countTokensMaxWaitMs,
+  isCountTokens, countTokensMaxWaitMs, networkMaxWaitMs,
 }) {
   let windowMs;
   if (!stream) {
@@ -1408,6 +1415,11 @@ function computeQueueWindowMs({
   // the upstream processing once acquired) so a non-heartbeated metadata call fast-
   // fails with a retryable 429 instead of hanging past the client's idle window.
   if (isCountTokens && countTokensMaxWaitMs != null) windowMs = Math.min(windowMs, countTokensMaxWaitMs);
+  // A dead ROUTE is not a scheduled reset: holding it out is waiting for nothing. Cap it
+  // hard, independent of how patient the client is — a raised CLAUDE_STREAM_IDLE_TIMEOUT_MS
+  // (the `cc` alias sets 3h) otherwise licenses a multi-hour hold on a connection that is
+  // simply gone. Error-fast + client reconnect beats an unattended hold.
+  if (cause === 'network' && networkMaxWaitMs != null) windowMs = Math.min(windowMs, networkMaxWaitMs);
   return windowMs;
 }
 
@@ -1950,6 +1962,9 @@ async function queueAndRetry(
   const streamClientToleranceMs = queueConfig.streamClientToleranceMs == null
     ? 3 * 60 * 60 * 1000
     : Math.max(0, Number(queueConfig.streamClientToleranceMs) || 0);
+  const networkMaxWaitMs = queueConfig.networkMaxWaitMs == null
+    ? 2 * 60 * 1000
+    : Math.max(0, Number(queueConfig.networkMaxWaitMs) || 0);
   const queueWindowMs = computeQueueWindowMs({
     cause,
     stream: Boolean(requestInfo.stream),
@@ -1957,6 +1972,7 @@ async function queueAndRetry(
     maxWaitMs,
     capacityMaxWaitMs,
     nonStreamMaxWaitMs,
+    networkMaxWaitMs,
     streamHoldMaxMs,
     streamClientToleranceMs,
     isCountTokens: Boolean(requestInfo.isCountTokens),

@@ -11,7 +11,12 @@
 import { spawn as realSpawn } from 'node:child_process';
 
 const POLL_MS = 5_000;      // re-check the in-flight signal (idle-sleep timers are minutes)
-const GRACE_MS = 60_000;    // stay awake this long after the last request, to bridge gaps
+// Stay awake this long after the last request. 60s lost a measured race on 2026-07-28: a
+// network outage drained all in-flight work, the guard released exactly 74s later, and
+// macOS (idle-sleep timer) slept in the SAME SECOND — so the machine went down while the
+// outage was still in progress and recovery had to wait for a keystroke. 5 minutes bridges
+// an outage-shaped gap without meaningfully delaying a genuinely idle sleep.
+const GRACE_MS = 300_000;
 
 export class SleepGuard {
   constructor({ getWorkPending, log = () => {}, spawn = realSpawn, enabled, pollMs = POLL_MS, graceMs = GRACE_MS } = {}) {
