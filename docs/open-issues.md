@@ -339,3 +339,10 @@ makes the suite non-deterministic, which erodes the signal every other fix relie
 Fix by making its waits deadline-based rather than fixed-duration, or by giving the
 spawned workers an explicit generous readiness budget like the reload-integration
 tests already do.
+
+## Flaky: `provider 529 remains provider-scoped and fails over` under full-suite load
+
+`test/server.test.js` — passes in isolation (60/60) but intermittently fails when the whole
+suite runs in parallel on a loaded machine (2026-07-29). Same class as the
+reload-OAuth flake above: real timers + spawned servers competing for CPU. Not a logic
+defect. Fix both together by making their waits deadline-based rather than fixed-duration.

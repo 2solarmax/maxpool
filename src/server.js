@@ -256,7 +256,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       let requestInfo = {};
       // Backstop reaper (defense-in-depth for any UNKNOWN future hang the specific
       // TTFB/idle/body/drain guards don't cover). See startIdleRequestReaper.
-      const reaperTimer = startIdleRequestReaper(res, reqId, REQUEST_IDLE_MAX_MS);
+      const reaperTimer = startIdleRequestReaper(res, reqId, REQUEST_IDLE_MAX_MS, { getRequestInfo: () => requestInfo });
       try {
         // Buffer request body (needed for retry on 429)
         const bodyChunks = [];
@@ -2407,12 +2407,24 @@ function mappedModel(originalModel, account) {
  * (which has no idempotency guard). Clock/timer injectable for tests. Returns the
  * interval handle (caller clearInterval()s it in the request's finally).
  */
-function startIdleRequestReaper(res, reqId, idleMs, { now = Date.now, setIntervalFn = setInterval } = {}) {
+function startIdleRequestReaper(res, reqId, idleMs, { now = Date.now, setIntervalFn = setInterval, getRequestInfo = null } = {}) {
   let lastBytes = res.socket?.bytesWritten ?? 0;
   let lastProgressAt = now();
   const timer = setIntervalFn(() => {
+    // Count only REAL progress. `bytesWritten` includes maxpool's OWN queue keepalive,
+    // which pings every 10s — so a request stuck forever kept resetting this watchdog with
+    // our own noise and could never be reaped. Observed 2026-07-29: 50 requests pinned
+    // "in-flight" on one account for up to 6.7h, serving zero, which distorted the load
+    // balancer into avoiding a healthy account. A held request is progressing only if the
+    // UPSTREAM produced something; heartbeat bytes prove nothing.
+    const heldOnHeartbeat = Boolean(getRequestInfo?.()?.queueHeartbeatActive);
     const bytes = res.socket?.bytesWritten ?? lastBytes;
-    if (bytes !== lastBytes) { lastBytes = bytes; lastProgressAt = now(); return; }
+    if (bytes !== lastBytes) {
+      lastBytes = bytes;
+      if (!heldOnHeartbeat) { lastProgressAt = now(); return; }
+      // Held: those bytes were OUR keepalive, so they are not progress — deliberately
+      // fall through to the staleness check rather than returning.
+    }
     if (now() - lastProgressAt >= idleMs && !res.writableEnded && !res.destroyed) {
       console.error(`[Maxpool] Request ${reqId} — no write progress for ${Math.round(idleMs / 1000)}s (backstop reaper); force-aborting a stuck request to free its account slot`);
       res.destroy();

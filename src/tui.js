@@ -1214,7 +1214,11 @@ export class TUI {
 
     // Active requests
     const now = Date.now();
-    for (const [, r] of this.active) {
+    // NEWEST FIRST, matching the completed log directly below (which is `unshift`ed).
+    // A Map iterates in INSERTION order, so this block used to run oldest-first while the
+    // log under it ran newest-first — the panel disagreed with itself and the newest thing
+    // that happened was buried in the middle of the screen.
+    for (const [, r] of [...this.active].reverse()) {
       const el = ((now - r.started) / 1000).toFixed(1);
       const sp = cyan(SPINNER[this.frame]);
       const a = r.account ? ` → ${r.account}` : '';
