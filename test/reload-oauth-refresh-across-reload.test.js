@@ -94,7 +94,10 @@ function readBody(req) {
   return new Promise(resolve => { let b = ''; req.on('data', c => b += c); req.on('end', () => resolve(b)); });
 }
 
-function proxyGet(port, apiKey, timeoutMs = 6000) {
+// 25s, not 6s: these spawn REAL worker processes and the parallel suite starves
+// them of CPU on a loaded machine — a local request that normally answers in
+// milliseconds was timing out and failing a test with no logic defect.
+function proxyGet(port, apiKey, timeoutMs = 25000) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path: '/v1/messages', method: 'POST',
       headers: { 'content-type': 'application/json' } }, res => {
@@ -114,7 +117,7 @@ function status(port, apiKey) {
       headers: { 'x-api-key': apiKey } }, res => {
       let b = ''; res.on('data', c => b += c); res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
     });
-    req.setTimeout(4000, () => req.destroy(new Error('status timeout')));
+    req.setTimeout(15000, () => req.destroy(new Error('status timeout')));
     req.on('error', reject);
     req.end();
   });
