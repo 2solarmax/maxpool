@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.53] - 2026-07-31
+
+### Changed
+
+- Raise local-HTTP timeouts in the process-spawning reload test
+
+### Fixed
+
+- Reap requests stuck behind our OWN keepalive + newest-first activity panel
+
 ## [1.5.52] - 2026-07-28
 
 ### Fixed
