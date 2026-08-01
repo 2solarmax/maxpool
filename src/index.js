@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
@@ -7,6 +8,24 @@ import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed } fro
 import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer, REQUEST_IDLE_MAX_MS } from './server.js';
+
+// ── Happy Eyeballs: stop racing a dead IPv6 leg ────────────────────────────────
+// Node 20 resolves both families and, 250ms after starting the IPv4 connect, races an
+// IPv6 one (autoSelectFamily, autoSelectFamilyAttemptTimeout=250). On a machine whose
+// resolver returns an AAAA that BLACKHOLES — a VPN advertising IPv6 it cannot carry is
+// the common case — that second leg never completes and takes the whole connect down
+// with it, surfacing as UND_ERR_CONNECT_TIMEOUT / ETIMEDOUT on a network that is
+// otherwise fine (curl, which falls back cleanly, succeeds in the same second).
+//
+// Measured 2026-08-01 on this fleet: 6,848 connect failures in one day; A/B over 14
+// requests gave 12/14 at the 250ms default vs 14/14 with the timeout raised. Raising it
+// is preferred over disabling the race outright: real IPv6 still wins where it works,
+// and a blackholed leg simply loses instead of poisoning the attempt. `dns
+// setDefaultResultOrder('ipv4first')` was ALSO measured and is NOT reliable (6 of 14 in a
+// degraded window) — it reorders preference but still starts the doomed leg.
+net.setDefaultAutoSelectFamilyAttemptTimeout(
+  Math.max(1000, Number(process.env.MAXPOOL_FAMILY_ATTEMPT_TIMEOUT_MS) || 5000),
+);
 import { Prober } from './prober.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint } from './oauth.js';
 import { TUI } from './tui.js';
