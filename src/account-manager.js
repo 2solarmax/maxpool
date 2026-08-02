@@ -1785,13 +1785,14 @@ export class AccountManager {
     // are all unavailable the request HOLDS/queues (recoverable) rather than 400ing.
     if (requestInfo.hasImage && account.provider === 'kimi') return false;
 
-    // A large-context session: a provider already rejected this request with a
-    // context-length 400. The GLM/Kimi *coding* endpoints serve a fixed model capped
-    // at ~256K and IGNORE the model id (so a K3/GLM 1M PLAN doesn't lift the coding
-    // leg's ceiling). Only a 1M-context Claude account can hold it — bench the
-    // providers for this session so it routes to Claude, or HOLDS for one, instead of
-    // re-404ing on a too-small leg. Sticky per session (context only grows turn over
-    // turn), so no follow-up turn re-pays the wasted attempt.
+    // A large-context session: a provider already rejected THIS request with a
+    // context-length 400. Deliberately REACTIVE — it never assumes a ceiling, it learns
+    // one from an actual rejection, so it self-corrects as providers grow. That matters:
+    // the old ~256K coding-endpoint cap is gone (verified 2026-08-02 — GLM 5.2 and Kimi
+    // K3 both accepted a ~400K-token payload and both honoured the requested model id),
+    // so this branch simply stops firing rather than needing a new constant.
+    // Sticky per session (context only grows turn over turn) so no follow-up turn re-pays
+    // the wasted attempt.
     if (account.type === 'provider' && this._isSessionLargeContext(requestInfo)) return false;
 
     const { incompatible, homeProvider } = this._effectiveIncompatible(requestInfo);

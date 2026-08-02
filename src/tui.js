@@ -1152,16 +1152,31 @@ export class TUI {
     }
     lines.push(` Routing  ${cyan(routing)}${xpText}`);
     const queuedCount = this.am.queueState?.waiting?.length || 0;
-    if (this.am._isUpstreamThrottleBlocking?.() || queuedCount) {
+    // Throttle and WAITING are different things and used to share one line labelled
+    // "Anthropic upstream throttled" — so a request parked purely because every account
+    // is at its quota was either invisible (no throttle) or described as a throttle it
+    // wasn't. Waiting is the headline state of this proxy; it gets its own line, always
+    // shown whenever anything is parked, naming what it is waiting FOR.
+    if (this.am._isUpstreamThrottleBlocking?.()) {
       const throttle = this.am.upstreamThrottle;
       const remaining = throttle.until ? Math.max(0, Math.ceil((throttle.until - Date.now()) / 1000)) : 0;
-      const state = this.am._isUpstreamThrottleBlocking?.()
-        ? throttle.probeInFlight ? 'probing recovery' : `retry in ${remaining}s`
-        : 'recovering';
-      const queued = queuedCount;
-      const oldest = queued ? Math.max(0, Date.now() - this.am.queueState.waiting[0].queuedAt) : 0;
-      const queueText = queued ? `  queued ${queued}  oldest ${formatMs(oldest)}` : '';
-      lines.push(` ${yellow(' Anthropic upstream throttled')}  ${dim(state + queueText)}`);
+      const state = throttle.probeInFlight ? 'probing recovery' : `retry in ${remaining}s`;
+      lines.push(` ${yellow(' Anthropic upstream throttled')}  ${dim(state)}`);
+    }
+    if (queuedCount) {
+      const oldest = Math.max(0, Date.now() - this.am.queueState.waiting[0].queuedAt);
+      // Name the soonest thing that would release them, so a long wait reads as
+      // "waiting for a known reset" rather than "hung".
+      let why = 'waiting for capacity';
+      try {
+        const plan = this.am.nextRetryForRequest?.({}, new Set()) || {};
+        if (Number.isFinite(plan.retryAfterMs) && plan.retryAfterMs > 0) {
+          why = `next account frees in ~${formatMs(plan.retryAfterMs)}`;
+        } else if (plan.cause) {
+          why = `waiting (${plan.cause.replace(/_/g, ' ')})`;
+        }
+      } catch { /* display-only; never let the oracle break the render */ }
+      lines.push(` ${cyan(' Parked')} ${dim(`${queuedCount} request${queuedCount === 1 ? '' : 's'} held  oldest ${formatMs(oldest)}  ·  ${why}`)}`);
     }
 
     // ── Accounts

@@ -2370,7 +2370,10 @@ function prepareRuntimeProviders(accountManager, headers) {
 
   const kimiToken = headerValue(headers, 'x-maxpool-kimi-token');
   if (kimiToken) {
-    const model = headerValue(headers, 'x-maxpool-kimi-model') || 'kimi-k2.7';
+    // Fallback only — `cc all` always sends x-maxpool-kimi-model from the llm_config SSOT,
+    // so this is what a bare/older client gets. Kept current deliberately: it read
+    // 'kimi-k2.7' while the fleet had moved to k3.
+    const model = headerValue(headers, 'x-maxpool-kimi-model') || 'kimi-k3';
     accountManager.upsertRuntimeAccount({
       name: 'kimi-fallback',
       type: 'provider',
