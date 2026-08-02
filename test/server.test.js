@@ -152,7 +152,7 @@ test('unavailableMessage tells the truth when no account will recover soon', () 
   };
 
   // Recoverable soon -> a retry hint is honest.
-  assert.match(unavailableMessage(withProviders, {}, 60, true), /Retry in 60s/);
+  assert.match(unavailableMessage(withProviders, {}, 60, true), /Retry in ~1m/);
 
   // Not recoverable soon -> no fake retry; counts only the Claude accounts + names providers.
   const exhausted = unavailableMessage(withProviders, {}, 60, false);
@@ -173,7 +173,7 @@ test('unavailableMessage no longer falsely claims GLM/Kimi is barred for a signe
   const am = { accounts: [{}, {}], _requiresAnthropicThinkingIntegrity: () => true };
   const thinkingSoon = unavailableMessage(am, { requiresAnthropicThinkingIntegrity: true }, 45, true);
   assert.doesNotMatch(thinkingSoon, /fallback is disabled|fallback is unavailable/i, 'thinking sessions DO fall back to providers');
-  assert.match(thinkingSoon, /Retry in 45s/);
+  assert.match(thinkingSoon, /Retry in ~45s/);
 });
 
 test('500 is treated as a retriable upstream status', () => {

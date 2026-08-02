@@ -1446,11 +1446,18 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   }
 
   const claudeCount = accountManager.accounts.filter(a => a.type !== 'provider').length;
-  // Only name the providers when this pool actually HAS them (`cc all`). On `cc ma`
-  // (Claude-only) there are none, so the old hardcoded "and the GLM/Kimi providers"
-  // was a lie. When present they DO serve (not barred), so they're saturated too.
-  const providersClause = accountManager.accounts.some(a => a.type === 'provider')
+  // Only name the providers when this pool HAS them AND they are actually allowed to
+  // serve this request. With crossProviderFallbackPolicy 'never' (the default) they are
+  // barred by POLICY, not saturated — saying they are "at their limit" is a lie that
+  // hides the real, one-keypress fix. Name the switch instead.
+  const providerAccounts = accountManager.accounts.filter(a => a.type === 'provider');
+  const providersUsable = providerAccounts.some(a => a.enabled !== false
+    && accountManager._claudeFallbackFor?.(a.provider) !== 'never');
+  const providersClause = providerAccounts.length && providersUsable
     ? ' and the GLM/Kimi providers' : '';
+  const providersBarredHint = providerAccounts.length && !providersUsable
+    ? ' GLM and Kimi are switched off for Claude sessions — turn one on with m then g if you want them to cover this.'
+    : '';
 
   // No route is expected to recover within the queue window — i.e. every Claude
   // account is at its own 5h/weekly limit. A short "retry in Ns" would be a lie;
@@ -1459,10 +1466,14 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
     const eta = Number.isFinite(retryAfter) && retryAfter > 0
       ? ` Soonest reset in ~${formatRetryDuration(retryAfter)}, beyond the hold window.`
       : '';
-    return `No account can take this request — all ${claudeCount} Claude accounts${providersClause} are at their limit.${eta} Add another Claude account or wait for a quota reset.`;
+    return `No account can take this request — all ${claudeCount} Claude accounts${providersClause} are at their limit.${eta} Add another Claude account or wait for a quota reset.${providersBarredHint}`;
   }
 
-  return `No account can take this request right now — all ${claudeCount} Claude accounts${providersClause} are momentarily at their limit. Retry in ${retryAfter}s.`;
+  // "momentarily ... Retry in 2282s" was two bugs in one breath: 2282 seconds is 38
+  // MINUTES (not momentary), and raw seconds are unreadable. Scale the wording to the
+  // actual wait and render it in human units, the way every other branch already does.
+  const waitLong = Number.isFinite(retryAfter) && retryAfter >= 120;
+  return `No account can take this request right now — all ${claudeCount} Claude accounts${providersClause} are ${waitLong ? 'at their limit' : 'momentarily at their limit'}. Retry in ~${formatRetryDuration(retryAfter)}.${providersBarredHint}`;
 }
 
 // A provider (GLM/Kimi) rejecting a request whose token count exceeds its context
