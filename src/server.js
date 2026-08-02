@@ -91,10 +91,14 @@ const DEFAULT_QUEUE = {
   // exports CLAUDE_STREAM_IDLE_TIMEOUT_MS=3h, but a session started any other way keeps the
   // 300s floor — holding its request for hours just parks a caller that left at 5 minutes.
   // Derive from the env we can observe; otherwise stay under the real floor.
-  streamClientToleranceMs: Math.max(60_000, Number(process.env.MAXPOOL_STREAM_CLIENT_TOLERANCE_MS)
-    || (Number(process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS) > 300_000
-      ? Math.floor(Number(process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS) * 0.8)
-      : 240_000)),
+  // How long the CLIENT will tolerate a held stream. This is a fact about the PEER, so it
+  // is read per-request from `x-maxpool-client-stream-idle-ms` (the cc alias forwards its
+  // own CLAUDE_STREAM_IDLE_TIMEOUT_MS). Reading maxpool's OWN env was a category error: the
+  // alias exports that variable to the Claude Code process, never to this one, so it always
+  // fell to 240s and clamped every hold to 4 minutes despite a configured 24h.
+  // The 240s default is CORRECT for a bare `claude` — without the alias the client dies at
+  // a hard 300s and no keepalive can extend it — so it stays as the conservative floor.
+  streamClientToleranceMs: Math.max(60_000, Number(process.env.MAXPOOL_STREAM_CLIENT_TOLERANCE_MS) || 240_000),
   // Non-streaming requests have no SSE heartbeat to keep them alive, so a long
   // hold would die on the client timeout anyway. Cap their wait conservatively.
   nonStreamMaxWaitMs: 5 * 60 * 1000,
@@ -277,6 +281,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         }
         requestInfo.profile = getMaxpoolProfile(req.headers);
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
+        // The CLIENT tells us how long it will wait — the only source that is actually
+        // true. A `cc` session exports CLAUDE_STREAM_IDLE_TIMEOUT_MS=3h and forwards it
+        // here; a bare `claude` sends nothing and keeps the conservative 240s default,
+        // which is correct for it (its watchdog dies at a hard 300s regardless).
+        // Held at 80% so maxpool always gives up fractionally BEFORE the client does,
+        // turning a silent client-side death into an honest retryable 429.
+        const clientIdleMs = Number(headerValue(req.headers, 'x-maxpool-client-stream-idle-ms'));
+        if (Number.isFinite(clientIdleMs) && clientIdleMs > 300_000) {
+          requestInfo.clientToleranceMs = Math.floor(clientIdleMs * 0.8);
+        }
         // (Removed a FALSE "provider fallback disabled for signed thinking" log here: it
         // fired on every thinking `all` request but was untrue under the default
         // when-exhausted/always policies — providers DO serve thinking requests — and it
@@ -1419,7 +1433,13 @@ function computeQueueWindowMs({
   // hard, independent of how patient the client is — a raised CLAUDE_STREAM_IDLE_TIMEOUT_MS
   // (the `cc` alias sets 3h) otherwise licenses a multi-hour hold on a connection that is
   // simply gone. Error-fast + client reconnect beats an unattended hold.
-  if (cause === 'network' && networkMaxWaitMs != null) windowMs = Math.min(windowMs, networkMaxWaitMs);
+  // Network holds are NOT special-cased short any more. maxpool already re-polls every ~1s
+  // and each retry issues a FRESH fetch, so a hold IS "keep probing, resume the moment any
+  // route returns" — exactly what an unattended agent needs to survive a connectivity blip.
+  // Failing fast at 2 minutes handed the turn to Claude Code's retry loop, which is the
+  // thing that loses accumulated work. Visibility is paid for by logging/TUI, not by
+  // truncating the wait.
+  if (cause === 'network' && networkMaxWaitMs != null) windowMs = Math.min(windowMs, Math.max(networkMaxWaitMs, streamClientToleranceMs || 0));
   return windowMs;
 }
 
@@ -1970,8 +1990,9 @@ async function queueAndRetry(
   const streamHoldMaxMs = queueConfig.streamHoldMaxMs == null
     ? 7 * 24 * 60 * 60 * 1000
     : Math.max(0, Number(queueConfig.streamHoldMaxMs) || 0);
-  const streamClientToleranceMs = queueConfig.streamClientToleranceMs == null
-    ? 3 * 60 * 60 * 1000
+  // Per-request (from the client's own header) wins over the conservative default.
+  const streamClientToleranceMs = Number.isFinite(requestInfo.clientToleranceMs)
+    ? requestInfo.clientToleranceMs
     : Math.max(0, Number(queueConfig.streamClientToleranceMs) || 0);
   const networkMaxWaitMs = queueConfig.networkMaxWaitMs == null
     ? 2 * 60 * 1000
@@ -2428,14 +2449,16 @@ function startIdleRequestReaper(res, reqId, idleMs, { now = Date.now, setInterva
     // "in-flight" on one account for up to 6.7h, serving zero, which distorted the load
     // balancer into avoiding a healthy account. A held request is progressing only if the
     // UPSTREAM produced something; heartbeat bytes prove nothing.
-    const heldOnHeartbeat = Boolean(getRequestInfo?.()?.queueHeartbeatActive);
+    // A QUEUE-HELD request is exempt. It has ALREADY released its account lease before
+    // queueing, so reaping it frees no capacity — the thing this reaper exists to protect.
+    // Its wait is bounded by its own queue ticket deadline instead. Reaping it here was
+    // the blocker that made a longer hold window inert: the window can be hours, but the
+    // socket was destroyed at 20 minutes with no error frame, just a reset.
+    // (The 2026-07-29 case this reaper caught — 50 requests pinned on one account for 6.7h
+    // — were IN-FLIGHT holding leases, not queue-held, so they are still reaped below.)
+    if (getRequestInfo?.()?.queueHeartbeatActive) { lastProgressAt = now(); return; }
     const bytes = res.socket?.bytesWritten ?? lastBytes;
-    if (bytes !== lastBytes) {
-      lastBytes = bytes;
-      if (!heldOnHeartbeat) { lastProgressAt = now(); return; }
-      // Held: those bytes were OUR keepalive, so they are not progress — deliberately
-      // fall through to the staleness check rather than returning.
-    }
+    if (bytes !== lastBytes) { lastBytes = bytes; lastProgressAt = now(); return; }
     if (now() - lastProgressAt >= idleMs && !res.writableEnded && !res.destroyed) {
       console.error(`[Maxpool] Request ${reqId} — no write progress for ${Math.round(idleMs / 1000)}s (backstop reaper); force-aborting a stuck request to free its account slot`);
       res.destroy();

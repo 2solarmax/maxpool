@@ -10,12 +10,16 @@ const base = {
   networkMaxWaitMs: 120_000,
 };
 
-test('a NETWORK-cause hold is capped short even when the client is patient', () => {
-  // 2026-07-28: a request was held 10,445s (2h54m) with ZERO bytes produced because a raised
-  // CLAUDE_STREAM_IDLE_TIMEOUT_MS licensed a multi-hour hold on a dead route. Nothing aborted
-  // it until the user touched the keyboard. A dead route is not a scheduled reset.
+test('a NETWORK-cause hold now gets the SAME ceiling as any other cause', () => {
+  // REVERSED on evidence 2026-08-02. The 2-minute cap was "make the wait visible"
+  // implemented as "make it fail": maxpool already re-polls ~1s and issues a FRESH fetch
+  // each retry, so a hold IS "keep probing, resume the moment a route returns". Failing
+  // fast handed the turn to Claude Code's retry loop — which is exactly what loses an
+  // unattended agent's accumulated work.
   const w = computeQueueWindowMs({ ...base, cause: 'network', retryPlanCause: 'network' });
-  assert.equal(w, 120_000, 'capped at the network ceiling, not the 3h client tolerance');
+  assert.equal(w, base.streamClientToleranceMs,
+    'a network wait is bounded by what the CLIENT will tolerate, not by an arbitrary 2min');
+  assert.ok(w > 120_000, 'no longer truncated to the old 2-minute cap');
 });
 
 test('a CAPACITY/quota hold is NOT shortened — a real reset is worth waiting for', () => {

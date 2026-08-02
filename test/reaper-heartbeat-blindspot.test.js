@@ -23,14 +23,16 @@ function harness({ held }) {
   };
 }
 
-test('a request HELD on the keepalive is still reaped — our own pings are not progress', () => {
-  // THE BUG (2026-07-29): the reaper watched bytesWritten, which includes maxpool's own
-  // 10s keepalive. A stuck request therefore reset the watchdog forever with our noise.
-  // Result: 50 requests pinned "in-flight" on one account for up to 6.7h, serving zero,
-  // which distorted the load balancer into avoiding a perfectly healthy account.
+test('a request HELD on the queue is EXEMPT — reaping it would free nothing', () => {
+  // REVERSED on evidence 2026-08-02. A queue-held request has ALREADY released its account
+  // lease before queueing, so destroying it frees no capacity — the only thing this reaper
+  // exists to protect. Worse, it capped every hold at 20 minutes with no error frame, which
+  // made a longer hold window inert. The 2026-07-29 case this reaper legitimately caught
+  // (50 requests pinned on one account for 6.7h) were IN-FLIGHT holding leases — still
+  // reaped, see the tests below.
   const h = harness({ held: true });
-  for (let i = 0; i < 4; i++) h.advance(30_000);   // 2 min of keepalive-only "progress"
-  assert.equal(h.res.destroyed, true, 'reaped despite continuous keepalive writes');
+  for (let i = 0; i < 8; i++) h.advance(30_000);   // 4 minutes of holding
+  assert.equal(h.res.destroyed, false, 'a held request is never reaped by the idle backstop');
 });
 
 test('a NORMAL streaming request is never reaped while real bytes flow', () => {

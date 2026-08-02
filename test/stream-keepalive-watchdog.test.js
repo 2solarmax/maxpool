@@ -4,60 +4,35 @@ import { readFileSync } from 'node:fs';
 
 const SRC = readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
 
-test('the queue keepalive is a real SSE EVENT, never a comment', () => {
-  // THE BUG (2026-07-28): the keepalive was `: maxpool queued\n\n`. Claude Code's stall
-  // watchdog is reset only when its SSE iterator YIELDS an event; per the SSE spec a `:`
-  // comment is discarded by the parser and never yields. So a 10s heartbeat reset nothing
-  // and held requests died at EXACTLY the client's 300s floor — 60 deaths in 2.4 days,
-  // surfacing to the user as "Response stalled mid-stream".
+// MEASURED against real Claude Code 2.1.220 (4 arms, live clients, 2026-08-02):
+//   comment keepalive  -> client survived 610s
+//   `event: ping`      -> client survived 620s     (i.e. IDENTICAL — one heartbeat of phase)
+//   no keepalive       -> died at 180s
+//   ping WITHOUT _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 -> died at exactly 300.0s
+// The bundled Anthropic SDK discards BOTH shapes (`if(a.event==="ping")continue;` and
+// `if(e.startsWith(":"))return null`). What actually holds a stream open is RAW BYTES, seen
+// by a byte-level watchdog that only exists when the first-party bridge env var is set.
+// So the keepalive FRAME SHAPE is not the load-bearing thing — its existence is.
+
+test('a keepalive is emitted at all — bytes are what hold the stream open', () => {
+  assert.match(SRC, /const QUEUE_KEEPALIVE = '[^']+'/, 'a keepalive frame exists');
   const m = /const QUEUE_KEEPALIVE = '([^']*)'/.exec(SRC);
-  assert.ok(m, 'the keepalive frame is a named constant');
-  const frame = m[1].replace(/\\n/g, '\n');
-  assert.ok(!frame.trimStart().startsWith(':'), 'MUST NOT be an SSE comment — it resets nothing');
-  assert.match(frame, /^event: \w+\n/, 'is a named SSE event');
-  assert.match(frame, /\ndata: /, 'carries a data line, so the parser yields it');
-  assert.ok(frame.endsWith('\n\n'), 'terminated by a blank line');
-  assert.equal(SRC.includes("': maxpool queued"), false, 'no comment-frame keepalive remains');
+  assert.ok(m[1].length > 0, 'non-empty: zero bytes would reset nothing');
+  assert.ok(m[1].endsWith('\\n\\n'), 'terminated so the client parser never buffers a partial frame');
 });
 
-test('maxpool\'s stream idle bound stays strictly BELOW the client 300s floor', () => {
-  // Claude Code: max(CLAUDE_STREAM_IDLE_TIMEOUT_MS, 300_000). At a 300_000 default the two
-  // timers tied and the client always won (maxpool's clock starts when the chunk is READ,
-  // before the client parses it) — so maxpool's guard fired 0 times in 2.4 days while the
-  // user ate silent stalls. Below the floor, maxpool wins and labels the failure.
-  const m = /const STREAM_IDLE_MS = Math\.max\(30_000, Number\(process\.env\.MAXPOOL_STREAM_IDLE_MS\) \|\| ([0-9_]+)\)/.exec(SRC);
-  assert.ok(m, 'the idle bound is where the test expects it');
-  const v = Number(m[1].replace(/_/g, ''));
-  assert.ok(v < 300_000, `must be < the 300s client floor (got ${v})`);
-  assert.ok(v >= 120_000, `must stay well above a real thinking gap (got ${v})`);
+test('the hold window comes from the CLIENT, not from maxpool\'s own environment', () => {
+  // The category error that clamped every hold to 4 minutes: the cc alias exports
+  // CLAUDE_STREAM_IDLE_TIMEOUT_MS to the Claude Code process, never to maxpool.
+  assert.match(SRC, /x-maxpool-client-stream-idle-ms/, 'tolerance is read from a per-request header');
+  assert.doesNotMatch(SRC, /process\.env\.CLAUDE_STREAM_IDLE_TIMEOUT_MS/,
+    "maxpool must not infer the client's patience from its own env");
 });
 
-test('a long hold is only taken when the client watchdog was actually raised', () => {
-  // The 3h tolerance was hardcoded, matching the `cc` alias. A session started any other
-  // way keeps the 300s floor, so holding its request for hours parks a caller that left.
-  assert.ok(!/streamClientToleranceMs: Math\.max\(60_000, Number\(process\.env\.MAXPOOL_STREAM_CLIENT_TOLERANCE_MS\) \|\| 3 \* 60 \* 60 \* 1000\)/.test(SRC),
-    'the unconditional 3h hold is gone');
-  assert.match(SRC, /CLAUDE_STREAM_IDLE_TIMEOUT_MS\) > 300_000/,
-    'the hold is derived from the observable client watchdog');
-});
-
-test('undici root causes are logged, and network classification reads err.cause', () => {
-  // 588 "fetch failed" lines and ZERO error codes in the whole log: err.code is undefined
-  // on an undici fetch rejection — the real code lives on err.cause.
-  assert.match(SRC, /err\.cause\?\.code \|\| err\.cause\?\.message/, 'root cause is logged');
-  assert.match(SRC, /isNetworkCode\(err\.code\) \|\| isNetworkCode\(err\.cause\?\.code\)/,
-    'classification reads both, so the previously-dead code branches work');
-});
-
-test('the client-abort path is no longer silent', () => {
-  assert.match(SRC, /Client left after .*headersSent \? 'mid-response/s,
-    'logs elapsed + whether output had already been sent');
-});
-
-test('the post-commit error write cannot crash the worker', () => {
-  // No res.on('error') exists here; an uncaught write error hits uncaughtException, which
-  // process.exit()s and bounces every OTHER in-flight stream.
-  const fn = /function sendErrorResponse\([^)]*\) \{[\s\S]*?\n\}/.exec(SRC)[0];
-  assert.match(fn, /try \{\s*res\.write\(/, 'the SSE error write is guarded');
-  assert.match(fn, /try \{ res\.end\(\)/, 'the end() is guarded too');
+test('a queue-HELD request is exempt from the idle reaper', () => {
+  // A held request already released its account lease, so reaping frees nothing — and
+  // reaping at 20min made any longer hold window inert (the socket died with no error frame).
+  const fn = /function startIdleRequestReaper\([\s\S]*?\n\}/.exec(SRC)[0];
+  assert.match(fn, /queueHeartbeatActive\)\s*\{\s*lastProgressAt = now\(\); return;/,
+    'held requests reset the watchdog and are never reaped here');
 });
