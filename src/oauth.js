@@ -27,14 +27,17 @@ export function tokenFingerprint(token) {
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
  */
+// How long to wait for the user to finish the browser login. Env-overridable.
+const LOGIN_TIMEOUT_MS = Math.max(60_000, Number(process.env.MAXPOOL_LOGIN_TIMEOUT_MS) || 300_000);
+
 export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT) {
   const maxRetries = 2;
   const baseDelayMs = 500;
-  // Bound each refresh POST so a hung connect during an outage can't pin the
-  // single-flight _refreshPromise indefinitely (which would stall that account's
-  // recovery). Comfortably above a normal refresh latency; a timeout is classified
-  // as a network error below and retried / short-cooled.
-  const perAttemptTimeoutMs = 10_000;
+  // 30s, not 10s. A refresh aborted by OUR timeout is the dangerous case (see below), so
+  // the timeout must be generous enough that a merely slow network never triggers it.
+  // Measured 2026-08-03: refreshes aborted at 10s during a degraded-network window, and
+  // the retries that followed destroyed 4 accounts.
+  const perAttemptTimeoutMs = Math.max(10_000, Number(process.env.MAXPOOL_TOKEN_REFRESH_TIMEOUT_MS) || 30_000);
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -83,10 +86,26 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
            err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT'));
 
-      if (attempt < maxRetries && isNetworkError) {
+      // NEVER re-send a single-use refresh token after an AMBIGUOUS failure. A timeout,
+      // an abort, or a reset AFTER the request left us means the server may have processed
+      // it and rotated the token — retrying then spends a token that is already dead and
+      // the account is destroyed with invalid_grant. Only a failure that provably happened
+      // BEFORE the server saw the request (connection refused, DNS) is safe to retry.
+      //
+      // Measured 2026-08-03: a degraded network aborted refreshes at 10s; the retry loop
+      // re-sent each token up to 3 times within seconds, and 4 accounts died with
+      // "Refresh token not found or invalid" — requiring a manual re-login each.
+      const sentToServer = !(err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND'
+        || err.code === 'EAI_AGAIN' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+      if (attempt < maxRetries && isNetworkError && !sentToServer) {
         continue;
       }
-      if (isNetworkError) err.retryable = true;
+      if (isNetworkError) {
+        err.retryable = true;
+        // Tell the caller the token's fate is UNKNOWN, so it cools the account and tries
+        // once later instead of treating this as a clean failure.
+        err.ambiguousRefresh = sentToServer;
+      }
       throw err;
     }
   }
@@ -555,11 +574,13 @@ function startCallbackServer(expectedState) {
     });
     server.on('error', reject);
 
-    // Timeout after 2 minutes (unref so it doesn't keep the process alive)
+    // Bounded so a forgotten browser tab can't pin the process. 5 minutes, not 2:
+    // reported 2026-08-03 that a real login (password + 2FA, several accounts in a row)
+    // repeatedly overran 2 minutes and had to be restarted from scratch.
     const timer = setTimeout(() => {
-      rejectCode(new Error('Login timed out after 2 minutes'));
+      rejectCode(new Error(`Login timed out after ${Math.round(LOGIN_TIMEOUT_MS / 60_000)} minutes`));
       server.close();
-    }, 120_000);
+    }, LOGIN_TIMEOUT_MS);
     timer.unref();
   });
 }
