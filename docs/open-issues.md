@@ -346,3 +346,18 @@ tests already do.
 suite runs in parallel on a loaded machine (2026-07-29). Same class as the
 reload-OAuth flake above: real timers + spawned servers competing for CPU. Not a logic
 defect. Fix both together by making their waits deadline-based rather than fixed-duration.
+
+## A hold outlives a fleet that can never recover (known, not yet fixed)
+
+Since v1.5.56 a queue-held request waits for the client's real tolerance (hours) instead of
+being cut at 20 minutes. That is correct while capacity is merely busy. It is WRONG when
+every account is `disabled` / `refreshDead`: there is nothing to wait for, so the request
+holds in silence instead of telling the user to re-login.
+
+Observed 2026-08-03: after four accounts were disabled by the refresh-token bug (fixed in
+v1.5.58), sessions showed in-flight requests aging past 5 hours with no output — read by the
+user as "all my sessions are bricked".
+
+Fix: end the hold immediately when `nextRetryForRequest` reports no route can ever recover
+(all accounts disabled/refreshDead), returning an actionable "re-login required" instead of
+holding. Deliberately deferred by the user 2026-08-03.
