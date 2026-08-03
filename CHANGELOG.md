@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.58] - 2026-08-03
+
+### Fixed
+
+- Stop destroying accounts by re-sending a single-use refresh token
+
 ## [1.5.57] - 2026-08-02
 
 ### Fixed
