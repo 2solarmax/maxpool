@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.59] - 2026-08-04
+
+### Documentation
+
+- Record the hold-outlives-a-dead-fleet issue as known, deferred
+
+### Fixed
+
+- Stop blaming the user's internet for an upstream mid-flight drop
+
 ## [1.5.58] - 2026-08-03
 
 ### Fixed
