@@ -1332,11 +1332,20 @@ async function forwardRequest(
       // Record the user-facing failure explicitly so it's greppable in the event
       // log (the in-memory TUI feed scrolls away). `err` is the last network error.
       console.error(`[Maxpool] Returned connection_unavailable (503) after network errors on all routes (last: "${account.name}" — ${err.code || err.message})`);
+      // Name what actually happened. "Check your internet connection" sent the user
+      // hunting a fault that wasn't there: measured 2026-08-04, 10 requests failed this
+      // way within one hour while every other session kept working — the connection to
+      // Anthropic dropped mid-flight (`terminated`) on each account tried, which is not
+      // the same as the machine being offline. Carrying the real code makes it greppable
+      // and stops the misdiagnosis.
+      const lastCode = err.code || err.cause?.code || (err.message || '').slice(0, 40);
       sendErrorResponse(res, requestInfo, 503, {
         type: 'error',
         error: {
           type: 'connection_unavailable',
-          message: 'Could not connect to Claude or a configured fallback provider. Check your internet connection and try again. This is not an account quota issue.',
+          message: `The connection to Claude dropped on every account maxpool tried (${lastCode}). `
+            + 'This is not a quota problem, and it is usually brief — sending the message again normally works. '
+            + 'If it keeps happening, the link between this machine and Anthropic is unstable.',
         },
       });
       return;

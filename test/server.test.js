@@ -1283,7 +1283,11 @@ test('network failures return connection unavailable instead of quota exhaustion
     assert.equal(res.status, 503);
     const body = await res.json();
     assert.equal(body.error.type, 'connection_unavailable');
-    assert.match(body.error.message, /not an account quota issue/i);
+    // Intent unchanged (rule out quota); wording now also names the real cause and the
+    // error code instead of blaming the user's internet — see
+    // test/connection-unavailable-message.test.js.
+    assert.match(body.error.message, /not a quota problem/i);
+    assert.doesNotMatch(body.error.message, /Check your internet connection/i);
   } finally {
     await close(proxy);
   }
