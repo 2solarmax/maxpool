@@ -480,6 +480,38 @@ export class TUI {
 
   /** The visible Updates panel. Answers, at a glance: what am I running, is anything
    *  newer, is it automatic, and what is happening right now. */
+  /** The Routing header line. Split out so a test can assert the RENDERED string —
+   *  matching source text is how a header that contradicted routing survived review. */
+  /** The "Cross-provider: …" fragment. Its own method so a test can assert what the user
+   *  actually sees without needing a TTY — the previous version read a superseded global
+   *  and contradicted routing, and only a source-text test would have "passed" on it. */
+  _crossProviderText() {
+    // Show the EFFECTIVE policy, i.e. what actually governs routing. Since per-provider
+    // settings were added, `_claudeFallbackFor(provider)` decides — and the legacy global
+    // knob this used to read is only its fallback when a provider has no entry of its own.
+    // Reading the global made the header contradict both the footer and reality: it said
+    // "when-exhausted" while GLM and Kimi were each set to "always" and routing agreed
+    // with the footer, not the header.
+    const provs = this.am.accounts.filter(a => a.type === 'provider');
+    if (!provs.length) return '';   // no GLM/Kimi in this pool — the whole line is meaningless
+    const eff = [...new Set(provs.map(a => this.am._claudeFallbackFor?.(a.provider)
+      || this.am._crossProviderFallbackPolicy?.() || 'when-exhausted'))];
+    const colour = v => (v === 'never' ? yellow(v) : v === 'always' ? green(v) : cyan(v));
+    if (eff.length === 1) {
+      return `  ${dim('·')}  ${dim('Cross-provider:')} ${colour(eff[0])}`;
+    } else {
+      // Providers disagree — naming each is the only honest summary; a single word here
+      // would misdescribe at least one of them.
+      const parts = provs.map(a => `${a.provider === 'zai' ? 'GLM' : a.provider === 'kimi' ? 'Kimi' : a.provider}: `
+        + colour(this.am._claudeFallbackFor?.(a.provider) || 'never'));
+      return `  ${dim('·')}  ${dim('Cross-provider:')} ${parts.join(dim(' / '))}`;
+    }
+  }
+
+  _routingLine(routing, xpText) {
+    return ` Routing  ${cyan(routing)}${xpText}`;
+  }
+
   _renderUpdatesDetail() {
     const v = this.am.versionInfo;
     const running = v?.current ? `v${v.current}` : 'unknown';
@@ -1137,9 +1169,7 @@ export class TUI {
     const hasProviders = this.am.accounts.some(a => a.type === 'provider');
     let xpText = '';
     if (hasProviders) {
-      const p = this.am._crossProviderFallbackPolicy?.() || 'when-exhausted';
-      const pc = p === 'never' ? yellow(p) : p === 'always' ? green(p) : cyan(p);
-      xpText = `  ${dim('·')}  ${dim('Cross-provider:')} ${pc}`;
+      xpText = this._crossProviderText();
       // Overflow visibility: when GLM/Kimi actually served requests recently, surface the
       // volume so provider traffic isn't a mystery — it's overflow that spilled here while
       // OAuth was saturated. Reuses the SAME 15m load window as the per-row "15m Nr" column.
@@ -1150,7 +1180,7 @@ export class TUI {
       }
       if (provReq > 0) xpText += `  ${dim('·')}  ${yellow(`providers: ${provReq} req/15m`)}`;
     }
-    lines.push(` Routing  ${cyan(routing)}${xpText}`);
+    lines.push(this._routingLine(routing, xpText));
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     // Throttle and WAITING are different things and used to share one line labelled
     // "Anthropic upstream throttled" — so a request parked purely because every account
