@@ -33,6 +33,10 @@ const NETWORK_ERROR_CODES = new Set([
   'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'ECONNABORTED', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT',
 ]);
 const isNetworkCode = c => Boolean(c) && NETWORK_ERROR_CODES.has(c);
+// How long a NON-STREAMING request may soak through a network blip. Short by construction:
+// with no keepalive the client's hard 300s floor applies, so we must error first.
+const NETWORK_SOAK_NONSTREAM_MS = Math.max(5_000,
+  Number(process.env.MAXPOOL_NETWORK_SOAK_NONSTREAM_MS) || 45_000);
 const QUEUE_KEEPALIVE = 'event: ping\ndata: {}\n\n';
 // 240s, strictly BELOW Claude Code's hard 300s stall floor. At the old 300_000 the two
 // timers were a dead heat and the client always won — maxpool's clock starts when a chunk
@@ -1958,7 +1962,26 @@ async function queueAndRetry(
   // a real outage doesn't spin. A non-streaming network failure (no keepalive) still
   // fails fast — it would die on the client's own timeout anyway.
   if (cause === 'proxy') return false;
-  if (cause === 'network' && (!requestInfo.stream || !canQueueBufferedBody)) return false;
+  if (cause === 'network' && !canQueueBufferedBody) return false;
+  // NETWORK SOAK, hard-bounded. A brief connectivity blip should not throw away a turn —
+  // but an unbounded soak is worse than a fast error (it presents as a hang, which is the
+  // failure mode the user explicitly fears). So a network-caused hold carries its OWN
+  // absolute deadline, stamped once and NEVER reset by a re-queue, independent of the
+  // per-attempt queue window. Past it, we stop soaking and return the honest error.
+  //
+  // Non-streaming gets a short budget: it has no keepalive, so the client's hard 300s
+  // floor applies with nothing resetting it — we must give up well before that so the user
+  // sees a real message instead of a client-side timeout.
+  if (cause === 'network') {
+    const budgetMs = requestInfo.stream
+      ? Math.max(60_000, Number(queueConfig.networkMaxWaitMs) || 120_000)
+      : NETWORK_SOAK_NONSTREAM_MS;
+    requestInfo.networkSoakDeadline ||= Date.now() + budgetMs;
+    if (Date.now() >= requestInfo.networkSoakDeadline) {
+      console.log(`[Maxpool] Network soak budget spent (${Math.round(budgetMs / 1000)}s) — returning the connection error instead of holding longer`);
+      return false;
+    }
+  }
 
   const maxWaitMs = Math.max(0, Number(queueConfig.maxWaitMs) || 0);
   const autoMaxWaitMs = queueConfig.autoMaxWaitMs == null
