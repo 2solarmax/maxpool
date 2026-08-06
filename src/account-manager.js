@@ -176,6 +176,10 @@ const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
 // fall back to per-account handling. Bounds any future "poisoned probe" from becoming
 // an indefinite fleet-wide outage (2026-07-25 incident).
 const MAX_FAILED_PROBES = 4;
+// Consecutive quota-probe failures before we say so. High enough that a network blip or a
+// single 429 never trips it; low enough that a permanently dead endpoint surfaces the same
+// day rather than never.
+const PROBE_FAILURE_ALERT_AT = 20;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
@@ -2183,6 +2187,8 @@ export class AccountManager {
    * Same effect as learning quota from a live response, but for idle accounts.
    */
   applyUsageData(accountIndex, usage) {
+    // A successful probe ends any escalation streak.
+    if (this.accounts[accountIndex]?.quota) this.accounts[accountIndex].quota.consecutiveProbeFailures = 0;
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
@@ -2257,6 +2263,22 @@ export class AccountManager {
     q.lastProbeError = message ? String(message).slice(0, 160) : 'probe failed';
     q.lastProbeErrorAt = Date.now();
     q.lastProbeErrorStatus = Number.isFinite(status) ? status : null;
+    // ESCALATE A SYSTEMIC PROBE FAILURE. These fields were written and never read by
+    // anything, so a probe that fails on EVERY call did so in total silence — measured
+    // 2026-08-06: both quota endpoints (/v1/usages and /v1/usage) return 404, so weekly
+    // quota was only ever learned from upstream 429 headers, and an account that had not
+    // yet hit a 429 showed a blank weekly forever with no indication why.
+    // A fail-open probe that never says it is failing is a log line, not a detector.
+    q.consecutiveProbeFailures = (q.consecutiveProbeFailures || 0) + 1;
+    const n = q.consecutiveProbeFailures;
+    // Once, at a threshold that cannot be a blip, then every 100th so it stays visible
+    // without walling the log.
+    if (n === PROBE_FAILURE_ALERT_AT || (n > PROBE_FAILURE_ALERT_AT && n % 100 === 0)) {
+      console.error(`[Maxpool] Quota probe has failed ${n}x in a row for "${account.name}"`
+        + `${status ? ` (HTTP ${status})` : ''}: ${q.lastProbeError}. `
+        + 'Weekly quota can only be learned from upstream 429 headers until this recovers, '
+        + 'so an account that has not hit a 429 will show a blank weekly.');
+    }
   }
 
   /**
