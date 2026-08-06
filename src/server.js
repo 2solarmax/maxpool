@@ -403,6 +403,13 @@ async function forwardRequest(
 ) {
   const configuredAttempts = Number(retryConfig.maxAttemptsPerRequest) || accountManager.accounts.length;
   const maxAttempts = Math.max(1, configuredAttempts);
+  // A body REPAIR (strip a block, convert a tool pair, downgrade effort) is not an
+  // account failover — it re-sends a FIXED body and consumes no account. Charging both
+  // to one budget sized by ACCOUNT COUNT meant a 1-account fleet could never repair
+  // anything and a 2-account fleet got exactly one repair, while the chain is now six
+  // deep. Each repair latches its own flag, so this budget is a backstop, not the bound.
+  const repairCount = requestInfo.repairCount || 0;
+  const canRepairBody = repairCount < 6 && !res.headersSent;
 
   // PRE-STRIP a session already known to carry provider-authored thinking. The client
   // resends the whole poisoned history every turn, so without this each turn pays another
@@ -1076,7 +1083,8 @@ async function forwardRequest(
       // text + tool_use preserved. Tried once per request (thinkingStripped guard); if it
       // still fails, the provider pin below is the fallback.
       if (isSignatureRejection && !requestInfo.thinkingStripped
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && canRepairBody) {
+        console.log(`[Maxpool] Anthropic rejected a block: ${describeRejectedBlock(body, errorBody)}`);
         const { body: cleanBody, removed, converted } = stripForeignThinkingBlocks(body);
         if (cleanBody) {
           // Latch it so EVERY later turn is stripped up front instead of re-paying this
@@ -1085,7 +1093,35 @@ async function forwardRequest(
           console.log(`[Maxpool] Recovering session on Claude: stripped ${removed} provider thinking block(s), converted ${converted} provider search block(s) to text`);
           return forwardRequest(
             req, res, cleanBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-            retryConfig, queueConfig, { ...requestInfo, thinkingStripped: true },
+            retryConfig, queueConfig, { ...requestInfo, thinkingStripped: true, repairCount: repairCount + 1 },
+            canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+      }
+
+      // COORDINATE REPAIR (runs after the broad strip found nothing, or found the wrong
+      // thing). Anthropic pointed at an exact block index; trust that over our own shape
+      // model. Its own flag, so it still fires on a request whose broad strip already ran.
+      if (isSignatureRejection && !requestInfo.rejectedBlockStripped && canRetryBufferedBody && canRepairBody) {
+        const { body: fixedBody, removed, type } = stripRejectedBlockClass(body, errorBody);
+        if (fixedBody) {
+          // Latch the session ONLY for the class the pre-strip can actually repair up
+          // front. `stripForeignThinkingBlocks` never touches `redacted_thinking`, so
+          // latching on it would make every later turn pay a rejected round-trip that
+          // the pre-strip cannot prevent — and would mislabel the give-up message as a
+          // GLM/Kimi story. Same reason `thinkingStripped` is set only for `thinking`:
+          // setting it here would bar the broad strip on the retry.
+          const preStripCanRepeat = type === 'thinking';
+          if (preStripCanRepeat) accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
+          console.log(`[Maxpool] Recovering session on Claude: Anthropic rejected a "${type}" block by index; removed ${removed} block(s) of that type`);
+          return forwardRequest(
+            req, res, fixedBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, {
+              ...requestInfo,
+              rejectedBlockStripped: true,
+              thinkingStripped: preStripCanRepeat || requestInfo.thinkingStripped,
+              repairCount: repairCount + 1,
+            },
             canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
           );
         }
@@ -1147,9 +1183,24 @@ async function forwardRequest(
         // Say only what ACTUALLY happened. `thinkingStripped` is set only when the strip
         // ran; without it we found nothing provider-shaped, so claiming we stripped —
         // or blaming GLM/Kimi — would misdirect the user.
-        const what = requestInfo.thinkingStripped
-          ? 'This session ran on GLM/Kimi earlier, and Anthropic will not accept parts of what they wrote. Maxpool repaired what it could and retried on Claude, but Anthropic still rejected the history.'
-          : "Anthropic rejected part of this session's history that maxpool could not repair automatically.";
+        // Log the shape on the way out: this is the ONE place a give-up is observable,
+        // and without it the two surviving explanations (a block the strip cannot see
+        // vs. a body over the retry buffer) are indistinguishable in the log.
+        console.log(`[Maxpool] Unrepaired signature 400: ${describeRejectedBlock(body, errorBody)} bufferable=${canRetryBufferedBody} stripped=${!!requestInfo.thinkingStripped}`);
+        // A body over the retry buffer bars EVERY repair above without a word — the user
+        // then sees "could not repair" for a transcript maxpool never even tried to fix.
+        // Name that separately so the reason is actionable rather than mysterious.
+        // `peek` (not the full class-strip) because on THIS path the body may be the very
+        // one just declared too large to rewrite — a full parse+rebuild there costs 15ms
+        // and a discarded 4.8MB Buffer on a 9.6MB body, to read one string.
+        const rejectedType = canRetryBufferedBody ? peekRejectedBlockType(body, errorBody) : null;
+        const what = !canRetryBufferedBody
+          ? `This session's history is too large for maxpool to rewrite automatically (over ${Math.round(retryConfig.maxRetryBufferBytes / (1024 * 1024))}MB). Run /compact and it will keep going.`
+          : rejectedType && rejectedType !== 'thinking' && rejectedType !== 'redacted_thinking'
+            ? `Anthropic rejected a "${rejectedType}" block in this session's history, which maxpool cannot remove without losing conversation content.`
+            : requestInfo.thinkingStripped || requestInfo.rejectedBlockStripped
+              ? 'This session ran on GLM/Kimi earlier, and Anthropic will not accept parts of what they wrote. Maxpool repaired what it could and retried on Claude, but Anthropic still rejected the history.'
+              : "Anthropic rejected part of this session's history that maxpool could not repair automatically.";
         const hint = provs.length === 0
           ? ''
           : provs.every(a => a.enabled === false)
@@ -1160,7 +1211,12 @@ async function forwardRequest(
           type: 'error',
           error: {
             type: 'invalid_request_error',
-            message: `Start a new session to keep working — this one cannot continue. ${what}${hint}`,
+            // The lead depends on whether the session is actually RECOVERABLE. Telling a
+            // user "this one cannot continue" and then "run /compact and it will keep
+            // going" is two mutually exclusive remedies in one sentence.
+            message: canRetryBufferedBody
+              ? `Start a new session to keep working — this one cannot continue. ${what}${hint}`
+              : `${what}${hint}`,
           },
         });
         return;
@@ -1520,7 +1576,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
+export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1709,6 +1765,119 @@ function isStrippableThinkingBlock(block) {
 }
 
 /**
+ * Anthropic's signature 400 names the EXACT block it rejected:
+ *   "messages.29.content.58: Invalid `signature` in `thinking` block"
+ * That coordinate is GROUND TRUTH. Every other repair here depends on maxpool's own
+ * model of what a provider-authored block looks like, and that model is what silently
+ * failed — the role gate above meant `stripForeignThinkingBlocks` returned "nothing to
+ * remove" for a block Anthropic had just pointed at by index.
+ *
+ * Returns { mi, ci } or null.
+ */
+function parseRejectedBlockPath(errorBody) {
+  const s = String(errorBody || '');
+  const m = /messages\.(\d+)\.content\.(\d+)/.exec(s);
+  if (!m) return null;
+  // A NESTED path — `messages.29.content.58.content.3` — points INSIDE the block at
+  // [58], not at it. Taking the outer coordinate would name the wrong block: the user
+  // would be told a "tool_result" was rejected when a thinking block nested in it is
+  // the real culprit, and a class-strip keyed on that type would be wrong too.
+  if (/^\.content\./.test(s.slice(m.index + m[0].length))) return null;
+  return { mi: Number(m[1]), ci: Number(m[2]) };
+}
+
+/**
+ * The rejected block's TYPE only — no parse-and-rebuild. Used on the give-up path,
+ * where the body may be the very one we just declared too large to rewrite (measured:
+ * a full stripRejectedBlockClass on a 9.6MB body costs 15ms and allocates a 4.8MB
+ * Buffer that is discarded, because only `.type` is ever read).
+ */
+function peekRejectedBlockType(body, errorBody) {
+  const path = parseRejectedBlockPath(errorBody);
+  if (!path) return null;
+  try {
+    const json = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body));
+    return json?.messages?.[path.mi]?.content?.[path.ci]?.type || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One line naming exactly what Anthropic rejected: coordinate, role, block type, and
+ * whether the body was even parseable. Without it, the two remaining explanations for a
+ * silent give-up (a block shape the strip cannot see vs. a body over the retry buffer)
+ * are indistinguishable in the log — and once the repair starts working, the successful
+ * path logs the same line as the already-working one, so the question becomes
+ * unanswerable. Types and roles only; no transcript content.
+ */
+function describeRejectedBlock(body, errorBody) {
+  const path = parseRejectedBlockPath(errorBody);
+  if (!path) return 'coordinate=unparsed';
+  try {
+    const json = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body));
+    const msg = json?.messages?.[path.mi];
+    const block = msg?.content?.[path.ci];
+    return `coordinate=messages.${path.mi}.content.${path.ci} role=${msg?.role ?? 'MISSING'} type=${block?.type ?? 'MISSING'} blocks=${Array.isArray(msg?.content) ? msg.content.length : 'n/a'}`;
+  } catch {
+    return `coordinate=messages.${path.mi}.content.${path.ci} body=UNPARSEABLE`;
+  }
+}
+
+/**
+ * Last-resort repair driven by the upstream's own coordinate, for a rejected block no
+ * shape heuristic here recognised. Removes every block sharing the rejected block's
+ * TYPE, on any role — fixing the whole class in ONE round-trip rather than replaying
+ * once per bad block (a 47-block transcript would otherwise cost 47 rejected requests).
+ *
+ * Restricted to the thinking family on purpose: `text` / `tool_use` / `tool_result`
+ * carry conversation content and tool pairing, so removing them would corrupt the
+ * transcript rather than repair it. A rejected block outside that family returns null
+ * and the 400 surfaces with its real cause intact.
+ *
+ * Returns { body, removed, type } — `body` is null when nothing was safe to remove.
+ */
+function stripRejectedBlockClass(body, errorBody) {
+  const path = parseRejectedBlockPath(errorBody);
+  if (!path) return { body: null, removed: 0, type: null };
+  try {
+    const json = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body));
+    if (!Array.isArray(json?.messages)) return { body: null, removed: 0, type: null };
+    const target = json.messages[path.mi]?.content?.[path.ci];
+    const type = target?.type;
+    // Only the thinking family is safe to drop wholesale (verified 2026-07-25: a
+    // history with thinking blocks removed replays 200 OK, text + tool_use preserved).
+    if (type !== 'thinking' && type !== 'redacted_thinking') {
+      return { body: null, removed: 0, type: type || null };
+    }
+    let removed = 0;
+    const messages = [];
+    for (const msg of json.messages) {
+      if (!Array.isArray(msg?.content)) { messages.push(msg); continue; }
+      const kept = msg.content.filter(b => {
+        if (b?.type !== type) return true;
+        removed++;
+        return false;
+      });
+      if (kept.length === msg.content.length) { messages.push(msg); continue; }
+      // A turn stripping empties is DROPPED — an empty content array is itself invalid,
+      // and keeping the original would resend the exact body that just 400'd. Except
+      // messages[0], which must survive as a `user` turn (see the same guard above).
+      if (kept.length === 0) {
+        if (messages.length === 0) { messages.push({ ...msg, content: [{ type: 'text', text: '(content removed)' }] }); }
+        continue;
+      }
+      messages.push({ ...msg, content: kept });
+    }
+    if (!removed) return { body: null, removed: 0, type };
+    json.messages = messages;
+    return { body: Buffer.from(JSON.stringify(json)), removed, type };
+  } catch {
+    return { body: null, removed: 0, type: null };
+  }
+}
+
+/**
  * Recovery for a provider-contaminated transcript: drop the assistant `thinking` /
  * `redacted_thinking` blocks whose signature Anthropic can't validate, so the session
  * can CONTINUE ON CLAUDE instead of being pinned to a provider forever.
@@ -1847,10 +2016,12 @@ function stripForeignThinkingBlocks(body) {
       // assistant turn but its result can be carried on the following user turn.
       const tools = convertForeignServerTools(msg.content, foreignToolIds);
       converted += tools.converted;
-      if (msg.role !== 'assistant') {
-        messages.push(tools.converted ? { ...msg, content: tools.content } : msg);
-        continue;
-      }
+      // Thinking blocks are stripped on EVERY role, not just `assistant`. Anthropic
+      // validates the signature wherever the block sits, so a role gate here made the
+      // repair silently find NOTHING to remove — which left `thinkingStripped` false,
+      // barred the session latch, and surfaced the 400 to the user as "maxpool could
+      // not repair automatically" while healthy Claude accounts sat idle. Measured
+      // 2026-08-06: 315 signature 400s, the broad strip finding nothing on a subset.
       let localRemoved = 0;
       const kept = tools.content.filter(block => {
         if (!isStrippableThinkingBlock(block)) return true;
@@ -1866,7 +2037,14 @@ function stripForeignThinkingBlocks(body) {
       // leaving it would resend the exact body that just 400'd while reporting success
       // and burning the single recovery attempt. Verified against the live API — the
       // resulting consecutive user messages are accepted (200 OK).
-      if (kept.length === 0) continue;
+      // EXCEPT messages[0]: Anthropic requires the first message to be role `user`, so
+      // dropping it leaves an `assistant`-first transcript that is rejected outright.
+      // Reachable only since the role gate was removed — before that, non-assistant
+      // turns were never dropped at all.
+      if (kept.length === 0) {
+        if (messages.length === 0) { messages.push({ ...msg, content: [{ type: 'text', text: '(content removed)' }] }); }
+        continue;
+      }
       messages.push({ ...msg, content: kept });
     }
     if (!removed && !converted) return { body: null, removed: 0, converted: 0 };
