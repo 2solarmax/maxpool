@@ -2154,7 +2154,18 @@ export class AccountManager {
     if (q.unified7d == null) return 'unknown';
 
     const used = clamp01(q.unified7d);
-    if (used >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
+    // NEVER bench on utilization alone while the upstream explicitly says the account is
+    // ALLOWED. Anthropic reports both a percentage and a verdict; the verdict is the
+    // authority, and it keeps saying "allowed"/"allowed_warning" at 100% used. This mirrors
+    // _isAccountWideRejected above, which already treats an explicit 'rejected' as decisive
+    // for the negative case — the positive case was simply missing.
+    // Measured 2026-08-06: max@gomokka.com sat benched at unified7d=1.00 with
+    // unifiedStatus='allowed_warning' and returned 200 to a live request. Capacity the user
+    // was waiting on, withheld because a threshold outranked the upstream's own answer.
+    // 'exhausted' is the only state that removes an account from routing, so the override
+    // is scoped to it — critical/reserve still apply their soft costs unchanged.
+    const upstreamAllows = typeof q.unifiedStatus === 'string' && q.unifiedStatus.startsWith('allowed');
+    if (used >= this.scheduler.weeklyExhaustedThreshold && !upstreamAllows) return 'exhausted';
     if (used >= this.scheduler.weeklyCriticalThreshold) return 'critical';
     if (used >= this.scheduler.weeklyReserveThreshold) return 'reserve';
     if (used >= this.scheduler.weeklySoftThreshold) return 'soft';
@@ -2264,11 +2275,13 @@ export class AccountManager {
     q.lastProbeErrorAt = Date.now();
     q.lastProbeErrorStatus = Number.isFinite(status) ? status : null;
     // ESCALATE A SYSTEMIC PROBE FAILURE. These fields were written and never read by
-    // anything, so a probe that fails on EVERY call did so in total silence — measured
-    // 2026-08-06: both quota endpoints (/v1/usages and /v1/usage) return 404, so weekly
-    // quota was only ever learned from upstream 429 headers, and an account that had not
-    // yet hit a 429 showed a blank weekly forever with no indication why.
-    // A fail-open probe that never says it is failing is a log line, not a detector.
+    // anything, so a probe failing on every call would do so in total silence.
+    // (Correction: an earlier version of this comment claimed the Anthropic quota probe was
+    // dead because /v1/usages and /v1/usage 404. Those are the KIMI PROVIDER endpoints
+    // (src/oauth.js fetchProviderUsage). Anthropic's OAuth quota endpoint is
+    // /api/oauth/usage and it is healthy — every account carries a recent lastProbeOkAt and
+    // zero consecutive failures, and this escalation has never fired. The guard is still
+    // worth having; the diagnosis that motivated it was wrong.)
     q.consecutiveProbeFailures = (q.consecutiveProbeFailures || 0) + 1;
     const n = q.consecutiveProbeFailures;
     // Once, at a threshold that cannot be a blip, then every 100th so it stays visible
