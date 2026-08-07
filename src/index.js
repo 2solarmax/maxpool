@@ -593,6 +593,40 @@ async function serverWorkerCommand() {
   // self-healing window as an abrupt SIGKILL. A cold restart reads the clean-shutdown
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
+
+  // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
+  // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
+  // referencing a GCP Secret Manager secret by NAME — the key is resolved at
+  // startup and held in memory only, never written to config or state.json.
+  // Team members add a provider by storing the key in GCP, then pointing maxpool
+  // at the secret name via the TUI. Deleting the GCP secret disables the provider
+  // on the next restart — no key to hunt down in config files.
+  if (Array.isArray(config.providers) && config.providers.length > 0) {
+    try {
+      const { resolveSecrets } = await import('./secret-resolver.js');
+      // Split: GCP-sourced (secretName) vs direct (apiKey). Both produce a token
+      // the same way — the resolution path is the only difference.
+      const gcpEntries = config.providers.filter(p => p.secretName);
+      const directEntries = config.providers.filter(p => p.apiKey && !p.secretName);
+      const secretNames = gcpEntries.map(p => p.secretName);
+      const resolved = await resolveSecrets(secretNames);
+      const entries = config.providers.map(p => ({
+        ...p,
+        token: p.secretName ? (resolved[p.secretName] || null) : (p.apiKey || null),
+      }));
+      accountManager.loadConfigProviders(entries);
+      const ok = entries.filter(e => e.token).length;
+      const fail = entries.length - ok;
+      console.log(`[Maxpool] Config providers: ${ok} active${fail ? `, ${fail} unresolved` : ''}`);
+      for (const p of config.providers) {
+        const a = accountManager.accounts.find(a => a.name === p.name);
+        if (a && p.secretName) a.secretName = p.secretName;
+      }
+    } catch (err) {
+      console.error(`[Maxpool] Config provider resolution failed: ${err.message}`);
+    }
+  }
+
   // Track the state-file generation we last observed so a stale flush is refused.
   let stateGeneration = Number(savedState?._generation) || 0;
 

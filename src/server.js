@@ -1562,6 +1562,20 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   // MINUTES (not momentary), and raw seconds are unreadable. Scale the wording to the
   // actual wait and render it in human units, the way every other branch already does.
   const waitLong = Number.isFinite(retryAfter) && retryAfter >= 120;
+
+  // "at their limit" is a QUOTA claim. When the accounts are actually in short network
+  // cooldowns (a connectivity blip drops every in-flight connection and cools each
+  // account for ~5s), that claim sends the user to check quota and add accounts while
+  // the fleet is healthy and recovers in seconds. Name the real cause.
+  const census = accountManager.unavailabilityCensus?.(requestInfo.model);
+  if (census && census.dominant === 'transient') {
+    const netly = census.network > 0;
+    const what = netly
+      ? `${census.network} of ${census.total} Claude accounts are in a brief reconnect cooldown`
+      : `all ${census.total} Claude accounts are momentarily busy`;
+    return `No account can take this request right now — ${what}, not out of quota. Retry in ~${formatRetryDuration(retryAfter)}; it clears on its own.${providersBarredHint}`;
+  }
+
   return `No account can take this request right now — all ${claudeCount} Claude accounts${providersClause} are ${waitLong ? 'at their limit' : 'momentarily at their limit'}. Retry in ~${formatRetryDuration(retryAfter)}.${providersBarredHint}`;
 }
 
@@ -2559,8 +2573,18 @@ function getMaxpoolProfile(headers) {
 function prepareRuntimeProviders(accountManager, headers) {
   if (getMaxpoolProfile(headers) !== 'all') return;
 
+  // Config-sourced providers already exist (resolved from GCP at startup). A `cc all`
+  // session sends the SAME token as a header → dedup by token so we don't create a
+  // duplicate provider for every request. The config provider wins (it persists, has
+  // the right name, and carries quota state from earlier requests).
+  const configTokens = new Set(
+    (accountManager.accounts || [])
+      .filter(a => a.configSourced && a.credential)
+      .map(a => a.credential),
+  );
+
   const zaiToken = headerValue(headers, 'x-maxpool-zai-token');
-  if (zaiToken) {
+  if (zaiToken && !configTokens.has(zaiToken)) {
     const opus = headerValue(headers, 'x-maxpool-zai-opus-model') || headerValue(headers, 'x-maxpool-zai-model') || 'glm-5.2';
     const sonnet = headerValue(headers, 'x-maxpool-zai-sonnet-model') || headerValue(headers, 'x-maxpool-zai-model') || opus;
     const haiku = headerValue(headers, 'x-maxpool-zai-haiku-model') || 'glm-5.1';
@@ -2579,7 +2603,7 @@ function prepareRuntimeProviders(accountManager, headers) {
   }
 
   const kimiToken = headerValue(headers, 'x-maxpool-kimi-token');
-  if (kimiToken) {
+  if (kimiToken && !configTokens.has(kimiToken)) {
     // Fallback only — `cc all` always sends x-maxpool-kimi-model from the llm_config SSOT,
     // so this is what a bare/older client gets. Kept current deliberately: it read
     // 'kimi-k2.7' while the fleet had moved to k3.

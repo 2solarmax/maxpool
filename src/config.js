@@ -154,6 +154,11 @@ export function createDefaultConfig() {
       heartbeatMs: 10_000,
     },
     accounts: [],
+    // Config-sourced provider accounts (GLM/Kimi). Each entry references a GCP
+    // Secret Manager secret by NAME — the key is resolved at startup and held in
+    // memory only. See src/secret-resolver.js.
+    //   [{ name, provider:'zai'|'kimi', secretName, upstream?, priority? }]
+    providers: [],
   };
 }
 

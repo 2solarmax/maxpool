@@ -405,6 +405,7 @@ export class TUI {
       case 'accounts': this._keyAccounts(k); break;
       case 'routing': this._keyRouting(k); break;
       case 'updates': this._keyUpdates(k); break;
+      case 'providers': this._keyProviders(k); break;
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
       case 'confirm': this._keyConfirm(k); break;
@@ -442,6 +443,8 @@ export class TUI {
       );
     } else if (k === 'u') {
       this.mode = 'updates';
+    } else if (k === 'p') {
+      this.mode = 'providers';
     }
     // Enable/disable lives ONLY under [a] Accounts now (with rename/delete/login) —
     // one home for every account mutation, instead of a duplicate top-level toggle.
@@ -582,6 +585,140 @@ export class TUI {
     }
   }
 
+  _keyProviders(k) {
+    if (k === 'a') {
+      this._providerAddStep('name');
+    } else if (k === 'd') {
+      this._startProviderSelection('delete');
+    } else if (k === 't') {
+      this._startProviderSelection('toggle');
+    } else if (k === 'esc' || k === 'q') {
+      this.mode = 'normal';
+    }
+  }
+
+  // Multi-step input for adding a provider. Steps: name → type → secret name.
+  _providerAddStep(step, prev) {
+    if (step === 'name') {
+      this.mode = 'input';
+      this.inputPrompt = 'Provider display name (e.g. glm-ahmed)';
+      this.inputBuf = '';
+      this.inputSensitive = false;
+      this.inputCb = value => {
+        const name = String(value || '').trim();
+        if (!name) { this.mode = 'providers'; return; }
+        if (this.am.accounts.some(a => a.name === name)) {
+          this._addLog(`Account "${name}" already exists`); this.mode = 'providers'; return;
+        }
+        this._providerAddStep('type', { name });
+      };
+    } else if (step === 'type') {
+      this.mode = 'input';
+      this.inputPrompt = `Type for ${prev.name} (zai or kimi)`;
+      this.inputBuf = 'zai';
+      this.inputSensitive = false;
+      this.inputCb = value => {
+        const provider = String(value || '').trim().toLowerCase();
+        if (provider !== 'zai' && provider !== 'kimi') { this._addLog('Type must be zai or kimi'); this.mode = 'providers'; return; }
+        this._providerAddStep('secret', { ...prev, provider });
+      };
+    } else if (step === 'secret') {
+      this.mode = 'input';
+      this.inputPrompt = `${prev.name}: GCP secret name OR paste API key directly`;
+      this.inputBuf = '';
+      this.inputSensitive = false;
+      this.inputCb = async value => {
+        const input = String(value || '').trim();
+        if (!input) { this.mode = 'providers'; return; }
+        // Heuristic: a GCP secret name is uppercase/dashes/underscores and short.
+        // An API key is long and contains dots/mixed-case/alphanumeric.
+        const looksLikeSecretName = /^[A-Z][A-Z0-9_-]{2,60}$/.test(input) && !input.includes('.');
+        if (looksLikeSecretName) {
+          await this._doAddProvider({ ...prev, secretName: input });
+        } else {
+          // Direct key paste — store in config (0600, same protection as OAuth tokens).
+          await this._doAddProvider({ ...prev, apiKey: input });
+        }
+      };
+    }
+  }
+
+  async _doAddProvider({ name, provider, secretName, apiKey }) {
+    this.mode = 'providers';
+    const isDirect = !secretName && apiKey;
+    if (secretName) this._addLog(`Resolving secret "${secretName}" from GCP…`);
+    else this._addLog(`Adding "${name}" with direct API key…`);
+    this.render();
+    try {
+      let token = null;
+      if (secretName) {
+        const { resolveSecret } = await import('../secret-resolver.js');
+        token = await resolveSecret(secretName);
+        if (!token) {
+          this._addLog(`✗ Secret "${secretName}" not found in GCP — create it first: gcloud secrets create ${secretName} --data-file=-`);
+          return;
+        }
+      } else {
+        token = apiKey;
+      }
+      // Add to config (persistence) and activate immediately.
+      const { atomicConfigUpdate } = await import('../config.js');
+      await atomicConfigUpdate(cfg => {
+        if (!Array.isArray(cfg.providers)) cfg.providers = [];
+        const entry = { name, provider };
+        if (secretName) entry.secretName = secretName;
+        else entry.apiKey = apiKey;
+        cfg.providers.push(entry);
+      });
+      // Activate in the running process.
+      this.am.loadConfigProviders([{ name, provider, secretName, token }]);
+      const a = this.am.accounts.find(a => a.name === name);
+      if (a && secretName) a.secretName = secretName;
+      this._addLog(`✓ Added "${name}" (${provider})${secretName ? ` — GCP secret "${secretName}"` : ' — direct key'}`);
+    } catch (err) {
+      this._addLog(`✗ Failed to add provider: ${err.message}`);
+    }
+  }
+
+  _startProviderSelection(action) {
+    const providers = this.am.accounts.filter(a => a.type === 'provider');
+    if (!providers.length) { this._addLog('No providers to manage'); return; }
+    this._selOptions = providers.map(a => a.index);
+    this._selLabels = providers.map(a => {
+      const enabled = a.enabled !== false;
+      const tag = a.configSourced ? ' (GCP)' : ' (header)';
+      const secret = a.secretName ? ` [${a.secretName}]` : '';
+      return `${a.name}${tag}${secret}${enabled ? '' : ' ✕'}`;
+    });
+    this.selAction = action;
+    this.mode = 'select';
+  }
+
+  _renderProviders(buf, width) {
+    const providers = this.am.accounts.filter(a => a.type === 'provider');
+    buf.push(`${bold('Providers (GLM / Kimi)')}  ${dim('— managed via GCP Secret Manager')}`);
+    buf.push('');
+    if (!providers.length) {
+      buf.push(dim('  No providers configured.'));
+      buf.push('');
+      buf.push(dim('  Press ') + bold('a') + dim(' to add one. You\'ll need:'));
+      buf.push(dim('    1. An API key from z.ai (GLM) or Moonshot (Kimi)'));
+      buf.push(dim('    2. The key stored in GCP: ') + 'gcloud secrets create <name> --data-file=-');
+      buf.push(dim('    3. The GCP secret name (e.g. RESTRICTED_MAXPOOL_ZAI_NEW)'));
+      return;
+    }
+    for (const a of providers) {
+      const enabled = a.enabled !== false;
+      const tag = a.configSourced ? dim(' (GCP)') : dim(' (header)');
+      const secret = a.secretName ? dim(` [${a.secretName}]`) : '';
+      const status = a.status === 'error' ? red(a.lastError || 'error')
+        : enabled ? green('active') : red('✕');
+      const q = a.quota;
+      const ses = q?.providerSes != null ? ` Ses ${Math.round(q.providerSes * 100)}%` : '';
+      buf.push(`  ${enabled ? '' : dim('')} ${bold(a.name)} ${a.provider}${tag}${secret} ${status}${ses}`);
+    }
+  }
+
   _keyRouting(k) {
     if (k === 'a') {
       this._confirm(
@@ -641,6 +778,51 @@ export class TUI {
   }
 
   _keySelect(k) {
+    // Provider selection (from the providers screen) uses its own option list.
+    if (this._selOptions && (this.selAction === 'delete' || this.selAction === 'toggle')
+      && this.mode === 'select' && this.am.accounts[this._selOptions[0]]?.type === 'provider') {
+      const opts = this._selOptions;
+      const position = Math.max(0, opts.indexOf(this.selIdx));
+      if (k === 'up' || k === 'k') this.selIdx = opts[Math.max(0, position - 1)] ?? this.selIdx;
+      else if (k === 'down' || k === 'j') this.selIdx = opts[Math.min(opts.length - 1, position + 1)] ?? this.selIdx;
+      else if (k === 'enter') {
+        const account = this.am.accounts[this.selIdx];
+        if (!account) { this.mode = 'providers'; return; }
+        if (this.selAction === 'toggle') {
+          const enable = !account.enabled;
+          this._confirm(
+            `${enable ? 'Enable' : 'Disable'} "${account.name}"?`,
+            enable ? 'Allow this provider to receive requests again.' : 'Stop routing to it. Active requests continue.',
+            () => { this._doToggle(this.selIdx, enable); this.mode = 'providers'; },
+          );
+        } else if (this.selAction === 'delete') {
+          this._confirm(
+            `Delete provider "${account.name}"?`,
+            account.configSourced
+              ? 'Removes it from config and GCP reference. The GCP secret itself stays — delete it separately if needed.'
+              : 'Removes the runtime provider. It returns on the next request that sends its token.',
+            async () => {
+              if (account.configSourced) {
+                try {
+                  const { atomicConfigUpdate } = await import('../config.js');
+                  await atomicConfigUpdate(cfg => {
+                    if (Array.isArray(cfg.providers)) {
+                      cfg.providers = cfg.providers.filter(p => p.name !== account.name);
+                    }
+                  });
+                } catch (err) { this._addLog(`Config update failed: ${err.message}`); }
+              }
+              this.am.removeAccount(this.selIdx);
+              this._addLog(`Deleted provider "${account.name}"`);
+              this.mode = 'providers';
+            },
+          );
+        }
+      }
+      else if (k === 'esc' || k === 'q') { this.mode = 'providers'; }
+      return;
+    }
+
     const selectable = this._selectableIndexes(this.selAction);
     const position = Math.max(0, selectable.indexOf(this.selIdx));
     if (k === 'up' || k === 'k') this.selIdx = selectable[Math.max(0, position - 1)] ?? this.selIdx;
@@ -1283,6 +1465,13 @@ export class TUI {
     // Pad to fill
     while (lines.length < H - footerH) lines.push('');
 
+    // Providers panel — shown when the user is on the providers screen
+    if (this.mode === 'providers' || this.mode === 'select') {
+      const pLines = [];
+      this._renderProviders(pLines, W);
+      lines.push(...pLines);
+    }
+
     // ── Footer
     lines.push(' ' + dim('─'.repeat(W - 2)));
     if (this.mode === 'confirm') lines.push(` ${this.confirmDetail}`);
@@ -1405,7 +1594,12 @@ export class TUI {
 
     let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2)}`;
+      // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
+      // both render as an empty bar. Say which, so a healthy uncapped account
+      // (privacy@gomokka.com, measured 2026-08-06) doesn't read as broken.
+      line += (r2 == null && q.weeklyAbsent)
+        ? `  ${l2} ${emptyBar('none', bw)}`
+        : `  ${l2} ${bar(r2, bw, t2)}`;
     }
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
@@ -1481,7 +1675,10 @@ export class TUI {
     let sesCell, wkCell, note = '';
     if (q.providerSes != null || q.providerWk != null) {
       sesCell = q.providerSes != null ? bar(q.providerSes, bw, q.providerSesReset) : emptyBar('—', bw);
-      wkCell = q.providerWk != null ? bar(q.providerWk, bw, q.providerWkReset) : emptyBar('—', bw);
+      // z.ai's `max` plan genuinely has NO weekly token window (measured 2026-08-06:
+      // one TOKENS_LIMIT, unit 3 = 5h). "none" says that; "—" read as a broken probe.
+      wkCell = q.providerWk != null ? bar(q.providerWk, bw, q.providerWkReset)
+        : emptyBar(q.weeklyAbsent ? 'none' : '—', bw);
       note = this._probeHealthNote(a);
     } else if (q.providerQuotaSource === 'console-only') {
       sesCell = emptyBar('n/a', bw);
@@ -1527,13 +1724,15 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop`;
+        return ` ${bold('a')} Accounts  ${bold('p')} Providers  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop`;
       case 'updates': {
         const state = this._autoUpdateOn() ? green('on') : dim('off');
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
       }
       case 'accounts':
         return ` ${bold('l')} Login/re-auth (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+      case 'providers':
+        return ` ${bold('a')} Add provider  ${bold('d')} Delete  ${bold('t')} Enable/disable  ${bold('Esc')} Back`;
       case 'routing': {
         // Show the CURRENT cross-provider policy inline so pressing f visibly changes it
         // right here at the footer (the policy also renders in the header, far from the

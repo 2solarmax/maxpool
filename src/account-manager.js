@@ -50,6 +50,10 @@ function emptyQuota() {
     // { fable:{utilization,resetAt,severity,isActive}, opus:{...}, sonnet:{...} }.
     scopedWeekly: {},
     unifiedStatus: null,   // allowed | allowed_warning | rejected
+    // TRUE when a SUCCESSFUL probe reported no weekly cap for this account — i.e.
+    // "this plan has no weekly limit", NOT "we couldn't read one". Without it both
+    // states render as an empty bar and a healthy account reads as broken.
+    weeklyAbsent: false,
     resetsAt: null,
     // Provider (z.ai / Kimi) quota — kept SEPARATE from unified* so a provider
     // reading never leaks into the OAuth quota gates (_isAvailable / _weeklyRawState
@@ -1396,6 +1400,41 @@ export class AccountManager {
     return { cause: 'unavailable', retryAt: null, queueable: false };
   }
 
+  /**
+   * Why is every Claude account unavailable RIGHT NOW? Counts the per-account causes
+   * the retry oracle already computes, so the 429 can name the real one.
+   *
+   * "All N accounts are at their limit" was wrong whenever the true cause was a short
+   * NETWORK cooldown (5s each, applied on a connection drop): the user reads a quota
+   * problem, waits, and considers adding accounts — when the fleet is actually fine and
+   * recovers in seconds. Returns { total, quota, transient, network, dominant }.
+   */
+  unavailabilityCensus(model = null) {
+    const QUOTA = new Set(['exhausted', 'weekly_exhausted', 'session_limit', 'token_limit', 'request_limit', 'rate_limited']);
+    const TRANSIENT = new Set(['cooldown', 'upstream_failure', 'concurrency_cap', 'weekly_critical']);
+    const c = { total: 0, quota: 0, transient: 0, network: 0, disabled: 0, error: 0, other: 0 };
+    for (const a of this.accounts) {
+      if (a.type === 'provider') continue;
+      c.total++;
+      const cause = this._retryInfo(a, model)?.cause || 'unavailable';
+      if (cause === 'disabled') c.disabled++;
+      else if (cause === 'error') c.error++;
+      else if (QUOTA.has(cause)) c.quota++;
+      else if (TRANSIENT.has(cause)) {
+        c.transient++;
+        // A cooldown whose window matches the NETWORK cooldown is a connectivity blip,
+        // not congestion — the distinction the user's report was about.
+        if (cause === 'cooldown' && a.cooldownUntil
+          && (a.cooldownUntil - Date.now()) <= this.scheduler.networkCooldownMs) c.network++;
+      } else c.other++;
+    }
+    const eligible = c.total - c.disabled - c.error;
+    c.dominant = eligible <= 0 ? 'none'
+      : c.quota >= Math.max(1, Math.ceil(eligible / 2)) ? 'quota'
+        : c.transient > 0 ? 'transient' : 'other';
+    return c;
+  }
+
   // The soonest active short-term (non-weekly) blocker for an account, or null if
   // none is active. Ordered most-specific-first; each entry is a {cause, retryAt,
   // queueable} the retry oracle can hold on. Kept separate from the weekly state
@@ -2212,6 +2251,11 @@ export class AccountManager {
       if (usage.sevenDay.utilization != null) q.unified7d = clamp01(usage.sevenDay.utilization);
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
+    // Only a SUCCESSFUL probe carrying the flag speaks to this. A header-driven update
+    // can't see the limits[] array, and a FAILED read knows nothing about the account's
+    // caps — either one claiming "uncapped" would mislabel a capped account as having no
+    // weekly limit, which is the exact wrong direction (it reads as free capacity).
+    if (!usage.error && usage.weeklyAbsent !== undefined) q.weeklyAbsent = Boolean(usage.weeklyAbsent);
     // Per-model weekly sub-limits (Fable, Opus, ...). Replace wholesale with the
     // fresh probe set so a family that dropped out of the response doesn't linger
     // stale; expiry on reset is a backstop for the between-probe window. EXCEPTION:
@@ -2320,11 +2364,16 @@ export class AccountManager {
     if (usage.wk) {
       if (usage.wk.utilization != null) q.providerWk = clamp01(usage.wk.utilization);
       if (usage.wk.resetAt != null) q.providerWkReset = usage.wk.resetAt;
+      q.weeklyAbsent = false;
     } else {
       // Weekly window absent from this plan/response — clear so a stale weekly
-      // reading doesn't linger after a plan/window change.
+      // reading doesn't linger after a plan/window change. A SUCCESSFUL poll that
+      // carries no weekly is positive knowledge that the plan has none: measured
+      // 2026-08-06, z.ai `max` returns exactly one TOKENS_LIMIT (unit 3 = the 5h
+      // session) and no unit-6 weekly, so GLM's blank Wk is correct, not a gap.
       q.providerWk = null;
       q.providerWkReset = null;
+      q.weeklyAbsent = true;
     }
     q.lastProbeOkAt = Date.now();
   }
@@ -2773,6 +2822,8 @@ export class AccountManager {
       modelMap: acctData.modelMap || null,
       stripBetaHeaders: Boolean(acctData.stripBetaHeaders),
       runtime: Boolean(acctData.runtime),
+      configSourced: Boolean(acctData.configSourced),
+      secretName: acctData.secretName || null,
       enabled: acctData.enabled !== false,
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
@@ -2827,6 +2878,8 @@ export class AccountManager {
     account.modelMap = acctData.modelMap || account.modelMap;
     account.stripBetaHeaders = Boolean(acctData.stripBetaHeaders);
     account.runtime = true;
+    if (acctData.configSourced !== undefined) account.configSourced = acctData.configSourced;
+    if (acctData.secretName !== undefined) account.secretName = acctData.secretName;
     // Restore path carries an explicit enabled (persisted disable); honor it. The `cc
     // all` header path (prepareRuntimeProviders) omits enabled, so a re-sent token
     // NEVER silently re-enables a provider the user benched in the TUI.
@@ -2851,7 +2904,7 @@ export class AccountManager {
    */
   exportRuntimeProviders() {
     return this.accounts
-      .filter(a => a.runtime && a.type === 'provider' && a.credential)
+      .filter(a => a.runtime && a.type === 'provider' && a.credential && !a.configSourced)
       .map(a => ({
         name: a.name,
         type: a.type,
@@ -2877,6 +2930,10 @@ export class AccountManager {
    * live `cc all` request refreshes the token before routing (prepareRuntimeProviders
    * runs ahead of account selection), so a stale restored token never serves a
    * request. Idempotent — upsertRuntimeAccount matches by name.
+   *
+   * Config-sourced providers (resolved from GCP Secret Manager at startup) are
+   * EXCLUDED — their source of truth is config + GCP, not state.json, so persisting
+   * their token to disk would duplicate the secret and survive a GCP deletion.
    */
   restoreRuntimeProviders(list) {
     if (!Array.isArray(list)) return;
@@ -2884,6 +2941,69 @@ export class AccountManager {
       if (!p || !p.name || !(p.authToken || p.credential)) continue;
       this.upsertRuntimeAccount({ ...p, authToken: p.authToken || p.credential });
     }
+  }
+
+  /**
+   * Load config-sourced provider accounts — resolved from GCP Secret Manager at
+   * startup, NOT from per-request headers. Each config entry is { name, provider,
+   * secretName, upstream?, priority?, modelMap? }. The secret is resolved by the
+   * caller (index.js) and passed as `token`; if null the provider is created but
+   * marked error so the TUI shows WHY it's broken.
+   *
+   * These are marked configSourced so they're excluded from state.json persistence
+   * (their source of truth is config + GCP, not disk) and so the header path can
+   * dedup against them (same token → skip creating a duplicate runtime provider).
+   */
+  loadConfigProviders(entries) {
+    if (!Array.isArray(entries)) return;
+    // Remove existing config-sourced providers that are no longer in the config
+    // (handles a config edit that removes an entry).
+    const wantedNames = new Set(entries.map(e => e.name).filter(Boolean));
+    for (const a of this.accounts) {
+      if (a.configSourced && !wantedNames.has(a.name)) {
+        const idx = this.accounts.indexOf(a);
+        if (idx >= 0 && this.accounts[idx].inFlight === 0) this.removeAccount(idx);
+      }
+    }
+    for (const entry of entries) {
+      if (!entry || !entry.name || !entry.provider) continue;
+      this.upsertRuntimeAccount({
+        name: entry.name,
+        type: 'provider',
+        provider: entry.provider,
+        authToken: entry.token || null,
+        upstream: entry.upstream || (entry.provider === 'kimi'
+          ? 'https://api.kimi.com/coding'
+          : 'https://api.z.ai/api/anthropic'),
+        authHeader: 'authorization',
+        profiles: ['all'],
+        priority: Number.isFinite(entry.priority) ? entry.priority : 10,
+        modelMap: entry.modelMap,
+        model: entry.model,
+        stripBetaHeaders: true,
+        configSourced: true,
+      });
+      if (!entry.token) {
+        const a = this.accounts.find(a => a.name === entry.name);
+        if (a) { a.status = 'error'; a.lastError = 'secret-unresolved'; }
+      }
+    }
+  }
+
+  /**
+   * Return the config-sourced provider definitions (name + provider + secretName)
+   * for the TUI and for config serialization. Tokens are NEVER included.
+   */
+  configProviderDefs() {
+    return this.accounts
+      .filter(a => a.configSourced && a.type === 'provider')
+      .map(a => ({
+        name: a.name,
+        provider: a.provider,
+        secretName: a.secretName || null,
+        upstream: a.upstream,
+        priority: a.priority,
+      }));
   }
 
   /**

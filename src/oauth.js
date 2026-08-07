@@ -267,10 +267,18 @@ export async function fetchUsage(accessToken) {
       }
     }
 
+    const sevenDay = limitsWeeklyAll || normalizeUsageBucket(data?.seven_day);
     return {
       fiveHour: limitsSession || normalizeUsageBucket(data?.five_hour),
-      sevenDay: limitsWeeklyAll || normalizeUsageBucket(data?.seven_day),
+      sevenDay,
       scopedWeekly,
+      // A SUCCESSFUL read that carries no weekly bucket is positive knowledge: this
+      // account HAS no weekly cap, as opposed to "we haven't managed to read one yet".
+      // Both render as a blank bar otherwise, so a perfectly healthy account looks
+      // broken. Measured 2026-08-06: privacy@gomokka.com returns limits=[session,
+      // weekly_scoped(inactive)] and `seven_day: null`, while every other account
+      // returns a `weekly_all` — it is genuinely uncapped, not unread.
+      weeklyAbsent: sevenDay == null || sevenDay.utilization == null,
     };
   } catch (err) {
     return { error: err.message || String(err), status: null };

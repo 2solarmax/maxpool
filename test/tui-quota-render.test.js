@@ -219,14 +219,19 @@ test('a z.ai provider account renders real Ses/Wk bars from provider fields', ()
   assert.match(line, /61%/);
 });
 
-test('a z.ai account with no weekly (z.ai omits it) shows real Ses + an honest "—" Wk placeholder', () => {
+test('a z.ai account with no weekly shows real Ses + an honest "none" Wk placeholder', () => {
+  // Updated 2026-08-06: this used to assert "—", which is also what an UNREAD/failed
+  // probe renders — so a healthy uncapped plan was indistinguishable from a broken
+  // one, and read as broken. Measured against the live z.ai `max` plan: the monitor
+  // endpoint returns exactly one TOKENS_LIMIT (unit 3 = the 5h session) and no unit-6
+  // weekly, so "none" is the accurate word. The real invariants below are unchanged.
   const am = providerAM();
   am.applyProviderUsage(1, { source: 'zai', ses: { utilization: 0.07, resetAt: Date.now() + 3600_000 } });
   const tui = new TUI({ accountManager: am });
   const line = strip(tui._renderAcct(1, 11, true));
   assert.match(line, /Ses/);
   assert.match(line, /7%/);
-  assert.match(line, /Wk\s+—/, 'weekly shows an aligned "—" placeholder, not a fabricated data bar');
+  assert.match(line, /Wk\s+none/, 'weekly says the plan HAS none — an aligned placeholder, not a fabricated bar');
   assert.doesNotMatch(line, /Wk\s+\d+%/, 'never a fake Wk percentage');
 });
 
