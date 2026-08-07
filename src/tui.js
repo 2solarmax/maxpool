@@ -585,6 +585,18 @@ export class TUI {
     }
   }
 
+  // Derive a human-readable account name from a GCP secret name.
+  // RESTRICTED_AL_MAXPOOL_ZAI → glm al  |  ZAI_API_KEY → glm primary
+  // RESTRICTED_MAX_KIMI_API_KEY → kimi max  |  KIMI_API_KEY → kimi primary
+  static deriveProviderName(provider, secretName) {
+    const provLabel = provider === 'kimi' ? 'kimi' : 'glm';
+    const s = String(secretName || '').toUpperCase();
+    // Try to extract a user from RESTRICTED_<USER>_...
+    const m = /^RESTRICTED_([A-Z]+)_/.exec(s);
+    const user = m ? m[1].toLowerCase() : null;
+    return user ? `${provLabel} ${user}` : `${provLabel} primary`;
+  }
+
   _keyProviders(k) {
     if (k === 'a') {
       this._providerAddStep('name');
@@ -620,9 +632,12 @@ export class TUI {
       this.inputCb = value => {
         const provider = String(value || '').trim().toLowerCase();
         if (provider !== 'zai' && provider !== 'kimi') { this._addLog('Type must be zai or kimi'); this.mode = 'providers'; return; }
-        this._providerAddStep('secret', { ...prev, provider });
+        // Suggest a name derived from the provider type
+        const suggested = provider === 'kimi' ? 'kimi' : 'glm';
+        this._providerAddStep('secret', { ...prev, provider, suggestedName: suggested });
       };
     } else if (step === 'secret') {
+      const suggested = TUI.deriveProviderName(prev.provider, '');
       this.mode = 'input';
       this.inputPrompt = `${prev.name}: GCP secret name OR paste API key directly`;
       this.inputBuf = '';

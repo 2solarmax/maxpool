@@ -2965,8 +2965,26 @@ export class AccountManager {
         if (idx >= 0 && this.accounts[idx].inFlight === 0) this.removeAccount(idx);
       }
     }
+    // Remove state-restored (header-based) providers whose token is now served by a
+    // config provider — otherwise the same key shows up twice (once as the old
+    // "glm-fallback"/"kimi-fallback" from state.json, once as the config provider).
+    const configTokens = new Set(
+      entries.map(e => e.token).filter(Boolean),
+    );
+    for (const a of [...this.accounts]) {
+      if (!a.configSourced && a.type === 'provider' && a.credential && configTokens.has(a.credential)) {
+        const idx = this.accounts.indexOf(a);
+        if (idx >= 0 && this.accounts[idx].inFlight === 0) this.removeAccount(idx);
+      }
+    }
     for (const entry of entries) {
       if (!entry || !entry.name || !entry.provider) continue;
+      // Default model maps — match what `cc all` sends via headers. Users can override
+      // per-provider in config. Without these z.ai returns [1210 Invalid API parameter].
+      const defaultModelMap = entry.provider === 'zai'
+        ? { opus: 'glm-5.2', sonnet: 'glm-5.2', haiku: 'glm-5.1', default: 'glm-5.2' }
+        : null;
+      const defaultModel = entry.provider === 'kimi' ? 'kimi-k3' : null;
       this.upsertRuntimeAccount({
         name: entry.name,
         type: 'provider',
@@ -2978,8 +2996,8 @@ export class AccountManager {
         authHeader: 'authorization',
         profiles: ['all'],
         priority: Number.isFinite(entry.priority) ? entry.priority : 10,
-        modelMap: entry.modelMap,
-        model: entry.model,
+        modelMap: entry.modelMap || defaultModelMap,
+        model: entry.model || defaultModel,
         stripBetaHeaders: true,
         configSourced: true,
       });

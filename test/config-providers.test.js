@@ -148,3 +148,38 @@ test('a direct apiKey in config produces a working provider', () => {
   // Direct-key providers are also excluded from state.json (same as GCP ones).
   assert.equal(am.exportRuntimeProviders().length, 0);
 });
+
+test('config providers REMOVE state-restored header providers with the same token', () => {
+  // The exact duplicate scenario: state.json restored glm-fallback with token ABC,
+  // then config loads glm-primary with the SAME token ABC. The fallback must be gone.
+  const am = new AccountManager([], 0.90);
+  // Simulate state.json restore
+  am.upsertRuntimeAccount({
+    name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'ABC',
+    upstream: 'https://api.z.ai/api/anthropic',
+  });
+  assert.equal(am.accounts.filter(a => a.provider === 'zai').length, 1);
+  // Now config providers load (boot continues)
+  am.loadConfigProviders([
+    { name: 'glm-primary', provider: 'zai', token: 'ABC' },
+  ]);
+  const zai = am.accounts.filter(a => a.provider === 'zai');
+  assert.equal(zai.length, 1, 'no duplicate — the state-restored fallback is gone');
+  assert.equal(zai[0].name, 'glm-primary');
+  assert.equal(zai[0].configSourced, true);
+});
+
+test('a DIFFERENT token (second GLM account) is NOT removed — load balancing works', () => {
+  const am = new AccountManager([], 0.90);
+  // Ahmed's GLM in state.json
+  am.upsertRuntimeAccount({
+    name: 'glm-ahmed', type: 'provider', provider: 'zai', authToken: 'AHMED_KEY',
+    upstream: 'https://api.z.ai/api/anthropic',
+  });
+  // Max's GLM in config
+  am.loadConfigProviders([
+    { name: 'glm-max', provider: 'zai', token: 'MAX_KEY' },
+  ]);
+  const zai = am.accounts.filter(a => a.provider === 'zai');
+  assert.equal(zai.length, 2, 'two different keys = two providers, load balanced');
+});
