@@ -2970,7 +2970,10 @@ export class AccountManager {
     // Remove existing config-sourced providers that are no longer in the config
     // (handles a config edit that removes an entry).
     const wantedNames = new Set(entries.map(e => e.name).filter(Boolean));
-    for (const a of this.accounts) {
+    // Iterate a COPY: removeAccount splices this.accounts, and splicing the array
+    // being iterated makes the loop skip the element after each removal — so
+    // dropping 2 of 3 config providers left one phantom behind.
+    for (const a of [...this.accounts]) {
       if (a.configSourced && !wantedNames.has(a.name)) {
         const idx = this.accounts.indexOf(a);
         if (idx >= 0 && this.accounts[idx].inFlight === 0) this.removeAccount(idx);

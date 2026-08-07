@@ -199,3 +199,44 @@ test('a provider-only fleet is a VALID config (the teammate-onboarding case)', (
   const lease = am.acquireAccount({ profile: 'all' }, new Set());
   assert.ok(lease?.account, 'and it can serve a request with no Claude account at all');
 });
+
+// ── judge findings: dead code, splice-while-iterating, quota collisions ───────
+
+import { TUI } from '../src/tui.js';
+
+test('deriveProviderName is WIRED and derives a name from the secret', () => {
+  // Was dead code: computed into a discarded variable and called only with '', so the
+  // RESTRICTED_<USER>_ branch was structurally unreachable. 634 tests passed with the
+  // whole body replaced by a constant.
+  assert.equal(TUI.deriveProviderName('zai', 'RESTRICTED_AL_MAXPOOL_ZAI'), 'glm al');
+  assert.equal(TUI.deriveProviderName('kimi', 'RESTRICTED_MAX_MAXPOOL_KIMI'), 'kimi max');
+  assert.equal(TUI.deriveProviderName('zai', 'ZAI_API_KEY'), 'glm primary');
+  assert.equal(TUI.deriveProviderName('kimi', ''), 'kimi primary');
+  assert.equal(TUI.deriveProviderName('zai', null), 'glm primary');
+});
+
+test('removing MULTIPLE config providers at once leaves no phantom', () => {
+  // The removal loop spliced the array it was iterating, so each removal skipped the
+  // next element: dropping 2 of 3 left 1 behind, still routable but absent from config.
+  const am = new AccountManager([], 0.90);
+  am.loadConfigProviders([
+    { name: 'glm a', provider: 'zai', token: 'ka' },
+    { name: 'glm b', provider: 'zai', token: 'kb' },
+    { name: 'glm c', provider: 'zai', token: 'kc' },
+  ]);
+  assert.equal(am.accounts.length, 3);
+  // Config edited down to one.
+  am.loadConfigProviders([{ name: 'glm c', provider: 'zai', token: 'kc' }]);
+  assert.deepEqual(am.accounts.map(a => a.name), ['glm c'], 'both removed, none skipped');
+});
+
+test('removing ALL config providers leaves none behind', () => {
+  const am = new AccountManager([], 0.90);
+  am.loadConfigProviders([
+    { name: 'p1', provider: 'zai', token: '1' },
+    { name: 'p2', provider: 'zai', token: '2' },
+    { name: 'p3', provider: 'kimi', token: '3' },
+  ]);
+  am.loadConfigProviders([]);
+  assert.equal(am.accounts.length, 0);
+});

@@ -1226,7 +1226,7 @@ test('acquireAccount reports migratedFromName only when the session actually mov
 
 test('revertSessionBinding + pinnedAccountName route a request back to the issuer', () => {
   const am = manager(3);
-  const a1 = am.accounts[0];
+  const _a1 = am.accounts[0];
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   assert.equal(first.account.name, 'a1');
   am.releaseAccount(first, { success: true, status: 200 });
@@ -1238,7 +1238,7 @@ test('revertSessionBinding + pinnedAccountName route a request back to the issue
 
 test('pinnedAccountName falls through to normal selection when the issuer is unavailable', () => {
   const am = manager(2);
-  const a1 = am.accounts[0], a2 = am.accounts[1];
+  const _a1 = am.accounts[0], _a2 = am.accounts[1];
   am.markRateLimited(0, 60); // issuer a1 is down
   const lease = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, pinnedAccountName: 'a1' });
   assert.equal(lease.account.name, 'a2', 'a down issuer never strands the request — falls through');

@@ -289,13 +289,22 @@ export async function fetchUsage(accessToken) {
 // (account.upstream is the Anthropic-compat endpoint). Zero-spend read.
 const ZAI_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
 
-/** Classify one z.ai `limits[]` entry into a Ses (5h) or Wk (weekly) TOKEN window.
- *  Only `TOKENS_LIMIT` maps to the quota bars; `TIME_LIMIT` is a tool-call cap
- *  (web-search/reader counts) and is intentionally ignored. `unit` is z.ai's
- *  window enum (3 = 5-hour session, 6 = weekly); we fall back to reset-distance
- *  when the code is unfamiliar so a new plan tier still classifies sanely. */
+// z.ai reports a plan's consumption cap under DIFFERENT type names depending on the
+// plan: `TOKENS_LIMIT` on older coding plans, `CREDIT_LIMIT` on newer ones. Both are
+// the same thing for our purposes — "how much of your allowance is used" — and both
+// carry the same `percentage` + `nextResetTime` + `unit` fields. Accepting only
+// TOKENS_LIMIT left every CREDIT_LIMIT account with no quota reading at all, so the
+// TUI showed "probing" forever even though the poll succeeded (measured 2026-08-07 on
+// a newly-provisioned `max` plan returning CREDIT_LIMIT unit 3 + unit 6).
+const ZAI_CONSUMPTION_TYPES = new Set(['TOKENS_LIMIT', 'CREDIT_LIMIT']);
+
+/** Classify one z.ai `limits[]` entry into a Ses (5h) or Wk (weekly) consumption
+ *  window. `TIME_LIMIT` is a tool-call cap (web-search/reader counts) and is
+ *  intentionally ignored. `unit` is z.ai's window enum (3 = 5-hour session,
+ *  6 = weekly); we fall back to reset-distance when the code is unfamiliar so a new
+ *  plan tier still classifies sanely. */
 export function classifyZaiLimit(l, now = Date.now()) {
-  if (!l || l.type !== 'TOKENS_LIMIT') return null;
+  if (!l || !ZAI_CONSUMPTION_TYPES.has(l.type)) return null;
   const reset = Number(l.nextResetTime);
   const resetAt = Number.isFinite(reset) && reset > 0 ? reset : null;
   const pct = typeof l.percentage === 'number' ? l.percentage : parseFloat(l.percentage);
@@ -303,7 +312,13 @@ export function classifyZaiLimit(l, now = Date.now()) {
   let bucket;
   if (l.unit === 3) bucket = 'ses';
   else if (l.unit === 6) bucket = 'wk';
-  else if (resetAt) bucket = (resetAt - now) <= 12 * 60 * 60 * 1000 ? 'ses' : 'wk';
+  else if (l.type === 'CREDIT_LIMIT') {
+    // The reset-distance fallback is NOT extended to CREDIT_LIMIT. `unit: 5` is what
+    // z.ai uses for the monthly TOOL-call cap; if it ever renames that cap to
+    // CREDIT_LIMIT the fallback would render a web-search allowance as the weekly
+    // model-quota bar. Only the two window enums we have actually observed count.
+    return null;
+  } else if (resetAt) bucket = (resetAt - now) <= 12 * 60 * 60 * 1000 ? 'ses' : 'wk';
   else bucket = 'ses';
   return { bucket, utilization, resetAt };
 }
@@ -406,11 +421,22 @@ export async function fetchProviderUsage(account) {
     }
     const now = Date.now();
     let ses = null, wk = null;
+    // Two entries can land in the SAME bucket (e.g. a plan reporting both a
+    // TOKENS_LIMIT and a CREDIT_LIMIT for its 5h window). Keep the HIGHER utilization:
+    // last-wins was silently optimistic — 95% followed by 4% reported 4%, i.e. an
+    // account at its cap rendered as nearly empty.
+    const keepWorse = (cur, next) => {
+      if (!cur) return next;
+      if (next.utilization == null) return cur;
+      if (cur.utilization == null) return next;
+      return next.utilization > cur.utilization ? next : cur;
+    };
     for (const l of (Array.isArray(data.data.limits) ? data.data.limits : [])) {
       const c = classifyZaiLimit(l, now);
       if (!c) continue;
-      if (c.bucket === 'ses') ses = { utilization: c.utilization, resetAt: c.resetAt };
-      else if (c.bucket === 'wk') wk = { utilization: c.utilization, resetAt: c.resetAt };
+      const entry = { utilization: c.utilization, resetAt: c.resetAt };
+      if (c.bucket === 'ses') ses = keepWorse(ses, entry);
+      else if (c.bucket === 'wk') wk = keepWorse(wk, entry);
     }
     return { ses, wk, level: data.data.level || null, source: 'zai' };
   } catch (err) {

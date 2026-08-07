@@ -126,3 +126,11 @@ export async function runReloadBaton({
   log('reload: cutover complete; new worker is primary');
   return RELOAD_SWAPPED;
 }
+
+// Sent to the NEW primary worker once the OLD worker has actually exited. Node calls
+// libuv's uv_tty_reset_mode() on process exit, which restores the termios the dying
+// process saved when IT first enabled raw mode — clobbering the live worker's terminal
+// back to canonical (cooked) mode. `process.stdin.isRaw` still reads true, so nothing
+// in-process can detect it; the TUI keeps rendering while the kernel line-buffers, so
+// every keystroke (r / q / p) is swallowed. Measured on a real pty 2026-08-07.
+export const MSG_TTY_REASSERT = 'tty-reassert';

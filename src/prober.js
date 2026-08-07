@@ -176,9 +176,18 @@ export class Prober {
       await this.am.ensureTokenFresh(account.index);
       let usage = await this._withTimeout(this.probeFn(account.credential));
       if (usage?.status === 401) {
-        // Token rejected — force a refresh and retry once.
-        await this.am.ensureTokenFresh(account.index, true);
-        usage = await this._withTimeout(this.probeFn(account.credential));
+        // Token rejected — force a refresh and retry once. NOT for a DISABLED account:
+        // `force` deliberately overrides the no-rotate guard in ensureTokenFresh (it
+        // exists for user-initiated re-auth), so forcing here would rotate the very
+        // single-use token that guard protects. Worse, it is GUARANTEED to fire for a
+        // disabled account: blocking the proactive refresh means the token always
+        // expires, which always 401s — moving the rotation from the controlled
+        // pre-expiry path into this error path. Accept the 401 and record it; the
+        // account refreshes normally the moment it is re-enabled.
+        if (account.enabled !== false) {
+          await this.am.ensureTokenFresh(account.index, true);
+          usage = await this._withTimeout(this.probeFn(account.credential));
+        }
       }
       if (usage == null) { // timed out
         this.am.recordProbeError?.(account.index, 'probe timed out', null);

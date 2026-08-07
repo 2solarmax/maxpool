@@ -599,7 +599,7 @@ export class TUI {
 
   _keyProviders(k) {
     if (k === 'a') {
-      this._providerAddStep('name');
+      this._providerAddStep('type');
     } else if (k === 'd') {
       this._startProviderSelection('delete');
     } else if (k === 't') {
@@ -609,35 +609,22 @@ export class TUI {
     }
   }
 
-  // Multi-step input for adding a provider. Steps: name → type → secret name.
-  _providerAddStep(step, prev) {
-    if (step === 'name') {
+  // Multi-step input for adding a provider. Steps: type → secret/key → name.
+  // Name LAST so it can be pre-filled from the secret (RESTRICTED_AL_MAXPOOL_ZAI →
+  // "glm al") instead of asking the user to invent one before they've said which
+  // account it is.
+  _providerAddStep(step, prev = {}) {
+    if (step === 'type') {
       this.mode = 'input';
-      this.inputPrompt = 'Provider display name (e.g. glm-ahmed)';
-      this.inputBuf = '';
-      this.inputSensitive = false;
-      this.inputCb = value => {
-        const name = String(value || '').trim();
-        if (!name) { this.mode = 'providers'; return; }
-        if (this.am.accounts.some(a => a.name === name)) {
-          this._addLog(`Account "${name}" already exists`); this.mode = 'providers'; return;
-        }
-        this._providerAddStep('type', { name });
-      };
-    } else if (step === 'type') {
-      this.mode = 'input';
-      this.inputPrompt = `Type for ${prev.name} (zai or kimi)`;
+      this.inputPrompt = 'Provider type (zai or kimi)';
       this.inputBuf = 'zai';
       this.inputSensitive = false;
       this.inputCb = value => {
         const provider = String(value || '').trim().toLowerCase();
         if (provider !== 'zai' && provider !== 'kimi') { this._addLog('Type must be zai or kimi'); this.mode = 'providers'; return; }
-        // Suggest a name derived from the provider type
-        const suggested = provider === 'kimi' ? 'kimi' : 'glm';
-        this._providerAddStep('secret', { ...prev, provider, suggestedName: suggested });
+        this._providerAddStep('secret', { ...prev, provider });
       };
     } else if (step === 'secret') {
-      const suggested = TUI.deriveProviderName(prev.provider, '');
       this.mode = 'input';
       this.inputPrompt = `${prev.name}: GCP secret name OR paste API key directly`;
       this.inputBuf = '';
@@ -648,19 +635,29 @@ export class TUI {
         // Heuristic: a GCP secret name is uppercase/dashes/underscores and short.
         // An API key is long and contains dots/mixed-case/alphanumeric.
         const looksLikeSecretName = /^[A-Z][A-Z0-9_-]{2,60}$/.test(input) && !input.includes('.');
-        if (looksLikeSecretName) {
-          await this._doAddProvider({ ...prev, secretName: input });
-        } else {
-          // Direct key paste — store in config (0600, same protection as OAuth tokens).
-          await this._doAddProvider({ ...prev, apiKey: input });
+        const keyed = looksLikeSecretName ? { secretName: input } : { apiKey: input };
+        // The name step is LAST so it can offer a default derived from the secret —
+        // `RESTRICTED_AL_MAXPOOL_ZAI` → `glm al`. Pre-filled and editable: press Enter
+        // to accept, or type over it.
+        this._providerAddStep('name', { ...prev, ...keyed });
+      };
+    } else if (step === 'name') {
+      this.mode = 'input';
+      this.inputPrompt = 'Name for this provider (Enter to accept)';
+      this.inputBuf = TUI.deriveProviderName(prev.provider, prev.secretName || '');
+      this.inputSensitive = false;
+      this.inputCb = async value => {
+        const name = String(value || '').trim() || TUI.deriveProviderName(prev.provider, prev.secretName || '');
+        if (this.am.accounts.some(a => a.name === name)) {
+          this._addLog(`Account "${name}" already exists`); this.mode = 'providers'; return;
         }
+        await this._doAddProvider({ ...prev, name });
       };
     }
   }
 
   async _doAddProvider({ name, provider, secretName, apiKey }) {
     this.mode = 'providers';
-    const isDirect = !secretName && apiKey;
     if (secretName) this._addLog(`Resolving secret "${secretName}" from GCP…`);
     else this._addLog(`Adding "${name}" with direct API key…`);
     this.render();
@@ -709,7 +706,7 @@ export class TUI {
     this.mode = 'select';
   }
 
-  _renderProviders(buf, width) {
+  _renderProviders(buf, _width) {
     const providers = this.am.accounts.filter(a => a.type === 'provider');
     buf.push(`${bold('Providers (GLM / Kimi)')}  ${dim('— managed via GCP Secret Manager')}`);
     buf.push('');

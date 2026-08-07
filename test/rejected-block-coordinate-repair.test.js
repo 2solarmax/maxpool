@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { __serverTest } from '../src/server.js';
 
 const { stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock } = __serverTest;
@@ -425,7 +424,9 @@ test('a body over the retry buffer gets its OWN reason and is NOT told to start 
   // MUT-F: this branch shipped with zero coverage. The user must learn the real cause
   // (too large to rewrite) and a remedy that does not contradict itself.
   const upstream = http.createServer((req, res) => {
-    let raw = ''; req.on('data', c => { raw += c; });
+    // The body must be CONSUMED for 'end' to fire — without a data listener the
+    // stream never flows and the response is never sent (the request just hangs).
+    req.resume();
     req.on('end', () => {
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',

@@ -37,6 +37,7 @@ import {
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
   MSG_LISTEN, MSG_RELEASE, MSG_TAKEOVER, MSG_PROBE_READY,
   MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
+  MSG_TTY_REASSERT,
 } from './reload-protocol.js';
 
 const args = process.argv.slice(2);
@@ -370,7 +371,14 @@ async function supervisorCommand() {
         // sent PRIMARY during the baton; re-assert the master-accept close.
         monitorAsActive(newWorker);
         closeMasterAccept().catch(() => {});
-        reapOldWorker(oldWorker);
+        // Tell the new primary to re-assert raw mode ONCE the old worker has actually
+        // exited — its exit resets the shared terminal out from under the new worker
+        // (see MSG_TTY_REASSERT). Driven off the real exit event, never a timer: with
+        // in-flight streams the old worker can linger, so a timed guess would leave the
+        // terminal working for a while and then die mid-session.
+        reapOldWorker(oldWorker, () => {
+          try { newWorker.send({ type: MSG_TTY_REASSERT }); } catch { /* worker gone */ }
+        });
         return;
       }
 
@@ -460,14 +468,21 @@ async function supervisorCommand() {
 
 // Drain + reap a released worker. The worker exits itself once its bounded
 // in-flight finishes; the supervisor SIGKILLs it if it outlives the drain cap.
-function reapOldWorker(worker) {
+function reapOldWorker(worker, onExited = () => {}) {
   if (!worker) return;
   // +30s grace over the worker's own RELOAD_DRAIN_MS hardCap so its clean exit(0)
   // (fired while its streaming socket keeps the loop alive) always wins the race —
   // SIGKILL only ever reaps a genuinely wedged worker, never cuts a live stream.
   const cap = RELOAD_DRAIN_MS + 30_000;
   let reaped = false;
-  const finish = () => { if (reaped) return; reaped = true; clearTimeout(timer); };
+  // `onExited` fires on BOTH paths (clean exit and SIGKILL): the terminal is clobbered
+  // by the exit itself, however that exit came about.
+  const finish = () => {
+    if (reaped) return;
+    reaped = true;
+    clearTimeout(timer);
+    try { onExited(); } catch { /* never let the callback break reaping */ }
+  };
   const timer = setTimeout(() => {
     if (reaped) return;
     console.error(`[Maxpool] Old worker outlived ${Math.ceil(cap / 1000)}s reload-drain cap; SIGKILL.`);
@@ -613,9 +628,7 @@ async function serverWorkerCommand() {
       const { resolveSecrets } = await import('./secret-resolver.js');
       // Split: GCP-sourced (secretName) vs direct (apiKey). Both produce a token
       // the same way — the resolution path is the only difference.
-      const gcpEntries = config.providers.filter(p => p.secretName);
-      const directEntries = config.providers.filter(p => p.apiKey && !p.secretName);
-      const secretNames = gcpEntries.map(p => p.secretName);
+      const secretNames = config.providers.filter(p => p.secretName).map(p => p.secretName);
       const resolved = await resolveSecrets(secretNames);
       const entries = config.providers.map(p => ({
         ...p,
@@ -1389,6 +1402,29 @@ async function serverWorkerCommand() {
           // sends MSG_PRIMARY (the baton waits on it).
           await listenOnHandle(handle);
           await becomePrimary({ viaTakeover: true });
+        } else if (msg?.type === MSG_TTY_REASSERT) {
+          // The old worker has now EXITED, and its exit reset the shared terminal out
+          // of raw mode (libuv's uv_tty_reset_mode on process exit). Reclaim it.
+          //
+          // The toggle OFF then ON is load-bearing: Node short-circuits setRawMode(true)
+          // when it believes isRaw is already true — and it does believe that, because
+          // the clobber happened in ANOTHER process and left our flag untouched. A bare
+          // setRawMode(true) here is a silent no-op (verified on a real pty 2026-08-07).
+          if (process.stdin.isTTY) {
+            try {
+              process.stdin.setRawMode(false);
+              process.stdin.setRawMode(true);
+              process.stdin.resume();
+            } catch { /* terminal gone — nothing to reclaim */ }
+          }
+          // Re-assert the screen state too: the dying worker's alt-screen exit and
+          // cursor-show can land after ours.
+          if (tui?.running && process.stdout.isTTY) {
+            try {
+              process.stdout.write('\x1b[?1049h\x1b[?25l');
+              tui.render();
+            } catch { /* ignore */ }
+          }
         } else if (msg?.type === MSG_ROLLED_BACK) {
           // Why the swap failed decides whether a cold restart is safe (see the watchdog).
           lastRollbackReason = msg.reason || null;

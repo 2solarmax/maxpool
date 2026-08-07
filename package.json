@@ -41,6 +41,7 @@
     "node": ">=20.3.0"
   },
   "devDependencies": {
+    "eslint": "^9.39.5",
     "git-cliff": "2.13.1"
   }
 }

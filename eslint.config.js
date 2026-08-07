@@ -22,7 +22,11 @@ export default [
       },
     },
     rules: {
-      'no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+      // ERROR, not warn: an unused local is the signature of an INERT change — a value
+      // computed and discarded, a helper wired to nothing. Shipped twice as a 'feature'
+      // (2026-08-07: deriveProviderName was dead on arrival and 634 tests passed). A
+      // warning exits 0, so CI stayed green on both. Prefix genuinely-unused with _.
+      'no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
       'no-undef': 'error',
       'no-constant-condition': 'warn',
       'no-unreachable': 'error',
