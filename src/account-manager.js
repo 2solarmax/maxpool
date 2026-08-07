@@ -2692,6 +2692,17 @@ export class AccountManager {
     // ~60s forever (hammering Anthropic's OAuth endpoint). Cleared on re-login.
     if (account.refreshDead) return false;
 
+    // A DISABLED account never spends its single-use refresh token. The prober still
+    // READS its quota by design (you disable an exhausted account and still want to
+    // watch it recover — prober.js:73), but rotation is a WRITE that can permanently
+    // brick the account: each rotation invalidates the previous token, so a refresh
+    // that races a restart (or another writer) loses the new token and the account
+    // dies with invalid_grant. Spending that risk on an account the user has
+    // explicitly benched is never worth it — it serves its existing access token for
+    // read-only probing, and re-enabling refreshes on the next real request.
+    // `force` still wins: an explicit re-auth/enable path may need the rotation.
+    if (!force && account.enabled === false) return true;
+
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return true;
 
     // Coalesce concurrent refreshes
@@ -3000,6 +3011,9 @@ export class AccountManager {
         model: entry.model || defaultModel,
         stripBetaHeaders: true,
         configSourced: true,
+        // An explicitly-disabled provider in config stays benched across restarts —
+        // a second GLM account you keep configured but off (a teammate's, a spare).
+        enabled: entry.enabled !== false,
       });
       if (!entry.token) {
         const a = this.accounts.find(a => a.name === entry.name);

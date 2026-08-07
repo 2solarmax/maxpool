@@ -537,16 +537,23 @@ async function serverWorkerCommand() {
   const logTo = argValue('--log-to');
   if (logTo) config.logDir = logTo;
 
-  if (config.accounts.length === 0) {
+  // A provider-only fleet is valid: a teammate may have a GLM/Kimi key and no Claude
+  // account at all. Counting only `accounts` refused to start for them — the exact
+  // onboarding case this config-provider feature exists to serve.
+  if (config.accounts.length === 0 && !(Array.isArray(config.providers) && config.providers.length > 0)) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
     console.error('  maxpool login            OAuth login via browser');
     console.error('  maxpool login --api      Add an API key');
+    console.error('  (or add a GLM/Kimi provider from the TUI: press p → a)');
     process.exit(1);
   }
 
   const accounts = await resolveAccounts(config);
-  if (accounts.length === 0) {
+  // Config providers are loaded further below (they need an AccountManager first), so
+  // a provider-only fleet legitimately has zero accounts HERE. Only bail when there is
+  // nothing to load at all.
+  if (accounts.length === 0 && !(Array.isArray(config.providers) && config.providers.length > 0)) {
     console.error('No valid accounts after initialization');
     process.exit(1);
   }

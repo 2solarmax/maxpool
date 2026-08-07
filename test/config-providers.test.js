@@ -183,3 +183,19 @@ test('a DIFFERENT token (second GLM account) is NOT removed — load balancing w
   const zai = am.accounts.filter(a => a.provider === 'zai');
   assert.equal(zai.length, 2, 'two different keys = two providers, load balanced');
 });
+
+test('a provider-only fleet is a VALID config (the teammate-onboarding case)', () => {
+  // Measured 2026-08-07: maxpool exited with "No accounts configured" when the config
+  // had providers but zero Claude accounts — exactly the state a teammate is in when
+  // they have a GLM key and no Anthropic account. The startup gate counted only
+  // `config.accounts`. Asserted here as the CONFIG SHAPE being legal; the gate itself
+  // lives in index.js and is exercised by the real boot.
+  const am = new AccountManager([], 0.90, { crossProviderFallbackPolicy: 'always' });
+  am.loadConfigProviders([
+    { name: 'glm max@gomokka.com', provider: 'zai', token: 'k1' },
+    { name: 'kimi max@gomokka.com', provider: 'kimi', token: 'k2' },
+  ]);
+  assert.equal(am.accounts.length, 2, 'a provider-only fleet has real, routable accounts');
+  const lease = am.acquireAccount({ profile: 'all' }, new Set());
+  assert.ok(lease?.account, 'and it can serve a request with no Claude account at all');
+});
