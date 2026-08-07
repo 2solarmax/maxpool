@@ -15,7 +15,7 @@ const execFileAsync = promisify(execFile);
 
 const DEFAULT_PROJECT = 'mokka-business-automations';
 
-export async function resolveSecret(secretName, { project = DEFAULT_PROJECT, timeoutMs = 10_000 } = {}) {
+export async function resolveSecret(secretName, { project = DEFAULT_PROJECT, timeoutMs = 45_000 } = {}) {
   if (!secretName || typeof secretName !== 'string') return null;
   try {
     const { stdout } = await execFileAsync(
