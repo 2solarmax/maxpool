@@ -229,3 +229,66 @@ test('the update check cadence is 30 minutes, env-tunable, floored at 60s', () =
   assert.equal(eval(m[1].replace(/_/g, '')), 30 * 60 * 1000, 'default is 30 minutes');
   assert.match(m[0], /Math\.max\(60_000/, 'still floored at 60s so a bad env value cannot hammer npm');
 });
+
+// ── the auto-update dead-end (reported 2026-08-08) ──────────────────────────────
+//
+// Each failed seamless reload calls markApplied(version). Once every published version
+// has been quarantined, the timer keeps firing but `applicable` is always false — the
+// user is stuck on old code forever, with auto-update silently doing nothing.
+// The ONLY escape is a manual quit+relaunch (which clears the in-memory quarantine).
+// This test PROVES the dead-end exists so a future fix to clearQuarantine or the timer
+// can demonstrate it resolves the scenario.
+
+test('DEAD-END: successive failed reloads quarantine every version — auto-update stuck', async () => {
+  __resetUpdaterState();
+  // Running 1.0.0. npm publishes 1.0.1, 1.0.2, 1.0.3 in sequence.
+  // Each reload fails (the TTY bug), old worker resumes, markApplied quarantines.
+  const h = harness({ running: '1.0.0', latest: '1.0.1' });
+
+  // First cycle: 1.0.1 published, installs, reload fails
+  const r1 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r1.applied, true, '1.0.1 installed + reload attempted');
+  // Reload FAILED — running is still 1.0.0, disk is 1.0.1
+
+  // Second cycle: npm now has 1.0.2 (time passes, new release)
+  h.setLatest('1.0.2');
+  const r2 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r2.applied, true, '1.0.2 > quarantined 1.0.1, so it applies');
+  // Reload FAILED again — running still 1.0.0
+
+  // Third cycle: npm now has 1.0.3
+  h.setLatest('1.0.3');
+  const r3 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r3.applied, true, '1.0.3 > quarantined 1.0.2');
+
+  // Now: npm STAYS at 1.0.3. No newer release comes. The timer fires again.
+  const r4 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r4.applied, false, 'DEAD-END: 1.0.3 is quarantined, nothing newer exists');
+  assert.equal(r4.applicable, false);
+  assert.equal(r4.hasUpdate, true, 'npm still reports 1.0.3 > running 1.0.0');
+  assert.equal(r4.installedVersion, '1.0.3', 'on-disk IS 1.0.3');
+
+  // The running process is STILL on 1.0.0. The on-disk is 1.0.3. Auto-update
+  // will NEVER apply it — the quarantine floor is 1.0.3 and nothing exceeds it.
+  // This is the exact state reported: stuck on old code with the new version
+  // sitting on disk.
+  const h2 = harness({ running: '1.0.0', latest: '1.0.3' });
+  h2.setDisk('1.0.3');   // disk already has it from the install above
+  const r5 = await checkAndMaybeApply(CFG_AUTO, h2.deps);
+  assert.equal(r5.applied, false, 'confirmed: stuck forever without manual restart');
+});
+
+test('ESCAPE: a manual quit+relaunch clears the quarantine (fresh process)', async () => {
+  // The only escape today: __resetUpdaterState() models a new process boot.
+  // After it, the quarantine is empty and the on-disk version applies immediately.
+  __resetUpdaterState();
+  // Simulate: the user quit, disk had 1.0.3, they relaunch → running 1.0.3
+  const h = harness({ running: '1.0.3', latest: '1.0.3' });
+  const r = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r.hasUpdate, false, 'fresh process on 1.0.3 — no update needed');
+  assert.equal(r.applied, false);
+  // Auto-update is healthy again — next time npm publishes 1.0.4, it applies.
+  h.setLatest('1.0.4');
+  const r2 = await checkAndMaybeApply(CFG_AUTO, h.deps);
+  assert.equal(r2.applied, true, 'quarantine cleared — 1.0.4 applies cleanly');
+});

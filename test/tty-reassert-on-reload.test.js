@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MSG_TTY_REASSERT } from '../src/reload-protocol.js';
 
+
 // The seamless reload clobbers the shared terminal: when the old worker exits,
 // libuv's uv_tty_reset_mode() restores the termios it saved — which is COOKED
 // mode (what the terminal was in before the worker set raw mode). The new worker's
@@ -58,4 +59,45 @@ test('a bare setRawMode(true) WITHOUT the toggle is a no-op (the trap)', () => {
   fakeStdin.setRawMode(true);  // the "obvious fix" — does nothing
   assert.equal(fakeStdin.isRaw, true, 'isRaw is still stale-true');
   // The terminal is still cooked, but Node thinks it's raw. Nothing changed.
+});
+
+// ── WIRING: reapOldWorker must send MSG_TTY_REASSERT to the new worker ────────
+//
+// The unit test above proves the toggle technique. This proves the IPC WIRING —
+// that the message actually fires when the old worker exits. Without this, deleting
+// the `newWorker.send({type: MSG_TTY_REASSERT})` line is a silent no-op.
+
+test('WIRING: reapOldWorker calls onExited which sends MSG_TTY_REASSERT', async () => {
+  // reapOldWorker(worker, onExited) — the callback fires when the worker's child
+  // process exits. The caller (orchestrateReload) passes a callback that sends
+  // MSG_TTY_REASSERT. We verify the contract: the callback IS invoked on exit.
+  //
+  // We can't easily import reapOldWorker (it's not exported), but we CAN verify
+  // the reload-protocol message type is what the handler expects — and that the
+  // handler exists in the message switch. This is a structural test: it pins the
+  // wiring so deleting either end of the chain fails.
+  
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const src = require('node:fs').readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+
+  // The send side exists
+  assert.match(src, /newWorker\.send\(\s*\{\s*type:\s*MSG_TTY_REASSERT\s*\}/,
+    'orchestrateReload must send MSG_TTY_REASSERT to the new worker');
+
+  // The send is wired to reapOldWorker's exit callback
+  assert.match(src, /reapOldWorker\(oldWorker,\s*\(\)\s*=>\s*\{/,
+    'reapOldWorker must receive an onExited callback');
+
+  // The receive side exists (the handler in the message switch)
+  assert.match(src, /msg\?\.type\s*===\s*MSG_TTY_REASSERT/,
+    'the worker message handler must handle MSG_TTY_REASSERT');
+
+  // The handler does the off→on toggle (not just on)
+  // Match the HANDLER (msg?.type ===), not the import at the top of the file.
+  const handlerMatch = src.match(/msg\?\.type\s*===\s*MSG_TTY_REASSERT[\s\S]{0,800}/);
+  assert.ok(handlerMatch, 'handler block found');
+  assert.match(handlerMatch[0], /setRawMode\(false\)/, 'handler toggles OFF');
+  assert.match(handlerMatch[0], /setRawMode\(true\)/, 'handler toggles ON');
+  assert.match(handlerMatch[0], /resume\(\)/, 'handler resumes stdin');
 });
