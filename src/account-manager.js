@@ -1165,6 +1165,10 @@ export class AccountManager {
       if (used >= this.switchThreshold) return true;
     }
 
+    // Provider (z.ai/Kimi) session quota — the 5h token window. Without this a
+    // provider at 95% of its 5h cap reads as fully available.
+    if (q.providerSes != null && q.providerSes >= this.switchThreshold) return true;
+
     return false;
   }
 
@@ -2110,6 +2114,15 @@ export class AccountManager {
     if (q.requestsLimit != null && q.requestsRemaining != null && q.requestsLimit > 0) {
       scarcity = Math.max(scarcity, 1 - q.requestsRemaining / q.requestsLimit);
     }
+    // Provider (z.ai/Kimi) quota — same scoring axis as Anthropic's windows. Without
+    // this, a GLM account at 80% of its 5h session scored the same as one at 5%,
+    // so the scheduler dogpiled the near-cap account until z.ai 429'd it.
+    if (q.providerSes != null) {
+      scarcity = Math.max(scarcity, this._windowScarcity(q.providerSes, q.providerSesReset, FIVE_HOUR_MS, now));
+    }
+    if (q.providerWk != null) {
+      scarcity = Math.max(scarcity, this._windowScarcity(q.providerWk, q.providerWkReset, WEEK_MS, now));
+    }
     return scarcity;
   }
 
@@ -2190,6 +2203,22 @@ export class AccountManager {
     const q = account.quota;
     this._clearExpiredQuotas(account);
     if (this._isAccountWideRejected(account)) return 'exhausted';
+
+    // Provider accounts (GLM/Kimi) carry their quota in providerSes/providerWk, NOT
+    // unified7d — those fields are Anthropic-only. Without this, a provider at 83%
+    // weekly (Kimi measured 2026-08-08) reads as 'unknown' = healthy, so the scheduler
+    // keeps piling onto it instead of spreading load. The same thresholds apply.
+    if (account.type === 'provider') {
+      const sesUsed = q.providerSes != null ? clamp01(q.providerSes) : null;
+      const wkUsed = q.providerWk != null ? clamp01(q.providerWk) : null;
+      const used = Math.max(sesUsed ?? 0, wkUsed ?? 0);
+      if (used >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
+      if (used >= this.scheduler.weeklyCriticalThreshold) return 'critical';
+      if (used >= this.scheduler.weeklyReserveThreshold) return 'reserve';
+      if (used >= this.scheduler.weeklySoftThreshold) return 'soft';
+      return 'normal';
+    }
+
     if (q.unified7d == null) return 'unknown';
 
     const used = clamp01(q.unified7d);
@@ -2212,6 +2241,8 @@ export class AccountManager {
   }
 
   _weeklyPaceState(account) {
+    // Provider quota lives in separate fields — see _weeklyRawState.
+    if (account.type === 'provider') return this._weeklyRawState(account);
     if (account.quota.unified7d == null) return 'unknown';
     const effective = this._effectiveWeeklyUsage(account);
     if (effective >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
