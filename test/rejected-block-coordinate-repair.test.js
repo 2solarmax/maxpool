@@ -457,3 +457,69 @@ test('a body over the retry buffer gets its OWN reason and is NOT told to start 
     await close(proxy); await close(upstream);
   }
 });
+
+// ── the fail-safe must not fire for a PROVIDER issuer (the 400-loop bug) ──────
+//
+// The thinking-signature fail-safe reverts a session to the account that ISSUED the
+// rejected block. That is correct for a Claude→Claude migration. But when the issuer
+// is a PROVIDER, reverting there repairs NOTHING: the provider serves the request
+// happily, the transcript keeps its provider-authored thinking, and the next turn
+// that routes back to Claude 400s on the SAME block.
+//
+// Measured 2026-08-09: coordinate messages.5.content.23 failed 4 times in 2 minutes,
+// each logging "reverting session to issuer glm max@gomokka.com" — a pure ping-pong.
+
+test('a PROVIDER issuer does NOT trigger the revert fail-safe (the 400-loop bug)', () => {
+  // Drives the REAL migration: bind a session to the provider, then acquire on a
+  // Claude account — that sets lease.migratedFromName to the provider's name, which
+  // is exactly the state that produced the 4x loop on 2026-08-09.
+  const am = new AccountManager([
+    { name: 'cc1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    { name: 'glm', type: 'provider', provider: 'zai', authToken: 'z',
+      upstream: 'https://api.z.ai/api/anthropic', profiles: ['claude', 'all'] },
+  ], 0.90, { crossProviderFallbackPolicy: 'always' });
+
+  const glm = am.accounts.find(a => a.type === 'provider');
+
+  // Session lives on the PROVIDER
+  am._bindSession('sess', glm, null);
+  // Now force it onto the Claude account (the migration)
+  const lease = am.acquireAccount(
+    { profile: 'claude', sessionKey: 'sess', pinnedAccountName: 'cc1' }, new Set(),
+  );
+  assert.equal(lease?.account?.name, 'cc1', 'migrated onto the Claude account');
+  assert.equal(lease.migratedFromName, 'glm', 'the issuer is the PROVIDER');
+
+  // THE ASSERTION: the issuer is a provider, so the fail-safe must be skipped.
+  // This is the exact predicate server.js uses.
+  const issuer = am.accounts.find(a => a.name === lease.migratedFromName);
+  const issuerIsClaude = issuer && issuer.type !== 'provider';
+  assert.equal(issuerIsClaude, false,
+    'a provider issuer must NOT satisfy the fail-safe gate — reverting there repairs nothing');
+});
+
+test('a CLAUDE issuer DOES trigger the revert fail-safe (the fix stays scoped)', () => {
+  const am = new AccountManager([
+    { name: 'cc1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    { name: 'cc2', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 },
+  ], 0.90);
+  const cc1 = am.accounts[0];
+  am._bindSession('sess', cc1, null);
+  const lease = am.acquireAccount(
+    { profile: 'claude', sessionKey: 'sess', pinnedAccountName: 'cc2' }, new Set(),
+  );
+  assert.equal(lease.migratedFromName, 'cc1', 'the issuer is another CLAUDE account');
+  const issuer = am.accounts.find(a => a.name === lease.migratedFromName);
+  const issuerIsClaude = issuer && issuer.type !== 'provider';
+  assert.equal(issuerIsClaude, true, 'a Claude issuer still gets the revert fail-safe');
+});
+
+test('WIRING: server.js gates the fail-safe on issuerIsClaude', async () => {
+  // Pins the actual source predicate so removing it fails.
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  assert.match(src, /const issuerIsClaude = issuer && issuer\.type !== 'provider'/,
+    'the issuer-type check must exist');
+  assert.match(src, /if \(lease\.migratedFromName && issuerIsClaude && requestInfo\.sessionKey/,
+    'the fail-safe branch must be gated on issuerIsClaude');
+});

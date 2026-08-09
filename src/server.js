@@ -1043,7 +1043,18 @@ async function forwardRequest(
         // self-heals instead of poisoning the session into a 400 loop. Signatures are
         // portable in practice (verified 2026-07-02); this only fires if Anthropic
         // ever account-binds them.
-        if (lease.migratedFromName && requestInfo.sessionKey
+        // ONLY for a Claude→Claude migration. When the issuer is a PROVIDER, reverting
+        // there is not a repair — the provider happily serves the request, but the
+        // transcript keeps its provider-authored thinking blocks, so the very next turn
+        // that routes back to Claude 400s on the SAME block. Measured 2026-08-09: the
+        // same coordinate (messages.5.content.23) failed 4 times in 2 minutes, each one
+        // "reverting to issuer glm max@gomokka.com" and never repairing anything.
+        // The correct repair for a provider-authored block is the strip below.
+        const issuer = lease.migratedFromName
+          ? accountManager.accounts?.find(a => a.name === lease.migratedFromName)
+          : null;
+        const issuerIsClaude = issuer && issuer.type !== 'provider';
+        if (lease.migratedFromName && issuerIsClaude && requestInfo.sessionKey
           && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
           accountManager.revertSessionBinding(requestInfo.sessionKey, lease.migratedFromName);
           excludedIndexes.add(account.index);

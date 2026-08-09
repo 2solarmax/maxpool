@@ -151,7 +151,7 @@ test('a provider session at 92% weekly rebalances to a healthier provider', () =
     { name: 'glm max', type: 'provider', provider: 'zai', authToken: 'k1', upstream: 'https://api.z.ai/api/anthropic' },
     { name: 'glm glm1', type: 'provider', provider: 'zai', authToken: 'k2', upstream: 'https://api.z.ai/api/anthropic' },
   ], 0.90, { crossProviderFallbackPolicy: 'always' });
-  const glmMax = am.accounts[0], glm1 = am.accounts[1];
+  const glm1 = am.accounts[1];
   glm1.quota.providerWk = 0.92;
   glm1.quota.providerWkReset = Date.now() + 4 * 86400_000;
   // Bind a session to glm1 (the hot one)
