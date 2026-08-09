@@ -137,3 +137,51 @@ test('an Anthropic account is unaffected by the provider quota change', () => {
   cc.quota.providerSes = 0.95;   // must NOT affect an OAuth account
   assert.equal(am._weeklyRawState(cc), 'soft', 'provider fields are invisible to OAuth scoring');
 });
+
+// ── session rebalancing for providers (the 92% GLM stuck-on-one bug) ──────────
+//
+// A GLM session bound to an account at 92% weekly stayed there forever because
+// _migrationSafeForRequest returned false: it requires bodyThinkingScanned === true
+// (an Anthropic safety gate), but provider requests never set that flag (no Anthropic
+// thinking blocks to scan). A same-provider migration (GLM→GLM) is always safe —
+// the thinking format is identical on both sides.
+
+test('a provider session at 92% weekly rebalances to a healthier provider', () => {
+  const am = new AccountManager([
+    { name: 'glm max', type: 'provider', provider: 'zai', authToken: 'k1', upstream: 'https://api.z.ai/api/anthropic' },
+    { name: 'glm glm1', type: 'provider', provider: 'zai', authToken: 'k2', upstream: 'https://api.z.ai/api/anthropic' },
+  ], 0.90, { crossProviderFallbackPolicy: 'always' });
+  const glmMax = am.accounts[0], glm1 = am.accounts[1];
+  glm1.quota.providerWk = 0.92;
+  glm1.quota.providerWkReset = Date.now() + 4 * 86400_000;
+  // Bind a session to glm1 (the hot one)
+  am._bindSession('sess1', glm1, null);
+  // The session should migrate to glm max, not stay on glm1
+  const lease = am.acquireAccount({ profile: 'all', sessionKey: 'sess1' }, new Set());
+  assert.equal(lease?.account?.name, 'glm max', 'session must leave the 92%-used account');
+});
+
+test('a Claude session still requires body scan before migration (unchanged)', () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3.6e6 },
+    { name: 'a2', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3.6e6 },
+  ], 0.90);
+  am._bindSession('s', am.accounts[0], null);
+  // No bodyThinkingScanned → migration NOT safe (same as before the fix)
+  assert.equal(am._migrationSafeForRequest({ sessionKey: 's' }), false);
+  // With bodyThinkingScanned → migration IS safe
+  assert.equal(am._migrationSafeForRequest({ sessionKey: 's', bodyThinkingScanned: true }), true);
+});
+
+test('a session bound to a HEALTHY provider stays put (no unnecessary churn)', () => {
+  const am = new AccountManager([
+    { name: 'glm max', type: 'provider', provider: 'zai', authToken: 'k1', upstream: 'https://api.z.ai/api/anthropic' },
+    { name: 'glm glm1', type: 'provider', provider: 'zai', authToken: 'k2', upstream: 'https://api.z.ai/api/anthropic' },
+  ], 0.90, { crossProviderFallbackPolicy: 'always' });
+  // Both healthy
+  am.accounts[0].quota.providerSes = 0.10;
+  am.accounts[1].quota.providerSes = 0.15;
+  am._bindSession('s', am.accounts[1], null);
+  const lease = am.acquireAccount({ profile: 'all', sessionKey: 's' }, new Set());
+  assert.equal(lease?.account?.name, 'glm glm1', 'a healthy bound session stays bound');
+});

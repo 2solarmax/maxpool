@@ -1191,6 +1191,17 @@ export class AccountManager {
    *  body signal only — never the session-sticky policy — and fails CLOSED on any
    *  body we couldn't fully scan (non-JSON / parse error → bodyThinkingScanned unset). */
   _migrationSafeForRequest(requestInfo = {}) {
+    // A same-PROVIDER migration (GLM→GLM, Kimi→Kimi) is always safe: the thinking
+    // format is identical on both sides, so there is no cross-format replay risk.
+    // The body-scanning gate below exists for Anthropic cross-account migration
+    // (where a signed thinking block replayed to a different account can 400). It
+    // was blocking provider rebalancing entirely — a GLM session bound to an account
+    // at 92% weekly stayed there forever because bodyThinkingScanned was never set
+    // on provider-origin requests (no Anthropic thinking blocks to scan).
+    const boundName = this._sessionBinding(requestInfo.sessionKey)?.currentName;
+    const boundAcct = boundName ? this.accounts.find(a => a.name === boundName) : null;
+    if (boundAcct?.type === 'provider') return true;
+
     // Fail closed on any body we couldn't fully scan (non-JSON / parse error).
     if (requestInfo.bodyThinkingScanned !== true) return false;
     // An Anthropic-incompatible (provider-pinned) session's only possible cross is
