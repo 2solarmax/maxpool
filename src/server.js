@@ -1093,8 +1093,14 @@ async function forwardRequest(
       // its life. Verified against the real API — the stripped history returns 200, with
       // text + tool_use preserved. Tried once per request (thinkingStripped guard); if it
       // still fails, the provider pin below is the fallback.
-      if (isSignatureRejection && !requestInfo.thinkingStripped
-        && canRetryBufferedBody && canRepairBody) {
+      // NOT gated on canRetryBufferedBody. That limit exists to stop a huge body being
+      // re-sent across accounts on a FAILOVER — but a repair SHRINKS the body (measured:
+      // 11.5MB → 5.7MB in 20ms) and is the only thing standing between the user and a
+      // dead session. The body is already fully in memory by this point, so refusing to
+      // rewrite it saves nothing; it just guarantees the 400 surfaces. Reported
+      // 2026-08-10: "history too large to rewrite automatically" on a session the strip
+      // would have fixed in 20ms. The retry it schedules re-checks the SHRUNK size.
+      if (isSignatureRejection && !requestInfo.thinkingStripped && canRepairBody) {
         console.log(`[Maxpool] Anthropic rejected a block: ${describeRejectedBlock(body, errorBody)}`);
         const { body: cleanBody, removed, converted } = stripForeignThinkingBlocks(body);
         if (cleanBody) {
@@ -1102,10 +1108,14 @@ async function forwardRequest(
           // rejected round-trip (the client resends the full poisoned history each turn).
           accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
           console.log(`[Maxpool] Recovering session on Claude: stripped ${removed} provider thinking block(s), converted ${converted} provider search block(s) to text`);
+          // Re-derive the retry budget from the SHRUNK body. Inheriting the old flag
+          // would leave a now-5.7MB body permanently marked "too big to retry" because
+          // it was 11.5MB before the repair — barring the very failover the repair
+          // exists to enable.
           return forwardRequest(
             req, res, cleanBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, { ...requestInfo, thinkingStripped: true, repairCount: repairCount + 1 },
-            canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+            cleanBody.length <= retryConfig.maxRetryBufferBytes, canQueueBufferedBody, excludedIndexes,
           );
         }
       }
@@ -1113,7 +1123,9 @@ async function forwardRequest(
       // COORDINATE REPAIR (runs after the broad strip found nothing, or found the wrong
       // thing). Anthropic pointed at an exact block index; trust that over our own shape
       // model. Its own flag, so it still fires on a request whose broad strip already ran.
-      if (isSignatureRejection && !requestInfo.rejectedBlockStripped && canRetryBufferedBody && canRepairBody) {
+      // Same reasoning as the broad strip above: a repair SHRINKS the body, so the
+      // re-send limit must not bar it.
+      if (isSignatureRejection && !requestInfo.rejectedBlockStripped && canRepairBody) {
         const { body: fixedBody, removed, type } = stripRejectedBlockClass(body, errorBody);
         if (fixedBody) {
           // Latch the session ONLY for the class the pre-strip can actually repair up
@@ -1133,7 +1145,7 @@ async function forwardRequest(
               thinkingStripped: preStripCanRepeat || requestInfo.thinkingStripped,
               repairCount: repairCount + 1,
             },
-            canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+            fixedBody.length <= retryConfig.maxRetryBufferBytes, canQueueBufferedBody, excludedIndexes,
           );
         }
       }
@@ -1198,16 +1210,14 @@ async function forwardRequest(
         // and without it the two surviving explanations (a block the strip cannot see
         // vs. a body over the retry buffer) are indistinguishable in the log.
         console.log(`[Maxpool] Unrepaired signature 400: ${describeRejectedBlock(body, errorBody)} bufferable=${canRetryBufferedBody} stripped=${!!requestInfo.thinkingStripped}`);
-        // A body over the retry buffer bars EVERY repair above without a word — the user
-        // then sees "could not repair" for a transcript maxpool never even tried to fix.
-        // Name that separately so the reason is actionable rather than mysterious.
-        // `peek` (not the full class-strip) because on THIS path the body may be the very
-        // one just declared too large to rewrite — a full parse+rebuild there costs 15ms
-        // and a discarded 4.8MB Buffer on a 9.6MB body, to read one string.
-        const rejectedType = canRetryBufferedBody ? peekRejectedBlockType(body, errorBody) : null;
-        const what = !canRetryBufferedBody
-          ? `This session's history is too large for maxpool to rewrite automatically (over ${Math.round(retryConfig.maxRetryBufferBytes / (1024 * 1024))}MB). Run /compact and it will keep going.`
-          : rejectedType && rejectedType !== 'thinking' && rejectedType !== 'redacted_thinking'
+        // `peek` (not the full class-strip) — reads only `.type`, no parse+rebuild.
+        // Read it regardless of body size: the repairs are no longer size-gated, so a
+        // large body reaches here for a REAL reason (an unremovable block type) and the
+        // user deserves to be told which one.
+        const rejectedType = peekRejectedBlockType(body, errorBody);
+        // NOTE: no "too large to rewrite" branch any more — the repairs above are no
+        // longer gated on canRetryBufferedBody, so size never blocks a repair attempt.
+        const what = rejectedType && rejectedType !== 'thinking' && rejectedType !== 'redacted_thinking'
             ? `Anthropic rejected a "${rejectedType}" block in this session's history, which maxpool cannot remove without losing conversation content.`
             : requestInfo.thinkingStripped || requestInfo.rejectedBlockStripped
               ? 'This session ran on GLM/Kimi earlier, and Anthropic will not accept parts of what they wrote. Maxpool repaired what it could and retried on Claude, but Anthropic still rejected the history.'

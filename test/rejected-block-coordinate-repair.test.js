@@ -420,17 +420,32 @@ test('the instrument names role+type+coordinate so the next give-up is diagnosab
   assert.match(describeRejectedBlock(body, 'messages.9.content.9: x'), /role=MISSING type=MISSING/);
 });
 
-test('a body over the retry buffer gets its OWN reason and is NOT told to start over', async () => {
-  // MUT-F: this branch shipped with zero coverage. The user must learn the real cause
-  // (too large to rewrite) and a remedy that does not contradict itself.
+test('a body OVER the retry buffer is still REPAIRED (size must not block a repair)', async () => {
+  // Reported 2026-08-10: "This session's history is too large for maxpool to rewrite
+  // automatically (over 10MB). Run /compact" — on a session the strip fixes in 20ms.
+  // The limit exists to stop a huge body being RE-SENT across accounts on failover; a
+  // repair SHRINKS it (measured 11.5MB -> 5.7MB), so gating the repair on it was
+  // backwards. Worse, /compact itself goes through maxpool, so the user was deadlocked.
+  //
+  // Asserts WHICH repair ran: the two repair paths mask each other's absence, so a
+  // status-only assertion passes even with the gate restored on one of them.
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => { logs.push(a.join(' ')); };
+  const bodies = [];
   const upstream = http.createServer((req, res) => {
-    // The body must be CONSUMED for 'end' to fire — without a data listener the
-    // stream never flows and the response is never sent (the request just hangs).
-    req.resume();
+    let raw = '';
+    req.on('data', c => { raw += c; });
     req.on('end', () => {
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',
-        message: 'messages.1.content.0: Invalid `signature` in `thinking` block' } }));
+      bodies.push(JSON.parse(raw));
+      if (bodies.length === 1) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',
+          message: 'messages.1.content.0: Invalid `signature` in `thinking` block' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
     });
   });
   const upstreamPort = await listen(upstream);
@@ -445,29 +460,78 @@ test('a body over the retry buffer gets its OWN reason and is NOT told to start 
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'test', messages: [
         { role: 'user', content: [{ type: 'text', text: 'x'.repeat(500) }] },
-        { role: 'user', content: [{ type: 'thinking', thinking: 'y', signature: 's' }] },
+        { role: 'user', content: [
+          { type: 'thinking', thinking: 'y', signature: 's' },
+          { type: 'text', text: 'kept' },
+        ] },
       ] }),
     });
-    assert.equal(res.status, 400);
-    const msg = (await res.json()).error.message;
-    assert.match(msg, /too large for maxpool to rewrite/, 'must name the REAL reason');
-    assert.match(msg, /\/compact/, 'must give the remedy that works');
-    assert.doesNotMatch(msg, /cannot continue/, 'must not contradict the /compact remedy');
+    console.log = orig;
+    assert.equal(res.status, 200, 'an oversized body must STILL be repaired, not refused');
+    assert.equal(bodies.length, 2, 'the repair retry fired despite the size limit');
+    // The BROAD strip must be what ran — if its gate is restored, the coordinate repair
+    // silently covers for it and a status-only check would still pass.
+    const joined = logs.join('\n');
+    assert.match(joined, /stripped \d+ provider thinking block/,
+      'the BROAD strip must run on an oversized body');
+    const retried = bodies[1].messages;
+    assert.ok(retried.every(m => m.content.every(b => b.type !== 'thinking')),
+      'the offending block was stripped');
   } finally {
+    console.log = orig;
     await close(proxy); await close(upstream);
   }
 });
 
-// ── the fail-safe must not fire for a PROVIDER issuer (the 400-loop bug) ──────
-//
-// The thinking-signature fail-safe reverts a session to the account that ISSUED the
-// rejected block. That is correct for a Claude→Claude migration. But when the issuer
-// is a PROVIDER, reverting there repairs NOTHING: the provider serves the request
-// happily, the transcript keeps its provider-authored thinking, and the next turn
-// that routes back to Claude 400s on the SAME block.
-//
-// Measured 2026-08-09: coordinate messages.5.content.23 failed 4 times in 2 minutes,
-// each logging "reverting session to issuer glm max@gomokka.com" — a pure ping-pong.
+test('the COORDINATE repair also ignores the size limit (its own gate)', async () => {
+  // Same fix, other path. Uses redacted_thinking, which the broad strip is blind to by
+  // design — so ONLY the coordinate repair can rescue this, isolating its gate.
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => { logs.push(a.join(' ')); };
+  const bodies = [];
+  const upstream = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', () => {
+      bodies.push(JSON.parse(raw));
+      if (bodies.length === 1) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',
+          message: 'messages.1.content.0: Invalid `signature` in `thinking` block' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(fleet(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upstreamPort}`,
+    retry: { maxRetryBufferBytes: 200 },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [
+        { role: 'user', content: [{ type: 'text', text: 'x'.repeat(500) }] },
+        { role: 'assistant', content: [
+          { type: 'redacted_thinking', data: 'zzz' },
+          { type: 'text', text: 'kept' },
+        ] },
+      ] }),
+    });
+    console.log = orig;
+    assert.equal(res.status, 200, 'the coordinate repair must run on an oversized body');
+    assert.match(logs.join('\n'), /rejected a "redacted_thinking" block by index/,
+      'the COORDINATE repair is what saved it');
+  } finally {
+    console.log = orig;
+    await close(proxy); await close(upstream);
+  }
+});
 
 test('a PROVIDER issuer does NOT trigger the revert fail-safe (the 400-loop bug)', () => {
   // Drives the REAL migration: bind a session to the provider, then acquire on a
