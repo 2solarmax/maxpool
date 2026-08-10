@@ -1230,7 +1230,29 @@ export class AccountManager {
    *  score loop), so a healthy bound account never ping-pongs. */
   _isBoundAccountHot(account) {
     return this._isSessionQuotaUnavailable(account)
-      || ['reserve', 'critical', 'exhausted'].includes(this._weeklyPaceState(account));
+      || ['reserve', 'critical', 'exhausted'].includes(this._weeklyPaceState(account))
+      // SESSION-window pressure counts too. _isSessionQuotaUnavailable only fires at
+      // switchThreshold (0.90), and the weekly bands don't see the 5h window at all —
+      // so an account at 82% of a 5h window was "not hot" and every bound session
+      // stayed on it while idle accounts sat at 2%. Measured 2026-08-10: Anthropic at
+      // Ses 82% / Wk 66% hammered flat-out beside two GLM accounts at 2% and 9%.
+      // Uses the SOFT band (0.65), not reserve (0.85): the point is to shed load while
+      // there is still headroom, not at the cliff edge. _shouldRebalanceBoundSession
+      // still requires a clearly-cheaper, strictly-healthier target, so a hot account
+      // with no better alternative keeps its sessions — this only opens the question.
+      || this._sessionWindowUsage(account) >= this.scheduler.weeklySoftThreshold;
+  }
+
+  /** Fraction of the SESSION (5h) window consumed, across both quota shapes.
+   *  Anthropic reports unified5h; a provider reports providerSes. Returns 0 when
+   *  unknown — an unreadable window must never make an account look hot. */
+  _sessionWindowUsage(account) {
+    const q = account?.quota;
+    if (!q) return 0;
+    const vals = [];
+    if (q.unified5h != null) vals.push(clamp01(q.unified5h));
+    if (q.providerSes != null) vals.push(clamp01(q.providerSes));
+    return vals.length ? Math.max(...vals) : 0;
   }
 
   /** Decide whether a bound session should leave its (hot) account THIS request.
@@ -1333,6 +1355,18 @@ export class AccountManager {
     // remaining weekly headroom dominates concurrency spread; the per-request
     // candidate loop lands on the least-loaded healthy account, spreading the move.
     if ((WEEKLY_TIER[this._weeklyRawState(bound)] ?? 0) >= WEEKLY_TIER.reserve) return true;
+
+    // Same absolute escape for the SESSION window. The tier test below compares WEEKLY
+    // tiers, so a bound account burning down its 5h window can never satisfy it while
+    // its weekly is merely soft — which is exactly how an account at Ses 82% kept every
+    // session while idle accounts sat at 2%. Requires a MATERIALLY cheaper target so
+    // this can't churn between two similarly-loaded accounts.
+    // No score margin here, for the reason the weekly escape documents directly above:
+    // boundScore*0.5 on an IDLE near-cap account sits below every candidate's minimum
+    // score, so the margin is unsatisfiable and pins the session to the account it is
+    // meant to relieve. The candidate loop has already kept only RAW-healthy targets,
+    // and preserving the last of a 5h window beats concurrency spread.
+    if (this._sessionWindowUsage(bound) >= this.scheduler.weeklyReserveThreshold) return true;
 
     // Otherwise the trigger was PACE-only on a RAW-healthy account — a fast-burner
     // that still has real absolute headroom (RAW soft but pace reserve/critical,
