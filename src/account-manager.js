@@ -2370,6 +2370,18 @@ export class AccountManager {
     // worth having; the diagnosis that motivated it was wrong.)
     q.consecutiveProbeFailures = (q.consecutiveProbeFailures || 0) + 1;
     const n = q.consecutiveProbeFailures;
+    // A SUSTAINED 401 is dead credentials, not a blip. Latch refreshDead so (a) the
+    // prober stops re-POSTing a rejected token every 60s forever — measured 2026-08-10:
+    // 8 disabled accounts each past 20 consecutive 401s, hammering Anthropic's OAuth
+    // endpoint for nothing — and (b) the TUI can SHOW that the account needs re-login
+    // instead of leaving the user to guess. Cleared on a successful re-auth
+    // (updateAccountTokens) exactly like a refresh-path invalid_grant.
+    // Three strikes, not one: a single 401 can be a transient edge/token-rotation race.
+    if (status === 401 && n >= 3 && !account.refreshDead) {
+      account.refreshDead = true;
+      console.error(`[Maxpool] "${account.name}" credentials rejected ${n}x (HTTP 401) — marking it needs re-login. `
+        + 'Re-authenticate via the TUI (a → l). Probing stops until then.');
+    }
     // Once, at a threshold that cannot be a blip, then every 100th so it stays visible
     // without walling the log.
     if (n === PROBE_FAILURE_ALERT_AT || (n > PROBE_FAILURE_ALERT_AT && n % 100 === 0)) {

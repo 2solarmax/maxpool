@@ -1557,7 +1557,12 @@ export class TUI {
     // A dead refresh token surfaces as "reauth" (re-login needed) rather than a
     // generic "error", so the user knows the fix. Display-only — account.status
     // stays 'error' so routing/eligibility still exclude it.
-    if (a.enabled !== false && a.refreshDead) effectiveStatus = 'reauth';
+    // A DISABLED account still shows its auth state. Suppressing it meant disabling an
+    // account hid the fact that it needs re-login: the row read "✕ disabled" whether the
+    // credentials were fine or long dead, so re-enabling it later silently produced a
+    // broken account. Reported 2026-08-10 with all 8 disabled accounts sitting on dead
+    // credentials (HTTP 401) and no way to see it.
+    if (a.refreshDead) effectiveStatus = a.enabled === false ? 'disabled-reauth' : 'reauth';
     switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'reauth':    status = yellow('reauth'); break;
@@ -1566,6 +1571,9 @@ export class TUI {
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
+      // Disabled AND needs re-login — both facts matter: it won't serve because you
+      // switched it off, and it CAN'T serve until you log in again.
+      case 'disabled-reauth': status = red('✕ reauth'); break;
       case 'throttled': {
         // A transient auto-recovering cooldown — show the remaining time (from
         // rateLimitedUntil) so it reads as "recovering in Ns", not stuck.
