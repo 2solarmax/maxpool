@@ -2060,6 +2060,38 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   if (memConfig.routing.mode === 'preferred' && !preferredApplied) {
     memConfig.routing = { mode: 'automatic', preferredAccount: null };
   }
+
+  // Config PROVIDERS (GLM/Kimi) sync too. Without this a provider added to config —
+  // by the TUI or by hand — stayed invisible until a full restart, because this
+  // function only ever walked `accounts`. Reported 2026-08-10: a new GLM key was in
+  // GCP and in config and served ZERO requests.
+  if (Array.isArray(diskConfig.providers)) {
+    const before = JSON.stringify(memConfig.providers || []);
+    const after = JSON.stringify(diskConfig.providers);
+    if (before !== after) {
+      try {
+        const { resolveSecrets } = await import('./secret-resolver.js');
+        const names = diskConfig.providers.filter(p => p.secretName).map(p => p.secretName);
+        const resolved = await resolveSecrets(names);
+        const entries = diskConfig.providers.map(p => ({
+          ...p,
+          token: p.secretName ? (resolved[p.secretName] || null) : (p.apiKey || null),
+        }));
+        accountManager.loadConfigProviders(entries);
+        for (const p of diskConfig.providers) {
+          const a = accountManager.accounts.find(a => a.name === p.name);
+          if (a && p.secretName) a.secretName = p.secretName;
+        }
+        memConfig.providers = diskConfig.providers;
+        const ok = entries.filter(e => e.token).length;
+        console.log(`[Maxpool] Config providers re-synced from disk: ${ok} active`);
+        added += Math.max(0, entries.length - JSON.parse(before).length);
+      } catch (err) {
+        console.error(`[Maxpool] Provider re-sync failed: ${err.message}`);
+      }
+    }
+  }
+
   return added;
 }
 

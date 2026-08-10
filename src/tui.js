@@ -257,7 +257,10 @@ export class TUI {
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | accounts | routing | select | input | confirm
+    this.mode = 'normal';    // normal | accounts | routing | select | input | confirm | providers | addtype
+    // Hide disabled accounts from the table. With 8 dead/disabled accounts the live
+    // ones scroll off the top; `h` collapses them to a one-line summary.
+    this.hideDisabled = false;
     this.selAction = null;   // prefer | toggle | delete
     this.selIdx = 0;
     this.inputPrompt = '';
@@ -406,6 +409,7 @@ export class TUI {
       case 'routing': this._keyRouting(k); break;
       case 'updates': this._keyUpdates(k); break;
       case 'providers': this._keyProviders(k); break;
+      case 'addtype': this._keyAddType(k); break;
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
       case 'confirm': this._keyConfirm(k); break;
@@ -445,6 +449,9 @@ export class TUI {
       this.mode = 'updates';
     } else if (k === 'p') {
       this.mode = 'providers';
+    } else if (k === 'h') {
+      this.hideDisabled = !this.hideDisabled;
+      this._addLog(this.hideDisabled ? 'Hiding disabled accounts' : 'Showing all accounts');
     }
     // Enable/disable lives ONLY under [a] Accounts now (with rename/delete/login) —
     // one home for every account mutation, instead of a duplicate top-level toggle.
@@ -555,19 +562,15 @@ export class TUI {
   }
 
   _keyAccounts(k) {
-    if (k === 'k') {
-      this.mode = 'input';
-      this.inputPrompt = 'Anthropic API key';
-      this.inputBuf = '';
-      this.inputSensitive = true;
-      this.inputCb = value => {
-        if (!value) return;
-        this._confirm(
-          'Add this API key?',
-          'Store it in Maxpool config as a new Anthropic API account.',
-          () => this._doAddKey(value),
-        );
-      };
+    if (k === 'a') {
+      // ONE entry point for every account type. Previously `l` (browser) and `k`
+      // (Anthropic API key) were the only options and GLM/Kimi had no path at all —
+      // the provider screen existed but nothing in the Accounts UI led to it
+      // (reported 2026-08-10: "it only offers anthropic accounts via browser").
+      this.mode = 'addtype';
+    } else if (k === 'k') {
+      // Kept as a shortcut; the `a` flow reaches the same place.
+      this._addAccountOfType('anthropic-key');
     } else if (k === 'l') {
       this._confirm(
         'Log in / re-authenticate via browser?',
@@ -583,6 +586,89 @@ export class TUI {
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
+  }
+
+  // ── unified add-account flow ────────────────────────────────────────────────
+  // Four account types, two credential sources. Every path lands here so there is
+  // exactly ONE thing to learn: press `a`, pick a type, supply a credential.
+  static ADD_TYPES = [
+    { key: '1', id: 'anthropic-oauth', label: 'Anthropic subscription (browser login)' },
+    { key: '2', id: 'anthropic-key',   label: 'Anthropic API key' },
+    { key: '3', id: 'zai',             label: 'GLM / z.ai API key' },
+    { key: '4', id: 'kimi',            label: 'Kimi / Moonshot API key' },
+  ];
+
+  _keyAddType(k) {
+    if (k === 'esc' || k === 'q') { this.mode = 'accounts'; return; }
+    const pick = TUI.ADD_TYPES.find(t => t.key === k);
+    if (pick) this._addAccountOfType(pick.id);
+  }
+
+  _addAccountOfType(typeId) {
+    if (typeId === 'anthropic-oauth') {
+      this.mode = 'accounts';
+      this._confirm(
+        'Log in / re-authenticate via browser?',
+        'Opens a browser. Logging into an account that is already added RE-AUTHENTICATES it in place — no duplicate.',
+        () => this._doLogin(),
+      );
+      return;
+    }
+    if (typeId === 'anthropic-key') {
+      this.mode = 'input';
+      this.inputPrompt = 'Anthropic API key — paste it, or type a GCP secret name';
+      this.inputBuf = '';
+      this.inputSensitive = false;   // a GCP NAME is not a secret; the key is masked on save
+      this.inputCb = async value => {
+        const input = String(value || '').trim();
+        if (!input) { this.mode = 'accounts'; return; }
+        const key = await this._resolveCredential(input);
+        if (!key) return;
+        this.mode = 'accounts';
+        this._confirm('Add this API key?', 'Store it in Maxpool config as a new Anthropic API account.',
+          () => this._doAddKey(key));
+      };
+      return;
+    }
+    // GLM / Kimi — the provider path. Same two credential sources.
+    this._providerAddStep('secret', { provider: typeId === 'kimi' ? 'kimi' : 'zai' });
+  }
+
+  /** Accept EITHER a pasted API key or a GCP Secret Manager name, and return the key.
+   *  A GCP name is UPPER_SNAKE with no dots; real keys carry dots/mixed case. Resolving
+   *  here (not at each call site) is what makes "type it or point at GCP" one concept. */
+  async _resolveCredential(input) {
+    const looksLikeSecretName = /^[A-Z][A-Z0-9_-]{2,60}$/.test(input) && !input.includes('.');
+    if (!looksLikeSecretName) return input;   // a pasted key
+    this._addLog(`Resolving GCP secret "${input}"…`);
+    this.render();
+    try {
+      const { resolveSecret } = await import('../secret-resolver.js');
+      const v = await resolveSecret(input);
+      if (!v) {
+        this._addLog(`✗ GCP secret "${input}" not found (or gcloud is not authenticated). ` +
+          'Run: gcloud auth application-default login');
+        this.mode = 'accounts';
+        return null;
+      }
+      return v;
+    } catch (err) {
+      this._addLog(`✗ Could not reach GCP: ${err.message}`);
+      this.mode = 'accounts';
+      return null;
+    }
+  }
+
+  _renderAddType(buf) {
+    buf.push(`${bold('Add an account')}  ${dim('— pick a type')}`);
+    buf.push('');
+    for (const t of TUI.ADD_TYPES) {
+      buf.push(`   ${bold(t.key)}  ${t.label}`);
+    }
+    buf.push('');
+    buf.push(dim('   API keys: paste the key, OR type a GCP Secret Manager name'));
+    buf.push(dim('   (e.g. RESTRICTED_MAX_MAXPOOL_ZAI_PLUS1) to keep it out of your config.'));
+    buf.push(dim('   GCP needs: gcloud auth application-default login'));
   }
 
   // Derive a human-readable account name from a GCP secret name.
@@ -713,10 +799,16 @@ export class TUI {
     if (!providers.length) {
       buf.push(dim('  No providers configured.'));
       buf.push('');
-      buf.push(dim('  Press ') + bold('a') + dim(' to add one. You\'ll need:'));
-      buf.push(dim('    1. An API key from z.ai (GLM) or Moonshot (Kimi)'));
-      buf.push(dim('    2. The key stored in GCP: ') + 'gcloud secrets create <name> --data-file=-');
-      buf.push(dim('    3. The GCP secret name (e.g. RESTRICTED_MAXPOOL_ZAI_NEW)'));
+      buf.push(dim('  Press ') + bold('a') + dim(' to add one. Two ways to supply the key:'));
+      buf.push('');
+      buf.push(dim('   A) Paste the API key directly — stored in your config (0600).'));
+      buf.push(dim('      Simplest; works with no cloud setup.'));
+      buf.push('');
+      buf.push(dim('   B) Point at a GCP Secret Manager name — the key never touches disk.'));
+      buf.push(dim('      Store it:  ') + 'gcloud secrets create MY_KEY --data-file=-');
+      buf.push(dim('      Maxpool resolves it via YOUR gcloud login:'));
+      buf.push(dim('                 ') + 'gcloud auth application-default login');
+      buf.push(dim('      Delete the secret and the provider stops working everywhere.'));
       return;
     }
     for (const a of providers) {
@@ -1427,8 +1519,13 @@ export class TUI {
       // display order over the canonical am.accounts array (which stays untouched so
       // routing/index-keyed actions are unaffected). Selection navigation shares the
       // SAME order via _selectableIndexes → _displayOrder.
+      let hidden = 0;
       for (const i of this._displayOrder()) {
+        if (this.hideDisabled && this.am.accounts[i]?.enabled === false) { hidden++; continue; }
         lines.push(this._renderAcct(i, bw, showBoth));
+      }
+      if (hidden > 0) {
+        lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
       }
       // Glossary FOOTER (expands the abbreviations the header + inline labels can't
       // spell out). Below the rows so it never breaks the header↔column alignment.
@@ -1464,6 +1561,21 @@ export class TUI {
       lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${a} ${dim(`(${el}s...)`)}`);
     }
 
+    // Providers panel — BEFORE the log so it lands inside the visible region. It used
+    // to be pushed after the pad-to-full-height loop, so every line fell past the
+    // bottom edge and the screen rendered only its header (reported 2026-08-10:
+    // "when I click on providers I just see the title — how is that helpful?").
+    if (this.mode === 'providers') {
+      const pLines = [];
+      this._renderProviders(pLines, W);
+      lines.push('', ...pLines);
+    }
+    if (this.mode === 'addtype') {
+      const aLines = [];
+      this._renderAddType(aLines);
+      lines.push('', ...aLines);
+    }
+
     // Completed log
     // 2 = separator + footer; confirm adds its detail line; updates adds its detail block.
     const footerH = this.mode === 'confirm' ? 3
@@ -1476,13 +1588,6 @@ export class TUI {
 
     // Pad to fill
     while (lines.length < H - footerH) lines.push('');
-
-    // Providers panel — shown when the user is on the providers screen
-    if (this.mode === 'providers' || this.mode === 'select') {
-      const pLines = [];
-      this._renderProviders(pLines, W);
-      lines.push(...pLines);
-    }
 
     // ── Footer
     lines.push(' ' + dim('─'.repeat(W - 2)));
@@ -1744,13 +1849,15 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('p')} Providers  ${bold('m')} Routing  ${bold('s')} Sync  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop`;
+        return ` ${bold('a')} Accounts  ${bold('p')} Providers  ${bold('m')} Routing  ${bold('h')} Hide disabled  ${bold('s')} Sync  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop`;
       case 'updates': {
         const state = this._autoUpdateOn() ? green('on') : dim('off');
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
       }
       case 'accounts':
-        return ` ${bold('l')} Login/re-auth (browser)  ${bold('k')} API key  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+      case 'addtype':
+        return ` ${bold('1')}-${bold('4')} pick a type  ${bold('Esc')} Back`;
       case 'providers':
         return ` ${bold('a')} Add provider  ${bold('d')} Delete  ${bold('t')} Enable/disable  ${bold('Esc')} Back`;
       case 'routing': {
