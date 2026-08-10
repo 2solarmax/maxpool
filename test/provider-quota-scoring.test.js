@@ -177,7 +177,7 @@ test('a session bound to a HEALTHY provider stays put (no unnecessary churn)', (
   const am = new AccountManager([
     { name: 'glm max', type: 'provider', provider: 'zai', authToken: 'k1', upstream: 'https://api.z.ai/api/anthropic' },
     { name: 'glm glm1', type: 'provider', provider: 'zai', authToken: 'k2', upstream: 'https://api.z.ai/api/anthropic' },
-  ], 0.90, { crossProviderFallbackPolicy: 'always' });
+  ], 0.90, { routingMode: 'sticky', crossProviderFallbackPolicy: 'always' });
   // Both healthy
   am.accounts[0].quota.providerSes = 0.10;
   am.accounts[1].quota.providerSes = 0.15;

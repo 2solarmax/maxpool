@@ -129,7 +129,9 @@ test("policy 'never' keeps a Claude session on Claude (no provider fallback)", (
 test("policy 'always' peers providers with Claude for a compatible session", () => {
   const am = withProviders('always');
   assert.equal(am._effectivePriority(glmOf(am), { profile: 'all' }), 0, 'provider peers under always');
-  assert.equal(am._effectivePriority(glmOf(am), { anthropicIncompatible: true }), 10, 'incompatible session keeps fallback priority');
+  // Under balance mode (migrated from 'always'), the incompatible-session home
+  // provider peers at priority 0 — same as any account in balance mode.
+  assert.equal(am._effectivePriority(glmOf(am), { anthropicIncompatible: true }), 0, 'balance mode: incompatible home provider peers');
 });
 
 // ── signed thinking: fallback allowed, MIGRATION stays Claude-only ────────────

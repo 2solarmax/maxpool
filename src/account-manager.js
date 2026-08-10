@@ -111,6 +111,7 @@ const DEFAULT_SCHEDULER = {
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
   paceCostWeight: 1.5,            // soft de-preference of accounts burning ahead of pace (was the ×6 term)
+  utilizationWeight: 3,           // RAW utilization cost — drives load balancing in the mid-range
   scarcityWeight: 6,              // legacy; superseded by paceCostWeight (kept so old configs don't error)
   // Reserve-account OVERFLOW model. A weekly-RESERVE account (util 0.85-0.95) used to
   // sit idle behind a healthy-only first pass; now it's eligible in the first pass but
@@ -255,10 +256,16 @@ export class AccountManager {
     // Migrate the legacy single-value policy to the new mode if the caller (config)
     // set `crossProviderFallbackPolicy` but not `routingMode`. The per-provider
     // `providers[<key>].claudeFallback` still works under the prefer-* modes.
+    // IMPORTANT: when schedulerOptions is empty (no explicit crossProviderFallbackPolicy),
+    // the DEFAULT_SCHEDULER value 'never' triggers migration. But the old behaviour
+    // under 'never' WAS sticky pinning — so the default must map to 'sticky', not
+    // 'prefer-claude'. Only an EXPLICIT 'always' in the caller's config changes the mode.
     if (!schedulerOptions.routingMode) {
       const leg = schedulerOptions.crossProviderFallbackPolicy;
       if (leg === 'always') this.scheduler.routingMode = 'balance';
-      else this.scheduler.routingMode = 'prefer-claude';
+      else if (leg === 'when-exhausted') this.scheduler.routingMode = 'prefer-claude';
+      // 'never' or unset → sticky (the historical default: sessions pin to one account)
+      else this.scheduler.routingMode = 'sticky';
     }
     this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
     this.accounts = accounts.map((acct, index) => ({
@@ -1877,7 +1884,7 @@ export class AccountManager {
     return base;
   }
 
-  setRoutingMode(mode) {
+  setProviderRoutingMode(mode) {
     if (!['balance', 'prefer-claude', 'prefer-zai', 'prefer-kimi', 'sticky'].includes(mode)) return false;
     this.scheduler.routingMode = mode;
     console.log(`[Maxpool] Routing mode set to "${mode}"`);
@@ -1889,7 +1896,7 @@ export class AccountManager {
     if (!['never', 'when-exhausted', 'always'].includes(policy)) return false;
     this.scheduler.crossProviderFallbackPolicy = policy;
     // Map to the new mode so the binding/priority logic agrees.
-    this.scheduler.routingMode = policy === 'always' ? 'balance' : 'prefer-claude';
+    this.scheduler.routingMode = policy === 'always' ? 'balance' : policy === 'when-exhausted' ? 'prefer-claude' : 'sticky';
     console.log(`[Maxpool] Cross-provider fallback policy set to "${policy}" (routing mode: ${this.scheduler.routingMode})`);
     return true;
   }
@@ -2154,6 +2161,14 @@ export class AccountManager {
     // soft de-preference of accounts burning ahead of an even pace. Never a bench.
     const paceCost = this._accountScarcity(account, now) * this.scheduler.paceCostWeight;
 
+    // RAW utilization cost — direct, not pace-adjusted. The pace cost above discounts
+    // by how far into the window you are, so an account at 80% with 2h left is only
+    // "slightly ahead of pace" → tiny cost. That's right for avoiding premature
+    // benching, but wrong for load balancing: an account at 80% should be clearly less
+    // attractive than one at 10% even if both are "on pace". Measured 2026-08-10: cc at
+    // 80% scored 52.30 vs glm at 10% at 52.15 — a 0.15 gap drowned by round-robin.
+    const utilizationCost = this._rawUtilization(account) * this.scheduler.utilizationWeight;
+
     // Per-model weekly de-preference: an account whose scoped weekly for THIS
     // request's model (e.g. Fable) is high-but-not-exhausted is a poor pick for
     // that model — shed its load toward healthier accounts BEFORE the hard bench
@@ -2180,7 +2195,7 @@ export class AccountManager {
     // default) learns the real number within a cycle. `probing`/requalify still
     // flags a never-seen account for learning — that path is unchanged.
 
-    return concurrency + capPenalty + paceCost + scopedPace + spread + ramp + reserveCost + failurePenalty;
+    return concurrency + capPenalty + paceCost + utilizationCost + scopedPace + spread + ramp + reserveCost + failurePenalty;
   }
 
   /**
@@ -2232,6 +2247,29 @@ export class AccountManager {
       scarcity = Math.max(scarcity, this._windowScarcity(q.providerWk, q.providerWkReset, WEEK_MS, now));
     }
     return scarcity;
+  }
+
+  /** RAW utilization (0..1) — not pace-adjusted. Reads the same fields as
+   *  _accountScarcity but WITHOUT the elapsed-fraction discount. This is the signal
+   *  the load balancer needs: an account at 80% is more expensive than one at 10%,
+   *  full stop. */
+  _rawUtilization(account) {
+    const q = account?.quota;
+    if (!q) return 0;
+    // SESSION windows use raw utilization — headroom is consumed immediately and an
+    // 80%-used 5h window is genuinely more expensive than a 10%-used one right now.
+    let util = 0;
+    if (q.unified5h != null) util = Math.max(util, clamp01(q.unified5h));
+    if (q.providerSes != null) util = Math.max(util, clamp01(q.providerSes));
+    // WEEKLY windows use PACE-ADJUSTED utilization (via _windowScarcity), not raw —
+    // a 79% account resetting in 2h has plenty of headroom and should be cheap to
+    // spend (the use-it-or-lose-it principle). Using raw weekly would break that.
+    // The pace cost already carries this signal; here we add only the session signal
+    // the pace cost was too weak to express.
+    if (q.tokensLimit != null && q.tokensLimit > 0 && q.tokensRemaining != null) {
+      util = Math.max(util, 1 - q.tokensRemaining / q.tokensLimit);
+    }
+    return util;
   }
 
   _windowScarcity(util, resetMs, windowLen, now = Date.now()) {
