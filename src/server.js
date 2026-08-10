@@ -2587,7 +2587,13 @@ function containsImageBlock(value) {
 
 function getMaxpoolProfile(headers) {
   // headerValue() handles the x-teamclaude-* legacy fallback.
-  const profile = String(headerValue(headers, 'x-maxpool-profile') || 'claude').trim().toLowerCase();
+  // A request with NO x-maxpool-profile header is a bare `claude` session that
+  // inherited ANTHROPIC_BASE_URL from a parent cc shell (measured 2026-08-10: 41% of
+  // traffic). Defaulting those to 'claude' (Anthropic-only) silently excluded
+  // providers from 7,489 requests that should have been able to use them. Configurable
+  // so a setup that wants bare claude to be Anthropic-only can set it back.
+  const fallback = String(headers?.['x-maxpool-default-profile'] || '').trim().toLowerCase();
+  const profile = String(headerValue(headers, 'x-maxpool-profile') || fallback || 'claude').trim().toLowerCase();
   return profile || 'claude';
 }
 
