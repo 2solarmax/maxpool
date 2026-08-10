@@ -140,22 +140,30 @@ const DEFAULT_SCHEDULER = {
   crossAccountThinkingMigration: true,
   // Cross-PROVIDER fallback policy for 'cc all' (profile=all), i.e. whether a session
   // may be served by a provider FAMILY other than its home (Claude ↔ GLM ↔ Kimi).
-  //   'never'         — (DEFAULT) a Claude session never spills onto a provider. NOTE:
-  //                     this governs the Claude→provider direction ONLY — it is NOT a
-  //                     same-family pin (a provider-origin session still reaches Claude).
-  //   'when-exhausted'— home family preferred; a Claude session falls back to GLM/Kimi
-  //                     only once all Claude accounts are unavailable, and a GLM session
-  //                     may fall to Kimi once GLM is exhausted.
-  //   'always'        — providers peer with Claude for a Claude/unknown session
-  //                     (load-balanced, not last-resort).
-  // DEFAULT is 'never' (2026-07-24): a Claude Code session stays on Anthropic. Routing
-  // Claude→GLM/Kimi proved unreliable (the coding legs 403/429 + ignore the model id),
-  // so cross-routing OUT of Claude is OFF by default; re-enable via the TUI routing
-  // cycle or config. This governs ONLY the Claude→provider direction.
-  // INVARIANT (all policies): a GLM/Kimi-origin session NEVER routes to an Anthropic
-  // account — Anthropic 400s on a non-`srvtoolu_` server_tool_use id; that direction
-  // is unfixable, not policy-tunable.
+  //
+  // SUPERSEDED by `routingMode` below — kept for backward-compat migration only. An
+  // old config carrying `crossProviderFallbackPolicy` but no `routingMode` is upgraded
+  // at boot: 'always' → 'balance', 'when-exhausted'/'never' → 'prefer-claude'. The
+  // per-provider `providers[<key>].claudeFallback` field still controls the same thing
+  // for its one provider under the legacy modes.
   crossProviderFallbackPolicy: 'never',
+  // ROUTING MODE — the single knob that governs how sessions are distributed across
+  // the account pool. Replaces the hidden per-session binding that made 'always' not
+  // actually balance. Reported 2026-08-10: with cross-provider 'always' set, 20
+  // long-lived sessions that happened to start on the same Anthropic account hammered
+  // it at 82% while two GLM accounts at 2%/9% sat idle — because 'always' only governed
+  // the FIRST request; after that the session was pinned to one account.
+  //
+  //   'balance'         — score EVERY request across the full pool. No session binding.
+  //                       Accounts drain evenly. The behaviour 'always' should always
+  //                       have been.
+  //   'prefer-claude'   — score every request, but Anthropic accounts outrank providers
+  //                       unless they are all loaded/exhausted.
+  //   'prefer-zai'      — GLM accounts preferred; Claude/Kimi fill overflow.
+  //   'prefer-kimi'     — Kimi preferred; Claude/GLM fill overflow.
+  //   'sticky'          — the old behaviour, made explicit. Sessions stay on the account
+  //                       they first land on until it goes hot, then rebalance.
+  routingMode: 'sticky',
   // The OTHER cross direction, independent of the policy above: may a provider-origin
   // (GLM/Kimi) session cross to the OTHER provider (GLM↔Kimi)? Default ON — both legs are
   // lenient and accept each other's ids, and it's the reliable direction the user wants
@@ -244,6 +252,14 @@ function parseResetHeader(value) {
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.90, schedulerOptions = {}, dependencies = {}) {
     this.scheduler = { ...DEFAULT_SCHEDULER, ...schedulerOptions };
+    // Migrate the legacy single-value policy to the new mode if the caller (config)
+    // set `crossProviderFallbackPolicy` but not `routingMode`. The per-provider
+    // `providers[<key>].claudeFallback` still works under the prefer-* modes.
+    if (!schedulerOptions.routingMode) {
+      const leg = schedulerOptions.crossProviderFallbackPolicy;
+      if (leg === 'always') this.scheduler.routingMode = 'balance';
+      else this.scheduler.routingMode = 'prefer-claude';
+    }
     this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
     this.accounts = accounts.map((acct, index) => ({
       index,
@@ -1565,7 +1581,15 @@ export class AccountManager {
         return preferred;
       }
     }
-    const bound = this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo);
+    // Session binding only applies in 'sticky' mode. Every other mode scores each
+    // request independently — the whole point of 'balance' is that 20 sessions that
+    // happened to start on the same account do NOT keep hammering it while others
+    // idle. Warmup-pull still works under the non-sticky modes because it keys on
+    // `_isWarming`, not on a binding.
+    const isStickyMode = this.scheduler.routingMode === 'sticky';
+    const bound = isStickyMode
+      ? this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo)
+      : null;
     if (bound) {
       // Warmup-pull: onboard a freshly-ADDED account (added mid-session, no reload)
       // by DIRECTLY re-homing this migration-safe session onto the warming account,
@@ -1821,18 +1845,52 @@ export class AccountManager {
   // (10/20) → fallback-only. A foreign session is provider-only regardless.
   _effectivePriority(account, requestInfo = {}) {
     const base = Number.isFinite(account.priority) ? account.priority : 0;
+    const mode = this.scheduler.routingMode;
+    const incompatible = this._effectiveIncompatible(requestInfo).incompatible;
+    // An incompatible session is pinned to its provider family — no mode overrides that.
+    if (incompatible) {
+      const isHome = account.type === 'provider'
+        && (mode === 'prefer-zai' ? account.provider === 'zai'
+          : mode === 'prefer-kimi' ? account.provider === 'kimi' : true);
+      return isHome ? 0 : base;
+    }
+    // Balance: every account peers at priority 0. Accounts are ranked by score alone.
+    if (mode === 'balance') return 0;
+    // Prefer-* modes: the preferred family sits at 0, everything else at its base
+    // priority (10 for GLM, 20 for Kimi). So the preferred family is chosen first and
+    // the others only when every preferred account is unavailable (the score loop's
+    // pass-1 admits reserve accounts, so a loaded preferred account DOES give way).
+    if (mode === 'prefer-claude') {
+      return account.type === 'provider' ? base : 0;
+    }
+    if (mode === 'prefer-zai') {
+      return account.provider === 'zai' ? 0 : base;
+    }
+    if (mode === 'prefer-kimi') {
+      return account.provider === 'kimi' ? 0 : base;
+    }
+    // Sticky: legacy behaviour — the 'always' policy promoted providers to 0.
     if (account.type === 'provider'
-        && this._claudeFallbackFor(account.provider) === 'always'
-        && !this._effectiveIncompatible(requestInfo).incompatible) {
+        && this._claudeFallbackFor(account.provider) === 'always') {
       return 0;
     }
     return base;
   }
 
+  setRoutingMode(mode) {
+    if (!['balance', 'prefer-claude', 'prefer-zai', 'prefer-kimi', 'sticky'].includes(mode)) return false;
+    this.scheduler.routingMode = mode;
+    console.log(`[Maxpool] Routing mode set to "${mode}"`);
+    return true;
+  }
+
+  // Legacy shim — the TUI routing screen still cycles this. Maps to the new mode.
   setCrossProviderFallbackPolicy(policy) {
     if (!['never', 'when-exhausted', 'always'].includes(policy)) return false;
     this.scheduler.crossProviderFallbackPolicy = policy;
-    console.log(`[Maxpool] Cross-provider fallback policy set to "${policy}"`);
+    // Map to the new mode so the binding/priority logic agrees.
+    this.scheduler.routingMode = policy === 'always' ? 'balance' : 'prefer-claude';
+    console.log(`[Maxpool] Cross-provider fallback policy set to "${policy}" (routing mode: ${this.scheduler.routingMode})`);
     return true;
   }
 
@@ -1906,15 +1964,20 @@ export class AccountManager {
 
     // Compatible session — includes Kimi and GLM-without-server-tools, whose regular
     // tool_use ids pass Anthropic's loose validation, AND ordinary Claude sessions.
-    // Claude is eligible + preferred (priority 0). Provider fallback is the SAFE
-    // direction (lenient providers accept Anthropic ids/signatures) and is
-    // policy-gated ONLY: 'never' keeps a Claude session on Claude; 'when-exhausted'
-    // lets providers serve as a priority-fallback; 'always' peers them
-    // (_effectivePriority). Signed thinking no longer bars providers here — but its
-    // live MIGRATION stays Claude-only (see the rebalance guard).
-    // PER-PROVIDER Claude→provider gate (GLM and Kimi steer independently). Unset ⇒
-    // inherits the legacy global policy, so behavior is unchanged on upgrade.
-    if (account.type === 'provider' && this._claudeFallbackFor(account.provider) === 'never') return false;
+    // Under the new routing modes, providers are eligible whenever the mode allows
+    // them to peer (balance + prefer-{zai,kimi}) or serve as fallback
+    // (prefer-claude + sticky). The legacy per-provider `claudeFallback: 'never'`
+    // gate only applies under 'sticky' — the old behaviour it was written for.
+    if (account.type === 'provider') {
+      const mode = this.scheduler.routingMode;
+      // Balance and prefer-{zai,kimi}: providers are always eligible (scored, not gated).
+      if (mode === 'balance' || mode === 'prefer-zai' || mode === 'prefer-kimi') return true;
+      // Prefer-claude: providers serve as overflow. Still eligible — priority handles the
+      // preference; an available Claude account always wins on priority.
+      if (mode === 'prefer-claude') return true;
+      // Sticky: the legacy per-provider gate applies — this is the mode it was written for.
+      if (this._claudeFallbackFor(account.provider) === 'never') return false;
+    }
     return true;
   }
 
