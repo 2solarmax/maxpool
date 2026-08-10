@@ -44,7 +44,12 @@ test('normal footer uses mnemonic top-level actions', () => {
   // On/off consolidated into [a] Accounts — no longer a top-level footer action.
   assert.doesNotMatch(footer, /On\/off/);
   assert.match(footer, /m Routing/);
-  assert.match(footer, /s Sync/);
+  // `s Sync` removed 2026-08-10: syncAccountsFromDisk already runs every 15s and logs
+  // what it picked up, so a manual key for it was a button for something automatic.
+  assert.doesNotMatch(footer, /s Sync/);
+  // `p Providers` removed in the same change — providers are accounts, managed under [a].
+  assert.doesNotMatch(footer, /p Providers/);
+  assert.match(footer, /h Hide disabled/);
   assert.match(footer, /r Restart/);
   assert.match(footer, /q Stop/);
   assert.doesNotMatch(footer, /switch/i);

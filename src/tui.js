@@ -408,7 +408,6 @@ export class TUI {
       case 'accounts': this._keyAccounts(k); break;
       case 'routing': this._keyRouting(k); break;
       case 'updates': this._keyUpdates(k); break;
-      case 'providers': this._keyProviders(k); break;
       case 'addtype': this._keyAddType(k); break;
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
@@ -447,8 +446,6 @@ export class TUI {
       );
     } else if (k === 'u') {
       this.mode = 'updates';
-    } else if (k === 'p') {
-      this.mode = 'providers';
     } else if (k === 'h') {
       this.hideDisabled = !this.hideDisabled;
       this._addLog(this.hideDisabled ? 'Hiding disabled accounts' : 'Showing all accounts');
@@ -592,10 +589,10 @@ export class TUI {
   // Four account types, two credential sources. Every path lands here so there is
   // exactly ONE thing to learn: press `a`, pick a type, supply a credential.
   static ADD_TYPES = [
-    { key: '1', id: 'anthropic-oauth', label: 'Anthropic subscription (browser login)' },
-    { key: '2', id: 'anthropic-key',   label: 'Anthropic API key' },
-    { key: '3', id: 'zai',             label: 'GLM / z.ai API key' },
-    { key: '4', id: 'kimi',            label: 'Kimi / Moonshot API key' },
+    { key: '1', id: 'anthropic-oauth', label: 'Anthropic subscription', hint: 'log in with a browser (Max / Pro plan)' },
+    { key: '2', id: 'anthropic-key',   label: 'Anthropic API key',      hint: 'pay-per-token key from console.anthropic.com' },
+    { key: '3', id: 'zai',             label: 'GLM (z.ai) API key',     hint: '' },
+    { key: '4', id: 'kimi',            label: 'Kimi (Moonshot) API key', hint: '' },
   ];
 
   _keyAddType(k) {
@@ -660,15 +657,23 @@ export class TUI {
   }
 
   _renderAddType(buf) {
-    buf.push(`${bold('Add an account')}  ${dim('— pick a type')}`);
+    buf.push(`${bold('Add an account')}   ${dim('pick what you have')}`);
     buf.push('');
     for (const t of TUI.ADD_TYPES) {
-      buf.push(`   ${bold(t.key)}  ${t.label}`);
+      buf.push(`   ${bold(t.key)}  ${t.label.padEnd(26)}${dim(t.hint || '')}`);
     }
     buf.push('');
-    buf.push(dim('   API keys: paste the key, OR type a GCP Secret Manager name'));
-    buf.push(dim('   (e.g. RESTRICTED_MAX_MAXPOOL_ZAI_PLUS1) to keep it out of your config.'));
-    buf.push(dim('   GCP needs: gcloud auth application-default login'));
+    buf.push(dim('   Fixing an account that says "reauth"? Pick 1 and log in as that account.'));
+    buf.push(dim('   It repairs the existing row, it does not add a second one.'));
+    buf.push('');
+    // Kept verbatim from the deleted Providers panel — the only place that explained
+    // BOTH credential sources and the gcloud command a non-owner needs.
+    buf.push(dim('   For 2-4, two ways to supply the key:'));
+    buf.push(dim('     A) Paste it — stored in your config (0600). No cloud setup.'));
+    buf.push(dim('     B) Type a GCP Secret Manager name — the key never touches disk.'));
+    buf.push(dim('        Store it:  ') + 'gcloud secrets create MY_KEY --data-file=-');
+    buf.push(dim('        Maxpool reads it as YOU:  ') + 'gcloud auth application-default login');
+    buf.push(dim('        Delete the secret and the account stops working everywhere.'));
   }
 
   // Derive a human-readable account name from a GCP secret name.
@@ -683,17 +688,6 @@ export class TUI {
     return user ? `${provLabel} ${user}` : `${provLabel} primary`;
   }
 
-  _keyProviders(k) {
-    if (k === 'a') {
-      this._providerAddStep('type');
-    } else if (k === 'd') {
-      this._startProviderSelection('delete');
-    } else if (k === 't') {
-      this._startProviderSelection('toggle');
-    } else if (k === 'esc' || k === 'q') {
-      this.mode = 'normal';
-    }
-  }
 
   // Multi-step input for adding a provider. Steps: type → secret/key → name.
   // Name LAST so it can be pre-filled from the secret (RESTRICTED_AL_MAXPOOL_ZAI →
@@ -707,17 +701,17 @@ export class TUI {
       this.inputSensitive = false;
       this.inputCb = value => {
         const provider = String(value || '').trim().toLowerCase();
-        if (provider !== 'zai' && provider !== 'kimi') { this._addLog('Type must be zai or kimi'); this.mode = 'providers'; return; }
+        if (provider !== 'zai' && provider !== 'kimi') { this._addLog('Type must be zai or kimi'); this.mode = 'accounts'; return; }
         this._providerAddStep('secret', { ...prev, provider });
       };
     } else if (step === 'secret') {
       this.mode = 'input';
-      this.inputPrompt = `${prev.name}: GCP secret name OR paste API key directly`;
+      this.inputPrompt = `${prev.provider === 'kimi' ? 'Kimi' : 'GLM'} key — paste it, or type a GCP secret name`;
       this.inputBuf = '';
       this.inputSensitive = false;
       this.inputCb = async value => {
         const input = String(value || '').trim();
-        if (!input) { this.mode = 'providers'; return; }
+        if (!input) { this.mode = 'accounts'; return; }
         // Heuristic: a GCP secret name is uppercase/dashes/underscores and short.
         // An API key is long and contains dots/mixed-case/alphanumeric.
         const looksLikeSecretName = /^[A-Z][A-Z0-9_-]{2,60}$/.test(input) && !input.includes('.');
@@ -735,7 +729,7 @@ export class TUI {
       this.inputCb = async value => {
         const name = String(value || '').trim() || TUI.deriveProviderName(prev.provider, prev.secretName || '');
         if (this.am.accounts.some(a => a.name === name)) {
-          this._addLog(`Account "${name}" already exists`); this.mode = 'providers'; return;
+          this._addLog(`Account "${name}" already exists`); this.mode = 'accounts'; return;
         }
         await this._doAddProvider({ ...prev, name });
       };
@@ -743,7 +737,7 @@ export class TUI {
   }
 
   async _doAddProvider({ name, provider, secretName, apiKey }) {
-    this.mode = 'providers';
+    this.mode = 'accounts';
     if (secretName) this._addLog(`Resolving secret "${secretName}" from GCP…`);
     else this._addLog(`Adding "${name}" with direct API key…`);
     this.render();
@@ -778,50 +772,7 @@ export class TUI {
     }
   }
 
-  _startProviderSelection(action) {
-    const providers = this.am.accounts.filter(a => a.type === 'provider');
-    if (!providers.length) { this._addLog('No providers to manage'); return; }
-    this._selOptions = providers.map(a => a.index);
-    this._selLabels = providers.map(a => {
-      const enabled = a.enabled !== false;
-      const tag = a.configSourced ? ' (GCP)' : ' (header)';
-      const secret = a.secretName ? ` [${a.secretName}]` : '';
-      return `${a.name}${tag}${secret}${enabled ? '' : ' ✕'}`;
-    });
-    this.selAction = action;
-    this.mode = 'select';
-  }
 
-  _renderProviders(buf, _width) {
-    const providers = this.am.accounts.filter(a => a.type === 'provider');
-    buf.push(`${bold('Providers (GLM / Kimi)')}  ${dim('— managed via GCP Secret Manager')}`);
-    buf.push('');
-    if (!providers.length) {
-      buf.push(dim('  No providers configured.'));
-      buf.push('');
-      buf.push(dim('  Press ') + bold('a') + dim(' to add one. Two ways to supply the key:'));
-      buf.push('');
-      buf.push(dim('   A) Paste the API key directly — stored in your config (0600).'));
-      buf.push(dim('      Simplest; works with no cloud setup.'));
-      buf.push('');
-      buf.push(dim('   B) Point at a GCP Secret Manager name — the key never touches disk.'));
-      buf.push(dim('      Store it:  ') + 'gcloud secrets create MY_KEY --data-file=-');
-      buf.push(dim('      Maxpool resolves it via YOUR gcloud login:'));
-      buf.push(dim('                 ') + 'gcloud auth application-default login');
-      buf.push(dim('      Delete the secret and the provider stops working everywhere.'));
-      return;
-    }
-    for (const a of providers) {
-      const enabled = a.enabled !== false;
-      const tag = a.configSourced ? dim(' (GCP)') : dim(' (header)');
-      const secret = a.secretName ? dim(` [${a.secretName}]`) : '';
-      const status = a.status === 'error' ? red(a.lastError || 'error')
-        : enabled ? green('active') : red('✕');
-      const q = a.quota;
-      const ses = q?.providerSes != null ? ` Ses ${Math.round(q.providerSes * 100)}%` : '';
-      buf.push(`  ${enabled ? '' : dim('')} ${bold(a.name)} ${a.provider}${tag}${secret} ${status}${ses}`);
-    }
-  }
 
   _keyRouting(k) {
     if (k === 'a') {
@@ -882,51 +833,6 @@ export class TUI {
   }
 
   _keySelect(k) {
-    // Provider selection (from the providers screen) uses its own option list.
-    if (this._selOptions && (this.selAction === 'delete' || this.selAction === 'toggle')
-      && this.mode === 'select' && this.am.accounts[this._selOptions[0]]?.type === 'provider') {
-      const opts = this._selOptions;
-      const position = Math.max(0, opts.indexOf(this.selIdx));
-      if (k === 'up' || k === 'k') this.selIdx = opts[Math.max(0, position - 1)] ?? this.selIdx;
-      else if (k === 'down' || k === 'j') this.selIdx = opts[Math.min(opts.length - 1, position + 1)] ?? this.selIdx;
-      else if (k === 'enter') {
-        const account = this.am.accounts[this.selIdx];
-        if (!account) { this.mode = 'providers'; return; }
-        if (this.selAction === 'toggle') {
-          const enable = !account.enabled;
-          this._confirm(
-            `${enable ? 'Enable' : 'Disable'} "${account.name}"?`,
-            enable ? 'Allow this provider to receive requests again.' : 'Stop routing to it. Active requests continue.',
-            () => { this._doToggle(this.selIdx, enable); this.mode = 'providers'; },
-          );
-        } else if (this.selAction === 'delete') {
-          this._confirm(
-            `Delete provider "${account.name}"?`,
-            account.configSourced
-              ? 'Removes it from config and GCP reference. The GCP secret itself stays — delete it separately if needed.'
-              : 'Removes the runtime provider. It returns on the next request that sends its token.',
-            async () => {
-              if (account.configSourced) {
-                try {
-                  const { atomicConfigUpdate } = await import('../config.js');
-                  await atomicConfigUpdate(cfg => {
-                    if (Array.isArray(cfg.providers)) {
-                      cfg.providers = cfg.providers.filter(p => p.name !== account.name);
-                    }
-                  });
-                } catch (err) { this._addLog(`Config update failed: ${err.message}`); }
-              }
-              this.am.removeAccount(this.selIdx);
-              this._addLog(`Deleted provider "${account.name}"`);
-              this.mode = 'providers';
-            },
-          );
-        }
-      }
-      else if (k === 'esc' || k === 'q') { this.mode = 'providers'; }
-      return;
-    }
-
     const selectable = this._selectableIndexes(this.selAction);
     const position = Math.max(0, selectable.indexOf(this.selIdx));
     if (k === 'up' || k === 'k') this.selIdx = selectable[Math.max(0, position - 1)] ?? this.selIdx;
@@ -961,9 +867,14 @@ export class TUI {
           () => this._doToggle(this.selIdx, enable),
         );
       } else if (this.selAction === 'delete') {
+        // A GCP-backed row: say what deleting does NOT do, so nobody thinks the key
+        // is gone from the cloud.
+        const secret = account.secretName
+          ? ` The GCP secret "${account.secretName}" is left alone — delete it separately if you want the key gone.`
+          : '';
         this._confirm(
           `Delete "${account.name}"?`,
-          'Permanently remove it from Maxpool config. Deletion is blocked while it has active requests.',
+          `Permanently remove it from Maxpool config. Deletion is blocked while it has active requests.${secret}`,
           () => this._doDelete(this.selIdx),
         );
       } else if (this.selAction === 'rename') {
@@ -1013,10 +924,16 @@ export class TUI {
       .map(index => ({ account: this.am.accounts[index], index }))
       .filter(({ account }) => {
         if (action === 'prefer') return account.type !== 'provider' && account.enabled;
-        // Enable/disable also works on runtime providers (GLM/Kimi) — a session-only
-        // toggle, since they're not in config. Rename/delete stay config-account-only.
-        if (action === 'toggle') return this._configAccountIndex(account) >= 0 || account.type === 'provider';
-        return this._configAccountIndex(account) >= 0;
+        // Enable/disable works on EVERY row — including a session-created provider,
+        // where it is the DURABLE action (exportRuntimeProviders persists `enabled`,
+        // and the header path never re-enables a row the user benched).
+        if (action === 'toggle') return true;
+        // Rename/delete need a config entry to act on. That now includes config
+        // PROVIDERS (via _isConfigBacked), which the old accounts-only lookup excluded.
+        // A SESSION row is still barred: renaming it forks a duplicate (upsertRuntime
+        // Account matches by NAME, so the next header request recreates the original
+        // and the same key lands on two accounts), and deleting it undoes itself.
+        return this._isConfigBacked(account);
       })
       .map(({ index }) => index);
   }
@@ -1133,16 +1050,24 @@ export class TUI {
     if (this.am.accounts.some((a, i) => i !== idx && a.name === newName)) {
       this._addLog(`An account named "${newName}" already exists`); return;
     }
-    const cfgIdx = this._configAccountIndex(account);
-    if (cfgIdx < 0) { this._addLog(`Cannot rename "${account.name}" (not in config)`); return; }
+    const loc = this._configLocation(account);
+    if (!loc) {
+      // Renaming a SESSION row forks it: upsertRuntimeAccount matches by NAME, so the
+      // next `cc all` request recreates the original and the same key ends up on two
+      // accounts — double-counted quota and routing weight.
+      this._addLog(`Cannot rename "${account.name}" — it comes from a running cc session, not your config`);
+      return;
+    }
+    const cfgIdx = loc.index;
+    const cfgArray = loc.array;
     const old = account.name;
-    const prev = this.config.accounts[cfgIdx].name;
-    this.config.accounts[cfgIdx].name = newName;
+    const prev = this.config[cfgArray][cfgIdx].name;
+    this.config[cfgArray][cfgIdx].name = newName;
     if (this.config.routing?.preferredAccount === old) this.config.routing.preferredAccount = newName;
     try {
       await this.saveConfig(this.config);
     } catch (error) {
-      this.config.accounts[cfgIdx].name = prev;
+      this.config[cfgArray][cfgIdx].name = prev;
       throw error;
     }
     account.name = newName; // update the running account manager
@@ -1297,6 +1222,30 @@ export class TUI {
     return this.config.accounts.findIndex(candidate => candidate.name === account.name);
   }
 
+  /** Where does this account live in config — `accounts` or `providers`?
+   *  A config PROVIDER (GLM/Kimi from config.providers) is just as durable as an OAuth
+   *  account, but _configAccountIndex only ever searched config.accounts, so providers
+   *  reported -1 and were excluded from rename/delete. With the Providers screen gone,
+   *  that would strand them in config forever. Returns { array, index } or null. */
+  _configLocation(account) {
+    if (!account) return null;
+    const accIdx = this._configAccountIndex(account);
+    if (accIdx >= 0) return { array: 'accounts', index: accIdx };
+    const provs = this.config.providers;
+    if (Array.isArray(provs)) {
+      const pIdx = provs.findIndex(p => p.name === account.name);
+      if (pIdx >= 0) return { array: 'providers', index: pIdx };
+    }
+    return null;
+  }
+
+  /** True when this row can be permanently removed/renamed — i.e. it is backed by a
+   *  config entry. A SESSION row (created from `cc all` headers, not in config) is not:
+   *  deleting it is a lie because the next request recreates it. */
+  _isConfigBacked(account) {
+    return this._configLocation(account) !== null;
+  }
+
   async _doToggle(idx, enabled) {
     const account = this.am.accounts[idx];
     if (!account) return;
@@ -1342,11 +1291,16 @@ export class TUI {
       this._addLog(`Cannot delete "${name}" while ${account.inFlight} request(s) are active; disable it and retry when idle`);
       return;
     }
-    const configIndex = this._configAccountIndex(account);
-    if (configIndex < 0) {
-      this._addLog(`Cannot permanently delete runtime provider "${name}" from the TUI`);
+    const loc = this._configLocation(account);
+    if (!loc) {
+      // A SESSION row: a running `cc all` is handing maxpool this key, so deleting it
+      // would be undone by the next request. Disabling IS durable here — the header
+      // path never re-enables a benched row — so point the user at the action that works.
+      this._addLog(`"${name}" comes from a running cc session, so deleting it would not stick — press t to switch it off instead (that survives restarts)`);
       return;
     }
+    const configIndex = loc.index;
+    const configArray = loc.array;
     const wasEnabled = account.enabled;
     this.am.setAccountEnabled(idx, false);
     if (account.inFlight > 0) {
@@ -1355,7 +1309,7 @@ export class TUI {
       return;
     }
 
-    const [removedConfig] = this.config.accounts.splice(configIndex, 1);
+    const [removedConfig] = this.config[configArray].splice(configIndex, 1);
     const previousRouting = this.config.routing;
     if (this.config.routing?.preferredAccount === name) {
       this.config.routing = { mode: 'automatic', preferredAccount: null };
@@ -1363,13 +1317,13 @@ export class TUI {
     try {
       await this.saveConfig(this.config);
     } catch (error) {
-      this.config.accounts.splice(configIndex, 0, removedConfig);
+      this.config[configArray].splice(configIndex, 0, removedConfig);
       this.config.routing = previousRouting;
       this.am.setAccountEnabled(idx, wasEnabled);
       throw error;
     }
     if (!this.am.removeAccount(idx)) {
-      this.config.accounts.splice(configIndex, 0, removedConfig);
+      this.config[configArray].splice(configIndex, 0, removedConfig);
       this.config.routing = previousRouting;
       this.am.setAccountEnabled(idx, wasEnabled);
       await this.saveConfig(this.config);
@@ -1565,11 +1519,6 @@ export class TUI {
     // to be pushed after the pad-to-full-height loop, so every line fell past the
     // bottom edge and the screen rendered only its header (reported 2026-08-10:
     // "when I click on providers I just see the title — how is that helpful?").
-    if (this.mode === 'providers') {
-      const pLines = [];
-      this._renderProviders(pLines, W);
-      lines.push('', ...pLines);
-    }
     if (this.mode === 'addtype') {
       const aLines = [];
       this._renderAddType(aLines);
@@ -1849,7 +1798,7 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('p')} Providers  ${bold('m')} Routing  ${bold('h')} Hide disabled  ${bold('s')} Sync  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
       case 'updates': {
         const state = this._autoUpdateOn() ? green('on') : dim('off');
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
@@ -1858,8 +1807,6 @@ export class TUI {
         return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'addtype':
         return ` ${bold('1')}-${bold('4')} pick a type  ${bold('Esc')} Back`;
-      case 'providers':
-        return ` ${bold('a')} Add provider  ${bold('d')} Delete  ${bold('t')} Enable/disable  ${bold('Esc')} Back`;
       case 'routing': {
         // Show the CURRENT cross-provider policy inline so pressing f visibly changes it
         // right here at the footer (the policy also renders in the header, far from the
