@@ -426,7 +426,12 @@ export class TUI {
     } else if (k === 'r') {
       this._confirm(
         'Restart Maxpool?',
-        'Pause new requests, drain active work, then start the updated server.',
+        // Say what actually happens to the user's sessions. The old text ("pause new
+        // requests, drain active work") was accurate but hid the consequence: with
+        // several long requests in flight, NEW requests get a 503 for up to the drain
+        // window, and every running session sees a retry. Reported 2026-08-10: "I click
+        // restart, then yes, and NOTHING happens" — while ~30 sessions were 503-ing.
+        this._restartConfirmDetail(),
         // Do NOT stop the TUI here — let the reload path own it: cold restart stops
         // it in restartWorkerNow, a seamless reload in releaseBatonAndDrain (on
         // MSG_RELEASE). If the reload ROLLS BACK (new worker fails to boot), neither
@@ -556,6 +561,22 @@ export class TUI {
       this._addLog(`Could not save update setting: ${error.message}`);
     }
     this.mode = 'normal';
+  }
+
+  /** Live description of what pressing restart will do RIGHT NOW — counts the
+   *  in-flight requests that must drain and states the worst-case pause, so the
+   *  confirm is honest about the cost instead of hiding it behind "drain active work". */
+  _restartConfirmDetail() {
+    const inFlight = this.active?.size || 0;
+    const sessions = new Set([...(this.active?.values() || [])].map(r => r.sessionKey).filter(Boolean)).size;
+    const drainSec = Math.round((this.config?.restartDrainTimeoutMs ?? 10_000) / 1000);
+    if (inFlight === 0) {
+      return 'Nothing is in flight, so this restarts immediately. Running sessions reconnect on their next request.';
+    }
+    const s = sessions === 1 ? '' : 's';
+    return `${inFlight} request${inFlight === 1 ? '' : 's'} from ${sessions} session${s} are in flight. `
+      + `They finish first (up to ${drainSec}s), and during that window NEW requests get a "restarting" retry. `
+      + 'Sessions are not lost — they reconnect automatically.';
   }
 
   _keyAccounts(k) {

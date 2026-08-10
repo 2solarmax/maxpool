@@ -211,7 +211,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             type: 'error',
             error: {
               type: 'restart_in_progress',
-              message: 'Maxpool is restarting. Retry immediately.',
+              message: 'Maxpool is restarting — finishing in-flight requests first. This retries automatically; your session is not lost.',
             },
           }));
           return;
@@ -247,7 +247,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           type: 'error',
           error: {
             type: 'restart_in_progress',
-            message: 'Maxpool is restarting. Retry immediately.',
+            message: 'Maxpool is restarting — finishing in-flight requests first. This retries automatically; your session is not lost.',
           },
         }));
         return;

@@ -985,6 +985,13 @@ async function serverWorkerCommand() {
     pauseAdmission: () => accountManager.setAdmissionPaused(true),
     resumeAdmission: () => accountManager.setAdmissionPaused(false),
     restartNow: requestReload,
+    // The pre-drain only earns its cost on the COLD path (the socket closes, so an
+    // in-flight request would be severed). Seamless keeps serving them post-baton.
+    isSeamless: () => {
+      const forceCold = process.env.MAXPOOL_TEST_FORCE_COLD_RESTART === '1'
+        || process.env.MAXPOOL_TUI_COLD_RESTART === '1';
+      return !forceCold && reloadStrategy({ supervised }) === 'seamless';
+    },
     // Configurable so ops can tune the bounded pre-restart drain, and so the
     // integration test can exercise the force-restart path without a 10s wait.
     ...(Number.isFinite(config.restartDrainTimeoutMs) ? { drainTimeoutMs: config.restartDrainTimeoutMs } : {}),

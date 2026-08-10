@@ -66,7 +66,12 @@ test('restart requires confirmation and explains drain behavior', () => {
 
   tui._keyNormal('r');
   assert.equal(tui.mode, 'confirm');
-  assert.match(tui.confirmDetail, /drain active work/i);
+  // The detail is now DERIVED from what is actually in flight (2026-08-10): with an
+  // idle pool the restart really is instant, and saying "drain active work" there was
+  // the copy that made the user expect a wait and read the instant restart as "nothing
+  // happened". The in-flight wording is covered in restart-ux-and-adoption.test.js.
+  assert.match(tui.confirmDetail, /restarts immediately/i);
+  assert.match(tui.confirmDetail, /reconnect/i);
   assert.equal(stopped, false);
   assert.equal(restarted, false);
 

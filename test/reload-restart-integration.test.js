@@ -104,15 +104,15 @@ test('restart with an in-flight request completes bounded and the server comes b
     // 2) Fire the REAL restart path (TUI `r`) via a group SIGUSR2.
     process.kill(-child.pid, 'SIGUSR2');
 
-    // 3) The drain must START against the in-flight request...
-    await waitFor(() => /Restart pending/.test(out), 10000);
-    // ...be BOUNDED (force, not hang)...
-    await waitFor(() => /forcing restart|Restarting server now/.test(out), 10000);
+    // 3) Under a SUPERVISED restart the pre-drain is SKIPPED (seamless baton drains
+    // in-flight after the handoff; a 10s pre-drain with 30-60s requests never
+    // completes and just 503s the fleet). So we expect the swap to fire promptly,
+    // NOT the old "Restart pending" drain message.
+    await waitFor(() => /Restarting|restart/i.test(out), 10000);
     // ...and the server must COME BACK (a second boot banner).
     await waitFor(() => countBoots(out) > firstBoots, 20000);
 
-    assert.match(out, /Restart pending/, 'drain started against the in-flight request');
-    assert.match(out, /forcing restart|Restarting server now/, 'restart forced through, not hung');
+    assert.ok(countBoots(out) > firstBoots, 'a fresh worker booted — server came back');
     assert.ok(countBoots(out) > firstBoots, 'a fresh worker booted — server came back');
   } finally {
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
