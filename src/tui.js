@@ -804,12 +804,16 @@ export class TUI {
       );
     } else if (k === 'p' && this.am.accounts.some(account => account.type !== 'provider')) {
       this._startSelection('prefer');
+    } else if (k === 'f' || k === 'F' || k === 'm' || k === 'M') {
+      // Cycle the named routing mode — reversible + non-destructive, so no confirm
+      // dialog (unlike restart/delete). `f` is kept for muscle memory from the old
+      // cross-provider knob this replaced; `m` is the mnemonic (mode).
+      this._cycleRoutingMode();
     } else if (k === 'g' || k === 'k') {
+      // Per-provider Claude→provider fallback. Only affects routing under `sticky`
+      // mode — under balance/prefer-* the mode itself controls eligibility. Still
+      // safe to set (it'll apply if you switch back to sticky).
       this._cycleProviderClaudeFallback(k === 'g' ? 'zai' : 'kimi');
-    } else if (k === 'f' || k === 'F') {
-      // Cycle the cross-provider fallback policy in place — reversible + non-destructive,
-      // so no confirm dialog (unlike restart/delete). Accept F too (Shift-f muscle memory).
-      this._cycleCrossProviderPolicy();
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
@@ -843,14 +847,38 @@ export class TUI {
     apply();
   }
 
-  async _cycleCrossProviderPolicy() {
-    const order = ['never', 'when-exhausted', 'always'];
-    const cur = this.am._crossProviderFallbackPolicy();
-    const next = order[(order.indexOf(cur) + 1) % order.length];
-    this.am.setCrossProviderFallbackPolicy(next);
-    this.config.scheduler = { ...(this.config.scheduler || {}), crossProviderFallbackPolicy: next };
+  /** The five named routing modes, in cycle order. Each carries the plain-English
+   *  line the header shows, so the name the operator picks and the behaviour they
+   *  get are described by ONE string — the old `never/when-exhausted/always` knob
+   *  read as "load balance across everything" and did nothing of the sort. */
+  static ROUTING_MODES = [
+    { id: 'balance', label: 'Balance all',
+      help: 'Score every request across Claude, GLM and Kimi. Busiest accounts get less.' },
+    { id: 'prefer-claude', label: 'Prefer Claude',
+      help: 'Claude first; GLM/Kimi pick up the overflow when Claude is loaded.' },
+    { id: 'prefer-zai', label: 'Prefer GLM',
+      help: 'GLM first; Claude/Kimi pick up the overflow when GLM is loaded.' },
+    { id: 'prefer-kimi', label: 'Prefer Kimi',
+      help: 'Kimi first; Claude/GLM pick up the overflow when Kimi is loaded.' },
+    { id: 'sticky', label: 'One account per session',
+      help: 'Each session stays on the account it started on. No spreading.' },
+  ];
+
+  _routingModeDef(id) {
+    return TUI.ROUTING_MODES.find(m => m.id === id) || TUI.ROUTING_MODES[0];
+  }
+
+  async _cycleRoutingMode() {
+    const modes = TUI.ROUTING_MODES;
+    const cur = this.am.scheduler?.routingMode || 'sticky';
+    const next = modes[(modes.findIndex(m => m.id === cur) + 1) % modes.length];
+    this.am.setProviderRoutingMode?.(next.id);
+    this.config.scheduler = { ...(this.config.scheduler || {}), routingMode: next.id };
+    // Clear the stale legacy policy so it can't contradict the new mode in
+    // /maxpool/status or be read by code that still references it.
+    delete this.config.scheduler.crossProviderFallbackPolicy;
     await this.saveConfig(this.config);
-    this._addLog(`Cross-provider fallback: ${next}`);
+    this._addLog(`Routing: ${next.label} — ${next.help}`);
   }
 
   _keySelect(k) {
@@ -1421,9 +1449,18 @@ export class TUI {
       const how = this._autoUpdateOn() ? 'applying automatically · or press u now' : 'press u to update now';
       lines.push('  ' + yellow(`↑ Update available: v${v.current} → v${v.latest}`) + dim(`  ·  ${how}`));
     }
-    const routing = this.am.routingMode === 'preferred'
-      ? `Manual preference: ${this.am.preferredAccountName} (automatic failover)`
-      : 'Automatic load balancing';
+    // Routing header: name the mode + show the one-line description the operator
+    // picked when cycling. Under `preferred`, show the manual-preference line (still
+    // available via the 'p' key on the routing screen).
+    let routing;
+    if (this.am.routingMode === 'preferred') {
+      routing = `Manual preference: ${this.am.preferredAccountName} (automatic failover)`;
+    } else {
+      // Label ONLY here. The one-line description belongs on the routing screen (and in
+      // the log line when the mode changes) — inlining it here pushed the provider-volume
+      // and cross-provider fragments off the right edge at 120 columns.
+      routing = this._routingModeDef(this.am.scheduler?.routingMode || 'sticky').label;
+    }
     // Cross-provider fallback policy — only meaningful when GLM/Kimi providers are in
     // the pool (profile=all). never=strict pin (yellow), when-exhausted=default (cyan),
     // always=peer (green).
@@ -1829,12 +1866,14 @@ export class TUI {
       case 'addtype':
         return ` ${bold('1')}-${bold('4')} pick a type  ${bold('Esc')} Back`;
       case 'routing': {
-        // Show the CURRENT cross-provider policy inline so pressing f visibly changes it
-        // right here at the footer (the policy also renders in the header, far from the
-        // keypress — the "f does nothing" report).
-        const g = this.am._claudeFallbackFor?.('zai') || 'never';
-        const k = this.am._claudeFallbackFor?.('kimi') || 'never';
-        return ` ${bold('a')} Automatic  ${bold('p')} Preference  ${bold('g')} GLM: ${cyan(g)} ↻  ${bold('k')} Kimi: ${cyan(k)} ↻  ${bold('Esc')} Back`;
+        const mode = this._routingModeDef(this.am.scheduler?.routingMode || 'sticky');
+        const hasProviders = this.am.accounts.some(a => a.type === 'provider');
+        // g/k controls only affect routing under sticky — hide them under other modes
+        // so the operator never cycles a knob that does nothing.
+        const provPart = (hasProviders && mode.id === 'sticky')
+          ? `  ${bold('g')} GLM: ${cyan(this.am._claudeFallbackFor?.('zai') || 'never')}  ${bold('k')} Kimi: ${cyan(this.am._claudeFallbackFor?.('kimi') || 'never')}`
+          : '';
+        return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}  ${bold('p')} Manual preference  ${bold('Esc')} Back`;
       }
       case 'select': {
         const act = this.selAction === 'prefer'
