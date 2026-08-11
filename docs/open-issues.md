@@ -14,8 +14,17 @@ Living tracker for in-flight work. One core issue at a time. Newest status on to
 
 ## OPEN
 
+### M1. Multi-provider routing correctness across modes
+**Status:** Shipped v1.5.80-83. Monitor.
+**What shipped:** Five named routing modes, utilization-weighted scoring in `balance`,
+per-mode provider eligibility in `_isRequestCompatible` + `_effectivePriority`,
+TUI exposure (`f`/`m` cycle), cache-first secret resolution.
+**Watch for:** GLM weekly limit absent on legacy plans (TOKENS_LIMIT vs CREDIT_LIMIT);
+z.ai sunsetting legacy plans (migration April 2026). Don't rely on unlimited-weekly
+long-term.
+
 ### 1. Routing: spread-to-stay-healthy; use-it-or-lose-it only near reset  ⟵ CORE
-**Status:** Phase 1 SHIPPED (v1.2.0), Phase 2 SHIPPED (v1.4.0). Phase 3 CLOSED 2026-06-27 (not worth building — see below).
+**Status:** Phase 1 SHIPPED (v1.2.0), Phase 2 SHIPPED (v1.4.0). Phase 3 CLOSED 2026-06-27. **SUPERSEDED by routing modes (v1.5.80, decision #8)** — the five named modes (`balance`/`prefer-claude`/`prefer-zai`/`prefer-kimi`/`sticky`) replace the old scoring-only approach. In `balance` mode every request is scored across the whole pool with utilization-weighting; session binding only happens under `sticky`. The original Phase 1/2 scoring is preserved as the implementation under each mode.
 **Problem:** The scheduler over-weighted pace + near-reset (`scarcity×6` was the dominant term), so it *concentrated* load on the single soonest-to-reset account and benched raw-healthy accounts (mk@gomokka at 69% raw) to last-resort "critical" via pace. Concentration is exactly what triggers the short-term throttle — the opposite of the goal.
 **Design:** 3-advocate council + lead-architect synthesis (2026-06-26). Continuous, load-gated additive scoring — no mode switches. Phased "prove-it" rollout.
 **Phase 1 (DONE, v1.2.0):**

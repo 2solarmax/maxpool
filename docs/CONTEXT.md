@@ -18,23 +18,96 @@
 
 ## Current focus
 
-Release hygiene + a reusable project-context harness shipped 2026-07-23 (pushed to
-`private/main` @ `02d9f9b`; judge verdict SHIP):
-- `CHANGELOG.md` is now auto-generated from Conventional Commits (git-cliff) and
-  folds into each release via the package.json `version` hook. It regenerates on
-  the NEXT `npm run release` (nothing releases on its own).
-- This repo now has a committed Claude Code harness: `CLAUDE.md` (durable facts +
-  invariants), this file (`docs/CONTEXT.md`, living memory), a SessionStart read
-  hook, and the `/maxpool-builder` skill (memory ritual + reuse seed).
-- npm account hardened: 2FA on + package publishing set to "require 2FA and
-  disallow tokens" (OIDC publish unaffected).
+Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
+load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
+routing modes. Current version: **v1.5.83** (installed as a global symlink to
+`~/maxpool`, so `git pull` updates the running install).
 
-No open feature work owned by this thread. Ongoing product roadmap lives in
-`docs/open-issues.md` (rate-aware load balancing is the core problem).
+**Recently shipped (2026-08-10/11):**
+- v1.5.80: routing modes (`balance`, `prefer-claude`, `prefer-zai`, `prefer-kimi`,
+  `sticky`) replacing the opaque 3-policy knob. Utilisation-weighted scoring in
+  `balance` mode. Session binding only under `sticky`.
+- v1.5.81: restart UX fix — seamless path skips the 10s pre-drain (it was pure cost:
+  30-60s requests never finish in 10s, so it was always 10s of guaranteed 503s for
+  zero drained requests). Progress ticks during cold-path drain. Honest confirm text.
+- v1.5.82: cache-first secret resolution (reads `~/.claude/.credentials-cache` before
+  `gcloud`, fixing `secret-unresolved` rows that spawned duplicate `-fallback`
+  entries). Routing modes exposed in TUI (`f`/`m` key cycle).
+- v1.5.83: hide inert "Cross-provider: always" text under non-sticky modes (it
+  looked like two conflicting controls when only the mode governed routing).
+
+**Open items:**
+- `glm max@gomokka.com` (legacy TOKENS_LIMIT plan) has no weekly limit — confirmed
+  real (not a parse gap), but z.ai is sunsetting legacy plans (migration notice
+  April 2026). Don't rely on this long-term.
+- Ahmed's RESTRICTED_AL_MAXPOOL_ZAI key is absent from Max's credentials cache
+  (~17s gcloud resolution at boot on Max's machine; instant on Ahmed's).
+- `crossProviderFallbackPolicy: when-exhausted` still in config.json — inert
+  (routingMode takes precedence), cleaned up on next `f` key cycle.
 
 ---
 
 ## Decisions
+
+### 2026-08-10 · #8 — Five named routing modes replace crossProviderFallbackPolicy
+
+**Context:** `crossProviderFallbackPolicy: 'always'` read as "load balance across
+everything" but only governed a session's FIRST request — after that, the session
+was pinned to one account (per-ACCOUNT, not per-provider). ~30 sessions that started
+on the same account hammered it forever while every other account idled. The pin
+existed for signed-thinking-block safety, which was empirically disproven (2026-07-02,
+cross-account replay returned 200) and provider-authored thinking blocks are now
+auto-stripped (v1.5.64+).
+**Decision:** Replace the single knob with five explicit modes. `balance` scores
+every request across the whole pool. `prefer-*` modes bias toward a provider
+family. `sticky` preserves the old behavior. Migration: `always`→`balance`,
+`when-exhausted`→`prefer-claude`, `never`→`sticky`. TUI `f`/`m` cycles modes.
+**Consequences:** The per-provider `claudeFallback` knob (`g`/`k` keys) is now
+inert under every mode except `sticky`. The header only renders it under `sticky`.
+
+### 2026-08-10 · #7 — Cache-first secret resolution
+
+**Context:** Resolving 5 GCP secrets via `gcloud secrets versions access` in
+parallel at boot caused 3 of 5 to hit the 45s timeout (gcloud invocations contend
+on credential cache + network). Unresolved secrets left config providers in
+`error: secret-unresolved` state, and the header-based runtime path created
+duplicate `-fallback` rows beside them.
+**Decision:** Read `~/.claude/.credentials-cache` (plaintext JSON, written by
+`scripts/load-secrets.sh`, mode 0600, sanctioned) FIRST. Fall back to gcloud
+sequentially only for names the cache lacks. Measured: 5/5 resolve in 17.5s
+(4 from cache instantly, 1 gcloud miss) vs 2/5 before.
+**Consequences:** No new attack surface (an attacker who can read the cache
+already has everything). Cache staleness bounded: a rotated key 401s → provider
+shows error → degrades gracefully. Maxpool restart picks up refreshed cache.
+
+### 2026-08-10 · #6 — Seamless restart skips the pre-drain
+
+**Context:** `r` → `y` paused admission immediately, then waited up to 10s for
+in-flight requests to drain. With ~30 sessions running 30-60s requests, the drain
+NEVER completed naturally — it always timed out, producing 10s of guaranteed 503s
+across the fleet. The seamless baton path already drains in-flight requests
+post-handoff (releaseBatonAndDrain, 60s+ cap), so the pre-drain was redundant.
+**Decision:** `RestartController` now takes an `isSeamless()` predicate. When true,
+the restart fires immediately — in-flight requests finish on the old worker after
+the baton passes. Cold path still drains (socket closes, so in-flight would be
+severed without it).
+**Consequences:** `admissionPaused` is constructor-initialised false and never
+persisted — a cold start always begins with admission open. The 503 message now
+reads "finishing in-flight requests first" instead of "Retry immediately".
+
+### 2026-08-07 · #5 — Multi-provider support (GLM/Kimi)
+
+**Context:** Maxpool was Anthropic-only. Max wanted to add GLM (z.ai) and Kimi
+(Moonshot) accounts to the pool so Claude Code sessions could spread across three
+providers.
+**Decision:** Provider accounts carry an API key (not OAuth). Keys stored in
+`~/.config/teamclaude.json` as GCP secret names, resolved at boot. Provider quota
+probed from each provider's own usage API. Providers participate in routing
+according to the mode (see #8). Provider-authored thinking blocks are auto-stripped
+before forwarding to Anthropic (rejected-block self-heal via revert-to-issuer).
+**Consequences:** Provider keys are owner-scoped via GCP IAM. Adding a teammate's
+key: `gcloud secrets create RESTRICTED_<USER>_MAXPOOL_ZAI` + IAM binding. Team
+registry: `mokka-workspace/knowledge/technical/maxpool-api-key-registry.md`.
 
 ### 2026-07-23 · #4 — Project-context harness is committed in-repo
 

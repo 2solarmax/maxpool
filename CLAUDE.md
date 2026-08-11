@@ -1,10 +1,41 @@
 # Maxpool — project instructions for Claude Code
 
-Maxpool is a multi-account proxy for Claude Code. It sits between Claude Code and
-the Anthropic API and spreads requests across several accounts you own, using
-adaptive, rate-aware load balancing (keep accounts healthy; drain a quota only
-when its reset window is genuinely near). Node.js, zero runtime dependencies,
-published to npm as `maxpool`.
+Maxpool is a multi-account, multi-provider proxy for Claude Code. It sits between
+Claude Code and the Anthropic API (and GLM/Kimi) and spreads requests across all
+accounts you own — Anthropic OAuth (subscription), GLM (z.ai), and Kimi
+(Moonshot) — using adaptive, rate-aware load balancing. Node.js, zero runtime
+dependencies, published to npm as `maxpool`.
+
+## Providers (multi-provider since v1.5.64)
+
+Three account types coexist in one pool:
+
+| Type | Auth | Quota source | Notes |
+|---|---|---|---|
+| `oauth` (Anthropic) | Browser login → OAuth refresh tokens | `/api/oauth/usage` + response headers (unified 5h / 7d) | Single-use refresh tokens rotate on first use |
+| `provider` (z.ai/GLM) | API key from GCP Secret Manager | `api.z.ai/api/monitor/usage/quota/limit` | `TOKENS_LIMIT` (legacy, no weekly) vs `CREDIT_LIMIT` (newer, has weekly) |
+| `provider` (Kimi/Moonshot) | API key from GCP Secret Manager | `/v1/usages` | Session + weekly windows |
+
+Provider keys are stored in `~/.config/teamclaude.json` as **secret names** (never
+the key value). At startup `src/secret-resolver.js` resolves them via
+`~/.claude/.credentials-cache` first (instant), falling back to `gcloud secrets
+versions access` sequentially. See `mokka-workspace/knowledge/technical/maxpool-api-key-registry.md`
+for the key registry.
+
+## Routing modes (since v1.5.80)
+
+Five named modes replace the old opaque `crossProviderFallbackPolicy`:
+
+| Mode | Behaviour |
+|---|---|
+| `balance` | Score every request across the whole pool. Accounts drain evenly. |
+| `prefer-claude` | Claude first; GLM/Kimi pick up overflow when Claude is loaded. |
+| `prefer-zai` | GLM first; others overflow. (Label: "Prefer GLM") |
+| `prefer-kimi` | Kimi first; others overflow. |
+| `sticky` | Session stays on the account it started on. The only mode where the per-provider `claudeFallback` knob matters. |
+
+TUI: `f` or `m` cycles modes on the routing screen. The `cross-provider: …` header
+fragment only renders under `sticky` (it's inert under other modes).
 
 ## ⚡ Prime directives — read/update the project memory
 
@@ -76,6 +107,8 @@ never add IP/fingerprint spoofing or MITM — PRs adding them are rejected.
 - `src/reload-protocol.js` + `src/restart-controller.js` — zero-downtime reload
   (drain in-flight streams before restart/quit).
 - `src/config.js` — config load/validate (`config.example.json` is the schema).
+- `src/secret-resolver.js` — resolves GCP Secret Manager names to API keys
+  (cache-first via `~/.claude/.credentials-cache`, gcloud fallback sequential).
 - `src/event-log.js`, `src/sleep-guard.js`, `src/updater.js` — logging,
   keep-awake, self-update.
 - Config knobs: `proxy` (host/port/apiKey), `upstream`, `switchThreshold`,
@@ -91,4 +124,7 @@ never add IP/fingerprint spoofing or MITM — PRs adding them are rejected.
   GitHub Release).
 
 > This repo is OUTSIDE the mokka-workspace; it does not inherit those skills or
-> rules. Everything Claude needs here is committed in this repo.
+> rules. Everything Claude needs here is committed in this repo. Task tracking
+> for maxpool work lives in `mokka-workspace/work/tooling/` (Max works from that
+> workspace). The key registry lives at
+> `mokka-workspace/knowledge/technical/maxpool-api-key-registry.md`.
