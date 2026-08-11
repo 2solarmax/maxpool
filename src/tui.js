@@ -1465,12 +1465,19 @@ export class TUI {
     // the pool (profile=all). never=strict pin (yellow), when-exhausted=default (cyan),
     // always=peer (green).
     const hasProviders = this.am.accounts.some(a => a.type === 'provider');
+    const mode = this.am.scheduler?.routingMode || 'sticky';
     let xpText = '';
+    // Only show the cross-provider fragment under sticky — under balance/prefer-*, the
+    // MODE controls routing and claudeFallback is inert. Showing it there made the
+    // header read "Balance all · Cross-provider: always" which looked like two
+    // conflicting settings when only the first one does anything.
     if (hasProviders) {
-      xpText = this._crossProviderText();
+      // Cross-provider fragment is sticky-only — under other modes it is inert and
+      // reading "always" next to "Balance all" looked like two conflicting controls.
+      if (mode === 'sticky') xpText = this._crossProviderText();
       // Overflow visibility: when GLM/Kimi actually served requests recently, surface the
-      // volume so provider traffic isn't a mystery — it's overflow that spilled here while
-      // OAuth was saturated. Reuses the SAME 15m load window as the per-row "15m Nr" column.
+      // volume so provider traffic isn't a mystery. This is DATA, not a control — shown
+      // in every mode. Reuses the SAME 15m load window as the per-row "15m Nr" column.
       const now = Date.now();
       let provReq = 0;
       for (const a of this.am.accounts) {
