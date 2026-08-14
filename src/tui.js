@@ -1797,7 +1797,7 @@ export class TUI {
       if (headerFresh) return '';
     }
     const s = q.lastProbeErrorStatus;
-    if (s === 429) return `  ${yellow('stale·rate-limited')}`;
+    if (s === 429) return `  ${yellow('stale·probe throttled')}`;
     if (s) return `  ${yellow('stale·probe ' + s)}`;
     return `  ${dim('stale')}`;
   }

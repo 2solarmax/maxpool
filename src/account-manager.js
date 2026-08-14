@@ -1487,10 +1487,15 @@ export class AccountManager {
     const c = { total: 0, quota: 0, transient: 0, network: 0, disabled: 0, error: 0, other: 0 };
     for (const a of this.accounts) {
       if (a.type === 'provider') continue;
+      // DISABLED accounts are out of the serving pool — counting them in `total`
+      // made the 429 say "all 9 Claude accounts are momentarily busy" when ONE
+      // enabled account was reconnecting and EIGHT were disabled with dead tokens
+      // (reported 2026-08-13). The user reads 9-busy as fleet saturation; the
+      // truth is 1-busy + 8-off. Track them for the message, exclude from cause math.
+      if (a.enabled === false) { c.disabled++; continue; }
       c.total++;
       const cause = this._retryInfo(a, model)?.cause || 'unavailable';
-      if (cause === 'disabled') c.disabled++;
-      else if (cause === 'error') c.error++;
+      if (cause === 'error') c.error++;
       else if (QUOTA.has(cause)) c.quota++;
       else if (TRANSIENT.has(cause)) {
         c.transient++;
@@ -1500,7 +1505,7 @@ export class AccountManager {
           && (a.cooldownUntil - Date.now()) <= this.scheduler.networkCooldownMs) c.network++;
       } else c.other++;
     }
-    const eligible = c.total - c.disabled - c.error;
+    const eligible = c.total - c.error;
     c.dominant = eligible <= 0 ? 'none'
       : c.quota >= Math.max(1, Math.ceil(eligible / 2)) ? 'quota'
         : c.transient > 0 ? 'transient' : 'other';

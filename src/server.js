@@ -1555,7 +1555,9 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
     return `This session is too large for the GLM/Kimi fallbacks (their ~256K limit) — it needs a 1M-context Claude account, and they're all busy right now.${eta} It sends as soon as one frees; /compact shortens the session if you'd rather not wait.`;
   }
 
-  const claudeCount = accountManager.accounts.filter(a => a.type !== 'provider').length;
+  // ENABLED only — a disabled account is not "at its limit", it is off; counting it
+  // made a 1-enabled-account pool report "all 9 accounts at their limit".
+  const claudeCount = accountManager.accounts.filter(a => a.type !== 'provider' && a.enabled !== false).length;
   // Only name the providers when this pool HAS them AND they are actually allowed to
   // serve this request. With crossProviderFallbackPolicy 'never' (the default) they are
   // barred by POLICY, not saturated — saying they are "at their limit" is a lie that
@@ -1592,12 +1594,20 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
   if (census && census.dominant === 'transient') {
     const netly = census.network > 0;
     const what = netly
-      ? `${census.network} of ${census.total} Claude accounts are in a brief reconnect cooldown`
-      : `all ${census.total} Claude accounts are momentarily busy`;
-    return `No account can take this request right now — ${what}, not out of quota. Retry in ~${formatRetryDuration(retryAfter)}; it clears on its own.${providersBarredHint}`;
+      ? `${census.network} of ${census.total} Claude account${census.total === 1 ? '' : 's'} are in a brief reconnect cooldown`
+      : census.total === 1
+        ? 'the only enabled Claude account is momentarily busy'
+        : `all ${census.total} Claude accounts are momentarily busy`;
+    // When most of the pool is DISABLED, "1 account busy" begs the real question —
+    // name the disabled share so the fix (re-enable/re-auth) is visible in the message
+    // instead of reading like a fleet that mysteriously shrank.
+    const offNote = census.disabled > 0
+      ? ` (${census.disabled} account${census.disabled === 1 ? '' : 's'} disabled)`
+      : '';
+    return `No account can take this request right now — ${what}, not out of quota${offNote}. Retry in ~${formatRetryDuration(retryAfter)}; it clears on its own.${providersBarredHint}`;
   }
 
-  return `No account can take this request right now — all ${claudeCount} Claude accounts${providersClause} are ${waitLong ? 'at their limit' : 'momentarily at their limit'}. Retry in ~${formatRetryDuration(retryAfter)}.${providersBarredHint}`;
+  return `No account can take this request right now — all ${claudeCount} Claude account${claudeCount === 1 ? '' : 's'}${providersClause} are ${waitLong ? 'at their limit' : 'momentarily at their limit'}. Retry in ~${formatRetryDuration(retryAfter)}.${providersBarredHint}`;
 }
 
 // A provider (GLM/Kimi) rejecting a request whose token count exceeds its context

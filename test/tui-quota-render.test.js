@@ -97,7 +97,7 @@ test('a LIVE account still surfaces a real failing-probe signal (not over-suppre
   // NOT refreshDead, NOT disabled, no live response-header traffic → a self-throttling
   // probe is a real signal (this is the idle / no-recent-header case).
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
-  assert.match(line, /stale·rate-limited/, 'a live account keeps its actionable probe signal');
+  assert.match(line, /stale·probe throttled/, 'a live account keeps its actionable probe signal');
 });
 
 test('a busy OAuth account (bars fresh from response headers) is NOT flagged stale when only its background probe is 429-throttled', () => {
@@ -120,7 +120,7 @@ test('a probe-only scoped cap still reads stale on a stale probe even when the u
   am.accounts[0].quota.lastProbeErrorStatus = 429;
   am.accounts[0].quota.lastHeaderQuotaAt = Date.now();           // unified bars fresh, but Fable% is probe-ONLY
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
-  assert.match(line, /stale·rate-limited/, 'a displayed scoped cap is probe-only → still warn');
+  assert.match(line, /stale·probe throttled/, 'a displayed scoped cap is probe-only → still warn');
 });
 
 test('automatic mode marks accounts SERVING right now (inFlight>0) with ►, not the last-routed idle one', () => {
@@ -199,7 +199,7 @@ test('a provider account stays probe-only — a stale probe still reads stale, h
   am.accounts[1].quota.lastProbeErrorStatus = 429;
   am.accounts[1].quota.lastHeaderQuotaAt = Date.now();           // must be IGNORED for a provider (bars are probe-only)
   const line = strip(new TUI({ accountManager: am })._renderAcct(1, 11, true));
-  assert.match(line, /stale·rate-limited/, 'provider bars are probe-only → header stamp must not suppress');
+  assert.match(line, /stale·probe throttled/, 'provider bars are probe-only → header stamp must not suppress');
 });
 
 // ── Ask A: providers show Ses/Wk like the rest ────────────────────────────────
