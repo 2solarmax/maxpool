@@ -21,7 +21,7 @@ function addGlm(am, token = 'zai-tok') {
   am.upsertRuntimeAccount({
     name: 'glm-fallback', type: 'provider', provider: 'zai',
     authToken: token, upstream: 'https://api.z.ai/api/anthropic', authHeader: 'authorization',
-    profiles: ['all'], priority: 10, modelMap: { opus: 'glm-5.2', sonnet: 'glm-5.2', haiku: 'glm-5.1', default: 'glm-5.2' },
+    profiles: ['all'], priority: 10, modelMap: { opus: 'glm-5.3', sonnet: 'glm-5.3', haiku: 'glm-5.3', default: 'glm-5.3' },
     stripBetaHeaders: true,
   });
 }
@@ -47,7 +47,7 @@ test('exportRuntimeProviders captures runtime providers, excludes OAuth + non-ru
   assert.equal(glm.provider, 'zai');
   assert.equal(glm.authToken, 'zai-tok', 'token carried so it survives the restart');
   assert.equal(glm.upstream, 'https://api.z.ai/api/anthropic');
-  assert.deepEqual(glm.modelMap, { opus: 'glm-5.2', sonnet: 'glm-5.2', haiku: 'glm-5.1', default: 'glm-5.2' });
+  assert.deepEqual(glm.modelMap, { opus: 'glm-5.3', sonnet: 'glm-5.3', haiku: 'glm-5.3', default: 'glm-5.3' });
   assert.equal(glm.priority, 10);
   // No OAuth account leaks into the export.
   assert.ok(!exported.some(p => p.name.startsWith('a')));

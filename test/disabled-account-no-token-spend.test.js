@@ -114,9 +114,9 @@ test('a zai config provider gets a model map — z.ai 400s without one', () => {
   am.loadConfigProviders([{ name: 'glm max@gomokka.com', provider: 'zai', token: 'k1' }]);
   const a = am.accounts[0];
   assert.ok(a.modelMap, 'a zai provider MUST carry a model map');
-  assert.equal(a.modelMap.opus, 'glm-5.2');
-  assert.equal(a.modelMap.sonnet, 'glm-5.2');
-  assert.equal(a.modelMap.haiku, 'glm-5.1');
+  assert.equal(a.modelMap.opus, 'glm-5.3');
+  assert.equal(a.modelMap.sonnet, 'glm-5.3');
+  assert.equal(a.modelMap.haiku, 'glm-5.3');
 });
 
 test('a kimi config provider gets a model', () => {

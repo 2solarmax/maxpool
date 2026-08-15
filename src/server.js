@@ -2622,9 +2622,9 @@ function prepareRuntimeProviders(accountManager, headers) {
 
   const zaiToken = headerValue(headers, 'x-maxpool-zai-token');
   if (zaiToken && !configTokens.has(zaiToken)) {
-    const opus = headerValue(headers, 'x-maxpool-zai-opus-model') || headerValue(headers, 'x-maxpool-zai-model') || 'glm-5.2';
+    const opus = headerValue(headers, 'x-maxpool-zai-opus-model') || headerValue(headers, 'x-maxpool-zai-model') || 'glm-5.3';
     const sonnet = headerValue(headers, 'x-maxpool-zai-sonnet-model') || headerValue(headers, 'x-maxpool-zai-model') || opus;
-    const haiku = headerValue(headers, 'x-maxpool-zai-haiku-model') || 'glm-5.1';
+    const haiku = headerValue(headers, 'x-maxpool-zai-haiku-model') || 'glm-5.3';
     accountManager.upsertRuntimeAccount({
       name: 'glm-fallback',
       type: 'provider',

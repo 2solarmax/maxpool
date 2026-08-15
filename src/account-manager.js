@@ -3190,7 +3190,7 @@ export class AccountManager {
       // Default model maps — match what `cc all` sends via headers. Users can override
       // per-provider in config. Without these z.ai returns [1210 Invalid API parameter].
       const defaultModelMap = entry.provider === 'zai'
-        ? { opus: 'glm-5.2', sonnet: 'glm-5.2', haiku: 'glm-5.1', default: 'glm-5.2' }
+        ? { opus: 'glm-5.3', sonnet: 'glm-5.3', haiku: 'glm-5.3', default: 'glm-5.3' }
         : null;
       const defaultModel = entry.provider === 'kimi' ? 'kimi-k3' : null;
       this.upsertRuntimeAccount({
