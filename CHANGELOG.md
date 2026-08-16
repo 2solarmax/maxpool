@@ -5,7 +5,11 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.5.84] - 2026-08-14
+## [1.5.85] - 2026-08-16
+
+### Changed
+
+- Default model maps glm-5.2/5.1 → glm-5.3
 
 ### Documentation
 
@@ -17,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache-first secret resolution + routing modes in TUI
 - Hide inert Cross-provider text under non-sticky routing modes
 - 429 message counts only ENABLED accounts; name the disabled share
+- Group provider accounts by family in the account table
 
 ## [1.5.80] - 2026-08-10
 
