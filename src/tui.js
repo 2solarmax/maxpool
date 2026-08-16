@@ -961,7 +961,20 @@ export class TUI {
     const nonProv = [];
     const prov = [];
     this.am.accounts.forEach((a, i) => (a.type === 'provider' ? prov : nonProv).push(i));
-    return [...nonProv, ...prov];
+    // GROUP providers by family (all GLM together, all Kimi together). Providers land
+    // in the config array in the order they were ADDED, so a GLM account added after a
+    // Kimi rendered below it — same-provider accounts split across the table (reported
+    // 2026-08-17: "accounts need to be grouped by provider... you shouldn't be mixing
+    // Anthropic with Z.ai and Moonshot"). Stable: group by first-seen order, preserving
+    // the within-family order and never reordering OAuth rows.
+    const familyFirstSeen = new Map();
+    for (const idx of prov) {
+      const fam = this.am.accounts[idx].provider || 'other';
+      if (!familyFirstSeen.has(fam)) familyFirstSeen.set(fam, []);
+      familyFirstSeen.get(fam).push(idx);
+    }
+    const provGrouped = [...familyFirstSeen.values()].flat();
+    return [...nonProv, ...provGrouped];
   }
 
   _selectableIndexes(action) {
