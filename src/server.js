@@ -2749,6 +2749,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   let committed = res.headersSent;
   let readFailed = false;
 
+
   // We're now committed to streaming a real upstream response body onto this
   // response — there is no more failover for this forward. Stop the queue
   // heartbeat (if this was a resumed held stream) BEFORE the first real byte, so
@@ -2864,6 +2865,20 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
     reader.cancel().catch(() => {});
     if (!readFailed) {
       if (!committed && !res.headersSent) res.writeHead(status, responseHeaders);
+      // Truncation sentinel FIRST (before end()) — a write after end() throws and
+      // would be swallowed, silently producing the truncated stream this guards.
+      // Fires ONLY on a genuinely truncated stream: a non-empty residual SSE buffer
+      // means the upstream died mid-event (an event without its '\n\n' terminator).
+      // Complete-event streams without a terminal message_stop (z.ai compat shape,
+      // test fixtures) end with an EMPTY residual and pass through unchanged.
+      if ((committed || res.headersSent) && sseBuffer.trim() && !res.destroyed && !res.writableEnded) {
+        try {
+          res.write(`event: error\ndata: ${JSON.stringify({
+            type: 'error',
+            error: { type: 'api_error', message: 'Upstream closed the stream before the response completed. Retry the message.' },
+          })}\n\n`);
+        } catch { /* client already gone */ }
+      }
       if (!res.writableEnded) res.end();
     }
   }
