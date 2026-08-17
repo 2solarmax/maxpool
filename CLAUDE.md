@@ -22,6 +22,16 @@ the key value). At startup `src/secret-resolver.js` resolves them via
 versions access` sequentially. See `mokka-workspace/knowledge/technical/maxpool-api-key-registry.md`
 for the key registry.
 
+## Model IDs (z.ai / Kimi)
+
+Static defaults (`src/server.js`, `src/account-manager.js`) are release-time
+hygiene only. Mokka's traffic always sends `x-maxpool-*-model` headers derived
+from the mokka-workspace `llm_config/models.yaml` SSOT (via `cc`/`ccall`
+aliases in ~/.zshrc), which override the defaults. Standalone users can pin any
+model per-provider in their own config. Precedence trap: a persistent maxpool
+config entry carrying the gomokka z.ai token would make config beat the SSOT
+headers — do NOT add that token to maxpool config.
+
 ## Routing modes (since v1.5.80)
 
 Five named modes replace the old opaque `crossProviderFallbackPolicy`:
@@ -59,6 +69,12 @@ lines) — it loads in full every session.
 - Ship with `npm run release` (patch) / `scripts/release.sh minor|major|X.Y.Z`.
   It runs tests → lint → `npm version` (commit + `vX.Y.Z` tag) → push → GitHub
   Actions publishes to npm. **Never `npm publish` by hand.**
+- **A manual `npm version --no-git-tag-version` + commit publishes NOTHING** —
+  publish.yml fires on TAG push only. This exact bypass left npm 6 versions
+  behind git (1.5.80 vs 1.5.86, 2026-08-17). A commit-msg hook (.githooks/)
+  now blocks a bare `vX.Y.Z` subject with no matching tag.
+- **GitHub fires workflows for at most 3 tags per push** — pushing 6 tags in
+  one batch triggers ZERO runs, silently. Push tags in batches ≤3.
 - **npm publish is tokenless — OIDC Trusted Publishing + provenance.** There is
   NO `NPM_TOKEN`. The `repository.url` in package.json MUST stay
   `2solarmax/maxpool` or OIDC breaks. The repo must stay **public** (OIDC needs it).
