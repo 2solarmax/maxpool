@@ -1,0 +1,16 @@
+#!/bin/bash
+# Guard: a "vX.Y.Z" commit message WITHOUT its tag means the release pipeline was
+# bypassed (npm version --no-git-tag-version + manual commit), which publishes
+# NOTHING — npm lagged 6 versions behind git before this existed (2026-08-17).
+# commit-msg (not pre-commit) because pre-commit cannot see the new message.
+MSG_FILE="$1"
+SUBJECT=$(head -1 "$MSG_FILE")
+if echo "$SUBJECT" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  if ! git rev-parse -q --verify "refs/tags/$SUBJECT" >/dev/null; then
+    echo "❌ RELEASE BYPASS BLOCKED: commit '$SUBJECT' has no matching tag."
+    echo "   Use the pipeline: npm run release  (or scripts/release.sh X.Y.Z)"
+    echo "   It tags + pushes so publish.yml fires. A manual bump publishes nothing."
+    echo "   (If you INTEND a manual bump: git tag $SUBJECT first.)"
+    exit 1
+  fi
+fi
