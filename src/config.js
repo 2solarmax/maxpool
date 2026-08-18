@@ -1,4 +1,5 @@
 import { readFile, writeFile, mkdir, rename, chmod, unlink } from 'node:fs/promises';
+import { DEFAULT_PEAK_PROVIDERS, mergePeakDefaults } from './peak-window.js';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -117,7 +118,14 @@ export function createDefaultConfig() {
       // Left EMPTY: an unset provider inherits the policy above, so off-by-default holds
       // without shadowing it. The TUI writes an entry here only when you steer one
       // provider differently from the other.
-      providers: {},
+      // Peak-hour governance defaults (2026-08-18). Fresh installs get the block ON
+      // DISK; existing installs inherit it at load (see the migration in loadConfig).
+      // NEVER in account-manager's DEFAULT_SCHEDULER.providers: the shallow spread
+      // there wipes it for any config that already has `providers`, and a default in
+      // that object reaches every directly-constructed AccountManager in the test
+      // suite, making it time-dependent. Both proven by probe 2026-08-18.
+      providers: structuredClone(DEFAULT_PEAK_PROVIDERS),
+      peakDefaultsVersion: 1,
     },
     retry: {
       maxAttemptsPerRequest: 0,
@@ -190,6 +198,18 @@ export async function loadConfig() {
     const defaults = createDefaultConfig();
     for (const key of Object.keys(defaults)) {
       if (!(key in parsed)) parsed[key] = defaults[key];
+    }
+    // ── Peak-hours migration (2026-08-18) ──
+    // The top-level backfill fills ABSENT top-level keys only, and every real config
+    // already HAS `scheduler` — the nested provider defaults never reach an existing
+    // install without this pass. Merges by key-PRESENCE (an explicit user value wins;
+    // `peakWindows: []` = never-peak and survives), gated on peakDefaultsVersion so
+    // deliberately-emptied windows are not re-seeded. CLONES — config.scheduler is
+    // reference-shared with the TUI persist path, and mutating it would write the
+    // defaults to disk on the next toggle (pre-mortem MINOR 8).
+    if (parsed.scheduler && typeof parsed.scheduler === 'object') {
+      parsed.scheduler.providers = mergePeakDefaults(parsed.scheduler.providers, parsed.scheduler.peakDefaultsVersion);
+      parsed.scheduler.peakDefaultsVersion = 1;
     }
   }
   return parsed;

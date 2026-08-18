@@ -520,6 +520,25 @@ export class TUI {
     }
   }
 
+  /** The peak fragment for the routing header: `GLM peak · ends in 2h05m` while any
+   *  provider is inside its window, '' otherwise. Names the window end so the 4h
+   *  shape is legible; per-account detail lives in the row tags. `now` is injectable
+   *  so a test can assert the rendered string without waiting for 06:00 UTC. */
+  _peakHeaderNote(now = Date.now()) {
+    const parts = [];
+    const seen = new Set();
+    for (const a of this.am.accounts) {
+      if (a.type !== 'provider' || seen.has(a.provider)) continue;
+      seen.add(a.provider);
+      const st = this.am._peakStateFor?.(a.provider, now);
+      if (!st?.inPeak || !st.endsAt) continue;
+      const label = a.provider === 'zai' ? 'GLM' : a.provider === 'kimi' ? 'Kimi' : a.provider;
+      const mins = Math.max(0, Math.ceil((st.endsAt - now) / 60_000));
+      parts.push(`${yellow(label + ' peak')} ${dim(`ends in ${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, '0')}m`)}`);
+    }
+    return parts.join('  ');
+  }
+
   _routingLine(routing, xpText) {
     return ` Routing  ${cyan(routing)}${xpText}`;
   }
@@ -1485,6 +1504,11 @@ export class TUI {
     // header read "Balance all · Cross-provider: always" which looked like two
     // conflicting settings when only the first one does anything.
     if (hasProviders) {
+      // PEAK (SC9): name an active window — the feature must be visible, not silent.
+      // Only while a provider is genuinely in-window, so an off-peak screen is
+      // byte-identical to today (render parity, TEST PLAN H1).
+      const peakNote = this._peakHeaderNote();
+      if (peakNote) xpText += (xpText ? '  ' : '') + peakNote;
       // Cross-provider fragment is sticky-only — under other modes it is inert and
       // reading "always" next to "Balance all" looked like two conflicting controls.
       if (mode === 'sticky') xpText = this._crossProviderText();
@@ -1832,6 +1856,17 @@ export class TUI {
       wkCell = q.providerWk != null ? bar(q.providerWk, bw, q.providerWkReset)
         : emptyBar(q.weeklyAbsent ? 'none' : '—', bw);
       note = this._probeHealthNote(a);
+      // PEAK row tag (SC9): mirrors the router's own predicates — hard-barred = off,
+      // tier 2 = over cap, tier 1 = peak (or "cap n/a" when the weekly is unreadable,
+      // so the soft cap is inert). The label can never disagree with routing because
+      // it reads the same predicates.
+      if (this.am._peakHardBarred?.(a)) note += `  ${red('peak·off')}`;
+      else {
+        const tier = this.am._peakTier?.(a) || 0;
+        const wu = this.am._peakWeeklyUtilization?.(a);
+        if (tier === 2) note += `  ${yellow(`peak·capped ${Math.round((wu ?? 0) * 100)}%`)}`;
+        else if (tier === 1) note += wu == null ? `  ${dim('peak·cap n/a')}` : `  ${yellow('peak')}`;
+      }
     } else if (q.providerQuotaSource === 'console-only') {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);

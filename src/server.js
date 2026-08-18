@@ -1536,6 +1536,27 @@ function computeQueueWindowMs({
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRecoverSoon = true) {
   const incompat = accountManager._effectiveIncompatible?.(requestInfo) || { incompatible: false, homeProvider: null };
 
+  // PEAK (2026-08-18): when a provider family is hard-barred (peakCap 0.0) inside its
+  // peak window and that is why no route exists, NAME IT — "all Claude accounts are
+  // at their limit" would send the user hunting quota when a SETTING is holding the
+  // provider out. Checked directly off the peak predicates (the census skips
+  // providers entirely, so it can never name this).
+  // ENABLED accounts only: a family that is simply switched off must not be reported
+  // as held out by the peak setting.
+  const peakBarred = [];
+  const seenPeakProviders = new Set();
+  for (const a of accountManager.accounts || []) {
+    if (a.type !== 'provider' || !a.enabled || seenPeakProviders.has(a.provider)) continue;
+    seenPeakProviders.add(a.provider);
+    if (accountManager._peakHardBarred?.(a)) {
+      peakBarred.push(a.provider === 'zai' ? 'GLM' : a.provider === 'kimi' ? 'Kimi' : a.provider);
+    }
+  }
+  if (peakBarred.length) {
+    const eta = Number.isFinite(retryAfter) && retryAfter > 0 ? ` Peak ends in ~${formatRetryDuration(retryAfter)}.` : '';
+    return `${peakBarred.join(' and ')} ${peakBarred.length === 1 ? 'is' : 'are'} switched off during peak hours (a setting: peakCap 0), and no other account can take this request.${eta} Set scheduler.providers.<provider>.peakCap above 0 to let it cover peak hours.`;
+  }
+
   // An Anthropic-incompatible session is pinned to provider accounts — Anthropic
   // 400s on its server_tool_use id / foreign thinking. "All Claude at limit" would
   // be the wrong story (Claude is irrelevant to it); say what actually blocks it.

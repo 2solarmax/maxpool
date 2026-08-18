@@ -1,4 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { peakWindowState, DEFAULT_PEAK_CAP } from './peak-window.js';
 
 // Bounded re-poll hold for an account blocked ONLY by a transient, self-clearing
 // condition whose exact recovery time is unknown: (a) a weekly-critical account
@@ -194,6 +195,14 @@ const MAX_FAILED_PROBES = 4;
 // day rather than never.
 const PROBE_FAILURE_ALERT_AT = 20;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+// Peak-hour governance (2026-08-18). A peak TIER, added to _effectivePriority after the
+// mode layer: tier 1 = provider inside its peak window (de-prefer), tier 2 = also over
+// its peakCap (last-resort). A STRIDE, not an additive constant, so a peak account ranks
+// below every non-peak account BY CONSTRUCTION even against a hand-set `priority: 500`,
+// while intra-tier ordering (the mode layer) is preserved. Not Infinity — the selector's
+// `priority < bestPriority` is false for Infinity vs Infinity and an all-peaked pool
+// would select nothing.
+const PEAK_TIER_STRIDE = 1_000_000;
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
 // Quota fields that survive a restart: utilization levels and their reset
@@ -322,6 +331,7 @@ export class AccountManager {
     this.routingMode = 'automatic';
     this.preferredAccountName = null;
     this.sessionBindings = new Map();
+    this._peakCache = null;   // per-UTC-minute peak-window memo (see _peakStateFor)
     this.sessionPolicies = new Map();
     this.upstreamThrottle = {
       until: null,
@@ -362,10 +372,10 @@ export class AccountManager {
    */
   getActiveAccount(requestInfo = {}, excludedIndexes = new Set()) {
     this.refreshExpiredQuotas();
-    return this._selectNext(requestInfo, excludedIndexes);
+    return this._selectNext(requestInfo, excludedIndexes, requestInfo.now);
   }
 
-  nextRetryForRequest(requestInfo = {}, excludedIndexes = new Set()) {
+  nextRetryForRequest(requestInfo = {}, excludedIndexes = new Set(), now = Date.now()) {
     this.refreshExpiredQuotas();
     const upstreamRetry = this._upstreamThrottleRetry();
     if (upstreamRetry && !this._hasAvailableProvider(requestInfo, excludedIndexes)) {
@@ -434,7 +444,7 @@ export class AccountManager {
       // finite hold. It must NEVER contribute the WEEKLY reset (days) — that is the
       // multi-day-hang the bounded path fences off; see the !fairnessOnlyBlock
       // guards on the weekly branches below.
-      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, model: requestInfo.model })) {
+      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, model: requestInfo.model, now })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -443,13 +453,13 @@ export class AccountManager {
           matchingRoutes,
         };
       }
-      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
+      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
         soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
         if (!boundedHoldCause) boundedHoldCause = 'queued_behind_fairness';
         continue;
       }
 
-      const retry = this._retryInfo(account, requestInfo.model);
+      const retry = this._retryInfo(account, requestInfo.model, now);
       note(retry.cause);
       if (!fairnessOnlyBlock && retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
         return {
@@ -464,7 +474,7 @@ export class AccountManager {
         // A known, soon short-term reset (5h cap / rate-limit / cooldown) — even on
         // a weekly-critical account, this is the REAL near-term recovery time, so
         // it holds here with the true cause rather than the distant weekly reset.
-        const ms = retry.retryAt - Date.now();
+        const ms = retry.retryAt - now;
         if (ms < soonestTemporary) {
           soonestTemporary = ms;
           temporaryCause = retry.cause;
@@ -488,7 +498,7 @@ export class AccountManager {
         // avoid (a weekly-exhausted gated fleet stays terminal → honest error,
         // matching the no-newcomer-vs-queue distinction). Only its short-term reset
         // (above) or the bounded hold may fire.
-        const ms = retry.retryAt - Date.now();
+        const ms = retry.retryAt - now;
         if (ms < soonestWeekly) soonestWeekly = ms;
       } else if (!fairnessOnlyBlock && retry.cause === 'weekly_exhausted' && !retry.retryAt) {
         // Weekly-capped but we haven't learned the reset time (cold start /
@@ -540,7 +550,7 @@ export class AccountManager {
     };
   }
 
-  hasAvailableRoute(requestInfo = {}, excludedIndexes = new Set()) {
+  hasAvailableRoute(requestInfo = {}, excludedIndexes = new Set(), now = Date.now()) {
     this.refreshExpiredQuotas();
     const profile = requestInfo.profile || 'claude';
     // Route-EXISTENCE check only (order-independent `.some`): unlike the acquire
@@ -562,7 +572,7 @@ export class AccountManager {
     return weeklyPasses.some(options => this.accounts.some(account => {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
-      return this._isAvailable(account, { ...options, model: requestInfo.model });
+      return this._isAvailable(account, { ...options, model: requestInfo.model, now });
     }));
   }
 
@@ -580,7 +590,9 @@ export class AccountManager {
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
     const upstreamThrottleProbe = account.type !== 'provider' && this._claimUpstreamThrottleProbe();
     if (requestInfo.sessionKey) {
-      this._bindSession(requestInfo.sessionKey, account, requestInfo.model);
+      // Same clock the selection above used, so the peak-failover guard can never
+      // disagree with the peak tier that caused the move (defaults to real time).
+      this._bindSession(requestInfo.sessionKey, account, requestInfo.model, requestInfo.now);
     }
     account.inFlight++;
     account.activeWeight += weight;
@@ -715,7 +727,7 @@ export class AccountManager {
   _isAvailable(account, options = {}) {
     if (!account) return false;
     if (!account.enabled) return false;
-    const now = Date.now();
+    const now = options.now ?? Date.now();
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -764,6 +776,12 @@ export class AccountManager {
     // (but the account still serves its other models). options.model is threaded in
     // by request-path callers; model-agnostic call sites skip this gate.
     if (options.model && this._scopedExhausted(account, options.model)) return false;
+
+    // PEAK HARD BAR (peakCap: 0.0 — "never during peak"). The ONLY peak gate on
+    // ELIGIBILITY; the soft cap is a priority tier and can never strand a request.
+    // No allow* opt-out exists on purpose: zero means zero. The request parks on the
+    // finite hold the _retryInfo peak branch hands the oracle — it must never die.
+    if (this._peakHardBarred(account, now)) return false;
 
     return true;
   }
@@ -1251,7 +1269,7 @@ export class AccountManager {
    *  near-reset session (whose pace stays normal) never triggers → no churn. Does
    *  NOT flip the instant a request migrates (unlike live in-flight, left to the
    *  score loop), so a healthy bound account never ping-pongs. */
-  _isBoundAccountHot(account) {
+  _isBoundAccountHot(account, now = Date.now()) {
     return this._isSessionQuotaUnavailable(account)
       || ['reserve', 'critical', 'exhausted'].includes(this._weeklyPaceState(account))
       // SESSION-window pressure counts too. _isSessionQuotaUnavailable only fires at
@@ -1263,7 +1281,11 @@ export class AccountManager {
       // there is still headroom, not at the cliff edge. _shouldRebalanceBoundSession
       // still requires a clearly-cheaper, strictly-healthier target, so a hot account
       // with no better alternative keeps its sessions — this only opens the question.
-      || this._sessionWindowUsage(account) >= this.scheduler.weeklySoftThreshold;
+      || this._sessionWindowUsage(account) >= this.scheduler.weeklySoftThreshold
+      // PEAK (2026-08-18): a provider inside its peak window is "hot" in the COST
+      // sense — staying bound burns at 2x for hours. Peak-only ⇒ inert off-peak
+      // (SC2). This only OPENS the question; the rebalance gates still decide.
+      || this._peakTier(account, now) > 0;
   }
 
   /** Fraction of the SESSION (5h) window consumed, across both quota shapes.
@@ -1330,10 +1352,10 @@ export class AccountManager {
     return best;
   }
 
-  _shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx) {
+  _shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx, now = Date.now()) {
     if (!this._migrationSafeForRequest(requestInfo)) return false;
     if (requestInfo.queueTicket || requestInfo.queueAdmitted) return false;
-    if (!this._isBoundAccountHot(bound)) return false;
+    if (!this._isBoundAccountHot(bound, now)) return false;
 
     const boundScore = this._scoreAccount(bound, requestInfo, scoringCtx);
     // Tier guard on the SAME axis as the trigger (pace, not raw). If the trigger is
@@ -1357,6 +1379,9 @@ export class AccountManager {
       // remove assuming the fall-through protects signed thinking — it does not.
       if (requestInfo.requiresAnthropicThinkingIntegrity === true && account.type === 'provider') continue;
       if (!this._matchesRequest(account, profile, requestInfo)) continue;
+      // PEAK (2026-08-18): never migrate ONTO a peak-suppressed account — the move
+      // would immediately be a 2x-burn destination. Peak-only ⇒ inert off-peak.
+      if (this._peakTier(account, now) > 0) continue;
       // Genuinely-healthy alternatives only (normal/soft/unknown weekly + model headroom).
       if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model })) continue;
       const score = this._scoreAccount(account, requestInfo, scoringCtx);
@@ -1391,6 +1416,14 @@ export class AccountManager {
     // and preserving the last of a 5h window beats concurrency spread.
     if (this._sessionWindowUsage(bound) >= this.scheduler.weeklyReserveThreshold) return true;
 
+    // PEAK (2026-08-18) — absolute escape. The score margins below are calibrated for
+    // LOAD relief and are UNSATISFIABLE for a healthy peak account: peak tier 1/2 with
+    // weekly pace `normal` means bestTier < boundTier can never hold, so without this
+    // escape the exact sessions causing the 2x spend would never move. Flap-stable:
+    // clause (b) guarantees every candidate is non-peak, and within the window nothing
+    // pulls the session back. Peak-only ⇒ inert off-peak (SC2).
+    if (this._peakTier(bound, now) > 0) return true;
+
     // Otherwise the trigger was PACE-only on a RAW-healthy account — a fast-burner
     // that still has real absolute headroom (RAW soft but pace reserve/critical,
     // e.g. 79% used resetting in ~3.5d). Keep the conservative gate so it isn't
@@ -1402,8 +1435,7 @@ export class AccountManager {
       && bestTier < boundTier;
   }
 
-  _retryInfo(account, model = null) {
-    const now = Date.now();
+  _retryInfo(account, model = null, now = Date.now()) {
     const q = account.quota || {};
 
     // TERMINAL (non-recoverable) states FIRST — before any weekly/short-term
@@ -1435,6 +1467,30 @@ export class AccountManager {
     // account reports its REAL near-term recovery, not the distant weekly reset.
     const shortTerm = this._shortTermRetry(account, now, q);
 
+    // PEAK HARD BAR (peakCap 0.0) — barred until a KNOWN wall-clock time, so the oracle
+    // must hold FINITE. Placement is pinned: AFTER the terminal checks above, BEFORE
+    // the weekly branches. A LATE placement falls through to the terminal
+    // `{cause:'unavailable'}` return, contributes to NO recovery bucket, collapses
+    // nextRetryForRequest to Infinity, and server.js error-fasts — a session KILL at
+    // 06:00 UTC. Precedence: weekly_exhausted (below) outranks peak when the weekly
+    // reset dominates; here the max() merge with shortTerm means BOTH must clear.
+    if (this._peakHardBarred(account, now)) {
+      const { endsAt } = this._peakStateFor(account.provider, now);
+      const weeklyReset = q.providerWkReset || q.unified7dReset || 0;
+      // CAUSE follows the DOMINANT blocker, not merely the branch we are in. A
+      // peak-barred account that is ALSO weekly-exhausted clears in DAYS, not at the
+      // window end — labelling that `peak_window` would tell the user "peak ends in
+      // 3h" while the real wait is 3 days (the misleading-message class this codebase
+      // has been bitten by before). The TIME was always right via the max-merge; this
+      // makes the LABEL agree with it.
+      const retryAt = Math.max(endsAt || 0, shortTerm?.retryAt || 0, weeklyReset);
+      const weeklyDominates = weeklyReset > 0 && weeklyReset >= (endsAt || 0);
+      return {
+        cause: weeklyDominates ? 'weekly_exhausted' : 'peak_window',
+        retryAt,
+        queueable: true,
+      };
+    }
     if (weeklyState === 'exhausted') {
       // Hard block: only a weekly reset unblocks it — a sooner short-term clear
       // does not help — so key the hold on the weekly reset.
@@ -1568,7 +1624,9 @@ export class AccountManager {
     return null;
   }
 
-  _selectNext(requestInfo = {}, excludedIndexes = new Set()) {
+  // `now` is the injected clock for every time-varying predicate on the selection
+  // path (peak tier, sticky escape). Defaults to the real clock; tests pass it.
+  _selectNext(requestInfo = {}, excludedIndexes = new Set(), now = Date.now()) {
     // Adaptive least-loaded balancing: spread requests across every healthy
     // account immediately, and let live load, quota pressure, and recent errors
     // push traffic away from weaker accounts.
@@ -1612,7 +1670,7 @@ export class AccountManager {
     // `_isWarming`, not on a binding.
     const isStickyMode = this.scheduler.routingMode === 'sticky';
     const bound = isStickyMode
-      ? this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo)
+      ? this._boundAccount(requestInfo.sessionKey, profile, excludedIndexes, requestInfo, now)
       : null;
     if (bound) {
       // Warmup-pull: onboard a freshly-ADDED account (added mid-session, no reload)
@@ -1629,7 +1687,7 @@ export class AccountManager {
         return warmupTarget;   // _bindSession re-homes the session on acquire
       }
       if (!this._hasHigherPriorityAvailable(bound, profile, excludedIndexes, requestInfo)
-        && !this._shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx)) {
+        && !this._shouldRebalanceBoundSession(bound, profile, excludedIndexes, requestInfo, scoringCtx, now)) {
         return bound;
       }
     }
@@ -1662,7 +1720,7 @@ export class AccountManager {
         if (!this._matchesRequest(account, profile, requestInfo)) continue;
         if (!this._isAvailable(account, { ...weeklyOptions, model: requestInfo.model })) continue;
 
-        const priority = this._effectivePriority(account, requestInfo);
+        const priority = this._effectivePriority(account, requestInfo, now);
         const score = this._scoreAccount(account, requestInfo, scoringCtx);
         if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
           bestPriority = priority;
@@ -1714,12 +1772,12 @@ export class AccountManager {
     return null;
   }
 
-  _boundAccount(sessionKey, profile, excludedIndexes = new Set(), requestInfo = {}) {
+  _boundAccount(sessionKey, profile, excludedIndexes = new Set(), requestInfo = {}, now = Date.now()) {
     if (!sessionKey) return null;
     const binding = this._sessionBinding(sessionKey);
     if (!binding) return null;
 
-    const home = this._eligibleBoundAccount(binding.homeName, profile, excludedIndexes, { allowWeeklyReserve: true }, requestInfo);
+    const home = this._eligibleBoundAccount(binding.homeName, profile, excludedIndexes, { allowWeeklyReserve: true, now }, requestInfo);
     if (home) return home;
 
     const current = this._eligibleBoundAccount(binding.currentName, profile, excludedIndexes, { allowWeeklyReserve: true }, requestInfo);
@@ -1743,7 +1801,7 @@ export class AccountManager {
     return account;
   }
 
-  _bindSession(sessionKey, account, model = null) {
+  _bindSession(sessionKey, account, model = null, now = Date.now()) {
     const priority = this._priority(account);
     const binding = this._sessionBinding(sessionKey) || {
       homeName: account.name,
@@ -1751,7 +1809,19 @@ export class AccountManager {
       currentName: account.name,
     };
 
-    if (!binding.homeName || priority < binding.homePriority) {
+    // PEAK FAILOVER GUARD (2026-08-18): a move forced by peak suppression is a
+    // FAILOVER, not a by-choice rebalance — keep homeName so the session returns to
+    // its home once the window closes. Without this, `priority < homePriority`
+    // (oauth 0 < provider 10) permanently re-homes every sticky GLM session live at
+    // 06:00 UTC, and it never returns after 10:00 — an SC2 violation. Mirrors the
+    // CHOICE-vs-FAILOVER distinction the equal-priority branch below already encodes.
+    // Both legs need the previous home, so it is resolved once here.
+    const oldHome = binding.homeName ? this.accounts.find(a => a.name === binding.homeName) : null;
+    const oldHomeInPeak = oldHome != null && this._peakTier(oldHome, now) > 0;
+    // Lower-priority leg: only a move ONTO a non-peak account is peak-driven.
+    const peakFailover = oldHomeInPeak && this._peakTier(account, now) === 0;
+
+    if (!binding.homeName || (priority < binding.homePriority && !peakFailover)) {
       binding.homeName = account.name;
       binding.homePriority = priority;
     } else if (priority === binding.homePriority && account.name !== binding.homeName) {
@@ -1763,8 +1833,12 @@ export class AccountManager {
       // Model-aware: a move off a home that's capped for THIS model (but healthy
       // for others) is a FAILOVER, not a by-choice rebalance — keep homeName so the
       // session snaps back once the model's scoped cap resets.
-      const oldHome = this.accounts.find(a => a.name === binding.homeName);
-      if (oldHome && this._isAvailable(oldHome, { allowWeeklyReserve: true, model })) {
+      //
+      // PEAK FAILOVER GUARD (equal-priority leg): an in-peak old home reads AVAILABLE
+      // (tier 1/2 is a ranking, not an eligibility bar) — so without this check the
+      // CHOICE branch would treat a peak-driven move as by-choice and permanently
+      // re-home the session. A peak home is a FAILOVER cause: keep homeName.
+      if (oldHome && !oldHomeInPeak && this._isAvailable(oldHome, { allowWeeklyReserve: true, model })) {
         binding.homeName = account.name;
       }
     }
@@ -1867,7 +1941,17 @@ export class AccountManager {
   // Claude session load-balances across Claude+GLM+Kimi rather than using providers
   // only as last-resort. 'never'/'when-exhausted' keep the provider's own priority
   // (10/20) → fallback-only. A foreign session is provider-only regardless.
-  _effectivePriority(account, requestInfo = {}) {
+  _effectivePriority(account, requestInfo = {}, now = Date.now()) {
+    // PEAK TIER (2026-08-18): a stride added AFTER the mode layer, so a peak provider
+    // ranks strictly below every non-peak account in EVERY routing mode with no
+    // per-mode branch. Tier 0 returns base IDENTICALLY — off-peak behaviour is
+    // byte-identical to the pre-peak implementation (SC2 by construction).
+    const base = this._basePriority(account, requestInfo);
+    const tier = this._peakTier(account, now);
+    return tier === 0 ? base : base + tier * PEAK_TIER_STRIDE;
+  }
+
+  _basePriority(account, requestInfo = {}) {
     const base = Number.isFinite(account.priority) ? account.priority : 0;
     const mode = this.scheduler.routingMode;
     const incompatible = this._effectiveIncompatible(requestInfo).incompatible;
@@ -1946,7 +2030,129 @@ export class AccountManager {
     const providers = { ...(this.scheduler.providers || {}) };
     providers[providerKey] = { ...(providers[providerKey] || {}), claudeFallback: policy };
     this.scheduler.providers = providers;
+    this._peakCache = null;   // provider settings changed → peak memo is stale (MINOR 10)
     return true;
+  }
+
+  /** Peak settings setter (TUI + config writes). Validates, spread-preserves sibling
+   *  keys, clears the per-minute memo. Returns false on invalid input (no change). */
+  setPeakSettingsForProvider(providerKey, { peakWindows, peakCap, peakDepreference } = {}) {
+    if (!providerKey) return false;
+    const existing = this.scheduler.providers?.[providerKey] || {};
+    const next = { ...existing };
+    if (peakWindows !== undefined) {
+      if (!Array.isArray(peakWindows)) return false;
+      next.peakWindows = peakWindows;
+    }
+    if (peakCap !== undefined) {
+      const c = Number(peakCap);
+      if (!Number.isFinite(c) || c < 0 || c > 1) return false;
+      next.peakCap = c;
+    }
+    if (peakDepreference !== undefined) next.peakDepreference = Boolean(peakDepreference);
+    const providers = { ...(this.scheduler.providers || {}) };
+    providers[providerKey] = next;
+    this.scheduler.providers = providers;
+    this._peakCache = null;
+    return true;
+  }
+
+  /** Machine-readable peak state for the status endpoint (SC9). Per provider:
+   *  inPeak/endsAt/cap/depreference; plus which accounts are tier-1/2/barred. */
+  peakSummary(now = Date.now()) {
+    const providers = {};
+    for (const a of this.accounts) {
+      if (a.type !== 'provider' || providers[a.provider]) continue;
+      const { inPeak, endsAt, settings } = this._peakStateFor(a.provider, now);
+      providers[a.provider] = { inPeak, endsAt, cap: settings.cap, depreference: settings.depreference };
+    }
+    return { providers };
+  }
+
+  // ── Peak-hour governance (2026-08-18) ─────────────────────────────────────────
+  // Peak is a DERIVED, STATELESS overlay: a pure function of now + config. Never
+  // persisted, never latched, never timer-driven — so sleep/wake, restart and the
+  // zero-downtime reload need no recovery code. All peak predicates route through
+  // these four helpers so the selector, the oracle and the TUI can never disagree.
+
+  /** Merged peak settings for one provider family. A malformed cap falls back to the
+   *  shipped default rather than throwing — but a malformed WINDOW yields `[]`, i.e.
+   *  never peak, so a config typo degrades to today's behaviour instead of benching an
+   *  account. Defaults resolve ONLY from scheduler.providers (seeded by the loadConfig
+   *  migration / createDefaultConfig — see peak-window.js for why they must not live
+   *  in DEFAULT_SCHEDULER). Resolved once per provider per minute via _peakStateFor. */
+  _peakSettingsFor(providerKey) {
+    const p = this.scheduler.providers?.[providerKey] || {};
+    const cap = Number(p.peakCap);
+    return {
+      windows: Array.isArray(p.peakWindows) ? p.peakWindows : [],
+      // null/absent ⇒ follow the MACHINE's local zone (wallClockIn's own default).
+      // A string pins an IANA zone. Both are user-settable (2026-08-18).
+      timezone: typeof p.peakTimezone === 'string' && p.peakTimezone ? p.peakTimezone : null,
+      cap: Number.isFinite(cap) ? clamp01(cap) : DEFAULT_PEAK_CAP,
+      depreference: p.peakDepreference !== false,
+    };
+  }
+
+  /** {inPeak, endsAt, settings} for a provider family, memoized per UTC MINUTE (the
+   *  evaluation is minute-stable by construction, so the memo is exact). Carrying the
+   *  resolved settings in the same entry is what lets _peakTier / _peakHardBarred /
+   *  peakSummary read them without re-resolving. Invalidated by the peak/provider
+   *  setters, which are the only things that can change settings mid-minute. */
+  _peakStateFor(providerKey, now = Date.now()) {
+    const minute = Math.floor(now / 60_000);
+    if (!this._peakCache || this._peakCache.minute !== minute) {
+      this._peakCache = { minute, byProvider: new Map() };
+    }
+    let st = this._peakCache.byProvider.get(providerKey);
+    if (!st) {
+      const settings = this._peakSettingsFor(providerKey);
+      st = { ...peakWindowState(settings.windows, now, settings.timezone), settings };
+      this._peakCache.byProvider.set(providerKey, st);
+    }
+    return st;
+  }
+
+  /** WEEKLY utilization 0..1, or null when unreadable. The cap's basis (D2): TOTAL
+   *  WEEKLY — deliberately NOT _weeklyRawState's max(providerSes, providerWk), which
+   *  conflates the 5h session window with the weekly one. null (legacy TOKENS_LIMIT
+   *  plan / weeklyAbsent) FAILS OPEN: unknown must never mean over-cap. Provider-only,
+   *  like every peak predicate — OAuth accounts have no peak concept. */
+  _peakWeeklyUtilization(account) {
+    const wk = account?.quota?.providerWk;
+    return wk != null ? clamp01(wk) : null;
+  }
+
+  /** SOFT cap: weekly utilization at/over the cap during peak ⇒ tier 2 (last-resort).
+   *  cap >= 1 is "feature off" (SC4) — the strict < 1 guard also stops cap 1.0 firing
+   *  at exactly util 1.0. cap === 0 is NOT handled here; it is the hard bar, a
+   *  different mechanism entirely (utilization-independent). */
+  _peakCapExceeded(account, settings) {
+    if (!(settings.cap > 0 && settings.cap < 1)) return false;
+    const util = this._peakWeeklyUtilization(account);
+    if (util == null) return false;          // fail open
+    return util >= settings.cap;
+  }
+
+  /** HARD bar: peakCap === 0.0 means "never use this provider during peak" (D4).
+   *  Utilization is irrelevant — zero means zero. The ONLY peak predicate that gates
+   *  ELIGIBILITY (_isAvailable); everything else is ranking. */
+  _peakHardBarred(account, now = Date.now()) {
+    if (account?.type !== 'provider') return false;
+    const { inPeak, settings } = this._peakStateFor(account.provider, now);
+    return inPeak && settings.cap === 0;
+  }
+
+  /** 0 = unaffected · 1 = peak, de-preferred · 2 = peak + over the soft cap.
+   *  OAuth accounts are 0 always (no peak concept). A provider with no window is 0
+   *  always (Kimi by default — SC5). The cap is independent of depreference: turning
+   *  depreference off must not disable the cap (both knobs exist, D7). */
+  _peakTier(account, now = Date.now()) {
+    if (account?.type !== 'provider') return 0;
+    const { inPeak, settings } = this._peakStateFor(account.provider, now);
+    if (!inPeak) return 0;
+    if (this._peakCapExceeded(account, settings)) return 2;
+    return settings.depreference ? 1 : 0;
   }
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
@@ -3385,6 +3591,7 @@ export class AccountManager {
         admissionPaused: this.admissionPaused,
         safetyMaxActivePerAccount: this.scheduler.safetyMaxActivePerAccount,
         safetyMaxGlobalActive: this.scheduler.safetyMaxGlobalActive,
+        peak: this.peakSummary(),
       },
       upstreamThrottle: {
         active: this._isUpstreamThrottleBlocking(),
