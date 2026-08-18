@@ -2053,9 +2053,11 @@ export class AccountManager {
       next.peakWindows = peakWindows;
     }
     if (peakCap !== undefined) {
-      const c = Number(peakCap);
-      if (!Number.isFinite(c) || c < 0 || c > 1) return false;
-      next.peakCap = c;
+      // The SAME coercion trap the read path documents: Number(null)/Number('')/
+      // Number(false) are all 0 = the HARD BAR. A persisted 0 is then unreachable
+      // by the read-path guard (typeof 0 === 'number'). Reject non-numbers here.
+      if (typeof peakCap !== 'number' || !Number.isFinite(peakCap) || peakCap < 0 || peakCap > 1) return false;
+      next.peakCap = peakCap;
     }
     if (peakDepreference !== undefined) next.peakDepreference = Boolean(peakDepreference);
     if (peakTimezone !== undefined) {

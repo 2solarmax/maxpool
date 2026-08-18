@@ -328,6 +328,17 @@ test('R2 peakCap coercion FAILS SAFE — no garbage value may hard-bar', () => {
   am.scheduler.providers = { zai: { peakCap: 0 } };
   am._peakCache = null;
   assert.equal(am._peakSettingsFor('zai').cap, 0);
+  // The SAME garbage must be rejected by the SETTER (critic round 2, 2026-08-18): a
+  // persisted 0 is structurally unreachable by the read-path guard above. This test
+  // loops the identical 8 values through setPeakSettingsForProvider.
+  const am2 = fleet(PEAK_SCHED);
+  for (const bad of [null, '', false, [], {}, 'abc', NaN, undefined]) {
+    const ok = am2.setPeakSettingsForProvider('zai', { peakCap: bad });
+    if (bad === undefined) continue;   // undefined = "not changing it" — legit
+    assert.equal(ok, false, `setter must REJECT peakCap: ${JSON.stringify(bad)}`);
+  }
+  assert.equal(am2.setPeakSettingsForProvider('zai', { peakCap: 0 }), true, 'a real 0 is a deliberate instruction');
+  assert.equal(am2._peakSettingsFor('zai').cap, 0);
 });
 
 test('R3 setPeakSettingsForProvider accepts peakTimezone and REJECTS a bad zone', () => {

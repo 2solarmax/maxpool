@@ -181,7 +181,12 @@ test('unavailableMessage is honest for an incompatible-pinned session (not the m
   const am = withProviders('when-exhausted');
   am.markSessionIncompatible('s-msg', 'zai');
   const msg = unavailableMessage(am, { profile: 'all', sessionKey: 's-msg' }, 30, true);
-  assert.match(msg, /GLM/);
+  // Assert on a string UNIQUE to the incompat branch, not a bare /GLM/ — the generic
+  // fallback message also contains "GLM/Kimi providers", so /GLM/ passed even with
+  // this entire branch DELETED (verified 2026-08-18: 18/18 green against the defect).
+  // A vacuous pin, per dev-prove-by-exercise gate 7: assert by a needle only the
+  // branch under test can produce.
+  assert.match(msg, /can only run on GLM/, 'must be the incompat branch, not the generic fallback');
   assert.doesNotMatch(msg, /5h or weekly|all \d+ (are|accounts)/i);
 });
 
