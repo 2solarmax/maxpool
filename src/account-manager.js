@@ -1438,7 +1438,19 @@ export class AccountManager {
     if (weeklyState === 'exhausted') {
       // Hard block: only a weekly reset unblocks it — a sooner short-term clear
       // does not help — so key the hold on the weekly reset.
-      return { cause: 'weekly_exhausted', retryAt: q.unified7dReset || null, queueable: false };
+      //
+      // Read the PROVIDER reset too. `unified7dReset` is an Anthropic-only field;
+      // a GLM/Kimi account stores its weekly reset in `providerWkReset`
+      // (applyProviderUsage). Reading only the Anthropic field returned retryAt:null
+      // for every weekly-exhausted PROVIDER, which lands on `weeklyUnknownReset` in
+      // nextRetryForRequest → retryAfterMs: Infinity → server.js error-fasts → the
+      // live session is KILLED, despite the real reset time being known all along.
+      // Reproduced 2026-08-18 with providerWk=0.9995 + a known providerWkReset.
+      return {
+        cause: 'weekly_exhausted',
+        retryAt: q.unified7dReset || q.providerWkReset || null,
+        queueable: false,
+      };
     }
 
     if (weeklyState === 'critical') {
