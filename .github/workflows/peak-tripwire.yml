@@ -1,0 +1,38 @@
+# BLOCKER 5 / TEST PLAN T2 — the standing time-dependence tripwire.
+#
+# The peak-hours feature makes routing depend on the wall clock. Its defaults are
+# deliberately placed on the config LOAD path so directly-constructed AccountManagers
+# (i.e. the whole suite) never inherit a window — but that is an invariant a future
+# change can silently break, and it would only fail for 20 of 168 hours a week.
+#
+# This runs the suite INSIDE the z.ai peak window (06:30 UTC weekdays = 14:30 SGT),
+# so a re-introduced clock dependence surfaces the next morning rather than as a
+# mystery red build months later.
+name: Peak-window tripwire
+
+on:
+  schedule:
+    - cron: '30 6 * * 1-5'   # weekdays 06:30 UTC — inside Mon-Fri 06:00-10:00 UTC
+  workflow_dispatch:
+
+jobs:
+  in-window-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Confirm we are genuinely inside the window
+        run: |
+          set -euo pipefail
+          node -e "
+            const d = new Date();
+            const day = d.getUTCDay(), min = d.getUTCHours()*60 + d.getUTCMinutes();
+            const inWindow = day >= 1 && day <= 5 && min >= 360 && min < 600;
+            console.log('UTC now:', d.toISOString(), '| in 06:00-10:00 Mon-Fri:', inWindow);
+            if (!inWindow) console.log('NOTE: dispatched outside the window — the run still checks the suite, just not the tripwire property.');
+          "
+      - run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+      - run: npx eslint src/ test/
+      - run: bash scripts/run-tests.sh

@@ -19,6 +19,7 @@ export default [
         AbortController: 'readonly',
         AbortSignal: 'readonly',
         fetch: 'readonly',
+        structuredClone: 'readonly',
       },
     },
     rules: {

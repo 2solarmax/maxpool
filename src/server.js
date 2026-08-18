@@ -1536,27 +1536,6 @@ function computeQueueWindowMs({
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRecoverSoon = true) {
   const incompat = accountManager._effectiveIncompatible?.(requestInfo) || { incompatible: false, homeProvider: null };
 
-  // PEAK (2026-08-18): when a provider family is hard-barred (peakCap 0.0) inside its
-  // peak window and that is why no route exists, NAME IT — "all Claude accounts are
-  // at their limit" would send the user hunting quota when a SETTING is holding the
-  // provider out. Checked directly off the peak predicates (the census skips
-  // providers entirely, so it can never name this).
-  // ENABLED accounts only: a family that is simply switched off must not be reported
-  // as held out by the peak setting.
-  const peakBarred = [];
-  const seenPeakProviders = new Set();
-  for (const a of accountManager.accounts || []) {
-    if (a.type !== 'provider' || !a.enabled || seenPeakProviders.has(a.provider)) continue;
-    seenPeakProviders.add(a.provider);
-    if (accountManager._peakHardBarred?.(a)) {
-      peakBarred.push(a.provider === 'zai' ? 'GLM' : a.provider === 'kimi' ? 'Kimi' : a.provider);
-    }
-  }
-  if (peakBarred.length) {
-    const eta = Number.isFinite(retryAfter) && retryAfter > 0 ? ` Peak ends in ~${formatRetryDuration(retryAfter)}.` : '';
-    return `${peakBarred.join(' and ')} ${peakBarred.length === 1 ? 'is' : 'are'} switched off during peak hours (a setting: peakCap 0), and no other account can take this request.${eta} Set scheduler.providers.<provider>.peakCap above 0 to let it cover peak hours.`;
-  }
-
   // An Anthropic-incompatible session is pinned to provider accounts — Anthropic
   // 400s on its server_tool_use id / foreign thinking. "All Claude at limit" would
   // be the wrong story (Claude is irrelevant to it); say what actually blocks it.
@@ -1575,6 +1554,30 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
       ? ` A Claude account should free in ~${formatRetryDuration(retryAfter)}.` : '';
     return `This session is too large for the GLM/Kimi fallbacks (their ~256K limit) — it needs a 1M-context Claude account, and they're all busy right now.${eta} It sends as soon as one frees; /compact shortens the session if you'd rather not wait.`;
   }
+
+  // PEAK (2026-08-18): a provider family hard-barred by peakCap:0 inside its window.
+  // Placed AFTER the incompat + large-context branches on purpose — both have strictly
+  // better explanations for THEIR requests, and this preempting them told a >256K
+  // session to raise peakCap (which cannot help it). ENABLED accounts only, and the ETA
+  // comes from the peak window end — never the caller's retryAfter, which may reflect
+  // an entirely different blocker (red-team 2026-08-18).
+  {
+    const peakBarred = [];
+    const seenPeakProviders = new Set();
+    for (const a of accountManager.accounts || []) {
+      if (a.type !== 'provider' || a.enabled === false || seenPeakProviders.has(a.provider)) continue;
+      seenPeakProviders.add(a.provider);
+      if (accountManager._peakHardBarred?.(a)) peakBarred.push(a);
+    }
+    if (peakBarred.length) {
+      const names = [...new Set(peakBarred.map(a => (a.provider === 'zai' ? 'GLM' : a.provider === 'kimi' ? 'Kimi' : a.provider)))];
+      const endsAt = Math.max(...peakBarred.map(a => accountManager._peakStateFor?.(a.provider)?.endsAt || 0));
+      const leftMs = endsAt - Date.now();
+      const eta = leftMs > 0 ? ` Peak ends in ~${formatRetryDuration(Math.round(leftMs / 1000))}.` : '';
+      return `${names.join(' and ')} ${names.length === 1 ? 'is' : 'are'} switched off during peak hours (a setting: peakCap 0), and no other account can take this request.${eta} Set scheduler.providers.<provider>.peakCap above 0 to let it cover peak hours.`;
+    }
+  }
+
 
   // ENABLED only — a disabled account is not "at its limit", it is off; counting it
   // made a 1-enabled-account pool report "all 9 accounts at their limit".

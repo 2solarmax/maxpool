@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { mergePeakDefaults } from '../src/peak-window.js';
+import { TUI, __tuiTest } from '../src/tui.js';
+const { strip } = __tuiTest;
 
 // Lanes B-E of the TEST PLAN. The clock is ALWAYS injected — never ambient (T3).
 const U = (y, mo, d, h, mi) => Date.UTC(y, mo, d, h, mi, 0, 0);
@@ -294,4 +296,80 @@ test('E3c the failover guard needs a NON-PEAK destination — a peak→peak move
   am._bindSession('sess-z', b, null, TUE_IN);
   assert.equal(am.sessionBindings.get('sess-z').homeName, 'glm-b',
     'peak→peak is not a failover — the better-ranked account becomes home');
+});
+
+// ── Red-team fixes (2026-08-18). Each of these pins a construct that survived the
+// first mutation sweep, or a defect the red-team probe found in the shipped code. ──
+
+test('R1 a HEALTHY provider that merely LEARNED its weekly reset reports peak, not weekly', () => {
+  // The defect: providerWkReset is set on every successfully-PROBED account, so reading
+  // it unconditionally made a 5%-weekly account report a 72h "weekly_exhausted" hold
+  // instead of the real 3h peak hold — the multi-day-hang class, inverted.
+  const sched = { providers: mergePeakDefaults({ zai: { peakCap: 0 } }, undefined), routingMode: 'balance' };
+  const am = fleet(sched);
+  const glm = glmOf(am);
+  glm.quota.providerWk = 0.05;                       // healthy
+  glm.quota.providerWkReset = TUE_IN + 3 * 86400_000; // known, but NOT blocking
+  const info = am._retryInfo(glm, null, TUE_IN);
+  assert.equal(info.cause, 'peak_window', 'a healthy account is peak-blocked, not weekly-blocked');
+  assert.ok(info.retryAt - TUE_IN < 4 * 3600_000, `hold must be the ~3h window, got ${(info.retryAt - TUE_IN) / 3600_000}h`);
+});
+
+test('R2 peakCap coercion FAILS SAFE — no garbage value may hard-bar', () => {
+  // `Number(null)` is 0, which is the hard bar. `peakCap: null` is the natural JSON
+  // spelling of "no cap" AND the convention peakTimezone uses in the same object.
+  const am = fleet(PEAK_SCHED);
+  for (const bad of [null, '', false, [], {}, 'abc', NaN, undefined]) {
+    am.scheduler.providers = { zai: { peakCap: bad } };
+    am._peakCache = null;
+    assert.equal(am._peakSettingsFor('zai').cap, 0.5, `peakCap: ${JSON.stringify(bad)} must fall back, never bar`);
+  }
+  // ...while a real 0 still means the deliberate hard bar.
+  am.scheduler.providers = { zai: { peakCap: 0 } };
+  am._peakCache = null;
+  assert.equal(am._peakSettingsFor('zai').cap, 0);
+});
+
+test('R3 setPeakSettingsForProvider accepts peakTimezone and REJECTS a bad zone', () => {
+  const am = fleet(PEAK_SCHED);
+  assert.equal(am.setPeakSettingsForProvider('zai', { peakTimezone: 'Europe/Berlin' }), true);
+  assert.equal(am._peakSettingsFor('zai').timezone, 'Europe/Berlin', 'the zone actually changed');
+  assert.equal(am.setPeakSettingsForProvider('zai', { peakTimezone: 'Not/AZone' }), false, 'a typo is rejected at the setter');
+  assert.equal(am._peakSettingsFor('zai').timezone, 'Europe/Berlin', 'and leaves the previous value intact');
+  assert.equal(am.setPeakSettingsForProvider('zai', { peakTimezone: null }), true, 'null = follow the machine zone');
+  assert.equal(am._peakSettingsFor('zai').timezone, null);
+});
+
+test('R4 the selector REFUSES a hard-barred account (the gate, not just the oracle)', () => {
+  // No test previously covered "_selectNext honours the hard bar" — only the oracle did.
+  const sched = { providers: mergePeakDefaults({ zai: { peakCap: 0 } }, undefined), routingMode: 'balance' };
+  const am = fleet(sched);
+  ccOf(am).enabled = false;
+  am.accounts.find(a => a.provider === 'kimi').enabled = false;
+  assert.equal(am._selectNext({ profile: 'all' }, new Set(), TUE_IN), null,
+    'a hard-barred sole account is NOT selected — the request parks on the finite hold');
+});
+
+test('R5 E2: a peak account is never a MIGRATION DESTINATION', () => {
+  const am = fleet({ ...PEAK_SCHED_STICKY, routingMode: 'sticky' });
+  const cc = ccOf(am);
+  // bind to Claude, make Claude hot, and confirm the in-peak GLM is not chosen as target
+  am._bindSession('s-mig', cc, null);
+  cc.quota.unified5h = 0.99;   // hot
+  const picked = am._selectNext({ profile: 'all', sessionKey: 's-mig' }, new Set(), TUE_IN);
+  assert.notEqual(picked?.name, 'glm', 'never migrate ONTO a peak-suppressed account');
+});
+
+test('R6 SC9: the peak header survives STICKY mode (which overwrites xpText wholesale)', () => {
+  // sticky is DEFAULT_SCHEDULER.routingMode, the TUI's own fallback, AND the legacy
+  // migration target — and its `xpText = this._crossProviderText()` assignment
+  // discarded a peak note that had been prepended. Verified dead by red-team probe.
+  for (const mode of ['sticky', 'balance']) {
+    const am = fleet({ ...PEAK_SCHED_STICKY, routingMode: mode });
+    // Freeze the TUI's clock reads by pointing the memo at an in-window instant.
+    am._peakStateFor('zai', TUE_IN);
+    const tui = new TUI({ accountManager: am, config: {} });
+    const note = strip(tui._peakHeaderNote(TUE_IN));
+    assert.match(note, /peak/i, `${mode}: _peakHeaderNote must render in-window`);
+  }
 });

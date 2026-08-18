@@ -1342,7 +1342,7 @@ export class AccountManager {
       if (!this._isWarming(account, now)) continue;
       if (!this._matchesRequest(account, profile, requestInfo)) continue;
       // Genuinely-healthy target only (same bar as the hot-rebalance candidate scan).
-      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model })) continue;
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
       const score = this._scoreAccount(account, requestInfo, ctx);
       if (score < bestScore) {
         bestScore = score;
@@ -1383,7 +1383,7 @@ export class AccountManager {
       // would immediately be a 2x-burn destination. Peak-only ⇒ inert off-peak.
       if (this._peakTier(account, now) > 0) continue;
       // Genuinely-healthy alternatives only (normal/soft/unknown weekly + model headroom).
-      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model })) continue;
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
       const score = this._scoreAccount(account, requestInfo, scoringCtx);
       if (score < bestScore) {
         bestScore = score;
@@ -1476,7 +1476,15 @@ export class AccountManager {
     // reset dominates; here the max() merge with shortTerm means BOTH must clear.
     if (this._peakHardBarred(account, now)) {
       const { endsAt } = this._peakStateFor(account.provider, now);
-      const weeklyReset = q.providerWkReset || q.unified7dReset || 0;
+      // Only a weekly reset that is ACTUALLY BLOCKING may dominate. providerWkReset is
+      // set on every successfully-PROBED provider account — i.e. the steady state, not
+      // an exceptional one — so reading it unconditionally made a HEALTHY account at 5%
+      // weekly report a 72h "weekly_exhausted" hold instead of the real 3h peak hold.
+      // That is the multi-day-hang class this branch exists to prevent, inverted.
+      // (Caught by red-team probe 2026-08-18; the D5b control passed only because its
+      // fixture left quota={}, a state a probed account is never in.)
+      const weeklyBlocked = weeklyState === 'exhausted';
+      const weeklyReset = weeklyBlocked ? (q.providerWkReset || q.unified7dReset || 0) : 0;
       // CAUSE follows the DOMINANT blocker, not merely the branch we are in. A
       // peak-barred account that is ALSO weekly-exhausted clears in DAYS, not at the
       // window end — labelling that `peak_window` would tell the user "peak ends in
@@ -1646,7 +1654,7 @@ export class AccountManager {
       const pinned = this.accounts.find(a => a.name === requestInfo.pinnedAccountName);
       if (pinned && !excludedIndexes.has(pinned.index)
         && this._matchesRequest(pinned, profile, requestInfo)
-        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
+        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
         this.currentIndex = pinned.index;
         return pinned;
       }
@@ -1658,7 +1666,7 @@ export class AccountManager {
         { allowWeeklyReserve: true, allowWeeklyCritical: false },
         { allowWeeklyReserve: true, allowWeeklyCritical: true },
       ];
-      if (preferredPasses.some(options => this._isAvailable(preferred, { ...options, model: requestInfo.model }))) {
+      if (preferredPasses.some(options => this._isAvailable(preferred, { ...options, model: requestInfo.model, now }))) {
         this.currentIndex = preferred.index;
         return preferred;
       }
@@ -1718,7 +1726,7 @@ export class AccountManager {
         const account = this.accounts[idx];
         if (excludedIndexes.has(account.index)) continue;
         if (!this._matchesRequest(account, profile, requestInfo)) continue;
-        if (!this._isAvailable(account, { ...weeklyOptions, model: requestInfo.model })) continue;
+        if (!this._isAvailable(account, { ...weeklyOptions, model: requestInfo.model, now })) continue;
 
         const priority = this._effectivePriority(account, requestInfo, now);
         const score = this._scoreAccount(account, requestInfo, scoringCtx);
@@ -1780,7 +1788,7 @@ export class AccountManager {
     const home = this._eligibleBoundAccount(binding.homeName, profile, excludedIndexes, { allowWeeklyReserve: true, now }, requestInfo);
     if (home) return home;
 
-    const current = this._eligibleBoundAccount(binding.currentName, profile, excludedIndexes, { allowWeeklyReserve: true }, requestInfo);
+    const current = this._eligibleBoundAccount(binding.currentName, profile, excludedIndexes, { allowWeeklyReserve: true, now }, requestInfo);
     if (current) return current;
 
     const homeExists = binding.homeName && this.accounts.some(a => a.name === binding.homeName);
@@ -2036,7 +2044,7 @@ export class AccountManager {
 
   /** Peak settings setter (TUI + config writes). Validates, spread-preserves sibling
    *  keys, clears the per-minute memo. Returns false on invalid input (no change). */
-  setPeakSettingsForProvider(providerKey, { peakWindows, peakCap, peakDepreference } = {}) {
+  setPeakSettingsForProvider(providerKey, { peakWindows, peakCap, peakDepreference, peakTimezone } = {}) {
     if (!providerKey) return false;
     const existing = this.scheduler.providers?.[providerKey] || {};
     const next = { ...existing };
@@ -2050,6 +2058,16 @@ export class AccountManager {
       next.peakCap = c;
     }
     if (peakDepreference !== undefined) next.peakDepreference = Boolean(peakDepreference);
+    if (peakTimezone !== undefined) {
+      // null = follow the machine's zone. A string must be a zone Intl accepts —
+      // validate by construction so a typo is rejected here rather than silently
+      // falling back at every routing decision.
+      if (peakTimezone !== null) {
+        if (typeof peakTimezone !== 'string') return false;
+        try { new Intl.DateTimeFormat('en-US', { timeZone: peakTimezone }); } catch { return false; }
+      }
+      next.peakTimezone = peakTimezone;
+    }
     const providers = { ...(this.scheduler.providers || {}) };
     providers[providerKey] = next;
     this.scheduler.providers = providers;
@@ -2083,13 +2101,19 @@ export class AccountManager {
    *  in DEFAULT_SCHEDULER). Resolved once per provider per minute via _peakStateFor. */
   _peakSettingsFor(providerKey) {
     const p = this.scheduler.providers?.[providerKey] || {};
-    const cap = Number(p.peakCap);
+    // Accept ONLY a real number. `Number(null)`/`Number('')`/`Number(false)`/`Number([])`
+    // are all 0 — which is the HARD BAR — so a config carrying `peakCap: null` (the
+    // natural JSON spelling of "no cap", and the very convention `peakTimezone: null`
+    // uses in this same object) would silently bench every GLM account for 4h every
+    // weekday. The window path already documents "a typo degrades to today's
+    // behaviour"; the cap path must match it.
+    const cap = typeof p.peakCap === 'number' && Number.isFinite(p.peakCap) ? p.peakCap : undefined;
     return {
       windows: Array.isArray(p.peakWindows) ? p.peakWindows : [],
       // null/absent ⇒ follow the MACHINE's local zone (wallClockIn's own default).
       // A string pins an IANA zone. Both are user-settable (2026-08-18).
       timezone: typeof p.peakTimezone === 'string' && p.peakTimezone ? p.peakTimezone : null,
-      cap: Number.isFinite(cap) ? clamp01(cap) : DEFAULT_PEAK_CAP,
+      cap: cap === undefined ? DEFAULT_PEAK_CAP : Math.max(0, Math.min(1, cap)),
       depreference: p.peakDepreference !== false,
     };
   }

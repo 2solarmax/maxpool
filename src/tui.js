@@ -1507,11 +1507,15 @@ export class TUI {
       // PEAK (SC9): name an active window — the feature must be visible, not silent.
       // Only while a provider is genuinely in-window, so an off-peak screen is
       // byte-identical to today (render parity, TEST PLAN H1).
-      const peakNote = this._peakHeaderNote();
-      if (peakNote) xpText += (xpText ? '  ' : '') + peakNote;
       // Cross-provider fragment is sticky-only — under other modes it is inert and
       // reading "always" next to "Balance all" looked like two conflicting controls.
       if (mode === 'sticky') xpText = this._crossProviderText();
+      // PEAK note is APPENDED after, never before: the sticky assignment above
+      // overwrites xpText wholesale, so prepending silently discarded the peak note
+      // in sticky — which is DEFAULT_SCHEDULER.routingMode, the TUI's own fallback,
+      // AND the legacy-policy migration target (red-team 2026-08-18).
+      const peakNote = this._peakHeaderNote();
+      if (peakNote) xpText += (xpText ? '  ' : '') + peakNote;
       // Overflow visibility: when GLM/Kimi actually served requests recently, surface the
       // volume so provider traffic isn't a mystery. This is DATA, not a control — shown
       // in every mode. Reuses the SAME 15m load window as the per-row "15m Nr" column.
