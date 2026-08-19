@@ -384,3 +384,51 @@ test('R6 SC9: the peak header survives STICKY mode (which overwrites xpText whol
     assert.match(note, /peak/i, `${mode}: _peakHeaderNote must render in-window`);
   }
 });
+
+// ── TUI discoverability (reported 2026-08-19: "I can't find any of the new features
+// in the TUI"). The settings were config-file-only at first ship — the red team
+// flagged the missing surface and it shipped anyway. These pin the controls.
+
+test('U1 the routing footer shows peak state + its two controls, in AND out of window', () => {
+  const am = fleet(PEAK_SCHED_STICKY);
+  am.loadConfigProviders([{ name: 'glm a', provider: 'zai', token: 'k' }]);
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.mode = 'routing';
+  const f = strip(tui._renderFooter());
+  assert.match(f, /d Peak/, 'the depreference control is visible');
+  assert.match(f, /c cap/, 'the cap control is visible');
+  assert.match(f, /prefer others|keep my mode/, 'and it shows the CURRENT state, not just a key');
+});
+
+test('U2 d toggles depreference and persists it', async () => {
+  const am = fleet(PEAK_SCHED_STICKY);
+  am.loadConfigProviders([{ name: 'glm a', provider: 'zai', token: 'k' }]);
+  let saved = null;
+  const tui = new TUI({ accountManager: am, config: { scheduler: {} } });
+  tui.saveConfig = async c => { saved = c; };
+  tui.mode = 'routing';
+  const before = am._peakSettingsFor('zai').depreference;
+  await tui._keyRouting('d');
+  await new Promise(r => setImmediate(r));
+  assert.equal(am._peakSettingsFor('zai').depreference, !before, 'the live setting flipped');
+  assert.equal(saved.scheduler.providers.zai.peakDepreference, !before, 'and it was written to config');
+});
+
+test('U3 c cycles the cap through the meaningful values and persists', async () => {
+  const am = fleet(PEAK_SCHED_STICKY);
+  am.loadConfigProviders([{ name: 'glm a', provider: 'zai', token: 'k' }]);
+  let saved = null;
+  const tui = new TUI({ accountManager: am, config: { scheduler: {} } });
+  tui.saveConfig = async c => { saved = c; };
+  tui.mode = 'routing';
+  const seen = new Set();
+  for (let i = 0; i < 5; i++) {
+    await tui._keyRouting('c');
+    await new Promise(r => setImmediate(r));
+    seen.add(am._peakSettingsFor('zai').cap);
+  }
+  assert.ok(seen.has(0), 'reaches 0 (never during peak)');
+  assert.ok(seen.has(1), 'reaches 1 (cap off)');
+  assert.ok(seen.has(0.5), 'passes through 50%');
+  assert.equal(typeof saved.scheduler.providers.zai.peakCap, 'number', 'persisted as a real number');
+});

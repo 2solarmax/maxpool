@@ -828,6 +828,14 @@ export class TUI {
       // dialog (unlike restart/delete). `f` is kept for muscle memory from the old
       // cross-provider knob this replaced; `m` is the mnemonic (mode).
       this._cycleRoutingMode();
+    } else if (k === 'd' || k === 'D') {
+      // Toggle peak de-preference. THE knob that matters: with it ON, the peak window
+      // OVERRIDES your routing mode for 4h every weekday (balance stops being balance).
+      // OFF keeps the weekly cap but lets your chosen mode run all day.
+      this._togglePeakDepreference();
+    } else if (k === 'c' || k === 'C') {
+      // Cycle the peak weekly cap: off → 25% → 50% → 75% → never-during-peak.
+      this._cyclePeakCap();
     } else if (k === 'g' || k === 'k') {
       // Per-provider Claude→provider fallback. Only affects routing under `sticky`
       // mode — under balance/prefer-* the mode itself controls eligibility. Still
@@ -885,6 +893,41 @@ export class TUI {
 
   _routingModeDef(id) {
     return TUI.ROUTING_MODES.find(m => m.id === id) || TUI.ROUTING_MODES[0];
+  }
+
+  /** Toggle peak de-preference for every provider that HAS a peak window. This is the
+   *  setting that silently overrides the routing mode during the window, so it gets a
+   *  first-class key rather than living only in the config file. */
+  async _togglePeakDepreference() {
+    const fams = [...new Set(this.am.accounts.filter(a => a.type === 'provider').map(a => a.provider))]
+      .filter(p => (this.am._peakSettingsFor?.(p)?.windows || []).length > 0);
+    if (!fams.length) { this._addLog('No provider has a peak window configured'); return; }
+    const next = !(this.am._peakSettingsFor(fams[0]).depreference);
+    for (const p of fams) this.am.setPeakSettingsForProvider?.(p, { peakDepreference: next });
+    this.config.scheduler = { ...(this.config.scheduler || {}) };
+    this.config.scheduler.providers = { ...(this.am.scheduler.providers || {}) };
+    await this.saveConfig(this.config);
+    this._addLog(next
+      ? 'Peak hours: prefer other accounts (your routing mode is overridden during the window)'
+      : 'Peak hours: keep your routing mode all day (the weekly cap still applies)');
+  }
+
+  /** Cycle the peak weekly cap across the values that mean something. */
+  async _cyclePeakCap() {
+    const order = [1, 0.75, 0.5, 0.25, 0];
+    const fams = [...new Set(this.am.accounts.filter(a => a.type === 'provider').map(a => a.provider))]
+      .filter(p => (this.am._peakSettingsFor?.(p)?.windows || []).length > 0);
+    if (!fams.length) { this._addLog('No provider has a peak window configured'); return; }
+    const cur = this.am._peakSettingsFor(fams[0]).cap;
+    const idx = order.findIndex(v => Math.abs(v - cur) < 1e-9);
+    const next = order[(idx === -1 ? 0 : idx + 1) % order.length];
+    for (const p of fams) this.am.setPeakSettingsForProvider?.(p, { peakCap: next });
+    this.config.scheduler = { ...(this.config.scheduler || {}) };
+    this.config.scheduler.providers = { ...(this.am.scheduler.providers || {}) };
+    await this.saveConfig(this.config);
+    this._addLog(next === 1 ? 'Peak cap: off (no weekly limit during peak)'
+      : next === 0 ? 'Peak cap: never use GLM during peak hours'
+        : `Peak cap: bench a GLM account once it passes ${Math.round(next * 100)}% of its weekly quota`);
   }
 
   async _cycleRoutingMode() {
@@ -1932,7 +1975,22 @@ export class TUI {
         const provPart = (hasProviders && mode.id === 'sticky')
           ? `  ${bold('g')} GLM: ${cyan(this.am._claudeFallbackFor?.('zai') || 'never')}  ${bold('k')} Kimi: ${cyan(this.am._claudeFallbackFor?.('kimi') || 'never')}`
           : '';
-        return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}  ${bold('p')} Manual preference  ${bold('Esc')} Back`;
+        // PEAK controls — always visible when a provider has a window, in-window or not.
+        // They were config-file-only at first ship, which meant the feature was
+        // undiscoverable from the UI (reported 2026-08-19). The state is shown next to
+        // the key so you can read the current setting without opening the config.
+        let peakPart = '';
+        const peakFam = this.am.accounts.find(a => a.type === 'provider'
+          && (this.am._peakSettingsFor?.(a.provider)?.windows || []).length > 0);
+        if (peakFam) {
+          const ps = this.am._peakSettingsFor(peakFam.provider);
+          const st = this.am._peakStateFor?.(peakFam.provider);
+          const now = st?.inPeak ? red(' NOW') : '';
+          const dep = ps.depreference ? yellow('prefer others') : cyan('keep my mode');
+          const cap = ps.cap >= 1 ? 'off' : ps.cap === 0 ? 'never' : `${Math.round(ps.cap * 100)}%`;
+          peakPart = `  ${dim('│')}  ${bold('d')} Peak${now}: ${dep}  ${bold('c')} cap ${cyan(cap)}`;
+        }
+        return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('p')} Preference  ${bold('Esc')} Back`;
       }
       case 'select': {
         const act = this.selAction === 'prefer'
