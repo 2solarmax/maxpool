@@ -397,7 +397,7 @@ test('U1 the routing footer shows peak state + its two controls, in AND out of w
   const f = strip(tui._renderFooter());
   assert.match(f, /d Peak/, 'the depreference control is visible');
   assert.match(f, /c cap/, 'the cap control is visible');
-  assert.match(f, /prefer others|keep my mode/, 'and it shows the CURRENT state, not just a key');
+  assert.match(f, /GLM last|normal/, 'and it shows the CURRENT state, not just a key');
 });
 
 test('U2 d toggles depreference and persists it', async () => {

@@ -908,8 +908,8 @@ export class TUI {
     this.config.scheduler.providers = { ...(this.am.scheduler.providers || {}) };
     await this.saveConfig(this.config);
     this._addLog(next
-      ? 'Peak hours: prefer other accounts (your routing mode is overridden during the window)'
-      : 'Peak hours: keep your routing mode all day (the weekly cap still applies)');
+      ? 'Peak hours: GLM ranks last during the window (overrides the routing mode)'
+      : 'Peak hours: routing runs normally during the window (the cap still applies)');
   }
 
   /** Cycle the peak weekly cap across the values that mean something. */
@@ -1986,9 +1986,9 @@ export class TUI {
           const ps = this.am._peakSettingsFor(peakFam.provider);
           const st = this.am._peakStateFor?.(peakFam.provider);
           const now = st?.inPeak ? red(' NOW') : '';
-          const dep = ps.depreference ? yellow('prefer others') : cyan('keep my mode');
+          const dep = ps.depreference ? yellow('GLM last') : cyan('normal');
           const cap = ps.cap >= 1 ? 'off' : ps.cap === 0 ? 'never' : `${Math.round(ps.cap * 100)}%`;
-          peakPart = `  ${dim('│')}  ${bold('d')} Peak${now}: ${dep}  ${bold('c')} cap ${cyan(cap)}`;
+          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}cap ${cyan(cap)}`;
         }
         return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('p')} Preference  ${bold('Esc')} Back`;
       }
