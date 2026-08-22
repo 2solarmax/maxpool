@@ -174,23 +174,26 @@ test('D4: a cycle the account was DISABLED during is shown but excluded from the
 
 // ── Lane E: persistence across a restart / a reload drain ────────────────────
 
-test('E1: a restart mid-cycle keeps the open cycle; a long DOWNTIME flags it partial', () => {
+test('E1: downtime flags the cycle partial; a brief restart or an idle ACCOUNT does not', () => {
   const am = amWithOauth();
   am.accrueCapacity(0, { input: 800, output: 200 });
   const payload = am.capacity.serialize();
 
-  // Restart seconds later — the cycle continues and stays a real observation.
-  const quick = amWithOauth();
-  quick.restoreCapacityState(payload, Date.now());
-  assert.equal(quick.capacity.openCycle('claude1', 'ses').tokensSoFar, 1000, 'the open cycle survived the restart');
-  quick.accounts[0].quota.unified5hReset = Date.now() - 1;
-  quick.closeExpiredCapacityCycles();
-  assert.equal(quick.capacity.windowStats('claude1', 'ses').cycles, 1, 'a brief restart does not disqualify the cycle');
+  // Seamless reload (state handed over live): downtime null → the cycle keeps
+  // qualifying, and an account that has simply been IDLE for hours is not punished
+  // (idle ≠ maxpool down — red-team F3).
+  const reloaded = amWithOauth();
+  reloaded.restoreCapacityState(payload, Date.now() + 3 * 3600_000, null);
+  reloaded.accounts[0].quota.unified5hReset = Date.now() - 1;
+  reloaded.closeExpiredCapacityCycles();
+  assert.equal(reloaded.capacity.windowStats('claude1', 'ses').cycles, 1,
+    'a long-idle account with no measured downtime keeps its observation');
 
-  // Restart HOURS later — maxpool was not running for part of the cycle, so its
-  // total under-reports capacity. Keep it visible, keep it out of the averages.
+  // Cold restart after real downtime: maxpool was not running for part of the
+  // cycle, so its total under-reports capacity. Keep it visible, keep it out of the
+  // averages.
   const late = amWithOauth();
-  late.restoreCapacityState(payload, Date.now() + 3 * 3600_000);
+  late.restoreCapacityState(payload, Date.now(), 3 * 3600_000);
   late.accounts[0].quota.unified5hReset = Date.now() - 1;
   late.closeExpiredCapacityCycles();
   assert.equal(late.capacity.windowStats('claude1', 'ses'), null, 'a cycle maxpool sat out is not a capacity number');
@@ -274,4 +277,96 @@ test('G4: a partial 7d window is disclosed as a floor, not reported as the truth
   am.accrueCapacity(0, { input: 10_000, output: 0 });
   am.capacity.markDayPartial('glm-legacy', new Date().toISOString().slice(0, 10));
   assert.match(renderCapacity(am, { window: 'wk' }), /≤ observed/, 'says the figure is a floor');
+});
+
+// ── Lane H: the mutants that survived the first suite (red-team F6, 2026-08-22) ──
+// Each test below exists because a specific mutation of the code it covers passed
+// 27/27 before it was written. A guard nobody pins is a guard that gets refactored out.
+
+test('H1: the PRODUCTION interleaving closes the cycle — the render tick, not just a probe sweep', () => {
+  // This is the exact sequence that shipped broken: refreshExpiredQuotas (TUI render
+  // tick, every routed request) NULLS the reset stamp the moment the window rolls, so
+  // a clock-close gated on that stamp had a ~500ms window to fire in and effectively
+  // never did. Any fix that reverts to closing only on a prober sweep fails here.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 1_200_000, output: 0 });
+  am.accounts[0].quota.unified5h = 0.9;
+  am.accounts[0].quota.unified5hReset = Date.now() - 1;
+  am.refreshExpiredQuotas();                       // the display/request path, not the prober
+  assert.equal(am.accounts[0].quota.unified5hReset, null, 'the stamp is gone, as in production');
+  const st = am.capacity.windowStats('claude1', 'ses');
+  assert.ok(st, 'the cycle closed at the rollover the display noticed');
+  assert.equal(st.last, 1_200_000);
+});
+
+test('H2: a probe reporting the SAME or an OLDER stamp closes nothing (guard pinned directly)', () => {
+  // Without the inner guard, a clock-skewed or repeated probe shreds one real cycle
+  // into many tiny fake ones — every column then reads far below the truth.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 500, output: 0 });
+  am.noteCapacityWindowAdvance('claude1', 'ses', 2_000_000, 2_000_000);
+  am.noteCapacityWindowAdvance('claude1', 'ses', 2_000_000, 1_000_000);   // stamp moved BACKWARD
+  assert.equal(am.capacity.windowStats('claude1', 'ses'), null, 'neither closed a cycle');
+  am.noteCapacityWindowAdvance('claude1', 'ses', 2_000_000, 3_000_000);
+  assert.equal(am.capacity.windowStats('claude1', 'ses').cycles, 1, 'only a genuine advance closes');
+});
+
+test('H3: a window that ROLLED during the drain does not dump its delta into the new cycle', async () => {
+  // The merge is scoped to the SAME cycle by startedAt. Drop that check and a drain
+  // spanning a reset credits the old window's tokens to the fresh one — inflating the
+  // very next capacity reading by a whole window's traffic.
+  const old = amWithOauth();
+  old.accrueCapacity(0, { input: 100, output: 0 });
+  const atFlush = old.capacity.serialize();
+
+  const fresh = amWithOauth();
+  fresh.restoreCapacityState(atFlush);
+  fresh.accounts[0].quota.unified5hReset = Date.now() - 1;
+  fresh.closeExpiredCapacityCycles();              // the window rolled on the new worker
+  await new Promise(r => setTimeout(r, 5));        // the new cycle starts at a distinct ms
+  fresh.accrueCapacity(0, { input: 5, output: 0 }); // brand-new cycle
+  const onDisk = fresh.capacity.serialize();
+
+  old.accrueCapacity(0, { input: 60, output: 0 }); // drain-time work, OLD cycle
+  const merged = CapacityLedger.mergeDelta(onDisk, atFlush, old.capacity.serialize());
+  const l = CapacityLedger.fromSerialized(merged);
+  assert.equal(l.openCycle('claude1', 'ses').tokensSoFar, 5,
+    "the new cycle keeps only its own 5 — the old window's 60 is not back-credited");
+});
+
+test('H4: a stream that DIES mid-flight still records the tokens it delivered', async () => {
+  // The longest generations are the ones that hit idle/upstream failures. Skipping
+  // their accrual under-counts exactly the requests that matter most for capacity.
+  await withProxy((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":400,"output_tokens":0}}}\n\n');
+    res.write('event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":90}}\n\n');
+    setTimeout(() => res.socket.destroy(), 30);   // upstream dies mid-stream (after chunks landed)
+  }, async ({ am, port }) => {
+    const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-4-8', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    }).catch(() => null);
+    if (r) await r.text().catch(() => {});
+    if (!am.capacity.openCycle('a1', 'ses')) {
+      // A retry may have consumed the ledger — give the async finally a tick.
+      await new Promise(res => setTimeout(res, 50));
+    }
+    const open = am.capacity.openCycle('a1', 'ses');
+    assert.ok(open, 'a died stream still opened/accrued a cycle');
+    assert.equal(open.tokensSoFar, 490, 'the 400 in + 90 delivered out are real capacity');
+  });
+});
+
+test('H5: an operator-DISABLED cycle is excluded on its own axis, not by borrowing "partial"', () => {
+  // Collapsing the two flags made disabledDuring query-redundant and untested.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 700, output: 0 });
+  am.setAccountEnabled(0, false);
+  const open = am.capacity.openCycle('claude1', 'ses');
+  assert.equal(open.disabledDuring, true);
+  assert.equal(open.complete, true, 'maxpool was up throughout — only the disable excludes it');
+  am.accounts[0].quota.unified5hReset = Date.now() - 1;
+  am.closeExpiredCapacityCycles();
+  assert.equal(am.capacity.windowStats('claude1', 'ses'), null, 'and it is excluded');
 });

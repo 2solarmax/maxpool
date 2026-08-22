@@ -1062,9 +1062,14 @@ export class AccountManager {
     let changed = false;
     let session = false;
 
-    // Clear expired unified quotas
+    // Clear expired unified quotas. The capacity cycle closes HERE, before the stamp
+    // is nulled: this is the authoritative rollover moment, and it fires wherever the
+    // rollover is noticed (TUI render tick, every routed request) — not only on a
+    // prober sweep that happens to land inside the sub-second window before the stamp
+    // disappears (without this, OAuth cycles essentially never close: red-team 2026-08-22).
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
       console.log(`[Maxpool] Account "${account.name}" session quota reset`);
+      this.capacity?.closeCycle?.(account.name, 'ses', q.unified5hReset, { resetAt: q.unified5hReset });
       q.unified5h = null;
       q.unified5hReset = null;
       changed = true;
@@ -1072,6 +1077,7 @@ export class AccountManager {
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[Maxpool] Account "${account.name}" weekly quota reset`);
+      this.capacity?.closeCycle?.(account.name, 'wk', q.unified7dReset, { resetAt: q.unified7dReset });
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -2676,6 +2682,10 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
+    // CAPACITY LEDGER: prev stamps, so a probe observing the window ADVANCE closes
+    // the old cycle (the OAuth twin of the applyProviderUsage hook).
+    const prevSesReset = q.unified5hReset;
+    const prevWkReset = q.unified7dReset;
 
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = clamp01(usage.fiveHour.utilization);
@@ -2684,6 +2694,14 @@ export class AccountManager {
     if (usage.sevenDay) {
       if (usage.sevenDay.utilization != null) q.unified7d = clamp01(usage.sevenDay.utilization);
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
+    }
+    // Stamp-advance close (same guard as the provider path): a FRESHER stamp means
+    // the old window rolled over — close its cycle at the old boundary.
+    if (usage.fiveHour?.resetAt && usage.fiveHour.resetAt > (prevSesReset || 0)) {
+      this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour.resetAt);
+    }
+    if (usage.sevenDay?.resetAt && usage.sevenDay.resetAt > (prevWkReset || 0)) {
+      this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay.resetAt);
     }
     // Only a SUCCESSFUL probe carrying the flag speaks to this. A header-driven update
     // can't see the limits[] array, and a FAILED read knows nothing about the account's
@@ -2979,17 +2997,27 @@ export class AccountManager {
    *  accrual is far behind now) means maxpool was down for part of that cycle, so the
    *  cycle is no longer a truthful capacity observation — flag it partial (B2/SC6).
    *  It still displays; it is excluded from averages. */
-  restoreCapacityState(payload, now = Date.now(), gapMs = 10 * 60_000) {
+  restoreCapacityState(payload, now = Date.now(), downtimeMs = null) {
     this.capacity = CapacityLedger.fromSerialized(payload);
+    // Partial is keyed on MAXPOOL'S OWN downtime, NEVER on the account's last request:
+    // an account parked >10min mid-cycle is normal fleet rotation, and keying on its
+    // last request discarded valid observations on every reload (red-team F3). The
+    // caller passes measured downtime (state mtime at save → boot now); when it
+    // cannot (a seamless reload handoff — the old worker was provably serving
+    // throughout), null skips the check entirely.
+    // 60s absorbs a restart's own turnaround; anything longer is real downtime, and
+    // it disqualifies EVERY open cycle (maxpool was not serving, so no account could
+    // deliver its true capacity) — the downtime is a property of the process, not of
+    // any one account's traffic.
+    if (!(downtimeMs > 60_000)) return;
+    const spannedDays = new Set();
+    for (let t = now - downtimeMs; t <= now; t += 3600_000) spannedDays.add(new Date(t).toISOString().slice(0, 10));
+    spannedDays.add(new Date(now).toISOString().slice(0, 10));
     for (const name of this.capacity.accounts()) {
-      for (const win of ['ses', 'wk']) {
-        const open = this.capacity.openCycle(name, win);
-        if (open && open.lastAccrualAt && (now - open.lastAccrualAt) > gapMs) {
-          this.capacity.markPartial(name);
-          const day = new Date(open.lastAccrualAt).toISOString().slice(0, 10);
-          this.capacity.markDayPartial(name, day);
-        }
+      if (this.capacity.openCycle(name, 'ses') || this.capacity.openCycle(name, 'wk')) {
+        this.capacity.markPartial(name);
       }
+      for (const day of spannedDays) this.capacity.markDayPartial(name, day);
     }
   }
 

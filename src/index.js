@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import net from 'node:net';
+import { stat } from 'node:fs/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed } from './event-log.js';
 import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
@@ -607,7 +608,18 @@ async function serverWorkerCommand() {
   // lease holder); a cold/direct worker reads the on-disk state file.
   const savedState = await loadState();
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
-  if (savedState?.capacity) accountManager.restoreCapacityState(savedState.capacity);
+  if (savedState?.capacity) {
+    // Measured maxpool downtime = state-file last write → boot. A seamless reload
+    // worker's state was handed over live (no gap) → null skips the partial check.
+    let downtimeMs = null;
+    try {
+      if (!isReloadWorker) {
+        const st = await stat(getStatePath());
+        downtimeMs = Date.now() - st.mtimeMs;
+      }
+    } catch { downtimeMs = null; }
+    accountManager.restoreCapacityState(savedState.capacity, Date.now(), downtimeMs);
+  }
   // Runtime fallback providers (glm-fallback/kimi-fallback) are created lazily from
   // `cc all` request headers, not config — so without restoring them here a restart
   // shows only the config OAuth accounts until the next `cc all` request re-sends the
@@ -698,13 +710,19 @@ async function serverWorkerCommand() {
     const after = accountManager.capacity?.serialize?.();
     if (!after) return;
     const disk = await loadState();
-    const merged = CapacityLedger.mergeDelta(disk?.capacity, capacityFlushSnapshot, after);
+    const capacity = CapacityLedger.mergeDelta(disk?.capacity, capacityFlushSnapshot, after);
     // Re-write the FULL on-disk state with only `capacity` replaced: quota and
     // runtimeProviders belong to the NEW worker now and must not be reverted to ours.
     // No generation guard — we are deliberately amending a file another writer owns,
     // and a same-instant race costs at most this drain's delta.
     const { _generation, ...rest } = disk || {};
-    await saveState({ ...rest, capacity: merged });
+    // NO generation bump: re-write the file at the SAME generation so the new
+    // worker's stateGeneration stays valid. saveState refuses a lower generation
+    // only — writing the observed one back is accepted and bumps nothing. Bumping
+    // here (the naive first version) wedged the new worker's periodic flush for its
+    // entire tenure: onDisk advanced past its stateGeneration and every guarded
+    // write was refused forever (red-team 2026-08-22).
+    await saveStateUnbumped({ ...rest, capacity }, _generation ?? 0);
     await flushStateWrites();
   };
 

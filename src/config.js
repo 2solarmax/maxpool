@@ -289,6 +289,22 @@ export async function readGeneration(path) {
  */
 let _stateWriteChain = Promise.resolve();
 
+/**
+ * Amended state write at an UNCHANGED generation (drain-exit capacity merge-flush).
+ * saveState always bumps `_generation`; a released worker amending the file the NEW
+ * lease-holder owns must NOT bump it, or the holder's `stateGeneration` is stale from
+ * that instant and every guarded periodic write is refused for its entire tenure.
+ * Serialized onto the same write chain; NEVER used for ordinary state updates.
+ */
+export function saveStateUnbumped(state, generation) {
+  const run = async () => {
+    await atomicWrite(getStatePath(), JSON.stringify({ ...state, _generation: generation }, null, 2) + '\n');
+  };
+  const result = _stateWriteChain.then(run, run);
+  _stateWriteChain = result.then(() => {}, () => {});
+  return result;
+}
+
 export function saveState(state, { expectedGeneration = null } = {}) {
   // Serialize state writes (a 60s interval flush can otherwise race the final
   // baton flush, read the same on-disk generation, and double-write).

@@ -1285,13 +1285,19 @@ async function forwardRequest(
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, upstreamRes.status, responseHeaders, account.index, accountManager, streamLog, requestInfo);
-      // CAPACITY LEDGER: one accrual per REQUEST, using the per-stream running max
+      // CAPACITY LEDGER: accrue in a FINALLY — a stream that dies mid-flight throws
+      // from streamResponse, and the tokens genuinely delivered before the failure
+      // are real capacity; skipping them under-counts exactly the longest
+      // generations (red-team F5). One accrual per request, per-stream running max
       // (M3 — cumulative interim deltas must not be summed).
-      accountManager.accrueCapacity?.(account.index, {
-        input: requestInfo._capacityInput || 0,
-        output: requestInfo._capacityOutput || 0,
-      });
+      try {
+        await streamResponse(upstreamRes.body, res, upstreamRes.status, responseHeaders, account.index, accountManager, streamLog, requestInfo);
+      } finally {
+        accountManager.accrueCapacity?.(account.index, {
+          input: requestInfo._capacityInput || 0,
+          output: requestInfo._capacityOutput || 0,
+        });
+      }
       accountManager.releaseAccount(lease, { success: true, status: upstreamRes.status });
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);

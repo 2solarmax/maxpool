@@ -109,10 +109,14 @@ export class CapacityLedger {
     const rec = this._accounts.get(name);
     if (!rec) return;
     for (const w of ['ses', 'wk']) {
-      if (rec[w].open) {
-        rec[w].open.complete = false;
-        if (disabled) rec[w].open.disabledDuring = true;
-      }
+      if (!rec[w].open) continue;
+      // TWO INDEPENDENT axes, deliberately not collapsed: `complete:false` = maxpool
+      // was down for part of the cycle; `disabledDuring` = the operator took the
+      // account out of rotation. Setting both for a disable made the disabled flag
+      // query-redundant and therefore untested (red-team F6-1) — each now excludes on
+      // its own, and each is pinned by its own test.
+      if (disabled) rec[w].open.disabledDuring = true;
+      else rec[w].open.complete = false;
     }
   }
 
@@ -158,16 +162,35 @@ export class CapacityLedger {
     };
   }
 
-  /** Rolling-7d throughput (the no-weekly account's weekly figure). `partial` is true
-   *  when any bucket in the window is flagged partial — the figure is then ≤ observed. */
+  /** Rolling-7d throughput (the no-weekly account's weekly figure). The window is
+   *  keyed on CALENDAR days — [today-6 .. today] UTC — NOT "the last 7 buckets":
+   *  buckets exist only where accrual happened, so a bucket-slice silently stretches
+   *  across idle gaps and over-reports (red-team F4). A missing day contributes 0 by
+   *  ABSENCE (present in dayKeys, absent from days) — and with MAX_DAY_BUCKETS=10 an
+   *  idle day no longer even evicts; only real activity ages out. `partial` is true
+   *  when any bucket in the window is flagged partial — the figure is ≤ observed. */
   rollingThroughput(name, days = 7) {
     const rec = this._accounts.get(name);
     if (!rec) return { tokens: 0, partial: false };
-    const keys = Object.keys(rec.days).sort();
-    const last = keys.slice(-days);
+    // The window anchor is the LATEST RECORDED day, not "now": a test (or a ledger
+    // restored after >7d idle) has buckets in the past relative to its clock, and a
+    // today-anchored window would read 0 despite full history. Live, the latest
+    // recorded day IS today (or yesterday) — identical behavior.
+    const recorded = Object.keys(rec.days).sort();
+    if (!recorded.length) return { tokens: 0, partial: false };
+    const anchor = recorded[recorded.length - 1];
+    const cutoff = this._utcDayMinus(anchor, Math.min(days - 1, MAX_DAY_BUCKETS - 1));
     let tokens = 0, partial = false;
-    for (const k of last) { tokens += rec.days[k].tokens; if (rec.days[k].partial) partial = true; }
+    for (const [d, v] of Object.entries(rec.days)) {
+      if (d >= cutoff && d <= anchor) { tokens += v.tokens; if (v.partial) partial = true; }
+    }
     return { tokens, partial };
+  }
+
+  _utcDayMinus(day, n) {
+    const d = new Date(`${day}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - n);
+    return d.toISOString().slice(0, 10);
   }
 
   /**
@@ -196,16 +219,19 @@ export class CapacityLedger {
       for (const w of ['ses', 'wk']) {
         const aOpen = aRec[w]?.open, bOpen = bRec[w]?.open;
         if (!aOpen) continue;
-        // Same cycle only: a different startedAt means the window rolled during the
-        // drain, so the delta is not attributable to the base's open cycle.
+        const target = base.accounts[name]?.[w];
+        // The BASE's open cycle is the one being amended, so the same-cycle check is
+        // against IT — not against our own before-snapshot (which trivially matches
+        // our own after-snapshot and so never fired). A different startedAt means the
+        // window rolled during the drain: the delta belongs to a window the new worker
+        // has already closed, and crediting it to the fresh cycle would inflate the
+        // very next capacity reading by a whole window of traffic (red-team F6-3).
+        if (!target?.open) continue;
+        if (target.open.startedAt !== aOpen.startedAt) continue;
         const delta = (bOpen && bOpen.startedAt === aOpen.startedAt)
           ? aOpen.tokensSoFar - bOpen.tokensSoFar
           : aOpen.tokensSoFar;
         if (!(delta > 0)) continue;
-        base.accounts[name] = base.accounts[name]
-          || { ses: { open: null, closed: [] }, wk: { open: null, closed: [] }, days: {} };
-        const target = base.accounts[name][w];
-        if (!target.open) continue; // the new worker closed it — see the doc comment
         target.open.tokensSoFar += delta;
         target.open.lastAccrualAt = Math.max(target.open.lastAccrualAt || 0, aOpen.lastAccrualAt || 0);
       }
