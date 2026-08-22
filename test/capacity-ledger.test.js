@@ -93,29 +93,39 @@ test('C4 sequential requests accumulate correctly across the same cycle', () => 
   assert.equal(c.tokens, 445);
 });
 
-test('E2/F1 rolling-7d from day buckets; E3 partial flagged', () => {
+test('E2/F1 rolling-7d sums the last 7 CALENDAR days ending today; E3 partial flagged', () => {
+  // Days run BACKWARD from the ledger's clock: the window is anchored on today, not on
+  // whatever the newest bucket happens to be (an anchor on the newest bucket reported a
+  // weeks-old window as current — red-team round 2, F2).
   const l = new CapacityLedger({ now: () => T0 });
-  for (let d = 0; d < 5; d++) l.accrue('a', { input: 1000, output: 0 }, T0 + d * 86400_000);
+  for (let d = 0; d < 5; d++) l.accrue('a', { input: 1000, output: 0 }, T0 - d * 86400_000);
   const r = l.rollingThroughput('a');
   assert.equal(r.tokens, 5000); assert.equal(r.partial, false);
-  l.markDayPartial('a', new Date(T0 + 4 * 86400_000).toISOString().slice(0, 10));
+  l.markDayPartial('a', new Date(T0 - 4 * 86400_000).toISOString().slice(0, 10));
   assert.equal(l.rollingThroughput('a').partial, true, 'the ≤observed marker');
+});
+
+test('E2b an IDLE account reads 0, never a stale window presented as current', () => {
+  // The favourite legacy-GLM row sits idle for weeks under normal fleet rotation.
+  const l = new CapacityLedger({ now: () => T0 });
+  for (let d = 0; d < 5; d++) l.accrue('a', { input: 5_000_000, output: 0 }, T0 - (20 + d) * 86400_000);
+  assert.equal(l.rollingThroughput('a').tokens, 0, '20 days idle → the 7d volume is 0, not 25M');
 });
 
 test('F2 a missing day is distinguishable from a zero day', () => {
   const l = new CapacityLedger({ now: () => T0 });
-  l.accrue('a', { input: 100, output: 0 }, T0);          // day 1
-  l.accrue('a', { input: 300, output: 0 }, T0 + 2 * 86400_000);  // day 3 — day 2 absent
+  l.accrue('a', { input: 100, output: 0 }, T0 - 2 * 86400_000);
+  l.accrue('a', { input: 300, output: 0 }, T0);                 // the day between is absent
   const keys = l.dayKeys('a');
   assert.equal(keys.length, 2);
-  assert.ok(!keys.includes(new Date(T0 + 86400_000).toISOString().slice(0, 10)), 'day 2 simply absent');
+  assert.ok(!keys.includes(new Date(T0 - 86400_000).toISOString().slice(0, 10)), 'the idle day is simply absent');
 });
 
 test('F3 bounded at 10 day-buckets; the 11th evicts the oldest', () => {
   const l = new CapacityLedger({ now: () => T0 });
-  for (let d = 0; d < 12; d++) l.accrue('a', { input: 100, output: 0 }, T0 + d * 86400_000);
+  for (let d = 11; d >= 0; d--) l.accrue('a', { input: 100, output: 0 }, T0 - d * 86400_000);
   assert.equal(l.dayKeys('a').length, 10);
-  assert.equal(l.rollingThroughput('a').tokens, 700, 'sums exactly the last 7 days');
+  assert.equal(l.rollingThroughput('a').tokens, 700, 'sums exactly the last 7 calendar days');
 });
 
 test('E4 the two account kinds never cross-contaminate (throughput vs tank)', () => {

@@ -2015,9 +2015,16 @@ export class TUI {
 
     if (!ledger) { out.push(yellow('  Capacity ledger unavailable on this worker.')); return out; }
 
-    const COLS = ['Last', 'Prev', 'Prev-1', 'Avg 3', 'Avg 10', 'All time'];
+    // Narrow terminals: drop trailing columns rather than let fitLine chop a number
+    // mid-digit (at W=80 the full 6-column row is 82+ chars — every row silently lost
+    // its last two cells). The dropped ones are the aggregates, not the observations.
+    const ALL_COLS = ['Last', 'Prev', 'Prev-1', 'Avg 3', 'Avg 10', 'All time'];
     const CW = 9;
-    const nameW = Math.max(12, Math.min(NAME_W, W - (PROVIDER_W + 2) - COLS.length * CW - 12));
+    const nameW = 12;
+    let COLS = ALL_COLS;
+    while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 14) > W) {
+      COLS = COLS.slice(0, -1);
+    }
     const header = '  ' + 'Account'.padEnd(nameW) + ' ' + 'Provider'.padEnd(PROVIDER_W) + ' '
       + COLS.map(c => c.padStart(CW)).join('') + '  Cycles';
     out.push(dimUnderline(fitLine(header, W)));
@@ -2036,7 +2043,11 @@ export class TUI {
         const t = ledger.rollingThroughput(a.name, 7);
         anyData = anyData || t.tokens > 0;
         const vol = t.tokens > 0 ? formatTokens(t.tokens) : '--';
-        const note = t.partial ? ' (≤ observed — maxpool was down part of the window)' : '';
+        // Always disclose the window's age boundary: today is unfinished, so the 7d
+        // figure grows through the day; a genuinely partial day adds the ≤-observed floor.
+        const note = t.partial
+          ? ' (≤ observed — maxpool was down part of the window; includes today, in progress)'
+          : ' (includes today, in progress)';
         out.push('  ' + name + ' ' + prov + ' '
           + cyan(`no weekly limit · 7d volume ${vol}`) + dim(note));
         continue;
@@ -2047,8 +2058,8 @@ export class TUI {
         continue;
       }
       anyData = true;
-      const cells = [st.last, st.prev, st.prev1, st.avg3, st.avg10, st.allTime]
-        .map(v => formatTokens(v).padStart(CW)).join('');
+      const all = { Last: st.last, Prev: st.prev, 'Prev-1': st.prev1, 'Avg 3': st.avg3, 'Avg 10': st.avg10, 'All time': st.allTime };
+      const cells = COLS.map(c => formatTokens(all[c]).padStart(CW)).join('');
       out.push('  ' + name + ' ' + prov + ' ' + cells + '  ' + dim(String(st.cycles)));
     }
 

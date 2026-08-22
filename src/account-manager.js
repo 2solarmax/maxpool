@@ -3037,16 +3037,20 @@ export class AccountManager {
     for (const a of this.accounts) {
       const q = a.quota || {};
       const pairs = a.type === 'provider'
-        ? [['ses', q.providerSesReset], ['wk', q.providerWkReset]]
-        : [['ses', q.unified5hReset], ['wk', q.unified7dReset]];
-      for (const [win, resetAt] of pairs) {
-        const open = this.capacity.openCycle(a.name, win);
-        if (!open) continue;
-        // The cycle ends when its window's reset time passes. A window with no known
-        // reset stamp cannot be closed on the clock — it closes on stamp-advance below.
-        if (resetAt && now >= resetAt) {
-          this.capacity.closeCycle(a.name, win, resetAt, { resetAt });
-        }
+        ? [['ses', 'providerSesReset', 'providerSes'], ['wk', 'providerWkReset', 'providerWk']]
+        : [['ses', 'unified5hReset', 'unified5h'], ['wk', 'unified7dReset', 'unified7d']];
+      for (const [win, stampKey, utilKey] of pairs) {
+        const resetAt = q[stampKey];
+        if (!resetAt || now < resetAt) continue;
+        this.capacity.closeCycle(a.name, win, resetAt, { resetAt });
+        // SINGLE-SHOT rollover: null the utilization AND the stamp, exactly as
+        // _clearExpiredQuotas does. Without this, the stamp survives the close and a
+        // second closer (the TUI tick / any routed request) re-fires on the SAME
+        // rollover — and a request that straddles the boundary gets lazily re-opened
+        // into a tiny second "complete" cycle that lands in the averages forever
+        // (red-team round 2, F1: avg3 2.0M → 1.0015M from one boundary crossing).
+        q[utilKey] = null;
+        q[stampKey] = null;
       }
     }
   }

@@ -127,6 +127,20 @@ export class CapacityLedger {
     const rec = this._accounts.get(name);
     if (!rec || !rec[window]?.open) return null;
     const open = rec[window].open;
+    // ONE CYCLE PER BOUNDARY CLOSURE — the structural backstop for the two-closer race
+    // (round-2 F1). If both closers observe the SAME reset stamp within the same
+    // rollover moment, the second close's tokens are a straddling tail of that same
+    // window, so they FOLD INTO that cycle instead of becoming a tiny fabricated second
+    // one that drags every average down. A LATER window reporting the same numeric stamp
+    // value (clock coincidence) is distinguished by endedAt. Pinned by I3.
+    const prev = rec[window].closed[rec[window].closed.length - 1];
+    if (resetAt != null && prev && prev.resetAt === resetAt && prev.endedAt === endedAt) {
+      prev.tokens += open.tokensSoFar;
+      if (!open.complete) prev.complete = false;
+      if (open.disabledDuring) prev.disabledDuring = true;
+      rec[window].open = null;
+      return prev;
+    }
     rec[window].closed.push({
       startedAt: open.startedAt,
       endedAt,
@@ -172,17 +186,15 @@ export class CapacityLedger {
   rollingThroughput(name, days = 7) {
     const rec = this._accounts.get(name);
     if (!rec) return { tokens: 0, partial: false };
-    // The window anchor is the LATEST RECORDED day, not "now": a test (or a ledger
-    // restored after >7d idle) has buckets in the past relative to its clock, and a
-    // today-anchored window would read 0 despite full history. Live, the latest
-    // recorded day IS today (or yesterday) — identical behavior.
-    const recorded = Object.keys(rec.days).sort();
-    if (!recorded.length) return { tokens: 0, partial: false };
-    const anchor = recorded[recorded.length - 1];
-    const cutoff = this._utcDayMinus(anchor, Math.min(days - 1, MAX_DAY_BUCKETS - 1));
+    // The window is anchored on the ledger's OWN clock — the last `days` CALENDAR days
+    // ending today. An earlier "latest recorded day" anchor reported a weeks-old window
+    // as if it were current (idle GLM fallback showed a stale 25M "7d volume" with no
+    // disclosure — red-team round 2, F2). Now: idle → 0, honestly.
+    const today = new Date(this._now()).toISOString().slice(0, 10);
+    const cutoff = this._utcDayMinus(today, Math.min(days - 1, MAX_DAY_BUCKETS - 1));
     let tokens = 0, partial = false;
     for (const [d, v] of Object.entries(rec.days)) {
-      if (d >= cutoff && d <= anchor) { tokens += v.tokens; if (v.partial) partial = true; }
+      if (d >= cutoff && d <= today) { tokens += v.tokens; if (v.partial) partial = true; }
     }
     return { tokens, partial };
   }

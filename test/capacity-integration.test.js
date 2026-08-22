@@ -160,8 +160,10 @@ test('D3: a probe observing a FRESHER reset stamp closes the provider cycle (sta
 
 test('D4: a cycle the account was DISABLED during is shown but excluded from the numbers', () => {
   const am = amWithOauth();
+  // Distinct boundary stamps, as in production (5h apart) — a same-instant repeat of
+  // ONE stamp is the two-closer race, which folds by design (I3).
   am.accrueCapacity(0, { input: 500, output: 0 });        // cycle 1 — clean
-  am.accounts[0].quota.unified5hReset = Date.now() - 1;
+  am.accounts[0].quota.unified5hReset = Date.now() - 5 * 3600_000;
   am.closeExpiredCapacityCycles();
   am.accrueCapacity(0, { input: 20, output: 0 });         // cycle 2 — disabled partway
   am.setAccountEnabled(0, false);
@@ -238,9 +240,11 @@ function renderCapacity(am, { window = 'ses', width = 120 } = {}) {
 
 test('G1: the page shows a per-account row with the six columns once cycles exist', () => {
   const am = amWithOauth();
+  // Three consecutive real windows — distinct boundary stamps, 5h apart.
+  let i = 3;
   for (const n of [1000, 2000, 3000]) {
     am.accrueCapacity(0, { input: n, output: 0 });
-    am.accounts[0].quota.unified5hReset = Date.now() - 1;
+    am.accounts[0].quota.unified5hReset = Date.now() - (i-- * 5 * 3600_000);
     am.closeExpiredCapacityCycles();
   }
   const page = renderCapacity(am);
@@ -369,4 +373,53 @@ test('H5: an operator-DISABLED cycle is excluded on its own axis, not by borrowi
   am.accounts[0].quota.unified5hReset = Date.now() - 1;
   am.closeExpiredCapacityCycles();
   assert.equal(am.capacity.windowStats('claude1', 'ses'), null, 'and it is excluded');
+});
+
+// ── Lane I: round-2 red-team pins (2026-08-22) ────────────────────────────────
+
+test('I1: the WEEKLY rollover closes through the display path too (the H1 twin — the whole 7,784-test suite once passed with that line deleted)', () => {
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 2_000_000, output: 0 });
+  am.accounts[0].quota.unified7d = 0.95;
+  am.accounts[0].quota.unified7dReset = Date.now() - 1;
+  am.refreshExpiredQuotas();
+  const st = am.capacity.windowStats('claude1', 'wk');
+  assert.ok(st, 'the weekly cycle closed at the rollover the display noticed');
+  assert.equal(st.last, 2_000_000);
+});
+
+test('I2: a boundary crossing fires the rollover EXACTLY ONCE regardless of which closer notices it (probe sweep, then display tick, then another sweep)', () => {
+  // Round-2 F1: the clock-close left the stamp alive, so a second closer re-fired on
+  // the same rollover and a straddling request was lazily re-opened into a tiny
+  // second "complete" cycle that poisoned the averages.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 1_500_000, output: 0 });
+  am.accounts[0].quota.unified5h = 0.9;
+  am.accounts[0].quota.unified5hReset = Date.now() - 1;
+  am.closeExpiredCapacityCycles();          // closer #1: the prober sweep
+  am.accrueCapacity(0, { input: 3_000, output: 0 });   // a request straddling the boundary
+  am.refreshExpiredQuotas();                // closer #2: the TUI tick
+  am.closeExpiredCapacityCycles();          // closer #3: another sweep
+  const st = am.capacity.windowStats('claude1', 'ses');
+  assert.equal(st.cycles, 1, 'one real cycle, never a tiny fabricated second one');
+  assert.equal(st.last, 1_500_000, 'the straddling tail belongs to the NEW cycle, not a fake');
+  const open = am.capacity.openCycle('claude1', 'ses');
+  assert.ok(open && open.startedAt >= Date.now() - 60_000, 'the tail re-opened in the new window');
+  assert.equal(open.tokensSoFar, 3_000);
+});
+
+test('I3: two closers on the SAME reset boundary produce ONE cycle, never a tiny second one', () => {
+  // Structural backstop for the I2 race: even if a closer regression re-fires on a
+  // boundary already closed, its straddling tail folds into that same cycle instead of
+  // entering the averages as a fabricated near-empty observation.
+  const l = new CapacityLedger({ now: () => Date.now() });
+  const boundary = Date.now();
+  l.accrue('x', { input: 1_500_000, output: 0 });
+  l.closeCycle('x', 'ses', boundary, { resetAt: boundary });
+  l.accrue('x', { input: 3_000, output: 0 });                  // straddling tail
+  l.closeCycle('x', 'ses', boundary, { resetAt: boundary });   // the regressed second closer
+  const st = l.windowStats('x', 'ses');
+  assert.equal(st.cycles, 1, 'one boundary, one cycle');
+  assert.equal(st.last, 1_503_000, 'the tail folded in rather than becoming a fake cycle');
+  assert.equal(st.avg3, 1_503_000, 'and the averages are not dragged down by a phantom');
 });

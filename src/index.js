@@ -710,12 +710,13 @@ async function serverWorkerCommand() {
     const after = accountManager.capacity?.serialize?.();
     if (!after) return;
     const disk = await loadState();
-    const capacity = CapacityLedger.mergeDelta(disk?.capacity, capacityFlushSnapshot, after);
+    if (!disk) return; // a failed read must not be "merged" into a quota-less state file (RT2-4)
+    const capacity = CapacityLedger.mergeDelta(disk.capacity, capacityFlushSnapshot, after);
     // Re-write the FULL on-disk state with only `capacity` replaced: quota and
     // runtimeProviders belong to the NEW worker now and must not be reverted to ours.
     // No generation guard — we are deliberately amending a file another writer owns,
     // and a same-instant race costs at most this drain's delta.
-    const { _generation, ...rest } = disk || {};
+    const { _generation, ...rest } = disk;
     // NO generation bump: re-write the file at the SAME generation so the new
     // worker's stateGeneration stays valid. saveState refuses a lower generation
     // only — writing the observed one back is accepted and bumps nothing. Bumping
