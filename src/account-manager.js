@@ -3039,18 +3039,19 @@ export class AccountManager {
       const pairs = a.type === 'provider'
         ? [['ses', 'providerSesReset', 'providerSes'], ['wk', 'providerWkReset', 'providerWk']]
         : [['ses', 'unified5hReset', 'unified5h'], ['wk', 'unified7dReset', 'unified7d']];
-      for (const [win, stampKey, utilKey] of pairs) {
+      for (const [win, stampKey] of pairs) {
         const resetAt = q[stampKey];
-        if (!resetAt || now < resetAt) continue;
-        this.capacity.closeCycle(a.name, win, resetAt, { resetAt });
-        // SINGLE-SHOT rollover: null the utilization AND the stamp, exactly as
-        // _clearExpiredQuotas does. Without this, the stamp survives the close and a
-        // second closer (the TUI tick / any routed request) re-fires on the SAME
-        // rollover — and a request that straddles the boundary gets lazily re-opened
-        // into a tiny second "complete" cycle that lands in the averages forever
-        // (red-team round 2, F1: avg3 2.0M → 1.0015M from one boundary crossing).
-        q[utilKey] = null;
-        q[stampKey] = null;
+        // Close ONLY. This path deliberately does NOT null the stamp: the rollover
+        // stays single-shot because closeCycle FOLDS a same-boundary repeat into the
+        // already-closed cycle (one boundary, one cycle), and the very next
+        // refreshExpiredQuotas / request-path _clearExpiredQuotas nulls the stamp with
+        // its full original side effects — the reset log, the `session` signal that
+        // drives _switchOnSessionReset, and the weekly `unifiedStatus` clear. Nulling
+        // here as well (round-2) made a prober-first notice silently swallow all of
+        // those whenever the sweep won the race (red-team round 3, RT3-1).
+        if (resetAt && now >= resetAt) {
+          this.capacity.closeCycle(a.name, win, resetAt, { resetAt });
+        }
       }
     }
   }

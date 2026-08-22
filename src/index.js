@@ -710,7 +710,10 @@ async function serverWorkerCommand() {
     const after = accountManager.capacity?.serialize?.();
     if (!after) return;
     const disk = await loadState();
-    if (!disk) return; // a failed read must not be "merged" into a quota-less state file (RT2-4)
+    if (!disk) { // a failed read must not be "merged" into a quota-less state file (RT2-4)
+      console.error('[Maxpool] Capacity drain-flush skipped: state file unreadable — drain-time token delta not persisted.');
+      return;
+    }
     const capacity = CapacityLedger.mergeDelta(disk.capacity, capacityFlushSnapshot, after);
     // Re-write the FULL on-disk state with only `capacity` replaced: quota and
     // runtimeProviders belong to the NEW worker now and must not be reverted to ours.

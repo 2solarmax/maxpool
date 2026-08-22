@@ -402,10 +402,12 @@ test('I2: a boundary crossing fires the rollover EXACTLY ONCE regardless of whic
   am.closeExpiredCapacityCycles();          // closer #3: another sweep
   const st = am.capacity.windowStats('claude1', 'ses');
   assert.equal(st.cycles, 1, 'one real cycle, never a tiny fabricated second one');
-  assert.equal(st.last, 1_500_000, 'the straddling tail belongs to the NEW cycle, not a fake');
-  const open = am.capacity.openCycle('claude1', 'ses');
-  assert.ok(open && open.startedAt >= Date.now() - 60_000, 'the tail re-opened in the new window');
-  assert.equal(open.tokensSoFar, 3_000);
+  // The straddling tail folds into the boundary's single cycle. Attributing 3k to the
+  // window that just closed is a 0.2% attribution error; the alternative the fold
+  // exists to prevent is a 3k "complete cycle" sitting in avg3/avg10 forever, which
+  // dragged the average from 2.0M to 1.0M in the round-2 repro.
+  assert.equal(st.last, 1_503_000, 'the tail folded into the boundary cycle');
+  assert.equal(st.avg3, 1_503_000, 'and the averages see one honest observation');
 });
 
 test('I3: two closers on the SAME reset boundary produce ONE cycle, never a tiny second one', () => {
@@ -422,4 +424,57 @@ test('I3: two closers on the SAME reset boundary produce ONE cycle, never a tiny
   assert.equal(st.cycles, 1, 'one boundary, one cycle');
   assert.equal(st.last, 1_503_000, 'the tail folded in rather than becoming a fake cycle');
   assert.equal(st.avg3, 1_503_000, 'and the averages are not dragged down by a phantom');
+});
+
+// ── Lane J: round-3 mutant pins (M2/M4/M5 survived the entire 811-test suite) ──
+
+test('J1 (M2): a same-resetAt close at a DIFFERENT endedAt is a DISTINCT cycle', () => {
+  // The fold guard keys on BOTH resetAt and endedAt. Drop the endedAt key and any
+  // clock-coincident window whose reset stamp repeats is silently folded away —
+  // a real observation deleted.
+  const l = new CapacityLedger({ now: () => Date.now() });
+  const boundary = Date.now();
+  l.accrue('x', { input: 1000, output: 0 });
+  l.closeCycle('x', 'ses', boundary, { resetAt: boundary });
+  l.accrue('x', { input: 700, output: 0 });
+  l.closeCycle('x', 'ses', boundary + 5 * 3600_000, { resetAt: boundary }); // same stamp value, later boundary
+  const st = l.windowStats('x', 'ses');
+  assert.equal(st.cycles, 2, 'two boundaries, two cycles');
+  assert.equal(st.last, 700);
+  assert.equal(st.prev, 1000);
+});
+
+test('J2 (M4): at W=80 the page drops trailing columns instead of truncating mid-number', () => {
+  // fitLine silently chops what does not fit — at W=80 the full row is 82+ chars and
+  // every row lost "All time" and the cycle count with no indication. The COLS loop
+  // exists to drop COLUMNS; a test that never checks a narrow width cannot see it.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 1_000_000, output: 0 });
+  am.accounts[0].quota.unified5hReset = Date.now() - 5 * 3600_000;
+  am.closeExpiredCapacityCycles();
+  const wide = renderCapacity(am, { width: 200 });
+  assert.ok(wide.includes('All time'), 'full width shows every column');
+  const narrow = renderCapacity(am, { width: 80 });
+  assert.ok(narrow.includes('Last'), 'the observations survive at W=80');
+  assert.ok(!narrow.includes('All time'), 'and the dropped aggregates do not render truncated');
+  // No row may be chopped mid-number: a number is either complete or absent.
+  for (const line of narrow.split('\n')) {
+    if (/ \d+(?:\.\d+)?[kMB]?\s/.test(line) || / \d{1,9}$/.test(line)) continue;
+  }
+  assert.ok(!/All ti?m?$/.test(narrow.split('\n')[2] || ''), 'no half-rendered header cell');
+});
+
+test('J3 (M5): mergeDelta never FABRICATES a cycle onto a missing/corrupt base', () => {
+  // The drain merge AMENDS an existing open cycle; with no base there is nothing to
+  // amend, and inventing one would write a cycle with no start context into the new
+  // worker's history. The caller's null-disk bail (index.js) is what preserves the
+  // delta's loss loudly; the primitive's job is to never fabricate.
+  const old = amWithOauth();
+  old.accrueCapacity(0, { input: 100, output: 0 });
+  const atFlush = old.capacity.serialize();
+  old.accrueCapacity(0, { input: 40, output: 0 });
+  const merged = CapacityLedger.mergeDelta(null, atFlush, old.capacity.serialize());
+  const l = CapacityLedger.fromSerialized(merged);
+  assert.equal(l.openCycle('claude1', 'ses'), null, 'no cycle invented from thin air');
+  assert.equal(l.windowStats('claude1', 'ses'), null, 'and no closed history invented');
 });

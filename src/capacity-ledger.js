@@ -134,10 +134,12 @@ export class CapacityLedger {
     // one that drags every average down. A LATER window reporting the same numeric stamp
     // value (clock coincidence) is distinguished by endedAt. Pinned by I3.
     const prev = rec[window].closed[rec[window].closed.length - 1];
-    if (resetAt != null && prev && prev.resetAt === resetAt && prev.endedAt === endedAt) {
+    if (resetAt != null && prev && prev.resetAt === resetAt && prev.endedAt === endedAt
+        && open.complete && !open.disabledDuring) {
+      // Fold ONLY a complete tail: folding a partial/disabled tail would flip the
+      // flags on the prior legitimate observation and ERASE it from the averages
+      // (round 3, RT3-2) — strictly worse than leaving a tiny excluded cycle.
       prev.tokens += open.tokensSoFar;
-      if (!open.complete) prev.complete = false;
-      if (open.disabledDuring) prev.disabledDuring = true;
       rec[window].open = null;
       return prev;
     }
