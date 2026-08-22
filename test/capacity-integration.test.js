@@ -457,7 +457,12 @@ test('J2 (M4): at W=80 the page drops trailing columns instead of truncating mid
   const narrow = renderCapacity(am, { width: 80 });
   assert.ok(narrow.includes('Last'), 'the observations survive at W=80');
   assert.ok(!narrow.includes('All time'), 'and the dropped aggregates do not render truncated');
-  assert.ok(!/All ti?m?$/.test(narrow.split('\n')[2] || ''), 'no half-rendered header cell');
+  // Assert on the HEADER line itself (found by index, never a hard-coded offset — the
+  // previous version read the blank spacer at [2] and passed unconditionally).
+  const header = narrow.split('\n').find(l => l.includes('Account') && l.includes('Last'));
+  assert.ok(header, 'the header renders');
+  assert.ok(!/All ti?m?e?\s*$/.test(header), 'no half-rendered header cell at the right edge');
+  assert.ok(header.length <= 80, 'the header fits the terminal');
 });
 
 test('J3 (M5): mergeDelta never FABRICATES a cycle onto a missing/corrupt base', () => {
@@ -494,4 +499,25 @@ test('J4: every row starts its columns at the SAME position, whatever the name l
   const lines = renderCapacity(am).split('\n').filter(l => / 1\.0M/.test(l));
   assert.equal(lines.length, 2, 'both accounts rendered a number');
   assert.equal(lines[0].indexOf('1.0M'), lines[1].indexOf('1.0M'), 'the columns line up across rows');
+});
+
+test('J5: the fold NEVER absorbs a partial or disabled tail over a complete observation', () => {
+  // Round-4 finding 1: deleting `&& open.complete && !open.disabledDuring` from the
+  // fold condition — a full revert of the RT3-2 fix — survived the entire 814-test
+  // suite. Without it, a partial tail's flags overwrite the prior legitimate cycle and
+  // erase it from every column.
+  for (const taint of ['partial', 'disabled']) {
+    const l = new CapacityLedger({ now: () => Date.now() });
+    const boundary = Date.now();
+    l.accrue('x', { input: 1_000_000, output: 0 });
+    l.closeCycle('x', 'ses', boundary, { resetAt: boundary });
+    l.accrue('x', { input: 900, output: 0 });                       // the tail
+    l.markPartial('x', { disabled: taint === 'disabled' });
+    l.closeCycle('x', 'ses', boundary, { resetAt: boundary });      // same boundary
+    const st = l.windowStats('x', 'ses');
+    assert.ok(st, `${taint}: the prior complete observation survives`);
+    assert.equal(st.cycles, 1, `${taint}: the tainted tail is excluded, not merged`);
+    assert.equal(st.last, 1_000_000, `${taint}: and its tokens never contaminate the real cycle`);
+    assert.equal(st.avg3, 1_000_000, `${taint}: the averages are untouched`);
+  }
 });
