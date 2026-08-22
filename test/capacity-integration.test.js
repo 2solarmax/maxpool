@@ -474,3 +474,24 @@ test('J3 (M5): mergeDelta never FABRICATES a cycle onto a missing/corrupt base',
   assert.equal(l.openCycle('claude1', 'ses'), null, 'no cycle invented from thin air');
   assert.equal(l.windowStats('claude1', 'ses'), null, 'and no closed history invented');
 });
+
+test('J4: every row starts its columns at the SAME position, whatever the name length', () => {
+  // The real page against real accounts exposed a pre-existing helper bug: truncate()
+  // always appended RESET (4 raw chars), so `.padEnd()` — which counts raw length —
+  // produced a 4-column-narrow name field for every name SHORTER than the width, and
+  // each row's numbers landed in a different place. Unreadable, and invisible to any
+  // test that used a single account name.
+  const am = new AccountManager([
+    { name: 'ab', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
+    { name: 'a-very-long-account-name', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
+  ], 0.90);
+  for (const a of am.accounts) {
+    am.accrueCapacity(a.index, { input: 1_000_000, output: 0 });
+    a.quota.unified5h = 0.9;
+    a.quota.unified5hReset = Date.now() - 5 * 3600_000;
+  }
+  am.refreshExpiredQuotas();
+  const lines = renderCapacity(am).split('\n').filter(l => / 1\.0M/.test(l));
+  assert.equal(lines.length, 2, 'both accounts rendered a number');
+  assert.equal(lines[0].indexOf('1.0M'), lines[1].indexOf('1.0M'), 'the columns line up across rows');
+});

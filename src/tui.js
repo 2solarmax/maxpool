@@ -68,7 +68,10 @@ function rpad(s, w) {
   return gap > 0 ? s + ' '.repeat(gap) : s;
 }
 
-/** Truncate a string with ANSI codes to exactly w visible characters, then reset. */
+/** Truncate a string with ANSI codes to exactly w visible characters, then reset.
+ *  The trailing RESET is appended only when something was actually cut — a no-op
+ *  truncate that unconditionally appended it shifted `.padEnd()` (raw-length) fields
+ *  4 columns narrow for every string shorter than the width (red-team round 3, RT3-4). */
 function truncate(s, w) {
   let visible = 0;
   let out = '';
@@ -82,7 +85,7 @@ function truncate(s, w) {
     visible++;
     i++;
   }
-  return out + RESET;
+  return visible < w ? out + ' '.repeat(w - visible) + RESET : out + RESET;
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
