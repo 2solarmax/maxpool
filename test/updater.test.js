@@ -225,7 +225,6 @@ test('the update check cadence is 30 minutes, env-tunable, floored at 60s', () =
   const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
   const m = /const updateIntervalMs = Math\.max\(60_000, Number\(process\.env\.MAXPOOL_UPDATE_CHECK_INTERVAL_MS\) \|\| ([^)]+)\);/.exec(src);
   assert.ok(m, 'the interval expression is where the test expects it');
-  // eslint-disable-next-line no-eval
   assert.equal(eval(m[1].replace(/_/g, '')), 30 * 60 * 1000, 'default is 30 minutes');
   assert.match(m[0], /Math\.max\(60_000/, 'still floored at 60s so a bad env value cannot hammer npm');
 });

@@ -70,6 +70,12 @@ export class Prober {
     this._stopping = false;
     this._inflight = (async () => {
       try {
+        // CAPACITY LEDGER: close any open cycle whose window's reset stamp has
+        // passed. Runs at the top of every sweep (lease-holder only — probeAll
+        // fires from the prober, which start/stop with the lease) so a window that
+        // rolled over between requests still closes promptly, not only on the next
+        // accrual or stamp-advance.
+        try { this.am.closeExpiredCapacityCycles?.(); } catch { /* never block probing */ }
         // DISABLED accounts are INTENTIONALLY still probed (no `a.enabled` filter):
         // a user often disables an account precisely BECAUSE it's exhausted, and still
         // wants to see its quota recover — so keep refreshing its usage for visibility

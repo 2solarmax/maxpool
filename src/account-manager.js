@@ -1,4 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { CapacityLedger } from './capacity-ledger.js';
 import { peakWindowState, DEFAULT_PEAK_CAP } from './peak-window.js';
 
 // Bounded re-poll hold for an account blocked ONLY by a transient, self-clearing
@@ -332,6 +333,9 @@ export class AccountManager {
     this.preferredAccountName = null;
     this.sessionBindings = new Map();
     this._peakCache = null;   // per-UTC-minute peak-window memo (see _peakStateFor)
+    // CAPACITY LEDGER (2026-08-22): observed tokens per completed window cycle, so
+    // "true capacity" is comparable across providers. Restored from state on boot.
+    this.capacity = new CapacityLedger();
     this.sessionPolicies = new Map();
     this.upstreamThrottle = {
       until: null,
@@ -1914,6 +1918,10 @@ export class AccountManager {
   setAccountEnabled(index, enabled) {
     const account = this.accounts[index];
     if (!account) return false;
+    // CAPACITY LEDGER: a cycle that spent part of its life DISABLED did not get the
+    // chance to deliver its true capacity, so it is not a capacity observation —
+    // flag it partial (shown, excluded from the averages).
+    if (!enabled && account.enabled) this.capacity.markPartial(account.name, { disabled: true });
     account.enabled = Boolean(enabled);
     if (!enabled && account.name === this.preferredAccountName) {
       this.setRoutingMode('automatic');
@@ -2787,6 +2795,11 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
+    // CAPACITY LEDGER: snapshot the previous reset stamps so a probe observing the
+    // window ADVANCE (new stamp) closes the capacity cycle at the old boundary —
+    // covers windows whose old stamp was never learned (clock-close can't fire).
+    const prevSesReset = q.providerSesReset;
+    const prevWkReset = q.providerWkReset;
     if (usage.error) {
       // Distinguish "no pollable quota" (Kimi) from a transient probe failure.
       // Never clear existing values on a transient error — let them age into the
@@ -2814,6 +2827,16 @@ export class AccountManager {
       q.weeklyAbsent = true;
     }
     q.lastProbeOkAt = Date.now();
+    // Stamp-advance close: a FRESHER reset stamp means the old window rolled over —
+    // the tokens accrued since the last close belong to the cycle that just ended.
+    // nextResetAt > prevResetAt guards the normal case (same window re-reported with
+    // the same stamp); a clock skew re-report of an OLDER stamp is ignored too.
+    if (usage.ses?.resetAt && usage.ses.resetAt > (prevSesReset || 0)) {
+      this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.ses.resetAt);
+    }
+    if (usage.wk?.resetAt && usage.wk.resetAt > (prevWkReset || 0)) {
+      this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.wk.resetAt);
+    }
   }
 
   /**
@@ -2952,6 +2975,61 @@ export class AccountManager {
   /**
    * Update cumulative token usage from response body data.
    */
+  /** Restore the ledger from persisted state. A BOOT GAP (the open cycle's last
+   *  accrual is far behind now) means maxpool was down for part of that cycle, so the
+   *  cycle is no longer a truthful capacity observation — flag it partial (B2/SC6).
+   *  It still displays; it is excluded from averages. */
+  restoreCapacityState(payload, now = Date.now(), gapMs = 10 * 60_000) {
+    this.capacity = CapacityLedger.fromSerialized(payload);
+    for (const name of this.capacity.accounts()) {
+      for (const win of ['ses', 'wk']) {
+        const open = this.capacity.openCycle(name, win);
+        if (open && open.lastAccrualAt && (now - open.lastAccrualAt) > gapMs) {
+          this.capacity.markPartial(name);
+          const day = new Date(open.lastAccrualAt).toISOString().slice(0, 10);
+          this.capacity.markDayPartial(name, day);
+        }
+      }
+    }
+  }
+
+  /** Accrue ONE request's tokens into the capacity ledger (per-request values; the
+   *  server seam has already applied max-semantics for streamed output). */
+  accrueCapacity(accountIndex, { input = 0, output = 0 } = {}) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    this.capacity.accrue(account.name, { input, output });
+  }
+
+  /** Close any window cycle whose reset time has passed — CLOCK-AUTHORITATIVE, so a
+   *  stale or dead probe can never leave a cycle open and mis-attribute the next
+   *  window's tokens to it (pre-mortem M5; worst case is the no-weekly account whose
+   *  probe latches refreshDead). Safe to call on every render tick and prober tick. */
+  closeExpiredCapacityCycles(now = Date.now()) {
+    for (const a of this.accounts) {
+      const q = a.quota || {};
+      const pairs = a.type === 'provider'
+        ? [['ses', q.providerSesReset], ['wk', q.providerWkReset]]
+        : [['ses', q.unified5hReset], ['wk', q.unified7dReset]];
+      for (const [win, resetAt] of pairs) {
+        const open = this.capacity.openCycle(a.name, win);
+        if (!open) continue;
+        // The cycle ends when its window's reset time passes. A window with no known
+        // reset stamp cannot be closed on the clock — it closes on stamp-advance below.
+        if (resetAt && now >= resetAt) {
+          this.capacity.closeCycle(a.name, win, resetAt, { resetAt });
+        }
+      }
+    }
+  }
+
+  /** Close a cycle because a probe observed the window ADVANCE (a new reset stamp) —
+   *  covers the case where the old stamp was never learned. */
+  noteCapacityWindowAdvance(accountName, window, prevResetAt, nextResetAt) {
+    if (!prevResetAt || !nextResetAt || nextResetAt <= prevResetAt) return;
+    this.capacity.closeCycle(accountName, window, prevResetAt, { resetAt: prevResetAt });
+  }
+
   updateUsage(accountIndex, inputTokens, outputTokens) {
     const account = this.accounts[accountIndex];
     if (!account) return;

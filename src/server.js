@@ -1286,6 +1286,12 @@ async function forwardRequest(
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
       await streamResponse(upstreamRes.body, res, upstreamRes.status, responseHeaders, account.index, accountManager, streamLog, requestInfo);
+      // CAPACITY LEDGER: one accrual per REQUEST, using the per-stream running max
+      // (M3 — cumulative interim deltas must not be summed).
+      accountManager.accrueCapacity?.(account.index, {
+        input: requestInfo._capacityInput || 0,
+        output: requestInfo._capacityOutput || 0,
+      });
       accountManager.releaseAccount(lease, { success: true, status: upstreamRes.status });
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
@@ -1312,7 +1318,7 @@ async function forwardRequest(
         clearTimeout(bodyTimer);
       }
       const buf = Buffer.from(arr);
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account.index, accountManager, requestInfo);
       markThinkingFromResponse(buf, accountManager, requestInfo);
       accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
       if (logDir) {
@@ -2914,10 +2920,18 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
 
   try {
     const data = JSON.parse(dataLine.slice(6));
-    if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-    } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+    // CAPACITY LEDGER (2026-08-22): stream-level usage feeds the per-cycle ledger.
+    // M3: Anthropic interim message_delta usage is CUMULATIVE — add-semantics inflates
+    // output on long generations. Track a per-stream RUNNING MAX, accrue once at end.
+    // M4: count_tokens responses are prompt-size echoes, not delivered work — skip.
+    if (!requestInfo.isCountTokens) {
+      if (data.type === 'message_start' && data.message?.usage) {
+        accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+        requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, data.message.usage.input_tokens || 0);
+      } else if (data.type === 'message_delta' && data.usage) {
+        accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+        requestInfo._capacityOutput = Math.max(requestInfo._capacityOutput || 0, data.usage.output_tokens || 0);
+      }
     }
     if (sseEventContainsThinking(data)) {
       accountManager.markSessionThinkingProtected?.(requestInfo.sessionKey, requestInfo.model);
@@ -2933,11 +2947,20 @@ function sseEventContainsThinking(data) {
     || data?.delta?.type === 'signature_delta';
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo = {}) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      // CAPACITY LEDGER — M4: a /count_tokens response is a prompt-size echo with ZERO
+      // work delivered. Claude Code calls it constantly; counting it would inflate every
+      // cycle by whole prompt sizes.
+      if (!requestInfo.isCountTokens) {
+        accountManager.accrueCapacity?.(accountIndex, {
+          input: json.usage.input_tokens || 0,
+          output: json.usage.output_tokens || 0,
+        });
+      }
     }
   } catch {
     // not JSON or no usage
