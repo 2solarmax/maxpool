@@ -457,10 +457,6 @@ test('J2 (M4): at W=80 the page drops trailing columns instead of truncating mid
   const narrow = renderCapacity(am, { width: 80 });
   assert.ok(narrow.includes('Last'), 'the observations survive at W=80');
   assert.ok(!narrow.includes('All time'), 'and the dropped aggregates do not render truncated');
-  // No row may be chopped mid-number: a number is either complete or absent.
-  for (const line of narrow.split('\n')) {
-    if (/ \d+(?:\.\d+)?[kMB]?\s/.test(line) || / \d{1,9}$/.test(line)) continue;
-  }
   assert.ok(!/All ti?m?$/.test(narrow.split('\n')[2] || ''), 'no half-rendered header cell');
 });
 

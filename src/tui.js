@@ -1621,13 +1621,7 @@ export class TUI {
       while (lines.length < H - 2) lines.push('');
       lines.push(' ' + dim('─'.repeat(W - 2)));
       lines.push(this._renderFooter());
-      let cbuf = `${ESC}H`;
-      for (let i = 0; i < H; i++) {
-        cbuf += fitLine(lines[i] || '', W);
-        if (i < H - 1) cbuf += '\r\n';
-      }
-      cbuf += `${ESC}?25l`;
-      process.stdout.write(cbuf);
+      this._writeScreen(lines, W, H);
       return;
     }
 
@@ -1729,7 +1723,12 @@ export class TUI {
     if (this.mode === 'updates') lines.push(...this._renderUpdatesDetail());
     lines.push(this._renderFooter());
 
-    // Write buffer
+    this._writeScreen(lines, W, H);
+  }
+
+  /** Full-screen buffer write: cursor home, H rows fitted to W, then hide the cursor
+   *  (shown only in input mode). */
+  _writeScreen(lines, W, H) {
     let buf = `${ESC}H`;
     for (let i = 0; i < H; i++) {
       buf += fitLine(lines[i] || '', W);

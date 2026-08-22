@@ -2697,12 +2697,10 @@ export class AccountManager {
     }
     // Stamp-advance close (same guard as the provider path): a FRESHER stamp means
     // the old window rolled over — close its cycle at the old boundary.
-    if (usage.fiveHour?.resetAt && usage.fiveHour.resetAt > (prevSesReset || 0)) {
-      this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour.resetAt);
-    }
-    if (usage.sevenDay?.resetAt && usage.sevenDay.resetAt > (prevWkReset || 0)) {
-      this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay.resetAt);
-    }
+    // noteCapacityWindowAdvance already no-ops on a missing/unchanged/older stamp, so
+    // there is nothing to gate here — pass the raw (possibly undefined) value through.
+    this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour?.resetAt);
+    this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay?.resetAt);
     // Only a SUCCESSFUL probe carrying the flag speaks to this. A header-driven update
     // can't see the limits[] array, and a FAILED read knows nothing about the account's
     // caps — either one claiming "uncapped" would mislabel a capped account as having no
@@ -2847,14 +2845,10 @@ export class AccountManager {
     q.lastProbeOkAt = Date.now();
     // Stamp-advance close: a FRESHER reset stamp means the old window rolled over —
     // the tokens accrued since the last close belong to the cycle that just ended.
-    // nextResetAt > prevResetAt guards the normal case (same window re-reported with
-    // the same stamp); a clock skew re-report of an OLDER stamp is ignored too.
-    if (usage.ses?.resetAt && usage.ses.resetAt > (prevSesReset || 0)) {
-      this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.ses.resetAt);
-    }
-    if (usage.wk?.resetAt && usage.wk.resetAt > (prevWkReset || 0)) {
-      this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.wk.resetAt);
-    }
+    // noteCapacityWindowAdvance already no-ops on a missing/unchanged/older stamp
+    // (same-window re-report, clock-skew backward re-report) — pass values through.
+    this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.ses?.resetAt);
+    this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.wk?.resetAt);
   }
 
   /**
@@ -2990,9 +2984,6 @@ export class AccountManager {
     }
   }
 
-  /**
-   * Update cumulative token usage from response body data.
-   */
   /** Restore the ledger from persisted state. A BOOT GAP (the open cycle's last
    *  accrual is far behind now) means maxpool was down for part of that cycle, so the
    *  cycle is no longer a truthful capacity observation — flag it partial (B2/SC6).
@@ -3037,8 +3028,8 @@ export class AccountManager {
     for (const a of this.accounts) {
       const q = a.quota || {};
       const pairs = a.type === 'provider'
-        ? [['ses', 'providerSesReset', 'providerSes'], ['wk', 'providerWkReset', 'providerWk']]
-        : [['ses', 'unified5hReset', 'unified5h'], ['wk', 'unified7dReset', 'unified7d']];
+        ? [['ses', 'providerSesReset'], ['wk', 'providerWkReset']]
+        : [['ses', 'unified5hReset'], ['wk', 'unified7dReset']];
       for (const [win, stampKey] of pairs) {
         const resetAt = q[stampKey];
         // Close ONLY. This path deliberately does NOT null the stamp: the rollover
@@ -3063,6 +3054,9 @@ export class AccountManager {
     this.capacity.closeCycle(accountName, window, prevResetAt, { resetAt: prevResetAt });
   }
 
+  /**
+   * Update cumulative token usage from response body data.
+   */
   updateUsage(accountIndex, inputTokens, outputTokens) {
     const account = this.accounts[accountIndex];
     if (!account) return;
