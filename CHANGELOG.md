@@ -5,6 +5,51 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-08-22
+
+### Added
+
+- True-capacity ledger — observed tokens per completed cycle, TUI capacity page
+
+### Changed
+
+- Simplify pass — dedupe stamp-advance call sites, share the screen-write tail, drop dead tuple element and a vacuous loop
+
+### Fixed
+
+- Red-team round 1 — both close paths, unbumped merge write, downtime-based partial, calendar 7d window, stream-death accrual
+- Red-team round 2 — single-shot rollover, clock-anchored 7d window, same-boundary fold, weekly-close pin, narrow-width page
+- Red-team round 3 residuals — restore reset-log/session-signal path, fold only complete tails, fail-loud drain bail, pin M2/M4/M5
+- Pad-name truncation aligned every column — the round-3 RT3-4 residual
+
+## [1.7.1] - 2026-08-19
+
+### Fixed
+
+- Peak footer wording + spacing
+
+## [1.7.0] - 2026-08-19
+
+### Added
+
+- Peak settings are now visible and controllable from the routing screen
+
+## [1.6.1] - 2026-08-18
+
+### Fixed
+
+- Critic round 2 — setter coercion trap + a vacuous pin
+
+## [1.6.0] - 2026-08-18
+
+### Added
+
+- Peak-hour governance for provider accounts — de-preference + usage cap
+
+### Fixed
+
+- Red-team round 1 — 7 findings, all fixed and mutation-pinned
+
 ## [1.5.87] - 2026-08-18
 
 ### Changed
