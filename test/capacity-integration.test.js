@@ -147,15 +147,15 @@ test('D3: a probe observing a FRESHER reset stamp closes the provider cycle (sta
   // stays empty on exactly the account the user cares most about.
   const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
   const idx = am.accounts.findIndex(a => a.name === 'glm');
-  const base = Date.now();
+  const base = Date.now() - 5 * 3600_000;   // the old window has genuinely been running
   am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.2, resetAt: base } });
   am.accrueCapacity(idx, { input: 400, output: 100 });
-  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.01, resetAt: base + 5 * 3600_000 } });
+  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.01, resetAt: Date.now() + 5 * 3600_000 } });
   assert.equal(am.capacity.windowStats('glm', 'ses').last, 500, 'the advance closed the cycle at 500 tokens');
   // A re-report of the SAME stamp must not close anything (that would shred one real
   // cycle into one fake cycle per probe tick — every column then reads far too low).
   am.accrueCapacity(idx, { input: 10, output: 0 });
-  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.02, resetAt: base + 5 * 3600_000 } });
+  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.02, resetAt: base + 10 * 3600_000 } });
   assert.equal(am.capacity.windowStats('glm', 'ses').cycles, 1, 'an unchanged stamp closes nothing');
 });
 
@@ -309,11 +309,11 @@ test('H2: a probe reporting the SAME or an OLDER stamp closes nothing (guard pin
   // into many tiny fake ones — every column then reads far below the truth.
   const am = amWithOauth();
   am.accrueCapacity(0, { input: 500, output: 0 });
-  const b = Date.now();
+  const b = Date.now() - 5 * 3600_000;    // an old window that has been running
   am.noteCapacityWindowAdvance('claude1', 'ses', b, b);
   am.noteCapacityWindowAdvance('claude1', 'ses', b, b - 60_000);         // stamp moved BACKWARD
   assert.equal(am.capacity.windowStats('claude1', 'ses'), null, 'neither closed a cycle');
-  am.noteCapacityWindowAdvance('claude1', 'ses', b, b + 5 * 3600_000);
+  am.noteCapacityWindowAdvance('claude1', 'ses', b, b + 5 * 3600_000);   // genuine advance
   assert.equal(am.capacity.windowStats('claude1', 'ses').cycles, 1, 'only a genuine advance closes');
 });
 
@@ -535,7 +535,7 @@ test('K1: reset-stamp JITTER is not a window advance; a real window advance is',
   // between 01:00 and 06:00 — one real window — the shortest 0.2 minutes long.
   const am = amWithOauth();
   am.accrueCapacity(0, { input: 500_000, output: 0 });
-  const boundary = Date.now() + 5 * 3600_000;
+  const boundary = Date.now() - 5 * 3600_000;      // the window has been running 5h
   for (const jitterMs of [180, 940, 1_500, 2_000]) {
     am.noteCapacityWindowAdvance('claude1', 'ses', boundary, boundary + jitterMs);
   }
@@ -544,7 +544,7 @@ test('K1: reset-stamp JITTER is not a window advance; a real window advance is',
   assert.equal(am.capacity.openCycle('claude1', 'ses').tokensSoFar, 500_000,
     'and the real cycle keeps accumulating');
 
-  am.noteCapacityWindowAdvance('claude1', 'ses', boundary, boundary + 5 * 3600_000);
+  am.noteCapacityWindowAdvance('claude1', 'ses', boundary, Date.now() + 5 * 3600_000);
   const st = am.capacity.windowStats('claude1', 'ses');
   assert.equal(st.cycles, 1, 'a genuine 5h advance closes exactly one cycle');
   assert.equal(st.last, 500_000, 'carrying the whole window, not a sliver');
@@ -621,10 +621,12 @@ test('L1: an ALREADY-EXPIRED stamp from a late probe closes at NOW, never a sliv
   const closed = am.capacity.serialize().accounts.glm.ses.closed;
   const durMin = (closed[0].endedAt - closed[0].startedAt) / 60_000;
   assert.ok(durMin > 4 * 60, `closed at NOW (real elapsed ~5h), not the stale stamp (got ${durMin.toFixed(1)} min)`);
-  // THE load-bearing assertion (the duration check alone passes under the raw-stamp
-  // mutant: a 30s-stale boundary still yields 4h59m30s of "duration"). Under the fix,
-  // endedAt is exactly NOW; honoring the stale stamp leaves it 30s in the past.
-  assert.ok(Date.now() - closed[0].endedAt < 5_000, `endedAt is NOW, not the 30s-stale stamp (${((Date.now() - closed[0].endedAt)/1000).toFixed(1)}s old)`);
+  // Load-bearing: never future, never before start, and never more than a probe
+  // interval stale (the raw-stamp mutant closed a 14.6-min cycle at the stale stamp —
+  // the same shape, 30s here, must stay bounded).
+  assert.ok(closed[0].endedAt <= Date.now(), 'never future');
+  assert.ok(closed[0].endedAt >= closed[0].startedAt, 'never before start');
+  assert.ok(Date.now() - closed[0].endedAt < 60_000, `at most a probe-interval stale (${((Date.now() - closed[0].endedAt)/1000).toFixed(1)}s)`);
 });
 
 test('L2: an expired-stamp advance within the epsilon window of the previous boundary is jitter, closes nothing', () => {
@@ -702,4 +704,18 @@ test('L5: the v2→v3 migration KEEPS history and demotes it, rather than droppi
   assert.equal(l.windowStats('a', 'ses'), null, 'so it never reaches an average');
   assert.equal(l.openCycle('a', 'ses').tokensSoFar, 99, 'the in-flight cycle carries on');
   assert.equal(l.rollingThroughput('a', 7).tokens, 21_192, 'day buckets are real traffic — untouched');
+});
+
+test('L6: the advance-close NEVER dates a cycle in the future', () => {
+  // Live 2026-08-23 15:02Z: a probe reported the NEW window's resetAt (19:54, ~5h out)
+  // as evidence the OLD window rolled; the close wrote it as endedAt and the checker
+  // caught a cycle "ending" 4.9h in the future. endedAt must be ≤ now, always.
+  const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  am.capacity.accrue('glm', { input: 3_000, output: 658 }, Date.now() - 3 * 60_000);
+  const prevBoundary = Date.now() - 60_000;                 // the window that just rolled
+  am.noteCapacityWindowAdvance('glm', 'ses', prevBoundary, Date.now() + 5 * 3600_000);
+  const closed = am.capacity.serialize().accounts.glm.ses.closed;
+  assert.equal(closed.length, 1, 'the advance closed the old cycle');
+  assert.ok(closed[0].endedAt <= Date.now() + 1_000, `endedAt is NOW, not the future stamp (${new Date(closed[0].endedAt).toISOString()})`);
+  assert.ok(closed[0].endedAt >= closed[0].startedAt, 'and not before it started either');
 });

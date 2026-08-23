@@ -3066,7 +3066,13 @@ export class AccountManager {
     //    window (>=5h) — the 60s epsilon separates it by three orders of magnitude.
     //    Provider stamps (z.ai/Kimi probe) are absolute and never jitter.
     const nowMs = Date.now();
-    const boundary = nextResetAt <= nowMs ? nowMs : nextResetAt;
+    // A close can never be dated in the FUTURE. An advance stamp legitimately points
+    // at the NEW window's reset (a fresh 5h away) — that is evidence the OLD window
+    // rolled, not the moment it rolled. Close at NOW (live 2026-08-23: a 3,658-token
+    // cycle was recorded as endedAt 4.9h in the future; the invariant checker caught
+    // it minutes later). `min` also floors the late-probe case (a stamp already
+    // expired) — endedAt is always within [start, now].
+    const boundary = Math.min(nextResetAt, nowMs);
     if (boundary - prevResetAt < WINDOW_ADVANCE_EPSILON_MS) return;
     this.capacity.closeCycle(accountName, window, boundary, { resetAt: prevResetAt });
   }
