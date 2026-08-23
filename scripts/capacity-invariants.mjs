@@ -28,12 +28,15 @@ import path from 'node:path';
 const STATE = process.env.MAXPOOL_STATE_PATH
   || path.join(homedir(), '.config', 'teamclaude.state.json');
 
-// A real 5h window is 5h; a real weekly is 7d. Anything under these floors is a
-// sliver — the shape both live defects took. Generous floors (a genuinely short
-// FIRST cycle after a fresh install is legitimate, so partial cycles are exempt).
-const FLOOR_MIN = { ses: 4 * 60, wk: 5 * 24 * 60 };
+// A COMPLETE cycle claims it observed a whole window, so its span must be within a
+// small tolerance of that window — not merely "long enough". The first floor here was
+// 4h/5h, and it stayed silent on three live rows of 64-74 minutes that were exactly as
+// wrong as the 14.6-minute one it did catch: a partial-observation defect is a SPAN
+// defect, and a generous floor only catches its most extreme instances.
+const WINDOW_MIN = { ses: 5 * 60, wk: 7 * 24 * 60 };
+const SPAN_TOLERANCE = 0.2;   // a complete cycle spans >=80% of its window
 const WINDOW_LABEL = { ses: '5h', wk: 'weekly' };
-const EXPECTED_SCHEMA = 2;
+const EXPECTED_SCHEMA = 3;
 
 export function checkInvariants(state, now = Date.now()) {
   const violations = [];
@@ -62,13 +65,15 @@ export function checkInvariants(state, now = Date.now()) {
             detail: `ends ${new Date(c.endedAt).toISOString()} — ${((c.endedAt - now) / 3_600_000).toFixed(1)}h in the future` });
         }
 
-        // 2. SLIVER. Only complete, counted cycles matter: a partial one is already
-        //    excluded from the averages, so a short one there is honest bookkeeping
-        //    (explicitly including the flagged joined-mid-window first cycle after a
-        //    history-dropping migration — expected once per account, never a defect).
-        if (c.complete && !c.disabledDuring && durMin < FLOOR_MIN[win]) {
-          violations.push({ kind: 'sliver', account: name, window: win,
-            detail: `${durMin.toFixed(1)} min for a ${WINDOW_LABEL[win]} window, ${c.tokens} tokens — counted toward the averages` });
+        // 2. PARTIAL OBSERVATION claiming to be complete. Only complete, counted
+        //    cycles matter: a partial one is already excluded from the averages, so a
+        //    short one there is honest bookkeeping (the flagged joined-mid-window and
+        //    pre-v3-unverified rows land here — expected, never a defect).
+        if (c.complete && !c.disabledDuring && durMin < WINDOW_MIN[win] * (1 - SPAN_TOLERANCE)) {
+          const pct = (100 * durMin / WINDOW_MIN[win]).toFixed(0);
+          violations.push({ kind: 'partial-observation', account: name, window: win,
+            detail: `spans ${durMin.toFixed(1)} min = ${pct}% of its ${WINDOW_LABEL[win]} window, ` +
+                    `${c.tokens} tokens — claims COMPLETE, counted toward the averages` });
         }
 
         // 3. BACKWARDS. endedAt before startedAt is arithmetic nonsense.

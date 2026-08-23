@@ -12,7 +12,7 @@ const cycle = (o = {}) => ({
   complete: true, disabledDuring: false, resetAt: NOW, ...o,
 });
 const state = (closed, win = 'ses', extra = {}) => ({
-  capacity: { schemaVersion: 2, accounts: { a1: {
+  capacity: { schemaVersion: 3, accounts: { a1: {
     ses: { open: null, closed: win === 'ses' ? closed : [] },
     wk: { open: null, closed: win === 'wk' ? closed : [] },
     days: {}, ...extra } } },
@@ -28,7 +28,7 @@ test('catches the v1.8.0 shape: a sliver counted toward the averages', () => {
   // The real row: 0.2 min / 2228 tokens, complete:true, inside the averages.
   const r = checkInvariants(state([cycle({ startedAt: NOW - 12_000, tokens: 2_228 })]), NOW);
   assert.equal(r.violations.length, 1);
-  assert.equal(r.violations[0].kind, 'sliver');
+  assert.equal(r.violations[0].kind, 'partial-observation');
 });
 
 test('catches the v1.8.0 shape: a weekly cycle dated in the future', () => {
@@ -38,7 +38,7 @@ test('catches the v1.8.0 shape: a weekly cycle dated in the future', () => {
 
 test('catches the v1.8.1 shape: a 14.6-minute GLM sliver from a late probe', () => {
   const r = checkInvariants(state([cycle({ startedAt: NOW - 876_000, tokens: 21_192 })]), NOW);
-  assert.equal(r.violations[0].kind, 'sliver');
+  assert.equal(r.violations[0].kind, 'partial-observation');
   assert.match(r.violations[0].detail, /14\.6 min/);
 });
 
@@ -66,7 +66,7 @@ test('catches a cycle stuck OPEN past its window — the silent failure mode', (
 
 test('catches a stale schema — an older build writing the file', () => {
   const s = state([cycle()]);
-  s.capacity.schemaVersion = 1;
+  s.capacity.schemaVersion = 2;
   assert.ok(checkInvariants(s, NOW).violations.some(v => v.kind === 'schema'));
 });
 
@@ -80,5 +80,28 @@ test('the joined-mid-window first cycle (flagged partial) is NOT flagged', () =>
   // alert after every upgrade would be a false positive.
   const r = checkInvariants(state([cycle({ startedAt: NOW - 876_000, tokens: 21_192,
     complete: false, partialReason: 'joined-mid-window' })]), NOW);
+  assert.deepEqual(r.violations, []);
+});
+
+test('catches the 64-minute variants a generous floor stayed silent on', () => {
+  // Live 2026-08-23: three rows of 64.3/64.4/74.4 min for 5h windows were exactly as
+  // wrong as the 14.6-min one, and the first floor (4h) flagged only the extreme case.
+  for (const durMin of [64.3, 64.4, 74.4, 200]) {
+    const r = checkInvariants(state([cycle({ startedAt: NOW - durMin * 60_000 })]), NOW);
+    assert.equal(r.violations.length, 1, `${durMin} min must be flagged`);
+    assert.equal(r.violations[0].kind, 'partial-observation');
+  }
+});
+
+test('a cycle spanning its whole window is clean, and 80% is the boundary', () => {
+  assert.deepEqual(checkInvariants(state([cycle({ startedAt: NOW - 5 * 3600_000 })]), NOW).violations, []);
+  assert.deepEqual(checkInvariants(state([cycle({ startedAt: NOW - 4.1 * 3600_000 })]), NOW).violations, [],
+    '82% of the window is a real observation (an account can go idle at the very end)');
+  assert.equal(checkInvariants(state([cycle({ startedAt: NOW - 3.9 * 3600_000 })]), NOW).violations.length, 1,
+    '78% is not');
+});
+
+test('the pre-v3 migrated rows are shown but never flagged', () => {
+  const r = checkInvariants(state([cycle({ startedAt: NOW - 876_000, complete: false, partialReason: 'pre-v3-unverified' })]), NOW);
   assert.deepEqual(r.violations, []);
 });

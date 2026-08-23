@@ -681,3 +681,25 @@ test('L4: a NORMAL restore keeps counting — the mid-window flag is not contagi
   assert.ok(st, 'a normal restore still produces real observations');
   assert.equal(st.last, 600_000, 'carrying the restored open cycle plus the new traffic');
 });
+
+test('L5: the v2→v3 migration KEEPS history and demotes it, rather than dropping it again', () => {
+  // v1→v2 dropped history because it was arithmetically poisoned. v2's rows are not
+  // poisoned, only UNVERIFIABLE: every one predates the joined-mid-window fix, so each
+  // is a tail-only observation labelled complete (live: 14.6/64.3/64.4/74.4 min for 5h
+  // windows — all four rows the ledger held). Dropping a second time would train the
+  // reader that history evaporates on upgrade; demoting keeps it visible and honest.
+  const v2 = { schemaVersion: 2, accounts: { a: {
+    ses: { open: { startedAt: Date.now() - 600_000, tokensSoFar: 99, lastAccrualAt: Date.now(), complete: true, disabledDuring: false },
+           closed: [{ startedAt: Date.now() - 876_000, endedAt: Date.now(), tokens: 21_192, complete: true, disabledDuring: false, resetAt: Date.now() }] },
+    wk: { open: null, closed: [] }, days: { '2026-08-23': { tokens: 21_192, partial: false } } } } };
+
+  const l = CapacityLedger.fromSerialized(v2);
+  assert.equal(l.serialize().schemaVersion, 3);
+  const closed = l.serialize().accounts.a.ses.closed;
+  assert.equal(closed.length, 1, 'the row is KEPT (not dropped like v1)');
+  assert.equal(closed[0].complete, false, 'but demoted');
+  assert.equal(closed[0].partialReason, 'pre-v3-unverified', 'with a reason the monitor recognizes');
+  assert.equal(l.windowStats('a', 'ses'), null, 'so it never reaches an average');
+  assert.equal(l.openCycle('a', 'ses').tokensSoFar, 99, 'the in-flight cycle carries on');
+  assert.equal(l.rollingThroughput('a', 7).tokens, 21_192, 'day buckets are real traffic — untouched');
+});

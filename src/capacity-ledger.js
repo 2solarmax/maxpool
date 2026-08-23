@@ -15,11 +15,18 @@
  * Pre-mortem (2026-08-22) blockers B1/B2 + majors M3-M7 are the load-bearing comments.
  */
 
+// v3 (2026-08-23): every v2 row was written before the joined-mid-window fix, so each
+// account's first cycle is a TAIL-only observation recorded as `complete` (measured on
+// the live ledger: 14.6, 64.3, 64.4 and 74.4 minutes for 5h windows — all four rows it
+// held). Rather than drop history a second time, v3 MIGRATES: closed v2 rows are kept
+// and shown, marked partial with a reason, so they never reach an average and never
+// re-alert. Forward rows are correct by construction.
+//
 // v2 (2026-08-23): v1 histories are POISONED and are deliberately dropped on load.
 // The OAuth reset-stamp jitter (see AccountManager.noteCapacityWindowAdvance) shredded
 // real windows into slivers and recorded future-dated weekly cycles, so a v1 payload's
 // averages are wrong for weeks. Starting empty costs one window; keeping it costs trust.
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 // Two closes this far apart are the SAME boundary observed twice (a clock-close and a
 // stamp-advance racing across the boundary second), not two windows.
@@ -41,6 +48,21 @@ export class CapacityLedger {
    *  start empty and KEEP the file (the caller preserves it); a corrupt shape → empty. */
   static fromSerialized(payload, { now = () => Date.now() } = {}) {
     const l = new CapacityLedger({ now });
+    // v2 → v3: keep the rows, demote them. They were all written before the
+    // joined-mid-window fix, so each is a partial observation mislabelled complete.
+    if (payload?.schemaVersion === 2) {
+      const migrated = { schemaVersion: SCHEMA_VERSION, accounts: {} };
+      for (const [name, rec] of Object.entries(payload.accounts || {})) {
+        migrated.accounts[name] = {
+          ses: { open: rec.ses?.open || null,
+                 closed: (rec.ses?.closed || []).map(c => ({ ...c, complete: false, partialReason: 'pre-v3-unverified' })) },
+          wk: { open: rec.wk?.open || null,
+                closed: (rec.wk?.closed || []).map(c => ({ ...c, complete: false, partialReason: 'pre-v3-unverified' })) },
+          days: rec.days || {},
+        };
+      }
+      return CapacityLedger.fromSerialized(migrated, { now });
+    }
     if (!payload || payload.schemaVersion !== SCHEMA_VERSION) {
       // No history to continue: whatever window each account is in RIGHT NOW is
       // already in progress, so the next cycle we close saw only its tail. Flag it so
