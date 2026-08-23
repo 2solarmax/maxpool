@@ -105,3 +105,14 @@ test('the pre-v3 migrated rows are shown but never flagged', () => {
   const r = checkInvariants(state([cycle({ startedAt: NOW - 876_000, complete: false, partialReason: 'pre-v3-unverified' })]), NOW);
   assert.deepEqual(r.violations, []);
 });
+
+test('the summary line counts cycle findings and state findings separately', () => {
+  // "5 of 4 closed cycles" — the schema violation is not one of the N cycles, and
+  // printing it that way makes the operator distrust the instrument (2026-08-23).
+  const s = state([cycle({ startedAt: NOW - 876_000 })]);
+  s.capacity.schemaVersion = 2;                       // a state-level finding
+  const r = checkInvariants(s, NOW);
+  assert.equal(r.cycles, 1, 'one closed cycle exists');
+  assert.equal(r.violations.filter(v => v.account).length, 1, 'one is cycle-scoped');
+  assert.equal(r.violations.filter(v => !v.account).length, 1, 'one is state-scoped');
+});

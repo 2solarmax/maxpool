@@ -126,7 +126,13 @@ async function main() {
   } else if (violations.length === 0) {
     console.log(`capacity invariants OK — ${cycles} closed cycle(s) across ${accounts} account(s)${note ? ` (${note})` : ''}`);
   } else {
-    console.log(`capacity invariants VIOLATED — ${violations.length} of ${cycles} closed cycle(s) across ${accounts} account(s):`);
+    // Count cycle-scoped findings separately: a schema/state-level violation is not
+    // "one of N cycles" and printing it that way produced "5 of 4" (2026-08-23).
+    const perCycle = violations.filter(v => v.account).length;
+    const global = violations.length - perCycle;
+    const parts = [`${perCycle} of ${cycles} closed cycle(s) across ${accounts} account(s)`];
+    if (global) parts.push(`${global} state-level issue(s)`);
+    console.log(`capacity invariants VIOLATED — ${parts.join(' + ')}:`);
     for (const v of violations) {
       console.log(`  ${v.kind}${v.account ? ` [${v.account} ${v.window}]` : ''}: ${v.detail}`);
     }
