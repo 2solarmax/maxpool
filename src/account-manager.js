@@ -3689,6 +3689,12 @@ export class AccountManager {
       // Running version + npm update state (set at startup by maybeCheckForUpdate).
       // null until the check resolves; `current` is known even offline.
       version: this.versionInfo || null,
+      // The version whose CODE is EXECUTING. `version.current` is a package.json DISK
+      // read, so after a self-install (or on an npm-link'd checkout) it reports the
+      // newest INSTALLED build, not the running one — a post-deploy check keyed on it
+      // verifies the wrong thing (measured 2026-08-23: reported 1.8.7 while executing
+      // 1.8.6). This field is the one to assert on.
+      runningVersion: this.runningVersion || null,
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       routing: {

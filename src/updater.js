@@ -85,6 +85,17 @@ let _lastAttemptedTarget = null;
 /** Test-only: reset the module's version-tracking state between cases. */
 export function __resetUpdaterState() { _bootVersion = undefined; _lastAttemptedTarget = null; }
 
+/** The version whose CODE this process is EXECUTING (captured at boot, before any
+ *  self-install can rewrite the disk). Everything user-facing that says "current"
+ *  should use THIS — a disk read reports the newest INSTALLED version, which after a
+ *  background self-install (or on an npm-link'd dev checkout whose package.json moves
+ *  with every commit) is not what is running. Measured 2026-08-23: the status endpoint
+ *  answered 1.8.7 for a process executing 1.8.6, and a post-deploy check keyed on that
+ *  number verified the wrong build. */
+export function getBootVersion() {
+  return _bootVersion ?? null;   // null only before the first maybeCheckForUpdate
+}
+
 /** Mark a version as ATTEMPTED-to-apply. The caller calls this at the moment it triggers
  *  the reload — BEFORE the reload — so a rolled-back target is quarantined (advance-only).
  *  Kept as the caller's action (not a side effect of maybeCheckForUpdate) so a caller that

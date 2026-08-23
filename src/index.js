@@ -33,7 +33,7 @@ import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, toke
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
-import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine } from './updater.js';
+import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, getBootVersion } from './updater.js';
 import {
   runReloadBaton,
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
@@ -1259,6 +1259,8 @@ async function serverWorkerCommand() {
       // pass the real config so they still respect the user's autoUpdate choice.
       const cfg = forceInstall ? { ...config, autoUpdate: true } : config;
       const r = await maybeCheckForUpdate(cfg, notifyUpdate, info => { accountManager.versionInfo = info; }, { announce });
+      // Capture the EXECUTING version for /maxpool/status (see AccountManager.getStatus).
+      accountManager.runningVersion = getBootVersion();
       apply(r);
       return r;
     } catch { return undefined; /* update path is best-effort; never break the proxy */ }
