@@ -147,14 +147,15 @@ test('D3: a probe observing a FRESHER reset stamp closes the provider cycle (sta
   // stays empty on exactly the account the user cares most about.
   const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
   const idx = am.accounts.findIndex(a => a.name === 'glm');
-  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.2, resetAt: 1_000_000 } });
+  const base = Date.now();
+  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.2, resetAt: base } });
   am.accrueCapacity(idx, { input: 400, output: 100 });
-  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.01, resetAt: 2_000_000 } });
+  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.01, resetAt: base + 5 * 3600_000 } });
   assert.equal(am.capacity.windowStats('glm', 'ses').last, 500, 'the advance closed the cycle at 500 tokens');
   // A re-report of the SAME stamp must not close anything (that would shred one real
   // cycle into one fake cycle per probe tick — every column then reads far too low).
   am.accrueCapacity(idx, { input: 10, output: 0 });
-  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.02, resetAt: 2_000_000 } });
+  am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.02, resetAt: base + 5 * 3600_000 } });
   assert.equal(am.capacity.windowStats('glm', 'ses').cycles, 1, 'an unchanged stamp closes nothing');
 });
 
@@ -308,10 +309,11 @@ test('H2: a probe reporting the SAME or an OLDER stamp closes nothing (guard pin
   // into many tiny fake ones — every column then reads far below the truth.
   const am = amWithOauth();
   am.accrueCapacity(0, { input: 500, output: 0 });
-  am.noteCapacityWindowAdvance('claude1', 'ses', 2_000_000, 2_000_000);
-  am.noteCapacityWindowAdvance('claude1', 'ses', 2_000_000, 1_000_000);   // stamp moved BACKWARD
+  const b = Date.now();
+  am.noteCapacityWindowAdvance('claude1', 'ses', b, b);
+  am.noteCapacityWindowAdvance('claude1', 'ses', b, b - 60_000);         // stamp moved BACKWARD
   assert.equal(am.capacity.windowStats('claude1', 'ses'), null, 'neither closed a cycle');
-  am.noteCapacityWindowAdvance('claude1', 'ses', 2_000_000, 3_000_000);
+  am.noteCapacityWindowAdvance('claude1', 'ses', b, b + 5 * 3600_000);
   assert.equal(am.capacity.windowStats('claude1', 'ses').cycles, 1, 'only a genuine advance closes');
 });
 
@@ -598,4 +600,39 @@ test('K5: a v1 payload is DROPPED — poisoned history never reaches the average
   const am = amWithOauth();
   am.restoreCapacityState(poisoned);
   assert.equal(am.capacity.windowStats('claude1', 'ses'), null, 'and nothing reaches the page');
+});
+
+// ── Lane L: the SECOND live defect (2026-08-23, found by the post-fix live walk) ──
+
+test('L1: an ALREADY-EXPIRED stamp from a late probe closes at NOW, never a sliver', () => {
+  // Live: the GLM account's probe delivered a resetAt that was already in the past
+  // when applied; the clock-close then honored the stale stamp and recorded a
+  // 14.6-minute "complete cycle" of 21k tokens. A cycle that short is never real.
+  const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  const idx = 0;
+  const startedAgo = 5 * 3600_000;
+  // Simulate: a real 5h-old open cycle, a probe stamp that expired 30s ago.
+  // A real 5h-old open cycle (startedAt back-dated) + a probe stamp that expired 30s ago.
+  am.capacity.accrue('glm', { input: 15_000, output: 6_000 }, Date.now() - startedAgo);
+  am.noteCapacityWindowAdvance('glm', 'ses', Date.now() - startedAgo, Date.now() - 30_000);
+  const st = am.capacity.windowStats('glm', 'ses');
+  assert.ok(st, 'the cycle closed — the window really did roll');
+  assert.equal(st.last, 21_000, 'carrying the whole cycle');
+  const closed = am.capacity.serialize().accounts.glm.ses.closed;
+  const durMin = (closed[0].endedAt - closed[0].startedAt) / 60_000;
+  assert.ok(durMin > 4 * 60, `closed at NOW (real elapsed ~5h), not the stale stamp (got ${durMin.toFixed(1)} min)`);
+  // THE load-bearing assertion (the duration check alone passes under the raw-stamp
+  // mutant: a 30s-stale boundary still yields 4h59m30s of "duration"). Under the fix,
+  // endedAt is exactly NOW; honoring the stale stamp leaves it 30s in the past.
+  assert.ok(Date.now() - closed[0].endedAt < 5_000, `endedAt is NOW, not the 30s-stale stamp (${((Date.now() - closed[0].endedAt)/1000).toFixed(1)}s old)`);
+});
+
+test('L2: an expired-stamp advance within the epsilon window of the previous boundary is jitter, closes nothing', () => {
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 1_000, output: 0 });
+  const boundary = Date.now() - 1_000;                 // just rolled
+  am.noteCapacityWindowAdvance('claude1', 'ses', boundary, Date.now() - 500);
+  assert.equal(am.capacity.windowStats('claude1', 'ses'), null,
+    'a 500ms "advance" on a just-rolled boundary is the same boundary');
+  assert.equal(am.capacity.openCycle('claude1', 'ses').tokensSoFar, 1_000, 'the cycle keeps accumulating');
 });

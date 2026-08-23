@@ -3055,19 +3055,20 @@ export class AccountManager {
    *  covers the case where the old stamp was never learned. */
   noteCapacityWindowAdvance(accountName, window, prevResetAt, nextResetAt) {
     if (!prevResetAt || !nextResetAt) return;
-    // EPSILON, not `>`. An OAuth reset stamp is derived per-response as
-    // `Date.now() + delay_seconds * 1000` (parseResetHeader), so the SAME window
-    // boundary reads a little later on every response — sub-second to ~2s of jitter.
-    // A bare `nextResetAt > prevResetAt` fired the advance-close on each of those,
-    // shredding one real 5h window into 9-10 fake cycles and closing a "weekly"
-    // cycle whose endedAt was a week in the FUTURE. Measured on live state.json
-    // 2026-08-23, 12h after v1.8.0 shipped: mk@dubner.io had 9 ses cycles between
-    // 01:00 and 06:00, the shortest 0.2 minutes. A REAL advance is a whole window
-    // (>=5h); 60s separates the two by three orders of magnitude.
-    // Provider stamps (z.ai/Kimi probe) are absolute and did NOT jitter — which is
-    // how the defect localized to the OAuth path.
-    if (nextResetAt - prevResetAt < WINDOW_ADVANCE_EPSILON_MS) return;
-    this.capacity.closeCycle(accountName, window, prevResetAt, { resetAt: prevResetAt });
+    // TWO guards, both learned from live data (2026-08-23):
+    // 1. PAST stamp = a probe that answered late (its window rolled mid-request) or
+    //    vendor clock skew — honoring it closed a minutes-long "cycle" sliver. Close
+    //    at NOW instead: the window genuinely rolled, just later than the stale stamp.
+    // 2. JITTER: OAuth stamps derive per-response as Date.now()+delay*1000
+    //    (parseResetHeader), so one boundary reads ~2s later on every response; a
+    //    bare `>` comparison shredded one real 5h window into 9-10 fake cycles and
+    //    dated a "weekly" cycle a week into the future. A real advance moves a whole
+    //    window (>=5h) — the 60s epsilon separates it by three orders of magnitude.
+    //    Provider stamps (z.ai/Kimi probe) are absolute and never jitter.
+    const nowMs = Date.now();
+    const boundary = nextResetAt <= nowMs ? nowMs : nextResetAt;
+    if (boundary - prevResetAt < WINDOW_ADVANCE_EPSILON_MS) return;
+    this.capacity.closeCycle(accountName, window, boundary, { resetAt: prevResetAt });
   }
 
   /**
