@@ -636,3 +636,48 @@ test('L2: an expired-stamp advance within the epsilon window of the previous bou
     'a 500ms "advance" on a just-rolled boundary is the same boundary');
   assert.equal(am.capacity.openCycle('claude1', 'ses').tokensSoFar, 1_000, 'the cycle keeps accumulating');
 });
+
+test('L3: the FIRST cycle after a history-dropping restore is partial, not capacity', () => {
+  // Live 2026-08-23: the v1.8.1 migration dropped the poisoned v1 history mid-window,
+  // so the next close recorded 21,192 tokens as a "5h window" it had observed for 14.6
+  // minutes — and with exactly one cycle on the books, that sliver was every column.
+  const am = amWithOauth();
+  am.restoreCapacityState({ schemaVersion: 1, accounts: {} });   // unusable payload → dropped
+  am.accrueCapacity(0, { input: 21_000, output: 192 });
+  am.accounts[0].quota.unified5hReset = Date.now() - 1;
+  am.closeExpiredCapacityCycles();
+
+  assert.equal(am.capacity.windowStats('claude1', 'ses'), null,
+    'the joined-mid-window cycle is not an observation');
+  const closed = am.capacity.serialize().accounts.claude1.ses.closed;
+  assert.equal(closed.length, 1, 'but it is still recorded and visible');
+  assert.equal(closed[0].complete, false);
+  assert.equal(closed[0].partialReason, 'joined-mid-window', 'and it says WHY');
+
+  // The SECOND cycle starts at a boundary we now know → a true observation.
+  am.accrueCapacity(0, { input: 1_000_000, output: 0 });
+  am.accounts[0].quota.unified5hReset = Date.now() + 5 * 3600_000;   // next real boundary
+  am.accounts[0].quota.unified5h = 0.9;
+  am.accounts[0].quota.unified5hReset = Date.now() - 1 + 5 * 3600_000;
+  am.capacity.closeCycle('claude1', 'ses', Date.now() + 5 * 3600_000, { resetAt: Date.now() + 5 * 3600_000 });
+  const st = am.capacity.windowStats('claude1', 'ses');
+  assert.equal(st.cycles, 1, 'only the fully-observed cycle counts');
+  assert.equal(st.last, 1_000_000);
+});
+
+test('L4: a NORMAL restore keeps counting — the mid-window flag is not contagious', () => {
+  // The flag must fire ONLY when history was dropped. A healthy restart continues the
+  // account's real history and its next cycle is a true observation.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 500_000, output: 0 });
+  const payload = am.capacity.serialize();
+
+  const fresh = amWithOauth();
+  fresh.restoreCapacityState(payload);                       // valid v2 payload
+  fresh.accrueCapacity(0, { input: 100_000, output: 0 });
+  fresh.accounts[0].quota.unified5hReset = Date.now() - 1;
+  fresh.closeExpiredCapacityCycles();
+  const st = fresh.windowStatsFor?.('claude1', 'ses') ?? fresh.capacity.windowStats('claude1', 'ses');
+  assert.ok(st, 'a normal restore still produces real observations');
+  assert.equal(st.last, 600_000, 'carrying the restored open cycle plus the new traffic');
+});

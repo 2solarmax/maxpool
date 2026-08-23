@@ -17,9 +17,10 @@ test('A1 accrue → close → history carries exactly the tokens accrued', () =>
 
 test('A2 columns resolve in order: last > prev > prev1', () => {
   const l = new CapacityLedger({ now: () => T0 });
+  let i = 0;
   for (const t of [100, 200, 300]) {
-    l.accrue('a', { input: t, output: 0 }, T0);
-    l.closeCycle('a', 'ses', T0 + t);
+    l.accrue('a', { input: t, output: 0 }, T0 - 5 * 3600_000 + i);   // real 5h duration
+    l.closeCycle('a', 'ses', T0 + i++);
   }
   const s = l.windowStats('a', 'ses');
   assert.equal(s.last, 300); assert.equal(s.prev, 200); assert.equal(s.prev1, 100);

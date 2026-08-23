@@ -32,13 +32,24 @@ export class CapacityLedger {
     this._now = now;
     // accountName → { ses: {open?, closed: []}, wk: {open?, closed: []}, days: {utcDay: {tokens, partial}} }
     this._accounts = new Map();
+    // True only for a ledger restored with no usable history — see fromSerialized.
+    // Cleared per account+window once that window's first boundary is behind us.
+    this._joinedMidWindow = false;
   }
 
   /** Restore from a serialized payload (state.json). Tolerant: unknown schemaVersion →
    *  start empty and KEEP the file (the caller preserves it); a corrupt shape → empty. */
   static fromSerialized(payload, { now = () => Date.now() } = {}) {
     const l = new CapacityLedger({ now });
-    if (!payload || payload.schemaVersion !== SCHEMA_VERSION) return l;
+    if (!payload || payload.schemaVersion !== SCHEMA_VERSION) {
+      // No history to continue: whatever window each account is in RIGHT NOW is
+      // already in progress, so the next cycle we close saw only its tail. Flag it so
+      // it is shown but never averaged (live 2026-08-23: the first GLM cycle after the
+      // v1.8.1 migration read 21,192 tokens for a 5h window it had watched 14.6 min —
+      // and with one cycle recorded, that sliver WAS every column).
+      l._joinedMidWindow = true;
+      return l;
+    }
     try {
       for (const [name, rec] of Object.entries(payload.accounts || {})) {
         const a = { ses: { open: null, closed: [] }, wk: { open: null, closed: [] }, days: {} };
@@ -91,7 +102,12 @@ export class CapacityLedger {
       // reset stamp was never learned). startedAt is the accrual time then — the cycle
       // will be flagged partial by the caller if the boot gap warrants it (B1/B2).
       if (!rec[w].open) {
-        rec[w].open = { startedAt: at, tokensSoFar: 0, lastAccrualAt: at, complete: true, disabledDuring: false };
+        const joined = this._joinedMidWindow && rec[w].closed.length === 0;
+        rec[w].open = {
+          startedAt: at, tokensSoFar: 0, lastAccrualAt: at,
+          complete: !joined, disabledDuring: false,
+          ...(joined ? { partialReason: 'joined-mid-window' } : {}),
+        };
       }
       rec[w].open.tokensSoFar += input + output;
       rec[w].open.lastAccrualAt = at;
@@ -162,6 +178,7 @@ export class CapacityLedger {
       tokens: open.tokensSoFar,
       complete: open.complete,
       disabledDuring: open.disabledDuring,
+      ...(open.partialReason ? { partialReason: open.partialReason } : {}),
       resetAt,
     });
     if (rec[window].closed.length > MAX_CYCLES_PER_WINDOW) rec[window].closed.shift();
