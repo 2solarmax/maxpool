@@ -34,6 +34,17 @@ const SAME_BOUNDARY_MS = 5_000;
 const MAX_CYCLES_PER_WINDOW = 50;
 const MAX_DAY_BUCKETS = 10;
 
+// Demote a pre-v3 closed cycle: unverifiable (every one predates the joined-mid-window
+// fix) AND untrustworthy in its timestamps (the v1.8.4 advance-close could date a row
+// hours into the future — live: a row ending 19:54 while the clock read 15:02). Also
+// CLAMPS a future endedAt to startedAt so the stored row itself stops violating
+// invariants after migration, not just the averages.
+function demote(c) {
+  const fixed = { ...c, complete: false, partialReason: 'pre-v3-unverified' };
+  if (fixed.endedAt > Date.now() + 60_000) fixed.endedAt = fixed.startedAt;
+  return fixed;
+}
+
 export class CapacityLedger {
   constructor({ now = () => Date.now() } = {}) {
     this._now = now;
@@ -55,9 +66,9 @@ export class CapacityLedger {
       for (const [name, rec] of Object.entries(payload.accounts || {})) {
         migrated.accounts[name] = {
           ses: { open: rec.ses?.open || null,
-                 closed: (rec.ses?.closed || []).map(c => ({ ...c, complete: false, partialReason: 'pre-v3-unverified' })) },
+                 closed: (rec.ses?.closed || []).map(c => demote(c)) },
           wk: { open: rec.wk?.open || null,
-                closed: (rec.wk?.closed || []).map(c => ({ ...c, complete: false, partialReason: 'pre-v3-unverified' })) },
+                closed: (rec.wk?.closed || []).map(c => demote(c)) },
           days: rec.days || {},
         };
       }
