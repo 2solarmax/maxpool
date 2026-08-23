@@ -92,8 +92,18 @@ export function __resetUpdaterState() { _bootVersion = undefined; _lastAttempted
  *  with every commit) is not what is running. Measured 2026-08-23: the status endpoint
  *  answered 1.8.7 for a process executing 1.8.6, and a post-deploy check keyed on that
  *  number verified the wrong build. */
+export async function captureBootVersion() {
+  // Read the disk ONCE, at process start, BEFORE any self-install can rewrite it — that
+  // read IS the executing version. (_bootVersion is the same value; it is populated
+  // lazily by the first maybeCheckForUpdate, which is up to 30 minutes after boot, so
+  // reading it at construction returns null — the bug in the first version of this fix.)
+  if (_bootVersion === undefined) _bootVersion = await getCurrentVersion();
+  return _bootVersion ?? null;
+}
+
+/** The already-captured executing version; null before captureBootVersion(). */
 export function getBootVersion() {
-  return _bootVersion ?? null;   // null only before the first maybeCheckForUpdate
+  return _bootVersion ?? null;
 }
 
 /** Mark a version as ATTEMPTED-to-apply. The caller calls this at the moment it triggers

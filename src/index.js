@@ -33,7 +33,7 @@ import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, toke
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
-import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, getBootVersion } from './updater.js';
+import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
@@ -577,6 +577,10 @@ async function serverWorkerCommand() {
 
   const threshold = config.switchThreshold || 0.90;
   const accountManager = new AccountManager(accounts, threshold, config.scheduler || {});
+  // The EXECUTING build: a disk read taken NOW, before any self-install can rewrite
+  // package.json. Fire-and-forget — the status endpoint reports null until it lands
+  // (milliseconds), never a wrong number.
+  captureBootVersion().then(v => { accountManager.runningVersion = v; }).catch(() => {});
   // (macOS) Keep the system awake ONLY while there is work in flight or queued, so a
   // long overnight streaming request survives Maintenance Sleep; the Mac sleeps
   // normally when idle. Disable via `preventSleep: false` in config.
@@ -1259,8 +1263,6 @@ async function serverWorkerCommand() {
       // pass the real config so they still respect the user's autoUpdate choice.
       const cfg = forceInstall ? { ...config, autoUpdate: true } : config;
       const r = await maybeCheckForUpdate(cfg, notifyUpdate, info => { accountManager.versionInfo = info; }, { announce });
-      // Capture the EXECUTING version for /maxpool/status (see AccountManager.getStatus).
-      accountManager.runningVersion = getBootVersion();
       apply(r);
       return r;
     } catch { return undefined; /* update path is best-effort; never break the proxy */ }
