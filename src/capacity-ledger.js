@@ -40,9 +40,9 @@ const MAX_DAY_BUCKETS = 10;
 // CLAMPS a future endedAt to startedAt so the stored row itself stops violating
 // invariants after migration, not just the averages.
 function demote(c) {
-  const fixed = { ...c, complete: false, partialReason: 'pre-v3-unverified' };
-  if (fixed.endedAt > Date.now() + 60_000) fixed.endedAt = fixed.startedAt;
-  return fixed;
+  // Timestamp repair is NOT done here — the load-time pass below handles a future
+  // endedAt at every schema version, so doing it twice would be two places to fix.
+  return { ...c, complete: false, partialReason: 'pre-v3-unverified' };
 }
 
 export class CapacityLedger {
@@ -88,7 +88,19 @@ export class CapacityLedger {
         const a = { ses: { open: null, closed: [] }, wk: { open: null, closed: [] }, days: {} };
         for (const w of ['ses', 'wk']) {
           if (rec[w]?.open) a[w].open = { ...rec[w].open };
-          if (Array.isArray(rec[w]?.closed)) a[w].closed = rec[w].closed.slice(-MAX_CYCLES_PER_WINDOW);
+          if (Array.isArray(rec[w]?.closed)) {
+            // LOAD-TIME REPAIR, applied at EVERY version — not inside the v2→v3 branch,
+            // which is where it was first (wrongly) placed: a future-dated row can be
+            // written by any build whose writer had the bug, and the payload it lands in
+            // is then already current, so a version-gated repair never runs. Measured
+            // 2026-08-23: a row ending 19:54 survived the v3 migration untouched because
+            // the state was already v3. A cycle cannot end after now; such a row is
+            // corrupt, so demote it and clamp it rather than let it re-alert until evicted.
+            a[w].closed = rec[w].closed.slice(-MAX_CYCLES_PER_WINDOW).map(c =>
+              (c.endedAt > Date.now() + 60_000)
+                ? { ...c, endedAt: c.startedAt, complete: false, partialReason: 'repaired-future-endedAt' }
+                : c);
+          }
         }
         if (rec.days && typeof rec.days === 'object') {
           for (const [d, v] of Object.entries(rec.days)) a.days[d] = { ...v };

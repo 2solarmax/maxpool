@@ -720,7 +720,7 @@ test('L6: the advance-close NEVER dates a cycle in the future', () => {
   assert.ok(closed[0].endedAt >= closed[0].startedAt, 'and not before it started either');
 });
 
-test('L7: migration clamps a FUTURE-dated v2 row so the stored state stops violating invariants', () => {
+test('L7: a FUTURE-dated row is repaired at EVERY schema version, not just on migration', () => {
   // The v1.8.4 advance-close could write endedAt hours ahead (live: 19:54 at 15:02).
   // The v1.8.5 fix prevents NEW ones; the migration must also repair the stored one,
   // or the checker re-alerts on it every 15 minutes until evicted (~50 cycles).
@@ -728,10 +728,16 @@ test('L7: migration clamps a FUTURE-dated v2 row so the stored state stops viola
     ses: { open: null, closed: [{ startedAt: Date.now() - 5 * 3600_000, endedAt: Date.now() + 4.9 * 3600_000,
       tokens: 3_658, complete: true, disabledDuring: false, resetAt: Date.now() }] },
     wk: { open: null, closed: [] }, days: {} } } };
-  const l = CapacityLedger.fromSerialized(v2);
-  const row = l.serialize().accounts.a.ses.closed[0];
-  assert.equal(row.complete, false, 'demoted');
-  assert.equal(row.partialReason, 'pre-v3-unverified');
-  assert.ok(row.endedAt <= Date.now(), `the future date is clamped (${new Date(row.endedAt).toISOString()})`);
-  assert.ok(row.endedAt >= row.startedAt, 'and not before start');
+  for (const version of [2, 3]) {
+    // v3 is the case that shipped broken: the repair lived inside the v2->v3 branch,
+    // so a future-dated row written BY v3 (the live glm1 row) was never touched and
+    // re-alerted every 15 minutes.
+    const payload = JSON.parse(JSON.stringify(v2));
+    payload.schemaVersion = version;
+    const row = CapacityLedger.fromSerialized(payload).serialize().accounts.a.ses.closed[0];
+    assert.ok(row, `v${version}: the row survives`);
+    assert.equal(row.complete, false, `v${version}: demoted`);
+    assert.ok(row.endedAt <= Date.now(), `v${version}: future date clamped (${new Date(row.endedAt).toISOString()})`);
+    assert.ok(row.endedAt >= row.startedAt, `v${version}: not before start`);
+  }
 });
