@@ -521,3 +521,81 @@ test('J5: the fold NEVER absorbs a partial or disabled tail over a complete obse
     assert.equal(st.avg3, 1_000_000, `${taint}: the averages are untouched`);
   }
 });
+
+// ── Lane K: the live-data defect (2026-08-23, 12h after v1.8.0 shipped) ──────
+// Every test here was written from REAL poisoned state.json rows. The whole suite
+// (41 tests, 4 red-team rounds) was green while production data was wrong, because
+// every fixture used clean synthetic stamps. Real OAuth stamps jitter.
+
+test('K1: reset-stamp JITTER is not a window advance; a real window advance is', () => {
+  // parseResetHeader derives an OAuth stamp as Date.now() + delay*1000, so the same
+  // boundary reads later on every response. Live: mk@dubner.io recorded 9 "cycles"
+  // between 01:00 and 06:00 — one real window — the shortest 0.2 minutes long.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 500_000, output: 0 });
+  const boundary = Date.now() + 5 * 3600_000;
+  for (const jitterMs of [180, 940, 1_500, 2_000]) {
+    am.noteCapacityWindowAdvance('claude1', 'ses', boundary, boundary + jitterMs);
+  }
+  assert.equal(am.capacity.windowStats('claude1', 'ses'), null,
+    'four jitters closed nothing — they are all the same boundary');
+  assert.equal(am.capacity.openCycle('claude1', 'ses').tokensSoFar, 500_000,
+    'and the real cycle keeps accumulating');
+
+  am.noteCapacityWindowAdvance('claude1', 'ses', boundary, boundary + 5 * 3600_000);
+  const st = am.capacity.windowStats('claude1', 'ses');
+  assert.equal(st.cycles, 1, 'a genuine 5h advance closes exactly one cycle');
+  assert.equal(st.last, 500_000, 'carrying the whole window, not a sliver');
+});
+
+test('K2: a WEEKLY jitter never records a cycle dated in the future', () => {
+  // Live: max@dubner.io held 9 "weekly" cycles whose endedAt was 2026-08-28/30 —
+  // days ahead of the clock. A cycle that has not ended cannot be a measurement.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 300_000, output: 0 });
+  const weekly = Date.now() + 7 * 86400_000;
+  am.noteCapacityWindowAdvance('claude1', 'wk', weekly, weekly + 490);
+  assert.equal(am.capacity.windowStats('claude1', 'wk'), null, 'no future-dated weekly cycle');
+  const closed = am.capacity.serialize().accounts.claude1.wk.closed;
+  assert.equal(closed.length, 0, 'nothing was written at all');
+});
+
+test('K3: two closers straddling ONE boundary second produce one cycle, not a sliver', () => {
+  // The exact-stamp fold missed this: the clock-close used the stamp, the advance-close
+  // used a stamp 0.5s later, so the boundary sliver was admitted as its own "complete"
+  // cycle — the 2228-token / 0.2-minute row in the live data.
+  const l = new CapacityLedger({ now: () => Date.now() });
+  const b = Date.now();
+  l.accrue('x', { input: 260_000, output: 0 });
+  l.closeCycle('x', 'ses', b, { resetAt: b });
+  l.accrue('x', { input: 2_228, output: 0 });
+  l.closeCycle('x', 'ses', b + 490, { resetAt: b + 490 });
+  const st = l.windowStats('x', 'ses');
+  assert.equal(st.cycles, 1, 'one boundary, one cycle');
+  assert.equal(st.last, 262_228, 'the sliver folded into the window it belongs to');
+});
+
+test('K4: two boundaries a real window apart stay TWO cycles (the guard must not over-fold)', () => {
+  const l = new CapacityLedger({ now: () => Date.now() });
+  const b = Date.now();
+  l.accrue('x', { input: 100, output: 0 });
+  l.closeCycle('x', 'ses', b, { resetAt: b });
+  l.accrue('x', { input: 700, output: 0 });
+  l.closeCycle('x', 'ses', b + 5 * 3600_000, { resetAt: b + 5 * 3600_000 });
+  const st = l.windowStats('x', 'ses');
+  assert.equal(st.cycles, 2, 'a real second window is its own observation');
+  assert.deepEqual([st.prev, st.last], [100, 700]);
+});
+
+test('K5: a v1 payload is DROPPED — poisoned history never reaches the averages', () => {
+  // The shipped v1 data holds slivers and future-dated cycles. Restoring it would put
+  // wrong numbers in every column for weeks; one empty window is the cheaper error.
+  const poisoned = { schemaVersion: 1, accounts: { claude1: { ses: { open: null,
+    closed: [{ startedAt: 1, endedAt: 2, tokens: 2228, complete: true, disabledDuring: false, resetAt: 2 }] },
+    wk: { open: null, closed: [] }, days: {} } } };
+  const l = CapacityLedger.fromSerialized(poisoned);
+  assert.deepEqual(l.accounts(), [], 'v1 history is not carried forward');
+  const am = amWithOauth();
+  am.restoreCapacityState(poisoned);
+  assert.equal(am.capacity.windowStats('claude1', 'ses'), null, 'and nothing reaches the page');
+});

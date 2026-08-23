@@ -15,7 +15,15 @@
  * Pre-mortem (2026-08-22) blockers B1/B2 + majors M3-M7 are the load-bearing comments.
  */
 
-const SCHEMA_VERSION = 1;
+// v2 (2026-08-23): v1 histories are POISONED and are deliberately dropped on load.
+// The OAuth reset-stamp jitter (see AccountManager.noteCapacityWindowAdvance) shredded
+// real windows into slivers and recorded future-dated weekly cycles, so a v1 payload's
+// averages are wrong for weeks. Starting empty costs one window; keeping it costs trust.
+const SCHEMA_VERSION = 2;
+
+// Two closes this far apart are the SAME boundary observed twice (a clock-close and a
+// stamp-advance racing across the boundary second), not two windows.
+const SAME_BOUNDARY_MS = 5_000;
 const MAX_CYCLES_PER_WINDOW = 50;
 const MAX_DAY_BUCKETS = 10;
 
@@ -134,8 +142,13 @@ export class CapacityLedger {
     // one that drags every average down. A LATER window reporting the same numeric stamp
     // value (clock coincidence) is distinguished by endedAt. Pinned by I3.
     const prev = rec[window].closed[rec[window].closed.length - 1];
-    if (resetAt != null && prev && prev.resetAt === resetAt && prev.endedAt === endedAt
-        && open.complete && !open.disabledDuring) {
+    // Same boundary within a few seconds, not just byte-identical stamps: the two
+    // closers can observe one rollover through slightly different stamps (jitter), and
+    // an exact-match-only fold then admitted a 0.2-minute sliver as its own cycle.
+    const sameBoundary = resetAt != null && prev
+      && Math.abs((prev.resetAt ?? prev.endedAt) - resetAt) <= SAME_BOUNDARY_MS
+      && Math.abs(prev.endedAt - endedAt) <= SAME_BOUNDARY_MS;
+    if (sameBoundary && open.complete && !open.disabledDuring) {
       // Fold ONLY a complete tail: folding a partial/disabled tail would flip the
       // flags on the prior legitimate observation and ERASE it from the averages
       // (round 3, RT3-2) — strictly worse than leaving a tiny excluded cycle.

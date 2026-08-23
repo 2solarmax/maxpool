@@ -1,5 +1,9 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
 import { CapacityLedger } from './capacity-ledger.js';
+
+// A capacity window boundary must move by at least this much to count as a real
+// window ADVANCE rather than reset-stamp jitter (see noteCapacityWindowAdvance).
+const WINDOW_ADVANCE_EPSILON_MS = 60_000;
 import { peakWindowState, DEFAULT_PEAK_CAP } from './peak-window.js';
 
 // Bounded re-poll hold for an account blocked ONLY by a transient, self-clearing
@@ -3050,7 +3054,19 @@ export class AccountManager {
   /** Close a cycle because a probe observed the window ADVANCE (a new reset stamp) —
    *  covers the case where the old stamp was never learned. */
   noteCapacityWindowAdvance(accountName, window, prevResetAt, nextResetAt) {
-    if (!prevResetAt || !nextResetAt || nextResetAt <= prevResetAt) return;
+    if (!prevResetAt || !nextResetAt) return;
+    // EPSILON, not `>`. An OAuth reset stamp is derived per-response as
+    // `Date.now() + delay_seconds * 1000` (parseResetHeader), so the SAME window
+    // boundary reads a little later on every response — sub-second to ~2s of jitter.
+    // A bare `nextResetAt > prevResetAt` fired the advance-close on each of those,
+    // shredding one real 5h window into 9-10 fake cycles and closing a "weekly"
+    // cycle whose endedAt was a week in the FUTURE. Measured on live state.json
+    // 2026-08-23, 12h after v1.8.0 shipped: mk@dubner.io had 9 ses cycles between
+    // 01:00 and 06:00, the shortest 0.2 minutes. A REAL advance is a whole window
+    // (>=5h); 60s separates the two by three orders of magnitude.
+    // Provider stamps (z.ai/Kimi probe) are absolute and did NOT jitter — which is
+    // how the defect localized to the OAuth path.
+    if (nextResetAt - prevResetAt < WINDOW_ADVANCE_EPSILON_MS) return;
     this.capacity.closeCycle(accountName, window, prevResetAt, { resetAt: prevResetAt });
   }
 
