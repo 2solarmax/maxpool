@@ -2056,7 +2056,19 @@ export class TUI {
       }
       const st = ledger.windowStats(a.name, win);
       if (!st) {
-        out.push('  ' + name + ' ' + prov + ' ' + dim('no completed cycle yet'));
+        // No completed cycle yet — but the vendor's own fullness reading still yields
+        // an ESTIMATE (tokens seen ÷ utilization): useful from minute one, honest about
+        // being an estimate. `~` marks it; a measured column replaces it after the first
+        // full window. A stale-util caveat only when we cannot prove same-window.
+        const est = this.am.capacityEstimate?.(i, win);
+        if (est) {
+          anyData = true;
+          const caveat = est.fresh ? '' : ' (utilization reading may be from the previous window)';
+          out.push('  ' + name + ' ' + prov + ' ' + cyan('~' + formatTokens(est.tokens).padStart(CW - 1))
+            + dim(` ≈ est from ${(est.utilization * 100).toFixed(0)}% full${caveat} — measured after this window completes`));
+        } else {
+          out.push('  ' + name + ' ' + prov + ' ' + dim('no completed cycle yet'));
+        }
         continue;
       }
       anyData = true;
@@ -2075,6 +2087,7 @@ export class TUI {
           : ' A session figure appears after an account\'s 5h window resets once.'));
     }
     out.push(' ' + dim('A cycle counts only if maxpool ran for all of it and the account stayed enabled.'));
+    out.push(' ' + dim('~ = estimated now from utilization (tokens ÷ % full); a measured column replaces it later.'));
     return out;
   }
 

@@ -2699,12 +2699,11 @@ export class AccountManager {
       if (usage.sevenDay.utilization != null) q.unified7d = clamp01(usage.sevenDay.utilization);
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
-    // Stamp-advance close (same guard as the provider path): a FRESHER stamp means
-    // the old window rolled over — close its cycle at the old boundary.
-    // noteCapacityWindowAdvance already no-ops on a missing/unchanged/older stamp, so
-    // there is nothing to gate here — pass the raw (possibly undefined) value through.
     this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour?.resetAt);
     this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay?.resetAt);
+    // Utilization readings feed the capacity ESTIMATE (tokens ÷ fullness). Noted even
+    // when null — a probe that carries no utilization is not evidence of anything.
+    this.capacity.noteUtilizationObserved();
     // Only a SUCCESSFUL probe carrying the flag speaks to this. A header-driven update
     // can't see the limits[] array, and a FAILED read knows nothing about the account's
     // caps — either one claiming "uncapped" would mislabel a capped account as having no
@@ -3018,6 +3017,19 @@ export class AccountManager {
 
   /** Accrue ONE request's tokens into the capacity ledger (per-request values; the
    *  server seam has already applied max-semantics for streamed output). */
+  /** The capacity ESTIMATE for an account+window, from live utilization. Falls back
+   *  to null when the vendor reports no utilization for that window (the no-weekly GLM
+   *  plans), the account has not accrued, or it is already throttled. */
+  capacityEstimate(accountIndex, window) {
+    const a = this.accounts[accountIndex];
+    if (!a) return null;
+    const q = a.quota || {};
+    const util = window === 'wk'
+      ? (a.type === 'provider' ? q.providerWk : q.unified7d)
+      : (a.type === 'provider' ? q.providerSes : q.unified5h);
+    return this.capacity.estimateFromUtilization(a.name, window, util) || null;
+  }
+
   accrueCapacity(accountIndex, { input = 0, output = 0 } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;

@@ -136,3 +136,38 @@ test('E4 the two account kinds never cross-contaminate (throughput vs tank)', ()
   assert.equal(l.windowStats('noWk', 'wk'), null, 'no-weekly has NO tank — ever');
   assert.ok(l.rollingThroughput('noWk'), 'but it does have throughput');
 });
+
+// ── M1: capacity estimate from utilization (user spec 2026-08-23: "if 10% took A,
+// 100% is A×10" — works mid-window, before any cycle completes) ───────────────
+
+test('M1: tokens ÷ utilization = the implied tank, at any fullness', () => {
+  const l = new CapacityLedger({ now: () => T0 });
+  l.noteUtilizationObserved(T0);
+  l.accrue('a', { input: 100_000, output: 0 }, T0);
+  const e = l.estimateFromUtilization('a', 'ses', 0.10);
+  assert.equal(e.tokens, 1_000_000, '10% full at 100k → 1M tank');
+  assert.equal(e.utilization, 0.10);
+  assert.equal(e.fresh, true, 'reading and accrual are same-window');
+  assert.equal(l.estimateFromUtilization('a', 'ses', 0.96).tokens, 104_167);
+});
+
+test('M1b: null cases — no utilization, zero fullness, no accrual, or already capped', () => {
+  const l = new CapacityLedger({ now: () => T0 });
+  l.accrue('a', { input: 500, output: 0 }, T0);
+  assert.equal(l.estimateFromUtilization('a', 'ses', 0), null, '0% full: 0÷0 is not a number');
+  assert.equal(l.estimateFromUtilization('a', 'ses', null), null, 'vendor reports nothing');
+  assert.equal(l.estimateFromUtilization('a', 'ses', 1), null, '100% full: the fraction says nothing about the tank');
+  assert.equal(l.estimateFromUtilization('nobody', 'ses', 0.5), null, 'no open cycle');
+  const l2 = new CapacityLedger({ now: () => T0 });
+  l2.noteUtilizationObserved(T0);
+  assert.equal(l2.estimateFromUtilization('a', 'ses', 0.5), null, 'utilization but zero accrual');
+});
+
+test('M1c: a stale utilization from the PREVIOUS window is marked not-fresh', () => {
+  // Utilization refreshes on probe/header; the open cycle rolls at the boundary. An
+  // old reading silently understates the estimate — flag it rather than trust it.
+  const l = new CapacityLedger({ now: () => T0 });
+  l.accrue('a', { input: 50_000, output: 0 }, T0);
+  const stale = l.estimateFromUtilization('a', 'ses', 0.10);
+  assert.equal(stale.fresh, false, 'no reading was ever noted → cannot prove same-window');
+});

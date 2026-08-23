@@ -53,6 +53,7 @@ export class CapacityLedger {
     // True only for a ledger restored with no usable history — see fromSerialized.
     // Cleared per account+window once that window's first boundary is behind us.
     this._joinedMidWindow = false;
+    this._utilObservedAt = 0;   // last utilization-reading arrival (see estimateFromUtilization)
   }
 
   /** Restore from a serialized payload (state.json). Tolerant: unknown schemaVersion →
@@ -229,6 +230,38 @@ export class CapacityLedger {
     if (rec[window].closed.length > MAX_CYCLES_PER_WINDOW) rec[window].closed.shift();
     rec[window].open = null;
     return rec[window].closed[rec[window].closed.length - 1];
+  }
+
+  /**
+   * ESTIMATED window capacity from live utilization: tokens observed in the OPEN
+   * cycle ÷ the vendor's own fullness fraction (0..1). A window at 96% holding 812k
+   * tokens implies a ~846k tank — no completed cycle needed. This is the same math the
+   * user does in their head ("if 10% took A tokens, 100% is A×10") and it makes the
+   * page useful from minute one, while completed cycles remain the precise column.
+   *
+   * Returns { tokens, utilization, fresh } or null when no estimate exists.
+   *   null cases — utilization 0/unknown (0÷0), no accrual yet, or util ≥ 1 (the
+   *   account is throttled; the fraction says nothing about the tank size).
+   * `fresh` = the utilization reading and the accrual are from the same window
+   * (utilization refreshes on probe/header; the open cycle closes at the boundary —
+   * a stale util from the PREVIOUS window silently understates the estimate).
+   */
+  estimateFromUtilization(name, window, utilization) {
+    if (!(utilization > 0) || !(utilization < 1)) return null;
+    const open = this.openCycle(name, window);
+    if (!open || !(open.tokensSoFar > 0)) return null;
+    // Fresh = we can prove the reading and the accrual describe the SAME window: the
+    // reading arrived after the open cycle began. A reading that predates the cycle (or
+    // was never noted at all) describes the previous window — mark it and let the UI
+    // caveat it, never silently trust it.
+    const fresh = this._utilObservedAt > 0 && open.startedAt != null && this._utilObservedAt >= open.startedAt;
+    return { tokens: Math.round(open.tokensSoFar / utilization), utilization, fresh };
+  }
+
+  /** Record when a utilization reading arrived, so estimateFromUtilization can tell
+   *  same-window freshness from a stale previous-window reading. */
+  noteUtilizationObserved(at = this._now()) {
+    this._utilObservedAt = at;
   }
 
   // ── Queries ─────────────────────────────────────────────────────────────────

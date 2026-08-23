@@ -741,3 +741,47 @@ test('L7: a FUTURE-dated row is repaired at EVERY schema version, not just on mi
     assert.ok(row.endedAt >= row.startedAt, `v${version}: not before start`);
   }
 });
+
+test('M2: the page shows the LIVE ESTIMATE where no cycle has completed (real TUI)', () => {
+  // The user's point: the page is empty for a full window per account, but the
+  // vendor's fullness reading makes capacity knowable NOW. Rendered through the real
+  // TUI class, with a caveat when the reading is not provably same-window.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 576_708, output: 0 });
+  am.accounts[0].quota.unified5h = 0.95;               // the probe path sets this
+  am.capacity.noteUtilizationObserved();               // reading arrived after the cycle began
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'ses';
+  const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(page, /~\s*607k ≈ est from 95% full/, 'the estimate renders (576,708 ÷ 0.95 ≈ 607k)');
+  assert.match(page, /95% full/, 'naming the fullness it came from');
+  assert.match(page, /measured after this window completes/, 'and what replaces it');
+  assert.doesNotMatch(page, /may be from the previous window/, 'fresh reading → no stale caveat');
+});
+
+test('M3: a stale utilization reading carries the caveat, never silent trust', () => {
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 50_000, output: 0 });
+  am.accounts[0].quota.unified5h = 0.10;
+  // NOTE: no noteUtilizationObserved — the reading predates the cycle
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'ses';
+  const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(page, /may be from the previous window/, 'the caveat is on the page');
+});
+
+test('M4: a measured cycle still beats the estimate — the estimate never overwrites data', () => {
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 800_000, output: 0 });
+  am.accounts[0].quota.unified5h = 0.9;
+  am.accounts[0].quota.unified5hReset = Date.now() - 5 * 3600_000;
+  am.refreshExpiredQuotas();                            // closes the real cycle
+  am.accounts[0].quota.unified5h = 0.5;
+  am.capacity.noteUtilizationObserved();
+  am.accrueCapacity(0, { input: 100_000, output: 0 });
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'ses';
+  const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(page, /claude1\s+Anthropic\s+800k/, 'the measured column renders');
+  assert.doesNotMatch(page, /~\s*200k/, 'no estimate row where data exists');
+});
