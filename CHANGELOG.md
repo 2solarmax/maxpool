@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.4] - 2026-08-23
+
+### Fixed
+
+- V3 migration demotes unverifiable history; span-based invariant catches the variants the floor missed
+
 ## [1.8.3] - 2026-08-23
 
 ### Fixed
