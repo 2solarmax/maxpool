@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-08-23
+
+### Changed
+
+- Pin the RT3-2 fold condition; de-vacuum J2's header assertion
+
+### Fixed
+
+- OAuth reset-stamp jitter shredded real windows into sliver cycles
+
 ## [1.8.0] - 2026-08-22
 
 ### Added
