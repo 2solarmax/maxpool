@@ -28,9 +28,10 @@ test('A2 columns resolve in order: last > prev > prev1', () => {
 
 test('A3 averages over COMPLETE cycles only (partial + disabled excluded)', () => {
   const l = new CapacityLedger({ now: () => T0 });
-  l.accrue('a', { input: 100, output: 0 }, T0); l.closeCycle('a', 'ses', T0 + 1);
-  l.accrue('a', { input: 900, output: 0 }, T0 + 2); l.markPartial('a'); l.closeCycle('a', 'ses', T0 + 3);
-  l.accrue('a', { input: 200, output: 0 }, T0 + 4); l.closeCycle('a', 'ses', T0 + 5);
+  const W = 5 * 3600_000;   // real window spans (the read floor rejects sub-window junk)
+  l.accrue('a', { input: 100, output: 0 }, T0 - 3 * W); l.closeCycle('a', 'ses', T0 - 2 * W);
+  l.accrue('a', { input: 900, output: 0 }, T0 - 2 * W + 1); l.markPartial('a'); l.closeCycle('a', 'ses', T0 - W);
+  l.accrue('a', { input: 200, output: 0 }, T0 - W + 1); l.closeCycle('a', 'ses', T0);
   const s = l.windowStats('a', 'ses');
   assert.equal(s.avg3, 150, 'avg over {100,200} — the 900 partial is excluded');
   assert.equal(s.cycles, 2);
@@ -38,7 +39,7 @@ test('A3 averages over COMPLETE cycles only (partial + disabled excluded)', () =
 
 test('A4 fewer cycles than the avg window → average over what exists, never NaN', () => {
   const l = new CapacityLedger({ now: () => T0 });
-  l.accrue('a', { input: 100, output: 0 }, T0); l.closeCycle('a', 'ses', T0 + 1);
+  l.accrue('a', { input: 100, output: 0 }, T0 - 5 * 3600_000); l.closeCycle('a', 'ses', T0);
   const s = l.windowStats('a', 'ses');
   assert.equal(s.avg3, 100); assert.equal(s.avg10, 100); assert.equal(s.allTime, 100);
   assert.equal(s.prev, null, 'no fabrication of missing cycles');
@@ -46,9 +47,10 @@ test('A4 fewer cycles than the avg window → average over what exists, never Na
 
 test('A5 bounded: the 51st cycle evicts the oldest', () => {
   const l = new CapacityLedger({ now: () => T0 });
+  const W = 5 * 3600_000;
   for (let i = 0; i < 52; i++) {
-    l.accrue('a', { input: i + 1, output: 0 }, T0 + i);
-    l.closeCycle('a', 'ses', T0 + i + 1000);
+    l.accrue('a', { input: i + 1, output: 0 }, T0 - (52 - i) * W);
+    l.closeCycle('a', 'ses', T0 - (51 - i) * W);
   }
   const s = l.windowStats('a', 'ses');
   assert.equal(s.cycles, 50, 'kept 50');
@@ -131,7 +133,7 @@ test('F3 bounded at 10 day-buckets; the 11th evicts the oldest', () => {
 
 test('E4 the two account kinds never cross-contaminate (throughput vs tank)', () => {
   const l = new CapacityLedger({ now: () => T0 });
-  l.accrue('capped', { input: 100, output: 0 }, T0); l.closeCycle('capped', 'wk', T0 + 1);
+  l.accrue('capped', { input: 100, output: 0 }, T0 - 7 * 86400_000); l.closeCycle('capped', 'wk', T0);
   assert.ok(l.windowStats('capped', 'wk'), 'capped has a weekly tank');
   assert.equal(l.windowStats('noWk', 'wk'), null, 'no-weekly has NO tank — ever');
   assert.ok(l.rollingThroughput('noWk'), 'but it does have throughput');
@@ -220,4 +222,43 @@ test('M5d: the absolute fallback is flagged a lower bound when joined mid-window
   const e = l.estimateFromUtilization('a', 'ses', 0.4);
   assert.equal(e.method, 'absolute');
   assert.equal(e.lowerBound, true, 'flagged — the UI renders ≥');
+});
+
+// ── R-lane: read-time junk floor (live defect 2026-08-24) ─────────────────────
+// The user's highest-capacity account showed avg 548k against a true ~685k: a
+// 0.5-second/588-token "complete cycle" (fold refused on an endedAt mismatch) sat in
+// the averages. A complete+enabled cycle under 80% of its window is writer junk — a
+// genuine short cycle is flagged partial at write time, never complete.
+
+test('R1: a complete sub-floor cycle never reaches the columns', () => {
+  const l = new CapacityLedger({ now: () => T0 });
+  l._accounts.set('a', { ses: { open: null, closed: [
+    { startedAt: T0 - 5 * 3600_000, endedAt: T0, tokens: 1_000_000, complete: true, disabledDuring: false, resetAt: T0 },
+    { startedAt: T0 - 500, endedAt: T0, tokens: 588, complete: true, disabledDuring: false, resetAt: T0 },
+  ] }, wk: { open: null, closed: [] }, days: {} });
+  const s = l.windowStats('a', 'ses');
+  assert.equal(s.cycles, 1, 'only the real window counts');
+  assert.equal(s.last, 1_000_000);
+  assert.equal(s.avg3, 1_000_000, 'avg3 not dragged by the sliver');
+});
+
+test('R2: a PARTIAL short cycle stays visible data — the floor only fires on complete', () => {
+  // Partial cycles are excluded from averages by design; the floor must not hide them
+  // from any future "all observations" view, and must not error on them.
+  const l = new CapacityLedger({ now: () => T0 });
+  l._accounts.set('a', { ses: { open: null, closed: [
+    { startedAt: T0 - 500, endedAt: T0, tokens: 588, complete: false, disabledDuring: false, resetAt: T0 },
+  ] }, wk: { open: null, closed: [] }, days: {} });
+  const s = l.windowStats('a', 'ses');
+  assert.equal(s, null, 'no counted cycles — but no crash either');
+});
+
+test('R3: the floor is per-window — a 4.5h ses cycle passes, a 5.5-day wk cycle passes', () => {
+  const l = new CapacityLedger({ now: () => T0 });
+  l._accounts.set('a', {
+    ses: { open: null, closed: [{ startedAt: T0 - 4.5 * 3600_000, endedAt: T0, tokens: 700_000, complete: true, disabledDuring: false, resetAt: T0 }] },
+    wk: { open: null, closed: [{ startedAt: T0 - 5.5 * 86400_000, endedAt: T0, tokens: 3_000_000, complete: true, disabledDuring: false, resetAt: T0 }] },
+    days: {} });
+  assert.equal(l.windowStats('a', 'ses').last, 700_000, '90% of a 5h window is real');
+  assert.equal(l.windowStats('a', 'wk').last, 3_000_000, '79% of a weekly window is real');
 });

@@ -31,6 +31,10 @@ const SCHEMA_VERSION = 3;
 // Two closes this far apart are the SAME boundary observed twice (a clock-close and a
 // stamp-advance racing across the boundary second), not two windows.
 const SAME_BOUNDARY_MS = 5_000;
+
+// The minimum span of a COMPLETE cycle per window (80% of nominal): a real one is
+// flagged partial by the writer, so a complete cycle below this is corrupt history.
+const READ_FLOOR_MS = { ses: 4 * 3600_000, wk: 5 * 86400_000 };
 const MAX_CYCLES_PER_WINDOW = 50;
 const MAX_DAY_BUCKETS = 10;
 
@@ -54,6 +58,9 @@ export class CapacityLedger {
     // Cleared per account+window once that window's first boundary is behind us.
     this._joinedMidWindow = false;
     this._utilObservedAt = 0;   // last utilization-reading arrival (see estimateFromUtilization)
+    // Test seam ONLY: real-window fixtures are laborious for every close-cycle test,
+    // so tests may zero the read floor. Production never touches this.
+    this._readFloorOverride = null;
   }
 
   /** Restore from a serialized payload (state.json). Tolerant: unknown schemaVersion →
@@ -324,7 +331,20 @@ export class CapacityLedger {
    *  are observations, not capacity). */
   windowStats(name, window) {
     const rec = this._accounts.get(name);
-    const closed = (rec?.[window]?.closed || []).filter(c => c.complete && !c.disabledDuring);
+    // READ-TIME FLOOR. A cycle marked complete + never-disabled but spanning far less
+    // than its window is junk from a writer bug — the live ledger held a 0.5-second /
+    // 588-token "cycle" (clock-close and stamp-advance racing at one boundary, the fold
+    // refused on an endedAt mismatch) and it dragged this account's Avg3 down ~188k.
+    // Unlike the WRITE-time floor I tried first (reverted: it punished accounts that
+    // were merely idle early in their window), at read time a genuinely short cycle is
+    // already flagged complete:false by the writer — so a complete sub-floor cycle is
+    // definitionally corrupt, never a real observation.
+    const floor = (this._readFloorOverride ?? READ_FLOOR_MS)[window] ?? 0;
+    // >= floor, with a 1s tolerance for the accrue-vs-close clock race (an accrue can
+    // stamp Date.now() a tick AFTER the close computed its boundary, making a 0-span
+    // cycle read as -1ms — found by debugging a D2 failure that only reproduced in-file).
+    const closed = (rec?.[window]?.closed || []).filter(c =>
+      c.complete && !c.disabledDuring && (c.endedAt - c.startedAt) >= floor - 1_000);
     if (!closed.length) return null;
     const avg = (arr) => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : null;
     const tokens = closed.map(c => c.tokens);

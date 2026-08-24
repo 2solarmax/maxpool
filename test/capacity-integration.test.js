@@ -19,6 +19,16 @@ const close = s => new Promise(r => s.close(r));
 
 const oauth = (name = 'a1') => ({ name, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 });
 
+// Most fixtures here close cycles at synthetic sub-second spans to test CLOSE LOGIC,
+// not span validity — the production read floor would reject them as junk. Zero it in
+// the harness; the R-lane tests in capacity-ledger.test.js pin the floor itself.
+const AM = class extends AccountManager {
+  constructor(accounts, th) {
+    super(accounts, th);
+    this.capacity._readFloorOverride = { ses: 0, wk: 0 };
+  }
+};
+
 /** SSE body whose message_delta usage is CUMULATIVE — the real Anthropic shape. */
 const CUMULATIVE_SSE = [
   'event: message_start',
@@ -42,7 +52,7 @@ const CUMULATIVE_SSE = [
 async function withProxy(upstreamHandler, fn, { accounts = [oauth()] } = {}) {
   const upstream = http.createServer(upstreamHandler);
   const upstreamPort = await listen(upstream);
-  const am = new AccountManager(accounts, 0.90);
+  const am = new AM(accounts, 0.90);
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
@@ -114,15 +124,16 @@ test('C3: a count_tokens request accrues NOTHING (a prompt-size echo is not deli
 // ── Lane D: cycle boundaries ─────────────────────────────────────────────────
 
 function amWithOauth() {
-  const am = new AccountManager([oauth('claude1')], 0.90);
+  const am = new AM([oauth('claude1')], 0.90);
   return am;
 }
 
 test('D1: a cycle closes on the CLOCK when its reset stamp passes, without needing a probe', async () => {
   const am = amWithOauth();
   const a = am.accounts[0];
-  am.accrueCapacity(0, { input: 1000, output: 200 });
-  a.quota.unified5hReset = Date.now() - 1000;   // the 5h window has rolled
+  const b1 = Date.now() - 1000;
+  am.capacity.accrue('claude1', { input: 1000, output: 200 }, b1 - 5 * 3600_000);
+  a.quota.unified5hReset = b1;   // the 5h window has rolled
   a.quota.unified7dReset = Date.now() + 86400_000; // the weekly has not
   am.closeExpiredCapacityCycles();
   const ses = am.capacity.windowStats('claude1', 'ses');
@@ -145,7 +156,7 @@ test('D3: a probe observing a FRESHER reset stamp closes the provider cycle (sta
   // The clock-close needs a stamp it already knows. A provider whose old stamp was
   // never learned closes only here — without it the cycle runs forever and the page
   // stays empty on exactly the account the user cares most about.
-  const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  const am = new AM([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
   const idx = am.accounts.findIndex(a => a.name === 'glm');
   const base = Date.now() - 5 * 3600_000;   // the old window has genuinely been running
   am.applyProviderUsage(idx, { source: 'zai', ses: { utilization: 0.2, resetAt: base } });
@@ -163,12 +174,13 @@ test('D4: a cycle the account was DISABLED during is shown but excluded from the
   const am = amWithOauth();
   // Distinct boundary stamps, as in production (5h apart) — a same-instant repeat of
   // ONE stamp is the two-closer race, which folds by design (I3).
-  am.accrueCapacity(0, { input: 500, output: 0 });        // cycle 1 — clean
-  am.accounts[0].quota.unified5hReset = Date.now() - 5 * 3600_000;
+  const b1 = Date.now() - 5 * 3600_000, b2 = Date.now() - 1;
+  am.capacity.accrue('claude1', { input: 500, output: 0 }, b1 - 5 * 3600_000);  // cycle 1 — clean
+  am.accounts[0].quota.unified5hReset = b1;
   am.closeExpiredCapacityCycles();
-  am.accrueCapacity(0, { input: 20, output: 0 });         // cycle 2 — disabled partway
+  am.capacity.accrue('claude1', { input: 20, output: 0 }, b2 - 5 * 3600_000);   // cycle 2 — disabled partway
   am.setAccountEnabled(0, false);
-  am.accounts[0].quota.unified5hReset = Date.now() - 1;
+  am.accounts[0].quota.unified5hReset = b2;
   am.closeExpiredCapacityCycles();
   const st = am.capacity.windowStats('claude1', 'ses');
   assert.equal(st.cycles, 1, 'the disabled-during cycle is not a capacity observation');
@@ -244,9 +256,11 @@ test('G1: the page shows a per-account row with the six columns once cycles exis
   // Three consecutive real windows — distinct boundary stamps, 5h apart.
   let i = 3;
   for (const n of [1000, 2000, 3000]) {
-    am.accrueCapacity(0, { input: n, output: 0 });
-    am.accounts[0].quota.unified5hReset = Date.now() - (i-- * 5 * 3600_000);
+    const b = Date.now() - (i * 5 * 3600_000);
+    am.capacity.accrue('claude1', { input: n, output: 0 }, b - 5 * 3600_000);
+    am.accounts[0].quota.unified5hReset = b;
     am.closeExpiredCapacityCycles();
+    i--;
   }
   const page = renderCapacity(am);
   for (const col of ['Last', 'Prev', 'Prev-1', 'Avg 3', 'Avg 10', 'All time']) {
@@ -268,7 +282,7 @@ test('G2: a fresh install says WHY the page is empty instead of showing zeros', 
 test('G3: the no-weekly account shows a 7d VOLUME, never an invented weekly capacity', () => {
   // The legacy z.ai plan has no weekly tank. A "weekly capacity" number for it would
   // be a fiction; what it actually moved in 7 days is the honest, useful figure.
-  const am = new AccountManager([{ name: 'glm-legacy', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  const am = new AM([{ name: 'glm-legacy', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
   am.accounts[0].quota.weeklyAbsent = true;
   am.accrueCapacity(0, { input: 900_000, output: 100_000 });
   const page = renderCapacity(am, { window: 'wk' });
@@ -277,7 +291,7 @@ test('G3: the no-weekly account shows a 7d VOLUME, never an invented weekly capa
 });
 
 test('G4: a partial 7d window is disclosed as a floor, not reported as the truth', () => {
-  const am = new AccountManager([{ name: 'glm-legacy', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  const am = new AM([{ name: 'glm-legacy', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
   am.accounts[0].quota.weeklyAbsent = true;
   am.accrueCapacity(0, { input: 10_000, output: 0 });
   am.capacity.markDayPartial('glm-legacy', new Date().toISOString().slice(0, 10));
@@ -418,7 +432,7 @@ test('I3: two closers on the SAME reset boundary produce ONE cycle, never a tiny
   // entering the averages as a fabricated near-empty observation.
   const l = new CapacityLedger({ now: () => Date.now() });
   const boundary = Date.now();
-  l.accrue('x', { input: 1_500_000, output: 0 });
+  l.accrue('x', { input: 1_500_000, output: 0 }, boundary - 5 * 3600_000);
   l.closeCycle('x', 'ses', boundary, { resetAt: boundary });
   l.accrue('x', { input: 3_000, output: 0 });                  // straddling tail
   l.closeCycle('x', 'ses', boundary, { resetAt: boundary });   // the regressed second closer
@@ -436,9 +450,9 @@ test('J1 (M2): a same-resetAt close at a DIFFERENT endedAt is a DISTINCT cycle',
   // a real observation deleted.
   const l = new CapacityLedger({ now: () => Date.now() });
   const boundary = Date.now();
-  l.accrue('x', { input: 1000, output: 0 });
+  l.accrue('x', { input: 1000, output: 0 }, boundary - 5 * 3600_000);
   l.closeCycle('x', 'ses', boundary, { resetAt: boundary });
-  l.accrue('x', { input: 700, output: 0 });
+  l.accrue('x', { input: 700, output: 0 }, boundary);
   l.closeCycle('x', 'ses', boundary + 5 * 3600_000, { resetAt: boundary }); // same stamp value, later boundary
   const st = l.windowStats('x', 'ses');
   assert.equal(st.cycles, 2, 'two boundaries, two cycles');
@@ -488,14 +502,15 @@ test('J4: every row starts its columns at the SAME position, whatever the name l
   // produced a 4-column-narrow name field for every name SHORTER than the width, and
   // each row's numbers landed in a different place. Unreadable, and invisible to any
   // test that used a single account name.
-  const am = new AccountManager([
+  const am = new AM([
     { name: 'ab', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
     { name: 'a-very-long-account-name', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
   ], 0.90);
+  const bj = Date.now() - 5 * 3600_000;
   for (const a of am.accounts) {
-    am.accrueCapacity(a.index, { input: 1_000_000, output: 0 });
+    am.capacity.accrue(a.name, { input: 1_000_000, output: 0 }, bj - 5 * 3600_000);
     a.quota.unified5h = 0.9;
-    a.quota.unified5hReset = Date.now() - 5 * 3600_000;
+    a.quota.unified5hReset = bj;
   }
   am.refreshExpiredQuotas();
   const lines = renderCapacity(am).split('\n').filter(l => / 1\.0M/.test(l));
@@ -511,7 +526,7 @@ test('J5: the fold NEVER absorbs a partial or disabled tail over a complete obse
   for (const taint of ['partial', 'disabled']) {
     const l = new CapacityLedger({ now: () => Date.now() });
     const boundary = Date.now();
-    l.accrue('x', { input: 1_000_000, output: 0 });
+    l.accrue('x', { input: 1_000_000, output: 0 }, boundary - 5 * 3600_000);
     l.closeCycle('x', 'ses', boundary, { resetAt: boundary });
     l.accrue('x', { input: 900, output: 0 });                       // the tail
     l.markPartial('x', { disabled: taint === 'disabled' });
@@ -568,7 +583,7 @@ test('K3: two closers straddling ONE boundary second produce one cycle, not a sl
   // cycle — the 2228-token / 0.2-minute row in the live data.
   const l = new CapacityLedger({ now: () => Date.now() });
   const b = Date.now();
-  l.accrue('x', { input: 260_000, output: 0 });
+  l.accrue('x', { input: 260_000, output: 0 }, b - 5 * 3600_000);
   l.closeCycle('x', 'ses', b, { resetAt: b });
   l.accrue('x', { input: 2_228, output: 0 });
   l.closeCycle('x', 'ses', b + 490, { resetAt: b + 490 });
@@ -580,7 +595,7 @@ test('K3: two closers straddling ONE boundary second produce one cycle, not a sl
 test('K4: two boundaries a real window apart stay TWO cycles (the guard must not over-fold)', () => {
   const l = new CapacityLedger({ now: () => Date.now() });
   const b = Date.now();
-  l.accrue('x', { input: 100, output: 0 });
+  l.accrue('x', { input: 100, output: 0 }, b - 5 * 3600_000);
   l.closeCycle('x', 'ses', b, { resetAt: b });
   l.accrue('x', { input: 700, output: 0 });
   l.closeCycle('x', 'ses', b + 5 * 3600_000, { resetAt: b + 5 * 3600_000 });
@@ -608,7 +623,7 @@ test('L1: an ALREADY-EXPIRED stamp from a late probe closes at NOW, never a sliv
   // Live: the GLM account's probe delivered a resetAt that was already in the past
   // when applied; the clock-close then honored the stale stamp and recorded a
   // 14.6-minute "complete cycle" of 21k tokens. A cycle that short is never real.
-  const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  const am = new AM([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
   const idx = 0;
   const startedAgo = 5 * 3600_000;
   // Simulate: a real 5h-old open cycle, a probe stamp that expired 30s ago.
@@ -710,7 +725,7 @@ test('L6: the advance-close NEVER dates a cycle in the future', () => {
   // Live 2026-08-23 15:02Z: a probe reported the NEW window's resetAt (19:54, ~5h out)
   // as evidence the OLD window rolled; the close wrote it as endedAt and the checker
   // caught a cycle "ending" 4.9h in the future. endedAt must be ≤ now, always.
-  const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  const am = new AM([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
   am.capacity.accrue('glm', { input: 3_000, output: 658 }, Date.now() - 3 * 60_000);
   const prevBoundary = Date.now() - 60_000;                 // the window that just rolled
   am.noteCapacityWindowAdvance('glm', 'ses', prevBoundary, Date.now() + 5 * 3600_000);
@@ -772,9 +787,10 @@ test('M3: a stale utilization reading carries the caveat, never silent trust', (
 
 test('M4: a measured cycle still beats the estimate — the estimate never overwrites data', () => {
   const am = amWithOauth();
-  am.accrueCapacity(0, { input: 800_000, output: 0 });
+  const bm = Date.now() - 5 * 3600_000;
+  am.capacity.accrue('claude1', { input: 800_000, output: 0 }, bm - 5 * 3600_000);
   am.accounts[0].quota.unified5h = 0.9;
-  am.accounts[0].quota.unified5hReset = Date.now() - 5 * 3600_000;
+  am.accounts[0].quota.unified5hReset = bm;
   am.refreshExpiredQuotas();                            // closes the real cycle
   am.accounts[0].quota.unified5h = 0.5;
   am.capacity.noteUtilizationObserved();

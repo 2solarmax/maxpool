@@ -3010,7 +3010,11 @@ export class AccountManager {
    *  cycle is no longer a truthful capacity observation — flag it partial (B2/SC6).
    *  It still displays; it is excluded from averages. */
   restoreCapacityState(payload, now = Date.now(), downtimeMs = null) {
+    // Preserve the test seam across the ledger swap (fromSerialized returns a fresh
+    // instance; without this the zero-floor harness override dies on any restore).
+    const floorOverride = this.capacity?._readFloorOverride ?? null;
     this.capacity = CapacityLedger.fromSerialized(payload);
+    this.capacity._readFloorOverride = floorOverride;
     // Partial is keyed on MAXPOOL'S OWN downtime, NEVER on the account's last request:
     // an account parked >10min mid-cycle is normal fleet rotation, and keying on its
     // last request discarded valid observations on every reload (red-team F3). The
