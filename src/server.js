@@ -1991,7 +1991,23 @@ function stripRejectedBlockClass(body, errorBody) {
       // and keeping the original would resend the exact body that just 400'd. Except
       // messages[0], which must survive as a `user` turn (see the same guard above).
       if (kept.length === 0) {
-        if (messages.length === 0) { messages.push({ ...msg, content: [{ type: 'text', text: '(content removed)' }] }); }
+        // messages[0] must survive AS A USER TURN — Anthropic requires the first message
+        // to be `user`, and preserving the original role (what this did until
+        // 2026-08-24) left a system-first transcript system-first: the guard silently
+        // not doing the one thing it exists for.
+        if (messages.length === 0) {
+          messages.push({ role: 'user', content: [{ type: 'text', text: '(content removed)' }] });
+          continue;
+        }
+        // A SYSTEM turn is never dropped. Every other role can go — the turn carried
+        // nothing but a poisoned block, and a gap is harmless. A system is an
+        // INSTRUCTION channel: deleting it changes how the session behaves with no
+        // signal to anyone, which is worse than the loud 400 the repair is fixing.
+        // Keep the turn as a placeholder so its position and presence survive.
+        if (msg?.role === 'system') {
+          messages.push({ ...msg, content: [{ type: 'text', text: '(content removed)' }] });
+          continue;
+        }
         continue;
       }
       messages.push({ ...msg, content: kept });
@@ -2169,7 +2185,23 @@ function stripForeignThinkingBlocks(body) {
       // Reachable only since the role gate was removed — before that, non-assistant
       // turns were never dropped at all.
       if (kept.length === 0) {
-        if (messages.length === 0) { messages.push({ ...msg, content: [{ type: 'text', text: '(content removed)' }] }); }
+        // messages[0] must survive AS A USER TURN — Anthropic requires the first message
+        // to be `user`, and preserving the original role (what this did until
+        // 2026-08-24) left a system-first transcript system-first: the guard silently
+        // not doing the one thing it exists for.
+        if (messages.length === 0) {
+          messages.push({ role: 'user', content: [{ type: 'text', text: '(content removed)' }] });
+          continue;
+        }
+        // A SYSTEM turn is never dropped. Every other role can go — the turn carried
+        // nothing but a poisoned block, and a gap is harmless. A system is an
+        // INSTRUCTION channel: deleting it changes how the session behaves with no
+        // signal to anyone, which is worse than the loud 400 the repair is fixing.
+        // Keep the turn as a placeholder so its position and presence survive.
+        if (msg?.role === 'system') {
+          messages.push({ ...msg, content: [{ type: 'text', text: '(content removed)' }] });
+          continue;
+        }
         continue;
       }
       messages.push({ ...msg, content: kept });
