@@ -180,7 +180,7 @@ function loadText(load) {
   return `${now}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
 }
 
-function weeklyPolicyText(am, account) {
+export function weeklyPolicyText(am, account) {
   if (!am?._weeklyState || !account || account.type === 'provider') return '';
   const state = am._weeklyState(account);
   if (!state || state === 'unknown' || state === 'normal') return '';
@@ -191,7 +191,19 @@ function weeklyPolicyText(am, account) {
     : '';
   const paceOnly = state !== rawState && rawState !== 'exhausted';
   const label = paceOnly ? `Pace ${state}` : `Wk ${state}`;
-  const text = paceOnly ? label : `${label}${pct}`;
+  let text = paceOnly ? label : `${label}${pct}`;
+  // Critical-unlock visibility (2026-08-24): a red "Wk critical 96%" row that is
+  // ACTIVELY ROUTING must say why, or the user watches a benched-looking account
+  // hoover traffic with no explanation (the peak-shipped-invisible lesson).
+  if (state === 'critical') {
+    const u = am.criticalUnlockSummary?.(account);
+    if (u) {
+      const eta = u.etaMs != null ? ` ${(u.etaMs / 60000).toFixed(0)}m` : '';
+      text += u.reason === 'prereset'
+        ? ` ·drain${eta}`
+        : u.reason === 'pressure' ? ' ·relief' : ' ·peak-relief';
+    }
+  }
   if (state === 'critical' || state === 'exhausted') return state !== rawState ? yellow(text) : red(text);
   if (state === 'reserve') return yellow(text);
   return cyan(text);

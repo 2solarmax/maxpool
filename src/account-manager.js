@@ -111,6 +111,31 @@ const DEFAULT_SCHEDULER = {
   // it's essentially full (a near-guaranteed-waste hard-429). A real 429 sets util≈1.0
   // and still benches here. Critical (0.95-0.999) stays last-resort-only (pass 2).
   weeklyExhaustedThreshold: 0.999,
+  // ── Situational CRITICAL unlock (2026-08-24) ────────────────────────────────
+  // An account at critical (≥0.95 weekly) used to be pass-2-only: spent ONLY during
+  // a total-fleet outage for the exact request, so its last ~5% usually died unused
+  // at reset. Three situational lifts make critical reachable without an outage.
+  // preReset: a critical account whose weekly reset is < this many hours away is
+  // unlocked, and its cost decays to NEGATIVE (below an idle healthy account — a
+  // decay to 0 only TIES, which rotation splits ~1/N; the drain must actually win).
+  // Stamp-freshness required (probe or header seen recently). 0 disables.
+  criticalPreResetHours: 2,
+  // pressure: unlock when at most this many healthy+reserve routes still have
+  // CONCURRENCY HEADROOM for the request (an at-cap route cannot serve without
+  // deepening the congestion). Congestion-based, not presence-based: an idle provider
+  // or reserve account keeps serving and no unlock fires — critical becomes relief
+  // exactly when the fleet is out of headroom, and never preempts an idle route
+  // (cost is also ABOVE reserve's attainable max ~19, pinning the ordering).
+  // -1 disables; 0 = unlock only when every route is at cap.
+  criticalPressureUnlockRoutes: 0,
+  criticalPressureCost: 21,
+  // Cost at the OPEN of the preReset window, decaying linearly to
+  // -(reserveFloorCost+1) at reset — below every healthy account, bounded only by
+  // the concurrency cap.
+  criticalDrainFloorCost: 8,
+  // peak: unlock critical Claude accounts while a provider peak de-preference is
+  // ACTIVE (_peakTier ≥ 1). Default OFF — mechanism shipped, immediate use declined.
+  criticalPeakUnlock: false,
   weeklyBurnDebtWeight: 0.6,
   // Routing-cost tuning (lower cost = preferred). The goal is to AVOID
   // short-term (rate/concurrency) throttling by spreading load across healthy
@@ -212,6 +237,10 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 // `priority < bestPriority` is false for Infinity vs Infinity and an all-peaked pool
 // would select nothing.
 const PEAK_TIER_STRIDE = 1_000_000;
+
+// Memo for _pressureEligibleRoutes, keyed on the requestInfo object (one selection
+// pass = one requestInfo instance).
+const _pressureCache = new WeakMap();
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
 // Quota fields that survive a restart: utilization levels and their reset
@@ -1734,6 +1763,7 @@ export class AccountManager {
       { allowWeeklyReserve: true, allowWeeklyCritical: true },
     ];
 
+    const bestUnlockMap = new Map();
     for (const weeklyOptions of weeklyPasses) {
       best = null;
       bestScore = Infinity;
@@ -1744,14 +1774,20 @@ export class AccountManager {
         const account = this.accounts[idx];
         if (excludedIndexes.has(account.index)) continue;
         if (!this._matchesRequest(account, profile, requestInfo)) continue;
-        if (!this._isAvailable(account, { ...weeklyOptions, model: requestInfo.model, now })) continue;
+        // Situational critical unlock: computed per-account per-request (pressure
+        // memoized by requestInfo). pass 2 keeps its unconditional fallback.
+        const critUnlock = weeklyOptions.allowWeeklyCritical
+          ? null
+          : this._criticalUnlock(account, requestInfo, excludedIndexes, null, now);
+        if (!this._isAvailable(account, { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!critUnlock, model: requestInfo.model, now })) continue;
 
         const priority = this._effectivePriority(account, requestInfo, now);
-        const score = this._scoreAccount(account, requestInfo, scoringCtx);
+        const score = this._scoreAccount(account, requestInfo, scoringCtx, critUnlock);
         if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
           bestPriority = priority;
           bestScore = score;
           best = account;
+          if (critUnlock) bestUnlockMap.set(account.name, critUnlock); else bestUnlockMap.delete(account.name);
         }
       }
 
@@ -1759,6 +1795,19 @@ export class AccountManager {
         const switched = best.index !== this.currentIndex;
         this.currentIndex = best.index;
         this.nextIndex = (best.index + 1) % this.accounts.length;
+        // Unlock visibility: ONE line per account+reason when a critical account
+        // first serves via a situational unlock (per-request would spam the log).
+        const usedUnlock = bestUnlockMap.get(best.name);
+        if (usedUnlock) {
+          const key = usedUnlock.reason;
+          if (best._lastUnlockLogged !== key) {
+            best._lastUnlockLogged = key;
+            const eta = usedUnlock.etaMs != null ? ` (reset in ${(usedUnlock.etaMs / 60000).toFixed(0)}m)` : '';
+            console.log(`[Maxpool] Critical unlock "${key}": routing to "${best.name}"${eta}`);
+          }
+        } else if (best._lastUnlockLogged) {
+          best._lastUnlockLogged = null;   // state left critical — re-log next unlock
+        }
         // If we switched to an account whose weekly quota is still unknown, flag
         // it so we re-evaluate once that quota is learned (see updateQuota).
         best.probing = best.quota.unified7dReset == null;
@@ -1976,6 +2025,11 @@ export class AccountManager {
     // ranks strictly below every non-peak account in EVERY routing mode with no
     // per-mode branch. Tier 0 returns base IDENTICALLY — off-peak behaviour is
     // byte-identical to the pre-peak implementation (SC2 by construction).
+    // The critical unlock deliberately does NOT touch this axis: priority dominates
+    // score, so any unlock tier here would block same-family relief entirely. The
+    // unlock's cross-class posture is enforced by the CONGESTION gate instead (an
+    // idle provider has headroom → no pressure unlock → provider keeps serving), and
+    // by the score cost (21 > reserve's max 19).
     const base = this._basePriority(account, requestInfo);
     const tier = this._peakTier(account, now);
     return tier === 0 ? base : base + tier * PEAK_TIER_STRIDE;
@@ -2406,7 +2460,7 @@ export class AccountManager {
    *   - ramp:        ease a just-recovered account back in instead of slamming it
    *   - failures:    direct per-account backoff after errors
    */
-  _scoreAccount(account, requestInfo = {}, ctx = null) {
+  _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
     const now = ctx?.now ?? Date.now();
     const reqWeight = Math.max(1, requestInfo.weight || 1);
     const inflight = account.activeWeight + reqWeight;
@@ -2422,7 +2476,10 @@ export class AccountManager {
     // bites sooner — load fans out across the fleet before a low-quota account is
     // dogpiled toward a 429.
     const weeklyState = this._weeklyRawState(account);
-    const concTarget = weeklyState === 'reserve'
+    // An UNLOCKED critical account is the lowest-headroom tier of all — it gets the
+    // same tight target as reserve (red team finding A: inheriting the looser
+    // per-account target removed the anti-dogpile cap exactly where quota is lowest).
+    const concTarget = (weeklyState === 'reserve' || (weeklyState === 'critical' && criticalUnlock))
       ? this.scheduler.reserveConcurrencyTarget
       : this.scheduler.perAccountConcurrencyTarget;
     const capPenalty = this.scheduler.capPenaltyWeight
@@ -2457,6 +2514,7 @@ export class AccountManager {
 
     const ramp = this._recoveryRamp(account, now);
     const reserveCost = this._reserveCost(account, now, weeklyState);
+    const criticalCost = this._criticalCost(account, now, criticalUnlock, weeklyState);
     const failurePenalty = account.consecutiveFailures * 5;
     // NO unknown-quota bonus. An account whose quota we cannot see must never be
     // MORE attractive than a known-healthy one — the old -0.5 nudge (safe only
@@ -2466,7 +2524,7 @@ export class AccountManager {
     // default) learns the real number within a cycle. `probing`/requalify still
     // flags a never-seen account for learning — that path is unchanged.
 
-    return concurrency + capPenalty + paceCost + utilizationCost + scopedPace + spread + ramp + reserveCost + failurePenalty;
+    return concurrency + capPenalty + paceCost + utilizationCost + scopedPace + spread + ramp + reserveCost + criticalCost + failurePenalty;
   }
 
   /**
@@ -2562,6 +2620,108 @@ export class AccountManager {
    * above a lightly-loaded reserve one (its capPenalty is unbounded) — that's intended
    * load-spread, not a violation of "healthy first".
    */
+  /**
+   * Situational CRITICAL unlock (2026-08-24). Returns null or { reason, etaMs }:
+   *  - 'prereset'  — the account's weekly reset lands inside criticalPreResetHours.
+   *                  That capacity is FREE: it dies at reset regardless, so it is
+   *                  drained FIRST (cost decays negative) while every other account's
+   *                  weekly budget survives. Requires a FRESH reset stamp (a stale
+   *                  future stamp with probing off must not fire the window early).
+   *  - 'pressure'  — ≤ criticalPressureUnlockRoutes healthy+reserve routes remain
+   *                  for THIS request (full pre-pass incl. _matchesRequest and
+   *                  excludedIndexes — an inline count is rotation-order-dependent).
+   *                  Relief one step BEFORE the stall, not only during it.
+   *  - 'peak'      — a provider peak de-preference is ACTIVE (tier ≥ 1, not merely
+   *                  in-window) and criticalPeakUnlock is enabled. Default off.
+   * Precedence prereset > pressure > peak: the cheaper drain wins.
+   */
+  _criticalUnlock(account, requestInfo = {}, excludedIndexes = new Set(), pressureCache = null, now = Date.now()) {
+    const state = this._weeklyRawState(account);
+    if (state !== 'critical') return null;
+
+    const hours = this.scheduler.criticalPreResetHours ?? 0;
+    if (hours > 0) {
+      const q = account.quota;
+      const resetAt = account.type === 'provider' ? q.providerWkReset : q.unified7dReset;
+      const etaMs = resetAt != null ? resetAt - now : null;
+      // Stamp freshness: a header or probe reading within max(2 probe intervals,
+      // the window itself). Without this, quotaProbeSeconds=0 + an idle account can
+      // carry a days-old future stamp and fire the drain far too early.
+      const probeInterval = this.quotaProbeIntervalMs || 60_000;
+      const freshBy = q.lastProbeOkAt != null && (now - q.lastProbeOkAt) < Math.max(2 * probeInterval, hours * 3600_000);
+      if (etaMs != null && etaMs > 0 && etaMs <= hours * 3600_000 && freshBy) {
+        return { reason: 'prereset', etaMs };
+      }
+    }
+
+    const routes = this.scheduler.criticalPressureUnlockRoutes;
+    if (routes != null && routes >= 0 && this._pressureEligibleRoutes(requestInfo, excludedIndexes, now) <= routes) {
+      return { reason: 'pressure' };
+    }
+
+    if (this.scheduler.criticalPeakUnlock && this.accounts.some(a => a.type === 'provider' && this._peakTier(a, now) >= 1)) {
+      return { reason: 'peak' };
+    }
+    return null;
+  }
+
+  /** Full pre-pass: how many healthy+reserve routes can take THIS request NOW —
+   *  pass-1-eligible AND under their concurrency target (an at-cap route cannot serve
+   *  without joining the congestion). Congestion-based, deliberately: a presence-only
+   *  count forced the unlock onto the PRIORITY axis, which then blocked same-family
+   *  relief entirely (priority dominates score — a slammed healthy account at priority
+   *  0 always beat the unlocked critical at 0+21). Counting only routes with headroom
+   *  keeps the unlock on the score axis where reserve/critical ordering lives.
+   *  Memoized per requestInfo via a module WeakMap. */
+  _pressureEligibleRoutes(requestInfo = {}, excludedIndexes = new Set(), now = Date.now()) {
+    let cached = _pressureCache.get(requestInfo);
+    if (cached != null) return cached;
+    const profile = requestInfo.profile || 'claude';
+    let n = 0;
+    for (const a of this.accounts) {
+      if (excludedIndexes.has(a.index)) continue;
+      if (!this._matchesRequest(a, profile, requestInfo)) continue;
+      if (!this._isAvailable(a, { allowWeeklyReserve: true, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
+      const target = this._weeklyRawState(a) === 'reserve'
+        ? this.scheduler.reserveConcurrencyTarget
+        : this.scheduler.perAccountConcurrencyTarget;
+      if (a.activeWeight + 1 > target) continue;   // at/over cap — cannot take more
+      n++;
+    }
+    _pressureCache.set(requestInfo, n);
+    return n;
+  }
+
+  /**
+   * Score cost for a situationally-unlocked critical account. State-gated exactly like
+   * _reserveCost (0 for any non-critical state) so the cost cannot linger past the
+   * weekly reset into the fresh 'unknown' state.
+   *  - prereset: decays linearly from criticalDrainFloorCost (window open) to
+   *    -(reserveFloorCost+1) AT reset — BELOW an idle healthy account, so dying
+   *    capacity is drained first (a decay to 0 only ties; rotation then splits the
+   *    drain ~1/N and the point is lost). Bounded by the concurrency cap, which the
+   *    shared target-2 keeps tight.
+   *  - pressure/peak: a flat cost ABOVE reserve's attainable max, so critical is
+   *    relief for a LOADED last route and never preempts an idle reserve.
+   */
+  _criticalCost(account, now = Date.now(), unlock = null, weeklyState = this._weeklyRawState(account)) {
+    if (weeklyState !== 'critical') return 0;
+    if (!unlock) return 0;
+    if (unlock.reason === 'prereset') {
+      const hours = this.scheduler.criticalPreResetHours || 1;
+      const floor = this.scheduler.criticalDrainFloorCost;
+      const bottom = -(this.scheduler.reserveFloorCost + 1);
+      const frac = unlock.etaMs != null ? Math.max(0, Math.min(1, 1 - unlock.etaMs / (hours * 3600_000))) : 1;
+      return floor + (bottom - floor) * frac;
+    }
+    return this.scheduler.criticalPressureCost;
+  }
+
+  /** TUI/status summary: { reason, etaMs } or null, without request context. */
+  criticalUnlockSummary(account, now = Date.now()) {
+    return this._criticalUnlock(account, { profile: 'claude' }, new Set(), null, now);
+  }
+
   _reserveCost(account, now = Date.now(), weeklyState = this._weeklyRawState(account)) {
     if (weeklyState !== 'reserve') return 0;
     const q = account.quota;
