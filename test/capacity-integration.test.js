@@ -753,7 +753,7 @@ test('M2: the page shows the LIVE ESTIMATE where no cycle has completed (real TU
   const tui = new TUI({ accountManager: am, config: {} });
   tui.capacityWindow = 'ses';
   const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(page, /~\s*607k ≈ est from 95% full/, 'the estimate renders (576,708 ÷ 0.95 ≈ 607k)');
+  assert.match(page, /[≥~]\s*607k est from 95% full/, 'the estimate renders (576,708 ÷ 0.95 ≈ 607k; ≥ when the join is unproven)');
   assert.match(page, /95% full/, 'naming the fullness it came from');
   assert.match(page, /measured after this window completes/, 'and what replaces it');
   assert.doesNotMatch(page, /may be from the previous window/, 'fresh reading → no stale caveat');
@@ -784,4 +784,29 @@ test('M4: a measured cycle still beats the estimate — the estimate never overw
   const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
   assert.match(page, /claude1\s+Anthropic\s+800k/, 'the measured column renders');
   assert.doesNotMatch(page, /~\s*200k/, 'no estimate row where data exists');
+});
+
+test('M6: a mid-window join renders ≥ (lower bound), the delta renders without it', () => {
+  const am = amWithOauth();
+  // late join, absolute fallback
+  am.accrueCapacity(0, { input: 400_000, output: 0 });
+  am.capacity.openCycle('claude1', 'ses').windowStartedAt = Date.now() - 3 * 3600_000;
+  am.accounts[0].quota.unified5h = 0.4;
+  am.capacity.noteUtilizationObserved(Date.now(), [{ name: 'claude1', window: 'ses', utilization: 0.4 }]);
+  let tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'ses';
+  let page = tui._renderCapacityPage(150).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(page, /≥\s*1\.0M/, 'the absolute-on-late-join renders as a lower bound');
+  assert.doesNotMatch(page, /Δ 40% full/, 'not claimed as delta');
+
+  // then a rising reading makes it a delta — no ≥ anymore
+  am.accrueCapacity(0, { input: 200_000, output: 0 });
+  am.accounts[0].quota.unified5h = 0.6;
+  am.capacity.noteUtilizationObserved(Date.now(), [{ name: 'claude1', window: 'ses', utilization: 0.6 }]);
+  tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'ses';
+  page = tui._renderCapacityPage(150).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(page, /~\s*1\.0M/, 'delta: 200k observed between marks ÷ 0.2 = 1.0M');
+  assert.match(page, /Δ 60% full/, 'labelled as delta');
+  assert.doesNotMatch(page, /≥\s*3\.0M/, 'no lower-bound sign on a delta');
 });

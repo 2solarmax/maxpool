@@ -2064,8 +2064,14 @@ export class TUI {
         if (est) {
           anyData = true;
           const caveat = est.fresh ? '' : ' (utilization reading may be from the previous window)';
-          out.push('  ' + name + ' ' + prov + ' ' + cyan('~' + formatTokens(est.tokens).padStart(CW - 1))
-            + dim(` ≈ est from ${(est.utilization * 100).toFixed(0)}% full${caveat} — measured after this window completes`));
+          // ≥ = absolute method on a window we joined late: the true tank is at least
+          // this. No ≥ when the delta method fired — it is join-independent, or the
+          // window was observed from its start.
+          const op = est.lowerBound ? '≥' : '~';
+          const via = est.method === 'delta'
+            ? `Δ ${(est.utilization * 100).toFixed(0)}% full` : `${(est.utilization * 100).toFixed(0)}% full`;
+          out.push('  ' + name + ' ' + prov + ' ' + cyan(op + formatTokens(est.tokens).padStart(CW - 1))
+            + dim(` est from ${via}${caveat} — measured after this window completes`));
         } else {
           out.push('  ' + name + ' ' + prov + ' ' + dim('no completed cycle yet'));
         }
@@ -2087,7 +2093,7 @@ export class TUI {
           : ' A session figure appears after an account\'s 5h window resets once.'));
     }
     out.push(' ' + dim('A cycle counts only if maxpool ran for all of it and the account stayed enabled.'));
-    out.push(' ' + dim('~ = estimated now from utilization (tokens ÷ % full); a measured column replaces it later.'));
+    out.push(' ' + dim('~ = estimated from utilization; ≥ = at least this (window joined late); Δ = exact-by-difference; measured replaces both.'));
     return out;
   }
 

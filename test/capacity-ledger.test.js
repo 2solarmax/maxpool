@@ -171,3 +171,53 @@ test('M1c: a stale utilization from the PREVIOUS window is marked not-fresh', ()
   const stale = l.estimateFromUtilization('a', 'ses', 0.10);
   assert.equal(stale.fresh, false, 'no reading was ever noted → cannot prove same-window');
 });
+
+// ── M5: the DELTA method — pre-join usage cancels, estimate is exact mid-window ──
+
+test('M5: delta method recovers the tank exactly despite a mid-window join', () => {
+  // The absolute method's blind spot, reproduced: a 3M tank with 1.8M spent BEFORE the
+  // ledger ever started counting. Absolute says 545k (2.2x understatement); delta says 3M.
+  const l = new CapacityLedger({ now: () => T0 });
+  const TANK = 3_000_000, PRE = 1_800_000;
+  l.accrue('a', { input: 100_000, output: 0 }, T0);      // first observed tokens
+  // The reading PAIRS with what has accrued at this instant: PRE + the 100k we saw.
+  const u1 = (PRE + 100_000) / TANK;
+  l.noteUtilizationObserved(T0, [{ name: 'a', window: 'ses', utilization: u1 }]);
+  l.accrue('a', { input: 300_000, output: 0 }, T0 + 3600_000);
+  const e = l.estimateFromUtilization('a', 'ses', (PRE + 400_000) / TANK);
+  assert.equal(e.method, 'delta', 'the delta branch fires');
+  assert.ok(Math.abs(e.tokens - TANK) < 0.02 * TANK, `~exact tank (got ${e.tokens})`);
+  assert.equal(e.fresh, true);
+});
+
+test('M5b: the mark resets when the window rolls — no cross-cycle differencing', () => {
+  const l = new CapacityLedger({ now: () => T0 });
+  l.accrue('a', { input: 10_000, output: 0 }, T0);
+  l.noteUtilizationObserved(T0, [{ name: 'a', window: 'ses', utilization: 0.1 }]);
+  // window rolls; a fresh cycle opens at a LOW utilization
+  l.closeCycle('a', 'ses', T0 + 1);
+  l.accrue('a', { input: 5_000, output: 0 }, T0 + 2);
+  const e = l.estimateFromUtilization('a', 'ses', 0.05);
+  assert.equal(e.method, 'absolute', 'a reading below the previous-cycle mark cannot delta — falls back');
+});
+
+test('M5c: rounded-percent noise is refused a denominator', () => {
+  // Vendors report whole percents. A 0.5pp move is rounding, not usage: 466 tokens ÷
+  // 0.005 would claim a 93k tank. The delta branch requires >=2pp.
+  const l = new CapacityLedger({ now: () => T0 });
+  l.accrue('a', { input: 466, output: 0 }, T0);
+  l.noteUtilizationObserved(T0, [{ name: 'a', window: 'ses', utilization: 0.10 }]);
+  l.accrue('a', { input: 466, output: 0 }, T0 + 1);
+  const e = l.estimateFromUtilization('a', 'ses', 0.105);
+  assert.equal(e.method, 'absolute', 'sub-2pp delta falls back to absolute');
+});
+
+test('M5d: the absolute fallback is flagged a lower bound when joined mid-window', () => {
+  const l = new CapacityLedger({ now: () => T0 });
+  l.accrue('a', { input: 400_000, output: 0 }, T0);
+  const open = l.openCycle('a', 'ses');
+  open.windowStartedAt = T0 - 3 * 3600_000;   // the window began 3h before we joined
+  const e = l.estimateFromUtilization('a', 'ses', 0.4);
+  assert.equal(e.method, 'absolute');
+  assert.equal(e.lowerBound, true, 'flagged — the UI renders ≥');
+});

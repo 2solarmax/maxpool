@@ -1,6 +1,10 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
 import { CapacityLedger } from './capacity-ledger.js';
 
+// Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
+// local table so account-manager does not import a private constant).
+const WINDOW_MS_BY_KIND = { ses: 5 * 3600_000, wk: 7 * 86400_000 };
+
 // A capacity window boundary must move by at least this much to count as a real
 // window ADVANCE rather than reset-stamp jitter (see noteCapacityWindowAdvance).
 const WINDOW_ADVANCE_EPSILON_MS = 60_000;
@@ -2701,9 +2705,12 @@ export class AccountManager {
     }
     this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour?.resetAt);
     this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay?.resetAt);
-    // Utilization readings feed the capacity ESTIMATE (tokens ÷ fullness). Noted even
-    // when null — a probe that carries no utilization is not evidence of anything.
-    this.capacity.noteUtilizationObserved();
+    // Utilization readings feed the capacity ESTIMATE. The probe path passes per-window
+    // marks so the DELTA method can difference consecutive readings.
+    this.capacity.noteUtilizationObserved(Date.now(), [
+      { name: account.name, window: 'ses', utilization: usage.fiveHour?.utilization },
+      { name: account.name, window: 'wk', utilization: usage.sevenDay?.utilization },
+    ]);
     // Only a SUCCESSFUL probe carrying the flag speaks to this. A header-driven update
     // can't see the limits[] array, and a FAILED read knows nothing about the account's
     // caps — either one claiming "uncapped" would mislabel a capped account as having no
@@ -2846,12 +2853,12 @@ export class AccountManager {
       q.weeklyAbsent = true;
     }
     q.lastProbeOkAt = Date.now();
-    // Stamp-advance close: a FRESHER reset stamp means the old window rolled over —
-    // the tokens accrued since the last close belong to the cycle that just ended.
-    // noteCapacityWindowAdvance already no-ops on a missing/unchanged/older stamp
-    // (same-window re-report, clock-skew backward re-report) — pass values through.
     this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.ses?.resetAt);
     this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.wk?.resetAt);
+    this.capacity.noteUtilizationObserved(Date.now(), [
+      { name: account.name, window: 'ses', utilization: usage.ses?.utilization },
+      { name: account.name, window: 'wk', utilization: usage.wk?.utilization },
+    ]);
   }
 
   /**
@@ -2877,6 +2884,17 @@ export class AccountManager {
   updateQuota(accountIndex, headers) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    // Utilization from RESPONSE HEADERS (every request) feeds the capacity estimate's
+    // delta marks too — header-driven moves arrive far more often than probe cycles.
+    const hdrU5 = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
+    const hdrU7 = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
+    if (!isNaN(hdrU5) || !isNaN(hdrU7)) {
+      this.capacity.noteUtilizationObserved(Date.now(), [
+        { name: account.name, window: 'ses', utilization: isNaN(hdrU5) ? undefined : clamp01(hdrU5) },
+        { name: account.name, window: 'wk', utilization: isNaN(hdrU7) ? undefined : clamp01(hdrU7) },
+      ]);
+    }
 
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
@@ -3046,6 +3064,16 @@ export class AccountManager {
       const pairs = a.type === 'provider'
         ? [['ses', 'providerSesReset'], ['wk', 'providerWkReset']]
         : [['ses', 'unified5hReset'], ['wk', 'unified7dReset']];
+      // Keep the open cycle's windowStartedAt fresh: a NEW reset stamp whose window
+      // start precedes the cycle's open means we joined mid-window (the absolute
+      // estimate is then only a lower bound — see the delta method).
+      for (const [win, stampKey] of pairs) {
+        const resetAt = q[stampKey];
+        const open = this.capacity.openCycle(a.name, win);
+        if (resetAt && open && open.startedAt > resetAt - WINDOW_MS_BY_KIND[win]) {
+          open.windowStartedAt = resetAt - WINDOW_MS_BY_KIND[win];
+        }
+      }
       for (const [win, stampKey] of pairs) {
         const resetAt = q[stampKey];
         // Close ONLY. This path deliberately does NOT null the stamp: the rollover

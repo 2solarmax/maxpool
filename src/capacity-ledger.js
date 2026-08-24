@@ -250,18 +250,71 @@ export class CapacityLedger {
     if (!(utilization > 0) || !(utilization < 1)) return null;
     const open = this.openCycle(name, window);
     if (!open || !(open.tokensSoFar > 0)) return null;
+
+    // DELTA METHOD (preferred). The absolute form (tokens ÷ utilization) silently
+    // assumes we watched the WHOLE window — false whenever the ledger joined late (a
+    // restart, a migration, a new account). Measured 2026-08-24: all four weekly
+    // estimates joined 8.9-95h into their window, so every one understated the tank,
+    // max@dubner.io by ~2x.
+    //
+    // Between two readings the tank is invariant, so pre-join usage cancels:
+    //     tank = (tokens observed between them) / (u2 - u1)
+    // No assumption about what happened before we started counting. Requires a rising
+    // utilization AND tokens accrued across the same span; falls back to absolute when
+    // we genuinely did watch from the start.
+    const mark = this._utilMarks?.get(`${name}:${window}`);
+    if (mark && utilization > mark.utilization) {
+      const deltaTokens = open.tokensSoFar - mark.tokensSoFar;
+      const deltaUtil = utilization - mark.utilization;
+      // A meaningful denominator only: a 0.5pp move on a coarse-rounded percentage
+      // (vendors report whole percents) turns rounding noise into a 200x multiplier.
+      if (deltaTokens > 0 && deltaUtil >= 0.02) {
+        return {
+          tokens: Math.round(deltaTokens / deltaUtil),
+          utilization, fresh: true, method: 'delta',
+          basis: { deltaTokens, deltaUtil },
+        };
+      }
+    }
     // Fresh = we can prove the reading and the accrual describe the SAME window: the
     // reading arrived after the open cycle began. A reading that predates the cycle (or
     // was never noted at all) describes the previous window — mark it and let the UI
     // caveat it, never silently trust it.
     const fresh = this._utilObservedAt > 0 && open.startedAt != null && this._utilObservedAt >= open.startedAt;
-    return { tokens: Math.round(open.tokensSoFar / utilization), utilization, fresh };
+    // ABSOLUTE fallback. Only a LOWER BOUND unless we observed the window from its very
+    // start — flagged so the UI can say "≥" rather than present a floor as the answer.
+    const wholeWindow = open.startedAt != null && open.windowStartedAt != null
+      && open.startedAt <= open.windowStartedAt + 60_000;
+    return {
+      tokens: Math.round(open.tokensSoFar / utilization),
+      utilization, fresh, method: 'absolute', lowerBound: !wholeWindow,
+    };
   }
 
   /** Record when a utilization reading arrived, so estimateFromUtilization can tell
    *  same-window freshness from a stale previous-window reading. */
-  noteUtilizationObserved(at = this._now()) {
+  noteUtilizationObserved(at = this._now(), marks = null) {
     this._utilObservedAt = at;
+    // Snapshot (utilization, tokensSoFar) per account+window so the NEXT reading can be
+    // differenced against it. `marks` is [{name, window, utilization}] from the caller,
+    // which owns the per-account-type quota fields.
+    if (!marks) return;
+    this._utilMarks = this._utilMarks || new Map();
+    for (const m of marks) {
+      if (!(m.utilization >= 0) || !(m.utilization < 1)) continue;
+      const open = this.openCycle(m.name, m.window);
+      if (!open) continue;
+      const key = `${m.name}:${m.window}`;
+      const prev = this._utilMarks.get(key);
+      // Keep the OLDEST usable mark within this cycle: a wider span means a larger
+      // denominator and less rounding sensitivity. Reset when the cycle rolls.
+      if (!prev || prev.cycleStartedAt !== open.startedAt || m.utilization < prev.utilization) {
+        this._utilMarks.set(key, {
+          utilization: m.utilization, tokensSoFar: open.tokensSoFar,
+          cycleStartedAt: open.startedAt, at,
+        });
+      }
+    }
   }
 
   // ── Queries ─────────────────────────────────────────────────────────────────
