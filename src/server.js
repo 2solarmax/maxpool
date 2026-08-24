@@ -1657,7 +1657,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
+export const __serverTest = { reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -1905,6 +1905,52 @@ function describeRejectedBlock(body, errorBody) {
   }
 }
 
+/** Anthropic (2026-08) accepts a mid-array `system` message under one positional rule,
+ *  stated verbatim in its own 400:
+ *    "role 'system' must precede an 'assistant' message or end the array; the
+ *     directive-only form (content: [] with output_config) is accepted at any position"
+ *
+ *  Both transcript repairs DROP a turn whose content strips empty. When that turn is the
+ *  assistant anchoring a preceding system, the system is orphaned and the NEXT request
+ *  400s — and because the repair LATCHES the session (markSessionThinkingContaminated →
+ *  the pre-strip at retryCount===0), the orphaning recurs on every later turn. The
+ *  ordering 400 is not an isSignatureRejection, so it never reaches the recovery branches
+ *  or the friendly give-up message: it surfaces raw and the session is bricked. Measured
+ *  2026-08-24: "stripped 21 provider thinking block(s)" at 06:12:13.278Z → that exact 400
+ *  at 06:12:13.835Z, 4 occurrences in one day.
+ *
+ *  RE-ANCHOR, never drop the system. A system message carries load-bearing directives;
+ *  deleting one silently changes the user's session with no signal — a worse defect than
+ *  the loud 400. The placeholder reuses the `(content removed)` string this file already
+ *  emits for the messages[0] guard, so it is an established shape here, not a new one.
+ *
+ *  Runs as a POST-PASS over the rebuilt array so it fires only on real violations:
+ *   - a system that ENDS the array is legal ("or end the array") — untouched
+ *   - a system already followed by an assistant is legal — untouched
+ *   - the directive-only form (content: [] + output_config) is legal ANYWHERE — untouched
+ *  Idempotent: a second run finds no violation, so the latched re-strip cannot grow the
+ *  transcript turn after turn.
+ */
+function reanchorOrphanedSystemMessages(messages) {
+  let inserted = 0;
+  const out = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    out.push(msg);
+    if (msg?.role !== 'system') continue;
+    const next = messages[i + 1];
+    if (next === undefined) continue;                       // ends the array — legal
+    if (next?.role === 'assistant') continue;               // already anchored — legal
+    // The directive-only form is accepted at any position; re-anchoring it would mutate
+    // a transcript the API already accepts.
+    if (Array.isArray(msg.content) && msg.content.length === 0) continue;
+    out.push({ role: 'assistant', content: [{ type: 'text', text: '(content removed)' }] });
+    inserted++;
+  }
+  return { messages: out, inserted };
+}
+
+
 /**
  * Last-resort repair driven by the upstream's own coordinate, for a rejected block no
  * shape heuristic here recognised. Removes every block sharing the rejected block's
@@ -1951,7 +1997,7 @@ function stripRejectedBlockClass(body, errorBody) {
       messages.push({ ...msg, content: kept });
     }
     if (!removed) return { body: null, removed: 0, type };
-    json.messages = messages;
+    json.messages = reanchorOrphanedSystemMessages(messages).messages;
     return { body: Buffer.from(JSON.stringify(json)), removed, type };
   } catch {
     return { body: null, removed: 0, type: null };
@@ -2129,7 +2175,7 @@ function stripForeignThinkingBlocks(body) {
       messages.push({ ...msg, content: kept });
     }
     if (!removed && !converted) return { body: null, removed: 0, converted: 0 };
-    json.messages = messages;
+    json.messages = reanchorOrphanedSystemMessages(messages).messages;
     return { body: Buffer.from(JSON.stringify(json)), removed, converted };
   } catch {
     return { body: null, removed: 0, converted: 0 };   // non-JSON / unparseable → no rewrite
