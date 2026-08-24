@@ -147,10 +147,10 @@ export class CapacityLedger {
    *  M3 in the pre-mortem — Anthropic interim deltas are CUMULATIVE, so the SSE seam
    *  passes the running max, and this adds it exactly once per request).
    *  count_tokens requests are the CALLER's job to skip (M4) — they never reach here. */
-  accrue(name, { input, output }, at = this._now()) {
+  accrue(name, { input, output }, at = this._now(), windows = ['ses', 'wk']) {
     if (!(input > 0) && !(output > 0)) return;
     const rec = this._rec(name);
-    for (const w of ['ses', 'wk']) {
+    for (const w of windows) {
       // Open the window lazily if nothing is open (a mid-cycle boot or a window whose
       // reset stamp was never learned). startedAt is the accrual time then — the cycle
       // will be flagged partial by the caller if the boot gap warrants it (B1/B2).

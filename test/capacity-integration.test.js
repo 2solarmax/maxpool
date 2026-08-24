@@ -826,3 +826,72 @@ test('M6: a mid-window join renders ≥ (lower bound), the delta renders without
   assert.match(page, /Δ 60% full/, 'labelled as delta');
   assert.doesNotMatch(page, /≥\s*3\.0M/, 'no lower-bound sign on a delta');
 });
+
+// ── W-lane: the no-weekly account's weekly view (user directive 2026-08-24:
+//    "some kind of an approximation from the session limits") ────────────────────
+
+function amWithLegacyGlm() {
+  const am = new AM([{ name: 'glm-legacy', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  am.accounts[0].quota.weeklyAbsent = true;
+  return am;
+}
+
+test('W1: a no-weekly plan accrues sessions and day buckets but NEVER opens a wk cycle', () => {
+  const am = amWithLegacyGlm();
+  am.accrueCapacity(0, { input: 1_000_000, output: 0 });
+  assert.ok(am.capacity.openCycle('glm-legacy', 'ses'), 'the session cycle accrues');
+  assert.equal(am.capacity.openCycle('glm-legacy', 'wk'), null, 'no weekly cycle — it could never close');
+  assert.equal(am.capacity.rollingThroughput('glm-legacy', 7).tokens, 1_000_000, 'the 7d volume still accrues');
+});
+
+test('W2: a legacy stuck wk cycle is retired as soon as the plan proves no-weekly', () => {
+  // Cycles opened before the probe confirmed weeklyAbsent must not sit open forever —
+  // the stuck-open invariant false-alarms at ~12d.
+  const am = amWithLegacyGlm();
+  am.capacity.accrue('glm-legacy', { input: 50_000, output: 0 }, Date.now() - 13 * 86400_000); // both windows
+  am.closeExpiredCapacityCycles();                    // the sweep sees weeklyAbsent
+  assert.equal(am.capacity.openCycle('glm-legacy', 'wk'), null, 'retired');
+  const closed = am.capacity.serialize().accounts['glm-legacy'].wk.closed;
+  assert.equal(closed.length, 1, 'kept as history');
+  assert.equal(closed[0].complete, false);
+  assert.equal(closed[0].partialReason, 'no-weekly-plan', 'and labelled why');
+});
+
+test('W3: the weekly row shows the SESSION-DERIVED ceiling, not a fabricated cap', () => {
+  const am = amWithLegacyGlm();
+  // two real session windows, DISTINCT boundaries 5h apart (a shared boundary folds)
+  let off = 2;
+  for (const tok of [600_000, 771_000]) {
+    const b = Date.now() - off-- * 5 * 3600_000;
+    am.capacity.accrue('glm-legacy', { input: tok, output: 0 }, b - 5 * 3600_000);
+    am.accounts[0].quota.providerSesReset = b;
+    am.closeExpiredCapacityCycles();
+  }
+  am.accrueCapacity(0, { input: 1_000_000, output: 0 });
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'wk';
+  const page = tui._renderCapacityPage(170).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(page, /no weekly limit/, 'named as such');
+  assert.match(page, /≈23M\/wk ceiling/, '≈33.6 × ~686k avg');
+  assert.match(page, /34 sessions × 686k/, 'the derivation is visible (33.6 rounded, avg10 685,500 → 686k)');
+  assert.match(page, /7d volume 2\.4M/, 'and what it actually moved (600k + 771k + 1M in flight)');
+});
+
+test('W4: no measured session capacity yet → volume only, never a fabricated ceiling', () => {
+  const am = amWithLegacyGlm();
+  am.accrueCapacity(0, { input: 5_000, output: 0 });
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'wk';
+  const page = tui._renderCapacityPage(170).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  const row = page.split('\n').find(l => l.includes('glm-legacy'));
+  assert.match(row, /7d volume 5k/);
+  assert.doesNotMatch(row, /ceiling/, 'no session history → no multiplier base → no ceiling');
+});
+
+test('W5: a CAPPED provider is untouched — still opens wk cycles', () => {
+  const am = new AM([{ name: 'glm-capped', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  // weeklyAbsent false/undefined
+  am.accrueCapacity(0, { input: 100, output: 0 });
+  assert.ok(am.capacity.openCycle('glm-capped', 'wk'), 'the weekly cycle still accrues');
+  assert.equal(am.capacity.openCycle('glm-capped', 'wk').tokensSoFar, 100);
+});

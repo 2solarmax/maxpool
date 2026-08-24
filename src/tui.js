@@ -2040,18 +2040,27 @@ export class TUI {
       const name = truncate(a.name, nameW).padEnd(nameW);
       const prov = gray(providerLabel(a).padEnd(PROVIDER_W));
       if (noWeekly) {
-        // No weekly limit — the favourite legacy plan. There is no cycle to complete,
-        // so a capacity number would be a fiction. Show what it actually DID move.
+        // No weekly limit — the favourite legacy plan. There is no weekly CAP, so a
+        // measured weekly capacity is a fiction; but there IS a real ceiling: the 5h
+        // session limit gates throughput, capping the week at (windows/wk × session
+        // capacity). 33.6 five-hour windows fit in 7 days — the user's own
+        // approximation ("from the session limits"), shipped as a ceiling, never a cap.
         const t = ledger.rollingThroughput(a.name, 7);
+        const ses = ledger.windowStats(a.name, 'ses');
+        const windowsPerWk = (7 * 24) / 5;
         anyData = anyData || t.tokens > 0;
         const vol = t.tokens > 0 ? formatTokens(t.tokens) : '--';
+        // The ceiling needs a measured session capacity; without one it would multiply
+        // a guess — show the volume alone rather than fabricate the headline.
+        const ceiling = ses ? ` · ≈${formatTokens(Math.round(windowsPerWk * ses.avg10))}/wk ceiling`
+                          + dim(` (${windowsPerWk.toFixed(0)} sessions × ${formatTokens(ses.avg10)})`) : '';
         // Always disclose the window's age boundary: today is unfinished, so the 7d
         // figure grows through the day; a genuinely partial day adds the ≤-observed floor.
         const note = t.partial
           ? ' (≤ observed — maxpool was down part of the window; includes today, in progress)'
           : ' (includes today, in progress)';
         out.push('  ' + name + ' ' + prov + ' '
-          + cyan(`no weekly limit · 7d volume ${vol}`) + dim(note));
+          + cyan(`no weekly limit · 7d volume ${vol}`) + yellow(ceiling) + dim(note));
         continue;
       }
       const st = ledger.windowStats(a.name, win);
@@ -2093,7 +2102,7 @@ export class TUI {
           : ' A session figure appears after an account\'s 5h window resets once.'));
     }
     out.push(' ' + dim('A cycle counts only if maxpool ran for all of it and the account stayed enabled.'));
-    out.push(' ' + dim('~ = estimated from utilization; ≥ = at least this (window joined late); Δ = exact-by-difference; measured replaces both.'));
+    out.push(' ' + dim('~ = estimated from utilization; ≥ = at least this (window joined late); Δ = exact-by-difference; ≈/wk ceiling = session rate, not a cap.'));
     return out;
   }
 

@@ -3055,7 +3055,13 @@ export class AccountManager {
   accrueCapacity(accountIndex, { input = 0, output = 0 } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
-    this.capacity.accrue(account.name, { input, output });
+    // A no-weekly plan (z.ai legacy TOKENS_LIMIT, weeklyAbsent) has no weekly window to
+    // measure, so opening a wk cycle only creates a cycle that can NEVER close — dead
+    // weight that grows until the stuck-open invariant false-alarms (~12d). Session
+    // window + day buckets (the 7d volume) are the real signals for such accounts.
+    const windows = account.type === 'provider' && account.quota?.weeklyAbsent
+      ? ['ses'] : ['ses', 'wk'];
+    this.capacity.accrue(account.name, { input, output }, undefined, windows);
   }
 
   /** Close any window cycle whose reset time has passed — CLOCK-AUTHORITATIVE, so a
@@ -3068,6 +3074,18 @@ export class AccountManager {
       const pairs = a.type === 'provider'
         ? [['ses', 'providerSesReset'], ['wk', 'providerWkReset']]
         : [['ses', 'unified5hReset'], ['wk', 'unified7dReset']];
+      // A no-weekly plan's wk cycle can never close (no stamp will ever arrive).
+      // Retire it as an explicitly-labelled partial so it stops occupying the open slot
+      // and never trips the stuck-open invariant. Reachable for cycles opened before
+      // the plan was confirmed no-weekly.
+      if (a.type === 'provider' && q.weeklyAbsent) {
+        const wkOpen = this.capacity.openCycle(a.name, 'wk');
+        if (wkOpen) {
+          wkOpen.complete = false;
+          wkOpen.partialReason = 'no-weekly-plan';
+          this.capacity.closeCycle(a.name, 'wk', now, {});
+        }
+      }
       // Keep the open cycle's windowStartedAt fresh: a NEW reset stamp whose window
       // start precedes the cycle's open means we joined mid-window (the absolute
       // estimate is then only a lower bound — see the delta method).
