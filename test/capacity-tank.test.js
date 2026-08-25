@@ -203,3 +203,18 @@ test('T6: capacityTank prefers measured cycles and falls back to the live window
   assert.equal(measured.source, 'cycles', 'a completed cycle outranks the live estimate');
   assert.ok(measured.avg > 0);
 });
+
+test('T7: the LIVE estimate obeys the same rounding floor as closed cycles', () => {
+  // A 1%-full open window read "≥45M" on the live page (2026-08-25): the closed-cycle
+  // guard existed, the live fallback lacked it. Both must share TANK_MIN_UTIL.
+  const am = amWith({ name: 'c3', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 });
+  am.accrueCapacity(0, { input: 455_000, output: 0 });
+  am.accounts[0].quota.unified5h = 0.01;
+  am.capacity.noteUtilizationObserved();
+  assert.equal(am.capacityTank(0, 'ses'), null, 'no tank from a 1% reading');
+  am.accounts[0].quota.unified5h = 0.05;
+  am.capacity.noteUtilizationObserved();
+  const t = am.capacityTank(0, 'ses');
+  assert.ok(t, 'a 5% reading is usable');
+  assert.equal(t.avg, 9_100_000, '455k ÷ 0.05');
+});

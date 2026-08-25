@@ -35,6 +35,14 @@ const SAME_BOUNDARY_MS = 5_000;
 // The minimum span of a COMPLETE cycle per window (80% of nominal): a real one is
 // flagged partial by the writer, so a complete cycle below this is corrupt history.
 const READ_FLOOR_MS = { ses: 4 * 3600_000, wk: 5 * 86400_000 };
+
+// TANK floor. tank = tokens ÷ utilization, and vendors report WHOLE percents — so at
+// 1% full, one percentage point of rounding swings the answer by 100% (measured live
+// 2026-08-25: a 1%-full window read "≥45M"). Below this the reading is rounding noise,
+// not a measurement. Exported because BOTH the closed-cycle average and the live
+// in-window estimate must apply the same floor; one guarding without the other is how
+// the absurd number reached the screen in the first place.
+export const TANK_MIN_UTIL = 0.05;
 const MAX_CYCLES_PER_WINDOW = 50;
 const MAX_DAY_BUCKETS = 10;
 
@@ -404,7 +412,7 @@ export class CapacityLedger {
     const usable = (rec?.[window]?.closed || []).filter(c =>
       c.complete && !c.disabledDuring
       && Number.isFinite(c.finalUtilization)
-      && c.finalUtilization >= 0.05
+      && c.finalUtilization >= TANK_MIN_UTIL
       && (c.endedAt - c.startedAt) >= floor - 1_000);
     if (!usable.length) return null;
     let sum = 0, exact = 0, bounded = 0;

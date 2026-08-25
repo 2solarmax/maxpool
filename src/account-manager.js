@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
-import { CapacityLedger } from './capacity-ledger.js';
+import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
 
 // Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
 // local table so account-manager does not import a private constant).
@@ -3299,6 +3299,10 @@ export class AccountManager {
     if (measured) return { ...measured, source: 'cycles' };
     const est = this.capacityEstimate(accountIndex, window);
     if (!est) return null;
+    // Same rounding-noise guard as tankStats: a 1%-full window divides by vendor
+    // whole-percent rounding and can read absurd (measured live: 455k ÷ 1% = "≥45M").
+    // Below the floor the reading is noise — withhold rather than print a fiction.
+    if (est.utilization < TANK_MIN_UTIL) return null;
     return {
       avg: est.tokens, last: est.tokens, n: 0, exact: est.lowerBound ? 0 : 1,
       bounded: est.lowerBound ? 1 : 0, lowerBound: Boolean(est.lowerBound),

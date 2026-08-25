@@ -2089,13 +2089,14 @@ export class TUI {
         continue;
       }
       const st = ledger.windowStats(a.name, win);
-      let tank = this.am.capacityTank?.(i, win);
+      const tank = this.am.capacityTank?.(i, win);
       const nowOpen = ledger.openCycle(a.name, win);
       const util = this.am._windowUtilization?.(a, win);
-      // A reading we cannot prove is from THIS window must not badge the capacity
-      // number as "live" — it may describe the previous window entirely (the estimate
-      // still renders; the basis line just stops claiming freshness it can't prove).
-      if (tank?.source === 'live' && tank.fresh === false) tank = null;
+      // A reading we cannot prove is from THIS window may describe the previous one —
+      // the basis line says "unproven" instead of "live", but the number still renders:
+      // a restored reading after a restart is real data, and suppressing it would blank
+      // the page at exactly the moment the user opens it.
+      const unproven = tank?.source === 'live' && tank.fresh === false;
 
       // A row with NEITHER a tank nor any delivery has genuinely nothing to say. Say
       // WHY in the account's own terms — "no completed cycle yet" was true and useless
@@ -2131,7 +2132,7 @@ export class TUI {
       const basis = !tank ? dim('no capacity reading yet')
         : tank.source === 'cycles'
           ? dim(`${tank.n} full ${tank.n === 1 ? 'window' : 'windows'}`)
-          : dim(`live · ${((tank.utilization ?? 0) * 100).toFixed(0)}% used`);
+          : dim(`${unproven ? 'from an older reading' : 'live'} · ${((tank.utilization ?? 0) * 100).toFixed(0)}% used`);
       const pct = util != null && tank?.source !== 'live' ? dim(` (${(util * 100).toFixed(0)}% full now)`) : '';
       out.push('  ' + name + ' ' + prov + ' ' + cyan(cells) + '  ' + basis + pct);
     }
