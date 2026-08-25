@@ -152,7 +152,7 @@ test('X11: pressure cost must outrank even a CHEAP reserve (the 5-19 band pin)',
   am.accounts[1].quota.unified7d = 0.96;
   am.accounts[1].quota.unified7dReset = Date.now() + 3 * 86400_000;
   // force the pressure condition: everything else congested
-  const third = oauth('loaded', { priority: 0 });
+  const _third = oauth('loaded', { priority: 0 });
   const am2 = amWith([oauth('resv', { priority: 0 }), oauth('crit', { priority: 0 })], {});
   am2.markRateLimited = am.markRateLimited; // noop guard
   // simpler: bench nothing, instead saturate by adding a loaded account is not needed —

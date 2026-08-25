@@ -624,7 +624,7 @@ test('L1: an ALREADY-EXPIRED stamp from a late probe closes at NOW, never a sliv
   // when applied; the clock-close then honored the stale stamp and recorded a
   // 14.6-minute "complete cycle" of 21k tokens. A cycle that short is never real.
   const am = new AM([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
-  const idx = 0;
+  const _idx = 0;
   const startedAgo = 5 * 3600_000;
   // Simulate: a real 5h-old open cycle, a probe stamp that expired 30s ago.
   // A real 5h-old open cycle (startedAt back-dated) + a probe stamp that expired 30s ago.

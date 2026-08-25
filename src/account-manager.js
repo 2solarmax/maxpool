@@ -2667,7 +2667,7 @@ export class AccountManager {
    *                  in-window) and criticalPeakUnlock is enabled. Default off.
    * Precedence prereset > pressure > peak: the cheaper drain wins.
    */
-  _criticalUnlock(account, requestInfo = {}, excludedIndexes = new Set(), pressureCache = null, now = Date.now()) {
+  _criticalUnlock(account, requestInfo = {}, excludedIndexes = new Set(), _pressureCache = null, now = Date.now()) {
     const state = this._weeklyRawState(account);
     if (state !== 'critical') return null;
 
@@ -2736,7 +2736,7 @@ export class AccountManager {
    *  - pressure/peak: a flat cost ABOVE reserve's attainable max, so critical is
    *    relief for a LOADED last route and never preempts an idle reserve.
    */
-  _criticalCost(account, now = Date.now(), unlock = null, weeklyState = this._weeklyRawState(account)) {
+  _criticalCost(account, _now = Date.now(), unlock = null, weeklyState = this._weeklyRawState(account)) {
     if (weeklyState !== 'critical') return 0;
     if (!unlock) return 0;
     if (unlock.reason === 'prereset') {

@@ -164,7 +164,6 @@ test('score: at session util in the reserve band the reserve floor is NOT discou
   // floor would silently soften exactly where quota is lowest.
   const am = makeAm();
   const unltd = am.accounts[0];
-  const ctx = am._scoringContext();
   unltd.quota.providerSes = 0.87;
   const state = am._weeklyRawState(unltd);
   assert.equal(state, 'reserve', 'fixture: weeklyAbsent at ses 0.87 is reserve');
