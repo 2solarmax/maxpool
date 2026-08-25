@@ -895,3 +895,28 @@ test('W5: a CAPPED provider is untouched — still opens wk cycles', () => {
   assert.ok(am.capacity.openCycle('glm-capped', 'wk'), 'the weekly cycle still accrues');
   assert.equal(am.capacity.openCycle('glm-capped', 'wk').tokensSoFar, 100);
 });
+
+test('V1: every row with an open window shows the LIVE now-tag that tracks accrual', () => {
+  // Reported 2026-08-25: "they don't seem to be updating at all" — the columns only
+  // move at window close, and the one number that ticks (the open cycle) wasn't
+  // rendered. Now every row with an open window carries '▸ <tokens>'.
+  const am = amWithOauth();
+  am.accrueCapacity(0, { input: 800_000, output: 0 });
+  am.accounts[0].quota.unified5hReset = Date.now() - 5 * 3600_000;
+  am.accounts[0].quota.unified5h = 0.9;
+  am.refreshExpiredQuotas();
+  am.accrueCapacity(0, { input: 15_000, output: 0 });      // open window ticking
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'ses';
+  const page = tui._renderCapacityPage(160).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(page, /▸ 15k/, 'the open window renders live');
+});
+
+test('V2: a row with no open cycle gets no now-tag', () => {
+  const am = amWithOauth();
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'ses';
+  const page = tui._renderCapacityPage(160).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  const row = page.split('\n').find(l => l.includes('claude1'));
+  assert.doesNotMatch(row, /▸/, 'nothing ticks when no window is open');
+});

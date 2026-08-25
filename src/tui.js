@@ -2082,6 +2082,12 @@ export class TUI {
         // being an estimate. `~` marks it; a measured column replaces it after the first
         // full window. A stale-util caveat only when we cannot prove same-window.
         const est = this.am.capacityEstimate?.(i, win);
+        // LIVE now-column: the open cycle is the only number that moves between window
+        // closes, and without it the page read as frozen (reported 2026-08-25: "they
+        // don't seem to be updating at all"). Rendered on every row that has one.
+        const nowOpen = ledger.openCycle(a.name, win);
+        const nowTag = nowOpen && nowOpen.tokensSoFar > 0
+          ? ' ' + yellow(`▸ ${formatTokens(nowOpen.tokensSoFar)} this window`) : '';
         if (est) {
           anyData = true;
           const caveat = est.fresh ? '' : ' (utilization reading may be from the previous window)';
@@ -2092,16 +2098,19 @@ export class TUI {
           const via = est.method === 'delta'
             ? `Δ ${(est.utilization * 100).toFixed(0)}% full` : `${(est.utilization * 100).toFixed(0)}% full`;
           out.push('  ' + name + ' ' + prov + ' ' + cyan(op + formatTokens(est.tokens).padStart(CW - 1))
-            + dim(` est from ${via}${caveat} — measured after this window completes`));
+            + dim(` est from ${via}${caveat} — measured after this window completes`) + nowTag);
         } else {
-          out.push('  ' + name + ' ' + prov + ' ' + dim('no completed cycle yet'));
+          out.push('  ' + name + ' ' + prov + ' ' + dim('no completed cycle yet') + nowTag);
         }
         continue;
       }
       anyData = true;
       const all = { Last: st.last, Prev: st.prev, 'Prev-1': st.prev1, 'Avg 3': st.avg3, 'Avg 10': st.avg10, 'All time': st.allTime };
       const cells = COLS.map(c => formatTokens(all[c]).padStart(CW)).join('');
-      out.push('  ' + name + ' ' + prov + ' ' + cells + '  ' + dim(String(st.cycles)));
+      const nowOpen = ledger.openCycle(a.name, win);
+      const nowTag = nowOpen && nowOpen.tokensSoFar > 0
+        ? ' ' + yellow(`▸ ${formatTokens(nowOpen.tokensSoFar)}`) : '';
+      out.push('  ' + name + ' ' + prov + ' ' + cells + '  ' + dim(String(st.cycles)) + nowTag);
     }
 
     out.push('');
@@ -2114,7 +2123,7 @@ export class TUI {
           : ' A session figure appears after an account\'s 5h window resets once.'));
     }
     out.push(' ' + dim('A cycle counts only if maxpool ran for all of it and the account stayed enabled.'));
-    out.push(' ' + dim('~ = estimated from utilization; ≥ = at least this (window joined late); Δ = exact-by-difference; ≈/wk ceiling = session rate, not a cap.'));
+    out.push(' ' + dim('~ = estimated; ≥ = at least; Δ = exact-by-difference; ≈/wk = session-rate ceiling; ▸ = live this window.'));
     return out;
   }
 
