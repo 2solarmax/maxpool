@@ -1134,7 +1134,10 @@ export class AccountManager {
     // disappears (without this, OAuth cycles essentially never close: red-team 2026-08-22).
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
       console.log(`[Maxpool] Account "${account.name}" session quota reset`);
-      this.capacity?.closeCycle?.(account.name, 'ses', q.unified5hReset, { resetAt: q.unified5hReset });
+      // TANK: q.unified5h is still the CLOSING window's fullness here — the nulls below
+      // come after. Snapshot into the cycle before the rollover wipes it.
+      this.capacity?.closeCycle?.(account.name, 'ses', q.unified5hReset,
+        { resetAt: q.unified5hReset, finalUtilization: q.unified5h });
       q.unified5h = null;
       q.unified5hReset = null;
       changed = true;
@@ -1142,7 +1145,8 @@ export class AccountManager {
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[Maxpool] Account "${account.name}" weekly quota reset`);
-      this.capacity?.closeCycle?.(account.name, 'wk', q.unified7dReset, { resetAt: q.unified7dReset });
+      this.capacity?.closeCycle?.(account.name, 'wk', q.unified7dReset,
+        { resetAt: q.unified7dReset, finalUtilization: q.unified7d });
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
@@ -2915,10 +2919,14 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
-    // CAPACITY LEDGER: prev stamps, so a probe observing the window ADVANCE closes
-    // the old cycle (the OAuth twin of the applyProviderUsage hook).
+    // CAPACITY LEDGER: prev stamps AND prev utilizations, so a probe observing the
+    // window ADVANCE closes the old cycle with the OLD window's tank reading —
+    // snapshot BEFORE the writes below clobber the fields with the new window's
+    // values (the OAuth twin of the applyProviderUsage hook).
     const prevSesReset = q.unified5hReset;
     const prevWkReset = q.unified7dReset;
+    const prevSesUtil = q.unified5h;
+    const prevWkUtil = q.unified7d;
 
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = clamp01(usage.fiveHour.utilization);
@@ -2928,8 +2936,8 @@ export class AccountManager {
       if (usage.sevenDay.utilization != null) q.unified7d = clamp01(usage.sevenDay.utilization);
       if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
     }
-    this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour?.resetAt);
-    this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay?.resetAt);
+    this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour?.resetAt, prevSesUtil);
+    this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay?.resetAt, prevWkUtil);
     // Utilization readings feed the capacity ESTIMATE. The probe path passes per-window
     // marks so the DELTA method can difference consecutive readings.
     this.capacity.noteUtilizationObserved(Date.now(), [
@@ -3046,11 +3054,14 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;
     const q = account.quota;
-    // CAPACITY LEDGER: snapshot the previous reset stamps so a probe observing the
-    // window ADVANCE (new stamp) closes the capacity cycle at the old boundary —
-    // covers windows whose old stamp was never learned (clock-close can't fire).
+    // CAPACITY LEDGER: snapshot the previous reset stamps AND utilizations so a probe
+    // observing the window ADVANCE (new stamp) closes the capacity cycle at the old
+    // boundary WITH the old window's tank reading — covers windows whose old stamp
+    // was never learned (clock-close can't fire). Snapshot before the writes below.
     const prevSesReset = q.providerSesReset;
     const prevWkReset = q.providerWkReset;
+    const prevSesUtil = q.providerSes;
+    const prevWkUtil = q.providerWk;
     if (usage.error) {
       // Distinguish "no pollable quota" (Kimi) from a transient probe failure.
       // Never clear existing values on a transient error — let them age into the
@@ -3078,8 +3089,8 @@ export class AccountManager {
       q.weeklyAbsent = true;
     }
     q.lastProbeOkAt = Date.now();
-    this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.ses?.resetAt);
-    this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.wk?.resetAt);
+    this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.ses?.resetAt, prevSesUtil);
+    this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.wk?.resetAt, prevWkUtil);
     this.capacity.noteUtilizationObserved(Date.now(), [
       { name: account.name, window: 'ses', utilization: usage.ses?.utilization },
       { name: account.name, window: 'wk', utilization: usage.wk?.utilization },
@@ -3277,6 +3288,24 @@ export class AccountManager {
     return this.capacity.estimateFromUtilization(a.name, window, util) || null;
   }
 
+  /** Measured TANK for an account+window: capacity, not delivery. Prefers completed
+   *  cycles (tokens ÷ closing utilization, averaged); falls back to the live open
+   *  window's estimate so a row is useful from minute one instead of reading
+   *  "no completed cycle yet" while the vendor is plainly reporting a percentage. */
+  capacityTank(accountIndex, window) {
+    const a = this.accounts[accountIndex];
+    if (!a) return null;
+    const measured = this.capacity.tankStats(a.name, window);
+    if (measured) return { ...measured, source: 'cycles' };
+    const est = this.capacityEstimate(accountIndex, window);
+    if (!est) return null;
+    return {
+      avg: est.tokens, last: est.tokens, n: 0, exact: est.lowerBound ? 0 : 1,
+      bounded: est.lowerBound ? 1 : 0, lowerBound: Boolean(est.lowerBound),
+      source: 'live', utilization: est.utilization, method: est.method, fresh: est.fresh,
+    };
+  }
+
   accrueCapacity(accountIndex, { input = 0, output = 0 } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
@@ -3287,6 +3316,18 @@ export class AccountManager {
     const windows = account.type === 'provider' && account.quota?.weeklyAbsent
       ? ['ses'] : ['ses', 'wk'];
     this.capacity.accrue(account.name, { input, output }, undefined, windows);
+  }
+
+  /** The vendor's CURRENT fullness reading for a window — the tank numerator's
+   *  denominator. Returns null when unreadable (a null reading divides nothing and
+   *  must never coerce to 0, which would make tank = Infinity). */
+  _windowUtilization(account, window) {
+    const q = account?.quota;
+    if (!q) return null;
+    const v = account.type === 'provider'
+      ? (window === 'wk' ? q.providerWk : q.providerSes)
+      : (window === 'wk' ? q.unified7d : q.unified5h);
+    return Number.isFinite(v) && v >= 0 ? v : null;
   }
 
   /** Close any window cycle whose reset time has passed — CLOCK-AUTHORITATIVE, so a
@@ -3332,7 +3373,14 @@ export class AccountManager {
         // here as well (round-2) made a prober-first notice silently swallow all of
         // those whenever the sweep won the race (red-team round 3, RT3-1).
         if (resetAt && now >= resetAt) {
-          this.capacity.closeCycle(a.name, win, resetAt, { resetAt });
+          this.capacity.closeCycle(a.name, win, resetAt, {
+            resetAt,
+            // TANK: the vendor's own fullness for the window we are closing. Read it
+            // BEFORE _clearExpiredQuotas nulls it — this sweep runs first by design
+            // (see the close-only note above), which is exactly why the reading is
+            // still the CLOSING window's and not the new one's.
+            finalUtilization: this._windowUtilization(a, win),
+          });
         }
       }
     }
@@ -3340,7 +3388,7 @@ export class AccountManager {
 
   /** Close a cycle because a probe observed the window ADVANCE (a new reset stamp) —
    *  covers the case where the old stamp was never learned. */
-  noteCapacityWindowAdvance(accountName, window, prevResetAt, nextResetAt) {
+  noteCapacityWindowAdvance(accountName, window, prevResetAt, nextResetAt, prevUtilization = null) {
     if (!prevResetAt || !nextResetAt) return;
     // TWO guards, both learned from live data (2026-08-23):
     // 1. PAST stamp = a probe that answered late (its window rolled mid-request) or
@@ -3361,7 +3409,15 @@ export class AccountManager {
     // expired) — endedAt is always within [start, now].
     const boundary = Math.min(nextResetAt, nowMs);
     if (boundary - prevResetAt < WINDOW_ADVANCE_EPSILON_MS) return;
-    this.capacity.closeCycle(accountName, window, boundary, { resetAt: prevResetAt });
+    // TANK: the CLOSING window's own fullness, passed in by the caller. It must be the
+    // caller's SNAPSHOT, never a re-read here: both probe paths write the new window's
+    // utilization into the quota fields before calling us, so re-reading would divide
+    // the old window's tokens by the NEW window's percentage — a silently wrong tank
+    // on exactly the rollover this path exists to catch.
+    this.capacity.closeCycle(accountName, window, boundary, {
+      resetAt: prevResetAt,
+      finalUtilization: Number.isFinite(prevUtilization) && prevUtilization >= 0 ? prevUtilization : null,
+    });
   }
 
   /**

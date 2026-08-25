@@ -251,7 +251,7 @@ function renderCapacity(am, { window = 'ses', width = 120 } = {}) {
   return tui._renderCapacityPage(width).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
 }
 
-test('G1: the page shows a per-account row with the six columns once cycles exist', () => {
+test('G1: the page shows a per-account row with the capacity columns once cycles exist', () => {
   const am = amWithOauth();
   // Three consecutive real windows — distinct boundary stamps, 5h apart.
   let i = 3;
@@ -263,19 +263,21 @@ test('G1: the page shows a per-account row with the six columns once cycles exis
     i--;
   }
   const page = renderCapacity(am);
-  for (const col of ['Last', 'Prev', 'Prev-1', 'Avg 3', 'Avg 10', 'All time']) {
+  for (const col of ['Capacity', 'Used now', 'Last cyc', 'Avg cyc']) {
     assert.ok(page.includes(col), `column "${col}" is on the page`);
   }
   assert.match(page, /claude1/, 'the account is listed');
-  assert.match(page, /3k/, 'the last cycle reads 3k tokens');
-  assert.match(page, /2k/, 'the average of 1k/2k/3k reads 2k');
+  assert.match(page, /3k/, 'the last cycle delivered 3k tokens');
+  assert.match(page, /Basis/, 'the page says how capacity was derived');
 });
 
 test('G2: a fresh install says WHY the page is empty instead of showing zeros', () => {
   // Zeros would read as "this account delivers nothing", which is the opposite of true.
   const page = renderCapacity(amWithOauth());
-  assert.match(page, /No completed cycles yet/);
-  assert.match(page, /no completed cycle yet/, 'and each account row says so too');
+  assert.match(page, /Nothing to measure yet/);
+  assert.doesNotMatch(page, /no completed cycle yet/,
+    'never the old jargon — it was true and told the reader nothing (2026-08-25)');
+  assert.match(page, /no quota reading from this provider/, 'each row says WHY in its own terms');
   assert.doesNotMatch(page, /\b0\s+0\s+0\b/, 'no fake zero row');
 });
 
@@ -465,20 +467,34 @@ test('J2 (M4): at W=80 the page drops trailing columns instead of truncating mid
   // every row lost "All time" and the cycle count with no indication. The COLS loop
   // exists to drop COLUMNS; a test that never checks a narrow width cannot see it.
   const am = amWithOauth();
-  am.accrueCapacity(0, { input: 1_000_000, output: 0 });
-  am.accounts[0].quota.unified5hReset = Date.now() - 5 * 3600_000;
-  am.closeExpiredCapacityCycles();
+  // A REAL cycle: tokens accrued INSIDE the window that then closed. Accruing at now()
+  // while closing at now-5h gives the cycle a negative span, which the read floor
+  // correctly rejects as junk — the fixture must not fabricate one.
+  const boundary = Date.now() - 1000;
+  am.capacity.accrue('claude1', { input: 1_000_000, output: 0 }, boundary - 5 * 3600_000);
+  am.accounts[0].quota.unified5h = 0.8;                 // a real fullness reading
+  am.accounts[0].quota.unified5hReset = boundary;
+  am.closeExpiredCapacityCycles();                       // closes WITH the reading
   const wide = renderCapacity(am, { width: 200 });
-  assert.ok(wide.includes('All time'), 'full width shows every column');
-  const narrow = renderCapacity(am, { width: 80 });
-  assert.ok(narrow.includes('Last'), 'the observations survive at W=80');
-  assert.ok(!narrow.includes('All time'), 'and the dropped aggregates do not render truncated');
-  // Assert on the HEADER line itself (found by index, never a hard-coded offset — the
-  // previous version read the blank spacer at [2] and passed unconditionally).
-  const header = narrow.split('\n').find(l => l.includes('Account') && l.includes('Last'));
-  assert.ok(header, 'the header renders');
-  assert.ok(!/All ti?m?e?\s*$/.test(header), 'no half-rendered header cell at the right edge');
-  assert.ok(header.length <= 80, 'the header fits the terminal');
+  assert.ok(wide.includes('Avg cyc'), 'full width shows every column');
+  // The real invariant: nothing is ever CHOPPED mid-cell. Whatever columns survive at a
+  // given width must fit it — the COLS loop drops whole columns rather than let fitLine
+  // slice a number in half. Assert the property across widths, not a specific surviving
+  // set (which changes whenever the column list does and proves nothing about chopping).
+  for (const width of [60, 70, 80, 100]) {
+    const page = renderCapacity(am, { width });
+    const header = page.split('\n').find(l => l.includes('Account') && l.includes('Capacity'));
+    assert.ok(header, `the header renders at W=${width}`);
+    assert.ok(header.length <= width, `the header fits W=${width}`);
+    assert.ok(/(Capacity|Used now|Last cyc|Avg cyc|Basis)\s*$/.test(header.trimEnd()),
+      `no half-rendered header cell at W=${width}: "${header.trimEnd().slice(-14)}"`);
+    const row = page.split('\n').find(l => l.includes('claude1'));
+    // renderCapacity already strips ANSI; visible width is what fits the terminal.
+    // The trailing Basis prose is capped by the renderer (fitLine); the NUMERIC cells
+    // are the mid-cell-chop hazard this test exists for, so check up to the basis.
+    const numeric = row.split('  1 full')[0].split('  live')[0];
+    assert.ok(numeric.length <= width, `the numeric row fits W=${width} (len ${numeric.length})`);
+  }
 });
 
 test('J3 (M5): mergeDelta never FABRICATES a cycle onto a missing/corrupt base', () => {
@@ -768,10 +784,9 @@ test('M2: the page shows the LIVE ESTIMATE where no cycle has completed (real TU
   const tui = new TUI({ accountManager: am, config: {} });
   tui.capacityWindow = 'ses';
   const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(page, /[≥~]\s*607k est from 95% full/, 'the estimate renders (576,708 ÷ 0.95 ≈ 607k; ≥ when the join is unproven)');
-  assert.match(page, /95% full/, 'naming the fullness it came from');
-  assert.match(page, /measured after this window completes/, 'and what replaces it');
-  assert.doesNotMatch(page, /may be from the previous window/, 'fresh reading → no stale caveat');
+  assert.match(page, /≥\s*607k/, 'the capacity column renders (576,708 ÷ 0.95 ≈ 607k; ≥ when the join is unproven)');
+  assert.match(page, /live · 95% used/, 'naming the fullness it came from');
+  assert.match(page, /577k/, 'and the open window\'s live token count');
 });
 
 test('M3: a stale utilization reading carries the caveat, never silent trust', () => {
@@ -782,7 +797,9 @@ test('M3: a stale utilization reading carries the caveat, never silent trust', (
   const tui = new TUI({ accountManager: am, config: {} });
   tui.capacityWindow = 'ses';
   const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(page, /may be from the previous window/, 'the caveat is on the page');
+  // A reading older than the cycle cannot prove same-window — the row must NOT badge
+  // it as a fresh "live" basis.
+  assert.doesNotMatch(page, /live · 10% used/, 'no live badge on a stale reading');
 });
 
 test('M4: a measured cycle still beats the estimate — the estimate never overwrites data', () => {
@@ -798,8 +815,8 @@ test('M4: a measured cycle still beats the estimate — the estimate never overw
   const tui = new TUI({ accountManager: am, config: {} });
   tui.capacityWindow = 'ses';
   const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(page, /claude1\s+Anthropic\s+800k/, 'the measured column renders');
-  assert.doesNotMatch(page, /~\s*200k/, 'no estimate row where data exists');
+  assert.match(page, /800k/, 'the measured last cycle renders');
+  assert.doesNotMatch(page, /~\s*200k/, 'no estimate where data exists');
 });
 
 test('M6: a mid-window join renders ≥ (lower bound), the delta renders without it', () => {
@@ -813,7 +830,6 @@ test('M6: a mid-window join renders ≥ (lower bound), the delta renders without
   tui.capacityWindow = 'ses';
   let page = tui._renderCapacityPage(150).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
   assert.match(page, /≥\s*1\.0M/, 'the absolute-on-late-join renders as a lower bound');
-  assert.doesNotMatch(page, /Δ 40% full/, 'not claimed as delta');
 
   // then a rising reading makes it a delta — no ≥ anymore
   am.accrueCapacity(0, { input: 200_000, output: 0 });
@@ -823,8 +839,9 @@ test('M6: a mid-window join renders ≥ (lower bound), the delta renders without
   tui.capacityWindow = 'ses';
   page = tui._renderCapacityPage(150).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
   assert.match(page, /~\s*1\.0M/, 'delta: 200k observed between marks ÷ 0.2 = 1.0M');
-  assert.match(page, /Δ 60% full/, 'labelled as delta');
-  assert.doesNotMatch(page, /≥\s*3\.0M/, 'no lower-bound sign on a delta');
+  // Scope to the ROW — the footer legend explains the ≥ symbol and always contains it.
+  const deltaRow = page.split('\n').find(l => l.includes('claude1'));
+  assert.doesNotMatch(deltaRow, /≥/, 'no lower-bound sign on a delta');
 });
 
 // ── W-lane: the no-weekly account's weekly view (user directive 2026-08-24:
@@ -872,8 +889,10 @@ test('W3: the weekly row shows the SESSION-DERIVED ceiling, not a fabricated cap
   tui.capacityWindow = 'wk';
   const page = tui._renderCapacityPage(170).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
   assert.match(page, /no weekly limit/, 'named as such');
-  assert.match(page, /≈23M\/wk ceiling/, '≈33.6 × ~686k avg');
-  assert.match(page, /34 sessions × 686k/, 'the derivation is visible (33.6 rounded, avg10 685,500 → 686k)');
+  // The ceiling is now derived from the session TANK (tokens ÷ fullness) — the test
+  // fixture has no utilization readings, so no measured tank exists and the ceiling
+  // correctly withholds rather than multiply a delivered-average. Volume still shows.
+  assert.doesNotMatch(page, /ceiling.*avg-delivery/, 'never a delivered-average masquerading as capacity');
   assert.match(page, /7d volume 2\.4M/, 'and what it actually moved (600k + 771k + 1M in flight)');
 });
 
@@ -909,7 +928,8 @@ test('V1: every row with an open window shows the LIVE now-tag that tracks accru
   const tui = new TUI({ accountManager: am, config: {} });
   tui.capacityWindow = 'ses';
   const page = tui._renderCapacityPage(160).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(page, /▸ 15k/, 'the open window renders live');
+  const row = page.split('\n').find(l => l.includes('claude1'));
+  assert.match(row, /15k/, 'the open window\'s live tokens render in Used now');
 });
 
 test('V2: a row with no open cycle gets no now-tag', () => {

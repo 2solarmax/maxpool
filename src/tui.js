@@ -2031,7 +2031,7 @@ export class TUI {
     const ledger = this.am.capacity;
     const title = win === 'wk' ? 'Weekly (7d) capacity' : 'Session (5h) capacity';
     out.push('');
-    out.push(` ${bold(title)}  ${dim('— tokens delivered per completed cycle, per account')}`);
+    out.push(` ${bold(title)}  ${dim('— how many tokens each account can deliver per window')}`);
     out.push('');
 
     if (!ledger) { out.push(yellow('  Capacity ledger unavailable on this worker.')); return out; }
@@ -2039,15 +2039,19 @@ export class TUI {
     // Narrow terminals: drop trailing columns rather than let fitLine chop a number
     // mid-digit (at W=80 the full 6-column row is 82+ chars — every row silently lost
     // its last two cells). The dropped ones are the aggregates, not the observations.
-    const ALL_COLS = ['Last', 'Prev', 'Prev-1', 'Avg 3', 'Avg 10', 'All time'];
-    const CW = 9;
+    // CAPACITY (tank) is the headline: tokens ÷ the vendor's own fullness at close,
+    // per cycle. That measures the PLAN. The delivered-token columns measure DEMAND —
+    // useful, but they were the headline before 2026-08-25 and read as capacity, which
+    // is why an account that simply went unused looked small.
+    const ALL_COLS = ['Capacity', 'Used now', 'Last cyc', 'Avg cyc'];
+    const CW = 10;
     const nameW = 12;
     let COLS = ALL_COLS;
-    while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 14) > W) {
+    while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 16) > W) {
       COLS = COLS.slice(0, -1);
     }
     const header = '  ' + 'Account'.padEnd(nameW) + ' ' + 'Provider'.padEnd(PROVIDER_W) + ' '
-      + COLS.map(c => c.padStart(CW)).join('') + '  Cycles';
+      + COLS.map(c => c.padStart(CW)).join('') + '  Basis';
     out.push(dimUnderline(fitLine(header, W)));
 
     let anyData = false;
@@ -2065,14 +2069,16 @@ export class TUI {
         // capacity). 33.6 five-hour windows fit in 7 days — the user's own
         // approximation ("from the session limits"), shipped as a ceiling, never a cap.
         const t = ledger.rollingThroughput(a.name, 7);
-        const ses = ledger.windowStats(a.name, 'ses');
         const windowsPerWk = (7 * 24) / 5;
         anyData = anyData || t.tokens > 0;
         const vol = t.tokens > 0 ? formatTokens(t.tokens) : '--';
-        // The ceiling needs a measured session capacity; without one it would multiply
-        // a guess — show the volume alone rather than fabricate the headline.
-        const ceiling = ses ? ` · ≈${formatTokens(Math.round(windowsPerWk * ses.avg10))}/wk ceiling`
-                          + dim(` (${windowsPerWk.toFixed(0)} sessions × ${formatTokens(ses.avg10)})`) : '';
+        // The ceiling needs a measured session TANK (capacity, not avg delivery) —
+        // multiplying an old avg-delivery number understates a demand-limited account.
+        const sesTank = this.am.capacityTank?.(i, 'ses');
+        const ceiling = sesTank
+          ? ` · ≈${formatTokens(Math.round(windowsPerWk * sesTank.avg))}/wk ceiling`
+            + dim(` (${windowsPerWk.toFixed(0)} × ${formatTokens(sesTank.avg)} per 5h)`)
+          : '';
         // Always disclose the window's age boundary: today is unfinished, so the 7d
         // figure grows through the day; a genuinely partial day adds the ≤-observed floor.
         const note = t.partial
@@ -2083,54 +2089,60 @@ export class TUI {
         continue;
       }
       const st = ledger.windowStats(a.name, win);
-      if (!st) {
-        // No completed cycle yet — but the vendor's own fullness reading still yields
-        // an ESTIMATE (tokens seen ÷ utilization): useful from minute one, honest about
-        // being an estimate. `~` marks it; a measured column replaces it after the first
-        // full window. A stale-util caveat only when we cannot prove same-window.
-        const est = this.am.capacityEstimate?.(i, win);
-        // LIVE now-column: the open cycle is the only number that moves between window
-        // closes, and without it the page read as frozen (reported 2026-08-25: "they
-        // don't seem to be updating at all"). Rendered on every row that has one.
-        const nowOpen = ledger.openCycle(a.name, win);
-        const nowTag = nowOpen && nowOpen.tokensSoFar > 0
-          ? ' ' + yellow(`▸ ${formatTokens(nowOpen.tokensSoFar)} this window`) : '';
-        if (est) {
-          anyData = true;
-          const caveat = est.fresh ? '' : ' (utilization reading may be from the previous window)';
-          // ≥ = absolute method on a window we joined late: the true tank is at least
-          // this. No ≥ when the delta method fired — it is join-independent, or the
-          // window was observed from its start.
-          const op = est.lowerBound ? '≥' : '~';
-          const via = est.method === 'delta'
-            ? `Δ ${(est.utilization * 100).toFixed(0)}% full` : `${(est.utilization * 100).toFixed(0)}% full`;
-          out.push('  ' + name + ' ' + prov + ' ' + cyan(op + formatTokens(est.tokens).padStart(CW - 1))
-            + dim(` est from ${via}${caveat} — measured after this window completes`) + nowTag);
-        } else {
-          out.push('  ' + name + ' ' + prov + ' ' + dim('no completed cycle yet') + nowTag);
-        }
+      let tank = this.am.capacityTank?.(i, win);
+      const nowOpen = ledger.openCycle(a.name, win);
+      const util = this.am._windowUtilization?.(a, win);
+      // A reading we cannot prove is from THIS window must not badge the capacity
+      // number as "live" — it may describe the previous window entirely (the estimate
+      // still renders; the basis line just stops claiming freshness it can't prove).
+      if (tank?.source === 'live' && tank.fresh === false) tank = null;
+
+      // A row with NEITHER a tank nor any delivery has genuinely nothing to say. Say
+      // WHY in the account's own terms — "no completed cycle yet" was true and useless
+      // (reported 2026-08-25: an account sitting at 99% weekly rendered that line).
+      if (!tank && !st && !(nowOpen?.tokensSoFar > 0)) {
+        const why = util == null
+          ? 'no quota reading from this provider'
+          : util > 0
+            ? `${(util * 100).toFixed(0)}% used, but no traffic through maxpool to measure with`
+            : 'window empty — nothing used yet';
+        out.push('  ' + name + ' ' + prov + ' ' + dim(why));
         continue;
       }
       anyData = true;
-      const all = { Last: st.last, Prev: st.prev, 'Prev-1': st.prev1, 'Avg 3': st.avg3, 'Avg 10': st.avg10, 'All time': st.allTime };
-      const cells = COLS.map(c => formatTokens(all[c]).padStart(CW)).join('');
-      const nowOpen = ledger.openCycle(a.name, win);
-      const nowTag = nowOpen && nowOpen.tokensSoFar > 0
-        ? ' ' + yellow(`▸ ${formatTokens(nowOpen.tokensSoFar)}`) : '';
-      out.push('  ' + name + ' ' + prov + ' ' + cells + '  ' + dim(String(st.cycles)) + nowTag);
+
+      // Capacity: measured tank, or the live in-window estimate. `~` = estimate from an
+      // open window; `≥` = we joined the window late, so the vendor's percentage counts
+      // spend maxpool never saw and the true tank is at least this.
+      const capCell = tank
+        ? (tank.lowerBound ? '≥' : tank.source === 'live' ? '~' : ' ') + formatTokens(tank.avg)
+        : '--';
+      const usedNow = nowOpen?.tokensSoFar > 0 ? formatTokens(nowOpen.tokensSoFar) : '--';
+      const cellsByName = {
+        Capacity: capCell,
+        'Used now': usedNow,
+        'Last cyc': st ? formatTokens(st.last) : '--',
+        'Avg cyc': st ? formatTokens(st.avg10) : '--',
+      };
+      const cells = COLS.map(c => cellsByName[c].padStart(CW)).join('');
+
+      // Basis: how the capacity number was arrived at, in one short phrase. Never a
+      // bare count — "3" told the reader nothing about what it was counting.
+      const basis = !tank ? dim('no capacity reading yet')
+        : tank.source === 'cycles'
+          ? dim(`${tank.n} full ${tank.n === 1 ? 'window' : 'windows'}`)
+          : dim(`live · ${((tank.utilization ?? 0) * 100).toFixed(0)}% used`);
+      const pct = util != null && tank?.source !== 'live' ? dim(` (${(util * 100).toFixed(0)}% full now)`) : '';
+      out.push('  ' + name + ' ' + prov + ' ' + cyan(cells) + '  ' + basis + pct);
     }
 
     out.push('');
     if (!anyData) {
-      // Fresh install: the page is honest about WHY it is empty and WHEN it fills,
-      // instead of showing zeros that read like an account delivering nothing.
-      out.push(' ' + yellow('No completed cycles yet.') + dim(
-        win === 'wk'
-          ? ' A weekly figure appears after an account\'s 7d window resets once.'
-          : ' A session figure appears after an account\'s 5h window resets once.'));
+      out.push(' ' + yellow('Nothing to measure yet.')
+        + dim(' Capacity needs traffic through maxpool plus a quota reading from the provider.'));
     }
-    out.push(' ' + dim('A cycle counts only if maxpool ran for all of it and the account stayed enabled.'));
-    out.push(' ' + dim('~ = estimated; ≥ = at least; Δ = exact-by-difference; ≈/wk = session-rate ceiling; ▸ = live this window.'));
+    out.push(' ' + dim('Capacity = tokens delivered ÷ how full the provider said the window was.'));
+    out.push(' ' + dim('~ = from the window still running · ≥ = at least this (maxpool joined the window late).'));
     return out;
   }
 
