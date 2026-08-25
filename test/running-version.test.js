@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccountManager } from '/Users/maxkrasnykh/maxpool/src/account-manager.js';
+import { AccountManager } from '../src/account-manager.js';
 
 test('status exposes the EXECUTING version separately from the disk read', () => {
   // `version.current` is a package.json disk read: after a self-install it names the
