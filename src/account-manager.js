@@ -161,6 +161,27 @@ const DEFAULT_SCHEDULER = {
   reserveConcurrencyTarget: 2,    // tighter in-flight cap for reserve (capPenalty bites at inflight>2 ⇒ load fans out
                                   // across the fleet before any single reserve account is dogpiled toward a 429)
   spreadShareWeight: 3,           // multiplies an account's share of recent fleet load (0..1)
+  // FAST-REFILL DISCOUNT (2026-08-25). The two LOAD-BALANCING terms — utilizationCost
+  // and paceCost — price a window by how FULL it is, never by how much absolute
+  // headroom it holds or how soon it refills. So "17% of a 5h window that refills 33.6x
+  // a week" is priced identically to "17% of a weekly window that refills once", and an
+  // account whose only cap is a fast-refilling session never pulls ahead of one guarding
+  // a scarce weekly budget. That is the whole reason the fleet's largest-capacity
+  // account sat at ~17% of fleet traffic (measured 2026-08-25) while four Claude
+  // accounts ran at weekly 1.0.
+  //
+  // The discount is a MULTIPLIER on those two terms only — never a flat bonus. A flat
+  // bonus would drive an idle account's total NEGATIVE (idle floor is concurrency×2 = 2),
+  // below the entire band structure that reserveFloorCost:5 / criticalPressureCost:21
+  // assume is non-negative. A multiplier in [0,1] cannot: it only ever REMOVES cost that
+  // is already there, so the total stays ≥ the concurrency floor and every safety term
+  // (concurrency, capPenalty, reserve, critical, ramp, failures) is untouched.
+  //
+  // It also DECAYS: at session util 0 the discount is full, and it is gone by
+  // fastRefillFadeUtil — so as the fast window fills, the account converges back to
+  // normal pricing and the fleet re-balances smoothly instead of flapping at a cliff.
+  fastRefillDiscount: 0.6,        // 0 = off (full cost), 0.6 = discount up to 60% of the two balancing terms
+  fastRefillFadeUtil: 0.65,       // discount reaches 0 at this session utilization (weeklySoftThreshold)
   recoveryRampWeight: 4,          // decaying penalty applied to a just-recovered account
   recoveryRampMs: 5 * 60_000,     // how long the post-recovery ramp lasts
   spreadWindowMs: 15 * 60_000,    // rolling window used to measure recent per-account load
@@ -250,6 +271,13 @@ const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 const PERSISTED_QUOTA_FIELDS = [
   'unified5h', 'unified7d', 'unified5hReset', 'unified7dReset', 'unifiedStatus', 'scopedWeekly',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+  // Plan identity, not a utilization: a successful probe's "no weekly window" is
+  // positive knowledge (2026-08-06). Without persisting it, every restart clears the
+  // flag and the fast-refill discount (plus the TUI "Wk none" rendering) silently
+  // drops until the next probe sweep re-learns it. The probe still rewrites it on
+  // every successful sweep, so a plan change heals on the same cadence.
+  'weeklyAbsent', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
+  'providerQuotaSource', 'lastProbeOkAt',
 ];
 
 function clampRetryAfterSeconds(value) {
@@ -2487,7 +2515,11 @@ export class AccountManager {
 
     // Burn-pace COST only (demoted from the old dominant scarcity×6 term): a
     // soft de-preference of accounts burning ahead of an even pace. Never a bench.
-    const paceCost = this._accountScarcity(account, now) * this.scheduler.paceCostWeight;
+    // FAST-REFILL DISCOUNT: applied to the pace and utilization terms (and only
+    // those) for an account whose only cap is a fast-refilling session window —
+    // see the DEFAULT_SCHEDULER block for the full rationale.
+    const refillMult = this._fastRefillMultiplier(account);
+    const paceCost = this._accountScarcity(account, now) * this.scheduler.paceCostWeight * refillMult;
 
     // RAW utilization cost — direct, not pace-adjusted. The pace cost above discounts
     // by how far into the window you are, so an account at 80% with 2h left is only
@@ -2495,7 +2527,7 @@ export class AccountManager {
     // benching, but wrong for load balancing: an account at 80% should be clearly less
     // attractive than one at 10% even if both are "on pace". Measured 2026-08-10: cc at
     // 80% scored 52.30 vs glm at 10% at 52.15 — a 0.15 gap drowned by round-robin.
-    const utilizationCost = this._rawUtilization(account) * this.scheduler.utilizationWeight;
+    const utilizationCost = this._rawUtilization(account) * this.scheduler.utilizationWeight * refillMult;
 
     // Per-model weekly de-preference: an account whose scoped weekly for THIS
     // request's model (e.g. Fable) is high-but-not-exhausted is a poor pick for
@@ -2720,6 +2752,39 @@ export class AccountManager {
   /** TUI/status summary: { reason, etaMs } or null, without request context. */
   criticalUnlockSummary(account, now = Date.now()) {
     return this._criticalUnlock(account, { profile: 'claude' }, new Set(), null, now);
+  }
+
+  /**
+   * FAST-REFILL MULTIPLIER — 1.0 (no change) or a discount in (0,1) for an account
+   * whose ONLY cap is a fast-refilling session window. The predicate is exactly the
+   * one the TUI already renders ("Wk none"): a provider whose quota poll succeeded
+   * and carried NO weekly window (positive knowledge the plan has none — measured
+   * 2026-08-06, z.ai `max` returns one TOKENS_LIMIT unit 3 = 5h and no unit-6 weekly).
+   *
+   * The discount is LINEARLY FADED to 0 by session utilization: full at 0%, gone at
+   * fastRefillFadeUtil. So the preference this grants decays as the window fills and
+   * the account converges back to normal pricing — no cliff, no flap. At util ≥ fade
+   * point the multiplier is exactly 1, making the term byte-identical to pre-2026-08-25
+   * behaviour by construction.
+   *
+   * Rationale (why a weeklyAbsent account at all): its window refills 33.6× per week
+   * vs a weekly window's 1×, so equal FULLNESS does not mean equal VALUE — capacity
+   * that expires unused every 5h is worth spending faster than capacity that guards a
+   * whole week. This is the use-it-or-lose-it principle _windowScarcity already applies
+   * WITHIN a window, extended across window KINDS. It is a discount on balancing terms
+   * only — never a flat bonus (a flat bonus drives the total negative, under the
+   * non-negative band structure reserveFloorCost/criticalPressureCost were calibrated
+   * against), and never on safety terms (concurrency, capPenalty, reserve, critical).
+   */
+  _fastRefillMultiplier(account) {
+    const disc = this.scheduler.fastRefillDiscount;
+    if (!(disc > 0)) return 1;                       // feature off → multiplier 1
+    if (!(account?.type === 'provider' && account.quota?.weeklyAbsent)) return 1;
+    const fade = this.scheduler.fastRefillFadeUtil;
+    const ses = clamp01(account.quota.providerSes ?? 0);
+    if (ses >= fade) return 1;
+    // 1 at ses=0 → 1-disc at ses=0; linear to 1 at ses=fade
+    return 1 - disc * (1 - ses / Math.max(1e-6, fade));
   }
 
   _reserveCost(account, now = Date.now(), weeklyState = this._weeklyRawState(account)) {
@@ -3974,6 +4039,22 @@ export class AccountManager {
         safetyMaxActivePerAccount: this.scheduler.safetyMaxActivePerAccount,
         safetyMaxGlobalActive: this.scheduler.safetyMaxGlobalActive,
         peak: this.peakSummary(),
+        // FAST-REFILL visibility (2026-08-25): monitors must be able to assert the
+        // discount is ARMED (config > 0) and, per eligible account, the multiplier
+        // actually being applied — a flag that can never show "inert" is not a
+        // monitorable feature. Mirrors the peak block's shape.
+        fastRefill: {
+          enabled: this.scheduler.fastRefillDiscount > 0,
+          discount: this.scheduler.fastRefillDiscount,
+          fadeUtil: this.scheduler.fastRefillFadeUtil,
+          accounts: this.accounts
+            .filter(a => a.type === 'provider' && a.quota?.weeklyAbsent)
+            .map(a => ({
+              name: a.name,
+              sesUtilization: clamp01(a.quota.providerSes ?? 0),
+              multiplier: Number(this._fastRefillMultiplier(a).toFixed(3)),
+            })),
+        },
       },
       upstreamThrottle: {
         active: this._isUpstreamThrottleBlocking(),

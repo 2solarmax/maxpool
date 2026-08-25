@@ -1961,6 +1961,13 @@ export class TUI {
         if (tier === 2) note += `  ${yellow(`peak·capped ${Math.round((wu ?? 0) * 100)}%`)}`;
         else if (tier === 1) note += wu == null ? `  ${dim('peak·cap n/a')}` : `  ${yellow('peak')}`;
       }
+      // FAST-REFILL tag (2026-08-25): mirrors the router's own _fastRefillMultiplier —
+      // the label cannot disagree with routing because it reads the same predicate.
+      // Only shown when a discount is actually applied (< 1).
+      if (a.quota?.weeklyAbsent && this.am._fastRefillMultiplier) {
+        const m = this.am._fastRefillMultiplier(a);
+        if (m < 1) note += `  ${cyan(`fast·refill ×${m.toFixed(2)}`)}`;
+      }
     } else if (q.providerQuotaSource === 'console-only') {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);
