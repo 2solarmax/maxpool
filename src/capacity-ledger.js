@@ -409,17 +409,31 @@ export class CapacityLedger {
   tankStats(name, window) {
     const rec = this._accounts.get(name);
     const floor = (this._readFloorOverride ?? READ_FLOOR_MS)[window] ?? 0;
-    const usable = (rec?.[window]?.closed || []).filter(c =>
-      c.complete && !c.disabledDuring
-      && Number.isFinite(c.finalUtilization)
-      && c.finalUtilization >= TANK_MIN_UTIL
-      && (c.endedAt - c.startedAt) >= floor - 1_000);
+    const closed = (rec?.[window]?.closed || []).filter(c =>
+      c.complete && !c.disabledDuring && (c.endedAt - c.startedAt) >= floor - 1_000);
+    // PHYSICAL FLOOR: a tank can never be smaller than the most tokens ever
+    // delivered in one complete window — every token we count is a vendor token
+    // (C ≤ V ≤ tank), so maxDelivered ≤ tank is an invariant, not a heuristic.
+    // A reading implying a smaller tank is contaminated: the vendor % counted
+    // spend maxpool never saw (usage outside the proxy — an account also used
+    // directly), or the reading was stale. Measured live 2026-08-26: a window
+    // that delivered 497k at a reported "95% full" implied a 523k tank while an
+    // earlier window of the SAME account had delivered 1.53M — impossible, and
+    // the understated reading silently dragged the average down 3.6x.
+    // CLAMP, never discard: the contaminated reading is still a real lower bound
+    // (the tank is at least the tokens we saw), so it joins the average AT the
+    // floor rather than being thrown away — discarding left an account whose
+    // every reading was contaminated with NOTHING to show. After a plan
+    // downgrade the floor over-states until old cycles age out — conservative.
+    const maxDelivered = closed.reduce((m, c) => Math.max(m, c.tokens), 0);
+    const usable = closed.filter(c =>
+      Number.isFinite(c.finalUtilization) && c.finalUtilization >= TANK_MIN_UTIL);
     if (!usable.length) return null;
     let sum = 0, exact = 0, bounded = 0;
     for (const c of usable) {
       const observedFromStart = c.startedAt != null && c.windowStartedAt != null
         && c.startedAt <= c.windowStartedAt + 60_000;
-      sum += c.tokens / c.finalUtilization;
+      sum += Math.max(c.tokens / c.finalUtilization, maxDelivered);
       if (observedFromStart) exact++; else bounded++;
     }
     const last = usable[usable.length - 1];
