@@ -325,6 +325,20 @@ function parseResetHeader(value) {
   return Number.isNaN(asDate) ? null : asDate;
 }
 
+/**
+ * A capUtilization is valid only as a real number strictly inside (0,1). Everything
+ * else — strings, NaN, negative, 0, >=1 — means "no cap"; an invalid EXPLICIT value
+ * also logs once so a hand-edited config doesn't silently fail open (a NaN cap makes
+ * every `util >= cap` comparison false = uncapped, with no error anywhere).
+ */
+function _sanitizeCap(value, name) {
+  if (value == null) return null;
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0 && n < 1) return n;
+  console.log(`[Maxpool] Ignoring invalid capUtilization ${JSON.stringify(value)} for "${name}" — expected 0-1`);
+  return null;
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.90, schedulerOptions = {}, dependencies = {}) {
     this.scheduler = { ...DEFAULT_SCHEDULER, ...schedulerOptions };
@@ -354,6 +368,13 @@ export class AccountManager {
       authHeader: acct.authHeader || null,
       profiles: acct.profiles || (acct.type === 'provider' ? ['all'] : ['claude', 'all']),
       priority: Number.isFinite(acct.priority) ? acct.priority : 0,
+      // USAGE CAP (owner-directed 2026-08-26): reserve capacity on this account —
+      // the proxy benches it at capUtilization of BOTH the 5h and 7d windows, keeping
+      // the rest for out-of-band use. null/undefined = fully utilized (the default;
+      // no behavior change). SANITIZED at parse: non-finite/out-of-range values drop
+      // to null HERE, visibly (below), so a hand-edited "50" or "abc" in the config
+      // can never fail the >= comparisons open as NaN.
+      capUtilization: _sanitizeCap(acct.capUtilization, acct.name),
       model: acct.model || null,
       modelMap: acct.modelMap || null,
       stripBetaHeaders: Boolean(acct.stripBetaHeaders),
@@ -837,7 +858,7 @@ export class AccountManager {
     // headroom (e.g. 69% used, resets in days) must stay in the healthy-spread
     // pool even if it's burning fast. Pace is a soft SCORE cost, never a bench.
     const weeklyState = this._weeklyRawState(account);
-    if (weeklyState === 'exhausted') return false;
+    if (weeklyState === 'exhausted' || weeklyState === 'capped') return false;
     if (weeklyState === 'critical' && !options.allowWeeklyCritical) return false;
     if (weeklyState === 'reserve' && !options.allowWeeklyReserve) return false;
 
@@ -1266,28 +1287,47 @@ export class AccountManager {
     }
   }
 
+  /**
+   * The session-bench threshold for THIS account: the global switchThreshold, lowered
+   * to its usage cap when one is set. Shared by _isSessionQuotaUnavailable (the bench)
+   * and _shortTermRetry (the retry oracle) — one helper, both call sites, so the
+   * oracle can never desync from the bench (a capped-benched account MUST report a
+   * finite retry time or a live session holding on it gets error-fasted).
+   */
+  _sessionBenchThreshold(account) {
+    const cap = account?.capUtilization;
+    return (cap != null && cap < this.switchThreshold) ? cap : this.switchThreshold;
+  }
+
+  /** True when the account's usage cap has it benched on the given window reading. */
+  _capped(account, utilization) {
+    const cap = account?.capUtilization;
+    return cap != null && utilization != null && utilization >= cap;
+  }
+
   _isSessionQuotaUnavailable(account) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
+    const bench = this._sessionBenchThreshold(account);
 
     // Unified 5h quota is immediate availability. Weekly quota is handled
     // separately as long-horizon admission control.
-    if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
+    if (q.unified5h != null && q.unified5h >= bench) return true;
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
       const used = 1 - (q.tokensRemaining / q.tokensLimit);
-      if (used >= this.switchThreshold) return true;
+      if (used >= bench) return true;
     }
 
     if (q.requestsLimit != null && q.requestsRemaining != null) {
       const used = 1 - (q.requestsRemaining / q.requestsLimit);
-      if (used >= this.switchThreshold) return true;
+      if (used >= bench) return true;
     }
 
     // Provider (z.ai/Kimi) session quota — the 5h token window. Without this a
     // provider at 95% of its 5h cap reads as fully available.
-    if (q.providerSes != null && q.providerSes >= this.switchThreshold) return true;
+    if (q.providerSes != null && q.providerSes >= bench) return true;
 
     return false;
   }
@@ -1578,9 +1618,10 @@ export class AccountManager {
         queueable: true,
       };
     }
-    if (weeklyState === 'exhausted') {
+    if (weeklyState === 'exhausted' || weeklyState === 'capped') {
       // Hard block: only a weekly reset unblocks it — a sooner short-term clear
-      // does not help — so key the hold on the weekly reset.
+      // does not help — so key the hold on the weekly reset. 'capped' (usage cap)
+      // shares this arm: the cap's recovery time IS the window reset.
       //
       // Read the PROVIDER reset too. `unified7dReset` is an Anthropic-only field;
       // a GLM/Kimi account stores its weekly reset in `providerWkReset`
@@ -1672,6 +1713,11 @@ export class AccountManager {
   // queueable} the retry oracle can hold on. Kept separate from the weekly state
   // so weekly-critical accounts surface their real near-term recovery time.
   _shortTermRetry(account, now, q) {
+    // USAGE CAP: the oracle reads the SAME per-account bench threshold as
+    // _isSessionQuotaUnavailable (_sessionBenchThreshold) — a capped account benched
+    // at 50% MUST report a finite retryAt here or a live session holding on it gets
+    // error-fasted instead of waiting out the window (red-team blocker 2).
+    const bench = this._sessionBenchThreshold(account);
     if (account.status === 'throttled' && account.rateLimitedUntil && now < account.rateLimitedUntil) {
       return { cause: 'rate_limited', retryAt: account.rateLimitedUntil, queueable: true };
     }
@@ -1684,13 +1730,13 @@ export class AccountManager {
       return { cause: 'upstream_failure', retryAt: account.provisionalUpstreamUntil, queueable: true };
     }
 
-    if (q.unified5h != null && q.unified5h >= this.switchThreshold) {
+    if (q.unified5h != null && q.unified5h >= bench) {
       return { cause: 'session_limit', retryAt: q.unified5hReset || null, queueable: Boolean(q.unified5hReset) };
     }
 
     if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
       const used = 1 - q.tokensRemaining / q.tokensLimit;
-      if (used >= this.switchThreshold) {
+      if (used >= bench) {
         const retryAt = q.resetsAt ? new Date(q.resetsAt).getTime() : null;
         return { cause: 'token_limit', retryAt, queueable: Boolean(retryAt) };
       }
@@ -1698,7 +1744,7 @@ export class AccountManager {
 
     if (q.requestsLimit != null && q.requestsRemaining != null && q.requestsLimit > 0) {
       const used = 1 - q.requestsRemaining / q.requestsLimit;
-      if (used >= this.switchThreshold) {
+      if (used >= bench) {
         const retryAt = q.resetsAt ? new Date(q.resetsAt).getTime() : null;
         return { cause: 'request_limit', retryAt, queueable: Boolean(retryAt) };
       }
@@ -2819,7 +2865,7 @@ export class AccountManager {
 
   _weeklyState(account) {
     const rawState = this._weeklyRawState(account);
-    if (rawState === 'unknown' || rawState === 'exhausted') return rawState;
+    if (rawState === 'unknown' || rawState === 'exhausted' || rawState === 'capped') return rawState;
 
     const pressure = Math.max(clamp01(account.quota.unified7d ?? 0), this._effectiveWeeklyUsage(account));
     if (pressure >= this.scheduler.weeklyCriticalThreshold) return 'critical';
@@ -2858,6 +2904,11 @@ export class AccountManager {
       const sesUsed = q.providerSes != null ? clamp01(q.providerSes) : null;
       const wkUsed = q.providerWk != null ? clamp01(q.providerWk) : null;
       const used = Math.max(sesUsed ?? 0, wkUsed ?? 0);
+      // USAGE CAP — checked FIRST, before every tier: a reservation is owner intent
+      // and outranks both the tier ladder and the upstream verdict. There is no
+      // upstreamAllows carve-out for providers anyway, but the ordering documents
+      // that a cap can never be talked out of by the vendor's "allowed".
+      if (this._capped(account, used)) return 'capped';
       if (used >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
       if (used >= this.scheduler.weeklyCriticalThreshold) return 'critical';
       if (used >= this.scheduler.weeklyReserveThreshold) return 'reserve';
@@ -2878,6 +2929,12 @@ export class AccountManager {
     // was waiting on, withheld because a threshold outranked the upstream's own answer.
     // 'exhausted' is the only state that removes an account from routing, so the override
     // is scoped to it — critical/reserve still apply their soft costs unchanged.
+    // USAGE CAP — before the upstreamAllows carve-out BY DESIGN (red-team blocker 1):
+    // a capped account is below its REAL limit, so upstream keeps saying "allowed"
+    // right through the cap — the override exists for genuine over-limit-but-allowed
+    // states and would otherwise make the cap a no-op on exactly the account it is
+    // for (measured: this exact shape sat at unified7d=1.00 'allowed_warning').
+    if (this._capped(account, used)) return 'capped';
     const upstreamAllows = typeof q.unifiedStatus === 'string' && q.unifiedStatus.startsWith('allowed');
     if (used >= this.scheduler.weeklyExhaustedThreshold && !upstreamAllows) return 'exhausted';
     if (used >= this.scheduler.weeklyCriticalThreshold) return 'critical';
@@ -3748,6 +3805,7 @@ export class AccountManager {
       runtime: Boolean(acctData.runtime),
       configSourced: Boolean(acctData.configSourced),
       secretName: acctData.secretName || null,
+      capUtilization: _sanitizeCap(acctData.capUtilization, acctData.name),
       enabled: acctData.enabled !== false,
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
@@ -3808,6 +3866,12 @@ export class AccountManager {
     // all` header path (prepareRuntimeProviders) omits enabled, so a re-sent token
     // NEVER silently re-enables a provider the user benched in the TUI.
     if (acctData.enabled !== undefined) account.enabled = acctData.enabled !== false;
+    // Same guard for the usage cap: the restore path carries an explicit persisted
+    // value; the `cc all` header path omits it, so a re-sent token never clears a
+    // cap the user set in the TUI.
+    if (acctData.capUtilization !== undefined) {
+      account.capUtilization = _sanitizeCap(acctData.capUtilization, account.name);
+    }
     if (account.status === 'error' && changed) {
       account.status = 'active';
       account.lastError = null;
@@ -3845,6 +3909,9 @@ export class AccountManager {
         // benched across a restart — without this an intentionally-disabled GLM/Kimi
         // silently comes back enabled on the next boot (restore defaults enabled:true).
         enabled: a.enabled,
+        // And the usage cap, same reasoning: a TUI-set reservation must survive both
+        // the restart AND the next `cc all` header re-send (the upsert guard).
+        capUtilization: a.capUtilization ?? null,
       }));
   }
 
@@ -4057,6 +4124,7 @@ export class AccountManager {
         upstream: a.upstream,
         profiles: a.profiles,
         priority: a.priority,
+        capUtilization: a.capUtilization ?? null,
         runtime: a.runtime,
         status: a.status,
         refreshDead: Boolean(a.refreshDead),

@@ -2099,6 +2099,14 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       accountManager.setAccountEnabled(mgr.index, enabled);
       console.log(`[Maxpool] ${enabled ? 'Enabled' : 'Disabled'} account "${mgr.name}" from config`);
     }
+    // Propagate a hand-edited usage cap the same way as enabled (red-team: without
+    // this a config-edit cap is stale until the next full reload).
+    const diskCap = Number.isFinite(diskAcct.capUtilization) && diskAcct.capUtilization > 0 && diskAcct.capUtilization < 1
+      ? diskAcct.capUtilization : null;
+    if (mgr.capUtilization !== diskCap) {
+      mgr.capUtilization = diskCap;
+      console.log(`[Maxpool] Usage cap for "${mgr.name}" ${diskCap ? `set to ${Math.round(diskCap * 100)}%` : 'removed'} from config`);
+    }
     memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct };
 
     if (freshCred.accessToken) {

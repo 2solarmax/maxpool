@@ -183,6 +183,12 @@ function loadText(load) {
 export function weeklyPolicyText(am, account) {
   if (!am?._weeklyState || !account || account.type === 'provider') return '';
   const state = am._weeklyState(account);
+  // USAGE CAP: the reservation outranks every tier label — a capped account is NOT
+  // exhausted, it's deliberately held, and labelling it "Wk exhausted 50%" (red team)
+  // while the bar shows half-full misstates the owner's own setting.
+  if (state === 'capped') {
+    return yellow(`Cap ${Math.round((account.capUtilization || 0) * 100)}%`);
+  }
   if (!state || state === 'unknown' || state === 'normal') return '';
   const rawState = am._weeklyRawState?.(account) || state;
   const used = Number(account.quota?.unified7d);
@@ -647,6 +653,11 @@ export class TUI {
       this._startSelection('rename');
     } else if (k === 't' && this.am.accounts.length > 0) {
       this._startSelection('toggle');
+    } else if (k === 'u' && this.am.accounts.length > 0) {
+      // USAGE CAP (owner-directed 2026-08-26): reserve capacity — the proxy benches
+      // this account at the chosen % of both the 5h and weekly windows, keeping the
+      // rest for personal use. Enter 1-99 to set; enter 0 to remove (fully utilized).
+      this._startSelection('cap');
     } else if (k === 'd' && this.am.accounts.length > 0) {
       this._startSelection('delete');
     } else if (k === 'esc' || k === 'q') {
@@ -1025,6 +1036,15 @@ export class TUI {
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doRename(targetIdx, String(value || '').trim());
+      } else if (this.selAction === 'cap') {
+        const targetIdx = this.selIdx;
+        const current = account.name;
+        const existing = this.am.accounts[targetIdx]?.capUtilization;
+        this.mode = 'input';
+        this.inputPrompt = `Usage cap % for "${current}" (1-99, 0 = off, now ${existing ? Math.round(existing * 100) + '%' : 'off'})`;
+        this.inputBuf = '';
+        this.inputSensitive = false;
+        this.inputCb = value => this._doSetCap(targetIdx, String(value || '').trim());
       }
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
@@ -1196,6 +1216,49 @@ export class TUI {
   }
 
   // Rename an account in config and in the running manager.
+  /**
+   * USAGE CAP setter — persists to config (rollback on write failure) and applies
+   * live. `0` / `off` / `100` REMOVE the cap (fully utilized); 1-99 set it. Runtime
+   * providers (not in config) keep the cap in memory like their `enabled` flag —
+   * it rides state.json across restarts and must also survive `cc all` header
+   * re-upserts (the upsert guard in account-manager).
+   */
+  async _doSetCap(idx, raw) {
+    const account = this.am.accounts[idx];
+    if (!account) { this._addLog('Account no longer exists'); return; }
+    const v = String(raw || '').trim().toLowerCase();
+    const off = v === '' || v === '0' || v === 'off' || v === '100';
+    let pct = null;
+    if (!off) {
+      pct = parseInt(v, 10);
+      if (!Number.isInteger(pct) || pct < 1 || pct > 99) {
+        this._addLog(`Usage cap must be 1-99 (or 0 to remove) — got "${raw}"`);
+        return;
+      }
+    }
+    const cap = off ? null : pct / 100;
+
+    const loc = this._configLocation(account);
+    if (loc) {
+      const prev = this.config[loc.array][loc.index].capUtilization ?? null;
+      if (cap == null) delete this.config[loc.array][loc.index].capUtilization;
+      else this.config[loc.array][loc.index].capUtilization = cap;
+      try {
+        await this.saveConfig(this.config);
+      } catch (error) {
+        // rollback both config and (below) skip the live apply
+        if (prev == null) delete this.config[loc.array][loc.index].capUtilization;
+        else this.config[loc.array][loc.index].capUtilization = prev;
+        throw error;
+      }
+    }
+    // No loc: a runtime provider — in-memory + state.json persistence (same as enabled).
+    account.capUtilization = cap;
+    this._addLog(cap == null
+      ? `Usage cap removed for "${account.name}" — fully utilized`
+      : `Usage cap ${pct}% set for "${account.name}" — the proxy stops routing to it at ${pct}% of the 5h and weekly windows`);
+  }
+
   async _doRename(idx, newName) {
     const account = this.am.accounts[idx];
     if (!account) { this._addLog('Account no longer exists'); return; }
@@ -1968,6 +2031,7 @@ export class TUI {
         const m = this.am._fastRefillMultiplier(a);
         if (m < 1) note += `  ${cyan(`fast·refill ×${m.toFixed(2)}`)}`;
       }
+      if (a.capUtilization != null) note += `  ${yellow(`cap ${Math.round(a.capUtilization * 100)}%`)}`;
     } else if (q.providerQuotaSource === 'console-only') {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);
