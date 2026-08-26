@@ -2066,7 +2066,7 @@ export class TUI {
       if (win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent) {
         const sesTank = this.am.capacityTank?.(i, 'ses');
         const approx = sesTank && sesTank.n > 0
-          ? `≈${formatTokens(Math.round(sesTank.avg * (7 * 24) / 5))}` : '--';
+          ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
         const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
         out.push('  ' + name + ' ' + prov + ' '
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
@@ -2085,11 +2085,11 @@ export class TUI {
       // vendor says it is. `~` estimate-from-open-window, `≥` lower bound (joined late).
       let cur = '--';
       if (tank && !(tank.source === 'live' && unprovenLive)) {
-        cur = (tank.lowerBound ? '≥' : tank.source === 'live' ? '~' : '') + formatTokens(tank.avg);
+        cur = formatTokens(tank.avg);
       } else if (nowOpen?.tokensSoFar > 0 && util > 0) {
-        cur = '~' + formatTokens(Math.round(nowOpen.tokensSoFar / util));
+        cur = formatTokens(Math.round(nowOpen.tokensSoFar / util));
       }
-      const curPct = util != null && cur !== '--' ? dim(`${Math.round(util * 100)}%`) : '';
+      const curPct = util != null && cur !== '--' ? dim(`@${Math.round(util * 100)}%`) : '';
       const st = ledger.windowStats(a.name, win);
       const cellsByName = {
         Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
@@ -2104,7 +2104,7 @@ export class TUI {
 
     out.push('');
     out.push(' ' + dim('Capacity = tokens ÷ how full the provider said the window was, at close.'));
-    out.push(' ' + dim('~ = running estimate · ≥ = at least (maxpool joined late) · ≈ = avg 5h × 33.6.'));
+    out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
     return out;
   }
 

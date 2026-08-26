@@ -784,8 +784,8 @@ test('M2: the page shows the LIVE ESTIMATE where no cycle has completed (real TU
   const tui = new TUI({ accountManager: am, config: {} });
   tui.capacityWindow = 'ses';
   const page = tui._renderCapacityPage(140).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(page, /~\s*607k|≥\s*607k/, 'the Current column renders (576,708 ÷ 0.95 ≈ 607k)');
-  assert.match(page, /95%/, 'the vendor fullness is shown next to it');
+  assert.match(page, /607k/, 'the Current column renders (576,708 ÷ 0.95 ≈ 607k)');
+  assert.match(page, /@95%/, 'the vendor fullness is shown with it');
 });
 
 test('M3: a stale utilization reading carries the caveat, never silent trust', () => {
@@ -818,9 +818,17 @@ test('M4: a measured cycle still beats the estimate — the estimate never overw
   assert.doesNotMatch(page, /~\s*200k/, 'no estimate where data exists');
 });
 
-test('M6: a mid-window join renders ≥ (lower bound), the delta renders without it', () => {
+function amWithLegacyGlm() {
+  const am = new AM([{ name: 'glm-legacy', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
+  am.accounts[0].quota.weeklyAbsent = true;
+  return am;
+}
+
+test('M6: join-independence holds — delta and late-join both render the same number', () => {
+  // The ≥/~ uncertainty markers were removed at owner direction (2026-08-26): every
+  // cell is just the number. What still matters: a mid-window join and a delta
+  // refinement both land on the same tank (1.0M), i.e. the math, not the marker.
   const am = amWithOauth();
-  // late join, absolute fallback
   am.accrueCapacity(0, { input: 400_000, output: 0 });
   am.capacity.openCycle('claude1', 'ses').windowStartedAt = Date.now() - 3 * 3600_000;
   am.accounts[0].quota.unified5h = 0.4;
@@ -828,29 +836,18 @@ test('M6: a mid-window join renders ≥ (lower bound), the delta renders without
   let tui = new TUI({ accountManager: am, config: {} });
   tui.capacityWindow = 'ses';
   let page = tui._renderCapacityPage(150).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(page, /≥\s*1\.0M/, 'the absolute-on-late-join renders as a lower bound');
+  const row1 = page.split('\n').find(l => l.includes('claude1'));
+  assert.match(row1, /1\.0M/, 'absolute-on-late-join: 400k ÷ 0.4');
 
-  // then a rising reading makes it a delta — no ≥ anymore
   am.accrueCapacity(0, { input: 200_000, output: 0 });
   am.accounts[0].quota.unified5h = 0.6;
   am.capacity.noteUtilizationObserved(Date.now(), [{ name: 'claude1', window: 'ses', utilization: 0.6 }]);
   tui = new TUI({ accountManager: am, config: {} });
   tui.capacityWindow = 'ses';
   page = tui._renderCapacityPage(150).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(page, /~\s*1\.0M/, 'delta: 200k observed between marks ÷ 0.2 = 1.0M');
-  // Scope to the ROW — the footer legend explains the ≥ symbol and always contains it.
-  const deltaRow = page.split('\n').find(l => l.includes('claude1'));
-  assert.doesNotMatch(deltaRow, /≥/, 'no lower-bound sign on a delta');
+  const row2 = page.split('\n').find(l => l.includes('claude1'));
+  assert.match(row2, /1\.0M/, 'delta: 200k between marks ÷ 0.2 — same 1.0M');
 });
-
-// ── W-lane: the no-weekly account's weekly view (user directive 2026-08-24:
-//    "some kind of an approximation from the session limits") ────────────────────
-
-function amWithLegacyGlm() {
-  const am = new AM([{ name: 'glm-legacy', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.90);
-  am.accounts[0].quota.weeklyAbsent = true;
-  return am;
-}
 
 test('W1: a no-weekly plan accrues sessions and day buckets but NEVER opens a wk cycle', () => {
   const am = amWithLegacyGlm();
@@ -907,7 +904,7 @@ test('W4: a measured session tank yields the ×33.6 weekly approximation', () =>
   const page = tui._renderCapacityPage(170).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
   const row = page.split('\n').find(l => l.includes('glm-legacy'));
   // 900k ÷ 0.9 = 1.0M session tank × 33.6 = 33.6M ≈ 34M
-  assert.match(row, /≈34M/, '1.0M per 5h × 33.6 ≈ 34M');
+  assert.match(row, /34M/, '1.0M per 5h × 33.6 = 34M');
 });
 
 test('W5: a CAPPED provider is untouched — still opens wk cycles', () => {
