@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.2] - 2026-08-26
+
+### Fixed
+
+- Physical floor — a tank can never be smaller than a past delivery
+
 ## [1.13.1] - 2026-08-25
 
 ### Fixed
