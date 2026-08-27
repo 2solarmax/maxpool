@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-08-27
+
+### Changed
+
+- Account-row cleanup — cap visible everywhere, exhausted vocabulary, quiet-when-idle activity cell
+
 ## [1.15.0] - 2026-08-26
 
 ### Added
