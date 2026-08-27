@@ -68,6 +68,11 @@ export class Prober {
     if (this._running) return this._inflight || Promise.resolve();
     this._running = true;
     this._stopping = false;
+    // Publish the sweep's liveness so the UI can answer "what happens next?"
+    // rather than printing a bare "stale". Reported 2026-08-27: a stale marker with
+    // no next step reads as a problem the user must fix, when the prober is already
+    // retrying on its own.
+    this.am.quotaProbeSweeping = true;
     this._inflight = (async () => {
       try {
         // CAPACITY LEDGER: close any open cycle whose window's reset stamp has
@@ -110,6 +115,10 @@ export class Prober {
       } finally {
         this._running = false;
         this._inflight = null;
+        this.am.quotaProbeSweeping = false;
+        // When the NEXT sweep starts. setInterval fires every intervalMs from the
+        // last tick, so "now + interval" is the honest estimate for the UI.
+        this.am.quotaProbeNextSweepAt = this.intervalMs > 0 ? Date.now() + this.intervalMs : null;
       }
     })();
     return this._inflight;

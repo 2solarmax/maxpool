@@ -139,6 +139,18 @@ function formatMs(ms) {
   return `${min}m${String(rem).padStart(2, '0')}s`;
 }
 
+/** Coarse human duration for AGE and NEXT-REFRESH text: "45s", "12m", "2h".
+ *  Deliberately not formatMs — "quota 12m03s old" spends precision on a number
+ *  nobody reads to the second, and the extra digits are what made the old cell
+ *  look like machine output. */
+function formatAge(ms) {
+  if (ms == null || isNaN(ms) || ms < 0) return '';
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
+}
+
 function statusColor(status) {
   if (status == null) return '-';
   if (status >= 200 && status < 300) return green(String(status));
@@ -162,17 +174,15 @@ function countdown(ts) {
   return `${Math.ceil(ms / 86_400_000)}d`;
 }
 
-/** ACTIVITY cell — "is this account working, and is it healthy?" in as few glyphs
- *  as that question needs. Rewritten 2026-08-27 on owner feedback: the old form
- *  ("Now 0  15m 0r  1h 0r") printed three numbers on EVERY row, and on a resting
- *  account all three were zero — a column of noise whose vocabulary ("now", then
- *  some minutes, then hours) nobody could read. An idle account now renders
- *  NOTHING, and a working one renders live · rate · latency.
+/** ACTIVITY cell — "is this account working, and is it healthy?" in plain words.
+ *  Rewritten twice on owner feedback (2026-08-27): first to symbols ("▶2 · 17/h ·
+ *  8.5s"), which read as secret code; now to words. Average latency is GONE —
+ *  "how long each request takes" is not something the owner acts on. An idle
+ *  account renders NOTHING.
  *
- *    ▶2 · 17/h · 8.5s      2 in flight, 17 requests in the last hour, 8.5s average
- *    17/h · 8.5s           idle this second, but working
- *    17/h · 8.5s  2f       …with 2 failures in the last 15m
- *    (blank)               resting — nothing to say
+ *    2 live · 17 req/hr · 1 failed
+ *    17 req/hr                 working, idle this second
+ *    (blank)                   resting — nothing to say
  */
 function loadText(load) {
   const inflight = load?.current?.inFlight || 0;
@@ -180,13 +190,10 @@ function loadText(load) {
   const failed = load?.last15m?.failed || 0;
   if (!inflight && !hourReq && !failed) return '';
   const parts = [];
-  if (inflight) parts.push(`▶${inflight}`);
-  if (hourReq) parts.push(`${hourReq}/h`);
-  const avg = load?.last15m?.avgMs ?? load?.last1h?.avgMs;
-  if (avg != null && hourReq) parts.push(formatMs(avg));
-  let s = parts.join(' · ');
-  if (failed) s += `  ${red(`${failed}f`)}`;
-  return s;
+  if (inflight) parts.push(`${inflight} live`);
+  if (hourReq) parts.push(`${hourReq} req/hr`);
+  if (failed) parts.push(red(`${failed} failed`));
+  return parts.join(' · ');
 }
 
 /** The usage CAP is an account PROPERTY, not a state — so it renders whenever one
@@ -199,6 +206,26 @@ function capText(a, benched) {
   if (a?.capUtilization == null) return '';
   const t = `cap ${Math.round(a.capUtilization * 100)}%`;
   return benched ? yellow(t) : dim(t);
+}
+
+/** PER-ACCOUNT SETTINGS the user set by hand — the last column's whole job
+ *  (owner, 2026-08-27: "the last column should contain any and all settings that
+ *  are custom per account"). Fleet-wide settings (routing mode, peak policy) stay
+ *  in the top header where they already live; only what is scoped to THIS account
+ *  belongs on THIS row.
+ *    preferred   this account is the manual routing pin (the 'p' key)
+ *    cap NN%     its reserved-capacity ceiling (the 'c' key)
+ *  Deliberately NOT here: automatic routing policies (peak, fast-refill) — those
+ *  are the system's behaviour, not the user's settings; they keep their own tags.
+ */
+function settingsTags(am, a) {
+  const tags = [];
+  if (am?.routingMode === 'preferred' && a?.name === am.preferredAccountName) {
+    tags.push(cyan('preferred'));
+  }
+  const capTag = capText(a, capBenched(am, a));
+  if (capTag) tags.push(capTag);
+  return tags;
 }
 
 /** True when the reservation is what is currently keeping traffic off this account
@@ -1775,11 +1802,11 @@ export class TUI {
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
       }
-      // Glossary FOOTER (expands the abbreviations the header + inline labels can't
-      // spell out). Below the rows so it never breaks the header↔column alignment.
-      if (W >= 88) {
-        lines.push(' ' + dim('Legend  Ses = 5h · Wk = 7d · ▶ = in-flight · /h = requests last hour · avg latency · f = fails'));
-      }
+      // The glossary FOOTER is gone (owner, 2026-08-27). A legend is a symptom: it
+      // exists to decode a row that could not be read on its own. Every cell now
+      // says what it means in words ("2 live · 17 req/hr", "quota 12m old ·
+      // refreshing in 45s"), so there is nothing left to decode — and one fewer
+      // line of chrome between the operator and the data.
     }
 
     // ── Activity header
@@ -1979,13 +2006,14 @@ export class TUI {
     }
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
-    // The reservation, whatever the account is doing. weeklyPolicyText renders
-    // "Cap 50%" only while the cap is the ACTIVE weekly state; this is the standing
-    // property, so a capped account that is exhausted, throttled or idle still says
-    // so. Suppressed when the weekly tag is already the Cap label (no double tag).
-    if (weekly.includes('Cap ') === false) {
-      const capTag = capText(a, capBenched(this.am, a));
-      if (capTag) line += `  ${capTag}`;
+    // Per-account SETTINGS (preferred pin, usage cap), whatever the account is
+    // doing. weeklyPolicyText renders "Cap 50%" only while the cap is the ACTIVE
+    // weekly state; these are the standing properties, so a capped account that is
+    // exhausted, throttled or idle still says so. The cap is suppressed when the
+    // weekly tag already IS the Cap label (no double tag).
+    for (const tag of settingsTags(this.am, a)) {
+      if (weekly.includes('Cap ') && tag.includes('cap ')) continue;
+      line += `  ${tag}`;
     }
     // Per-model weekly caps (e.g. Fable, while the unified weekly still has
     // headroom). Show the ACTUAL utilization — "Fable 90%" (yellow) while high but
@@ -2042,10 +2070,35 @@ export class TUI {
       const headerFresh = q.lastHeaderQuotaAt && (Date.now() - q.lastHeaderQuotaAt) <= Math.max(3 * interval, 180_000);
       if (headerFresh) return '';
     }
-    const s = q.lastProbeErrorStatus;
-    if (s === 429) return `  ${yellow('stale·probe throttled')}`;
-    if (s) return `  ${yellow('stale·probe ' + s)}`;
-    return `  ${dim('stale')}`;
+    // SAY WHAT HAPPENS NEXT (owner, 2026-08-27): "stale" / "stale·probe throttled"
+    // named an internal mechanism and left the user with nothing to do. Nothing IS
+    // the correct action — the prober retries on its own schedule and backs off
+    // automatically when Anthropic rate-limits it — so the cell now states how old
+    // the numbers are AND when they refresh, in that order.
+    const age = q.lastProbeOkAt ? formatAge(Date.now() - q.lastProbeOkAt) : null;
+    const ageText = age ? `quota ${age} old` : 'quota not read yet';
+    const next = this._probeNextText();
+    const throttled = q.lastProbeErrorStatus === 429;
+    // Throttled is the ONE case worth colouring: it is why the refresh is late, and
+    // it self-clears. Everything else is a plain dim statement of fact.
+    const body = throttled
+      ? `${ageText} · rate-limited, retrying ${next}`
+      : `${ageText} · refreshing ${next}`;
+    return `  ${throttled ? yellow(body) : dim(body)}`;
+  }
+
+  /** "now" while a sweep is in flight, else "in 45s" from the prober's next-tick
+   *  stamp. Falls back to the configured interval when no sweep has completed yet
+   *  (fresh boot), and to a bare "shortly" when the probe is manual/off. */
+  _probeNextText() {
+    if (this.am.quotaProbeSweeping) return 'now';
+    const at = this.am.quotaProbeNextSweepAt;
+    if (at) {
+      const ms = at - Date.now();
+      return ms > 0 ? `in ${formatAge(ms)}` : 'now';
+    }
+    const interval = this.am.quotaProbeIntervalMs;
+    return interval > 0 ? `every ${formatAge(interval)}` : 'shortly';
   }
 
   _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true) {
@@ -2091,11 +2144,10 @@ export class TUI {
       sesCell = emptyBar('probing', bw);
       wkCell = emptyBar('probing', bw);
     }
-    // The cap rides OUTSIDE the quota-readable branch: an account with an
+    // Settings ride OUTSIDE the quota-readable branch: an account with an
     // unreadable or not-yet-probed quota still HAS its reservation, and hiding the
     // setting whenever the probe is quiet is how a shipped feature reads as absent.
-    const capTag = capText(a, capBenched(this.am, a));
-    if (capTag) note += `  ${capTag}`;
+    for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
     let line = ` ${sel}${cur} ${name} ${type} ${status} Ses ${sesCell}`;
     if (showBoth) line += `  Wk  ${wkCell}`;
