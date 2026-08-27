@@ -162,22 +162,54 @@ function countdown(ts) {
   return `${Math.ceil(ms / 86_400_000)}d`;
 }
 
+/** ACTIVITY cell — "is this account working, and is it healthy?" in as few glyphs
+ *  as that question needs. Rewritten 2026-08-27 on owner feedback: the old form
+ *  ("Now 0  15m 0r  1h 0r") printed three numbers on EVERY row, and on a resting
+ *  account all three were zero — a column of noise whose vocabulary ("now", then
+ *  some minutes, then hours) nobody could read. An idle account now renders
+ *  NOTHING, and a working one renders live · rate · latency.
+ *
+ *    ▶2 · 17/h · 8.5s      2 in flight, 17 requests in the last hour, 8.5s average
+ *    17/h · 8.5s           idle this second, but working
+ *    17/h · 8.5s  2f       …with 2 failures in the last 15m
+ *    (blank)               resting — nothing to say
+ */
 function loadText(load) {
-  const cur = load?.current || {};
-  const m15 = load?.last15m || {};
-  const h1 = load?.last1h || {};
-  // "Now" = what this account is handling right THIS moment: N in-flight requests
-  // (and their combined weight ~ payload size, the scheduler's load input). Kept
-  // distinct from the "15m"/"1h" THROUGHPUT counts that follow, which the old
-  // "Load X/Y" label collided with.
-  const inflight = cur.inFlight || 0;
-  const weight = cur.activeWeight || 0;
-  const now = weight > 0 ? `Now ${inflight} (${weight}w)` : `Now ${inflight}`;
-  const recent = `${m15.requests || 0}r`;
-  const recentAvg = m15.avgMs != null ? ` ${formatMs(m15.avgMs)}` : '';
-  const hour = `${h1.requests || 0}r`;
-  const fails = (m15.failed || 0) > 0 ? ` ${red(`${m15.failed}f`)}` : '';
-  return `${now}  15m ${recent}${recentAvg}${fails}  1h ${hour}`;
+  const inflight = load?.current?.inFlight || 0;
+  const hourReq = load?.last1h?.requests || 0;
+  const failed = load?.last15m?.failed || 0;
+  if (!inflight && !hourReq && !failed) return '';
+  const parts = [];
+  if (inflight) parts.push(`▶${inflight}`);
+  if (hourReq) parts.push(`${hourReq}/h`);
+  const avg = load?.last15m?.avgMs ?? load?.last1h?.avgMs;
+  if (avg != null && hourReq) parts.push(formatMs(avg));
+  let s = parts.join(' · ');
+  if (failed) s += `  ${red(`${failed}f`)}`;
+  return s;
+}
+
+/** The usage CAP is an account PROPERTY, not a state — so it renders whenever one
+ *  is set, on every account type, whatever the account is doing. It previously
+ *  lived inline in the provider branch only, so the OAuth account the feature was
+ *  built for (max@gomokka.com) showed no cap anywhere: reported 2026-08-27, "I need
+ *  to be able to see whether an account has a cap or not." Yellow while the cap is
+ *  actively holding traffic back, dim otherwise. */
+function capText(a, benched) {
+  if (a?.capUtilization == null) return '';
+  const t = `cap ${Math.round(a.capUtilization * 100)}%`;
+  return benched ? yellow(t) : dim(t);
+}
+
+/** True when the reservation is what is currently keeping traffic off this account
+ *  — either window at or past the cap. Reads the manager's own predicate so the
+ *  label can never disagree with routing. */
+function capBenched(am, a) {
+  if (a?.capUtilization == null) return false;
+  const q = a.quota || {};
+  const ses = a.type === 'provider' ? q.providerSes : q.unified5h;
+  const wk = a.type === 'provider' ? q.providerWk : q.unified7d;
+  return !!(am?._capped?.(a, ses) || am?._capped?.(a, wk));
 }
 
 export function weeklyPolicyText(am, account) {
@@ -190,6 +222,14 @@ export function weeklyPolicyText(am, account) {
     return yellow(`Cap ${Math.round((account.capUtilization || 0) * 100)}%`);
   }
   if (!state || state === 'unknown' || state === 'normal') return '';
+  // SAY IT ONCE (2026-08-27). An account Anthropic is rejecting outright already
+  // says so twice on this row: the Wk bar reads 100%, and the Status column reads
+  // "exhausted". A third "Wk exhausted 100%" tag was pure repetition, and it pushed
+  // the genuinely-informative tags (Cap, a per-model sub-limit) off to the right.
+  // Dropped ONLY when the Status column carries the same fact — a soft/reserve/
+  // critical row, or an exhausted-by-threshold row the status column shows as
+  // "active", still needs the tag.
+  if (am._isAccountWideRejected?.(account)) return '';
   const rawState = am._weeklyRawState?.(account) || state;
   const used = Number(account.quota?.unified7d);
   const pct = Number.isFinite(used)
@@ -1738,7 +1778,7 @@ export class TUI {
       // Glossary FOOTER (expands the abbreviations the header + inline labels can't
       // spell out). Below the rows so it never breaks the header↔column alignment.
       if (W >= 88) {
-        lines.push(' ' + dim('Legend  Ses = 5h · Wk = 7d · Now = in-flight (weight) · 15m/1h = served (avg · f = fails)'));
+        lines.push(' ' + dim('Legend  Ses = 5h · Wk = 7d · ▶ = in-flight · /h = requests last hour · avg latency · f = fails'));
       }
     }
 
@@ -1859,13 +1899,16 @@ export class TUI {
     if (a.enabled !== false && upstreamBlocking && a.status === 'active') {
       effectiveStatus = a.inFlight > 0 ? 'probing' : 'waiting';
     }
-    // "blocked" = Anthropic is rejecting the WHOLE account (a 'rejected' unified
-    // status corroborated by an exhausted unified bucket). A per-model cap (Fable)
-    // is NOT account-wide — it shows as the separate "… maxed" tag, leaving the
-    // status column truthful. Keys on a.status (not effectiveStatus) so a genuine
-    // block wins even inside an upstream-throttle window.
+    // Anthropic is rejecting the WHOLE account (a 'rejected' unified status
+    // corroborated by an exhausted unified bucket). A per-model cap (Fable) is NOT
+    // account-wide — it shows as the separate "… maxed" tag, leaving the status
+    // column truthful. Keys on a.status (not effectiveStatus) so a genuine block
+    // wins even inside an upstream-throttle window.
+    // Named "exhausted", not "blocked" (2026-08-27): the row's own quota bar and
+    // every other surface call this state exhausted, and two words for one state
+    // read as two different problems.
     if (a.enabled !== false && a.status === 'active' && this.am._isAccountWideRejected?.(a)) {
-      effectiveStatus = 'blocked';
+      effectiveStatus = 'exhausted';
     }
     // A dead refresh token surfaces as "reauth" (re-login needed) rather than a
     // generic "error", so the user knows the fix. Display-only — account.status
@@ -1879,7 +1922,7 @@ export class TUI {
     switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'reauth':    status = yellow('reauth'); break;
-      case 'blocked':   status = red('blocked'); break;
+      case 'blocked':   status = red('exhausted'); break;
       case 'probing':   status = green('probing'); break;
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
@@ -1936,6 +1979,14 @@ export class TUI {
     }
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
+    // The reservation, whatever the account is doing. weeklyPolicyText renders
+    // "Cap 50%" only while the cap is the ACTIVE weekly state; this is the standing
+    // property, so a capped account that is exhausted, throttled or idle still says
+    // so. Suppressed when the weekly tag is already the Cap label (no double tag).
+    if (weekly.includes('Cap ') === false) {
+      const capTag = capText(a, capBenched(this.am, a));
+      if (capTag) line += `  ${capTag}`;
+    }
     // Per-model weekly caps (e.g. Fable, while the unified weekly still has
     // headroom). Show the ACTUAL utilization — "Fable 90%" (yellow) while high but
     // still usable, "Fable maxed" (red) ONLY at genuine exhaustion. This is the
@@ -1958,7 +2009,8 @@ export class TUI {
     // cause (e.g. rate-limited) when a probe failure is on record — rather than imply
     // the last-known value is current.
     line += this._probeHealthNote(a);
-    line += `  ${dim(loadText(this._accountLoad(a)))}`;
+    const act = loadText(this._accountLoad(a));
+    if (act) line += `  ${dim(act)}`;
     return line;
   }
 
@@ -2031,7 +2083,6 @@ export class TUI {
         const m = this.am._fastRefillMultiplier(a);
         if (m < 1) note += `  ${cyan(`fast·refill ×${m.toFixed(2)}`)}`;
       }
-      if (a.capUtilization != null) note += `  ${yellow(`cap ${Math.round(a.capUtilization * 100)}%`)}`;
     } else if (q.providerQuotaSource === 'console-only') {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);
@@ -2040,15 +2091,27 @@ export class TUI {
       sesCell = emptyBar('probing', bw);
       wkCell = emptyBar('probing', bw);
     }
+    // The cap rides OUTSIDE the quota-readable branch: an account with an
+    // unreadable or not-yet-probed quota still HAS its reservation, and hiding the
+    // setting whenever the probe is quiet is how a shipped feature reads as absent.
+    const capTag = capText(a, capBenched(this.am, a));
+    if (capTag) note += `  ${capTag}`;
 
     let line = ` ${sel}${cur} ${name} ${type} ${status} Ses ${sesCell}`;
     if (showBoth) line += `  Wk  ${wkCell}`;
     line += note;
     // Same recent-load columns as OAuth (providers track inFlight + load events),
     // plus a compact Last <status> <ms> — the one signal that matters for a
-    // rarely-hit fallback (loadText reads 0r when idle).
-    line += `  ${dim(loadText(this._accountLoad(a)))}`;
-    if (a.lastStatus) line += `  ${dim('Last')} ${statusColor(a.lastStatus)} ${dim(formatMs(a.lastResponseMs))}`;
+    // rarely-hit fallback. loadText renders empty when fully idle.
+    const act = loadText(this._accountLoad(a));
+    if (act) line += `  ${dim(act)}`;
+    // "Last 200 6.4s" next to a live "17/h · 6.4s" said the same thing twice. Keep it
+    // for the two cases where it is the ONLY thing that speaks: a non-2xx last result
+    // (always worth seeing), or an idle row whose activity cell is blank.
+    const lastOk = a.lastStatus >= 200 && a.lastStatus < 300;
+    if (a.lastStatus && (!lastOk || !act)) {
+      line += `  ${dim('Last')} ${statusColor(a.lastStatus)} ${dim(formatMs(a.lastResponseMs))}`;
+    }
     // Header-derived generic rate-limit (distinct from the monitor-endpoint quota),
     // if the provider upstream returns x-ratelimit-* headers — only when present.
     if (q.genericLimit != null && q.genericRemaining != null) {

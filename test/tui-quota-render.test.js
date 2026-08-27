@@ -59,6 +59,81 @@ test('an inactive scoped cap shows no tag (matches the routing gate)', () => {
   assert.doesNotMatch(line, /Fable/);
 });
 
+// ── cap VISIBILITY (2026-08-27): "I need to be able to see whether an account
+//    has a cap or not" — the tag must render on ANY account type in ANY state.
+
+test('a capped OAuth account shows its cap even while upstream-exhausted', () => {
+  // The exact shape of the reported miss: max@gomokka.com at 7d=1.00 'rejected'
+  // renders via the exhausted paths, and the cap tag lived only in the provider
+  // branch — so the account the feature was BUILT for showed no cap anywhere.
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.quota.unified5h = 0;
+  a.quota.unified7d = 1.0;
+  a.quota.unifiedStatus = 'rejected';
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/, 'the reservation is visible');
+  assert.doesNotMatch(line, /blocked/, 'and the status says exhausted, the shared vocabulary');
+  assert.match(line, /exhausted/);
+  // and while the cap is what is holding traffic back, the tag is YELLOW (alarm),
+  // not dim — pinned on the raw ANSI so a color swap can't slip through strip().
+  assert.match(tui._renderAcct(0, 11, true), /\x1b\[33mcap 50%/);
+});
+
+test('a capped account below its cap shows the cap dim, not alarming', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.quota.unified5h = 0.1;
+  a.quota.unified7d = 0.2;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/);
+});
+
+test('an uncapped account shows no cap tag', () => {
+  const am = oauthAM();
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.doesNotMatch(line, /cap \d/);
+});
+
+test('a capped provider whose quota has not been read STILL shows the cap', () => {
+  // The provider branch gated the tag on quota readability — an unprobed account
+  // kept its reservation invisible.
+  const am = new AccountManager([
+    { name: 'p', type: 'provider', provider: 'zai', authToken: 'zt', upstream: 'https://z', capUtilization: 0.5 },
+  ], 0.90);
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/);
+});
+
+// ── SAY IT ONCE (2026-08-27): "if an account is exhausted I already see this in
+//    the relevant quota column" — drop the third repetition of that fact.
+
+test('an upstream-rejected account drops the redundant "Wk exhausted" tag', () => {
+  const am = oauthAM();
+  am.accounts[0].quota.unified5h = 0.3;
+  am.accounts[0].quota.unified7d = 1.0;
+  am.accounts[0].quota.unifiedStatus = 'rejected';
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.doesNotMatch(line, /Wk exhausted/, 'status column + bar already say it');
+  assert.match(line, /exhausted/, 'the status column DOES say it');
+});
+
+test('a soft-tier account keeps its weekly tag — only true repetition is dropped', () => {
+  const am = oauthAM();
+  am.accounts[0].quota.unified5h = 0.3;
+  am.accounts[0].quota.unified7d = 0.70;   // above the 0.65 soft threshold
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /Wk soft 70%/);
+});
+
 // ── staleness marker answers "how do you know it's refreshed?" ────────────────
 
 test('a stale probe marks the scoped tag "stale"; a fresh one does not', () => {
@@ -399,8 +474,8 @@ test('the abbreviation glossary is a FOOTER below the rows, never between the he
   const legend = flat.slice(iGlossary);
   assert.match(legend, /Ses = 5h/);
   assert.match(legend, /Wk = 7d/);
-  assert.match(legend, /Now = in-flight \(weight\)/);
-  assert.match(legend, /15m\/1h = served \(avg · f = fails\)/);
+  assert.match(legend, /▶ = in-flight/);
+  assert.match(legend, /\/h = requests last hour/);
 });
 
 test('an extreme-narrow header clips WITHOUT bleeding the underline into later lines', () => {
