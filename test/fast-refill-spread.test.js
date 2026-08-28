@@ -16,7 +16,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 
-const FIVE_H = 5 * 3600_000;
 const provider = (name, extra = {}) => ({
   name, type: 'provider', provider: 'zai', authToken: 'z',
   upstream: 'https://z', profiles: ['all'], ...extra,
