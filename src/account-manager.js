@@ -2592,7 +2592,19 @@ export class AccountManager {
     const fleetRecentWeight = ctx?.fleetRecentWeight ?? 0;
     const recentWeight = this._loadSummary(account, this.scheduler.spreadWindowMs, now).weight;
     const share = fleetRecentWeight > 0 ? recentWeight / fleetRecentWeight : 0;
-    const spread = share * this.scheduler.spreadShareWeight;
+    // SPREAD also carries the fast-refill discount (2026-08-29, owner option 1). The
+    // spread term is the equaliser that pulls every account back to fleet parity — at
+    // converged equal share it is ~10x larger than the utilization+pace gap the
+    // discount bought before (measured: spread 1.500 vs 0.152 on the real fleet), so
+    // without this the unlimited account's preference washes out to ~52/48 and a
+    // weekly-limited sibling burns to 100% while the fast window's capacity expires
+    // unused every 5h. Discounted, the equilibrium share of a weeklyAbsent account is
+    // ~mult/(1-disc*(1-share)) of a sibling's — at the default 0.6 discount roughly
+    // 2.3x early in its window, fading to parity at the same ses 0.65 the multiplier
+    // already uses. Same safety invariants as the other discounted terms: a
+    // multiplier of 1 makes it byte-identical to pre-2026-08-25 behaviour, and it is
+    // never applied to concurrency/capPenalty/reserve/critical.
+    const spread = share * this.scheduler.spreadShareWeight * refillMult;
 
     const ramp = this._recoveryRamp(account, now);
     const reserveCost = this._reserveCost(account, now, weeklyState);
