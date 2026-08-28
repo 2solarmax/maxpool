@@ -60,16 +60,21 @@ test('multiplier: feature off (discount 0) returns exactly 1', () => {
 
 // ---------- score composition ----------
 
-test('score: the discount only removes cost — total stays ≥ concurrency floor, never negative', () => {
+test('score: the discount only removes cost — total stays ≥ the discounted in-flight floor, never negative', () => {
+  // v1.19.0 (2026-08-29): in-flight terms carry the discount too, so the floor is
+  // the DISCOUNTED in-flight cost. What stays inviolate: the total is never
+  // negative, and past the fade point (mult 1) the floor is the old full one.
   const am = makeAm();
   const unltd = am.accounts[0];
   const ctx = am._scoringContext();
-  for (const ses of [0, 0.1, 0.3, 0.6, 0.64]) {
+  for (const ses of [0, 0.1, 0.3, 0.6, 0.64, 0.65]) {
     unltd.quota.providerSes = ses;
+    const mult = am._fastRefillMultiplier(unltd);
     const s = am._scoreAccount(unltd, {}, ctx);
-    const concurrency = (unltd.activeWeight + 1) * am.scheduler.concurrencyWeight;
-    assert.ok(s >= concurrency - 1e-9,
-      `ses=${ses}: score ${s} dipped below the concurrency floor ${concurrency}`);
+    const floor = (unltd.activeWeight + 1) * am.scheduler.concurrencyWeight * mult;
+    assert.ok(s >= floor - 1e-9,
+      `ses=${ses}: score ${s} dipped below the discounted in-flight floor ${floor}`);
+    assert.ok(s >= 0, `ses=${ses}: score ${s} is negative`);
   }
 });
 
@@ -93,14 +98,18 @@ test('score: the win dies as the fast window fills (convergence, not a cliff)', 
   assert.ok(s2 < s1, `limited ${s2} should win once the unltd window fills (got unltd ${s1})`);
 });
 
-test('score: safety terms untouched — concurrency still dominates identically', () => {
+test('score: in-flight burst cost scales by mult for unltd, full for limited', () => {
+  // v1.19.0: the in-flight terms carry the discount, so the discounted account's
+  // burst cost is exactly mult× the limited account's (same util) at every depth
+  // — a proportional softening, never more (no flat bonus leaking in).
   const am = makeAm();
   const unltd = am.accounts[0];
   const ctx = am._scoringContext();
+  const mult = am._fastRefillMultiplier(unltd);
+  assert.ok(mult > 0 && mult < 1, 'fixture must be inside the discount window');
   const before = am._scoreAccount(unltd, {}, ctx);
   unltd.activeWeight = 5; // deep burst
   const after = am._scoreAccount(unltd, {}, ctx);
-  // The whole difference must be capPenalty + concurrency — same as a limited account.
   const ltd = am.accounts[1];
   ltd.quota.providerSes = unltd.quota.providerSes; // same util for parity
   const ltdBefore = am._scoreAccount(ltd, {}, ctx);
@@ -108,8 +117,8 @@ test('score: safety terms untouched — concurrency still dominates identically'
   const ltdAfter = am._scoreAccount(ltd, {}, ctx);
   const dUnltd = after - before;
   const dLtd = ltdAfter - ltdBefore;
-  assert.ok(Math.abs(dUnltd - dLtd) < 1e-6,
-    `burst cost must be identical (${dUnltd} vs ${dLtd}) — discount must not soften safety terms`);
+  assert.ok(Math.abs(dUnltd - dLtd * mult) < 1e-6,
+    `unltd burst cost must equal mult×ltd (${dUnltd} vs ${dLtd * mult})`);
 });
 
 test('score: BOTH balancing terms carry the discount (pace, not just utilization)', () => {
@@ -130,14 +139,16 @@ test('score: BOTH balancing terms carry the discount (pace, not just utilization
 
   const ctx = { now, fleetRecentWeight: 0 };
   const actual = am._scoreAccount(unltd, {}, ctx);
-  // Recompute the two balancing terms by hand and confirm the score matches the
+  // Recompute the discounted composition by hand and confirm the score matches the
   // DISCOUNTED form, not the undiscounted one — the gap between them is the assertion.
-  const conc = (unltd.activeWeight + 1) * am.scheduler.concurrencyWeight;
+  const conc = (unltd.activeWeight + 1) * am.scheduler.concurrencyWeight * mult;
+  const capP = am.scheduler.capPenaltyWeight
+    * Math.max(0, (unltd.activeWeight + 1) - am.scheduler.perAccountConcurrencyTarget) * mult;
   const util = am._rawUtilization(unltd);
-  const discounted = conc
+  const discounted = conc + capP
     + pace * am.scheduler.paceCostWeight * mult
     + util * am.scheduler.utilizationWeight * mult;
-  const undiscounted = conc
+  const undiscounted = conc / mult + capP / mult
     + pace * am.scheduler.paceCostWeight
     + util * am.scheduler.utilizationWeight;
   assert.ok(Math.abs(actual - discounted) < 1e-6,

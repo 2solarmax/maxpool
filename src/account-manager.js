@@ -170,16 +170,18 @@ const DEFAULT_SCHEDULER = {
   // account sat at ~17% of fleet traffic (measured 2026-08-25) while four Claude
   // accounts ran at weekly 1.0.
   //
-  // The discount is a MULTIPLIER on those two terms only — never a flat bonus. A flat
-  // bonus would drive an idle account's total NEGATIVE (idle floor is concurrency×2 = 2),
-  // below the entire band structure that reserveFloorCost:5 / criticalPressureCost:21
-  // assume is non-negative. A multiplier in [0,1] cannot: it only ever REMOVES cost that
-  // is already there, so the total stays ≥ the concurrency floor and every safety term
-  // (concurrency, capPenalty, reserve, critical, ramp, failures) is untouched.
-  //
-  // It also DECAYS: at session util 0 the discount is full, and it is gone by
-  // fastRefillFadeUtil — so as the fast window fills, the account converges back to
-  // normal pricing and the fleet re-balances smoothly instead of flapping at a cliff.
+  // The discount is a MULTIPLIER on the BALANCING terms — never a flat bonus. A flat
+  // bonus would drive an idle account's total NEGATIVE, below the entire band structure
+  // that reserveFloorCost:5 / criticalPressureCost:21 assume is non-negative. A
+  // multiplier in [0,1] cannot: it only ever REMOVES cost that is already there.
+  // Term set as of 2026-08-29 (v1.19.0): utilization + pace (original, 2026-08-25),
+  // spread (v1.18.0), and the in-flight terms — linear concurrency + capPenalty
+  // (v1.19.0). The in-flight extension exists because live requests run 18-27s at
+  // weight 10-50, making in-flight the marginal price of traffic: measured
+  // 2026-08-28, spread-only left the unlimited account at parity (0.24x share),
+  // defeating the owner's approved outcome. Reserve/critical/ramp/failure costs stay
+  // undiscounted, as do the hard gates (safetyMaxActivePerAccount, usage cap,
+  // cooldowns) — those are the anti-dogpile backstops, not price signals.
   fastRefillDiscount: 0.6,        // 0 = off (full cost), 0.6 = discount up to 60% of the two balancing terms
   fastRefillFadeUtil: 0.65,       // discount reaches 0 at this session utilization (weeklySoftThreshold)
   recoveryRampWeight: 4,          // decaying penalty applied to a just-recovered account
@@ -2542,11 +2544,20 @@ export class AccountManager {
     const now = ctx?.now ?? Date.now();
     const reqWeight = Math.max(1, requestInfo.weight || 1);
     const inflight = account.activeWeight + reqWeight;
+    const refillMult = this._fastRefillMultiplier(account);
 
     // DOMINANT term: in-flight concurrency. Short-term throttling is driven by
     // how many requests pile on one account, so least-loaded-first spread is
     // the primary objective.
-    const concurrency = inflight * this.scheduler.concurrencyWeight;
+    // FAST-REFILL (2026-08-29 extension): in the LIVE regime this term (plus the
+    // capPenalty below) is what actually sets the equilibrium share — requests
+    // run 18-27s at weight 10-50, so in-flight dwarfs every balancing term.
+    // Measured 2026-08-28 post-v1.18.0: a spread-only discount left the
+    // unlimited account at parity (12 of 56 GLM switches, share 0.24x). The
+    // linear term is BALANCING (it shares load), so it carries the discount;
+    // the steep past-D floor, the hard request gate, cooldowns and failure
+    // backoff are the anti-dogpile machinery and are handled below.
+    const concurrency = inflight * this.scheduler.concurrencyWeight * refillMult;
 
     // Steep soft cap past depth D — the throttle safety floor. No single
     // account absorbs a deep concurrent burst no matter how "cheap" it looks. A
@@ -2560,15 +2571,21 @@ export class AccountManager {
     const concTarget = (weeklyState === 'reserve' || (weeklyState === 'critical' && criticalUnlock))
       ? this.scheduler.reserveConcurrencyTarget
       : this.scheduler.perAccountConcurrencyTarget;
+    // FAST-REFILL (2026-08-29): carries the discount for the same reason as the
+    // linear term — at live weights every account sits past D, so the marginal
+    // in-flight price IS capPenalty; discounting one without the other changes
+    // nothing. The floor stays STEEP in absolute terms (≥ capPenaltyWeight*mult
+    // per unit, still >2x the largest balancing term at the max discount) and
+    // the hard per-account request gate (safetyMaxActivePerAccount), cooldowns
+    // and failurePenalty remain undiscounted backstops.
     const capPenalty = this.scheduler.capPenaltyWeight
-      * Math.max(0, inflight - concTarget);
+      * Math.max(0, inflight - concTarget) * refillMult;
 
     // Burn-pace COST only (demoted from the old dominant scarcity×6 term): a
     // soft de-preference of accounts burning ahead of an even pace. Never a bench.
-    // FAST-REFILL DISCOUNT: applied to the pace and utilization terms (and only
-    // those) for an account whose only cap is a fast-refilling session window —
-    // see the DEFAULT_SCHEDULER block for the full rationale.
-    const refillMult = this._fastRefillMultiplier(account);
+    // FAST-REFILL DISCOUNT: applied to the pace and utilization terms for an
+    // account whose only cap is a fast-refilling session window — see the
+    // DEFAULT_SCHEDULER block for the full rationale (refillMult computed above).
     const paceCost = this._accountScarcity(account, now) * this.scheduler.paceCostWeight * refillMult;
 
     // RAW utilization cost — direct, not pace-adjusted. The pace cost above discounts
@@ -2601,9 +2618,8 @@ export class AccountManager {
     // unused every 5h. Discounted, the equilibrium share of a weeklyAbsent account is
     // ~mult/(1-disc*(1-share)) of a sibling's — at the default 0.6 discount roughly
     // 2.3x early in its window, fading to parity at the same ses 0.65 the multiplier
-    // already uses. Same safety invariants as the other discounted terms: a
-    // multiplier of 1 makes it byte-identical to pre-2026-08-25 behaviour, and it is
-    // never applied to concurrency/capPenalty/reserve/critical.
+    // already uses. A multiplier of 1 makes every discounted term byte-identical to
+    // pre-2026-08-25 behaviour; reserve/critical/ramp/failure are never discounted.
     const spread = share * this.scheduler.spreadShareWeight * refillMult;
 
     const ramp = this._recoveryRamp(account, now);

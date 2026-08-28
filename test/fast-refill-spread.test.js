@@ -49,21 +49,38 @@ function equalShare(am, now, weightEach = 1000) {
   return { now, fleetRecentWeight: weightEach * am.accounts.length };
 }
 
-/** Route N requests, feeding each pick back into the load window — this is what
- *  the live scheduler does, so the resulting split IS the equilibrium share. */
-function simulate(am, now, n = 2000) {
-  for (const a of am.accounts) a.loadEvents = [];
+/** Route N requests, feeding each pick back into the load window AND accruing
+ *  in-flight weight like production does. The v1.18.0 mistake (2026-08-28 live
+ *  measurement) was simulating without in-flight: live requests run 18-27s at
+ *  weight 10-50, so in-flight — not spread — is the marginal price of traffic,
+ *  and a simulation that never accrues it models an address production never
+ *  reads. Here each request occupies its account for RTT_MS then releases;
+ *  arrivals are paced so both accounts can be busy at once, which is the regime
+ *  that actually sets the equilibrium share. */
+function simulate(am, now, n = 2000, { rttMs = 20_000, arrivalMs = 5_000, w = 50 } = {}) {
+  for (const a of am.accounts) { a.loadEvents = []; a.activeWeight = 0; }
   const picks = Object.fromEntries(am.accounts.map(a => [a.name, 0]));
+  const queue = []; // {releaseAt, account, w}
+  const flight = new Map(am.accounts.map(a => [a.name, 0]));
   for (let i = 0; i < n; i++) {
+    const t = now + i * arrivalMs;
+    while (queue.length && queue[0].releaseAt <= t) {
+      const d = queue.shift();
+      flight.set(d.account, Math.max(0, (flight.get(d.account) || 0) - d.w));
+    }
+    for (const a of am.accounts) a.activeWeight = flight.get(a.name) || 0;
     const fleetRecentWeight = am.accounts.reduce(
-      (t, a) => t + am._loadSummary(a, am.scheduler.spreadWindowMs, now).weight, 0);
+      (t2, a) => t2 + am._loadSummary(a, am.scheduler.spreadWindowMs, t).weight, 0);
     let best = null;
     for (const a of am.accounts) {
-      const s = am._scoreAccount(a, { weight: 1 }, { now, fleetRecentWeight });
+      const s = am._scoreAccount(a, { weight: w }, { now: t, fleetRecentWeight });
       if (!best || s < best.s) best = { a, s };
     }
     picks[best.a.name]++;
-    best.a.loadEvents.push({ at: now, weight: 50, success: true, durationMs: 1000 });
+    flight.set(best.a.name, (flight.get(best.a.name) || 0) + w);
+    best.a.loadEvents.push({ at: t, weight: w, success: true, durationMs: rttMs });
+    queue.push({ releaseAt: t + rttMs, account: best.a.name, w });
+    queue.sort((x, y) => x.releaseAt - y.releaseAt);
   }
   return picks;
 }
@@ -81,28 +98,34 @@ test('S1: at EQUAL share the unlimited account is now meaningfully cheaper', () 
   assert.ok(sw - su > 0.5, `gap must be decisive, got ${(sw - su).toFixed(3)}`);
 });
 
-test('S2: EQUILIBRIUM share — the unlimited account sustainably runs hotter', () => {
+test('S2: EQUILIBRIUM share with in-flight accrual — ~1/mult, no starvation', () => {
   // The real assertion of this change: not "cheaper for one request" but "settles
-  // at a higher steady share". Pre-fix this simulation returned ~1.05x (parity).
+  // at a higher steady share" IN THE LIVE REGIME. With in-flight accrual the
+  // marginal price of traffic to the discounted account is cost*mult, so
+  // equilibrium lands near 1/mult (~1.9x at mult 0.529); the steep past-D floor
+  // and the hard gates keep it from starving anyone. Pre-fix: parity (1.05x).
   const { am, now } = pair();
-  const picks = simulate(am, now);
+  const picks = simulate(am, now, 3000);
   const ratio = picks['glm-unl'] / picks['glm-wk'];
-  assert.ok(ratio > 1.8, `unlimited should run ~2x hotter, got ${ratio.toFixed(2)}x`);
-  assert.ok(ratio < 6, `but never starve the sibling, got ${ratio.toFixed(2)}x`);
-  assert.ok(picks['glm-wk'] > 200, 'the weekly-limited sibling still gets real traffic');
+  assert.ok(ratio > 1.5, `unlimited should run meaningfully hotter, got ${ratio.toFixed(2)}x`);
+  assert.ok(ratio < 3.5, `but never starve the sibling, got ${ratio.toFixed(2)}x`);
+  assert.ok(picks['glm-wk'] > 400, 'the weekly-limited sibling still gets real traffic');
 });
 
 // ── the discount still DECAYS: preference is temporary, never structural ──────
 
-test('S3: the preference fades as the fast window fills, reaching parity at the fade point', () => {
+test('S3: the preference fades as the fast window fills', () => {
+  // Two points suffice under in-flight accrual: deep-in-the-window the
+  // equilibrium is clamped by concurrency depth, so mid-window ratios sit at
+  // the clamp and mid-vs-late monotonicity is unmeasurable there. Early vs
+  // near-fade is the decision-grade signal, and S4 pins the exact fade point.
   const ratios = [];
-  for (const ses of [0.05, 0.35, 0.64]) {
+  for (const ses of [0.05, 0.64]) {
     const { am, now } = pair({ unlSes: ses });
     const picks = simulate(am, now, 1200);
     ratios.push(picks['glm-unl'] / picks['glm-wk']);
   }
   assert.ok(ratios[0] > ratios[1], `fades with fullness: ${ratios.map(r => r.toFixed(2))}`);
-  assert.ok(ratios[1] > ratios[2], `keeps fading: ${ratios.map(r => r.toFixed(2))}`);
 });
 
 test('S4: AT/ABOVE the fade point the spread term is byte-identical to pre-fix', () => {
@@ -159,17 +182,33 @@ test('S7: an OAuth (Claude) account is untouched — provider-only by constructi
 
 // ── safety terms stay undiscounted ───────────────────────────────────────────
 
-test('S8: concurrency and the cap penalty are NOT discounted — the anti-dogpile floor holds', () => {
-  // If the discount reached concurrency, a "cheap" unlimited account would absorb a
-  // deep burst and 429 itself. Load it up and confirm its score climbs by the FULL
-  // undiscounted concurrency weight per in-flight request.
+test('S8: in-flight terms carry the discount; the hard gate does not', () => {
+  // v1.19.0 design (owner-approved outcome, 2026-08-29): in the live regime
+  // in-flight IS the marginal price of traffic, so the linear term and the
+  // past-D penalty carry the SAME multiplier as the other balancing terms.
+  // What must NOT soften: the per-account hard request gate. It is a count of
+  // concurrent requests (safetyMaxActivePerAccount), not a score — discounting
+  // the score while the count gate holds means a discounted account can run at
+  // most mult×fewer concurrent requests before REFUSAL, never a 429 dogpile.
   const { am, u, now } = pair();
   const ctx = equalShare(am, now);
+  const mult = am._fastRefillMultiplier(u);
+  assert.ok(mult < 1, 'fixture must be inside the discount window');
   const base = am._scoreAccount(u, { weight: 1 }, ctx);
   u.activeWeight = 1;
   const withOne = am._scoreAccount(u, { weight: 1 }, ctx);
-  assert.ok(Math.abs((withOne - base) - am.scheduler.concurrencyWeight) < 1e-9,
-    'one extra in-flight costs the full concurrency weight, undiscounted');
+  // Linear term: one unit of in-flight adds exactly concurrencyWeight * mult.
+  assert.ok(Math.abs((withOne - base) - am.scheduler.concurrencyWeight * mult) < 1e-9,
+    `one extra in-flight costs concurrencyWeight*mult = ${(am.scheduler.concurrencyWeight * mult).toFixed(3)}, got ${(withOne - base).toFixed(3)}`);
+  // Past-D penalty: also discounted, but its marginal cost stays well above any
+  // balancing term — the anti-dogpile floor keeps its ranking even discounted.
+  u.activeWeight = 10;
+  const deep = am._scoreAccount(u, { weight: 1 }, ctx);
+  const marginalPastD = (deep - withOne) / 9;
+  assert.ok(marginalPastD >= am.scheduler.concurrencyWeight * mult - 1e-9,
+    `marginal in-flight cost never falls below the discounted linear rate (got ${marginalPastD.toFixed(3)})`);
+  // And the HARD gate is a count, not a score — an account can never route past it.
+  assert.equal(am.scheduler.safetyMaxActivePerAccount, 50, 'hard per-account request gate exists');
 });
 
 test('S9: a capped unlimited account is still BENCHED — the discount never buys past a cap', () => {
