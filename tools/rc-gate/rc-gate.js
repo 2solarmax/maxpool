@@ -45,7 +45,8 @@ const mitmServer = http.createServer((creq, cres) => {
   const headers = { ...creq.headers };
   delete headers.authorization;           // pool accounts supply upstream auth
   delete headers['proxy-connection'];
-  headers['x-maxpool-profile'] = PROFILE;
+  // Only default the profile; a client-sent x-maxpool-profile (cc all vs claude) wins.
+  if (!headers['x-maxpool-profile']) headers['x-maxpool-profile'] = PROFILE;
   const opts = {
     host: '127.0.0.1', port: MAXPOOL_PORT, method: creq.method,
     path: creq.url, headers, agent: false,
@@ -63,9 +64,11 @@ const mitmServer = http.createServer((creq, cres) => {
     // is keyed to the signed-in identity, and account settings must reflect the
     // real user. Routing these through maxpool would swap the token for a pool
     // account's and silently flip Remote Control flags off (measured 2026-08-31).
+    const dirHeaders = { ...creq.headers, host: 'api.anthropic.com' };
+    for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
     const dirOpts = {
       host: 'api.anthropic.com', method: creq.method, path: creq.url,
-      headers: { ...creq.headers, host: 'api.anthropic.com' }, agent: false,
+      headers: dirHeaders, agent: false,
     };
     const dir = https.request(dirOpts, ures => {
       cres.writeHead(ures.statusCode, ures.headers);
