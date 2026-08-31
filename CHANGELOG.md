@@ -5,6 +5,21 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.1] - 2026-08-31
+
+### Added
+
+- CONNECT-MITM front door — Claude Code Remote Control through maxpool
+
+### Changed
+
+- Fix L5 time-bomb — fixture day bucket hardcoded 2026-08-23, aged out of the 7d rolling window on 2026-08-26+
+
+### Fixed
+
+- Normalize provider model echo in SSE responses
+- Honor client-sent profile header; strip x-maxpool-* on direct-forwarded paths
+
 ## [1.19.0] - 2026-08-28
 
 ### Changed
