@@ -2856,6 +2856,21 @@ function startIdleRequestReaper(res, reqId, idleMs, { now = Date.now, setInterva
   return timer;
 }
 
+
+function concatUint8(chunks) {
+  let n = 0;
+  for (const c of chunks) n += c.length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+function totalLen(chunks) {
+  let n = 0;
+  for (const c of chunks) n += c.length;
+  return n;
+}
+
 async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog, requestInfo = {}, idleMs = STREAM_IDLE_MS) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
@@ -2879,6 +2894,10 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   // of leaking until the (maybe never) upstream close.
   const onClose = () => { reader.cancel().catch(() => {}); };
   res.once('close', onClose);
+
+  // MODEL ECHO NORMALIZATION state (rationale at the write site).
+  let modelEchoPending = true;
+  let modelEchoBuffer = null;
 
   try {
     while (true) {
@@ -2915,10 +2934,44 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         committed = true;
       }
 
-      // Forward chunk immediately
-      const ok = res.write(value);
+      // MODEL ECHO NORMALIZATION (2026-08-31): provider upstreams echo their own model
+      // id ("glm-5.3", kimi-*) in message_start, and Claude Code persists that id into
+      // the session transcript — on resume the id fails model-family resolution and the
+      // session prints "Session model ... could not be restored (not a model this
+      // version of Claude Code recognizes)" (278 sessions affected, measured).
+      // Rewrite the model field back to the CLIENT'S requested model (requestInfo.model,
+      // captured before the per-account rewrite) inside the first complete SSE event
+      // carrying a "model" key; afterwards chunks pass through untouched. ReadableStream
+      // chunks are Uint8Array — Buffer.concat/toString would yield comma-joined byte
+      // numbers (caught by the normalization tests), so hold an array of chunks and
+      // concat with decoder-safe helpers.
+      let out = value;
+      if (requestInfo?.model && modelEchoPending) {
+        modelEchoBuffer = modelEchoBuffer ? [...modelEchoBuffer, value] : [value];
+        const s = decoder.decode(concatUint8(modelEchoBuffer));
+        if (s.includes('"model"') && s.includes('\n\n')) {
+          const normalized = s.replace(
+            /("model":")[^"]+(")/,
+            `$1${requestInfo.model.replace(/["\\]/g, '\\$&')}$2`,
+          );
+          out = Buffer.from(normalized, 'utf8');
+          modelEchoBuffer = null;
+          modelEchoPending = false;
+        } else if (totalLen(modelEchoBuffer) > 64 * 1024) {
+          // Pathological upstream: 64KB with no complete model-bearing event. Flush
+          // verbatim — the warning is the worst outcome of a missed rewrite.
+          out = Buffer.from(concatUint8(modelEchoBuffer));
+          modelEchoBuffer = null;
+          modelEchoPending = false;
+        } else {
+          continue; // hold until the model-bearing event is complete
+        }
+      }
 
-      const text = decoder.decode(value, { stream: true });
+      // Forward chunk immediately
+      const ok = res.write(out);
+
+      const text = decoder.decode(out, { stream: true });
 
       // Capture for logging
       if (streamLog) streamLog.push(text);
@@ -2974,6 +3027,25 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
     readFailed = true;
     throw err;
   } finally {
+    // MODEL ECHO NORMALIZATION last-resort flush: the read loop can exit via done,
+    // error, or client disconnect while chunks are still HELD for the rewrite.
+    // Whatever the exit path, deliver the held bytes and accrue their usage — a
+    // mid-flight death must not swallow delivered tokens (H4) nor truncate the
+    // body (empty '' responses, C1).
+    if (modelEchoBuffer) {
+      const held = Buffer.from(concatUint8(modelEchoBuffer));
+      modelEchoBuffer = null;
+      try {
+        if (!readFailed && !res.destroyed) res.write(held);
+      } catch { /* client already gone */ }
+      const heldText = held.toString('utf8');
+      if (streamLog) streamLog.push(heldText);
+      sseBuffer += heldText;
+      for (const ev of sseBuffer.split('\n\n')) {
+        if (ev.trim()) parseSSEEvent(ev, accountIndex, accountManager, requestInfo);
+      }
+      sseBuffer = '';
+    }
     res.off('close', onClose);
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
