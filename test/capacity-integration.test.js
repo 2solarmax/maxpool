@@ -724,7 +724,7 @@ test('L5: the v2→v3 migration KEEPS history and demotes it, rather than droppi
   const v2 = { schemaVersion: 2, accounts: { a: {
     ses: { open: { startedAt: Date.now() - 600_000, tokensSoFar: 99, lastAccrualAt: Date.now(), complete: true, disabledDuring: false },
            closed: [{ startedAt: Date.now() - 876_000, endedAt: Date.now(), tokens: 21_192, complete: true, disabledDuring: false, resetAt: Date.now() }] },
-    wk: { open: null, closed: [] }, days: { '2026-08-23': { tokens: 21_192, partial: false } } } } };
+    wk: { open: null, closed: [] }, days: { [new Date(Date.now() - 3 * 86400_000).toISOString().slice(0, 10)]: { tokens: 21_192, partial: false } } } } };
 
   const l = CapacityLedger.fromSerialized(v2);
   assert.equal(l.serialize().schemaVersion, 3);
