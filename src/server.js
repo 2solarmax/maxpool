@@ -1355,8 +1355,16 @@ async function forwardRequest(
           res.end();
         }
       } else {
-        if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
-        res.end(buf);
+        // MODEL ECHO: rewrite the provider's model id back to the client's before the
+        // body reaches Claude Code. Computed BEFORE writeHead so a length change lands
+        // in the SAME header block — setting content-length after writeHead is a no-op
+        // and would ship a body/length mismatch (the client then hangs or truncates).
+        const outBuf = normalizeModelEcho(buf, requestInfo.model);
+        const outHeaders = outBuf === buf
+          ? responseHeaders
+          : { ...responseHeaders, 'content-length': String(outBuf.length) };
+        if (!res.headersSent) res.writeHead(upstreamRes.status, outHeaders);
+        res.end(outBuf);
       }
     }
   } catch (err) {
@@ -1657,7 +1665,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper };
+export const __serverTest = { reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper, normalizeModelEcho };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2856,6 +2864,26 @@ function startIdleRequestReaper(res, reqId, idleMs, { now = Date.now, setInterva
   return timer;
 }
 
+
+/** Rewrite a non-streaming JSON body's `model` back to the CLIENT'S requested model.
+ *  Twin of the SSE model-echo normalization in streamResponse: provider upstreams
+ *  (z.ai/GLM, Kimi) echo their own id, Claude Code persists it, and a resumed session
+ *  then prints "Session model glm-5.3 could not be restored". The streaming half
+ *  shipped in v1.19.1; this covers the buffered path, which is where the remaining
+ *  5,719 contaminated turns came from (measured 2026-09-02). No-op when the ids
+ *  already match, when the body is not JSON, or when no client model is known. */
+function normalizeModelEcho(buf, clientModel) {
+  if (!clientModel || !buf?.length) return buf;
+  try {
+    const json = JSON.parse(buf.toString('utf8'));
+    if (!json || typeof json !== 'object' || typeof json.model !== 'string') return buf;
+    if (json.model === clientModel) return buf;
+    json.model = clientModel;
+    return Buffer.from(JSON.stringify(json), 'utf8');
+  } catch {
+    return buf;  // non-JSON (or truncated) body — forward untouched
+  }
+}
 
 function concatUint8(chunks) {
   let n = 0;
