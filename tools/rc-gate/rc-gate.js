@@ -29,6 +29,15 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
+// KEEP-ALIVE AGENTS (2026-09-04 leak fix). Previously every forwarded request used
+// `agent: false` = a brand-new TCP connection, and with ~200 live Remote Control
+// sessions heart-beating every few seconds that churned thousands of sockets. Node
+// held their fds after close: measured 7,568 CLOSED sockets on one gate process,
+// which is what starved new CONNECTs and made Remote Control "keep dropping after
+// each reconnect". Pooled agents reuse connections and bound the socket count.
+const poolAgent = new http.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
+const directAgent = new https.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GATE_PORT = Number(process.env.RC_GATE_PORT || 3457);
 const GATE_HOST = process.env.RC_GATE_HOST || '127.0.0.1';
@@ -49,7 +58,7 @@ const mitmServer = http.createServer((creq, cres) => {
   if (!headers['x-maxpool-profile']) headers['x-maxpool-profile'] = PROFILE;
   const opts = {
     host: '127.0.0.1', port: MAXPOOL_PORT, method: creq.method,
-    path: creq.url, headers, agent: false,
+    path: creq.url, headers, agent: poolAgent,
   };
   console.log(`[mitm] ${creq.method} https://${creq.headers.host}${creq.url}`);
 
@@ -68,7 +77,7 @@ const mitmServer = http.createServer((creq, cres) => {
     for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
     const dirOpts = {
       host: 'api.anthropic.com', method: creq.method, path: creq.url,
-      headers: dirHeaders, agent: false,
+      headers: dirHeaders, agent: directAgent,
     };
     const dir = https.request(dirOpts, ures => {
       cres.writeHead(ures.statusCode, ures.headers);
@@ -116,6 +125,11 @@ gate.on('connect', (req, clientSocket, head) => {
     tlsSock.on('error', () => { try { clientSocket.destroy(); } catch {} });
     // Hand the TLS server socket to the MITM HTTP server: it parses requests
     // off the decrypted stream and runs the forward-to-maxpool handler.
+    // Tie the two lifetimes together: without this the raw clientSocket fd
+    // outlives the TLS socket (same CLOSED-fd leak as the blind tunnel).
+    tlsSock.on('close', () => { try { clientSocket.destroy(); } catch {} });
+    clientSocket.on('close', () => { try { tlsSock.destroy(); } catch {} });
+    clientSocket.setKeepAlive(true, 30_000);
     mitmServer.emit('connection', tlsSock);
     if (head && head.length) tlsSock.unshift(head);
     return;
@@ -128,9 +142,32 @@ gate.on('connect', (req, clientSocket, head) => {
     up.pipe(clientSocket);
     clientSocket.pipe(up);
   });
-  const kill = () => { try { clientSocket.destroy(); up.destroy(); } catch {} };
+  // Destroy BOTH ends whenever EITHER ends — on 'close' as well as 'error'. pipe()
+  // only end()s the peer, which leaves its fd held after the TCP socket is already
+  // CLOSED; that is the leak (7,568 CLOSED fds measured 2026-09-04). Keepalive
+  // probes also stop a silently-vanished peer (laptop sleep, Wi-Fi drop) from
+  // pinning a tunnel forever, since a WSS bridge can idle between heartbeats.
+  const kill = () => { try { clientSocket.destroy(); } catch {} try { up.destroy(); } catch {} };
   up.on('error', kill);
   clientSocket.on('error', kill);
+  up.on('close', kill);
+  clientSocket.on('close', kill);
+  up.setKeepAlive(true, 30_000);
+  clientSocket.setKeepAlive(true, 30_000);
+});
+
+// A gate crash drops Remote Control for EVERY live session at once, so no single
+// stray socket error may take the process down. EADDRINUSE is the benign case —
+// two `cc` launches racing to start the gate; the loser exits quietly (the log had
+// 10 stack-trace crashes from this before).
+gate.on('error', err => {
+  if (err?.code === 'EADDRINUSE') { console.log('rc-gate: port already served by another instance — exiting quietly'); process.exit(0); }
+  console.error('rc-gate server error:', err?.message || err);
+});
+mitmServer.on('clientError', (err, sock) => { try { sock.destroy(); } catch {} });
+process.on('uncaughtException', err => {
+  if (err?.code === 'EADDRINUSE') { console.log('rc-gate: port already in use — exiting quietly'); process.exit(0); }
+  console.error('rc-gate uncaught:', err?.message || err);
 });
 
 gate.listen(GATE_PORT, GATE_HOST, () => {
