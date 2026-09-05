@@ -84,7 +84,19 @@ const mitmServer = http.createServer((creq, cres) => {
     // and short one-shot posts stay pooled with a single socket-race retry.
     const isStreamPath = /\/stream(\?|$)/.test(creq.url)
       || (creq.headers.accept || '').includes('text/event-stream');
-    const isSmall = !isStreamPath && Number(creq.headers['content-length'] || 1) <= 512 * 1024;
+
+    // NEVER replay a request that CLAIMS or MUTATES session ownership (2026-09-05).
+    // A replayed /bridge or /worker registration makes the server see a SECOND
+    // connection for the same session and evict the first with close code 4090
+    // ("another connection took over this session") — then the user's /remote-control
+    // reconnect is evicted again, forever. Measured: 82 /bridge + 68 /worker replays
+    // in one gate lifetime, exactly matching the owner's 4090 report and the
+    // never-settling "reconnecting" state. Only genuinely idempotent, ownership-free
+    // posts (telemetry batches, heartbeats) may be retried.
+    const isOwnershipPath = /\/(bridge|worker|client\/presence)(\?|$)/.test(creq.url)
+      || /\/v1\/code\/sessions$/.test(creq.url);
+    const isSmall = !isStreamPath && !isOwnershipPath
+      && Number(creq.headers['content-length'] || 1) <= 512 * 1024;
     if (isStreamPath) {
       // Uncached connection, no agent, no idle timeout: the stream lives as long as its sockets do.
       const streamBody = [];
