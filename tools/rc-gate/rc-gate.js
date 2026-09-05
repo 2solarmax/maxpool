@@ -75,15 +75,83 @@ const mitmServer = http.createServer((creq, cres) => {
     // account's and silently flip Remote Control flags off (measured 2026-08-31).
     const dirHeaders = { ...creq.headers, host: 'api.anthropic.com' };
     for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
-    const dirOpts = {
+
+    // KEEP-ALIVE SOCKET RACE (2026-09-05): a pooled keep-alive socket the server closed between
+    // requests fails the next request with AggregateError/ECONNRESET. Worse, the agent's 60s
+    // idle timeout destroys sockets MID-STREAM for long-lived SSE endpoints (/worker/events/stream
+    // is a held stream that legitimately idles) — measured "socket hang up" cascades within minutes
+    // of the pool shipping. So: STREAMING paths bypass the pool entirely (agent:false, no timeout),
+    // and short one-shot posts stay pooled with a single socket-race retry.
+    const isStreamPath = /\/stream(\?|$)/.test(creq.url)
+      || (creq.headers.accept || '').includes('text/event-stream');
+    const isSmall = !isStreamPath && Number(creq.headers['content-length'] || 1) <= 512 * 1024;
+    if (isStreamPath) {
+      // Uncached connection, no agent, no idle timeout: the stream lives as long as its sockets do.
+      const streamBody = [];
+      creq.on('data', c => streamBody.push(c));
+      creq.on('end', () => {
+        const dir = https.request({
+          host: 'api.anthropic.com', method: creq.method, path: creq.url,
+          headers: dirHeaders, agent: false,
+        }, ures => {
+          cres.writeHead(ures.statusCode, ures.headers);
+          ures.pipe(cres);
+        });
+        dir.on('error', err => {
+          console.log('[stream-error]', creq.url, String(err?.message || err), 'causes:', JSON.stringify((err.errors||[]).map(e=>e.code+':'+e.message)).slice(0,300));
+          try { cres.destroy(); } catch {}
+        });
+        dir.end(Buffer.concat(streamBody));
+      });
+      return;
+    }
+    if (isSmall && !creq.readableEnded) {
+      const bodyChunks = [];
+      let retried = false;
+      creq.on('data', c => bodyChunks.push(c));
+      creq.on('end', () => {
+        const send = attempt => {
+          const dir = https.request({
+            host: 'api.anthropic.com', method: creq.method, path: creq.url,
+            headers: dirHeaders, agent: directAgent,
+          }, ures => {
+            if (/\/v1\/code\/sessions$/.test(creq.url)) {
+              console.log('[create-status]', ures.statusCode);
+            }
+            cres.writeHead(ures.statusCode, ures.headers);
+            ures.pipe(cres);
+          });
+          dir.on('error', err => {
+            const socketLevel = err instanceof Error && (err.code === 'ECONNRESET' || err.name === 'AggregateError' || err.code === 'EPIPE' || err.code === 'ECONNREFUSED');
+            if (socketLevel && attempt === 0 && !retried) {
+              retried = true;
+              console.log('[direct-retry]', creq.url, String(err.message || err));
+              // Do NOT destroy the whole agent: that would also kill sockets OTHER in-flight
+              // requests are using (cascade). The stale socket is already gone; the retry
+              // simply gets a fresh one from the pool.
+              send(1);
+              return;
+            }
+            console.log('[direct-error]', creq.url, String(err?.message || err), 'causes:', JSON.stringify((err.errors||[]).map(e=>e.code+':'+e.message)).slice(0,300));
+            try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
+            cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
+          });
+          dir.end(Buffer.concat(bodyChunks));
+        };
+        send(0);
+      });
+      return;
+    }
+
+    const dir = https.request({
       host: 'api.anthropic.com', method: creq.method, path: creq.url,
       headers: dirHeaders, agent: directAgent,
-    };
-    const dir = https.request(dirOpts, ures => {
+    }, ures => {
       cres.writeHead(ures.statusCode, ures.headers);
       ures.pipe(cres);
     });
     dir.on('error', err => {
+      console.log('[direct-error]', creq.url, String(err?.message || err));
       try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
       cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
     });
