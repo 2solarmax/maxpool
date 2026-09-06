@@ -35,8 +35,8 @@ import path from 'node:path';
 // held their fds after close: measured 7,568 CLOSED sockets on one gate process,
 // which is what starved new CONNECTs and made Remote Control "keep dropping after
 // each reconnect". Pooled agents reuse connections and bound the socket count.
-const poolAgent = new http.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
-const directAgent = new https.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
+const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
+const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GATE_PORT = Number(process.env.RC_GATE_PORT || 3457);
@@ -48,130 +48,84 @@ const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
 const cert = readFileSync(path.join(__dirname, 'anthropic-mitm.crt'));
 const key = readFileSync(path.join(__dirname, 'anthropic-mitm.key'));
 
+// MITM forward: ONE path for every decrypted request. Direct requests are piped
+// to https.request with a keep-alive agent that has NO idle timeout (a 60s agent
+// timeout was killing long-lived /worker/events/stream connections mid-stream —
+// the 09-05 regression) and NO custom retry (a replayed /bridge or /worker
+// registration makes the server evict the existing connection with close code
+// 4090 — the same-day second regression). If a pooled socket went stale, the
+// request fails and the CLI retries it itself, which is correct: the CLI knows
+// which of its requests are idempotent; a transport shim does not.
 const mitmServer = http.createServer((creq, cres) => {
-  // Forward decrypted request to maxpool as plain HTTP, re-applying the
-  // profile headers the cc wrapper would normally set.
   const headers = { ...creq.headers };
   delete headers.authorization;           // pool accounts supply upstream auth
   delete headers['proxy-connection'];
-  // Only default the profile; a client-sent x-maxpool-profile (cc all vs claude) wins.
   if (!headers['x-maxpool-profile']) headers['x-maxpool-profile'] = PROFILE;
+
+  const isIdentityPath = !creq.url.startsWith('/v1/') || creq.url.startsWith('/v1/code/sessions');
+  if (isIdentityPath) {
+    const dirHeaders = { ...creq.headers, host: 'api.anthropic.com' };
+    for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
+    // Session-create responses: force identity encoding so the body is readable end-to-end.
+    // The CLI negotiates zstd (server advertises zstd,gzip) and Node cannot decode zstd — a
+    // zstd body reached the CLI un-decoded while the create-status tee failed to parse it
+    // (bare "200" logs). identity keeps headers consistent and diagnosable.
+    if (/\/v1\/code\/sessions$/.test(creq.url)) dirHeaders['accept-encoding'] = 'identity';
+    // BUFFER-THEN-SEND for direct posts (2026-09-06): `creq.pipe(dir)` raced the keep-alive
+    // agent — Node could emit the request 'finish' and the server 'complete' before every
+    // body chunk was written, aborting the stream mid-body. Symptom (measured, CLI 2.1.263):
+    // "Session create request failed: stream has been aborted" x3, then "Session creation
+    // failed — see debug log". Direct-path bodies are small (identity paths: auth handshakes,
+    // session CRUD, settings — all <64KB typical); buffer fully and send with explicit length.
+    const dirSend = () => {
+      const bodyBufs = [];
+      creq.on('data', c => bodyBufs.push(c));
+      creq.on('end', () => {
+        const body = Buffer.concat(bodyBufs);
+        const hdrs = { ...dirHeaders };
+        delete hdrs['transfer-encoding'];
+        if (body.length || creq.method !== 'GET') hdrs['content-length'] = String(body.length);
+        const dir = https.request({
+          host: 'api.anthropic.com', method: creq.method, path: creq.url,
+          headers: hdrs, agent: directAgent,
+        }, ures => {
+      if (/\/v1\/code\/sessions$/.test(creq.url)) {
+        const chunks = [];
+        ures.on('data', c => chunks.push(c));
+        ures.on('end', () => {
+          const raw = Buffer.concat(chunks);
+          try {
+            const zlib = require('node:zlib');
+            const enc = String(ures.headers['content-encoding'] || '');
+            const body = enc.includes('gzip') ? zlib.gunzipSync(raw)
+              : enc.includes('br') ? zlib.brotliDecompressSync(raw)
+              : enc.includes('deflate') ? zlib.inflateSync(raw) : raw;
+            const j = JSON.parse(body.toString('utf8'));
+            console.log('[create-status]', ures.statusCode, 'id:', (j.id || '').slice(0, 12));
+          } catch (e) { console.log('[create-status]', ures.statusCode, 'PARSE-FAIL:', JSON.stringify(body.toString('utf8').slice(0,200))); }
+        });
+      }
+      cres.writeHead(ures.statusCode, ures.headers);
+      ures.pipe(cres);
+    });
+        dir.on('error', err => {
+          console.log('[direct-error]', creq.url, String(err?.message || err));
+          try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
+          cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
+        });
+        dir.end(body);
+      });
+    };
+    dirSend();
+    return;
+  }
+
+  // Inference paths go to maxpool: pool accounts supply upstream auth.
   const opts = {
     host: '127.0.0.1', port: MAXPOOL_PORT, method: creq.method,
     path: creq.url, headers, agent: poolAgent,
   };
   console.log(`[mitm] ${creq.method} https://${creq.headers.host}${creq.url}`);
-
-  // Identity/session-CRUD paths carry the user's own OAuth semantics (flag
-  // targeting, session ownership) — send them DIRECT. Only true inference
-  // calls belong to the pool. /v1/code/sessions* 404s through the pool because
-  // the pool account doesn't own the Remote Control session (measured 2026-08-31).
-  const isIdentityPath = !creq.url.startsWith('/v1/') || creq.url.startsWith('/v1/code/sessions');
-  if (isIdentityPath) {
-    // Identity/eval/settings paths must reach the REAL api.anthropic.com with the
-    // client's OWN OAuth token: feature-flag targeting (tengu_ccr_bridge et al.)
-    // is keyed to the signed-in identity, and account settings must reflect the
-    // real user. Routing these through maxpool would swap the token for a pool
-    // account's and silently flip Remote Control flags off (measured 2026-08-31).
-    const dirHeaders = { ...creq.headers, host: 'api.anthropic.com' };
-    for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
-
-    // KEEP-ALIVE SOCKET RACE (2026-09-05): a pooled keep-alive socket the server closed between
-    // requests fails the next request with AggregateError/ECONNRESET. Worse, the agent's 60s
-    // idle timeout destroys sockets MID-STREAM for long-lived SSE endpoints (/worker/events/stream
-    // is a held stream that legitimately idles) — measured "socket hang up" cascades within minutes
-    // of the pool shipping. So: STREAMING paths bypass the pool entirely (agent:false, no timeout),
-    // and short one-shot posts stay pooled with a single socket-race retry.
-    const isStreamPath = /\/stream(\?|$)/.test(creq.url)
-      || (creq.headers.accept || '').includes('text/event-stream');
-
-    // NEVER replay a request that CLAIMS or MUTATES session ownership (2026-09-05).
-    // A replayed /bridge or /worker registration makes the server see a SECOND
-    // connection for the same session and evict the first with close code 4090
-    // ("another connection took over this session") — then the user's /remote-control
-    // reconnect is evicted again, forever. Measured: 82 /bridge + 68 /worker replays
-    // in one gate lifetime, exactly matching the owner's 4090 report and the
-    // never-settling "reconnecting" state. Only genuinely idempotent, ownership-free
-    // posts (telemetry batches, heartbeats) may be retried.
-    const isOwnershipPath = /\/(bridge|worker|client\/presence)(\?|$)/.test(creq.url)
-      || /\/v1\/code\/sessions$/.test(creq.url);
-    const isSmall = !isStreamPath && !isOwnershipPath
-      && Number(creq.headers['content-length'] || 1) <= 512 * 1024;
-    if (isStreamPath) {
-      // Uncached connection, no agent, no idle timeout: the stream lives as long as its sockets do.
-      const streamBody = [];
-      creq.on('data', c => streamBody.push(c));
-      creq.on('end', () => {
-        const dir = https.request({
-          host: 'api.anthropic.com', method: creq.method, path: creq.url,
-          headers: dirHeaders, agent: false,
-        }, ures => {
-          cres.writeHead(ures.statusCode, ures.headers);
-          ures.pipe(cres);
-        });
-        dir.on('error', err => {
-          console.log('[stream-error]', creq.url, String(err?.message || err), 'causes:', JSON.stringify((err.errors||[]).map(e=>e.code+':'+e.message)).slice(0,300));
-          try { cres.destroy(); } catch {}
-        });
-        dir.end(Buffer.concat(streamBody));
-      });
-      return;
-    }
-    if (isSmall && !creq.readableEnded) {
-      const bodyChunks = [];
-      let retried = false;
-      creq.on('data', c => bodyChunks.push(c));
-      creq.on('end', () => {
-        const send = attempt => {
-          const dir = https.request({
-            host: 'api.anthropic.com', method: creq.method, path: creq.url,
-            headers: dirHeaders, agent: directAgent,
-          }, ures => {
-            if (/\/v1\/code\/sessions$/.test(creq.url)) {
-              console.log('[create-status]', ures.statusCode);
-            }
-            cres.writeHead(ures.statusCode, ures.headers);
-            ures.pipe(cres);
-          });
-          dir.on('error', err => {
-            const socketLevel = err instanceof Error && (err.code === 'ECONNRESET' || err.name === 'AggregateError' || err.code === 'EPIPE' || err.code === 'ECONNREFUSED');
-            if (socketLevel && attempt === 0 && !retried) {
-              retried = true;
-              console.log('[direct-retry]', creq.url, String(err.message || err));
-              // Do NOT destroy the whole agent: that would also kill sockets OTHER in-flight
-              // requests are using (cascade). The stale socket is already gone; the retry
-              // simply gets a fresh one from the pool.
-              send(1);
-              return;
-            }
-            console.log('[direct-error]', creq.url, String(err?.message || err), 'causes:', JSON.stringify((err.errors||[]).map(e=>e.code+':'+e.message)).slice(0,300));
-            try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
-            cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
-          });
-          dir.end(Buffer.concat(bodyChunks));
-        };
-        send(0);
-      });
-      return;
-    }
-
-    const dir = https.request({
-      host: 'api.anthropic.com', method: creq.method, path: creq.url,
-      headers: dirHeaders, agent: directAgent,
-    }, ures => {
-      cres.writeHead(ures.statusCode, ures.headers);
-      ures.pipe(cres);
-    });
-    dir.on('error', err => {
-      console.log('[direct-error]', creq.url, String(err?.message || err));
-      try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
-      cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
-    });
-    creq.pipe(dir);
-    return;
-  }
-
-  // Inference paths go to maxpool: pool accounts supply upstream auth.
   const up = http.request(opts, ures => {
     cres.writeHead(ures.statusCode, ures.headers);
     ures.pipe(cres);
@@ -182,7 +136,6 @@ const mitmServer = http.createServer((creq, cres) => {
   });
   creq.pipe(up);
 });
-// SSE-friendly: no request buffering beyond what streaming needs.
 mitmServer.headersTimeout = 0;
 mitmServer.requestTimeout = 0;
 mitmServer.keepAliveTimeout = 0;
