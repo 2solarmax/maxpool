@@ -44,6 +44,9 @@ const GATE_HOST = process.env.RC_GATE_HOST || '127.0.0.1';
 const MAXPOOL_PORT = Number(process.env.RC_GATE_MAXPOOL_PORT || 3456);
 const MITM_HOSTS = new Set((process.env.RC_GATE_MITM_HOSTS || 'api.anthropic.com').split(',').map(s => s.trim()).filter(Boolean));
 const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
+// Direct-forward upstream (test seam; defaults are production values).
+const DIRECT_HOST = process.env.RC_GATE_DIRECT_HOST || 'api.anthropic.com';
+const DIRECT_PORT = Number(process.env.RC_GATE_DIRECT_PORT || 443);
 
 const cert = readFileSync(path.join(__dirname, 'anthropic-mitm.crt'));
 const key = readFileSync(path.join(__dirname, 'anthropic-mitm.key'));
@@ -64,7 +67,7 @@ const mitmServer = http.createServer((creq, cres) => {
 
   const isIdentityPath = !creq.url.startsWith('/v1/') || creq.url.startsWith('/v1/code/sessions');
   if (isIdentityPath) {
-    const dirHeaders = { ...creq.headers, host: 'api.anthropic.com' };
+    const dirHeaders = { ...creq.headers, host: DIRECT_HOST };
     for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
     // Session-create responses: force identity encoding so the body is readable end-to-end.
     // The CLI negotiates zstd (server advertises zstd,gzip) and Node cannot decode zstd — a
@@ -86,7 +89,9 @@ const mitmServer = http.createServer((creq, cres) => {
         delete hdrs['transfer-encoding'];
         if (body.length || creq.method !== 'GET') hdrs['content-length'] = String(body.length);
         const dir = https.request({
-          host: 'api.anthropic.com', method: creq.method, path: creq.url,
+          host: DIRECT_HOST, port: DIRECT_PORT,
+          servername: 'api.anthropic.com',   // SNI/cert name stays first-party even for a test-routed upstream
+          method: creq.method, path: creq.url,
           headers: hdrs, agent: directAgent,
         }, ures => {
       if (/\/v1\/code\/sessions$/.test(creq.url)) {

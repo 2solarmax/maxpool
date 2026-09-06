@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mokka.rc-gate</string>
+  <!-- launchd runs the gate DIRECTLY and is its supervisor. The hand-rolled
+       supervise.sh loop this replaces raced the cc wrapper's own auto-start and
+       restart-stormed the gate on 2026-09-06, bricking every session. launchd
+       has no such race: one owner, KeepAlive restarts on crash, throttled. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/maxkrasnykh/.nvm/versions/node/v20.19.6/bin/node</string>
+    <string>/Users/maxkrasnykh/maxpool/tools/rc-gate/rc-gate.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/maxkrasnykh/maxpool/tools/rc-gate</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/maxkrasnykh/maxpool/tools/rc-gate/gate.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/maxkrasnykh/maxpool/tools/rc-gate/gate.log</string>
+</dict>
+</plist>
