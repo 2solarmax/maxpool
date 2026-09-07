@@ -48,6 +48,41 @@ const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
 const DIRECT_HOST = process.env.RC_GATE_DIRECT_HOST || 'api.anthropic.com';
 const DIRECT_PORT = Number(process.env.RC_GATE_DIRECT_PORT || 443);
 
+// TIMESTAMPED LOGGING + STALL DETECTION (2026-09-07). The gate's log had no clock,
+// so a user-visible stall could not be correlated with anything — and the stall that
+// prompted this left NO entry in maxpool's log at all (it was serving 200s throughout),
+// meaning the request never reached it. The two candidates for that are: the gate never
+// accepted the connection, or its event loop was blocked so it could not. Both are now
+// observable: every line is UTC-stamped, and a lag watchdog reports whenever the loop
+// stalls long enough to refuse/delay an accept.
+const _log = console.log.bind(console);
+console.log = (...a) => _log(new Date().toISOString().replace(/\.\d+Z$/, 'Z'), ...a);
+const _err = console.error.bind(console);
+console.error = (...a) => _err(new Date().toISOString().replace(/\.\d+Z$/, 'Z'), ...a);
+
+// Event-loop lag: schedule for +500ms, measure the overshoot. A blocked loop cannot
+// accept() — which is exactly the "connection never arrived anywhere" signature.
+{
+  const INTERVAL = 500;
+  const REPORT_OVER_MS = 250;
+  let expected = Date.now() + INTERVAL;
+  setInterval(() => {
+    const drift = Date.now() - expected;
+    expected = Date.now() + INTERVAL;
+    if (drift > REPORT_OVER_MS) console.log(`[loop-stall] event loop blocked ~${drift}ms — accepts were delayed this long`);
+  }, INTERVAL).unref?.();
+}
+
+// Connection accounting: a periodic line only when something is unusual, so the log
+// stays readable but a growth trend (the 2026-09-04 fd leak's signature) is visible.
+let _accepts = 0, _liveTunnels = 0;
+setInterval(() => {
+  if (_liveTunnels > 200 || _accepts > 5000) {
+    console.log(`[conn] accepts=${_accepts} liveTunnels=${_liveTunnels}`);
+    _accepts = 0;
+  }
+}, 60_000).unref?.();
+
 const cert = readFileSync(path.join(__dirname, 'anthropic-mitm.crt'));
 const key = readFileSync(path.join(__dirname, 'anthropic-mitm.key'));
 
@@ -150,6 +185,8 @@ const gate = http.createServer((req, res) => {
   res.writeHead(405).end('rc-gate: CONNECT only');
 });
 gate.on('connect', (req, clientSocket, head) => {
+  _accepts++; _liveTunnels++;
+  clientSocket.once('close', () => { _liveTunnels--; });
   const [host, portStr] = req.url.split(':');
   const port = Number(portStr || 443);
 
