@@ -75,13 +75,16 @@ console.error = (...a) => _err(new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
 
 // Connection accounting: a periodic line only when something is unusual, so the log
 // stays readable but a growth trend (the 2026-09-04 fd leak's signature) is visible.
-let _accepts = 0, _liveTunnels = 0;
+let _accepts = 0, _liveTunnels = 0, _acceptsByHost = {};
 setInterval(() => {
-  if (_liveTunnels > 200 || _accepts > 5000) {
-    console.log(`[conn] accepts=${_accepts} liveTunnels=${_liveTunnels}`);
-    _accepts = 0;
+  // Report every 10 min when churn is high enough to matter, naming the top hosts.
+  if (_accepts > 500 || _liveTunnels > 200) {
+    const top = Object.entries(_acceptsByHost).sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([h, n]) => `${h}=${n}`).join(' ');
+    console.log(`[conn] accepts=${_accepts} liveTunnels=${_liveTunnels} | ${top}`);
   }
-}, 60_000).unref?.();
+  _accepts = 0; _acceptsByHost = {};
+}, 600_000).unref?.();
 
 const cert = readFileSync(path.join(__dirname, 'anthropic-mitm.crt'));
 const key = readFileSync(path.join(__dirname, 'anthropic-mitm.key'));
@@ -213,6 +216,11 @@ const gate = http.createServer((req, res) => {
 });
 gate.on('connect', (req, clientSocket, head) => {
   _accepts++; _liveTunnels++;
+  // Per-host accept counting: 5,053 accepts against 563 MITM requests in one hour
+  // (2026-09-07) meant ~9 of every 10 tunnels were NOT inference, and nothing named
+  // them. Connection CHURN is the suspected driver of the intermittent
+  // EADDRNOTAVAIL/connect-timeout family, so the churn needs an owner, not a total.
+  _acceptsByHost[req.url.split(':')[0]] = (_acceptsByHost[req.url.split(':')[0]] || 0) + 1;
   clientSocket.once('close', () => { _liveTunnels--; });
   const [host, portStr] = req.url.split(':');
   const port = Number(portStr || 443);
