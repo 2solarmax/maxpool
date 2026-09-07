@@ -89,6 +89,17 @@ setInterval(() => {
 const cert = readFileSync(path.join(__dirname, 'anthropic-mitm.crt'));
 const key = readFileSync(path.join(__dirname, 'anthropic-mitm.key'));
 
+// ONE shared secure context for every tunnel (2026-09-07). This was previously built
+// per connection — tls.createSecureContext() re-parsed the cert and key on EVERY
+// CONNECT, thousands of times an hour (5,053 accepts in one measured hour). It is
+// synchronous and CPU-bound, so a reconnect burst serialised into event-loop blocks
+// of 293-672ms (measured by the lag watchdog during a restart storm). A blocked loop
+// cannot accept(), which surfaces to the CLI as ECONNREFUSED / connect timeouts —
+// i.e. the intermittent "check your network" this investigation was chasing.
+// The context is immutable and thread-safe to share; Node's own tls.createServer
+// builds exactly one for the whole server.
+const SECURE_CONTEXT = tls.createSecureContext({ cert, key });
+
 // MITM forward: ONE path for every decrypted request. Direct requests are piped
 // to https.request with a keep-alive agent that has NO idle timeout (a 60s agent
 // timeout was killing long-lived /worker/events/stream connections mid-stream —
@@ -229,7 +240,7 @@ gate.on('connect', (req, clientSocket, head) => {
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     const tlsSock = new tls.TLSSocket(clientSocket, {
       isServer: true,
-      secureContext: tls.createSecureContext({ cert, key }),
+      secureContext: SECURE_CONTEXT,
     });
     // Handle TLS handshake errors without crashing the gate.
     tlsSock.on('error', () => { try { clientSocket.destroy(); } catch {} });
