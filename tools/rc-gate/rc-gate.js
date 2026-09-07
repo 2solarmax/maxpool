@@ -166,11 +166,38 @@ const mitmServer = http.createServer((creq, cres) => {
     path: creq.url, headers, agent: poolAgent,
   };
   console.log(`[mitm] ${creq.method} https://${creq.headers.host}${creq.url}`);
+  // RESPONSE-LEG ACCOUNTING (2026-09-07). maxpool can log a clean 200 while the client
+  // still reports "Connection lost mid-response" — the break is then on THIS leg
+  // (gate -> CLI) and was previously invisible: the response was piped with no error
+  // or completion tracking anywhere. Only anomalies are logged; a clean response is
+  // silent, so this stays readable at ~20 req/min.
+  const t0 = Date.now();
+  let bytes = 0, upstreamEnded = false, clientAborted = false;
   const up = http.request(opts, ures => {
     cres.writeHead(ures.statusCode, ures.headers);
+    ures.on('data', c => { bytes += c.length; });
+    ures.on('end', () => { upstreamEnded = true; });
+    ures.on('error', e => {
+      console.log(`[resp-break] UPSTREAM errored mid-response ${creq.url} after ${bytes}B/${Date.now() - t0}ms — ${e?.code || e?.message}`);
+    });
+    ures.on('aborted', () => {
+      console.log(`[resp-break] UPSTREAM aborted mid-response ${creq.url} after ${bytes}B/${Date.now() - t0}ms`);
+    });
     ures.pipe(cres);
   });
+  // The client (Claude Code) going away before the upstream finished is the exact
+  // shape of the user-visible "Connection lost mid-response".
+  cres.on('close', () => {
+    if (!upstreamEnded && !cres.writableFinished) {
+      clientAborted = true;
+      console.log(`[resp-break] CLIENT closed before response completed ${creq.url} after ${bytes}B/${Date.now() - t0}ms`);
+    }
+  });
+  cres.on('error', e => {
+    console.log(`[resp-break] CLIENT leg errored ${creq.url} after ${bytes}B/${Date.now() - t0}ms — ${e?.code || e?.message}`);
+  });
   up.on('error', err => {
+    console.log(`[resp-break] forward to maxpool failed ${creq.url} after ${Date.now() - t0}ms — ${err?.code || err?.message}${clientAborted ? ' (client had already gone)' : ''}`);
     try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
     cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_upstream_error', message: String(err?.message || err) } }));
   });
