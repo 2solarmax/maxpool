@@ -48,6 +48,24 @@ const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
 const DIRECT_HOST = process.env.RC_GATE_DIRECT_HOST || 'api.anthropic.com';
 const DIRECT_PORT = Number(process.env.RC_GATE_DIRECT_PORT || 443);
 
+// SESSION TITLE SYNC (2026-09-08). Optional, loaded dynamically so a fault in it can
+// never stop the gate from starting — this process carries ALL inference for every
+// session, so nothing new is allowed onto its critical path. Both hooks are no-ops
+// until the module resolves. Disable with RC_GATE_TITLE_SYNC=0.
+let _titleSync = null;
+if (process.env.RC_GATE_TITLE_SYNC !== '0') {
+  import('./title-sync.js')
+    .then(m => {
+      _titleSync = m;
+      m.startTitleSync({
+        host: DIRECT_HOST, port: DIRECT_PORT,
+        stateFile: path.join(__dirname, '.title-sync-state.json'),
+      });
+      console.log('[title-sync] armed');
+    })
+    .catch(e => console.log('[title-sync] disabled — module failed to load:', e?.message || e));
+}
+
 // TIMESTAMPED LOGGING + STALL DETECTION (2026-09-07). The gate's log had no clock,
 // so a user-visible stall could not be correlated with anything — and the stall that
 // prompted this left NO entry in maxpool's log at all (it was serving 200s throughout),
@@ -117,6 +135,7 @@ const mitmServer = http.createServer((creq, cres) => {
   const isIdentityPath = !creq.url.startsWith('/v1/') || creq.url.startsWith('/v1/code/sessions');
   if (isIdentityPath) {
     const dirHeaders = { ...creq.headers, host: DIRECT_HOST };
+    try { _titleSync?.noteAuthHeaders(creq.url, creq.headers); } catch {}
     for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
     // Session-create responses: force identity encoding so the body is readable end-to-end.
     // The CLI negotiates zstd (server advertises zstd,gzip) and Node cannot decode zstd — a

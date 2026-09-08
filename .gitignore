@@ -3,3 +3,6 @@ config.json
 *.log
 package-lock.json
 .claude/settings.local.json
+
+# rc-gate: which session titles have already been pushed (local runtime state)
+tools/rc-gate/.title-sync-state.json
