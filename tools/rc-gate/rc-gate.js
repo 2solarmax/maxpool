@@ -28,7 +28,7 @@ import tls from 'node:tls';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { classifyLoopGap } from './loop-gap.js';
+import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
 
 // KEEP-ALIVE AGENTS (2026-09-04 leak fix). Previously every forwarded request used
 // `agent: false` = a brand-new TCP connection, and with ~200 live Remote Control
@@ -83,15 +83,15 @@ console.error = (...a) => _err(new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
 // accept() — which is exactly the "connection never arrived anywhere" signature.
 {
   const INTERVAL = 500;
+  const PROBE_WAKE_OVER_MS = 5_000;
   let expected = Date.now() + INTERVAL;
-  let lastMono = process.hrtime.bigint();
   setInterval(() => {
     const now = Date.now();
-    const mono = process.hrtime.bigint();
     const drift = now - expected;
-    const verdict = classifyLoopGap(drift, drift + INTERVAL, Number(mono - lastMono) / 1e6);
     expected = now + INTERVAL;
-    lastMono = mono;
+    // Ask the kernel only when the gap is big enough for sleep to be plausible.
+    const lastWakeMs = drift >= PROBE_WAKE_OVER_MS ? readLastWakeMs() : null;
+    const verdict = classifyLoopGap(drift, { nowMs: now, lastWakeMs, probeWakeOverMs: PROBE_WAKE_OVER_MS });
     if (verdict.kind === 'stall') {
       console.log(`[loop-stall] event loop blocked ~${verdict.driftMs}ms — accepts were delayed this long`);
     } else if (verdict.kind === 'suspend') {
