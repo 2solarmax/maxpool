@@ -991,6 +991,9 @@ async function forwardRequest(
       // 262144". Detect it ONLY on a provider (a Claude account's context-length 400 is
       // terminal — nothing bigger to fall to) so we can pin the session to Claude.
       const providerTooSmall = account.type === 'provider' && isContextLengthError(errorBody);
+      // Same shape as providerTooSmall: the PROVIDER cannot take this body, Claude can.
+      const providerRejectedShape = account.type === 'provider'
+        && !providerTooSmall && isProviderParamRejection(errorBody);
       // DETERMINISTIC signature rejection (exact Anthropic wording) — the only trigger
       // for the strip-and-recover retry below. Deliberately NOT the fuzzy
       // isAnthropicIncompatBody heuristic, so a merely malformed request can never cause
@@ -1016,11 +1019,16 @@ async function forwardRequest(
           try { return JSON.parse(errorBody)?.error?.message || errorBody; } catch { return errorBody; }
         })();
         console.log(`[Maxpool] ${upstreamRes.status} from "${account.name}": ${String(why).slice(0, 300)}`);
+        // Providers answer with a code and no field name, so record what WE sent.
+        if (account.type === 'provider') {
+          console.log(`[Maxpool]   request shape: ${describeBodyShape(upstreamBody || body).slice(0, 600)}`);
+        }
       }
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
         ? 'invalid_thinking_signature'
         : anthropicIncompat ? 'anthropic_incompatible_transcript'
         : providerTooSmall ? 'provider_context_too_small'
+        : providerRejectedShape ? 'provider_rejected_request_shape'
         : `HTTP ${upstreamRes.status}`;
       const effortMode = classifyEffortRejection(errorBody);
       // A rejected effort level is a REQUEST-shaped fault, not an account-health signal —
@@ -1191,6 +1199,23 @@ async function forwardRequest(
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, { ...requestInfo, largeContext: true },
+          canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+        );
+      }
+
+      // A provider that will not take this body: retry on Claude instead of handing the
+      // user an opaque provider code. Unlike the context-too-small case this does NOT
+      // latch the session — the fault is one request's shape, not a durable property of
+      // the conversation, and latching would evict a session from GLM on a single blip.
+      if (providerRejectedShape && claudeAvailable
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        for (const a of (accountManager.accounts || [])) {
+          if (a.type === 'provider') excludedIndexes.add(a.index);
+        }
+        console.log(`[Maxpool] Provider "${account.name}" rejected this request's shape (${String(errorBody).slice(0, 120)}); retrying on Claude`);
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo,
           canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
@@ -1660,12 +1685,30 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
 // phrasings, NOT a bare "token limit" which a rate-limit body also carries) so the
 // pin-to-Claude heal only fires on a genuine size overflow, not any 400. Rate-limit
 // 429s are intercepted earlier (classifyRateLimit) and never reach this check.
+/** A PROVIDER rejecting the request shape with a code and no field name.
+ *
+ *  z.ai answers `[1210][Invalid API parameter, please check the documentation.]` —
+ *  a code family, not one fault: probing it on 2026-09-09 showed `max_tokens` too
+ *  large gets its own 1210 text, while other members return only the generic line.
+ *  Claude Code does not emit malformed requests, so on a provider this means "this
+ *  provider will not take a body Anthropic accepts", which is the same class as
+ *  `isContextLengthError` — repairable by moving the request to Claude, not by
+ *  surfacing a 400 the user can do nothing with.
+ *
+ *  Matched by CODE, never by prose: an error whose message names its field (Anthropic's
+ *  own 400s do) is a real client fault and keeps its own clear message.
+ */
+function isProviderParamRejection(errorBody) {
+  if (!errorBody) return false;
+  return /\[1210\]|"code"\s*:\s*"?1210"?/.test(errorBody);
+}
+
 function isContextLengthError(errorBody) {
   if (!errorBody) return false;
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, streamResponse, startIdleRequestReaper, normalizeModelEcho };
+export const __serverTest = { reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2798,6 +2841,64 @@ function headerValue(headers, name) {
 
 function trimTrailingSlash(value) {
   return String(value).replace(/\/+$/, '');
+}
+
+/** Compact, CONTENT-FREE shape of a request body, for diagnosing a provider 4xx.
+ *  Carries no message text, tool input, or system prompt — only structure: which
+ *  fields were sent and how large they were.
+ *
+ *  WHY (2026-09-09): z.ai answers a bad request with `[1210][Invalid API parameter,
+ *  please check the documentation.]` and does NOT name the field. Two of those reached
+ *  a session on 09-09 and nothing on disk could say which parameter was at fault —
+ *  `config.logDir` writes the whole body, so it stays off, and the log line recorded
+ *  only the provider's own unhelpful message. Probing z.ai showed 1210 is a FAMILY
+ *  (`max_tokens` illegal is one member, each with its own text), so the field has to
+ *  come from our side of the call.
+ */
+function describeBodyShape(buf) {
+  try {
+    const j = JSON.parse(buf.toString('utf8'));
+    if (!j || typeof j !== 'object') return 'non-object body';
+    const parts = [];
+    parts.push(`bytes=${buf.length}`);
+    parts.push(`keys=[${Object.keys(j).sort().join(',')}]`);
+    if (j.model) parts.push(`model=${j.model}`);
+    if (j.max_tokens !== undefined) parts.push(`max_tokens=${j.max_tokens}`);
+    if (j.stream !== undefined) parts.push(`stream=${j.stream}`);
+    if (j.thinking) parts.push(`thinking=${j.thinking.type}/${j.thinking.budget_tokens}`);
+    if (j.system !== undefined) {
+      parts.push(Array.isArray(j.system)
+        ? `system=blocks(${j.system.length})`
+        : `system=str(${String(j.system).length})`);
+    }
+    if (Array.isArray(j.tools)) parts.push(`tools=${j.tools.length}`);
+    if (j.tool_choice) parts.push(`tool_choice=${j.tool_choice.type}`);
+    let cacheMarks = 0, emptyBlocks = 0;
+    if (Array.isArray(j.messages)) {
+      const shapes = j.messages.map(m => {
+        const c = m?.content;
+        if (typeof c === 'string') { if (!c.length) emptyBlocks++; return `${m.role}:str(${c.length})`; }
+        if (!Array.isArray(c)) return `${m.role}:?`;
+        if (!c.length) emptyBlocks++;
+        const types = {};
+        for (const b of c) {
+          const t = b?.type || '?';
+          types[t] = (types[t] || 0) + 1;
+          if (b?.cache_control) cacheMarks++;
+          if (t === 'text' && !String(b.text || '').length) emptyBlocks++;
+        }
+        return `${m.role}:${Object.entries(types).map(([t, n]) => n > 1 ? `${t}x${n}` : t).join('+')}`;
+      });
+      parts.push(`msgs=${j.messages.length}`);
+      // Only the tail: a long transcript's head is never the new thing that broke.
+      parts.push(`tail=[${shapes.slice(-4).join(' ')}]`);
+    }
+    if (cacheMarks) parts.push(`cache_control=${cacheMarks}`);
+    if (emptyBlocks) parts.push(`EMPTY_BLOCKS=${emptyBlocks}`);
+    return parts.join(' ');
+  } catch {
+    return 'unparseable body';
+  }
 }
 
 function rewriteBodyForAccount(body, account) {
