@@ -108,12 +108,16 @@ async function startGate(env) {
   });
   gate.logFile = logFile;
   let log = '';
+  gate.port = null;
   gate.stdout.on('data', d => { log += d.toString(); });
   gate.stderr.on('data', d => { log += d.toString(); });
   gate.getLog = () => log;
   await new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('gate did not start: ' + log)), 10_000);
-    const check = () => { if (log.includes('listening')) { clearTimeout(t); resolve(); } };
+    const check = () => {
+      const m = /listening on [^:]+:(\d+)/.exec(log);
+      if (m) { gate.port = Number(m[1]); clearTimeout(t); resolve(); }
+    };
     const iv = setInterval(check, 100);
     gate.on('exit', () => { clearInterval(iv); });
     setTimeout(() => clearInterval(iv), 12_000);
@@ -172,14 +176,13 @@ test('rc-gate: create POST arrives upstream COMPLETE (stream-abort regression)',
   const ups = asTLS(up.server);
   await new Promise(r => ups.listen(0, r));
   const gate = await startGate({
-    RC_GATE_PORT: '3597',
+    RC_GATE_PORT: '0',
     RC_GATE_MAXPOOL_PORT: '1',                       // unused here
     RC_GATE_DIRECT_HOST: '127.0.0.1',
     RC_GATE_DIRECT_PORT: String(ups.address().port),
   });
   try {
-    const gatePort = 3597;
-    const { tls: t } = await mitmConnect(gatePort);
+    const { tls: t } = await mitmConnect(gate.port);
     // A realistic create body, sent in MULTIPLE writes (chunked arrival) to stress buffering.
     const body = JSON.stringify({ title: 'harness-session', bridge: {}, tags: ['remote-control-auto'], config: { cwd: '/tmp', model: 'claude-opus-5' } });
     const res = await httpOverTLS(t, 'POST', '/v1/code/sessions', { 'content-type': 'application/json', 'accept-encoding': 'identity' }, body);
@@ -197,12 +200,12 @@ test('rc-gate: /v1/messages routes to maxpool with profile header', async () => 
   const mp = fakeMaxpool();
   await new Promise(r => mp.server.listen(0, r));
   const gate = await startGate({
-    RC_GATE_PORT: '3598',
+    RC_GATE_PORT: '0',
     RC_GATE_MAXPOOL_PORT: String(mp.server.address().port),
     RC_GATE_PROFILE: 'all',
   });
   try {
-    const { tls: t } = await mitmConnect(3598);
+    const { tls: t } = await mitmConnect(gate.port);
     const res = await httpOverTLS(t, 'POST', '/v1/messages?beta=true', { 'content-type': 'application/json' }, JSON.stringify({ model: 'claude-opus-5', messages: [] }));
     assert.match(res, /HTTP\/1\.1 200/);
     const msg = mp.state.requests.find(r => r.url.startsWith('/v1/messages'));
@@ -233,13 +236,13 @@ test('rc-gate: a failed /bridge POST is NOT replayed (4090 regression)', async (
   const ups3 = asTLS(up);
   await new Promise(r => ups3.listen(0, r));
   const gate = await startGate({
-    RC_GATE_PORT: '3599',
+    RC_GATE_PORT: '0',
     RC_GATE_MAXPOOL_PORT: '1',
     RC_GATE_DIRECT_HOST: '127.0.0.1',
     RC_GATE_DIRECT_PORT: String(ups3.address().port),
   });
   try {
-    const { tls: t } = await mitmConnect(3599);
+    const { tls: t } = await mitmConnect(gate.port);
     await httpOverTLS(t, 'POST', '/v1/code/sessions/cse_x/bridge', { 'content-type': 'application/json' }, '{"claim":1}')
       .catch(() => 'connection reset (expected)');
     await new Promise(r => setTimeout(r, 1500));   // any (forbidden) replay would land here
@@ -254,13 +257,13 @@ test('rc-gate: an idle SSE stream survives (behavior pin; the 09-05 agent-timeou
   const ups4 = asTLS(up.server);
   await new Promise(r => ups4.listen(0, r));
   const gate = await startGate({
-    RC_GATE_PORT: '3600',
+    RC_GATE_PORT: '0',
     RC_GATE_MAXPOOL_PORT: '1',
     RC_GATE_DIRECT_HOST: '127.0.0.1',
     RC_GATE_DIRECT_PORT: String(ups4.address().port),
   });
   try {
-    const { tls: t } = await mitmConnect(3600);
+    const { tls: t } = await mitmConnect(gate.port);
     const got = await new Promise((resolve, reject) => {
       let buf = '';
       t.on('data', c => { buf += c.toString(); if (buf.includes('hello')) resolve(true); });
@@ -282,7 +285,7 @@ test('rc-gate: fds released after tunnel close (behavior pin; 09-04 leak mechani
   const ups5 = asTLS(up.server);
   await new Promise(r => ups5.listen(0, r));
   const gate = await startGate({
-    RC_GATE_PORT: '3601',
+    RC_GATE_PORT: '0',
     RC_GATE_MAXPOOL_PORT: '1',
     RC_GATE_DIRECT_HOST: '127.0.0.1',
     RC_GATE_DIRECT_PORT: String(ups5.address().port),
@@ -290,7 +293,7 @@ test('rc-gate: fds released after tunnel close (behavior pin; 09-04 leak mechani
   try {
     const before = await gateFds(gate);
     for (let i = 0; i < 25; i++) {
-      const { tls: t, sock } = await mitmConnect(3601);
+      const { tls: t, sock } = await mitmConnect(gate.port);
       await httpOverTLS(t, 'POST', '/api/event_logging/v2/batch', { 'content-type': 'application/json' }, '{"e":1}').catch(() => {});
       t.destroy(); sock.destroy();
     }

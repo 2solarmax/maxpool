@@ -311,7 +311,11 @@ process.on('uncaughtException', err => {
 });
 
 gate.listen(GATE_PORT, GATE_HOST, () => {
-  console.log(`rc-gate listening on ${GATE_HOST}:${GATE_PORT}`);
+  // Report the port the OS ACTUALLY bound, not the requested one: RC_GATE_PORT=0 is
+  // how the tests get a private port, and echoing the literal 0 gave them nothing to
+  // connect to. Identical output in production, where the requested port is the bound one.
+  const boundPort = gate.address()?.port ?? GATE_PORT;
+  console.log(`rc-gate listening on ${GATE_HOST}:${boundPort}`);
   console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool 127.0.0.1:${MAXPOOL_PORT} (profile: ${PROFILE})`);
   console.log(`  everything else: blind tunnel`);
 });

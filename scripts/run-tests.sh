@@ -19,6 +19,12 @@ export MAXPOOL_DISABLE_SLEEP_GUARD=1
 # token refresh / hit stubs and race the reload+refresh rotation-count assertions.
 # Disable it fleet-wide for spawned servers; quota-probe.test.js drives Prober directly.
 export MAXPOOL_DISABLE_QUOTA_PROBE=1
+# The rc-gate tests speak TLS to a locally-minted api.anthropic.com cert, so Node must
+# trust the mkcert root — it is read at process START, so a test cannot set it itself.
+# Without it those 12 tests fail here while passing when run by hand, which is exactly
+# how they were added on 2026-09-08. Absent mkcert, leave it unset and let them report.
+_mkcert_root="$HOME/Library/Application Support/mkcert/rootCA.pem"
+if [ -f "$_mkcert_root" ]; then export NODE_EXTRA_CA_CERTS="$_mkcert_root"; fi
 
 # Fast, in-process tests (everything except the subprocess-spawning reload files).
 fast=()
