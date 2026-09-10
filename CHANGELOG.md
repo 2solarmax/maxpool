@@ -5,6 +5,28 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.3] - 2026-09-10
+
+### Added
+
+- Launchd supervision + test-seam CA pin; delete hand-rolled supervisor
+- Timestamp the gate log, detect loop stalls, probe both hops
+- Instrument the response leg — 'Connection lost mid-response' was invisible
+- Name the connection churn by host
+- Push the /rename name up as the Remote Control title
+- Wire title-sync in, fail-safe
+
+### Fixed
+
+- Stop fd leak that dropped Remote Control across all sessions
+- SSE streams off the keep-alive pool; socket-race retry for one-shot posts
+- Never replay ownership-claiming requests (close code 4090 loop)
+- Buffer direct-post bodies — 'stream has been aborted' on session create
+- Watcher no longer replays history or pages on healthy churn
+- Page on abort BURSTS, not single client interrupts
+- Route a z.ai parameter rejection to Claude instead of surfacing it
+- Make the rc-gate suite pass under `npm test`, not only by hand
+
 ## [1.19.2] - 2026-09-02
 
 ### Fixed
