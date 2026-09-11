@@ -102,3 +102,13 @@ test('the owner map is bounded and LRU-evicts', () => {
   assert.equal(o.shouldRefuse('s49', 'acct', readThreadIntent(cont)), false, 'newest retained');
   assert.equal(o.shouldRefuse('s0', 'acct', readThreadIntent(cont)), true, 'oldest evicted');
 });
+
+test('with the gate disabled every branch is a no-op', () => {
+  // server.js passes `{kind:'none'}` when MAXPOOL_THREAD_GATE=0 rather than guarding
+  // each call site. Pin that this actually neutralises both entry points.
+  const o = new ThreadOwners();
+  const off = { kind: 'none' };
+  assert.equal(o.shouldRefuse('s1', 'anyone', off), false);
+  o.noteServed('s1', 'someacct', off);
+  assert.equal(o.size, 0, 'a disabled gate records nothing');
+});

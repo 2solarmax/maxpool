@@ -29,7 +29,7 @@ export function readThreadIntent(body) {
       // `previous_message_id` can also ride in `diagnostics`; that alone is not a thread.
       return { kind: 'none' };
     }
-    if (t.type === 'continue') return { kind: 'continue', previousMessageId: t.previous_message_id || null };
+    if (t.type === 'continue') return { kind: 'continue' };
     if (t.type === 'create') return { kind: 'create' };
     return { kind: 'none' };
   } catch {
