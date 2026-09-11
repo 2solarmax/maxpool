@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { ThreadOwners, readThreadIntent, threadRefusalBody } from './thread-gate.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { modelFamily } from './oauth.js';
@@ -585,6 +586,24 @@ async function forwardRequest(
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
   const upstreamBody = rewriteBodyForAccount(body, account);
+
+  // A threaded follow-up routed to an account that does not hold the thread cannot be
+  // served by it: a different Anthropic account 404s, a provider rejects the truncated
+  // transcript. Hand the client the signal it already knows how to act on — it resends
+  // the turn stateless and stops threading for the session — instead of letting the
+  // upstream produce an error the user sees.
+  const threadIntent = THREAD_GATE_ENABLED ? readThreadIntent(body) : { kind: 'none' };
+  if (THREAD_GATE_ENABLED && threadOwners.shouldRefuse(requestInfo.sessionKey, account.name, threadIntent)) {
+    threadOwners.noteRefused(requestInfo.sessionKey);
+    accountManager.releaseAccount(lease, { neutral: true });
+    console.log(`[Maxpool] thread not held by "${account.name}" — asking the client to resend this turn stateless [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
+    ctx.status = 400;
+    sendErrorResponse(res, requestInfo, 400, threadRefusalBody(account.name));
+    return;
+  }
+  // This account is about to serve the turn, so it holds the thread from here on.
+  // Recorded optimistically: if the turn fails, the next one is refused anyway.
+  if (THREAD_GATE_ENABLED) threadOwners.noteServed(requestInfo.sessionKey, account.name, threadIntent);
 
   // Build log sections
   const logSections = [];
@@ -2900,6 +2919,12 @@ function describeBodyShape(buf) {
     return 'unparseable body';
   }
 }
+
+// THREAD GATE (2026-09-11). Runs AFTER routing has chosen, so it never influences the
+// choice — it only decides what to say to the account that was picked. See
+// src/thread-gate.js for why this replaces rebuilding the transcript.
+const threadOwners = new ThreadOwners();
+const THREAD_GATE_ENABLED = process.env.MAXPOOL_THREAD_GATE !== '0';
 
 function rewriteBodyForAccount(body, account) {
   if (!body.length || (!account.model && !account.modelMap)) return body;
