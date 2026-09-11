@@ -17,6 +17,21 @@ tail -n 0 -F ~/.config/teamclaude.log ~/maxpool/tools/rc-gate/gate.log /tmp/hop-
     # responses they wanted. Everything is still written to gate.log for forensics;
     # this only governs what interrupts.
     case "$line" in
+      # A SUB-SECOND event-loop stall is ordinary CPU contention on a busy laptop, not a
+      # signal — measured 2026-09-11: 5 of them inside 15 minutes at load 9 while maxpool
+      # served 200s throughout, each reported individually and each a non-event. The class
+      # worth waking someone for is a LONG block (>2s, the starvation signature) or a
+      # BURST of shorter ones. Sleep is already excluded upstream by the gate's own
+      # classifier, so anything reaching here is genuine CPU, just usually harmless.
+      *"[loop-stall]"*)
+        _ms=$(printf '%s' "$line" | sed -n 's/.*blocked ~\([0-9]*\)ms.*/\1/p')
+        if [ -n "$_ms" ] && [ "$_ms" -lt 2000 ]; then
+          _snow=$(date +%s)
+          _scnt=$(( ${_scnt:-0} + 1 ))
+          [ $(( _snow - ${_swin:-0} )) -gt 300 ] && { _swin=$_snow; _scnt=1; }
+          [ "$_scnt" -lt 5 ] && continue
+        fi
+        ;;
       *"CLIENT closed before response completed"*)
         _now=$(date +%s)
         _cnt=$(( ${_cnt:-0} + 1 ))
