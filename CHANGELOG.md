@@ -5,6 +5,22 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.4] - 2026-09-11
+
+### Added
+
+- Let the client fall back to stateless when a turn is routed off-thread
+
+### Changed
+
+- Revert "fix(routing): keep server-side-thread and oversized requests off providers"
+
+### Fixed
+
+- Stop paging on system sleep — a suspend is not an event-loop stall
+- The sleep detector was inert — use the kernel's wake clock
+- Keep server-side-thread and oversized requests off providers
+
 ## [1.19.3] - 2026-09-10
 
 ### Added
