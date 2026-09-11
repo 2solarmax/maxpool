@@ -57,6 +57,9 @@ const MAX_SESSIONS = 500;
 // did NOT take the downgrade (a different agent id, a model switch, an older build).
 // Refusing forever would double its request volume, so stop and forward instead.
 const MAX_CONSECUTIVE_REFUSALS = 2;
+// Bucket for requests that carry no session header — keyed per account so the storm
+// bound still applies without pretending we know whose conversation it is.
+const NO_SESSION_PREFIX = '\u0000nosession:';
 
 export class ThreadOwners {
   constructor({ maxSessions = MAX_SESSIONS, maxRefusals = MAX_CONSECUTIVE_REFUSALS } = {}) {
@@ -80,27 +83,38 @@ export class ThreadOwners {
   /** Decide AFTER routing has chosen. Returns true only for a `continue` turn that the
    *  chosen account cannot serve, and only while refusals are still under the bound. */
   shouldRefuse(sessionKey, accountName, intent) {
-    if (!sessionKey || !accountName) return false;
+    if (!accountName) return false;
     if (intent?.kind !== 'continue') return false;          // `create` carries the full transcript
-    const entry = this._touch(sessionKey);
+    // A request with NO session header is invisible to ownership tracking, and measured
+    // 2026-09-11 those are the majority of traffic — 14 of 20 consecutive /v1/messages
+    // lines carried no `[sess …]`. Skipping them left threaded turns reaching GLM and
+    // failing exactly as before the gate existed. We cannot know the owner, so treat it
+    // as an unknown session (refuse, the safe direction) and bucket the refusal COUNT
+    // per account so the storm bound still applies.
+    const key = sessionKey || `${NO_SESSION_PREFIX}${accountName}`;
+    const entry = this._touch(key);
     if (entry && entry.owner === accountName) return false; // the account that holds it
     if (entry && entry.refusals >= this.maxRefusals) return false;  // bounded fail-open
     return true;
   }
 
   /** Record a refusal we are about to emit. */
-  noteRefused(sessionKey) {
-    if (!sessionKey) return;
-    const entry = this._touch(sessionKey) || { owner: null, refusals: 0 };
-    this._set(sessionKey, { owner: entry.owner, refusals: entry.refusals + 1 });
+  noteRefused(sessionKey, accountName = null) {
+    const key = sessionKey || (accountName ? `${NO_SESSION_PREFIX}${accountName}` : null);
+    if (!key) return;
+    const entry = this._touch(key) || { owner: null, refusals: 0 };
+    this._set(key, { owner: entry.owner, refusals: entry.refusals + 1 });
   }
 
   /** Record that `accountName` served a threaded turn for this session — it now holds
    *  the thread. Any refusal streak ends here. */
   noteServed(sessionKey, accountName, intent) {
-    if (!sessionKey || !accountName) return;
+    if (!accountName) return;
     if (intent?.kind !== 'create' && intent?.kind !== 'continue') return;
-    this._set(sessionKey, { owner: accountName, refusals: 0 });
+    // Without a session header there is no conversation to attribute ownership to; only
+    // clear the per-account refusal streak so a served turn re-arms the bound.
+    const key = sessionKey || `${NO_SESSION_PREFIX}${accountName}`;
+    this._set(key, { owner: sessionKey ? accountName : null, refusals: 0 });
   }
 
   get size() { return this.map.size; }

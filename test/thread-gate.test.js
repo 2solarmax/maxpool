@@ -88,9 +88,38 @@ test('an unknown session refuses — the safe direction', () => {
   assert.equal(o.shouldRefuse('never-seen', 'anyone', readThreadIntent(cont)), true);
 });
 
-test('missing session or account never refuses', () => {
+test('a request with NO session header is still refused — the majority of traffic', () => {
+  // Measured 2026-09-11: 14 of 20 consecutive /v1/messages log lines carried no
+  // `[sess …]`. Skipping those left threaded turns reaching GLM and failing exactly as
+  // before the gate existed. We cannot know the owner, so refuse (the safe direction).
   const o = new ThreadOwners();
-  assert.equal(o.shouldRefuse('', 'a', readThreadIntent(cont)), false);
+  assert.equal(o.shouldRefuse('', 'glm max@gomokka.com', readThreadIntent(cont)), true);
+  assert.equal(o.shouldRefuse(undefined, 'glm max@gomokka.com', readThreadIntent(cont)), true);
+});
+
+test('session-less refusals are still bounded, per account', () => {
+  // Without a session id the refusal count buckets per account, so the storm bound
+  // (PRE-MORTEM #2) still applies rather than being bypassed by the missing header.
+  const o = new ThreadOwners({ maxRefusals: 2 });
+  const i = readThreadIntent(cont);
+  assert.equal(o.shouldRefuse('', 'acct-a', i), true); o.noteRefused('', 'acct-a');
+  assert.equal(o.shouldRefuse('', 'acct-a', i), true); o.noteRefused('', 'acct-a');
+  assert.equal(o.shouldRefuse('', 'acct-a', i), false, 'bounded');
+  // a different account has its own budget
+  assert.equal(o.shouldRefuse('', 'acct-b', i), true, 'per-account bucket');
+});
+
+test('a session-less served turn claims no ownership', () => {
+  // There is no conversation to attribute, so it must only clear the refusal streak —
+  // never record an owner that a later real session could match against.
+  const o = new ThreadOwners();
+  o.noteServed('', 'acct-a', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('', 'acct-a', readThreadIntent(cont)), true,
+    'still refuses — no owner was claimed');
+});
+
+test('a missing account never refuses', () => {
+  const o = new ThreadOwners();
   assert.equal(o.shouldRefuse('s', '', readThreadIntent(cont)), false);
 });
 

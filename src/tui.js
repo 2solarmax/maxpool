@@ -332,7 +332,28 @@ function emptyBar(label, w = 10) {
   return `${ESC}100m${' '.repeat(lp)}${text}${' '.repeat(rp)}${RESET}`;
 }
 
-export const __tuiTest = { formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel };
+/** Write a provider's enabled flag into the CONFIG entry `loadConfigProviders` reads.
+ *
+ *  A config-sourced provider is re-created from config on every reload
+ *  (`enabled: entry.enabled !== false`), so a runtime-only flag is undone by the next
+ *  auto-update. Measured 2026-09-11: Kimi, disabled by the owner, came back enabled
+ *  after an update because its config entry carried no `enabled` key.
+ *
+ *  Returns `{changed, previous}` so the caller can roll back if the save fails.
+ *  `changed:false` means there is no config entry — a header-derived provider, whose
+ *  runtime-only flag IS durable for it.
+ */
+export function applyProviderEnabledToConfig(config, name, enabled) {
+  const list = config?.providers;
+  if (!Array.isArray(list)) return { changed: false, previous: undefined };
+  const i = list.findIndex(p => p?.name === name);
+  if (i < 0) return { changed: false, previous: undefined };
+  const previous = list[i].enabled;
+  list[i].enabled = enabled;
+  return { changed: true, previous };
+}
+
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -359,7 +380,8 @@ export class TUI {
     this.capacityWindow = 'ses'; // capacity page window: 'ses' (5h) | 'wk' (weekly)
     // Hide disabled accounts from the table. With 8 dead/disabled accounts the live
     // ones scroll off the top; `h` collapses them to a one-line summary.
-    this.hideDisabled = false;
+    // Restored from config so an auto-update/reload does not un-hide what the user hid.
+    this.hideDisabled = this.config?.ui?.hideDisabled === true;
     this.selAction = null;   // prefer | toggle | delete
     this.selIdx = 0;
     this.inputPrompt = '';
@@ -556,6 +578,13 @@ export class TUI {
     } else if (k === 'h') {
       this.hideDisabled = !this.hideDisabled;
       this._addLog(this.hideDisabled ? 'Hiding disabled accounts' : 'Showing all accounts');
+      // Persist the view choice; a reload otherwise resets it to "show all" every time.
+      // Fully defensive: a VIEW preference must never break the toggle itself, and the
+      // TUI is constructed without a config in several tests and in early startup.
+      if (this.config) {
+        this.config.ui = { ...(this.config.ui || {}), hideDisabled: this.hideDisabled };
+        try { this.saveConfig?.(this.config)?.catch?.(() => {}); } catch { /* view-only */ }
+      }
     }
     // Enable/disable lives ONLY under [a] Accounts now (with rename/delete/login) —
     // one home for every account mutation, instead of a duplicate top-level toggle.
@@ -1540,6 +1569,22 @@ export class TUI {
       // on the next save, so it stays benched across a restart too. Re-enable it here the
       // same way whenever the user wants it back — there's no "removed forever" state.
       if (account.type === 'provider') {
+        // A CONFIG-SOURCED provider (one with a `providers:` entry) is re-created from
+        // config on every reload — `loadConfigProviders` computes `enabled: entry.enabled
+        // !== false` — so a runtime-only flag is silently undone by the next update or
+        // restart. Persist it where that read happens. Measured 2026-09-11: Kimi, disabled
+        // by the owner, came back enabled after an auto-update because its config entry
+        // had no `enabled` key. Header-derived providers (no config entry) keep the
+        // runtime-only path below, which is durable for them.
+        const applied = applyProviderEnabledToConfig(this.config, account.name, enabled);
+        if (applied.changed) {
+          try {
+            await this.saveConfig(this.config);
+          } catch (error) {
+            applyProviderEnabledToConfig(this.config, account.name, applied.previous);
+            throw error;
+          }
+        }
         this.am.setAccountEnabled(idx, enabled);
         if (!enabled && this.am.preferredAccountName === account.name) this.am.setRoutingMode?.('automatic');
         this._addLog(`${enabled ? 'Enabled' : 'Disabled'} provider "${account.name}" — ${enabled ? 'routing resumed' : 'benched (stays off across cc all + restart; re-enable here anytime)'}`);

@@ -596,7 +596,7 @@ async function forwardRequest(
   // disabled path costs one comparison and needs no further guarding.
   const threadIntent = THREAD_GATE_ENABLED ? readThreadIntent(body) : { kind: 'none' };
   if (threadOwners.shouldRefuse(requestInfo.sessionKey, account.name, threadIntent)) {
-    threadOwners.noteRefused(requestInfo.sessionKey);
+    threadOwners.noteRefused(requestInfo.sessionKey, account.name);
     accountManager.releaseAccount(lease, { neutral: true });
     console.log(`[Maxpool] thread not held by "${account.name}" — asking the client to resend this turn stateless [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
     ctx.status = 400;
