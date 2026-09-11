@@ -1043,6 +1043,27 @@ async function forwardRequest(
         // Providers answer with a code and no field name, so record what WE sent.
         if (account.type === 'provider') {
           console.log(`[Maxpool]   request shape: ${describeBodyShape(upstreamBody || body).slice(0, 600)}`);
+          // OPT-IN BODY CAPTURE. The shape line is content-free by design, which is right
+          // for a log that runs always — but it cannot diagnose a rejection that lives in
+          // the message CONTENT. Measured 2026-09-11: every top-level field of a failing
+          // [1210] body, and the full combination of them, returned 200 OK when replayed;
+          // the cause is inside the 940-message transcript and invisible from a summary.
+          // Writes the WHOLE request (the user's transcript) so it is OFF unless a human
+          // sets the directory, and stops after a handful of samples.
+          if (PROVIDER_4XX_CAPTURE_DIR && _provider4xxCaptured < PROVIDER_4XX_CAPTURE_MAX) {
+            _provider4xxCaptured += 1;
+            const n = _provider4xxCaptured;
+            (async () => {
+              try {
+                await mkdir(PROVIDER_4XX_CAPTURE_DIR, { recursive: true });
+                const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+                await writeFile(join(PROVIDER_4XX_CAPTURE_DIR, `${stamp}-${account.provider || 'provider'}-${n}.json`),
+                  JSON.stringify({ status: upstreamRes.status, error: errorBody.slice(0, 2000),
+                    account: account.name, body: (upstreamBody || body).toString('utf8') }), 'utf-8');
+                console.log(`[Maxpool]   captured failing body ${n}/${PROVIDER_4XX_CAPTURE_MAX} -> ${PROVIDER_4XX_CAPTURE_DIR}`);
+              } catch (e) { console.log(`[Maxpool]   capture failed: ${e?.message || e}`); }
+            })();
+          }
         }
       }
       const errorType = errorBody.includes('Invalid `signature` in `thinking` block')
@@ -1719,6 +1740,13 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
  *  Matched by CODE, never by prose: an error whose message names its field (Anthropic's
  *  own 400s do) is a real client fault and keeps its own clear message.
  */
+// Opt-in capture of a failing provider request, for the class of rejection that lives in
+// message CONTENT and is therefore invisible to the content-free shape line. Writes the
+// user's transcript, so it stays OFF unless a human names a directory.
+const PROVIDER_4XX_CAPTURE_DIR = process.env.MAXPOOL_CAPTURE_PROVIDER_4XX || '';
+const PROVIDER_4XX_CAPTURE_MAX = Number(process.env.MAXPOOL_CAPTURE_PROVIDER_4XX_MAX || 3);
+let _provider4xxCaptured = 0;
+
 function isProviderParamRejection(errorBody) {
   if (!errorBody) return false;
   return /\[1210\]|"code"\s*:\s*"?1210"?/.test(errorBody);
