@@ -27,9 +27,16 @@ tail -n 0 -F ~/.config/teamclaude.log ~/maxpool/tools/rc-gate/gate.log /tmp/hop-
         _ms=$(printf '%s' "$line" | sed -n 's/.*blocked ~\([0-9]*\)ms.*/\1/p')
         if [ -n "$_ms" ] && [ "$_ms" -lt 2000 ]; then
           _snow=$(date +%s)
+          # Reset the window first, so a new window always starts from a clean count.
+          [ $(( _snow - ${_swin:-0} )) -gt 300 ] && { _swin=$_snow; _scnt=0; _sfired=0; }
           _scnt=$(( ${_scnt:-0} + 1 ))
-          [ $(( _snow - ${_swin:-0} )) -gt 300 ] && { _swin=$_snow; _scnt=1; }
-          [ "$_scnt" -lt 5 ] && continue
+          # Page ONCE per window when the burst threshold is crossed. Without the
+          # _sfired latch every later stall in the same window also pages, which turns
+          # one burst into a flood — observed 2026-09-11 immediately after shipping the
+          # threshold: the 6th stall correctly alerted, then the 7th did too.
+          if [ "$_scnt" -lt 5 ] || [ "${_sfired:-0}" = "1" ]; then continue; fi
+          _sfired=1
+          line="$line  [burst: ${_scnt} sub-2s stalls in 5min — sustained CPU pressure]"
         fi
         ;;
       *"CLIENT closed before response completed"*)
