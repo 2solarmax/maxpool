@@ -990,7 +990,17 @@ async function forwardRequest(
       // only a large-context Claude (1M) can hold — e.g. "exceeded model token limit:
       // 262144". Detect it ONLY on a provider (a Claude account's context-length 400 is
       // terminal — nothing bigger to fall to) so we can pin the session to Claude.
-      const providerTooSmall = account.type === 'provider' && isContextLengthError(errorBody);
+      // z.ai reports an over-large transcript as [1214] "messages parameter is illegal",
+      // which isContextLengthError cannot match — it names no length. Measured 09-11: 23
+      // of 37 provider rejections were >1MB bodies (median 3.6MB, max 4.8MB) with no
+      // `thread` key, i.e. genuinely too big rather than thread-truncated. Treat those as
+      // the context verdict they are, so the session latches and later turns stop paying
+      // the round-trip.
+      const providerOversized = account.type === 'provider'
+        && isProviderParamRejection(errorBody)
+        && (requestInfo.bodyBytes || 0) > PROVIDER_OVERSIZE_BYTES;
+      const providerTooSmall = account.type === 'provider'
+        && (isContextLengthError(errorBody) || providerOversized);
       // Same shape as providerTooSmall: the PROVIDER cannot take this body, Claude can.
       const providerRejectedShape = account.type === 'provider'
         && !providerTooSmall && isProviderParamRejection(errorBody);
@@ -1698,9 +1708,14 @@ function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRe
  *  Matched by CODE, never by prose: an error whose message names its field (Anthropic's
  *  own 400s do) is a real client fault and keeps its own clear message.
  */
+// A provider body past this size, rejected on shape, is read as "too big for this
+// provider" rather than a one-off malformation. Set an order of magnitude above a
+// normal turn so an ordinary request can never be misread as oversized.
+const PROVIDER_OVERSIZE_BYTES = 1_000_000;
+
 function isProviderParamRejection(errorBody) {
   if (!errorBody) return false;
-  return /\[1210\]|"code"\s*:\s*"?1210"?/.test(errorBody);
+  return /\[121[04]\]|"code"\s*:\s*"?121[04]"?/.test(errorBody);
 }
 
 function isContextLengthError(errorBody) {
@@ -1708,7 +1723,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho };
+export const __serverTest = { reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, PROVIDER_OVERSIZE_BYTES, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2659,6 +2674,14 @@ function describeRequest(req, body) {
     // Image content (incl. tool_result-nested screenshots) keeps a request off Kimi
     // (Moonshot 400s on some images GLM/Anthropic accept, and a 400 is terminal).
     if (containsImageBlock(json.messages)) info.hasImage = true;
+    // SERVER-SIDE THREADS (2026-09-10). Claude Code >= 2.1.265 keeps the conversation on
+    // Anthropic's servers and sends only the last turn or two plus a `thread` /
+    // `previous_message_id` reference. No provider has that state, so GLM receives a
+    // conversation that opens with a bare tool_result and rejects it — 69 of 97 captured
+    // request shapes on 09-11 carried `thread`, every one a z.ai [1214] "messages
+    // parameter is illegal". It is not a parameter to strip: the missing turns only exist
+    // on Anthropic, so a threaded request is Anthropic-ONLY by construction.
+    if (json.thread || json.previous_message_id) info.threaded = true;
   } catch {
     // Non-JSON requests are rare; body size still gives a useful load signal.
   }

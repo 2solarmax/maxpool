@@ -2347,6 +2347,15 @@ export class AccountManager {
     // are all unavailable the request HOLDS/queues (recoverable) rather than 400ing.
     if (requestInfo.hasImage && account.provider === 'kimi') return false;
 
+    // A SERVER-SIDE-THREAD request carries only the last turn or two plus a `thread`
+    // reference; the rest of the conversation lives on Anthropic. No provider can look
+    // it up, so GLM/Kimi receive a transcript that opens mid-tool-call and 400 on it
+    // ([1214] "messages parameter is illegal"). Unlike the large-context latch below
+    // this is PROACTIVE — there is nothing to learn from a rejection, the state simply
+    // is not there — and unlike that latch it is per-REQUEST, not sticky: the same
+    // session sends unthreaded requests too, and those still belong on providers.
+    if (requestInfo.threaded && account.type === 'provider') return false;
+
     // A large-context session: a provider already rejected THIS request with a
     // context-length 400. Deliberately REACTIVE — it never assumes a ceiling, it learns
     // one from an actual rejection, so it self-corrects as providers grow. That matters:
