@@ -141,7 +141,16 @@ const mitmServer = http.createServer((creq, cres) => {
   delete headers['proxy-connection'];
   if (!headers['x-maxpool-profile']) headers['x-maxpool-profile'] = PROFILE;
 
-  const isIdentityPath = !creq.url.startsWith('/v1/') || creq.url.startsWith('/v1/code/sessions');
+  // `/v1/sessions/<id>` is the v1-COMPAT Remote Control session API (fetch / patch /
+  // mark-read / archive) — identity-bound to the OAuth account that created the session,
+  // exactly like /v1/code/sessions. Claude Code 2.1.269 emits ~21 call sites on this path.
+  // Routing them through the pool rotated each call to a different account and 404'd on
+  // every one that didn't own the session (measured 2026-09-12: the same id failing on
+  // mk@gomokka, privacy@, mk@dubner.io, 2solarmax in turn). Inference stays on the pool:
+  // only the sessions APIs go direct.
+  const isIdentityPath = !creq.url.startsWith('/v1/')
+    || creq.url.startsWith('/v1/code/sessions')
+    || /^\/v1\/sessions(\/|$)/.test(creq.url);
   if (isIdentityPath) {
     const dirHeaders = { ...creq.headers, host: DIRECT_HOST };
     try { _titleSync?.noteAuthHeaders(creq.url, creq.headers); } catch {}
