@@ -6,7 +6,7 @@
 // Anthropic account 404s and GLM rejects the truncated transcript with [1214].
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ThreadOwners, readThreadIntent, threadRefusalBody, THREAD_UNSUPPORTED_CODE }
+import { ThreadOwners, readThreadIntent, threadRefusalBody, THREAD_UNSUPPORTED_CODE, isThreadlessAccount }
   from '../src/thread-gate.js';
 
 const B = (o) => Buffer.from(JSON.stringify(o));
@@ -140,4 +140,46 @@ test('with the gate disabled every branch is a no-op', () => {
   assert.equal(o.shouldRefuse('s1', 'anyone', off), false);
   o.noteServed('s1', 'someacct', off);
   assert.equal(o.size, 0, 'a disabled gate records nothing');
+});
+
+// 2026-09-13: provider accounts can never hold an Anthropic-side thread, so a
+// `continue` routed to GLM/Kimi is refused unconditionally — no ownership, no bound.
+// Driver: 118/118 provider-routed continues 400'd, and a standalone-valid slice tail
+// got ANSWERED from a ~2-message orphan context (the "amnesia" bug). The vendor
+// classifier turns our 400 into a permanent session-wide stateless downgrade.
+test('provider: refuses a continue on a cold map with no prior state', () => {
+  const o = new ThreadOwners();
+  assert.equal(o.shouldRefuse('s1', 'glm max', readThreadIntent(cont), true), true);
+});
+
+test('provider: never disarms — refused after served and after many refusals', () => {
+  const o = new ThreadOwners();
+  o.noteServed('s1', 'glm max', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('s1', 'glm max', readThreadIntent(cont), true), true,
+    'owner record must not disarm a provider');
+  for (let i = 0; i < 10; i++) o.noteRefused('s1', 'glm max');
+  assert.equal(o.shouldRefuse('s1', 'glm max', readThreadIntent(cont), true), true,
+    'the refusal bound must not disarm a provider');
+});
+
+test('provider: a `create` still goes through (it carries the full transcript)', () => {
+  const o = new ThreadOwners();
+  assert.equal(o.shouldRefuse('s1', 'glm max', readThreadIntent(create), true), false);
+});
+
+test('anthropic: owner logic intact — thread saving preserved', () => {
+  const o = new ThreadOwners();
+  o.noteServed('s1', 'mk@gomokka', readThreadIntent(create));
+  assert.equal(o.shouldRefuse('s1', 'mk@gomokka', readThreadIntent(cont)), false);
+  assert.equal(o.shouldRefuse('s1', 'max@dubner.io', readThreadIntent(cont)), true);
+});
+
+// The call site passes isThreadlessAccount(account); pin the classification itself so
+// production and the tests cannot disagree about what "provider" means (a mutant that
+// unwires the call site otherwise survives every unit test).
+test('isThreadlessAccount: providers yes, anthropic accounts no', () => {
+  assert.equal(isThreadlessAccount({ type: 'provider', name: 'glm max' }), true);
+  assert.equal(isThreadlessAccount({ type: 'oauth', name: 'mk@gomokka' }), false);
+  assert.equal(isThreadlessAccount({ name: 'no-type' }), false);
+  assert.equal(isThreadlessAccount(null), false);
 });

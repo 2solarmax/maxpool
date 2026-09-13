@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { ThreadOwners, readThreadIntent, threadRefusalBody } from './thread-gate.js';
+import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { modelFamily } from './oauth.js';
@@ -595,7 +595,7 @@ async function forwardRequest(
   // `kind:'none'` when the gate is off makes every branch below a no-op, so the
   // disabled path costs one comparison and needs no further guarding.
   const threadIntent = THREAD_GATE_ENABLED ? readThreadIntent(body) : { kind: 'none' };
-  if (threadOwners.shouldRefuse(requestInfo.sessionKey, account.name, threadIntent)) {
+  if (threadOwners.shouldRefuse(requestInfo.sessionKey, account.name, threadIntent, isThreadlessAccount(account))) {
     threadOwners.noteRefused(requestInfo.sessionKey, account.name);
     accountManager.releaseAccount(lease, { neutral: true });
     console.log(`[Maxpool] thread not held by "${account.name}" — asking the client to resend this turn stateless [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);

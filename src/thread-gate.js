@@ -19,6 +19,13 @@
 
 export const THREAD_UNSUPPORTED_CODE = 'thread_unsupported_request';
 
+/** Whether an account is a non-Anthropic provider (GLM/Kimi) that can never hold an
+ *  Anthropic-side thread. The ONE place this is decided, so the call site and the
+ *  tests cannot disagree about it. */
+export function isThreadlessAccount(account) {
+  return account?.type === 'provider';
+}
+
 /** What kind of thread intent a request body carries. Cheap: only the head of the body
  *  is JSON-parsed, and a non-JSON body is simply 'none'. */
 export function readThreadIntent(body) {
@@ -81,10 +88,25 @@ export class ThreadOwners {
   }
 
   /** Decide AFTER routing has chosen. Returns true only for a `continue` turn that the
-   *  chosen account cannot serve, and only while refusals are still under the bound. */
-  shouldRefuse(sessionKey, accountName, intent) {
+   *  chosen account cannot serve, and only while refusals are still under the bound.
+   *
+   *  2026-09-13: `isProvider` (GLM/Kimi) short-circuits to refuse — measured, not
+   *  guessed: 118 of 118 provider-routed continues 400'd, the client never downgrades
+   *  on a plain provider 400 (its downgrade trigger is exactly the code this gate
+   *  returns), and when a slice tail is standalone-valid the provider ANSWERS it from
+   *  a ~2-message orphan context (the "amnesia" bug: 2,844 effective input tokens
+   *  where the prior turn had 478,596). Ownership tracking is meaningless for
+   *  providers — they can never hold an Anthropic-side thread — so every provider
+   *  continue is refused unconditionally: no owner record, no bound. The bound
+   *  existed to stop storms when a client ignores refusals, but the classifier that
+   *  acts on them ships in every continue-capable build (>= 2.1.265), and one
+   *  refusal ends the session's slicing for good; a no-session-header storm is
+   *  bounded by that same downgrade. Anthropic accounts keep the owner logic below —
+   *  a same-account chain preserves the vendor's thread saving (64% of turns). */
+  shouldRefuse(sessionKey, accountName, intent, isProvider = false) {
     if (!accountName) return false;
     if (intent?.kind !== 'continue') return false;          // `create` carries the full transcript
+    if (isProvider) return true;                            // can never serve an Anthropic thread
     // A request with NO session header is invisible to ownership tracking, and measured
     // 2026-09-11 those are the majority of traffic — 14 of 20 consecutive /v1/messages
     // lines carried no `[sess …]`. Skipping them left threaded turns reaching GLM and
