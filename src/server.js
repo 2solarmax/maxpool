@@ -1757,7 +1757,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho };
+export const __serverTest = { rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2957,15 +2957,51 @@ const threadOwners = new ThreadOwners();
 const THREAD_GATE_ENABLED = process.env.MAXPOOL_THREAD_GATE !== '0';
 
 function rewriteBodyForAccount(body, account) {
-  if (!body.length || (!account.model && !account.modelMap)) return body;
+  const needsProviderSanitize = account.type === 'provider';
+  if (!body.length || (!account.model && !account.modelMap && !needsProviderSanitize)) return body;
 
   try {
     const json = JSON.parse(body.toString());
     if (!json || typeof json !== 'object' || !json.model) return body;
-    json.model = mappedModel(json.model, account);
+    if (account.model || account.modelMap) json.model = mappedModel(json.model, account);
+    if (needsProviderSanitize) sanitizeBlocksForProvider(json);
     return Buffer.from(JSON.stringify(json));
   } catch {
     return body;
+  }
+}
+
+// Content-block types Anthropic's own client emits that a provider's validator rejects
+// outright, taking the WHOLE request with it. Measured 2026-09-13 against z.ai: a body
+// carrying one `tool_reference` block (Claude Code writes these into `tool_result` when
+// ToolSearch loads a deferred tool) returns `[1210] Invalid API parameter` — the entire
+// 5.5MB transcript refused over 12 blocks. Counterfactual on the owner's real failing
+// session: identical body with ONLY these blocks rewritten to text returned 200 OK.
+//
+// It is not a size or token limit — z.ai has a distinct code for that (`[1261] Prompt
+// too long`), and a 34KB body with the block fails while 5.5MB without it passes.
+//
+// We rewrite rather than drop: the block carries a tool NAME the conversation refers to,
+// so replacing it with the equivalent sentence keeps the transcript truthful. Anthropic
+// accounts are untouched — they understand the block natively.
+const PROVIDER_UNSUPPORTED_BLOCKS = new Set(['tool_reference']);
+
+function sanitizeBlocksForProvider(json) {
+  const messages = json?.messages;
+  if (!Array.isArray(messages)) return;
+  for (const message of messages) {
+    const content = message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      // The blocks live INSIDE tool_result content, not at the message top level.
+      if (!block || typeof block !== 'object' || !Array.isArray(block.content)) continue;
+      for (let i = 0; i < block.content.length; i++) {
+        const inner = block.content[i];
+        if (!inner || typeof inner !== 'object') continue;
+        if (!PROVIDER_UNSUPPORTED_BLOCKS.has(inner.type)) continue;
+        block.content[i] = { type: 'text', text: `Tool loaded: ${inner.tool_name || 'unknown'}` };
+      }
+    }
   }
 }
 
