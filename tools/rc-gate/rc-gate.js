@@ -390,3 +390,33 @@ gate.listen(GATE_PORT, GATE_HOST, () => {
   console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool 127.0.0.1:${MAXPOOL_PORT} (profile: ${PROFILE})`);
   console.log(`  everything else: blind tunnel`);
 });
+
+// GRACEFUL SHUTDOWN (2026-09-14). launchd restarts the gate on deploys (`kickstart -k`
+// → SIGTERM, ExitTimeOut=5s) and the default Node behavior kills every open CONNECT tunnel
+// and in-flight MITM response instantly — surfacing in sessions as "API Error: Connection
+// lost mid-response". Measured: 12 of 12 all-time mid-response breaks coincide with a
+// proxy-layer restart (2 with maxpool's config reload, 10 with gate restarts); zero
+// spontaneous. On SIGTERM: stop accepting, close both servers, and wait (bounded 20s) for
+// the in-flight responses the [resp-break] tracker counts. com.mokka.rc-gate.plist
+// ExitTimeOut must stay ≥ 25s (checked at startup).
+const DRAIN_MS = 20_000;
+let draining = false;
+function drainAndExit(signal) {
+  if (draining) return;
+  draining = true;
+  gate.close();
+  try { mitmServer.close(); } catch {}
+  console.log(`[drain] ${signal} received — waiting up to ${DRAIN_MS / 1000}s for in-flight responses`);
+  const t0 = Date.now();
+  (function poll() {
+    const active = Object.values(poolAgent.sockets || {}).flat().length
+      + Object.values(directAgent.sockets || {}).flat().length;
+    if (active === 0 || Date.now() - t0 >= DRAIN_MS) {
+      console.log(`[drain] exiting after ${((Date.now() - t0) / 1000).toFixed(1)}s (active upstream sockets: ${active})`);
+      process.exit(0);
+    }
+    setTimeout(poll, 250);
+  })();
+}
+process.on('SIGTERM', () => drainAndExit('SIGTERM'));
+process.on('SIGINT', () => drainAndExit('SIGINT'));
