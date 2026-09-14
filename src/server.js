@@ -48,6 +48,12 @@ const QUEUE_KEEPALIVE = 'event: ping\ndata: {}\n\n';
 const STREAM_IDLE_MS = Math.max(30_000, Number(process.env.MAXPOOL_STREAM_IDLE_MS) || 240_000);  // max gap BETWEEN streamed chunks (reset per chunk)
 const UPSTREAM_BODY_MS = Math.max(30_000, Number(process.env.MAXPOOL_BODY_MS) || 300_000);       // non-streaming body read
 const CLIENT_DRAIN_MS = Math.max(5_000, Number(process.env.MAXPOOL_DRAIN_MS) || 60_000);         // max wait for a backpressured client to drain (half-open client → free the lease)
+// SAFEGUARD-REFUSAL REROUTE caps: how long streamResponse may hold the FIRST events
+// unsent while deciding refusal-vs-content. Both fail OPEN (release + stream verbatim)
+// so a pathological upstream can only cost a missed reroute, never a stall. Real
+// refusals resolve in the first 2-3 events (<4KB, <5s — measured on 9 captures).
+const REFUSAL_HOLD_MAX_BYTES = 64 * 1024;
+const REFUSAL_HOLD_MAX_MS = 30_000;
 // A provider 403 is (unlike a 401) almost always transient QUOTA/PLAN exhaustion — cool
 // the provider down RECOVERABLY for this window, then re-probe, instead of permanently
 // disabling it. Short (not reset-length) so a provider-pinned session's hold window
@@ -515,6 +521,14 @@ async function forwardRequest(
   // Track which account handles this request
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
+
+  // SAFEGUARD-REFUSAL REROUTE (2026-09-14): arm the stream-side hold only for Anthropic
+  // accounts on a streaming turn we could still fail over (nothing written yet). A
+  // provider has its own classifier and never emits this stop_reason, so holding its
+  // first events would be pure latency. See streamResponse + classifyHeldStreamPrefix.
+  requestInfo._refusalRerouteEligible = account.type !== 'provider'
+    && canRetryBufferedBody
+    && !res.headersSent;
 
   // Refresh OAuth token if needed
   const tokenReady = await accountManager.ensureTokenFresh(account.index);
@@ -1370,8 +1384,7 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
-    } else {
-      // Bound the non-streaming body read so a mid-body upstream stall can't hang
+    } else {      // Bound the non-streaming body read so a mid-body upstream stall can't hang
       // the request forever and leak the lease (same class as the streaming idle
       // guard). On timeout → UPSTREAM_BODY → the caller frees the lease.
       const bodyP = upstreamRes.arrayBuffer();
@@ -1458,6 +1471,35 @@ async function forwardRequest(
     const rootCause = err.cause?.code || err.cause?.message || err.code || '';
     console.error(`[Maxpool] Upstream error (account "${account.name}"):`, err.message
       + (rootCause && !String(err.message).includes(rootCause) ? ` (cause: ${rootCause})` : ''));
+
+    // SAFEGUARD-REFUSAL REROUTE (2026-09-14): streamResponse detected a
+    // stop_reason:"refusal" while still holding the first events — nothing was ever
+    // written to the client (usage is 0/0 on these; no model output exists). Every
+    // Anthropic account shares the classifier, so retrying another Anthropic account
+    // is guaranteed re-refusal: exclude ALL Anthropic accounts and re-dispatch onto a
+    // provider. If no provider is available,
+    // fall through to the normal error path — the client sees the same message it
+    // would have seen before this feature existed.
+    if (err.code === 'REFUSAL_RETRY' && canRetryBufferedBody && !res.headersSent) {
+      const category = err.refusalCategory || 'unknown';
+      const anthropicIndexes = accountManager.accounts
+        .filter(a => a.type !== 'provider')
+        .map(a => a.index);
+      anthropicIndexes.forEach(i => excludedIndexes.add(i));
+      const providerAvailable = accountManager.accounts.some(a => a.type === 'provider' && !excludedIndexes.has(a.index));
+      // No re-reroute latch: once rerouted, the turn is served by a PROVIDER, which never
+      // arms the hold (above), so it cannot refuse-and-reroute again. Mutation-tested
+      // 2026-09-14: removing a latch changed nothing on any constructible path.
+      if (providerAvailable && retryCount + 1 <= maxAttempts) {
+        console.log(`[Maxpool] Anthropic safeguard refusal (${category}) on "${account.name}" — rerouting turn to a provider account`);
+        accountManager.releaseAccount(lease, { success: true, status: 200, refusal: category });
+        return forwardRequest(
+          req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
+        );
+      }
+      console.log(`[Maxpool] Anthropic safeguard refusal (${category}) — no provider route available; surfacing error`);
+    }
 
     if (logDir) {
       logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
@@ -1757,7 +1799,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho };
+export const __serverTest = { rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -3119,6 +3161,25 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   let modelEchoPending = true;
   let modelEchoBuffer = null;
 
+  // SAFEGUARD-REFUSAL REROUTE (2026-09-14). Anthropic's server-side classifier can
+  // terminate a turn with HTTP 200 + `stop_reason:"refusal"` + stop_details.category
+  // (reasoning_extraction / cyber / bio / frontier_llm) and usage 0/0 — no model output
+  // is produced, and the CLI renders "API Error: … safeguards flagged this message",
+  // killing the turn. Every Anthropic account shares that classifier, so account
+  // failover cannot help; only a PROVIDER hop escapes it.
+  //
+  // Because usage is 0/0 the client has seen no model text, so the turn is safely
+  // retryable — but only while nothing has been WRITTEN yet. This rides the model-echo
+  // hold above: we keep buffering until a DECISIVE event (real content → flush and
+  // stream normally; refusal → throw REFUSAL_RETRY so the caller re-dispatches on a
+  // provider). `ping` is not decisive. Fail-open on either cap, exactly as the
+  // model-echo hold does — a missed reroute is a bad turn, a stall is a dead session.
+  // Task: work/tooling/**/task-2026-09-14-maxpool-reroute-anthropic-refusals-to-provider
+  let refusalRerouting = false;
+  const refusalWatch = requestInfo?._refusalRerouteEligible === true;
+  let refusalHoldBuffer = refusalWatch ? [] : null;
+  const refusalHoldStart = Date.now();
+
   try {
     while (true) {
       // Idle guard: a half-open upstream (headers, then silence, never closes) would
@@ -3143,11 +3204,36 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       } finally {
         clearTimeout(idleTimer);  // single live timer at a time — no per-chunk timer accumulation
       }
-      const { done, value } = result;
+      const { done, value: chunkValue } = result;
       if (done) break;
+      let value = chunkValue;
 
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
+
+      // SAFEGUARD-REFUSAL HOLD (see the state block above). Runs BEFORE writeHead so a
+      // rerouted turn leaves the client socket completely untouched — the caller can
+      // then re-dispatch onto a provider as if the Anthropic attempt never happened.
+      if (refusalHoldBuffer) {
+        refusalHoldBuffer.push(value);
+        const held = decoder.decode(concatUint8(refusalHoldBuffer));
+        const verdict = classifyHeldStreamPrefix(held);
+        if (verdict.decision === 'refusal') {
+          throw Object.assign(
+            new Error(`anthropic safeguard refusal (${verdict.category || 'unknown'})`),
+            { code: 'REFUSAL_RETRY', refusalCategory: verdict.category || 'unknown' },
+          );
+        }
+        if (verdict.decision === 'hold'
+            && totalLen(refusalHoldBuffer) <= REFUSAL_HOLD_MAX_BYTES
+            && Date.now() - refusalHoldStart <= REFUSAL_HOLD_MAX_MS) {
+          continue; // nothing decisive yet — keep holding, write nothing
+        }
+        // Decisive content, or either cap hit → fail open: release the held bytes as
+        // this chunk and never hold again on this stream.
+        value = concatUint8(refusalHoldBuffer);
+        refusalHoldBuffer = null;
+      }
 
       if (!committed) {
         res.writeHead(status, responseHeaders);
@@ -3245,8 +3331,40 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
     }
   } catch (err) {
     readFailed = true;
+    if (err?.code === 'REFUSAL_RETRY') refusalRerouting = true;
     throw err;
   } finally {
+    // SAFEGUARD-REFUSAL HOLD last-resort flush. A stream can end while the hold is
+    // still undecided — a `usage`-only stream (message_delta with no content blocks
+    // and no message_stop) reaches `done` having never produced a decisive event, and
+    // an upstream that DIES mid-flight throws with bytes still held. Both must still
+    // deliver and account for what arrived; only the refusal reroute discards, because
+    // that turn is being re-run on another account and its usage will be counted there.
+    // Caught by server.test.js "streaming response is not committed until first upstream
+    // chunk" and capacity-integration H4 on the first full-suite run — the held bytes
+    // were being dropped, truncating good responses and losing delivered tokens.
+    if (refusalHoldBuffer) {
+      const heldChunks = refusalHoldBuffer;
+      refusalHoldBuffer = null;
+      if (!refusalRerouting) {
+        const held = Buffer.from(concatUint8(heldChunks));
+        const heldText = held.toString('utf8');
+        // Account for delivered tokens even when the write is impossible (dead socket):
+        // capacity is about what the UPSTREAM produced, not what the client received.
+        if (streamLog) streamLog.push(heldText);
+        sseBuffer += heldText;
+        for (const ev of sseBuffer.split('\n\n')) {
+          if (ev.trim()) parseSSEEvent(ev, accountIndex, accountManager, requestInfo);
+        }
+        sseBuffer = '';
+        if (!readFailed && !res.destroyed) {
+          try {
+            if (!committed && !res.headersSent) { res.writeHead(status, responseHeaders); committed = true; }
+            res.write(held);
+          } catch { /* client already gone */ }
+        }
+      }
+    }
     // MODEL ECHO NORMALIZATION last-resort flush: the read loop can exit via done,
     // error, or client disconnect while chunks are still HELD for the rewrite.
     // Whatever the exit path, deliver the held bytes and accrue their usage — a
@@ -3321,6 +3439,37 @@ function sseEventContainsThinking(data) {
   return data?.content_block?.type === 'thinking'
     || data?.content_block?.type === 'redacted_thinking'
     || data?.delta?.type === 'signature_delta';
+}
+
+// SAFEGUARD-REFUSAL REROUTE — classify the held stream prefix (see streamResponse).
+// Decisive events, on the first COMPLETE SSE event boundary:
+//   - `stop_reason:"refusal"` (+ optional stop_details.category)  → { decision: 'refusal', category }
+//   - any content_block_start/content_block_delta                  → { decision: 'content' }
+//   - message_stop without a prior refusal                         → { decision: 'content' } (normal end)
+// Non-decisive: message_start, ping, partial/binary garbage → { decision: 'hold' }.
+// Works on the RAW prefix (not parsed events) so it can run per-chunk; a refusal
+// `message_delta` always lands after `message_start` and before any content, and no
+// provider-echo variant matters here because the hold is only armed on Anthropic
+// accounts (requestInfo._refusalRerouteEligible).
+function classifyHeldStreamPrefix(prefix) {
+  for (const event of prefix.split('\n\n')) {
+    const dataLine = event.split('\n').find(l => l.startsWith('data: '));
+    if (!dataLine) continue; // ping/comment — not decisive
+    let data;
+    try { data = JSON.parse(dataLine.slice(6)); } catch { continue; }
+    if (data?.delta?.stop_reason === 'refusal'
+        || (data?.type === 'message' && data?.stop_reason === 'refusal')) {
+      return { decision: 'refusal', category: data?.stop_details?.category || data?.delta?.stop_details?.category };
+    }
+    if (data?.type === 'content_block_start' || data?.type === 'content_block_delta') {
+      return { decision: 'content' };
+    }
+    if (data?.type === 'message_stop') {
+      // Terminal without refusal and without content blocks (usage-only edge) — release.
+      return { decision: 'content' };
+    }
+  }
+  return { decision: 'hold' };
 }
 
 function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo = {}) {
