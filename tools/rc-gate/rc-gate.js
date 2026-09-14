@@ -26,7 +26,7 @@ import os from 'node:os';
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
@@ -51,13 +51,29 @@ const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, m
 // transparently reconnects on the next request — no retry logic added, so the
 // 4090-eviction hazard of replayed /bridge registrations is untouched).
 let _netIfaces = JSON.stringify(os.networkInterfaces());
-setInterval(() => {
-  const now = JSON.stringify(os.networkInterfaces());
-  if (now === _netIfaces) return;
+function netEvacTick(sampleIfaces) {
+  const now = sampleIfaces === undefined ? JSON.stringify(os.networkInterfaces()) : sampleIfaces;
+  if (now === _netIfaces) return false;
   _netIfaces = now;
   console.log(`[net-evac] local interfaces changed — destroying pooled sockets (was holding sockets on a departed address)`);
   poolAgent.destroy();
   directAgent.destroy();
+  return true;
+}
+setInterval(() => netEvacTick(), 5_000).unref();
+
+// LIVE-SOAK SEAM (2026-09-14): lets an operator prove the evacuation end-to-end
+// without waiting for a natural network move —
+//   touch /tmp/rc-gate-force-net-evac
+// The tick notices the file, injects a synthetic interface snapshot, and the
+// REAL destroy() path runs on the REAL agents. Self-clears after one fire.
+const FORCE_EVAC_FLAG = '/tmp/rc-gate-force-net-evac';
+setInterval(() => {
+  try {
+    if (!existsSync(FORCE_EVAC_FLAG)) return;
+    rmSync(FORCE_EVAC_FLAG);
+    netEvacTick(_netIfaces + '\n[force-evac-probe]');
+  } catch {}
 }, 5_000).unref();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
