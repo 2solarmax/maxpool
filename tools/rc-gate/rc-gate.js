@@ -50,12 +50,26 @@ const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, m
 // Fix: watch os.networkInterfaces(); on any change, destroy both agents (Node
 // transparently reconnects on the next request — no retry logic added, so the
 // 4090-eviction hazard of replayed /bridge registrations is untouched).
-let _netIfaces = JSON.stringify(os.networkInterfaces());
-function netEvacTick(sampleIfaces) {
-  const now = sampleIfaces === undefined ? JSON.stringify(os.networkInterfaces()) : sampleIfaces;
-  if (now === _netIfaces) return false;
-  _netIfaces = now;
-  console.log(`[net-evac] local interfaces changed — destroying pooled sockets (was holding sockets on a departed address)`);
+// Watch only the IPv4 set: awdl0/utun churn and MAC-address reordering mutate the
+// full os.networkInterfaces() JSON constantly and would evacuate healthy pools
+// (measured 2026-09-14: a forced evacuation reset two IN-FLIGHT /v1/messages
+// responses). An evacuation is only warranted when a previously-sourced IPv4
+// address DISAPPEARS — the exact state that strands sockets. Additions (a new
+// VPN arriving, address added) never strand anything.
+function ipv4Set() {
+  const out = new Set();
+  for (const ifaces of Object.values(os.networkInterfaces()))
+    for (const i of ifaces || [])
+      if (i.family === 'IPv4' && i.internal === false) out.add(i.address);
+  return out;
+}
+let _netIPv4 = ipv4Set();
+function netEvacTick(sampleSet) {
+  const now = sampleSet === undefined ? ipv4Set() : sampleSet;
+  const lost = [..._netIPv4].some(a => !now.has(a));
+  _netIPv4 = now;
+  if (!lost) return false;
+  console.log(`[net-evac] an IPv4 source address disappeared — destroying pooled sockets (${[..._netIPv4].join(', ') || 'none left'})`);
   poolAgent.destroy();
   directAgent.destroy();
   return true;
@@ -65,14 +79,16 @@ setInterval(() => netEvacTick(), 5_000).unref();
 // LIVE-SOAK SEAM (2026-09-14): lets an operator prove the evacuation end-to-end
 // without waiting for a natural network move —
 //   touch /tmp/rc-gate-force-net-evac
-// The tick notices the file, injects a synthetic interface snapshot, and the
-// REAL destroy() path runs on the REAL agents. Self-clears after one fire.
+// Injects a snapshot missing one current address so the REAL "address
+// disappeared" predicate + destroy() path run on the REAL agents. Self-clears.
 const FORCE_EVAC_FLAG = '/tmp/rc-gate-force-net-evac';
 setInterval(() => {
   try {
     if (!existsSync(FORCE_EVAC_FLAG)) return;
     rmSync(FORCE_EVAC_FLAG);
-    netEvacTick(_netIfaces + '\n[force-evac-probe]');
+    const dropped = [..._netIPv4];
+    if (dropped.length) dropped.pop();
+    netEvacTick(new Set(dropped));
   } catch {}
 }, 5_000).unref();
 
