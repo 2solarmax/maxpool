@@ -66,10 +66,10 @@ function ipv4Set() {
 let _netIPv4 = ipv4Set();
 function netEvacTick(sampleSet) {
   const now = sampleSet === undefined ? ipv4Set() : sampleSet;
-  const lost = [..._netIPv4].some(a => !now.has(a));
+  const lost = [..._netIPv4].filter(a => !now.has(a));
   _netIPv4 = now;
-  if (!lost) return false;
-  console.log(`[net-evac] an IPv4 source address disappeared — destroying pooled sockets (${[..._netIPv4].join(', ') || 'none left'})`);
+  if (!lost.length) return false;
+  console.log(`[net-evac] IPv4 source address(es) ${lost.join(', ')} disappeared — destroying pooled sockets`);
   poolAgent.destroy();
   directAgent.destroy();
   return true;
