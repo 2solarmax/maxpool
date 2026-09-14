@@ -22,6 +22,7 @@
 // Authorization is stripped before forwarding so the pool's per-account tokens
 // are the only credentials upstream sees.
 import net from 'node:net';
+import os from 'node:os';
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
@@ -38,6 +39,26 @@ import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
 // each reconnect". Pooled agents reuse connections and bound the socket count.
 const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
 const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
+
+// NETWORK-CHANGE SOCKET EVACUATION (2026-09-14). When the machine changes network
+// (laptop moves: 192.168.10.x → 172.16.222.x → 172.16.0.x measured over two days),
+// every pooled/outbound socket stays bound to the OLD source address. The server
+// sends no keep-alive hint, so Node never expires them; they read ESTABLISHED but
+// are unsendable, and the next request the pool hands them fails with read
+// ETIMEDOUT — every RC session at once, then "Remote Control disconnected" after
+// the CLI burns its retry budget (root cause: bug-2026-09-14-rc-gate-socket-pool).
+// Fix: watch os.networkInterfaces(); on any change, destroy both agents (Node
+// transparently reconnects on the next request — no retry logic added, so the
+// 4090-eviction hazard of replayed /bridge registrations is untouched).
+let _netIfaces = JSON.stringify(os.networkInterfaces());
+setInterval(() => {
+  const now = JSON.stringify(os.networkInterfaces());
+  if (now === _netIfaces) return;
+  _netIfaces = now;
+  console.log(`[net-evac] local interfaces changed — destroying pooled sockets (was holding sockets on a departed address)`);
+  poolAgent.destroy();
+  directAgent.destroy();
+}, 5_000).unref();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GATE_PORT = Number(process.env.RC_GATE_PORT || 3457);
