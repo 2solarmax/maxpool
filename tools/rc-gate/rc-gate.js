@@ -188,6 +188,12 @@ const SECURE_CONTEXT = tls.createSecureContext({ cert, key });
 // 4090 — the same-day second regression). If a pooled socket went stale, the
 // request fails and the CLI retries it itself, which is correct: the CLI knows
 // which of its requests are idempotent; a transport shim does not.
+// In-flight INFERENCE responses only — the drain waits on these. Long-lived RC
+// streams (/worker/events/stream) never end by design, so counting raw agent
+// sockets made every drain burn its full timeout (measured 2026-09-14: exited
+// after 20.1s with 1 permanently-active stream socket).
+let inflightInference = 0;
+
 const mitmServer = http.createServer((creq, cres) => {
   const headers = { ...creq.headers };
   delete headers.authorization;           // pool accounts supply upstream auth
@@ -277,6 +283,10 @@ const mitmServer = http.createServer((creq, cres) => {
   // silent, so this stays readable at ~20 req/min.
   const t0 = Date.now();
   let bytes = 0, upstreamEnded = false, clientAborted = false;
+  inflightInference++;
+  let counted = true;
+  const settle = () => { if (counted) { counted = false; inflightInference--; } };
+  cres.on('close', settle);
   const up = http.request(opts, ures => {
     cres.writeHead(ures.statusCode, ures.headers);
     ures.on('data', c => { bytes += c.length; });
@@ -409,10 +419,8 @@ function drainAndExit(signal) {
   console.log(`[drain] ${signal} received — waiting up to ${DRAIN_MS / 1000}s for in-flight responses`);
   const t0 = Date.now();
   (function poll() {
-    const active = Object.values(poolAgent.sockets || {}).flat().length
-      + Object.values(directAgent.sockets || {}).flat().length;
-    if (active === 0 || Date.now() - t0 >= DRAIN_MS) {
-      console.log(`[drain] exiting after ${((Date.now() - t0) / 1000).toFixed(1)}s (active upstream sockets: ${active})`);
+    if (inflightInference === 0 || Date.now() - t0 >= DRAIN_MS) {
+      console.log(`[drain] exiting after ${((Date.now() - t0) / 1000).toFixed(1)}s (in-flight inference responses: ${inflightInference})`);
       process.exit(0);
     }
     setTimeout(poll, 250);
