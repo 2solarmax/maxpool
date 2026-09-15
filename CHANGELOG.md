@@ -5,6 +5,24 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.8] - 2026-09-15
+
+### Added
+
+- Operator-triggered net-evac probe seam for live soak
+- Reroute Anthropic safeguard refusals to a provider account
+
+### Changed
+
+- Log the LOST addresses in net-evac
+
+### Fixed
+
+- Evacuate pooled sockets when local interfaces change
+- Evacuate only when an IPv4 source address DISAPPEARS
+- Graceful drain on SIGTERM/SIGINT — stop cutting in-flight responses
+- Drain waits on in-flight INFERENCE responses, not all sockets
+
 ## [1.19.7] - 2026-09-13
 
 ### Fixed
