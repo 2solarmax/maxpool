@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
-import { readFileSync, mkdtempSync } from 'node:fs';
+import { readFileSync, mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +21,17 @@ import * as nodeChildProcess from 'node:child_process';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GATE_DIR = join(__dirname, '..', 'tools', 'rc-gate');
 const CA = join(process.env.HOME, 'Library', 'Application Support', 'mkcert', 'rootCA.pem');
+
+// CI has neither the locally-minted MITM fixture (gitignored — it is a private
+// key) nor the developer's mkcert root. Before this guard those tests ENOENT'd
+// and — worse — a spawned-but-unstarted gate leaked its child process, holding
+// `node --test`'s event loop open until the 6h runner cap (measured 2026-09-15:
+// every CI run since the suite landed hung, cancelled at 6h0m). Skipping is the
+// honest state: these pins run wherever the fixtures exist (dev machines); CI
+// covers everything else.
+const MITM_KEY = join(GATE_DIR, 'anthropic-mitm.key');
+const FIXTURES_PRESENT = existsSync(MITM_KEY) && existsSync(CA);
+const gateDescribe = FIXTURES_PRESENT ? test : test.skip;
 
 // ── fake upstreams ────────────────────────────────────────────────────────────
 function fakeAnthropic() {
@@ -113,7 +124,13 @@ async function startGate(env) {
   gate.stderr.on('data', d => { log += d.toString(); });
   gate.getLog = () => log;
   await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('gate did not start: ' + log)), 10_000);
+    const t = setTimeout(() => {
+      // Kill the child on the failure path — otherwise a spawned-but-unstarted
+      // gate outlives the test, holds node --test's loop open, and the runner
+      // dies at its 6h cap (the 2026-09-15 CI hang).
+      gate.kill();
+      reject(new Error('gate did not start: ' + log));
+    }, 10_000);
     const check = () => {
       const m = /listening on [^:]+:(\d+)/.exec(log);
       if (m) { gate.port = Number(m[1]); clearTimeout(t); resolve(); }
@@ -171,7 +188,7 @@ function httpOverTLS(t, method, path, headers, body) {
 }
 
 // ── the suite ─────────────────────────────────────────────────────────────────
-test('rc-gate: create POST arrives upstream COMPLETE (stream-abort regression)', async () => {
+gateDescribe('rc-gate: create POST arrives upstream COMPLETE (stream-abort regression)', async () => {
   const up = fakeAnthropic();
   const ups = asTLS(up.server);
   await new Promise(r => ups.listen(0, r));
@@ -196,7 +213,7 @@ test('rc-gate: create POST arrives upstream COMPLETE (stream-abort regression)',
   }
 });
 
-test('rc-gate: /v1/sessions/<id> routes DIRECT (identity), not through the pool', async () => {
+gateDescribe('rc-gate: /v1/sessions/<id> routes DIRECT (identity), not through the pool', async () => {
   // CLI 2.1.269 emits ~21 v1-compat session call sites; routing them through the pool
   // rotated identity-bound CRUD across accounts and 404'd on every non-owner
   // (measured 2026-09-12). Pin the classification both ways.
@@ -235,7 +252,7 @@ test('rc-gate: /v1/sessions/<id> routes DIRECT (identity), not through the pool'
   }
 });
 
-test('rc-gate: /v1/messages routes to maxpool with profile header', async () => {
+gateDescribe('rc-gate: /v1/messages routes to maxpool with profile header', async () => {
   const mp = fakeMaxpool();
   await new Promise(r => mp.server.listen(0, r));
   const gate = await startGate({
@@ -256,7 +273,7 @@ test('rc-gate: /v1/messages routes to maxpool with profile header', async () => 
   }
 });
 
-test('rc-gate: a failed /bridge POST is NOT replayed (4090 regression)', async () => {
+gateDescribe('rc-gate: a failed /bridge POST is NOT replayed (4090 regression)', async () => {
   let bridgeCalls = 0;
   const up = http.createServer((req, res) => {
     const chunks = [];
@@ -291,7 +308,7 @@ test('rc-gate: a failed /bridge POST is NOT replayed (4090 regression)', async (
   }
 });
 
-test('rc-gate: an idle SSE stream survives (behavior pin; the 09-05 agent-timeout kill is NOT separately mutation-pinned — Node agent timeout only reaps IDLE sockets, so the historical mechanism differs)', async () => {
+gateDescribe('rc-gate: an idle SSE stream survives (behavior pin; the 09-05 agent-timeout kill is NOT separately mutation-pinned — Node agent timeout only reaps IDLE sockets, so the historical mechanism differs)', async () => {
   const up = fakeAnthropic();
   const ups4 = asTLS(up.server);
   await new Promise(r => ups4.listen(0, r));
@@ -319,7 +336,7 @@ test('rc-gate: an idle SSE stream survives (behavior pin; the 09-05 agent-timeou
   }
 });
 
-test('rc-gate: fds released after tunnel close (behavior pin; 09-04 leak mechanism not mutation-pinned)', async () => {
+gateDescribe('rc-gate: fds released after tunnel close (behavior pin; 09-04 leak mechanism not mutation-pinned)', async () => {
   const up = fakeAnthropic();
   const ups5 = asTLS(up.server);
   await new Promise(r => ups5.listen(0, r));
