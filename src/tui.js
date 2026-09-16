@@ -1081,7 +1081,17 @@ export class TUI {
     const sched = { ...(this.config.scheduler || {}) };
     sched.weeklyAwareScoring = next;
     this.config.scheduler = sched;
-    await this.saveConfig(this.config);
+    try {
+      await this.saveConfig(this.config);
+    } catch (e) {
+      // Roll back both the live flag and the mirror so an unsaved toggle can't
+      // silently revert on the next reload — same pattern as the sibling
+      // _cycleProviderClaudeFallback (tui.js).
+      this.am.scheduler.weeklyAwareScoring = !next;
+      this.config.scheduler = sched.weeklyAwareScoring === next ? { ...sched, weeklyAwareScoring: !next } : sched;
+      this._addLog(`Could not save: ${e.message}`);
+      return;
+    }
     this._addLog(next
       ? 'Weekly-aware routing: ON — accounts near their weekly limit rank last, all day'
       : 'Weekly-aware routing: OFF — score sees only the 5h session window again');

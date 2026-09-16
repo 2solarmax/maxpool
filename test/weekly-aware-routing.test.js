@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 
 const oauth = (name, quota) => ({
   name, type: 'oauth', accessToken: 't', refreshToken: 'r',
@@ -88,7 +88,8 @@ test('weekly-aware OFF: the MARGINAL band (60% weekly, below the 85% reserve lad
 
 // --- feature 2: config — depreference off, cap intact -------------------------
 
-test('config: live teamclaude.json has zai peakDepreference off and peakCap 0.5', () => {
+test('config: live teamclaude.json has zai peakDepreference off and peakCap 0.5', { skip: !existsSync(
+  process.env.HOME + '/.config/teamclaude.json') }, () => {
   const cfg = JSON.parse(readFileSync(
     process.env.HOME + '/.config/teamclaude.json', 'utf8'));
   const zai = cfg.scheduler?.providers?.zai || {};

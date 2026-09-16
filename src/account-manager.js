@@ -124,8 +124,12 @@ const DEFAULT_SCHEDULER = {
   // CONCURRENCY HEADROOM for the request (an at-cap route cannot serve without
   // deepening the congestion). Congestion-based, not presence-based: an idle provider
   // or reserve account keeps serving and no unlock fires — critical becomes relief
-  // exactly when the fleet is out of headroom, and never preempts an idle route
-  // (cost is also ABOVE reserve's attainable max ~19, pinning the ordering).
+  // exactly when the fleet is out of headroom, and never preempts an idle route.
+  // Ordering vs reserve: reserve's attainable max is floor(5) + band(≤8) + weekly
+  // scarcity(≤6) ≈ 19, PLUS utilization's weekly term (≤3, 2026-09-16) ⇒ up to ~22 —
+  // this 21 sits above a lightly-priced reserve but can sit BELOW a maxed one. The
+  // X3 pin holds for the idle-reserve case (0.90 ⇒ ~10-19); if that regresses, raise
+  // this to 24 (see critical-unlock.test.js X3).
   // -1 disables; 0 = unlock only when every route is at cap.
   criticalPressureUnlockRoutes: 0,
   criticalPressureCost: 21,
