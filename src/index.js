@@ -1137,7 +1137,8 @@ async function serverWorkerCommand() {
         // policy cycled with the TUI 'f' key). Without this, the toggle takes effect
         // in memory but silently reverts on the next config write / restart. Merge
         // onto the existing disk scheduler block so other scheduler keys survive.
-        if (config.scheduler?.crossProviderFallbackPolicy || config.scheduler?.providers) {
+        if (config.scheduler?.crossProviderFallbackPolicy || config.scheduler?.providers
+          || config.scheduler?.weeklyAwareScoring !== undefined) {
           diskConfig.scheduler = {
             ...diskConfig.scheduler,
             ...(config.scheduler.crossProviderFallbackPolicy
@@ -1145,6 +1146,11 @@ async function serverWorkerCommand() {
             // Per-provider Claude→provider settings (TUI routing g / k). Must be listed
             // here explicitly or the toggle takes effect in memory and silently reverts.
             ...(config.scheduler.providers ? { providers: config.scheduler.providers } : {}),
+            // Weekly-aware scoring (TUI routing w). Red-team 2026-09-16: omitting it
+            // made the OFF direction memory-only — it silently reverted to the ON
+            // default on the next restart.
+            ...(config.scheduler.weeklyAwareScoring !== undefined
+              ? { weeklyAwareScoring: config.scheduler.weeklyAwareScoring } : {}),
           };
         }
         // Persist live-toggled automatic-update flags (the TUI 'u' Updates menu). Same

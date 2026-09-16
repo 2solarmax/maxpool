@@ -161,3 +161,19 @@ test('tui: routing footer shows score:weekly, and the w key flips + persists it'
   f = strip(tui._renderFooter());
   assert.match(f, /score:weekly/, 'round-trips back to weekly');
 });
+
+
+// --- persistence: the production saveConfig MERGE carries the key ----------------
+// The TUI test above stubs saveConfig — exactly what masked the v1.20.0 bug: production
+// saveConfig (index.js) merges a WHITELIST of scheduler keys onto disk, and
+// weeklyAwareScoring was not on it, so OFF was memory-only and silently reverted to ON
+// on restart. The merge is an inline closure in index.js (importing it would boot the
+// server), so the pin is a source scan of the merge block: a mutant deleting the line
+// kills this test.
+test('persistence: index.js saveConfig merge carries weeklyAwareScoring', () => {
+  const idx = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  const m = idx.match(/diskConfig\.scheduler = \{[\s\S]*?\n( {10})\};/);
+  assert.ok(m, 'merge block found in index.js');
+  assert.ok(m[0].includes('weeklyAwareScoring: config.scheduler.weeklyAwareScoring'),
+    'the merge whitelist must persist weeklyAwareScoring (v1.20.0 red-team finding)');
+});
