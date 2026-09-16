@@ -977,6 +977,11 @@ export class TUI {
       // mode — under balance/prefer-* the mode itself controls eligibility. Still
       // safe to set (it'll apply if you switch back to sticky).
       this._cycleProviderClaudeFallback(k === 'g' ? 'zai' : 'kimi');
+    } else if (k === 'w' || k === 'W') {
+      // WEEKLY-AWARE SCORING (2026-09-16): fold weekly utilization into the routing
+      // score, not just the 5h session. Without it, an account at 89% weekly with a
+      // fresh session window scores as cheap and keeps winning all day.
+      this._toggleWeeklyAware();
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
@@ -1064,6 +1069,22 @@ export class TUI {
     this._addLog(next === 1 ? 'Peak cap: off (no weekly limit during peak)'
       : next === 0 ? 'Peak cap: never use GLM during peak hours'
         : `Peak cap: bench a GLM account once it passes ${Math.round(next * 100)}% of its weekly quota`);
+  }
+
+  /** Toggle weekly-aware routing for the whole fleet. One scheduler flag — when OFF the
+   *  score sees only the 5h session (the pre-2026-09-16 behavior); when ON the weekly
+   *  number is folded in, so a nearly-exhausted account loses to a fresh one at ALL
+   *  hours, not just after its session window resets. */
+  async _toggleWeeklyAware() {
+    const next = this.am.scheduler.weeklyAwareScoring === false;
+    this.am.scheduler.weeklyAwareScoring = next;
+    const sched = { ...(this.config.scheduler || {}) };
+    sched.weeklyAwareScoring = next;
+    this.config.scheduler = sched;
+    await this.saveConfig(this.config);
+    this._addLog(next
+      ? 'Weekly-aware routing: ON — accounts near their weekly limit rank last, all day'
+      : 'Weekly-aware routing: OFF — score sees only the 5h session window again');
   }
 
   async _cycleRoutingMode() {
@@ -2369,7 +2390,8 @@ export class TUI {
           const now = st?.inPeak ? red(' NOW') : '';
           const dep = ps.depreference ? yellow('GLM last') : cyan('normal');
           const cap = ps.cap >= 1 ? 'off' : ps.cap === 0 ? 'never' : `${Math.round(ps.cap * 100)}%`;
-          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}cap ${cyan(cap)}`;
+          const wk = this.am.scheduler.weeklyAwareScoring === false ? yellow('5h-only') : cyan('weekly');
+          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}cap ${cyan(cap)} ${bold(' w ')}score:${wk}`;
         }
         return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('p')} Preference  ${bold('Esc')} Back`;
       }

@@ -147,6 +147,13 @@ const DEFAULT_SCHEDULER = {
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
   paceCostWeight: 1.5,            // soft de-preference of accounts burning ahead of pace (was the ×6 term)
   utilizationWeight: 3,           // RAW utilization cost — drives load balancing in the mid-range
+  // WEEKLY-AWARE SCORING (2026-09-16): when true, _rawUtilization also folds in the
+  // WEEKLY utilization (unified7d / providerWk), not just the 5h session. Before this,
+  // a Claude account at 89% weekly with a freshly-reset 5h window scored as CHEAP —
+  // weekly-burning accounts kept winning the lease all day (backtest: 62%→35% mean
+  // weekly burn once weekly-aware). Boolean; default ON was chosen because the
+  // pre-flag behavior is the bug this fixes.
+  weeklyAwareScoring: true,
   scarcityWeight: 6,              // legacy; superseded by paceCostWeight (kept so old configs don't error)
   // Reserve-account OVERFLOW model. A weekly-RESERVE account (util 0.85-0.95) used to
   // sit idle behind a healthy-only first pass; now it's eligible in the first pass but
@@ -2692,7 +2699,7 @@ export class AccountManager {
    *  _accountScarcity but WITHOUT the elapsed-fraction discount. This is the signal
    *  the load balancer needs: an account at 80% is more expensive than one at 10%,
    *  full stop. */
-  _rawUtilization(account) {
+  _rawUtilization(account, now = Date.now()) {
     const q = account?.quota;
     if (!q) return 0;
     // SESSION windows use raw utilization — headroom is consumed immediately and an
@@ -2707,6 +2714,24 @@ export class AccountManager {
     // the pace cost was too weak to express.
     if (q.tokensLimit != null && q.tokensLimit > 0 && q.tokensRemaining != null) {
       util = Math.max(util, 1 - q.tokensRemaining / q.tokensLimit);
+    }
+    // WEEKLY-AWARE (2026-09-16): fold the WEEKLY number in too, behind its own
+    // flag — via _windowScarcity (reset-aware), NEVER raw. v1 of this block used
+    // raw max(), which fixed the 89%-weekly-wins-all-day bug but broke the
+    // near-reset contracts that predate it: the use-it-or-lose-it pin, the
+    // preReset drain (X2/X5), and S10's flag-off parity. Pace-adjusted, a
+    // 60%-weekly account mid-window adds (0.60 − elapsedFrac) here at weight 3
+    // ON TOP of the paceCost's weight-1.5 copy — doubling the weekly steering
+    // signal (the actual fix) while capacity dying at reset stays free (the
+    // invariant the older tests pin). Unknown/absent reset → face value, same as
+    // _accountScarcity. Turn the flag off to restore session-only exactly.
+    if (this.scheduler.weeklyAwareScoring !== false) {
+      if (q.unified7d != null) {
+        util = Math.max(util, this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now));
+      }
+      if (q.providerWk != null) {
+        util = Math.max(util, this._windowScarcity(q.providerWk, q.providerWkReset, WEEK_MS, now));
+      }
     }
     return util;
   }
