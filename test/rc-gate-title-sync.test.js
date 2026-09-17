@@ -19,6 +19,12 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GATE_DIR = join(__dirname, '..', 'tools', 'rc-gate');
 
+// Same CI guard as rc-gate.test.js: the MITM pair is a gitignored developer
+// fixture. Without this, every test ENOENT'd on GitHub runners (measured
+// 2026-09-17, v1.20.3 CI red).
+const FIXTURES_PRESENT = existsSync(join(GATE_DIR, 'anthropic-mitm.key'));
+const gateDescribe = FIXTURES_PRESENT ? test : test.skip;
+
 // A TLS upstream standing in for api.anthropic.com, using the gate's own mkcert pair.
 function fakeUpstream(handler) {
   const server = https.createServer({
@@ -58,7 +64,7 @@ async function runOneCycle(mod, port, stateFile, intervalMs = 25) {
   stop();
 }
 
-test('pushes a user-renamed session, once, and records it', async () => {
+gateDescribe('pushes a user-renamed session, once, and records it', async () => {
   const puts = [];
   const server = fakeUpstream((req, res, body) => {
     puts.push({ method: req.method, url: req.url, body, auth: req.headers.authorization, version: req.headers['anthropic-version'] });
@@ -85,7 +91,7 @@ test('pushes a user-renamed session, once, and records it', async () => {
   server.closeAllConnections?.(); server.close();
 });
 
-test('a later rename IS pushed', async () => {
+gateDescribe('a later rename IS pushed', async () => {
   const puts = [];
   const server = fakeUpstream((req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
   const port = await listen(server);
@@ -102,7 +108,7 @@ test('a later rename IS pushed', async () => {
   server.closeAllConnections?.(); server.close();
 });
 
-test('never pushes derived names, unnamed sessions, or sessions with no bridge id', async () => {
+gateDescribe('never pushes derived names, unnamed sessions, or sessions with no bridge id', async () => {
   const puts = [];
   const server = fakeUpstream((req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
   const port = await listen(server);
@@ -120,7 +126,7 @@ test('never pushes derived names, unnamed sessions, or sessions with no bridge i
   server.closeAllConnections?.(); server.close();
 });
 
-test('does nothing until an authenticated request has been observed', async () => {
+gateDescribe('does nothing until an authenticated request has been observed', async () => {
   const puts = [];
   const server = fakeUpstream((req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
   const port = await listen(server);
@@ -137,7 +143,7 @@ test('does nothing until an authenticated request has been observed', async () =
   server.closeAllConnections?.(); server.close();
 });
 
-test('401 disarms the borrowed credential instead of retrying with it', async () => {
+gateDescribe('401 disarms the borrowed credential instead of retrying with it', async () => {
   let calls = 0;
   const server = fakeUpstream((req, res) => { calls++; res.writeHead(401); res.end('{"error":"invalid"}'); });
   const port = await listen(server);
@@ -153,7 +159,7 @@ test('401 disarms the borrowed credential instead of retrying with it', async ()
   server.closeAllConnections?.(); server.close();
 });
 
-test('gives up on a session the server keeps rejecting', async () => {
+gateDescribe('gives up on a session the server keeps rejecting', async () => {
   let calls = 0;
   const server = fakeUpstream((req, res) => { calls++; res.writeHead(404); res.end('{"error":"gone"}'); });
   const port = await listen(server);
@@ -168,7 +174,7 @@ test('gives up on a session the server keeps rejecting', async () => {
   server.closeAllConnections?.(); server.close();
 });
 
-test('a rename after a failure streak gets a fresh attempt', async () => {
+gateDescribe('a rename after a failure streak gets a fresh attempt', async () => {
   // The failure budget is per-TITLE. Keyed per-session it would mute a session's
   // name forever after one bad stretch, which is the opposite of the point.
   let calls = 0, fail = true;
