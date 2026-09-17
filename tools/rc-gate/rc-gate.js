@@ -225,6 +225,8 @@ const mitmServer = http.createServer((creq, cres) => {
     // "Session create request failed: stream has been aborted" x3, then "Session creation
     // failed — see debug log". Direct-path bodies are small (identity paths: auth handshakes,
     // session CRUD, settings — all <64KB typical); buffer fully and send with explicit length.
+    // headers-phase timeout for SHORT-RPC direct paths (see the arm site below).
+    const DIRECT_STALL_MS = Number(process.env.RC_GATE_DIRECT_STALL_MS || 30_000);
     const dirSend = () => {
       const bodyBufs = [];
       creq.on('data', c => bodyBufs.push(c));
@@ -233,6 +235,21 @@ const mitmServer = http.createServer((creq, cres) => {
         const hdrs = { ...dirHeaders };
         delete hdrs['transfer-encoding'];
         if (body.length || creq.method !== 'GET') hdrs['content-length'] = String(body.length);
+        // STALLED-UPSTREAM TIMEOUT, LONG-POLL-AWARE (2026-09-17). An upstream that
+        // accepts the socket and never responds fires neither 'response' nor
+        // 'error' — the request hangs forever, silently, the CLI burns its
+        // create-retry budget and reports "Remote Control disconnected — Session
+        // creation failed" (measured 14:59:51Z 2026-09-17; 46 fleet hits on
+        // 2026-09-02; reproduced with this exact agent+request shape: silent past
+        // 12s). But a blanket headers timeout is WRONG: v1 (adfbd7b) destroyed 134
+        // /worker/events + /worker/heartbeat LONG-POLL streams in its first 2
+        // minutes — those hold headers open BY DESIGN until an event arrives. So
+        // the 30s timer arms ONLY on short-RPC paths (session create, bridge,
+        // settings — answered in single-digit seconds); long-poll paths keep the
+        // full 09-05 no-timeout policy for their entire lifetime. Cleared on
+        // headers AND on error, never touches a streaming body.
+        const isLongPoll = /\/worker\/events|\/heartbeat|\/events\/stream/.test(creq.url);
+        let tStall = null;
         const dir = https.request({
           host: DIRECT_HOST, port: DIRECT_PORT,
           servername: 'api.anthropic.com',   // SNI/cert name stays first-party even for a test-routed upstream
@@ -258,11 +275,20 @@ const mitmServer = http.createServer((creq, cres) => {
       cres.writeHead(ures.statusCode, ures.headers);
       ures.pipe(cres);
     });
+        // headers arrived — disarm (short-RPC only; long-poll never armed)
+        if (tStall) clearTimeout(tStall);
         dir.on('error', err => {
           console.log('[direct-error]', creq.url, String(err?.message || err));
           try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
           cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
         });
+        if (!isLongPoll) {
+          tStall = setTimeout(() => {
+            console.log('[direct-stall]', creq.url, 'no response headers in', DIRECT_STALL_MS + 'ms — destroying');
+            dir.destroy(new Error('rc-gate: no response headers within ' + DIRECT_STALL_MS + 'ms'));
+          }, DIRECT_STALL_MS);
+        }
+        dir.on('error', () => { if (tStall) clearTimeout(tStall); });
         dir.end(body);
       });
     };

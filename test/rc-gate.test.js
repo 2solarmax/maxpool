@@ -360,3 +360,67 @@ gateDescribe('rc-gate: fds released after tunnel close (behavior pin; 09-04 leak
     gate.kill(); await new Promise(r => ups5.close(r));
   }
 });
+
+
+// ── stalled-upstream timeout (2026-09-17) ─────────────────────────────────────
+// v1 of this fix (adfbd7b) destroyed 134 long-poll streams in 2 live minutes.
+// These pin the v2 semantics: short-RPC create gets a 502 after the stall window;
+// long-poll paths NEVER get a headers timeout.
+gateDescribe('rc-gate: a stalled upstream on session CREATE errors out (stall timeout)', { timeout: 20_000 }, async () => {
+  // Upstream that accepts TLS and never responds.
+  const stall = tls.createServer({ key: readFileSync(join(GATE_DIR, 'anthropic-mitm.key')), cert: readFileSync(join(GATE_DIR, 'anthropic-mitm.crt')) }, () => {});
+  await new Promise(r => stall.listen(0, '127.0.0.1', r));
+  const { port: upPort } = stall.address();
+  try {
+    const gate = await startGate({ RC_GATE_PORT: '0', RC_GATE_DIRECT_HOST: '127.0.0.1', RC_GATE_DIRECT_PORT: String(upPort), RC_GATE_DIRECT_STALL_MS: '1500' });
+    const { tls: t, sock } = await mitmConnect(gate.port);
+    const status = await new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error('no response — stall timeout failed to fire')), 12_000);
+      const settle = v => { clearTimeout(to); resolve(v); };
+      t.on('error', () => settle('tls-error'));
+      t.on('data', d => settle('data:' + d.toString().split('\r\n')[0]));
+      t.on('close', () => settle('closed'));
+      sock.on('close', () => settle('closed'));
+      t.write('POST /v1/code/sessions HTTP/1.1\r\nhost: api.anthropic.com\r\ncontent-length: 2\r\n\r\n{}');
+    });
+    // The gate must DESTROY the stalled request (client sees the tunnel close or a
+    // 502), never hang. The pinned property is "settles at all" — the bug was
+    // silence forever.
+    assert.ok(typeof status === 'string' && status.length > 0, 'request settled: ' + status);
+    gate.kill();
+  } finally {
+    stall.close();
+  }
+});
+
+gateDescribe('rc-gate: a long-poll path with slow headers is NEVER stall-destroyed', { timeout: 20_000 }, async () => {
+  // Upstream that answers /worker/heartbeat only after 4s — longer than the 1.5s
+  // stall window. v1 would have destroyed it; v2 must not.
+  const up = tls.createServer({
+    key: readFileSync(join(GATE_DIR, 'anthropic-mitm.key')),
+    cert: readFileSync(join(GATE_DIR, 'anthropic-mitm.crt')),
+  }, sock => {
+    sock.on('data', () => {
+      setTimeout(() => {
+        sock.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}');
+      }, 4000);
+    });
+  });
+  await new Promise(r => up.listen(0, '127.0.0.1', r));
+  const { port: upPort } = up.address();
+  try {
+    const gate = await startGate({ RC_GATE_PORT: '0', RC_GATE_DIRECT_HOST: '127.0.0.1', RC_GATE_DIRECT_PORT: String(upPort), RC_GATE_DIRECT_STALL_MS: '1500' });
+    const { tls: t } = await mitmConnect(gate.port);
+    const got = await new Promise((resolve, reject) => {
+      let buf = '';
+      const to = setTimeout(() => reject(new Error('no response within 10s — long-poll was stall-destroyed or upstream broken')), 10_000);
+      t.on('data', d => { buf += d.toString(); if (buf.includes('200 OK')) { clearTimeout(to); resolve('200'); } });
+      t.on('close', () => { clearTimeout(to); reject(new Error('tunnel closed before headers — stall timeout destroyed a long-poll')); });
+      t.write('POST /v1/code/sessions/cse_x/worker/heartbeat HTTP/1.1\r\nhost: api.anthropic.com\r\ncontent-length: 2\r\n\r\n{}');
+    });
+    assert.equal(got, '200', 'slow-headers heartbeat survives the stall window');
+    gate.kill();
+  } finally {
+    up.close();
+  }
+});
