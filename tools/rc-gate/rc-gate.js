@@ -225,6 +225,10 @@ const mitmServer = http.createServer((creq, cres) => {
     // "Session create request failed: stream has been aborted" x3, then "Session creation
     // failed — see debug log". Direct-path bodies are small (identity paths: auth handshakes,
     // session CRUD, settings — all <64KB typical); buffer fully and send with explicit length.
+    // per-request headers-phase timeout, in ms. Generous: p99 direct-path
+    // (session CRUD/bridge POSTs) lands well under 10s; 30s catches stalls without
+    // racing slow-but-healthy upstreams.
+    const DIRECT_STALL_MS = Number(process.env.RC_GATE_DIRECT_STALL_MS || 30_000);
     const dirSend = () => {
       const bodyBufs = [];
       creq.on('data', c => bodyBufs.push(c));
@@ -233,6 +237,21 @@ const mitmServer = http.createServer((creq, cres) => {
         const hdrs = { ...dirHeaders };
         delete hdrs['transfer-encoding'];
         if (body.length || creq.method !== 'GET') hdrs['content-length'] = String(body.length);
+        // STALLED-UPSTREAM TIMEOUT (2026-09-17). Declared BEFORE the request so the
+        // response callback (which clears it) can reference it — a const declared
+        // after the callback is a TDZ ReferenceError on every success (caught by the
+        // rc-gate suite going 6/6 → 1/6 on exactly that mistake).
+        // The 09-05 fix removed ALL timeouts (a 60s agent timeout killed long-lived
+        // event streams mid-response), leaving the CONNECT+HEADERS phase unguarded:
+        // an upstream that accepts the socket and never responds fires neither
+        // 'response' nor 'error', the request hangs forever, the CLI burns its
+        // create-retry budget and reports "Remote Control disconnected — Session
+        // creation failed" (measured 14:59:51Z 2026-09-17; fleet-wide 46 hits on
+        // 2026-09-02; reproduced with this exact agent+request shape — silent past
+        // 12s). The timer guards connect+headers ONLY; once cleared, the request is
+        // governed by the same no-timeout policy the 09-05 fix established (an SSE
+        // /worker/events/stream response idles legally for minutes).
+        let tStall = null;
         const dir = https.request({
           host: DIRECT_HOST, port: DIRECT_PORT,
           servername: 'api.anthropic.com',   // SNI/cert name stays first-party even for a test-routed upstream
@@ -258,11 +277,21 @@ const mitmServer = http.createServer((creq, cres) => {
       cres.writeHead(ures.statusCode, ures.headers);
       ures.pipe(cres);
     });
+        // HEADERS ARRIVED — clear the stall timer BEFORE any body streams. The timer
+        // guards connect+headers only; from here the request is governed by the same
+        // no-timeout policy the 09-05 fix established (long-lived /worker/events/stream
+        // responses idle legally for minutes).
+        clearTimeout(tStall);
         dir.on('error', err => {
           console.log('[direct-error]', creq.url, String(err?.message || err));
           try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
           cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
         });
+        tStall = setTimeout(() => {
+          console.log('[direct-stall]', creq.url, 'no response headers in', DIRECT_STALL_MS + 'ms — destroying');
+          dir.destroy(new Error('rc-gate: no response headers within ' + DIRECT_STALL_MS + 'ms'));
+        }, DIRECT_STALL_MS);
+        dir.on('error', () => clearTimeout(tStall));
         dir.end(body);
       });
     };
