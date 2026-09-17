@@ -248,7 +248,11 @@ const mitmServer = http.createServer((creq, cres) => {
         // settings — answered in single-digit seconds); long-poll paths keep the
         // full 09-05 no-timeout policy for their entire lifetime. Cleared on
         // headers AND on error, never touches a streaming body.
-        const isLongPoll = /\/worker\/events|\/heartbeat|\/events\/stream/.test(creq.url);
+        // presence: held-open beacon (killed 7/7 in the v2 soak — it NEVER answers
+        // within 30s by design). /worker bare POST: register/status — the soak showed
+        // one session's repeats (4x) with the CLI retrying; treating it as RPC is
+        // fine (the CLI re-registers), but see gate.log 16:06-16:13 before touching.
+        const isLongPoll = /\/worker\/events|\/heartbeat|\/events\/stream|\/client\/presence/.test(creq.url);
         let tStall = null;
         const dir = https.request({
           host: DIRECT_HOST, port: DIRECT_PORT,
