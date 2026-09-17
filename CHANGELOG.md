@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.20.3] - 2026-09-17
+
+### Fixed
+
+- Rc-gate suite skips without local fixtures; startGate kills on timeout
+
 ## [1.20.2] - 2026-09-16
 
 ### Fixed
