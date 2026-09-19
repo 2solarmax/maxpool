@@ -289,6 +289,16 @@ const mitmServer = http.createServer((creq, cres) => {
         if (!isLongPoll) {
           tStall = setTimeout(() => {
             console.log('[direct-stall]', creq.url, 'no response headers in', DIRECT_STALL_MS + 'ms — destroying');
+            // SESSION-CREATE specifically: when the upstream stalls a create, the CLI's
+            // ONLY recovery is its ~3 retries on a FRESH connection. Destroying just this
+            // request leaves the pooled socket half-open server-side, and measured
+            // 2026-09-18/19 all 3 retries sometimes stall the same way — the session dies
+            // ("Remote Control disconnected — Session creation failed", 11:29Z 2026-09-19).
+            // Evicting the agent's free sockets on a create-stall guarantees each retry
+            // lands on a new TCP connection. Cheap: creates are rare.
+            if (creq.url === '/v1/code/sessions' && creq.method === 'POST') {
+              for (const sock of Object.values(directAgent.freeSockets).flat()) sock.destroy();
+            }
             dir.destroy(new Error('rc-gate: no response headers within ' + DIRECT_STALL_MS + 'ms'));
           }, DIRECT_STALL_MS);
         }
