@@ -187,6 +187,11 @@ export class Prober {
    *  than silently swallowed — a swallowed failing probe is what let a stale
    *  weekly look fresh. Never throws. */
   async probeOne(account) {
+    // Subscription latched org-disabled (account-manager recordProbeError): the quota
+    // endpoint 403s before answering anything, so probing is pure waste until the org
+    // accepts OAuth again. Skipping also stops the every-60s hammer that ran 700+ times
+    // on 2solarmax@ between 2026-09-18 and 09-20.
+    if (account.subscriptionGone) return { ok: false, status: 403 };
     try {
       await this.am.ensureTokenFresh(account.index);
       let usage = await this._withTimeout(this.probeFn(account.credential));

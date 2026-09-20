@@ -2022,6 +2022,9 @@ export class TUI {
     // broken account. Reported 2026-08-10 with all 8 disabled accounts sitting on dead
     // credentials (HTTP 401) and no way to see it.
     if (a.refreshDead) effectiveStatus = a.enabled === false ? 'disabled-reauth' : 'reauth';
+    // Subscription gone (org-disabled 403): a DISTINCT state from reauth — re-logging in
+    // will NOT fix it until the subscription is re-purchased. Says the actionable thing.
+    else if (a.subscriptionGone) effectiveStatus = 'no sub';
     switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'reauth':    status = yellow('reauth'); break;
@@ -2033,6 +2036,7 @@ export class TUI {
       // Disabled AND needs re-login — both facts matter: it won't serve because you
       // switched it off, and it CAN'T serve until you log in again.
       case 'disabled-reauth': status = red('✕ reauth'); break;
+      case 'no sub': status = red('✕ no sub'); break;
       case 'throttled': {
         // A transient auto-recovering cooldown — show the remaining time (from
         // rateLimitedUntil) so it reads as "recovering in Ns", not stuck.
@@ -2128,7 +2132,7 @@ export class TUI {
     // "stale·probe 401" here is just the perpetual echo of the 401 that killed it.
     // Only annotate probe-staleness for LIVE accounts, where a failing probe
     // (e.g. a 429) is a real, actionable signal.
-    if (a?.refreshDead || a?.enabled === false) return '';
+    if (a?.refreshDead || a?.subscriptionGone || a?.enabled === false) return '';
     if (!this.am._quotaProbeStale?.(a)) return '';   // probe fresh (or off) → nothing to flag; interval>0 after this
     // The background probe IS stale — but only flag it if something DISPLAYED is
     // actually stale. An OAuth account's Ses/Wk bars come from unified5h/7d, which

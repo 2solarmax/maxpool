@@ -1054,6 +1054,16 @@ async function forwardRequest(
           try { return JSON.parse(errorBody)?.error?.message || errorBody; } catch { return errorBody; }
         })();
         console.log(`[Maxpool] ${upstreamRes.status} from "${account.name}": ${String(why).slice(0, 300)}`);
+        // ORG-DISABLED SUBSCRIPTION (2026-09-20): "OAuth authentication is currently not
+        // allowed for this organization" means the plan is GONE server-side (canceled
+        // subscription lapsed). Fail-over handles this request, but without a latch every
+        // later request would pick the account again. recordProbeError latches
+        // subscriptionGone on 3 strikes — the request path strikes once per hit, so this
+        // converges after three routed attempts and benches it exactly like the probe path.
+        if (account.type !== 'provider' && upstreamRes.status === 403
+          && /not allowed for this organization|organization has disabled/i.test(String(why))) {
+          accountManager.recordProbeError?.(account.index, String(why).slice(0, 160), 403);
+        }
         // Providers answer with a code and no field name, so record what WE sent.
         if (account.type === 'provider') {
           console.log(`[Maxpool]   request shape: ${describeBodyShape(upstreamBody || body).slice(0, 600)}`);

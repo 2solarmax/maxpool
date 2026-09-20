@@ -830,6 +830,9 @@ export class AccountManager {
   _isAvailable(account, options = {}) {
     if (!account) return false;
     if (!account.enabled) return false;
+    // Subscription latched gone (org-disabled 403): benched until re-subscribed. The
+    // clear path is a successful re-auth (updateAccountTokens) after re-purchasing.
+    if (account.subscriptionGone) return false;
     const now = options.now ?? Date.now();
 
     // Check rate limit expiry
@@ -3135,6 +3138,19 @@ export class AccountManager {
     // worth having; the diagnosis that motivated it was wrong.)
     q.consecutiveProbeFailures = (q.consecutiveProbeFailures || 0) + 1;
     const n = q.consecutiveProbeFailures;
+    // A SUSTAINED ORG-403 is the subscription being gone (canceled Max plan lapsing
+    // server-side — measured 2026-09-18/20: "OAuth authentication is currently not
+    // allowed for this organization" on 2solarmax@ and privacy@, both canceled Sep 16).
+    // The quota endpoint refuses before any quota question is answered, so probing is
+    // pure waste. Latch subscriptionGone (3 strikes, like the 401 rule): the prober
+    // skips the account, the TUI says why, and routing treats it as unavailable. A
+    // successful re-auth clears it (updateAccountTokens).
+    if (status === 403
+      && /not allowed for this organization|disabled.*subscription|subscription.*disabled|organization has disabled/i.test(String(message))
+      && n >= 3 && !account.subscriptionGone) {
+      account.subscriptionGone = true;
+      console.error(`[Maxpool] "${account.name}" subscription disabled at the organization (HTTP 403 x${n}) — benching it. Re-enable after re-subscribing, or remove the account (a → d).`);
+    }
     // A SUSTAINED 401 is dead credentials, not a blip. Latch refreshDead so (a) the
     // prober stops re-POSTing a rejected token every 60s forever — measured 2026-08-10:
     // 8 disabled accounts each past 20 consecutive 401s, hammering Anthropic's OAuth
@@ -3717,7 +3733,7 @@ export class AccountManager {
     // A dead refresh token (invalid_grant) is PERMANENT until browser re-auth —
     // never auto-retry it. Without this the prober re-POSTs the rejected token every
     // ~60s forever (hammering Anthropic's OAuth endpoint). Cleared on re-login.
-    if (account.refreshDead) return false;
+    if (account.refreshDead || account.subscriptionGone) return false;
 
     // A DISABLED account never spends its single-use refresh token. The prober still
     // READS its quota by design (you disable an exhausted account and still want to
@@ -3831,6 +3847,7 @@ export class AccountManager {
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     account.refreshDead = false;  // fresh tokens from re-auth revive a dead-refresh account
+    account.subscriptionGone = false;  // a working re-auth means the org accepts OAuth again
     if (account.status === 'error') account.status = 'active';
     console.log(`[Maxpool] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
