@@ -520,6 +520,17 @@ export async function loginOAuth() {
  * Race the callback server promise against manual code entry from stdin.
  * The user can paste the full callback URL or just the authorization code.
  */
+// Rejection sentinel for a user-cancelled login — `err === LOGIN_CANCELLED` (or
+// isLoginCancelled(err)) distinguishes "changed my mind" from a real failure so the
+// UI can say 'cancelled' instead of 'failed' and CLI flows can exit 0 quietly.
+export const LOGIN_CANCELLED = Symbol.for('maxpool.login.cancelled');
+export function isLoginCancelled(err) { return err === LOGIN_CANCELLED; }
+
+export function isLoginCancelAnswer(answer) {
+  const t = String(answer || '').trim().toLowerCase();
+  return t === 'q' || t === 'quit' || t === 'cancel' || t === 'abort' || t === ':q';
+}
+
 function raceWithStdinCode(callbackPromise, expectedState) {
   if (!process.stdin.isTTY) return callbackPromise;
 
@@ -534,9 +545,20 @@ function raceWithStdinCode(callbackPromise, expectedState) {
       fn(val);
     };
 
-    rl.question('Paste authorization code here (or wait for browser callback): ', answer => {
+    // ESCAPE HATCH (2026-09-20). The login prompt had NO way out: a free-plan account
+    // can't complete the OAuth consent, the callback never arrives, and Ctrl+C — with
+    // no SIGINT listener on the readline — killed the whole maxpool process (measured:
+    // the owner was stuck on this exact screen and had to be told to kill the app).
+    // Now: Ctrl+C (first press) and typing q/quit/cancel/abort/:q both reject with a
+    // Cancelled sentinel the callers translate into "login cancelled", leaving the
+    // app alive. The TUI restarts itself from _doLogin's finally block.
+    const cancel = () => settle(reject, LOGIN_CANCELLED);
+    rl.on('SIGINT', cancel);
+
+    rl.question('Paste authorization code here (q or Ctrl+C to cancel): ', answer => {
       const trimmed = answer.trim();
       if (!trimmed) return; // empty input, keep waiting for callback
+      if (isLoginCancelAnswer(trimmed)) return cancel();
 
       // Try to parse as a URL with ?code= parameter
       try {

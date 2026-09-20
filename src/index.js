@@ -29,7 +29,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 );
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
@@ -1637,6 +1637,10 @@ async function loginOAuthCommand() {
   try {
     creds = await loginOAuth();
   } catch (err) {
+    if (isLoginCancelled(err)) {
+      console.error('Login cancelled.');
+      process.exit(0);
+    }
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
     console.error('Alternatives:');

@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { fetchProfile, loginOAuth, tokenFingerprint } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -1335,7 +1335,11 @@ export class TUI {
         ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
         : `\nAdded new account "${name}". Returning to maxpool…\n`);
     } catch (e) {
-      process.stdout.write(`\nLogin failed: ${e.message}\n`);
+      if (isLoginCancelled(e)) {
+        process.stdout.write('\nLogin cancelled.\n');
+      } else {
+        process.stdout.write(`\nLogin failed: ${e.message}\n`);
+      }
     } finally {
       setConsoleStdoutSuppressed(false);   // restore on every path (incl. the catch)
       if (wasRunning) this.start();
