@@ -5,6 +5,23 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.21.0] - 2026-09-20
+
+### Added
+
+- SubscriptionGone latch — maxpool knows when a plan is dead
+
+### Fixed
+
+- Headers-phase stall timeout on the direct path
+- Stall timeout only on short-RPC paths — long-poll exempt (v2)
+- Exempt /client/presence from the stall timer (held-open beacon)
+- Evict pooled direct sockets when a session-create stalls
+
+### Removed
+
+- Revert working-tree to HEAD (bad headers-timeout reverted live via launchd restart; rollback already deployed)
+
 ## [1.20.4] - 2026-09-17
 
 ### Fixed
