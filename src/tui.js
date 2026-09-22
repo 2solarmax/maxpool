@@ -2384,7 +2384,7 @@ export class TUI {
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
       }
       case 'accounts':
-        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'addtype':
         return ` ${bold('1')}-${bold('4')} pick a type  ${bold('Esc')} Back`;
       case 'routing': {

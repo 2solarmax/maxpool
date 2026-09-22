@@ -177,3 +177,18 @@ test('persistence: index.js saveConfig merge carries weeklyAwareScoring', () => 
   assert.ok(m[0].includes('weeklyAwareScoring: config.scheduler.weeklyAwareScoring'),
     'the merge whitelist must persist weeklyAwareScoring (v1.20.0 red-team finding)');
 });
+
+// --- accounts footer: the usage-cap key is listed (discoverability) ----------------
+// Owner 2026-09-22: could not find the cap option for a new account — the 'u' key
+// worked but the Accounts footer never showed it. A hidden feature is a missing feature.
+test('tui: accounts footer advertises the usage-cap key', async () => {
+  const { TUI, __tuiTest } = await import('../src/tui.js');
+  const am = new AccountManager(
+    [{ name: 'kira', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 }],
+    0.90,
+  );
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } }, saveConfig: async () => {} });
+  tui.mode = 'accounts';
+  const f = __tuiTest.strip(tui._renderFooter());
+  assert.match(f, /u Usage cap/, "the footer must advertise the 'u' cap key");
+});
