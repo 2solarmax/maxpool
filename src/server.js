@@ -1045,6 +1045,20 @@ async function forwardRequest(
           // '^srvtoolu_…'`. Repairable by converting the pair to text (verified 200 OK) —
           // it used to fall through to a PERMANENT provider pin.
           || /server_tool_use\.id: String should match pattern/i.test(errorBody));
+      // ORDERING REJECTION (2026-09-23): a mid-conversation `system` message sitting where
+      // the API no longer accepts it. Anthropic has now stated the rule twice, differently:
+      //   Aug: "must precede an 'assistant' message or end the array"
+      //   Sep: "must follow a 'user' message or an 'assistant' message ending in a server
+      //         tool result; the directive-only form (content: []) is accepted at any position"
+      // The CLI legitimately emits mid-conversation system messages (mid-conversation-system
+      // beta: compaction boundaries, injected reminders) at messages.NNN deep in history, so
+      // this fires on ordinary long sessions. Repairable WITHOUT dropping anything: convert
+      // the offending system to the directive-only form the API accepts at any position
+      // (content: [], text moved into output_config) — a shape-preserving transformation,
+      // not the orphaning re-anchor.
+      const isOrderingRejection = account.type !== 'provider'
+        && upstreamRes.status === 400
+        && /role 'system' must (follow|precede)/i.test(errorBody);
       // LOG THE ACTUAL REASON. Previously a 4xx recorded only "HTTP 400" and the upstream
       // message was never written anywhere, so a whole class of failures (e.g. a rejected
       // effort level breaking every web search) was invisible in the log — you could not
@@ -1174,6 +1188,28 @@ async function forwardRequest(
       // rewrite it saves nothing; it just guarantees the 400 surfaces. Reported
       // 2026-08-10: "history too large to rewrite automatically" on a session the strip
       // would have fixed in 20ms. The retry it schedules re-checks the SHRUNK size.
+      // ORDERING RECOVERY (2026-09-23): convert the offending system message(s) to the
+      // directive-only form and retry on the SAME account — the request is now valid by
+      // the API's own stated rule, so no failover is needed and the user never sees the
+      // 400. One-shot per request via its own flag so a second ordering 400 (a rule we
+      // have not modeled) still surfaces honestly instead of looping.
+      if (isOrderingRejection && !requestInfo.orderingRepaired && canRepairBody) {
+        const coord = /messages\.(\d+)/.exec(errorBody);
+        const { messages: fixedMessages, converted } = directiveOnlySystemMessages(
+          JSON.parse(body.toString('utf8')).messages ?? [],
+          coord ? Number(coord[1]) : -1);
+        if (converted > 0) {
+          const json = JSON.parse(body.toString('utf8'));
+          json.messages = fixedMessages;
+          const fixedBody = Buffer.from(JSON.stringify(json));
+          console.log(`[Maxpool] Recovering session on Claude: converted ${converted} mis-positioned system message(s) to directive-only form`);
+          return forwardRequest(
+            req, res, fixedBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, { ...requestInfo, orderingRepaired: true, repairCount: repairCount + 1 },
+            fixedBody.length <= retryConfig.maxRetryBufferBytes, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+      }
       if (isSignatureRejection && !requestInfo.thinkingStripped && canRepairBody) {
         console.log(`[Maxpool] Anthropic rejected a block: ${describeRejectedBlock(body, errorBody)}`);
         const { body: cleanBody, removed, converted } = stripForeignThinkingBlocks(body);
@@ -1809,7 +1845,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2083,6 +2119,41 @@ function describeRejectedBlock(body, errorBody) {
  *  Idempotent: a second run finds no violation, so the latched re-strip cannot grow the
  *  transcript turn after turn.
  */
+/** ORDERING REPAIR (2026-09-23): convert an illegally-positioned mid-conversation
+ *  system message into the directive-only form the API accepts ANYWHERE — content: []
+ *  with the original text preserved in output_config. Shape-preserving (nothing dropped,
+ *  nothing orphaned), idempotent (a directive-only system is already legal), and driven
+ *  by the upstream's own coordinate when it names one, else all violating systems.
+ *  Returns { messages, converted }.
+ */
+function directiveOnlySystemMessages(messages, coordIndex = -1) {
+  let converted = 0;
+  // Under the Sep rule, a system is legal when preceded by nothing (start), by a user
+  // message, or by an assistant ENDING IN a server tool result; and always when it is
+  // already directive-only. Everything else is a violation.
+  const violates = (i) => {
+    const m = messages[i];
+    if (m?.role !== 'system') return false;
+    if (Array.isArray(m.content) && m.content.length === 0) return false; // directive-only
+    if (i === 0) return false; // start-of-array — governed by first-message rules, not this
+    const prev = messages[i - 1];
+    if (prev?.role === 'user') return false;
+    if (prev?.role === 'assistant' && Array.isArray(prev.content) && prev.content.length
+      && prev.content[prev.content.length - 1]?.type === 'server_tool_result') return false;
+    return true;
+  };
+  const out = messages.map((m, i) => {
+    if (coordIndex >= 0 ? i !== coordIndex : !violates(i)) return m;
+    const text = (Array.isArray(m.content) ? m.content : [])
+      .map(b => (typeof b?.text === 'string' ? b.text : ''))
+      .filter(Boolean).join('\n');
+    converted++;
+    // output_config shape per the API's own 400 text: directive-only system.
+    return { role: 'system', content: [], output_config: { directives: text } };
+  });
+  return { messages: out, converted };
+}
+
 function reanchorOrphanedSystemMessages(messages) {
   let inserted = 0;
   const out = [];
