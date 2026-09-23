@@ -186,3 +186,39 @@ test('wiring: a NON-STREAMING provider response is normalized through the real p
     await new Promise(r => upstream.close(r));
   }
 });
+
+// REAL WIRE SHAPE (2026-09-23): z.ai serializes SSE JSON with spaces —
+// "model": "glm-5.3" — while the pre-fix regex required compact "model":"…", so it
+// matched zero real provider bytes and every glm id leaked into transcripts.
+// This fixture is the verbatim first event captured from a live z.ai stream.
+test('model echo: real z.ai wire format ("model": "glm-5.3" with spaces) is rewritten', async () => {
+  const got = [];
+  const res = mockRes(got);
+  await streamResponse(
+    sseBody(['event: message_start\ndata: {"type": "message_start", "message": {"id": "msg_test", "type": "message", "role": "assistant", "model": "glm-5.3", "content": []}}\n\n']),
+    res, 200, { 'content-type': 'text/event-stream' }, 0,
+    dummyManager(), [],
+    { model: 'claude-opus-5', stream: true },
+  );
+  const out = got.join('');
+  assert.match(out, /"model":\s*"claude-opus-5"/);
+  assert.doesNotMatch(out, /glm-5\.3/);
+});
+
+// Same shape, split across chunks mid-key to prove the hold handles it.
+test('model echo: spaced wire format split mid-model-key still rewrites', async () => {
+  const got = [];
+  const res = mockRes(got);
+  await streamResponse(
+    sseBody([
+      'event: message_start\ndata: {"type": "message_start", "message": {"id": "msg_t',
+      'est", "role": "assistant", "mod',
+      'el": "glm-5.3"}}\n\n',
+    ]),
+    res, 200, { 'content-type': 'text/event-stream' }, 0,
+    dummyManager(), [],
+    { model: 'claude-opus-5', stream: true },
+  );
+  const out = got.join('');
+  assert.doesNotMatch(out, /glm-5\.3/);
+});

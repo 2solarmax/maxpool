@@ -3337,8 +3337,13 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         modelEchoBuffer = modelEchoBuffer ? [...modelEchoBuffer, value] : [value];
         const s = decoder.decode(concatUint8(modelEchoBuffer));
         if (s.includes('"model"') && s.includes('\n\n')) {
+          // \s* — providers serialize SSE JSON with spaces ("model": "glm-5.3"),
+          // Anthropic compact ("model":"…"). The tight form shipped 2026-08-31 and never
+          // matched a single real z.ai byte (all 1,546 glm rows in this very session
+          // leaked through it; fixture JSON was hand-written compact, so tests stayed
+          // green while production leaked. 2026-09-23.
           const normalized = s.replace(
-            /("model":")[^"]+(")/,
+            /("model"\s*:\s*")[^"]+(")/,
             `$1${requestInfo.model.replace(/["\\]/g, '\\$&')}$2`,
           );
           out = Buffer.from(normalized, 'utf8');
