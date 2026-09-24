@@ -70,7 +70,10 @@ test('T2: effective cap rises monotonically with elapsed time and reaches switch
   const m = am([oauth('dyn', { capUtilization: 0.5, capMode: 'dynamic' })]);
   const a = m.accounts[0];
   const caps = [];
-  for (const remaining of [WEEK, WEEK * 0.75, WEEK * 0.5, WEEK * 0.25, WEEK * 0.1, 0]) {
+  // `remaining: 0` is EXCLUDED deliberately: a stamp at/behind `now` means the window
+  // has rolled and the position is unknown, which fails closed to the floor (T6) — it
+  // is not the ramp's limit. Approach expiry with a small positive remainder instead.
+  for (const remaining of [WEEK, WEEK * 0.75, WEEK * 0.5, WEEK * 0.25, WEEK * 0.1, 60_000]) {
     setWindow(a, 'wk', { util: 0.5, remainingMs: remaining });
     caps.push(m._effectiveCap(a, 'wk', T0));
   }
@@ -131,14 +134,22 @@ test('T4: an unknown reset stamp falls back to the floor (fail-closed), every ac
   }
 });
 
-test('T6: a reset stamp in the PAST clamps — no cap above the ceiling, no NaN', () => {
-  const m = am([oauth('stale', { capUtilization: 0.5, capMode: 'dynamic' })]);
-  const a = m.accounts[0];
-  setWindow(a, 'wk', { util: 0.5, remainingMs: -3 * WEEK }); // long expired, not yet cleared
-  const eff = m._effectiveCap(a, 'wk', T0);
-  assert.ok(Number.isFinite(eff), 'must not be NaN');
-  assert.ok(eff <= m.switchThreshold + 1e-12, `must clamp at the ceiling, got ${eff}`);
-  assert.ok(eff >= 0.5, 'must not fall below the floor');
+test('T6: a reset stamp in the PAST fails CLOSED to the floor — the window rolled, our position is unknown', () => {
+  // A past stamp does NOT mean "fully elapsed, spend the reserve". It means the window
+  // already rolled and the utilization we still hold belongs to the window that CLOSED.
+  // Ramping on that is a fail-OPEN on stale data — and provider stamps are never cleared
+  // by _clearExpiredQuotas, so a probe outage would hold it open indefinitely.
+  for (const acct of [oauth('stale', { capUtilization: 0.5, capMode: 'dynamic' }),
+                      provider('pstale', { capUtilization: 0.5, capMode: 'dynamic' })]) {
+    const m = am([acct]);
+    const a = m.accounts[0];
+    setWindow(a, 'wk', { util: 0.55, remainingMs: -3 * 24 * HOUR });
+    const eff = m._effectiveCap(a, 'wk', T0);
+    assert.ok(Number.isFinite(eff), 'must not be NaN');
+    assert.equal(eff, 0.5, `${a.name}: a rolled-but-unrefreshed window must hold the floor, got ${eff}`);
+    assert.equal(m._weeklyRawState(a, T0), 'capped',
+      `${a.name}: 0.55 over a 0.5 floor is benched — exactly as the fixed cap would be`);
+  }
 });
 
 // ── T5: fixed mode is untouched ──────────────────────────────────────────────
@@ -373,10 +384,227 @@ test('T9d: and the converse — a nearly-closed WEEKLY must not unlock the sessi
     'the session reserve is governed by the session clock alone');
 });
 
-test('T6b: a stale (past) reset stamp reads as a fully-elapsed window, not an overshoot', () => {
+test('T6b: the fail-closed floor holds however far in the past the stamp is', () => {
   const m = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic' })]);
   const a = m.accounts[0];
-  setWindow(a, 'wk', { util: 0.5, remainingMs: -5 * WEEK });
-  assert.equal(m._effectiveCap(a, 'wk', T0), m.switchThreshold,
-    'clamped to exactly the ceiling — never beyond it, never NaN');
+  for (const past of [-1, -HOUR, -5 * WEEK, -520 * WEEK]) {
+    setWindow(a, 'wk', { util: 0.5, remainingMs: past });
+    assert.equal(m._effectiveCap(a, 'wk', T0), 0.5,
+      `a stamp ${past}ms in the past must never lift the cap off its floor`);
+  }
+});
+
+// ── the hold is the RAMP CROSSING, not the window reset (pre-mortem finding 2) ──
+// A fixed cap only unbenches at the reset, so keying the hold there was right. A rising
+// cap unbenches on its own ramp — often hours earlier — and telling the client to wait
+// the full window stalls work that could have run, precisely near reset where this
+// feature is supposed to help.
+
+test('T7b: a dynamically-capped account holds until the ramp crosses it, not until the reset', () => {
+  const m = am([oauth('only', { capUtilization: 0.5, capMode: 'dynamic' })]);
+  const a = m.accounts[0];
+  const reset = T0 + 20 * HOUR;
+  a.quota.unified7d = 0.85;
+  a.quota.unifiedStatus = 'allowed';
+  a.quota.unified7dReset = reset;
+  assert.equal(m._weeklyRawState(a, T0), 'capped', 'precondition: benched now');
+
+  const at = m._capUnbenchAt(a, 0.85, 'wk', T0);
+  assert.ok(at != null && at > T0 && at < reset,
+    `must unbench strictly before the reset, got ${at} vs reset ${reset}`);
+  // and the answer is exact: at that instant the effective cap has reached 0.85.
+  assert.ok(Math.abs(m._effectiveCap(a, 'wk', at) - 0.85) < 1e-9,
+    'the reported instant is where the ramp actually crosses the utilization');
+  // The CAP has released it; the ordinary weekly ladder still applies (0.85 is a
+  // 'reserve'-tier utilization, which is routable with a soft cost — the point is that
+  // it is no longer 'capped', i.e. no longer held out by the owner's reservation).
+  assert.notEqual(m._weeklyRawState(a, at + 1000), 'capped',
+    'the reservation no longer benches it at the crossing');
+});
+
+test('T7c: utilization above the ceiling can never be reached by the ramp — falls back to the reset', () => {
+  const m = am([oauth('only', { capUtilization: 0.5, capMode: 'dynamic' })]);
+  const a = m.accounts[0];
+  const reset = T0 + 20 * HOUR;
+  a.quota.unified7d = 0.97;                     // above switchThreshold 0.90
+  a.quota.unifiedStatus = 'allowed';
+  a.quota.unified7dReset = reset;
+  assert.equal(m._capUnbenchAt(a, 0.97, 'wk', T0), null,
+    'the ramp tops out at the ceiling — only the reset helps');
+});
+
+test('T7d: a FIXED cap still holds to the reset (its recovery really is the window end)', () => {
+  const m = am([oauth('only', { capUtilization: 0.5, capMode: 'fixed' })]);
+  const a = m.accounts[0];
+  a.quota.unified7d = 0.85;
+  a.quota.unified7dReset = T0 + 20 * HOUR;
+  assert.equal(m._capUnbenchAt(a, 0.85, 'wk', T0), null, 'no ramp, no early crossing');
+});
+
+test('T7e: an unknown window position gives no crossing — the hold falls back, never to null', () => {
+  const m = am([oauth('only', { capUtilization: 0.5, capMode: 'dynamic' })]);
+  const a = m.accounts[0];
+  a.quota.unified7d = 0.85;
+  a.quota.unified7dReset = null;                // no stamp at all
+  assert.equal(m._capUnbenchAt(a, 0.85, 'wk', T0), null);
+  a.quota.unified7dReset = T0 - WEEK;           // rolled, not yet re-learned
+  assert.equal(m._capUnbenchAt(a, 0.85, 'wk', T0), null);
+});
+
+// ── config hygiene (pre-mortem findings 7) ──────────────────────────────────
+
+test('T10d: an unrecognised capMode is reported, not silently honoured', () => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    const m = am([oauth('typo', { capUtilization: 0.5, capMode: 'fxied' })]);
+    assert.equal(m.accounts[0].capMode, 'dynamic', 'falls back to the default');
+    assert.ok(logs.some(l => /Ignoring unknown capMode/.test(l)),
+      'and says so — a typo must not fail open in silence');
+  } finally { console.log = orig; }
+});
+
+test('T10e: an absent capMode migrates SILENTLY — every legacy config has that shape', () => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    const m = am([oauth('legacy', { capUtilization: 0.5 })]);
+    assert.equal(m.accounts[0].capMode, 'dynamic');
+    assert.ok(!logs.some(l => /capMode/.test(l)), 'the migration is not an error to report');
+  } finally { console.log = orig; }
+});
+
+test('T10f: an invalid cap is reported exactly ONCE per account, not once per internal read', () => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    am([oauth('bad', { capUtilization: 'abc', capMode: 'dynamic' })]);
+    const complaints = logs.filter(l => /Ignoring invalid capUtilization/.test(l));
+    assert.equal(complaints.length, 1, `expected one complaint, got ${complaints.length}`);
+  } finally { console.log = orig; }
+});
+
+// ── learned window span (pre-mortem finding 8) ───────────────────────────────
+// The 5h/7d table is an assumption about the vendor. A provider whose "weekly" is
+// really 3 days would sit part-way up the ramp from the moment the window is born —
+// permanently over-open. Learn the span from what we actually observe instead.
+
+test('T14: a shorter-than-nominal vendor window is learned, and the cap stays at its floor', () => {
+  const m = am([provider('p', { capUtilization: 0.5, capMode: 'dynamic' })]);
+  const a = m.accounts[0];
+  const THREE_DAYS = 3 * 24 * HOUR;
+  // A FRESH 3-day weekly window: 3 days remaining. Against the nominal 7d assumption
+  // that reads as 57% elapsed — already past rampStart, so the cap would lift on day one.
+  m.applyProviderUsage(0, { ses: null, wk: { utilization: 0.55, resetAt: Date.now() + THREE_DAYS } });
+  assert.ok(a.quota.capSpanWk >= THREE_DAYS - 1000, 'the observed span is recorded');
+  const eff = m._effectiveCap(a, 'wk', Date.now());
+  assert.equal(eff, 0.5,
+    `a fresh window must sit at the floor whatever its length, got ${eff}`);
+});
+
+test('T14b: the learned span is bounded by nominal — a long stamp cannot push the cap UP', () => {
+  const m = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic' })]);
+  const a = m.accounts[0];
+  m.applyUsageData(0, { sevenDay: { utilization: 0.5, resetAt: Date.now() + 30 * 24 * HOUR } });
+  assert.ok(a.quota.capSpanWk <= WEEK + 1000,
+    'never learn a span longer than nominal — that is the fail-open direction');
+});
+
+test('T14c: the span only ever grows, so a late-window observation cannot shrink it', () => {
+  const m = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic' })]);
+  const a = m.accounts[0];
+  m.applyUsageData(0, { sevenDay: { utilization: 0.1, resetAt: Date.now() + 6 * 24 * HOUR } });
+  const wide = a.quota.capSpanWk;
+  m.applyUsageData(0, { sevenDay: { utilization: 0.9, resetAt: Date.now() + 2 * HOUR } });
+  assert.equal(a.quota.capSpanWk, wide, 'a near-reset reading must not redefine the window');
+});
+
+// ── per-account ceiling / ramp start (pre-mortem finding 5) ──────────────────
+// How much of their own account to hold back, and from when, is the OWNER's call —
+// not a constant in DEFAULT_SCHEDULER.
+
+test('T15: a per-account ceiling bounds the ramp below switchThreshold', () => {
+  const m = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic', capCeiling: 0.7 })]);
+  const a = m.accounts[0];
+  setWindow(a, 'wk', { util: 0.5, remainingMs: 60_000 });   // effectively at expiry
+  const eff = m._effectiveCap(a, 'wk', T0);
+  assert.ok(eff <= 0.7 + 1e-9, `must not exceed the account's own ceiling, got ${eff}`);
+  assert.ok(eff > 0.69, 'and it does reach it');
+});
+
+test('T15b: a per-account rampStart moves when the lift begins', () => {
+  const late = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic', capRampStart: 0.9 })]);
+  const early = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic', capRampStart: 0.1 })]);
+  for (const m of [late, early]) setWindow(m.accounts[0], 'wk', { util: 0.5, remainingMs: WEEK * 0.4 });
+  assert.equal(late._effectiveCap(late.accounts[0], 'wk', T0), 0.5,
+    'a 0.9 ramp start keeps the full reserve until the last tenth of the window');
+  assert.ok(early._effectiveCap(early.accounts[0], 'wk', T0) > 0.5,
+    'a 0.1 ramp start has already begun opening up');
+});
+
+test('T15c: the unbench solver honours the SAME per-account numbers as the bench', () => {
+  const m = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic', capCeiling: 0.7, capRampStart: 0.25 })]);
+  const a = m.accounts[0];
+  const reset = T0 + 0.5 * WEEK;
+  a.quota.unified7d = 0.65;
+  a.quota.unifiedStatus = 'allowed';
+  a.quota.unified7dReset = reset;
+  const at = m._capUnbenchAt(a, 0.65, 'wk', T0);
+  assert.ok(at != null, 'a crossing exists below the 0.7 ceiling');
+  assert.ok(Math.abs(m._effectiveCap(a, 'wk', at) - 0.65) < 1e-9,
+    'and the bench agrees with the solver at that instant — one set of numbers, two readers');
+});
+
+test('T15d: an invalid per-account override is rejected and reported, falling back to the default', () => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    const m = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic', capRampStart: 1.5 })]);
+    assert.equal(m.accounts[0].capRampStart, null, 'rejected');
+    assert.ok(logs.some(l => /Ignoring invalid capRampStart/.test(l)), 'and reported');
+    setWindow(m.accounts[0], 'wk', { util: 0.5, remainingMs: WEEK });
+    assert.equal(m._effectiveCap(m.accounts[0], 'wk', T0), 0.5, 'default ramp still applies');
+  } finally { console.log = orig; }
+});
+
+test('T7f: the unbench time is never reported beyond the window reset', () => {
+  // The solver inverts the ramp; if the account also carries a per-account ceiling or a
+  // learned span, the algebraic crossing can land past the reset. Reporting that would
+  // hold a request LONGER than the window it is waiting on — the over-hold this whole
+  // ramp-aware path exists to remove, reintroduced at the other end.
+  const m = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic', capRampStart: 0.95 })]);
+  const a = m.accounts[0];
+  // REAL clock here, not the fixed T0: the leg below goes through nextRetryForRequest,
+  // which reads Date.now() itself. Mixing the two would measure the gap between the
+  // fake and real clocks rather than the hold.
+  const nowReal = Date.now();
+  const reset = nowReal + 2 * HOUR;
+  a.quota.unified7d = 0.89;                    // just under the ceiling → crossing very late
+  a.quota.unifiedStatus = 'allowed';
+  a.quota.unified7dReset = reset;
+  const at = m._capUnbenchAt(a, 0.89, 'wk', nowReal);
+  if (at != null) {
+    assert.ok(at <= reset, `the hold must never outlast the window itself: ${at} > ${reset}`);
+  }
+  // and through the real oracle, the client-facing hold obeys the same bound
+  const retry = m.nextRetryForRequest({ profile: 'claude' });
+  if (retry && Number.isFinite(retry.retryAfterMs)) {
+    assert.ok(retry.retryAfterMs <= 2 * HOUR + 1000,
+      `client hold must not exceed the window reset, got ${retry.retryAfterMs}ms`);
+  }
+});
+
+test('T14d: a reset stamp further out than a nominal window reads as "just started", not negative', () => {
+  // The low-side clamp on the elapsed ratio: a vendor window longer than we assume (or a
+  // stamp we cannot explain) must read as the START of a window — floor — never as a
+  // negative position, which would flow into the ramp arithmetic.
+  const m = am([oauth('o', { capUtilization: 0.5, capMode: 'dynamic' })]);
+  const a = m.accounts[0];
+  setWindow(a, 'wk', { util: 0.6, remainingMs: 30 * 24 * HOUR });   // 30d out, nominal 7d
+  assert.equal(m._effectiveCap(a, 'wk', T0), 0.5, 'holds the floor, no negative elapsed');
+  assert.equal(m._weeklyRawState(a, T0), 'capped', 'and the reserve is genuinely enforced');
 });

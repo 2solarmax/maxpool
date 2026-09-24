@@ -68,6 +68,16 @@ function emptyQuota() {
     // Provider (z.ai / Kimi) quota — kept SEPARATE from unified* so a provider
     // reading never leaks into the OAuth quota gates (_isAvailable / _weeklyRawState
     // / _accountScarcity read unified* only). z.ai is pollable; Kimi is not.
+    // Largest "time until reset" ever OBSERVED for each window, i.e. a lower bound on
+    // the window's true length. The dynamic cap needs a duration to know how far into a
+    // window it is, and the nominal 5h/7d table is an assumption about the VENDOR: a
+    // provider whose "weekly" is really 3 days would sit part-way up the ramp from the
+    // moment the window is born. Learning the span from observation fixes that, and the
+    // error direction of an UNDER-estimate (seen only late in a window) is conservative —
+    // it reports less elapsed, so the cap stays nearer its floor. Grows monotonically and
+    // self-corrects the first time a fresh window is seen.
+    capSpanSes: null,
+    capSpanWk: null,
     providerSes: null,          // utilization 0-1 (z.ai 5h token window)
     providerSesReset: null,     // ms
     providerWk: null,           // utilization 0-1 (z.ai weekly), null if plan has none
@@ -294,7 +304,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // flag and the fast-refill discount (plus the TUI "Wk none" rendering) silently
   // drops until the next probe sweep re-learns it. The probe still rewrites it on
   // every successful sweep, so a plan change heals on the same cadence.
-  'weeklyAbsent', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
+  'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
   'providerQuotaSource', 'lastProbeOkAt',
 ];
 
@@ -349,11 +359,13 @@ function parseResetHeader(value) {
  * also logs once so a hand-edited config doesn't silently fail open (a NaN cap makes
  * every `util >= cap` comparison false = uncapped, with no error anywhere).
  */
-function _sanitizeCap(value, name) {
+function _sanitizeCap(value, name, quiet = false) {
   if (value == null) return null;
   const n = Number(value);
   if (Number.isFinite(n) && n > 0 && n < 1) return n;
-  console.log(`[Maxpool] Ignoring invalid capUtilization ${JSON.stringify(value)} for "${name}" — expected 0-1`);
+  // `quiet` is for the second call that only resolves the MODE from the same value —
+  // it would otherwise print the identical complaint twice per account per load.
+  if (!quiet) console.log(`[Maxpool] Ignoring invalid capUtilization ${JSON.stringify(value)} for "${name}" — expected 0-1`);
   return null;
 }
 
@@ -364,9 +376,28 @@ function _sanitizeCap(value, name) {
  * the accounts that currently have the fixed cap", which is exactly the config shape
  * with a `capUtilization` and no `capMode`.
  */
-function _capMode(value, sanitizedCap) {
+/** A cap ramp start is a fraction of the window in [0,1); anything else means "use the
+ *  default". 1 or more would mean "never ramp", which is what `capMode:'fixed'` says
+ *  properly, so it is rejected here rather than silently creating a second way to say it. */
+function _sanitizeRampStart(value, name) {
+  if (value == null) return null;
+  const n = Number(value);
+  if (Number.isFinite(n) && n >= 0 && n < 1) return n;
+  console.log(`[Maxpool] Ignoring invalid capRampStart ${JSON.stringify(value)} for "${name}" — expected 0 to <1 (use capMode:"fixed" for no ramp)`);
+  return null;
+}
+
+function _capMode(value, sanitizedCap, name) {
   if (sanitizedCap == null) return null;
-  return value === 'fixed' ? 'fixed' : 'dynamic';
+  if (value === 'fixed' || value === 'dynamic') return value;
+  // Absent is the migration case and is silent BY DESIGN — every pre-2026-09-24 config
+  // has a cap and no mode, and the owner asked for those to become dynamic. A value that
+  // is present but unrecognised is a typo, and swallowing it silently would be the same
+  // fail-open-without-a-word shape _sanitizeCap exists to prevent for the number.
+  if (value != null) {
+    console.log(`[Maxpool] Ignoring unknown capMode ${JSON.stringify(value)} for "${name}" — expected "fixed" or "dynamic"; using dynamic`);
+  }
+  return 'dynamic';
 }
 
 /**
@@ -378,10 +409,18 @@ function _capMode(value, sanitizedCap) {
  */
 function _windowElapsedRatio(resetAt, durationMs, now) {
   if (!Number.isFinite(resetAt) || !Number.isFinite(durationMs) || durationMs <= 0) return null;
-  // No inner clamp on `remaining`: a stale (past) stamp makes it negative, which drives
-  // the ratio above 1, and the clamp01 below already pins that to a closed window. A
-  // second guard here was an equivalent mutant — provably dead code (T13/M6).
-  return clamp01((durationMs - (resetAt - now)) / durationMs);
+  // A stamp in the PAST means the window already rolled and we have not yet learned the
+  // new one — so our POSITION in the live window is unknown, and the utilization we hold
+  // belongs to the window that closed. Treating that as "fully elapsed" would ramp the cap
+  // to its ceiling on stale data: reproduced on a provider account (providerWk 0.55, stamp
+  // 3 days past) reading `normal` where the fixed cap says `capped`, and provider stamps
+  // are never cleared by _clearExpiredQuotas, so a probe outage holds that state open
+  // indefinitely. Unknown position must fail CLOSED to the floor, like a missing stamp.
+  if (resetAt <= now) return null;
+  // `resetAt > now` is guaranteed above and `durationMs > 0`, so the ratio cannot exceed
+  // 1; only the LOW side needs bounding, for a stamp further out than one nominal window
+  // (a vendor window longer than we assume) which must read as "window just started".
+  return Math.max(0, (durationMs - (resetAt - now)) / durationMs);
 }
 
 export class AccountManager {
@@ -425,7 +464,13 @@ export class AccountManager {
       // toward switchThreshold as the window nears its reset, so reserved-but-unused
       // capacity is spent instead of dying at reset. `capMode:'fixed'` opts back in to the
       // constant cap. Uncapped accounts carry no mode (nothing to modulate).
-      capMode: _capMode(acct.capMode, _sanitizeCap(acct.capUtilization, acct.name)),
+      capMode: _capMode(acct.capMode, _sanitizeCap(acct.capUtilization, acct.name, true), acct.name),
+      // Per-account overrides for the two numbers that decide how much reserve is kept
+      // and for how long. Defaults live in DEFAULT_SCHEDULER; these exist because the
+      // right answer is the OWNER's (how much of their own account to hold back, and
+      // from when), not a constant buried in the scheduler.
+      capCeiling: _sanitizeCap(acct.capCeiling, acct.name, true),
+      capRampStart: _sanitizeRampStart(acct.capRampStart, acct.name),
       model: acct.model || null,
       modelMap: acct.modelMap || null,
       stripBetaHeaders: Boolean(acct.stripBetaHeaders),
@@ -907,11 +952,15 @@ export class AccountManager {
     if (account.inFlight >= this.scheduler.safetyMaxActivePerAccount) return false;
     if (this.getGlobalInFlight() >= this.scheduler.safetyMaxGlobalActive) return false;
     if (account.status === 'exhausted' || account.status === 'error') return false;
-    if (this._isSessionQuotaUnavailable(account)) return false;
+    // `now` is threaded deliberately: under a DYNAMIC cap the bench threshold moves with
+    // the clock, so an availability decision and the retry oracle that explains it must
+    // read the same instant. The drift is milliseconds today, but it is always in the
+    // direction that manufactures a spurious 'capped' verdict, and nothing else enforces it.
+    if (this._isSessionQuotaUnavailable(account, now)) return false;
     // Gate on RAW weekly usage, not pace-adjusted: an account with real
     // headroom (e.g. 69% used, resets in days) must stay in the healthy-spread
     // pool even if it's burning fast. Pace is a soft SCORE cost, never a bench.
-    const weeklyState = this._weeklyRawState(account);
+    const weeklyState = this._weeklyRawState(account, now);
     if (weeklyState === 'exhausted' || weeklyState === 'capped') return false;
     if (weeklyState === 'critical' && !options.allowWeeklyCritical) return false;
     if (weeklyState === 'reserve' && !options.allowWeeklyReserve) return false;
@@ -1359,9 +1408,28 @@ export class AccountManager {
    * the note on emptyQuota). An account type with no reset stamp for the window
    * (API-key) yields a null stamp, which the caller treats as "cannot ramp".
    */
+  /** Record the largest remaining-time seen for a window — see capSpanSes/capSpanWk. */
+  _noteCapWindowSpan(account, window, resetAt, now = Date.now()) {
+    if (!Number.isFinite(resetAt)) return;
+    const remaining = resetAt - now;
+    if (!(remaining > 0)) return;
+    const key = window === 'ses' ? 'capSpanSes' : 'capSpanWk';
+    const q = account.quota;
+    const nominal = WINDOW_MS_BY_KIND[window];
+    // Never learn a span LONGER than nominal: that direction would push the cap up the
+    // ramp on an assumption, which is the fail-open side.
+    const bounded = Math.min(remaining, nominal);
+    if (q[key] == null || bounded > q[key]) q[key] = bounded;
+  }
+
   _capWindowFields(account, window) {
     const q = account?.quota || {};
-    const durationMs = WINDOW_MS_BY_KIND[window];
+    const learned = window === 'ses' ? q.capSpanSes : q.capSpanWk;
+    // Prefer the observed span over the nominal assumption; both are bounded above by
+    // nominal, so this can only ever move the cap DOWN toward its floor.
+    const durationMs = Number.isFinite(learned) && learned > 0
+      ? Math.min(learned, WINDOW_MS_BY_KIND[window])
+      : WINDOW_MS_BY_KIND[window];
     if (account?.type === 'provider') {
       return { resetAt: window === 'ses' ? q.providerSesReset : q.providerWkReset, durationMs };
     }
@@ -1389,14 +1457,53 @@ export class AccountManager {
     const floor = account?.capUtilization;
     if (floor == null) return null;                       // uncapped — unchanged
     if (account.capMode !== 'dynamic') return floor;      // fixed — byte-for-byte as before
-    const ceiling = this.switchThreshold;
+    const ceiling = account.capCeiling ?? this.switchThreshold;
     if (floor >= ceiling) return floor;                   // never pull a high floor DOWN
     const { resetAt, durationMs } = this._capWindowFields(account, window);
     const elapsed = _windowElapsedRatio(resetAt, durationMs, now);
     if (elapsed == null) return floor;                    // fail closed
-    const rampStart = this.scheduler.capRampStart;
+    const rampStart = account.capRampStart ?? this.scheduler.capRampStart;
     const ramp = rampStart >= 1 ? 0 : clamp01((elapsed - rampStart) / (1 - rampStart));
     return floor + (ceiling - floor) * ramp;
+  }
+
+  /**
+   * When a DYNAMIC cap will have risen far enough to stop benching `utilization` on
+   * this window — i.e. the instant the ramp crosses it. Null when that never happens
+   * before the reset (utilization at/above the ceiling), when the cap is fixed, or
+   * when the window position is unknown; the caller then falls back to the reset.
+   *
+   * Without this the cap's hold is keyed to the window RESET, which is correct for a
+   * fixed cap (only a reset unbenches it) and systematically too long for a rising one:
+   * util 0.85 on a 0.50-floor weekly with 20h left is routable in 15h, but the oracle
+   * would have told the client to wait the full 20h — an over-hold that lands exactly
+   * in this feature's own target regime (near reset). Linear in elapsed, so invert it.
+   */
+  _capUnbenchAt(account, utilization, window = 'wk', now = Date.now()) {
+    if (account?.capMode !== 'dynamic' || utilization == null) return null;
+    const floor = account.capUtilization;
+    const ceiling = account.capCeiling ?? this.switchThreshold;
+    if (floor == null || floor >= ceiling) return null;
+    if (utilization >= ceiling) return null;              // the ramp never reaches it
+    if (utilization < floor) return null;                 // not cap-benched at all
+    const { resetAt, durationMs } = this._capWindowFields(account, window);
+    if (_windowElapsedRatio(resetAt, durationMs, now) == null) return null;
+    const rampStart = account.capRampStart ?? this.scheduler.capRampStart;
+    if (rampStart >= 1) return null;
+    // effective(t) = floor + (ceiling-floor) * (elapsed(t) - rampStart)/(1 - rampStart)
+    // solve effective(t) = utilization for elapsed, then convert back to wall clock.
+    const neededRamp = (utilization - floor) / (ceiling - floor);
+    const neededElapsed = rampStart + neededRamp * (1 - rampStart);
+    const at = resetAt - durationMs * (1 - neededElapsed);
+    if (!Number.isFinite(at)) return null;
+    // Never report a time outside (now, reset]: a crossing already behind us means the
+    // account is not actually benched, and one past the reset is the reset's own case.
+    if (at <= now) return null;
+    // No upper bound needed: at = reset - duration*(1 - neededElapsed), and neededElapsed
+    // exceeds 1 only when utilization exceeds the ceiling, which returned null above. A
+    // `Math.min(at, resetAt)` here was dead defensive code — a brute-force sweep over
+    // span x remaining x utilization found the crossing never once landed past the reset.
+    return at;
   }
 
   /** True when the account's usage cap has it benched on the given window reading. */
@@ -1730,9 +1837,17 @@ export class AccountManager {
       // nextRetryForRequest → retryAfterMs: Infinity → server.js error-fasts → the
       // live session is KILLED, despite the real reset time being known all along.
       // Reproduced 2026-08-18 with providerWk=0.9995 + a known providerWkReset.
+      // A DYNAMIC cap unbenches on its own ramp, BEFORE the reset — so hold until the
+      // crossing, not the window end. `weeklyState === 'capped'` is the only case where
+      // that applies; a genuinely exhausted account still waits for the reset.
+      const wkReset = q.unified7dReset || q.providerWkReset || null;
+      const wkUtil = account.type === 'provider' ? q.providerWk : q.unified7d;
+      const capCrossing = weeklyState === 'capped'
+        ? this._capUnbenchAt(account, wkUtil, 'wk', now)
+        : null;
       return {
         cause: 'weekly_exhausted',
-        retryAt: q.unified7dReset || q.providerWkReset || null,
+        retryAt: capCrossing ?? wkReset,
         queueable: false,
       };
     }
@@ -1817,7 +1932,7 @@ export class AccountManager {
     // _isSessionQuotaUnavailable (_sessionBenchThreshold) — a capped account benched
     // at 50% MUST report a finite retryAt here or a live session holding on it gets
     // error-fasted instead of waiting out the window (red-team blocker 2).
-    const bench = this._sessionBenchThreshold(account);
+    const bench = this._sessionBenchThreshold(account, now);
     if (account.status === 'throttled' && account.rateLimitedUntil && now < account.rateLimitedUntil) {
       return { cause: 'rate_limited', retryAt: account.rateLimitedUntil, queueable: true };
     }
@@ -3131,11 +3246,17 @@ export class AccountManager {
 
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = clamp01(usage.fiveHour.utilization);
-      if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
+      if (usage.fiveHour.resetAt != null) {
+        q.unified5hReset = usage.fiveHour.resetAt;
+        this._noteCapWindowSpan(account, 'ses', usage.fiveHour.resetAt);
+      }
     }
     if (usage.sevenDay) {
       if (usage.sevenDay.utilization != null) q.unified7d = clamp01(usage.sevenDay.utilization);
-      if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
+      if (usage.sevenDay.resetAt != null) {
+        q.unified7dReset = usage.sevenDay.resetAt;
+        this._noteCapWindowSpan(account, 'wk', usage.sevenDay.resetAt);
+      }
     }
     this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour?.resetAt, prevSesUtil);
     this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay?.resetAt, prevWkUtil);
@@ -3286,11 +3407,17 @@ export class AccountManager {
     q.providerQuotaSource = usage.source || 'zai';
     if (usage.ses) {
       if (usage.ses.utilization != null) q.providerSes = clamp01(usage.ses.utilization);
-      if (usage.ses.resetAt != null) q.providerSesReset = usage.ses.resetAt;
+      if (usage.ses.resetAt != null) {
+        q.providerSesReset = usage.ses.resetAt;
+        this._noteCapWindowSpan(account, 'ses', usage.ses.resetAt);
+      }
     }
     if (usage.wk) {
       if (usage.wk.utilization != null) q.providerWk = clamp01(usage.wk.utilization);
-      if (usage.wk.resetAt != null) q.providerWkReset = usage.wk.resetAt;
+      if (usage.wk.resetAt != null) {
+        q.providerWkReset = usage.wk.resetAt;
+        this._noteCapWindowSpan(account, 'wk', usage.wk.resetAt);
+      }
       q.weeklyAbsent = false;
     } else {
       // Weekly window absent from this plan/response — clear so a stale weekly
@@ -3964,7 +4091,9 @@ export class AccountManager {
       configSourced: Boolean(acctData.configSourced),
       secretName: acctData.secretName || null,
       capUtilization: _sanitizeCap(acctData.capUtilization, acctData.name),
-      capMode: _capMode(acctData.capMode, _sanitizeCap(acctData.capUtilization, acctData.name)),
+      capMode: _capMode(acctData.capMode, _sanitizeCap(acctData.capUtilization, acctData.name, true), acctData.name),
+      capCeiling: _sanitizeCap(acctData.capCeiling, acctData.name, true),
+      capRampStart: _sanitizeRampStart(acctData.capRampStart, acctData.name),
       enabled: acctData.enabled !== false,
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
@@ -4030,7 +4159,7 @@ export class AccountManager {
     // cap the user set in the TUI.
     if (acctData.capUtilization !== undefined) {
       account.capUtilization = _sanitizeCap(acctData.capUtilization, account.name);
-      account.capMode = _capMode(acctData.capMode ?? account.capMode, account.capUtilization);
+      account.capMode = _capMode(acctData.capMode ?? account.capMode, account.capUtilization, account.name);
     }
     if (account.status === 'error' && changed) {
       account.status = 'active';
