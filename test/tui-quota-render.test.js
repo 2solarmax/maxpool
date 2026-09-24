@@ -552,3 +552,86 @@ test('an extreme-narrow header clips WITHOUT bleeding the underline into later l
   assert.ok(__tuiTest.strip(fitted).length <= 42, 'truncated to the terminal width');
   assert.ok(fitted.endsWith(RESET), 'RESET still terminates the underline after truncation');
 });
+
+// ── DYNAMIC CAP visibility (owner, 2026-09-24: "It should also be visible in the TUI") ──
+// The configured number is only a FLOOR; routing holds the account to the RAMPED cap.
+// Rendering the floor alone would state a number the scheduler is not using.
+
+test('a dynamic cap early in its window renders as one number (indistinguishable from fixed)', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 5 * 3600_000;   // 0% elapsed
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 7 * DAY;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/, 'the reserve is visible');
+  assert.doesNotMatch(line, /cap 50%>/, 'and while it sits at the floor there is no second number to show');
+});
+
+test('a dynamic cap that has ramped shows floor>effective, so the row states what routing enforces', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  // Weekly 90% elapsed → ramped well above the floor; session window fresh so the
+  // WEEKLY is not the minimum — give both a late position so the min is the ramped one.
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 0.2 * 5 * 3600_000;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 0.1 * 7 * DAY;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%>\d\d%/, `expected a ramped two-number cap tag, got: ${line}`);
+  const shown = Number(/cap 50%>(\d+)%/.exec(line)[1]);
+  assert.ok(shown > 50 && shown <= 90, `effective must be between the floor and the ceiling, got ${shown}`);
+});
+
+test('the rendered effective cap is the number routing actually enforces (the lower window)', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 5 * 3600_000;    // fresh → floor
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 0.05 * 7 * DAY;  // nearly over → high
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  // The session window is still at the floor, so the MINIMUM is 50% and the row must
+  // not advertise the weekly's generous ramp as if traffic could use it.
+  assert.match(line, /cap 50%/);
+  assert.doesNotMatch(line, /cap 50%>/, 'the stricter window governs, so no lift is claimed');
+});
+
+test('a fixed cap still renders exactly as before — one number, no ramp', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'fixed';
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 0.05 * 7 * DAY;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /cap 50%/);
+  assert.doesNotMatch(line, />/, 'fixed mode has nothing to ramp to');
+});
+
+test('the weekly policy label quotes the EFFECTIVE weekly cap, never the stale floor', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  a.quota.unified7d = 0.8;                                  // above the ramped cap → benched
+  a.quota.unified7dReset = Date.now() + 0.25 * 7 * DAY;     // 75% elapsed → cap ~0.70
+  assert.equal(am._weeklyRawState(a), 'capped', 'precondition: the dynamic cap benches it');
+  const label = strip(__tuiTest.weeklyPolicyText(am, a));
+  const pct = Number(/Cap (\d+)%/.exec(label)[1]);
+  assert.ok(pct > 50, `the label must show the cap that actually benched it, got "${label}"`);
+});
+
+test('the cap tag turns yellow exactly when the dynamic cap is what benches the account', () => {
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  a.quota.unified7d = 0.85;                                 // over the ramped cap
+  a.quota.unified7dReset = Date.now() + 7 * DAY;            // fresh window → cap at the floor
+  // Either spelling is correct: when the WEEKLY policy tag claims the cap (`Cap 50%`)
+  // the settings column drops its lowercase twin by the existing say-it-once rule. What
+  // must hold is that the cap is stated, in the alarm colour, with the effective number.
+  assert.match(new TUI({ accountManager: am })._renderAcct(0, 11, true), /\x1b\[33m[Cc]ap 50%/,
+    'benched by the cap → alarm colour, same contract as the fixed cap');
+});

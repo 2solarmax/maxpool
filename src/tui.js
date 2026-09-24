@@ -202,10 +202,32 @@ function loadText(load) {
  *  built for (max@gomokka.com) showed no cap anywhere: reported 2026-08-27, "I need
  *  to be able to see whether an account has a cap or not." Yellow while the cap is
  *  actively holding traffic back, dim otherwise. */
-function capText(a, benched) {
+function capText(a, benched, am) {
   if (a?.capUtilization == null) return '';
-  const t = `cap ${Math.round(a.capUtilization * 100)}%`;
+  const floorPct = Math.round(a.capUtilization * 100);
+  // DYNAMIC CAP (2026-09-24): the configured value is only a FLOOR — what routing
+  // actually holds the account to right now is the ramped effective cap, which climbs
+  // as the window nears its reset. Showing the floor alone would state a number the
+  // scheduler is not using. `cap 50%>67%` reads as "reserved 50%, currently allowing
+  // 67%"; the two collapse to one number while the cap sits at its floor, so an
+  // early-window dynamic account looks exactly like the fixed one it replaced.
+  const eff = capEffectivePct(am, a);
+  const t = (eff != null && eff !== floorPct)
+    ? `cap ${floorPct}%>${eff}%`
+    : `cap ${floorPct}%`;
   return benched ? yellow(t) : dim(t);
+}
+
+/** The percentage routing is ACTUALLY enforcing on this account right now: the worse
+ *  (lower) of its two windows' effective caps, which is the one that benches first.
+ *  Null for a fixed cap or when the manager cannot compute one. */
+function capEffectivePct(am, a) {
+  if (!am?._effectiveCap || a?.capMode !== 'dynamic') return null;
+  const vals = ['ses', 'wk']
+    .map(w => am._effectiveCap(a, w))
+    .filter(v => typeof v === 'number' && Number.isFinite(v));
+  if (!vals.length) return null;
+  return Math.round(Math.min(...vals) * 100);
 }
 
 /** PER-ACCOUNT SETTINGS the user set by hand — the last column's whole job
@@ -223,7 +245,7 @@ function settingsTags(am, a) {
   if (am?.routingMode === 'preferred' && a?.name === am.preferredAccountName) {
     tags.push(cyan('preferred'));
   }
-  const capTag = capText(a, capBenched(am, a));
+  const capTag = capText(a, capBenched(am, a), am);
   if (capTag) tags.push(capTag);
   return tags;
 }
@@ -236,7 +258,10 @@ function capBenched(am, a) {
   const q = a.quota || {};
   const ses = a.type === 'provider' ? q.providerSes : q.unified5h;
   const wk = a.type === 'provider' ? q.providerWk : q.unified7d;
-  return !!(am?._capped?.(a, ses) || am?._capped?.(a, wk));
+  // Each reading is judged against ITS OWN window's cap — under the dynamic cap the
+  // two differ (a 5h window nearly over is lifted while the weekly is still at its
+  // floor), so passing the default window for both would mislabel one of them.
+  return !!(am?._capped?.(a, ses, 'ses') || am?._capped?.(a, wk, 'wk'));
 }
 
 export function weeklyPolicyText(am, account) {
@@ -246,7 +271,10 @@ export function weeklyPolicyText(am, account) {
   // exhausted, it's deliberately held, and labelling it "Wk exhausted 50%" (red team)
   // while the bar shows half-full misstates the owner's own setting.
   if (state === 'capped') {
-    return yellow(`Cap ${Math.round((account.capUtilization || 0) * 100)}%`);
+    // The WEEKLY window's own effective cap — the number that actually benched it.
+    const eff = am._effectiveCap?.(account, 'wk');
+    const pct = Math.round((Number.isFinite(eff) ? eff : account.capUtilization || 0) * 100);
+    return yellow(`Cap ${pct}%`);
   }
   if (!state || state === 'unknown' || state === 'normal') return '';
   // SAY IT ONCE (2026-08-27). An account Anthropic is rejecting outright already
@@ -353,7 +381,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -1166,9 +1194,14 @@ export class TUI {
       } else if (this.selAction === 'cap') {
         const targetIdx = this.selIdx;
         const current = account.name;
-        const existing = this.am.accounts[targetIdx]?.capUtilization;
+        const existingAcct = this.am.accounts[targetIdx];
+        const existing = existingAcct?.capUtilization;
+        const existingMode = existingAcct?.capMode;
+        const nowLabel = existing
+          ? `${Math.round(existing * 100)}%${existingMode === 'dynamic' ? ' dynamic' : ' fixed'}`
+          : 'off';
         this.mode = 'input';
-        this.inputPrompt = `Usage cap % for "${current}" (1-99, 0 = off, now ${existing ? Math.round(existing * 100) + '%' : 'off'})`;
+        this.inputPrompt = `Usage cap for "${current}" — NN = dynamic floor (rises near reset), fNN = fixed, 0 = off, now ${nowLabel}`;
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doSetCap(targetIdx, String(value || '').trim());
@@ -1359,35 +1392,50 @@ export class TUI {
     if (!account) { this._addLog('Account no longer exists'); return; }
     const v = String(raw || '').trim().toLowerCase();
     const off = v === '' || v === '0' || v === 'off' || v === '100';
+    // MODE PREFIX/SUFFIX: a bare number means the DYNAMIC cap (the default since
+    // 2026-09-24 — the floor that lifts as the window nears reset); `f` marks the
+    // fixed cap explicitly. `d` is accepted as the explicit dynamic spelling so the
+    // two modes are symmetric to type.
+    const explicitFixed = /^f/.test(v) || /f$/.test(v);
     let pct = null;
     if (!off) {
-      pct = parseInt(v, 10);
+      const digits = v.replace(/[fd]/g, '');
+      pct = parseInt(digits, 10);
       if (!Number.isInteger(pct) || pct < 1 || pct > 99) {
-        this._addLog(`Usage cap must be 1-99 (or 0 to remove) — got "${raw}"`);
+        this._addLog(`Usage cap must be 1-99, optionally f-prefixed for fixed (0 to remove) — got "${raw}"`);
         return;
       }
     }
     const cap = off ? null : pct / 100;
+    const mode = cap == null ? null : (explicitFixed ? 'fixed' : 'dynamic');
 
     const loc = this._configLocation(account);
     if (loc) {
       const prev = this.config[loc.array][loc.index].capUtilization ?? null;
+      const prevMode = this.config[loc.array][loc.index].capMode ?? null;
       if (cap == null) delete this.config[loc.array][loc.index].capUtilization;
       else this.config[loc.array][loc.index].capUtilization = cap;
+      if (mode == null) delete this.config[loc.array][loc.index].capMode;
+      else this.config[loc.array][loc.index].capMode = mode;
       try {
         await this.saveConfig(this.config);
       } catch (error) {
         // rollback both config and (below) skip the live apply
         if (prev == null) delete this.config[loc.array][loc.index].capUtilization;
         else this.config[loc.array][loc.index].capUtilization = prev;
+        if (prevMode == null) delete this.config[loc.array][loc.index].capMode;
+        else this.config[loc.array][loc.index].capMode = prevMode;
         throw error;
       }
     }
     // No loc: a runtime provider — in-memory + state.json persistence (same as enabled).
     account.capUtilization = cap;
+    account.capMode = mode;
     this._addLog(cap == null
       ? `Usage cap removed for "${account.name}" — fully utilized`
-      : `Usage cap ${pct}% set for "${account.name}" — the proxy stops routing to it at ${pct}% of the 5h and weekly windows`);
+      : mode === 'dynamic'
+        ? `Dynamic cap ${pct}% set for "${account.name}" — it keeps ${100 - pct}% free early in each window, then opens up as the window nears its reset so nothing is stranded`
+        : `Fixed cap ${pct}% set for "${account.name}" — the proxy stops routing to it at ${pct}% of the 5h and weekly windows`);
   }
 
   async _doRename(idx, newName) {

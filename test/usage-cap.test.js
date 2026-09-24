@@ -105,7 +105,12 @@ test('C8: BLOCKER 2 — a capped-benched LAST ROUTE reports a finite retry, neve
   // sees 0.51 < 0.90, reports nothing, nextRetryForRequest collapses to Infinity and
   // server.js error-fasts a live session that should simply have waited.
   const reset = Date.now() + 90 * 60_000;
-  const m = am([oauth('only', { capUtilization: 0.5 })]);
+  // capMode 'fixed' is EXPLICIT here: this test pins the FIXED cap's oracle contract.
+  // Since 2026-09-24 a bare capUtilization migrates to the dynamic cap, under which
+  // 0.51 with 90min left of a 5h window is legitimately BELOW the ramped cap (0.66) —
+  // i.e. not benched at all, so there is correctly no hold to assert. The dynamic
+  // twin of this blocker lives in test/dynamic-usage-cap.test.js (T7).
+  const m = am([oauth('only', { capUtilization: 0.5, capMode: 'fixed' })]);
   const a = m.accounts[0];
   a.quota.unified5h = 0.51;
   a.quota.unified5hReset = reset;
@@ -119,7 +124,10 @@ test('C8: BLOCKER 2 — a capped-benched LAST ROUTE reports a finite retry, neve
 
 test('C9: the weekly-capped last route also holds on the weekly reset', () => {
   const reset = Date.now() + 3 * 86400_000;
-  const m = am([oauth('only', { capUtilization: 0.5 })]);
+  // Explicit 'fixed' for the same reason as C8 — and here it also removes a real
+  // fragility: under the dynamic cap this fixture's effective weekly cap is 0.557
+  // against a 0.55 utilization, so it passed by a 0.007 margin rather than by design.
+  const m = am([oauth('only', { capUtilization: 0.5, capMode: 'fixed' })]);
   const a = m.accounts[0];
   a.quota.unified7d = 0.55;
   a.quota.unifiedStatus = 'allowed';
