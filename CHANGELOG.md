@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.22.0] - 2026-09-24
+
+### Added
+
+- Dynamic usage cap — the reserve shrinks as the window nears reset, instead of expiring unused
+
+### Fixed
+
+- Close the pre-mortem findings on the dynamic cap
+
 ## [1.21.4] - 2026-09-23
 
 ### Fixed
