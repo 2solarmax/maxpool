@@ -211,23 +211,31 @@ function capText(a, benched, am) {
   // scheduler is not using. `cap 50%>67%` reads as "reserved 50%, currently allowing
   // 67%"; the two collapse to one number while the cap sits at its floor, so an
   // early-window dynamic account looks exactly like the fixed one it replaced.
+  // The WINDOW is named, not just the number. `cap 50%>75%` alone is ambiguous in the
+  // way that matters for the decision the row exists to support ("is it safe for me to
+  // use this account myself right now?"): a lift driven by the 5h window means reduced
+  // protection for minutes, the same number off the weekly means DAYS of it. Council
+  // finding 2026-09-24.
   const eff = capEffectivePct(am, a);
-  const t = (eff != null && eff !== floorPct)
-    ? `cap ${floorPct}%>${eff}%`
+  const t = (eff != null && eff.pct !== floorPct)
+    ? `cap ${floorPct}%>${eff.pct}% ${eff.window}`
     : `cap ${floorPct}%`;
   return benched ? yellow(t) : dim(t);
 }
 
-/** The percentage routing is ACTUALLY enforcing on this account right now: the worse
- *  (lower) of its two windows' effective caps, which is the one that benches first.
- *  Null for a fixed cap or when the manager cannot compute one. */
+/** What routing is ACTUALLY enforcing on this account right now: the worse (lower) of
+ *  its two windows' effective caps — the one that benches first — AND WHICH window that
+ *  is. Returns {pct, window:'5h'|'wk'} or null for a fixed cap / when the manager cannot
+ *  compute one. The window label is load-bearing: the same percentage means "protection
+ *  is thin for the next few minutes" off the 5h window and "thin for days" off the weekly. */
 function capEffectivePct(am, a) {
   if (!am?._effectiveCap || a?.capMode !== 'dynamic') return null;
-  const vals = ['ses', 'wk']
-    .map(w => am._effectiveCap(a, w))
-    .filter(v => typeof v === 'number' && Number.isFinite(v));
+  const vals = [['ses', '5h'], ['wk', 'wk']]
+    .map(([w, label]) => ({ v: am._effectiveCap(a, w), window: label }))
+    .filter(e => typeof e.v === 'number' && Number.isFinite(e.v));
   if (!vals.length) return null;
-  return Math.round(Math.min(...vals) * 100);
+  const worst = vals.reduce((lo, e) => (e.v < lo.v ? e : lo));
+  return { pct: Math.round(worst.v * 100), window: worst.window };
 }
 
 /** PER-ACCOUNT SETTINGS the user set by hand — the last column's whole job

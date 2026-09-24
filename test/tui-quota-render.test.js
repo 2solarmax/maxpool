@@ -635,3 +635,26 @@ test('the cap tag turns yellow exactly when the dynamic cap is what benches the 
   assert.match(new TUI({ accountManager: am })._renderAcct(0, 11, true), /\x1b\[33m[Cc]ap 50%/,
     'benched by the cap → alarm colour, same contract as the fixed cap');
 });
+
+test('the ramped cap names WHICH window is governing — 50%>75% means nothing without it', () => {
+  // Council finding 2026-09-24: the same percentage means "thin for minutes" off the 5h
+  // window and "thin for days" off the weekly, and the row exists to answer "is it safe
+  // for me to use this account right now?".
+  const am = oauthAM();
+  const a = am.accounts[0];
+  a.capUtilization = 0.5;
+  a.capMode = 'dynamic';
+  // 5h window nearly over (ramps high), weekly fresh (floor) → the WEEKLY governs.
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 0.02 * 5 * 3600_000;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 7 * DAY;
+  assert.doesNotMatch(strip(new TUI({ accountManager: am })._renderAcct(0, 11, true)), /cap 50%>/,
+    'weekly at the floor governs, so there is no lift to advertise');
+
+  // Now the weekly is nearly over and the session is fresh → the SESSION governs.
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 0.05 * 5 * 3600_000;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 0.05 * 7 * DAY;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  const m = /cap 50%>(\d+)% (5h|wk)/.exec(line);
+  assert.ok(m, `expected a window-labelled ramped cap, got: ${line}`);
+  assert.equal(m[2], '5h', 'the 5h window is the lower of the two here, so it is named');
+});
