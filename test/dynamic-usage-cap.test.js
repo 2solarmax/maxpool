@@ -608,3 +608,27 @@ test('T14d: a reset stamp further out than a nominal window reads as "just start
   assert.equal(m._effectiveCap(a, 'wk', T0), 0.5, 'holds the floor, no negative elapsed');
   assert.equal(m._weeklyRawState(a, T0), 'capped', 'and the reserve is genuinely enforced');
 });
+
+// ── session-window oracle twin (architect finding 1, verified) ───────────────
+// The weekly arm got the ramp-crossing retry time; the session arm still held to the
+// full 5h reset. util 0.55 over a just-rolled floor-0.50 window is released at ~2.8h,
+// not 5h.
+
+test('T7g: a SESSION-capped dynamic account holds to the ramp crossing, not the 5h reset', () => {
+  const m = am([oauth('only', { capUtilization: 0.5, capMode: 'dynamic' })]);
+  const a = m.accounts[0];
+  const nowReal = Date.now();
+  const reset = nowReal + 5 * HOUR;                  // window just rolled
+  a.quota.unified5h = 0.55;
+  a.quota.unified5hReset = reset;
+  a.quota.unified7d = 0.1; a.quota.unified7dReset = nowReal + 6 * 24 * HOUR;  // healthy weekly
+  assert.equal(m._isSessionQuotaUnavailable(a, nowReal), true, 'precondition: benched');
+  const at = m._capUnbenchAt(a, 0.55, 'ses', nowReal);
+  assert.ok(at != null && at > nowReal && at < reset,
+    `crossing ${at} must be strictly before the reset ${reset}`);
+  // and the ORACLE uses it, not the reset
+  const retry = m.nextRetryForRequest({ profile: 'claude' });
+  assert.ok(retry && Number.isFinite(retry.retryAfterMs));
+  assert.ok(retry.retryAfterMs < 5 * HOUR,
+    `the client hold must beat the full window reset, got ${retry.retryAfterMs}ms`);
+});

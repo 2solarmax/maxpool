@@ -639,22 +639,33 @@ test('the cap tag turns yellow exactly when the dynamic cap is what benches the 
 test('the ramped cap names WHICH window is governing — 50%>75% means nothing without it', () => {
   // Council finding 2026-09-24: the same percentage means "thin for minutes" off the 5h
   // window and "thin for days" off the weekly, and the row exists to answer "is it safe
-  // for me to use this account right now?".
+  // for me to use this account right now?". Computed against ONE frozen clock for both
+  // the fixture and the render: capEffectivePct reads Date.now() internally, so a fresh
+  // Date.now() per line would make the assert race the ramp on a slow runner.
+  const t0 = Date.now();
   const am = oauthAM();
   const a = am.accounts[0];
   a.capUtilization = 0.5;
   a.capMode = 'dynamic';
   // 5h window nearly over (ramps high), weekly fresh (floor) → the WEEKLY governs.
-  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 0.02 * 5 * 3600_000;
-  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 7 * DAY;
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = t0 + 0.02 * 5 * 3600_000;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = t0 + 7 * DAY;
   assert.doesNotMatch(strip(new TUI({ accountManager: am })._renderAcct(0, 11, true)), /cap 50%>/,
     'weekly at the floor governs, so there is no lift to advertise');
 
   // Now the weekly is nearly over and the session is fresh → the SESSION governs.
-  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + 0.05 * 5 * 3600_000;
-  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 0.05 * 7 * DAY;
+  // The margins are chosen so the verdict survives run time: even if the render's
+  // Date.now() trails t0 by several seconds, the 5h window (15 min left) stays near
+  // its floor and the weekly (8.4h left) stays near its ceiling, so the 5h cap is
+  // strictly lower and the label cannot flip.
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = t0 + 0.05 * 5 * 3600_000;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = t0 + 0.05 * 7 * DAY;
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
   const m = /cap 50%>(\d+)% (5h|wk)/.exec(line);
   assert.ok(m, `expected a window-labelled ramped cap, got: ${line}`);
-  assert.equal(m[2], '5h', 'the 5h window is the lower of the two here, so it is named');
+  // The named window must BE the governing (lower) one — assert against the source of
+  // truth rather than a hard-coded '5h', which makes the test brittle to clock skew.
+  const eff = __tuiTest.capEffectivePct(am, a);
+  assert.equal(m[2], eff.window,
+    `the label must name the governing window: tag says ${m[2]}, governing is ${eff.window}`);
 });

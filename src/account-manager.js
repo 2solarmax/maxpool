@@ -1445,10 +1445,11 @@ export class AccountManager {
    *
    * The ceiling is switchThreshold and never 1.0, deliberately: the owner asked for a
    * cap that "always preserves some meaningful room for usage of those accounts outside
-   * of MaxPool". A fully-ramped dynamic account therefore behaves exactly like an
-   * UNCAPPED one — never more aggressively — so this mechanism can only ever make an
-   * account MORE available than the fixed cap it replaces (pinned by T3c). That
-   * one-directionality is why it is not a live-session control surface.
+   * of MaxPool". NOTE the invariant is the WEAKER one: never LESS available than the
+   * FIXED CAP it replaces (pinned by T3c) — NOT "identical to an uncapped account".
+   * Above the ceiling the cap still hard-benches ('capped', ahead of the upstreamAllows
+   * carve-out) where the uncapped twin would read 'reserve' and stay routable. That is
+   * the reservation doing its job at the margin, not a parity bug.
    *
    * Fails CLOSED in every uncertain case (no stamp, unusable duration): an unknown
    * window position returns the floor, never an opened-up cap.
@@ -1946,7 +1947,13 @@ export class AccountManager {
     }
 
     if (q.unified5h != null && q.unified5h >= bench) {
-      return { cause: 'session_limit', retryAt: q.unified5hReset || null, queueable: Boolean(q.unified5hReset) };
+      // DYNAMIC CAP twin of the weekly arm's _capUnbenchAt: a rising session cap
+      // unbenches at its own ramp crossing, often hours before the 5h reset. Without
+      // this, util 0.55 over a floor 0.50 that has just rolled tells the client to wait
+      // ~5h when the cap releases it at ~2.8h (architect finding 2026-09-24).
+      const crossing = this._capUnbenchAt(account, q.unified5h, 'ses', now);
+      const retryAt = crossing ?? (q.unified5hReset || null);
+      return { cause: 'session_limit', retryAt, queueable: Boolean(retryAt) };
     }
 
     if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
@@ -4202,10 +4209,6 @@ export class AccountManager {
         // the restart AND the next `cc all` header re-send (the upsert guard).
         capUtilization: a.capUtilization ?? null,
         capMode: a.capMode ?? null,
-        capEffective: a.capUtilization == null ? null : {
-          ses: this._effectiveCap(a, 'ses'),
-          wk: this._effectiveCap(a, 'wk'),
-        },
       }));
   }
 
@@ -4420,10 +4423,6 @@ export class AccountManager {
         priority: a.priority,
         capUtilization: a.capUtilization ?? null,
         capMode: a.capMode ?? null,
-        capEffective: a.capUtilization == null ? null : {
-          ses: this._effectiveCap(a, 'ses'),
-          wk: this._effectiveCap(a, 'wk'),
-        },
         runtime: a.runtime,
         status: a.status,
         refreshDead: Boolean(a.refreshDead),
