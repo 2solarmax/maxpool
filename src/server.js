@@ -1193,6 +1193,39 @@ async function forwardRequest(
       // the API's own stated rule, so no failover is needed and the user never sees the
       // 400. One-shot per request via its own flag so a second ordering 400 (a rule we
       // have not modeled) still surfaces honestly instead of looping.
+      // THE REPAIR'S OWN REJECTION (2026-09-25): some accounts' validators 400 the
+      // output_config FIELD ITSELF ("Extra inputs are not permitted") even though the
+      // ordering rule's own error text names it as the accepted form — a gradual
+      // rollout on Anthropic's side (max@dubner.io and mk@gomokka rejected it same-day
+      // while max@gomokka.com accepted the identical repaired body). When that happens,
+      // fall back to position-preserving re-anchoring instead of surfacing the 400.
+      const isDirectiveFormRejection = account.type !== 'provider'
+        && upstreamRes.status === 400
+        && /output_config[^:]*: *Extra inputs are not permitted/i.test(errorBody);
+      if (isDirectiveFormRejection && requestInfo.orderingRepaired && !requestInfo.orderingFallback && canRepairBody) {
+        // Rewrite every directive-only system (the repair's own output) as a PLAIN
+        // assistant turn carrying the directives text — ordinary history, accepted by
+        // every validator, nothing dropped. A system ENDING the array stays legal
+        // everywhere, so it is left alone.
+        const json = JSON.parse(body.toString('utf8'));
+        let folded = 0;
+        json.messages = (json.messages ?? []).map((m, i, arr) => {
+          if (m?.role !== 'system' || !('output_config' in m)) return m;
+          if (i === arr.length - 1) return m;   // end-of-array system is legal universally
+          folded++;
+          const text = String(m.output_config?.directives ?? '');
+          return { role: 'assistant', content: text ? [{ type: 'text', text }] : [{ type: 'text', text: '(system directive)' }] };
+        });
+        if (folded > 0) {
+          const fixedBody = Buffer.from(JSON.stringify(json));
+          console.log(`[Maxpool] Account rejects the directive-only form — folded ${folded} system directive(s) into plain turns`);
+          return forwardRequest(
+            req, res, fixedBody, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, { ...requestInfo, orderingFallback: true, repairCount: repairCount + 1 },
+            fixedBody.length <= retryConfig.maxRetryBufferBytes, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+      }
       if (isOrderingRejection && !requestInfo.orderingRepaired && canRepairBody) {
         const coord = /messages\.(\d+)/.exec(errorBody);
         const { messages: fixedMessages, converted } = directiveOnlySystemMessages(
@@ -2144,9 +2177,16 @@ function directiveOnlySystemMessages(messages, coordIndex = -1) {
   };
   const out = messages.map((m, i) => {
     if (coordIndex >= 0 ? i !== coordIndex : !violates(i)) return m;
-    const text = (Array.isArray(m.content) ? m.content : [])
-      .map(b => (typeof b?.text === 'string' ? b.text : ''))
-      .filter(Boolean).join('\n');
+    // Content arrives BOTH ways: array-of-blocks (compaction boundaries) and a plain
+    // STRING (injected reminders — the common CLI shape). Reading only the array form
+    // silently DISCARDED every string system message's text: the directive went out
+    // empty AND some accounts 400 the emptied shape (measured 2026-09-25: directives ""
+    // -> "messages.6.output_config: Extra inputs are not permitted").
+    const text = typeof m.content === 'string'
+      ? m.content
+      : (Array.isArray(m.content) ? m.content : [])
+          .map(b => (typeof b?.text === 'string' ? b.text : ''))
+          .filter(Boolean).join('\n');
     converted++;
     // output_config shape per the API's own 400 text: directive-only system.
     return { role: 'system', content: [], output_config: { directives: text } };

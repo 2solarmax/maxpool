@@ -105,3 +105,71 @@ test('a system at index 0 is left alone (first-message rules own it, not this re
   assert.equal(r.converted, 0);
   assert.equal(r.messages[0].content[0].text, 'leading system', 'untouched');
 });
+
+
+// ── 2026-09-25: the two live defects from the desktop-app test ───────────────
+// 1. STRING content was silently dropped (directives: "") — the common CLI shape.
+// 2. Some accounts reject the output_config FIELD itself; the repair must fold the
+//    directive into a plain assistant turn rather than surface the 400.
+
+test('string-form system content is preserved in the directive (not emptied)', () => {
+  const msgs = [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+    { role: 'system', content: 'mid-conversation reminder' },   // STRING — the real shape
+    { role: 'user', content: 'go' },
+  ];
+  const { messages, converted } = directiveOnlySystemMessages(msgs, 2);
+  assert.equal(converted, 1);
+  assert.equal(messages[2].output_config.directives, 'mid-conversation reminder',
+    'the text must survive the conversion');
+});
+
+test('array-form system content is still extracted block-wise', () => {
+  const msgs = [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+    { role: 'system', content: [{ type: 'text', text: 'line one' }, { type: 'text', text: 'line two' }] },
+    { role: 'user', content: 'go' },
+  ];
+  const { messages, converted } = directiveOnlySystemMessages(msgs, 2);
+  assert.equal(converted, 1);
+  assert.equal(messages[2].output_config.directives, 'line one\nline two');
+});
+
+test('a directive-only system mid-array folds to a plain assistant turn on rejection', () => {
+  // Simulate exactly what the request path does when an account 400s the field itself:
+  const orig = [
+    { role: 'user', content: 'a' },
+    { role: 'assistant', content: [{ type: 'text', text: 'b' }] },
+    { role: 'system', content: 'keep me' },
+    { role: 'user', content: 'c' },
+  ];
+  const { messages } = directiveOnlySystemMessages(orig, 2);
+  // the fold from the request path, verbatim shape:
+  let folded = 0;
+  const out = messages.map((m, i, arr) => {
+    if (m?.role !== 'system' || !('output_config' in m)) return m;
+    if (i === arr.length - 1) return m;
+    folded++;
+    return { role: 'assistant', content: [{ type: 'text', text: String(m.output_config.directives) }] };
+  });
+  assert.equal(folded, 1);
+  assert.equal(out[2].role, 'assistant');
+  assert.equal(out[2].content[0].text, 'keep me', 'the directive text is preserved, not dropped');
+  assert.ok(!('output_config' in out[2]), 'the field the account rejects is gone');
+});
+
+test('an end-of-array directive-only system is left alone in the fold', () => {
+  const messages = [
+    { role: 'user', content: 'a' },
+    { role: 'assistant', content: [] },
+    { role: 'system', content: [], output_config: { directives: 'tail' } },
+  ];
+  const out = messages.map((m, i, arr) => {
+    if (m?.role !== 'system' || !('output_config' in m)) return m;
+    if (i === arr.length - 1) return m;
+    return m;
+  });
+  assert.equal(out[2].role, 'system', 'tail system is legal everywhere — untouched');
+});
