@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.0] - 2026-09-26
+
+### Added
+
+- A no-weekly account becomes the default route until its session window is nearly full
+
+### Fixed
+
+- Remote Control "server unreachable" was direct-pool saturation + a stall timer that never disarmed
+
 ## [1.22.3] - 2026-09-25
 
 ### Fixed
