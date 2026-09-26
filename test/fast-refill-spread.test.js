@@ -102,13 +102,14 @@ test('S2: EQUILIBRIUM share with in-flight accrual — ~1/mult, no starvation', 
   // The real assertion of this change: not "cheaper for one request" but "settles
   // at a higher steady share" IN THE LIVE REGIME. With in-flight accrual the
   // marginal price of traffic to the discounted account is cost*mult, so
-  // equilibrium lands near 1/mult (~1.9x at mult 0.529); the steep past-D floor
-  // and the hard gates keep it from starving anyone. Pre-fix: parity (1.05x).
+  // equilibrium lands near 1/mult. Since SOAK MODE (2026-09-26) the early-window
+  // multiplier is ~0.2 (soakDiscount 0.9) so the equilibrium is ~5x, clamped by the
+  // steep past-D floor; pre-soak it was ~1.9x (mult 0.529), pre-fast-refill parity.
   const { am, now } = pair();
   const picks = simulate(am, now, 3000);
   const ratio = picks['glm-unl'] / picks['glm-wk'];
-  assert.ok(ratio > 1.5, `unlimited should run meaningfully hotter, got ${ratio.toFixed(2)}x`);
-  assert.ok(ratio < 3.5, `but never starve the sibling, got ${ratio.toFixed(2)}x`);
+  assert.ok(ratio > 2.5, `unlimited should run far hotter under soak, got ${ratio.toFixed(2)}x`);
+  assert.ok(ratio < 12, `but never starve the sibling, got ${ratio.toFixed(2)}x`);
   assert.ok(picks['glm-wk'] > 400, 'the weekly-limited sibling still gets real traffic');
 });
 
@@ -131,8 +132,9 @@ test('S3: the preference fades as the fast window fills', () => {
 test('S4: AT/ABOVE the fade point the spread term is byte-identical to pre-fix', () => {
   // multiplier is exactly 1 there, so `share * weight * 1 === share * weight`.
   // This is the invariant that makes the change safe: it can only ever act inside
-  // the window where fast-refill was already acting.
-  const { am, u, w, now } = pair({ unlSes: 0.65 });
+  // the window where the preference was already acting. Since SOAK MODE the fade
+  // point is soakFadeUtil (0.90), not fastRefillFadeUtil (0.65).
+  const { am, u, w, now } = pair({ unlSes: 0.90 });
   const ctx = equalShare(am, now);
   assert.equal(am._fastRefillMultiplier(u), 1, 'discount fully faded at the fade point');
   const su = am._scoreAccount(u, { weight: 1 }, ctx);
@@ -224,6 +226,9 @@ test('S9: a capped unlimited account is still BENCHED — the discount never buy
 
 test('S10: fastRefillDiscount = 0 restores exact pre-2026-08-25 scoring', () => {
   const { am, u, w, now } = pair();
+  // (post-soak: the weeklyAbsent account reads soakDiscount, so turning THIS knob
+  // off must also neutralize soak — K6 pins the soak knob itself)
+  am.scheduler.soakDiscount = 0;
   am.scheduler.fastRefillDiscount = 0;
   const ctx = equalShare(am, now);
   assert.equal(am._fastRefillMultiplier(u), 1);
@@ -231,4 +236,91 @@ test('S10: fastRefillDiscount = 0 restores exact pre-2026-08-25 scoring', () => 
   const sw = am._scoreAccount(w, { weight: 1 }, ctx);
   // Both pay full spread; only the real quota difference separates them.
   assert.ok(sw - su < 0.5, `feature off → no spread-sized gap, got ${(sw - su).toFixed(3)}`);
+});
+
+// ── SOAK MODE (owner-directed 2026-09-26) ────────────────────────────────────
+// "This account has no weekly limit — send as many requests as possible to it, the
+// only thing to watch is the session limit, which resets fast anyway."
+// Measured before this change: the no-weekly account took 50 of 162 GLM requests
+// (~31%) — near parity, because fastRefill's 0.6 discount faded out at ses 0.65 and
+// the spread term pulled it back to the fleet mean. Soak escalates the same mechanism
+// (0.9 discount, fade at 0.9) so it is the DEFAULT route until its window is nearly
+// full, while every hard gate stays exactly where it was.
+
+test('K1: soak mode is ON BY DEFAULT for a weekly-less account (no config needed)', () => {
+  const { am, u } = pair({ unlSes: 0.10 });
+  assert.equal(am.scheduler.soakDiscount, 0.9, 'default soak discount ships enabled');
+  const mult = am._fastRefillMultiplier(u);
+  // 1 - 0.9*(1 - 0.10/0.9) = 1 - 0.9*0.889 = 0.2
+  assert.ok(Math.abs(mult - 0.2) < 0.01, `expected ~0.2 early-window multiplier, got ${mult.toFixed(3)}`);
+});
+
+test('K2: soak is MUCH stronger than the old fast-refill preference at the same utilization', () => {
+  const { am, u } = pair({ unlSes: 0.10 });
+  const soakMult = am._fastRefillMultiplier(u);
+  // Recreate the pre-soak behaviour by pointing the knobs back at the old values.
+  am.scheduler.soakDiscount = am.scheduler.fastRefillDiscount;   // 0.6
+  am.scheduler.soakFadeUtil = am.scheduler.fastRefillFadeUtil;   // 0.65
+  const oldMult = am._fastRefillMultiplier(u);
+  assert.ok(soakMult < oldMult,
+    `soak must prefer the account more strongly than fast-refill did (${soakMult.toFixed(3)} vs ${oldMult.toFixed(3)})`);
+});
+
+test('K3: a weekly-LIMITED sibling is never soaked — the preference is weekly-less only', () => {
+  const { am, w } = pair();
+  assert.equal(am._fastRefillMultiplier(w), 1, 'a weekly-limited account scores undiscounted');
+});
+
+test('K4: the preference holds nearly to the top of the session window, then reaches parity', () => {
+  const { am, u } = pair();
+  const at = (ses) => { u.quota.providerSes = ses; return am._fastRefillMultiplier(u); };
+  assert.ok(at(0.50) < 0.7, 'still strongly preferred at half a window');
+  assert.ok(at(0.80) < 1, 'still preferred at 80% — the old design had already faded out here');
+  assert.equal(at(0.90), 1, 'exact parity at the fade point');
+  assert.equal(at(0.99), 1, 'and above it');
+});
+
+test('K5: soaking never routes past a HARD gate — session bench, cap and request cap all hold', () => {
+  const { am, u } = pair({ unlSes: 0.10 });
+  // The session window is the ONLY thing bounding a soak, so it must still bench.
+  u.quota.providerSes = 0.99;
+  assert.equal(am._isSessionQuotaUnavailable(u), true,
+    'a full session window benches the account no matter how cheap soak makes it score');
+  // A usage cap still wins over cheapness.
+  u.quota.providerSes = 0.10;
+  u.capUtilization = 0.05;
+  u.capMode = 'fixed';
+  assert.equal(am._isAvailable(u), false, 'an owner cap outranks soak');
+  // And the hard per-account in-flight gate is a count, not a score.
+  assert.equal(am.scheduler.safetyMaxActivePerAccount, 50, 'hard request gate unchanged');
+});
+
+test('K6: soakDiscount = 0 turns the feature off and restores fast-refill exactly', () => {
+  const { am, u } = pair({ unlSes: 0.10 });
+  am.scheduler.soakDiscount = 0;
+  assert.equal(am._fastRefillMultiplier(u), 1, 'feature off → undiscounted');
+});
+
+test('K7: soak shows up where it matters — the account WINS the score against a healthy sibling', () => {
+  const { am, u, w, now } = pair({ unlSes: 0.10, wkSes: 0.10, wkWeekly: 0.45 });
+  const ctx = equalShare(am, now);
+  const su = am._scoreAccount(u, { weight: 1 }, ctx);
+  const sw = am._scoreAccount(w, { weight: 1 }, ctx);
+  assert.ok(su < sw, `the weekly-less account must score cheaper (soak ${su.toFixed(3)} vs sibling ${sw.toFixed(3)})`);
+  // And by a wide margin — this is the "as many requests as possible" intent, not a nudge.
+  assert.ok(sw - su > 1, `the margin must be decisive, got ${(sw - su).toFixed(3)}`);
+});
+
+
+test('K8: soak NEVER starves the weekly-limited sibling — the safety floor holds', () => {
+  // The exact defect the first soak implementation shipped with: soakDiscount 0.9
+  // also weakened the past-D in-flight floor, and the production-shaped simulation
+  // gave the unlimited account EVERY pick (ratio Infinity, sibling starved). The floor
+  // now clamps at fast-refill's 0.6, so soak changes WHERE traffic goes at equal
+  // depth, not how deep one account may stack.
+  const { am, now } = pair();
+  const picks = simulate(am, now, 3000);
+  const ratio = picks['glm-unl'] / picks['glm-wk'];
+  assert.ok(Number.isFinite(ratio), `sibling must not be starved, got ${ratio}`);
+  assert.ok(picks['glm-wk'] > 400, `the weekly-limited sibling still gets real traffic (${picks['glm-wk']})`);
 });

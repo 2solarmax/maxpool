@@ -156,6 +156,16 @@ const DEFAULT_SCHEDULER = {
   // half of every window, then opens it up over the second half — so the reserve is
   // protected while there is still time to use it, and spent when there is not.
   capRampStart: 0.5,
+  // SOAK MODE (owner-directed 2026-09-26): an account with NO weekly limit (z.ai
+  // no-weekly plans, quota.weeklyAbsent) should soak up as much traffic as its session
+  // window allows — its capacity expires unused every ~5h, while weekly-limited
+  // siblings pay a whole week for the same requests. Escalates fast-refill from
+  // "a preference that fades" to "the default route, bounded by the session window
+  // and the hard anti-dogpile gates". soakDiscount 0.9 ≈ 10x early-window preference;
+  // soakFadeUtil 0.9 keeps the preference until the session window is nearly full
+  // (parity only in the last stretch, where capacity really is running out).
+  soakDiscount: 0.9,
+  soakFadeUtil: 0.9,
   // Routing-cost tuning (lower cost = preferred). The goal is to AVOID
   // short-term (rate/concurrency) throttling by spreading load across healthy
   // accounts. So in-flight concurrency is the DOMINANT term, with a steep
@@ -2798,8 +2808,18 @@ export class AccountManager {
     // per unit, still >2x the largest balancing term at the max discount) and
     // the hard per-account request gate (safetyMaxActivePerAccount), cooldowns
     // and failurePenalty remain undiscounted backstops.
+    // SAFETY TERM — carries fastRefill's discount but NOT soak's (2026-09-26). The
+    // past-D floor is what forces load to fan out before an account is dogpiled toward
+    // a 429. Under soakDiscount 0.9 a discounted floor is 10x weaker, and the
+    // production-shaped simulation (RTT 20s, weight 50) showed the consequence: the
+    // unlimited account wins EVERY pick until the weekly-limited sibling is fully
+    // starved — the account then rides at extreme in-flight depth and eats 429s, the
+    // exact outcome the floor exists to prevent. A soak preference should change WHERE
+    // traffic goes at equal depth, not how deep one account is allowed to stack.
+    const safetyMult = this.scheduler.soakDiscount < 1
+      ? this._fastRefillMultiplier(account, { capFloor: true }) : refillMult;
     const capPenalty = this.scheduler.capPenaltyWeight
-      * Math.max(0, inflight - concTarget) * refillMult;
+      * Math.max(0, inflight - concTarget) * safetyMult;
 
     // Burn-pace COST only (demoted from the old dominant scarcity×6 term): a
     // soft de-preference of accounts burning ahead of an even pace. Never a bench.
@@ -3092,11 +3112,22 @@ export class AccountManager {
    * non-negative band structure reserveFloorCost/criticalPressureCost were calibrated
    * against), and never on safety terms (concurrency, capPenalty, reserve, critical).
    */
-  _fastRefillMultiplier(account) {
-    const disc = this.scheduler.fastRefillDiscount;
+  _fastRefillMultiplier(account, { capFloor = false } = {}) {
+    // SOAK MODE (2026-09-26): the multiplier call-site is shared, so the escalation is
+    // a knob swap here — the caller's invariants (balancing terms only, hard gates
+    // untouched, fades to 1) all hold unchanged. `capFloor: true` clamps the discount
+    // at fastRefill's historical 0.6 — used ONLY by the past-D safety floor so a soak
+    // preference cannot weaken anti-dogpile protection (see the capPenalty site).
+    const soak = account?.type === 'provider' && account.quota?.weeklyAbsent;
+    let disc = soak ? this.scheduler.soakDiscount : this.scheduler.fastRefillDiscount;
+    if (capFloor) disc = Math.min(disc, this.scheduler.fastRefillDiscount);
     if (!(disc > 0)) return 1;                       // feature off → multiplier 1
-    if (!(account?.type === 'provider' && account.quota?.weeklyAbsent)) return 1;
-    const fade = this.scheduler.fastRefillFadeUtil;
+    if (!soak) return 1;                             // (non-weeklyAbsent never reaches here with soak)
+    // The FADE is clamped under capFloor as well: clamping only the discount left
+    // soak's wider fade (0.90) applying a residual ~0.98 multiplier at ses 0.87 —
+    // inside the reserve band, which the floor is supposed to protect absolutely.
+    let fade = soak ? this.scheduler.soakFadeUtil : this.scheduler.fastRefillFadeUtil;
+    if (capFloor) fade = Math.min(fade, this.scheduler.fastRefillFadeUtil);
     const ses = clamp01(account.quota.providerSes ?? 0);
     if (ses >= fade) return 1;
     // 1 at ses=0 → 1-disc at ses=0; linear to 1 at ses=fade
@@ -4470,7 +4501,13 @@ export class AccountManager {
         // actually being applied — a flag that can never show "inert" is not a
         // monitorable feature. Mirrors the peak block's shape.
         fastRefill: {
-          enabled: this.scheduler.fastRefillDiscount > 0,
+          // Reports BOTH regimes: `discount`/`fadeUtil` are fast-refill's, and `soak`
+          // names what a weeklyAbsent account actually runs on — the per-account
+          // `multiplier` rows below are computed from the soak knobs for those
+          // accounts, so advertising only the fast-refill numbers made the block
+          // describe settings that were not in force (caught 2026-09-26).
+          enabled: this.scheduler.fastRefillDiscount > 0 || this.scheduler.soakDiscount > 0,
+          soak: { discount: this.scheduler.soakDiscount, fadeUtil: this.scheduler.soakFadeUtil },
           discount: this.scheduler.fastRefillDiscount,
           fadeUtil: this.scheduler.fastRefillFadeUtil,
           accounts: this.accounts

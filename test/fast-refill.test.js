@@ -32,10 +32,13 @@ function makeAm(opts = {}) {
 // ---------- _fastRefillMultiplier ----------
 
 test('multiplier: full discount at 0% session, decays linearly, gone at fade point', () => {
+  // Since SOAK MODE (2026-09-26) a weeklyAbsent fixture reads soakDiscount/soakFadeUtil
+  // (0.9/0.9) — the fast-refill path is pinned with soak neutralized to its old knobs.
   const am = makeAm();
   const unltd = am.accounts[0];
-  const disc = am.scheduler.fastRefillDiscount; // 0.6
-  const fade = am.scheduler.fastRefillFadeUtil; // 0.65
+  am.scheduler.soakDiscount = am.scheduler.fastRefillDiscount; // 0.6
+  am.scheduler.soakFadeUtil = am.scheduler.fastRefillFadeUtil; // 0.65
+  const disc = 0.6, fade = 0.65;
   unltd.quota.providerSes = 0;
   assert.equal(am._fastRefillMultiplier(unltd), 1 - disc);
   unltd.quota.providerSes = fade / 2;
@@ -54,7 +57,9 @@ test('multiplier: NOT applied to weekly-limited providers or Claude accounts', (
 });
 
 test('multiplier: feature off (discount 0) returns exactly 1', () => {
+  // soakDiscount is the weeklyAbsent off-switch now — both off for a clean 1.
   const am = makeAm({ fastRefillDiscount: 0 });
+  am.scheduler.soakDiscount = 0;
   assert.equal(am._fastRefillMultiplier(am.accounts[0]), 1);
 });
 
@@ -103,6 +108,10 @@ test('score: in-flight burst cost scales by mult for unltd, full for limited', (
   // burst cost is exactly mult× the limited account's (same util) at every depth
   // — a proportional softening, never more (no flat bonus leaking in).
   const am = makeAm();
+  // post-soak: use the OLD knob values so this proportionality pin stays about
+  // fast-refill's shape (soak's stronger values are pinned in fast-refill-spread K*)
+  am.scheduler.soakDiscount = am.scheduler.fastRefillDiscount;
+  am.scheduler.soakFadeUtil = am.scheduler.fastRefillFadeUtil;
   const unltd = am.accounts[0];
   const ctx = am._scoringContext();
   const mult = am._fastRefillMultiplier(unltd);
@@ -170,9 +179,12 @@ test('peak: fast-refill does NOT touch the peak tier — unltd still de-preferre
 
 test('score: at session util in the reserve band the reserve floor is NOT discounted', () => {
   // _weeklyRawState for a provider = max(ses, wk=null) — so a weeklyAbsent account at
-  // ses 0.87 IS weekly-reserve. The discount fades to 0 by 0.65, so reserveCost must
-  // pay FULL freight there; if the multiplier ever leaked onto it, the anti-dogpile
-  // floor would silently soften exactly where quota is lowest.
+  // ses 0.87 IS weekly-reserve. reserveCost must pay FULL freight there; if the
+  // multiplier ever leaked onto it, the anti-dogpile floor would silently soften
+  // exactly where quota is lowest. Post-SOAK (2026-09-26) this is a STRONGER pin than
+  // it was: soakFadeUtil is 0.90, so at ses 0.87 the account IS still discounted on its
+  // balancing terms — the floor being undiscounted is now a real separation, not a
+  // consequence of the discount already having faded to zero at 0.65.
   const am = makeAm();
   const unltd = am.accounts[0];
   unltd.quota.providerSes = 0.87;
@@ -186,14 +198,22 @@ test('score: at session util in the reserve band the reserve floor is NOT discou
   assert.equal(rc, 5, 'provider in reserve pays the full floor, never a discounted one');
   assert.equal(rc, am.scheduler.reserveFloorCost, 'and that floor is the configured one');
 
-  // STRUCTURAL guarantee, not a coincidence: reserve starts at 0.85 and the discount
-  // is fully faded by fastRefillFadeUtil (0.65), so the multiplier is EXACTLY 1
-  // everywhere the reserve/critical bands live. This is why the discount can never
-  // soften a safety term even if someone later multiplied one by it — pin the
-  // relationship so a config change that inverts it fails here.
+  // STRUCTURAL guarantee, not a coincidence: reserve starts at 0.85 and FAST-REFILL's
+  // discount is fully faded by fastRefillFadeUtil (0.65), so that multiplier is EXACTLY
+  // 1 everywhere the reserve/critical bands live — pin the relationship so a config
+  // change that inverts it fails here. SOAK MODE deliberately breaks this shape
+  // (soakFadeUtil 0.90 > 0.85): a no-weekly account's SESSION window is its only
+  // limit, so its balancing terms stay preferred even in the band its own utilization
+  // creates — while every SAFETY term (this floor, capPenalty via the capFloor clamp,
+  // critical, ramp, failure, all hard gates) stays undiscounted. That separation is
+  // pinned by the K5/K8 soak tests; what THIS pin guards is that the fast-refill path
+  // still keeps the old geometry.
   assert.ok(am.scheduler.fastRefillFadeUtil <= am.scheduler.weeklyReserveThreshold,
     'fade point must sit at or below the reserve threshold');
-  assert.equal(am._fastRefillMultiplier(unltd), 1, 'multiplier is 1 throughout the reserve band');
+  // (the fixture account is weeklyAbsent, so it reads soak knobs — assert via the
+  // capFloor route which clamps to fast-refill strength)
+  assert.equal(am._fastRefillMultiplier(unltd, { capFloor: true }), 1,
+    'multiplier is 1 throughout the reserve band (capFloor clamps soak to fast-refill)');
 });
 
 // ---------- persistence ----------
@@ -226,6 +246,36 @@ test('status: fastRefill block exposes armed + per-account multiplier', () => {
   assert.equal(fr.discount, 0.6);
   const row = fr.accounts.find(a => a.name === 'unltd');
   assert.ok(row, 'unltd row present');
-  assert.equal(row.multiplier, 0.557); // 1 - 0.6*(1 - 0.17/0.65) = 0.5569…
+  // post-soak: 1 - 0.9*(1 - 0.17/0.90) = 0.13 (weeklyAbsent reads soak knobs now)
+  // soak: 1 - 0.9*(1 - 0.17/0.90) = 0.27
+  assert.equal(row.multiplier, 0.27);
   assert.equal(fr.accounts.length, 1); // limited excluded
+});
+
+test('soak: the capFloor clamp is ABSOLUTE inside the reserve band (discount AND fade)', () => {
+  // Shipped-then-caught 2026-09-26: capFloor clamped only the DISCOUNT, so soak's wider
+  // fade (0.90) still applied a residual 0.98 multiplier at ses 0.87 — inside the
+  // reserve band the safety floor exists to protect absolutely.
+  const am = makeAm();
+  const unltd = am.accounts[0];
+  for (const ses of [0.85, 0.87, 0.90, 0.95, 0.99]) {
+    unltd.quota.providerSes = ses;
+    assert.equal(am._fastRefillMultiplier(unltd, { capFloor: true }), 1,
+      `the safety floor must be undiscounted at ses ${ses}, not merely reduced`);
+  }
+});
+
+test('soak: the status block names the regime actually in force', () => {
+  // The block advertised discount 0.6 / fadeUtil 0.65 while a weeklyAbsent account ran
+  // on soak's 0.9/0.9 — a TUI reading it would describe settings that were not applied.
+  const am = makeAm();
+  const fr = am.getStatus().scheduler.fastRefill;
+  assert.ok(fr.soak, 'the soak regime is reported');
+  assert.equal(fr.soak.discount, am.scheduler.soakDiscount);
+  assert.equal(fr.soak.fadeUtil, am.scheduler.soakFadeUtil);
+  const row = fr.accounts.find(a => a.name === 'unltd');
+  // and the per-account multiplier is consistent with the SOAK knobs it actually uses
+  const expected = 1 - fr.soak.discount * (1 - row.sesUtilization / fr.soak.fadeUtil);
+  assert.ok(Math.abs(row.multiplier - expected) < 0.005,
+    `row multiplier ${row.multiplier} must follow the soak knobs (${expected.toFixed(3)})`);
 });
