@@ -424,3 +424,98 @@ gateDescribe('rc-gate: a long-poll path with slow headers is NEVER stall-destroy
     up.close();
   }
 });
+
+// ── incident 6 (2026-09-26): pool saturation read as "server unreachable" ────
+// 43 live RC sessions against a 64-socket direct pool: 64 ESTABLISHED (pinned at the
+// cap) + 9 SYN_SENT queued. A queued short RPC blew the 30s headers timer, was
+// destroyed, and reconnected into the same saturated pool — stalls climbed 823/hr to
+// 4,100/hr and the CLI reported "could not reach the Remote Control server for about
+// 30 minutes" while the network was perfectly fine.
+//
+// Both tests need a SLOW upstream: with the instant-answering fakeAnthropic, a queue
+// wait is milliseconds and the stall timer never fires, so the test passes against
+// broken code (measured — the first version of these two tests survived both mutants).
+
+/** An upstream that holds each request open for `holdMs` before answering — the only
+ *  way to make one request's occupancy exceed the next one's stall budget. */
+function slowAnthropic(holdMs) {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push(req.url);
+    req.resume();
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    }, holdMs);
+  });
+  return { server, seen };
+}
+
+gateDescribe('rc-gate: a request QUEUED for a socket is not destroyed by the stall timer', async () => {
+  // ONE socket to the upstream; each request occupies it for 2s; stall budget 3s.
+  // Geometry: hold < budget < 2*hold (2000 < 3000 < 4000), with ~1s of slack for the
+  // two TLS handshakes (client->gate MITM and gate->upstream) — a tighter budget made
+  // the test measure handshake latency instead of the mechanism.
+  //   old code (timer armed at creation): B destroyed at 3s (it finishes at ~4s) -> 502
+  //   new code (timer armed on socket):   B's budget starts when it gets the socket -> served
+  const up = slowAnthropic(2000);
+  const ups = asTLS(up.server);
+  await new Promise(r => ups.listen(0, r));
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_MAXPOOL_PORT: '1',
+    RC_GATE_DIRECT_HOST: '127.0.0.1',
+    RC_GATE_DIRECT_PORT: String(ups.address().port),
+    RC_GATE_DIRECT_MAX_SOCKETS: '1',
+    RC_GATE_DIRECT_STALL_MS: '3000',
+  });
+  try {
+    const { tls: a } = await mitmConnect(gate.port);
+    const { tls: b } = await mitmConnect(gate.port);
+    const pa = httpOverTLS(a, 'GET', '/v1/code/sessions/cse_q1', { accept: 'application/json' });
+    await new Promise(r => setTimeout(r, 120));      // let A take the only socket
+    const pb = httpOverTLS(b, 'GET', '/v1/code/sessions/cse_q2', { accept: 'application/json' });
+    const [ra, rb] = await Promise.all([pa, pb]);
+    assert.ok(/^HTTP\/1\.1 200/.test(ra), `A must succeed, got: ${ra.slice(0, 90)}`);
+    assert.ok(/^HTTP\/1\.1 200/.test(rb),
+      `B waited for a socket and must still be served — not destroyed for queueing. Got: ${rb.slice(0, 90)}`);
+    assert.ok(!/no response headers in/.test(gate.getLog()),
+      `the stall timer must not fire on a queue wait. Gate log:\n${gate.getLog().slice(-400)}`);
+  } finally { gate.kill(); await new Promise(r => ups.close(r)); }
+});
+
+gateDescribe('rc-gate: telemetry batches do not consume the Remote Control socket pool', async () => {
+  // Telemetry occupies a socket for 1s; stall budget 1.5s. On its OWN agent the RC
+  // lifeline takes the free direct socket and completes in ~1s. On a SHARED pool the
+  // lifeline queues 1s behind telemetry, then holds 1s = 2s > 1.5s budget → destroyed.
+  const up = slowAnthropic(1000);
+  const ups = asTLS(up.server);
+  await new Promise(r => ups.listen(0, r));
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_MAXPOOL_PORT: '1',
+    RC_GATE_DIRECT_HOST: '127.0.0.1',
+    RC_GATE_DIRECT_PORT: String(ups.address().port),
+    RC_GATE_DIRECT_MAX_SOCKETS: '1',
+    RC_GATE_DIRECT_STALL_MS: '1500',
+  });
+  try {
+    const { tls: t1 } = await mitmConnect(gate.port);
+    const { tls: t2 } = await mitmConnect(gate.port);
+    const telemetry = httpOverTLS(t1, 'POST', '/api/event_logging/v2/batch',
+      { 'content-type': 'application/json' }, JSON.stringify({ events: [{ n: 1 }] }));
+    await new Promise(r => setTimeout(r, 120));      // telemetry takes its socket first
+    const t0 = Date.now();
+    const lifeline = httpOverTLS(t2, 'POST', '/v1/code/sessions/cse_rc1/bridge',
+      { 'content-type': 'application/json' }, JSON.stringify({ ping: true }));
+    const rl = await lifeline;
+    const waited = Date.now() - t0;
+    assert.ok(/^HTTP\/1\.1 200/.test(rl),
+      `the RC lifeline must be served while telemetry is in flight, got: ${rl.slice(0, 90)}`);
+    // On its own agent the lifeline never waits for telemetry's socket: it completes in
+    // about one upstream hold (1.5s), not two (3s).
+    assert.ok(waited < 2200,
+      `the lifeline must not queue behind telemetry (waited ${waited}ms — looks like a shared pool)`);
+    await telemetry;
+  } finally { gate.kill(); await new Promise(r => ups.close(r)); }
+});

@@ -38,7 +38,26 @@ import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
 // which is what starved new CONNECTs and made Remote Control "keep dropping after
 // each reconnect". Pooled agents reuse connections and bound the socket count.
 const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
-const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
+// DIRECT-POOL SATURATION (2026-09-26). The 64-socket cap was chosen on 2026-09-04 for the
+// fd-leak fix, when a handful of Remote Control sessions shared this gate. Measured today:
+// 43 live RC sessions, exactly 64 ESTABLISHED sockets to Anthropic (the cap, pinned) and 9
+// SYN_SENT queued behind them — so a short RPC waits for a free socket, blows the 30s
+// headers timer, gets destroyed, and RECONNECTS into the same saturated pool. That is the
+// vicious cycle behind "could not reach the Remote Control server for about 30 minutes"
+// while the network was fine: stalls climbed 823/hr (02:00) -> 4,100/hr (08:00).
+// Each RC session legitimately holds MULTIPLE long-poll sockets open by design
+// (/worker/events, /heartbeat, /client/presence), so the cap must scale with sessions,
+// not with cores. 512 leaves headroom for ~100 sessions; the 2026-09-04 fd leak is fixed
+// by keepAlive reuse + the CLOSED-socket reaping that commit added, not by a low cap.
+const DIRECT_MAX_SOCKETS = Number(process.env.RC_GATE_DIRECT_MAX_SOCKETS || 512);
+const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: DIRECT_MAX_SOCKETS, maxFreeSockets: 64 });
+// TELEMETRY GETS ITS OWN POOL. /api/event_logging/v2/batch stalled 6,113 times in the
+// 04:00-08:00 window — by far the largest consumer — and it is fire-and-forget statsig
+// batching. Sharing a pool with /worker and /bridge means analytics can starve the
+// Remote Control lifelines. A small dedicated agent bounds the damage: telemetry can
+// saturate its own 8 sockets and RC never notices.
+const telemetryAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 8, maxFreeSockets: 2 });
+const TELEMETRY_RE = /^\/api\/(event_logging|eval\/sdk-)/;
 
 // NETWORK-CHANGE SOCKET EVACUATION (2026-09-14). When the machine changes network
 // (laptop moves: 192.168.10.x → 172.16.222.x → 172.16.0.x measured over two days),
@@ -71,6 +90,7 @@ function netEvacTick(sampleSet) {
   if (!lost.length) return false;
   console.log(`[net-evac] IPv4 source address(es) ${lost.join(', ')} disappeared — destroying pooled sockets`);
   poolAgent.destroy();
+  telemetryAgent.destroy();
   directAgent.destroy();
   return true;
 }
@@ -258,7 +278,7 @@ const mitmServer = http.createServer((creq, cres) => {
           host: DIRECT_HOST, port: DIRECT_PORT,
           servername: 'api.anthropic.com',   // SNI/cert name stays first-party even for a test-routed upstream
           method: creq.method, path: creq.url,
-          headers: hdrs, agent: directAgent,
+          headers: hdrs, agent: TELEMETRY_RE.test(creq.url) ? telemetryAgent : directAgent,
         }, ures => {
       if (/\/v1\/code\/sessions$/.test(creq.url)) {
         const chunks = [];
@@ -276,18 +296,37 @@ const mitmServer = http.createServer((creq, cres) => {
           } catch (e) { console.log('[create-status]', ures.statusCode, 'PARSE-FAIL:', JSON.stringify(body.toString('utf8').slice(0,200))); }
         });
       }
+      // HEADERS ARRIVED — disarm, from INSIDE the response callback. This line used to
+      // sit after the https.request(...) call, at the same indentation as the arm below:
+      // it therefore ran ONCE at request-construction time (when tStall was still null)
+      // and never again, so the stall timer was never actually cancelled by a response —
+      // it could only ever fire. A healthy-but-slow upstream was destroyed at the budget
+      // regardless, which is a second, independent cause of the 2026-09-26 reconnect
+      // storm and is why the first version of the queue regression test still saw
+      // [direct-stall] on a request that owned its socket the whole time.
+      if (tStall) { clearTimeout(tStall); tStall = null; }
       cres.writeHead(ures.statusCode, ures.headers);
       ures.pipe(cres);
     });
-        // headers arrived — disarm (short-RPC only; long-poll never armed)
-        if (tStall) clearTimeout(tStall);
         dir.on('error', err => {
           console.log('[direct-error]', creq.url, String(err?.message || err));
           try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
           cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
         });
         if (!isLongPoll) {
-          tStall = setTimeout(() => {
+          // ARM ONLY ONCE THE REQUEST OWNS A SOCKET (2026-09-26). The timer previously
+          // started at request CREATION, so time spent QUEUED for a free socket counted
+          // against the upstream's 30s budget. Under pool saturation that inverted the
+          // fix's purpose: healthy requests were destroyed for the crime of waiting, and
+          // each destroy reconnected into the same saturated pool — the reconnect storm
+          // that read as "could not reach the Remote Control server for 30 minutes".
+          // 'socket' fires when the agent hands this request a connection, so the budget
+          // now measures the UPSTREAM's silence, which is what it was always meant to
+          // measure. A request that never gets a socket is a capacity problem and is
+          // logged as one, not silently killed.
+          dir.on('socket', () => {
+            if (tStall) return;                     // already armed (retry/reuse)
+            tStall = setTimeout(() => {
             console.log('[direct-stall]', creq.url, 'no response headers in', DIRECT_STALL_MS + 'ms — destroying');
             // SESSION-CREATE specifically: when the upstream stalls a create, the CLI's
             // ONLY recovery is its ~3 retries on a FRESH connection. Destroying just this
@@ -300,7 +339,17 @@ const mitmServer = http.createServer((creq, cres) => {
               for (const sock of Object.values(directAgent.freeSockets).flat()) sock.destroy();
             }
             dir.destroy(new Error('rc-gate: no response headers within ' + DIRECT_STALL_MS + 'ms'));
-          }, DIRECT_STALL_MS);
+            }, DIRECT_STALL_MS);
+          });
+          // CAPACITY VISIBILITY: if the agent cannot hand out a socket promptly, say so —
+          // otherwise saturation is indistinguishable from a silent upstream in the log.
+          const tQueue = setTimeout(() => {
+            const inUse = Object.values(directAgent.sockets).reduce((n, a) => n + a.length, 0);
+            console.log('[direct-queued]', creq.url, `no socket in 10s — direct pool ${inUse}/${DIRECT_MAX_SOCKETS} in use`);
+          }, 10_000);
+          tQueue.unref?.();
+          dir.on('socket', () => clearTimeout(tQueue));
+          dir.on('error', () => clearTimeout(tQueue));
         }
         dir.on('error', () => { if (tStall) clearTimeout(tStall); });
         dir.end(body);
