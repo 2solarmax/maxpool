@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mokka.claude-update-daily</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>$HOME/maxpool/tools/claude-updater/claude-update-daily.sh</string>
+  </array>
+  <!-- Daily, plus catch-up if the Mac was asleep at the scheduled time. -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/claude-update-daily.out</string>
+  <key>StandardErrorPath</key><string>/tmp/claude-update-daily.err</string>
+</dict>
+</plist>
