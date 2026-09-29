@@ -27,7 +27,14 @@ say "rc=$rc before=$before after=$after :: $(echo "$out" | tr '\n' ' ')"
 
 # The banner reads this file. A stale failure from a losing race keeps every new
 # session red, so clear it whenever the machine is actually current.
-if [ "$rc" -eq 0 ] && echo "$out" | grep -qiE "up to date|installed successfully|Updated to"; then
+# Success is: rc=0 AND (the updater's own success words OR the version actually
+# moved). 2026-09-29: "Successfully updated from 2.1.283 to version 2.1.284"
+# matched NEITHER of the original phrases (the grep looked for "Updated to"),
+# so a real successful update exited 1 and the fleet sweep flagged the job red.
+# OR (not a semicolon list): `{ grep; [ a ] && [ b ]; }` returns the status of
+# the LAST element — a version-unchanged "up to date" run made the [ ] chain
+# short-circuit to 1 and swallowed the grep's success (found live 2026-09-29).
+if [ "$rc" -eq 0 ] && { echo "$out" | grep -qiE "up to date|installed successfully|updated to|successfully updated" || { [ "$before" != "$after" ] && [ -n "$after" ]; }; }; then
   if [ -f "$RESULT" ] && grep -q '"outcome":"failed"' "$RESULT" 2>/dev/null; then
     python3 - "$RESULT" "$after" <<'PY'
 import json, sys, datetime
