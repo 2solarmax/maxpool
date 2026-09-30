@@ -51,6 +51,17 @@ const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxS
 // by keepAlive reuse + the CLOSED-socket reaping that commit added, not by a low cap.
 const DIRECT_MAX_SOCKETS = Number(process.env.RC_GATE_DIRECT_MAX_SOCKETS || 512);
 const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: DIRECT_MAX_SOCKETS, maxFreeSockets: 64 });
+// HALF-OPEN SOCKET REAPER (2026-09-30). Agent.destroy() only kills IDLE sockets, so
+// a socket checked out across a NAT-lease death survives both the outage and the
+// net-evac sweep — no FIN/RST ever arrives, the request never errors, and the slot
+// stays 'in use' forever. Measured after the 15:28Z outage: pool pinned at 512/512,
+// 2,224 [direct-queued] lines, zero recoveries. TCP keepalive probes detect the dead
+// peer (default probe cadence ~75s, ~8 retries -> dead in <15min; initialDelay 30s)
+// and surface ECONNRESET/ETIMEDOUT to the request, freeing the slot. Applied on the
+// request's 'socket' event (the agent itself exposes no socket hook).
+function armUpstreamKeepalive(req) {
+  req.on('socket', sock => { try { sock.setKeepAlive(true, 30_000); } catch {} });
+}
 // TELEMETRY GETS ITS OWN POOL. /api/event_logging/v2/batch stalled 6,113 times in the
 // 04:00-08:00 window — by far the largest consumer — and it is fire-and-forget statsig
 // batching. Sharing a pool with /worker and /bridge means analytics can starve the
@@ -324,6 +335,7 @@ const mitmServer = http.createServer((creq, cres) => {
           // now measures the UPSTREAM's silence, which is what it was always meant to
           // measure. A request that never gets a socket is a capacity problem and is
           // logged as one, not silently killed.
+          dir.on('socket', sock => { try { sock.setKeepAlive(true, 30_000); } catch {} });  // half-open reaper (see armUpstreamKeepalive)
           dir.on('socket', () => {
             if (tStall) return;                     // already armed (retry/reuse)
             tStall = setTimeout(() => {
