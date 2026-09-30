@@ -5,6 +5,22 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.0] - 2026-09-30
+
+### Added
+
+- Auto-redeem limit resets (Claude cedar_ember + z.ai cards), on by default
+
+### Changed
+
+- Transcript model-id normalizer — fixes glm-5.3 resume warning + opus-5 restore
+- Recursive walk, [1m] pairing, auto-detected target; alias rejected
+- Single machine updater — ends the 'Auto-update failed' banner
+
+### Fixed
+
+- A successful version bump is success, not failure
+
 ## [1.23.0] - 2026-09-26
 
 ### Added
