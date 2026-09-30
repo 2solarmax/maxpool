@@ -470,7 +470,8 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   assert.equal(narrow.indexOf('Account'), 4);
   assert.equal(narrow.indexOf('Status'), 35);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  assert.equal(narrow.indexOf('Quota'), 49);
+  // +4 for the new Rst column (Status 13 + 'Rst' 3 + space) before Quota
+  assert.equal(narrow.indexOf('Quota'), 53);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
@@ -708,4 +709,40 @@ test('an ENABLED account with a dead token still reads "reauth" (unchanged)', ()
   const line = strip(tui._renderAcct(0, 11, true));
   assert.match(line, /reauth/, 'the live-account path is untouched');
   assert.doesNotMatch(line, /disabled/, 'nothing was switched off');
+});
+
+// ── Rst column: banked limit resets, owner request 2026-09-30 ────────────────
+
+test('Rst column shows 0 when no cards/grants, aligned under the header', () => {
+  const am = oauthAM();
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  const col = hdr.indexOf('Rst');
+  assert.ok(col > 0);
+  assert.equal(row.slice(col, col + 1), '0', 'shows plain 0');
+});
+
+test('Rst column counts live cards + grants (expired excluded)', () => {
+  const am = oauthAM();
+  am.accounts[0].resetCards = { fiveHour: [], weekly: [
+    { recordId: 1, expiresAt: Date.now() + 3600e3, expired: false },
+    { recordId: 2, expiresAt: Date.now() - 1000, expired: true },
+  ], checkedAt: Date.now() };
+  am.accounts[0].resetGrants = { grants: [], eligible: true, checkedAt: Date.now() };
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  assert.equal(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), '1');
+});
+
+test('Rst column shows 0 on a DISABLED account even with cards present', () => {
+  const am = oauthAM();
+  am.accounts[0].enabled = false;
+  am.accounts[0].resetCards = { fiveHour: [{ recordId: 9, expiresAt: Date.now() + 3600e3, expired: false }], weekly: [], checkedAt: Date.now() };
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  assert.equal(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), '0',
+    "disabled accounts' resets are not ours — the column must not advertise them");
 });

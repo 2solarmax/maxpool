@@ -32,6 +32,8 @@ const vw = s => strip(s).length;
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
+const RESETS_W = 3;        // 'Rst' column — banked limit resets (cards/grants) the
+                           // pool can auto-redeem; '0' when none, count when some.
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
 
 // Human provider name for the accounts-table "Provider" column. account.provider
@@ -60,6 +62,7 @@ function acctHeader(W) {
     + 'Account'.padEnd(NAME_W) + ' '
     + 'Provider'.padEnd(PROVIDER_W) + ' '
     + 'Status'.padEnd(STATUS_W) + ' '
+    + 'Rst'.padEnd(RESETS_W) + ' '
     + quota;
 }
 
@@ -264,20 +267,6 @@ function settingsTags(am, a) {
     if (a.refreshDead) tags.push(yellow('needs login'));
     else if (a.subscriptionGone) tags.push(red('no sub'));
     return tags;   // disabled: never show card inventory either (owner gate)
-  }
-  // Available limit resets — the pool redeems these automatically per policy
-  // (reset-policy.js). Shown so the owner can see banked value before it expires.
-  const rc = a?.resetCards;
-  if (rc) {
-    const live5 = (rc.fiveHour || []).filter(c => !c.expired).length;
-    const liveW = (rc.weekly || []).filter(c => !c.expired).length;
-    if (liveW) tags.push(green(`reset wk×${liveW}`));
-    if (live5) tags.push(green(`reset 5h×${live5}`));
-  }
-  const rg = a?.resetGrants;
-  if (rg?.eligible) {
-    const live = (rg.grants || []).filter(g => g.usableNow && !g.expired).length;
-    if (live) tags.push(green(`reset×${live}`));
   }
   return tags;
 }
@@ -2147,8 +2136,25 @@ export class TUI {
     // Widened from 10 to fit "throttled 59s" so the quota bars stay column-aligned.
     status = rpad(status, STATUS_W);
 
+    // Rst column — banked limit resets (owner request 2026-09-30: a separate
+    // column showing 0 or the count). z.ai cards + Claude cedar_ember grants,
+    // not-yet-expired, on ENABLED accounts only: a disabled account's resets are
+    // not ours to spend, and showing a count there would imply otherwise.
+    let resetsCell;
+    {
+      let n = 0;
+      if (a.enabled !== false) {
+        const rc = a.resetCards;
+        if (rc) n += (rc.fiveHour || []).filter(c => !c.expired).length
+                 + (rc.weekly || []).filter(c => !c.expired).length;
+        const rg = a.resetGrants;
+        if (rg?.eligible) n += (rg.grants || []).filter(g => g.usableNow && !g.expired).length;
+      }
+      resetsCell = rpad(n > 0 ? green(String(n)) : gray('0'), RESETS_W);
+    }
+
     if (a.type === 'provider') {
-      return this._renderProviderAcct(sel, cur, name, type, status, a, bw, showBoth);
+      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth);
     }
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
@@ -2171,7 +2177,7 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    let line = ` ${sel}${cur} ${name} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
