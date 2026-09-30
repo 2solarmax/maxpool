@@ -56,12 +56,17 @@ test('re-authenticating revives a latched-dead account', () => {
 
 // ── the display half ─────────────────────────────────────────────────────────
 
-test('a DISABLED account with dead credentials shows "reauth", not just "disabled"', () => {
+// Updated 2026-09-30 per owner: a disabled account keeps "disabled" as the STATUS
+// (the disabled inventory must stay readable at a glance) and surfaces the dead
+// credential as its own tag. The 2026-08-10 requirement — that disabling must not
+// HIDE a dead credential — is still asserted, via the "needs login" tag.
+test('a DISABLED account with dead credentials shows "disabled" + "needs login"', () => {
   const am = new AccountManager([acct()], 0.90);
   am.accounts[0].enabled = false;
   am.accounts[0].refreshDead = true;
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
-  assert.match(line, /reauth/, 'the user must see it needs re-login even while disabled');
+  assert.match(line, /disabled/, 'disabled stays the headline status');
+  assert.match(line, /needs login/, 'the user must still see it needs re-login even while disabled');
 });
 
 test('a DISABLED account with GOOD credentials still shows plain "disabled"', () => {
@@ -69,7 +74,7 @@ test('a DISABLED account with GOOD credentials still shows plain "disabled"', ()
   am.accounts[0].enabled = false;
   const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
   assert.match(line, /disabled/);
-  assert.doesNotMatch(line, /reauth/, 'a healthy disabled account must NOT claim it needs re-login');
+  assert.doesNotMatch(line, /reauth|needs login/, 'a healthy disabled account must NOT claim it needs re-login');
 });
 
 test('an ENABLED account with dead credentials still shows "reauth" (unchanged)', () => {

@@ -8,6 +8,9 @@
 // This is the one sanctioned active-upstream feature; the proxy is otherwise passive.
 
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
+import { listResetCards, redeemResetCard } from './zai-reset-cards.js';
+import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
+import { decideZai, decideClaude } from './reset-policy.js';
 
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, timeoutMs = 10_000, log = console.log, usageGapMs = null } = {}) {
@@ -179,7 +182,54 @@ export class Prober {
       const usage = await this._withTimeout(this.providerProbeFn(account));
       if (!usage) return; // timed out — try again next cycle
       this.am.applyProviderUsage(account.index, usage);
+      // Reset cards piggyback on the same poll cycle (z.ai only; zero-spend read).
+      // Failures are swallowed on purpose: cards are an enhancement, never a probe
+      // health signal — a card-list 401 must not turn the quota bars stale.
+      // OWNER GATE (2026-09-30): disabled accounts are excluded from listing AND
+      // redemption entirely — a readable key on a disabled account (someone else
+      // uses it) is not authority to act.
+      if (account.enabled !== false && account.credential) {
+        if (account.provider === 'zai' && this.am.applyResetCards) {
+          try {
+            const cards = await this._withTimeout(listResetCards(account.credential));
+            if (cards) {
+              this.am.applyResetCards(account.index, cards);
+              const act = decideZai(account, cards);
+              if (act) await this._redeemZaiCard(account, act);
+            }
+          } catch { /* cards are best-effort */ }
+        }
+      }
     } catch { /* best-effort; never let a probe throw */ }
+  }
+
+  /** Execute a z.ai card redeem decided by the policy. Logs before/after. */
+  async _redeemZaiCard(account, act) {
+    try {
+      const q = account.quota || {};
+      this.log(`[reset-card] ${account.name}: redeeming ${act.resetType} card ${act.card.recordId} (${act.reason}; ses=${q.providerSes ?? '?'} wk=${q.providerWk ?? '?'})`);
+      const r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType));
+      if (r?.ok) {
+        this.log(`[reset-card] ${account.name}: card ${act.card.recordId} redeemed`);
+        if (this.am.applyResetCards) {
+          const fresh = await this._withTimeout(listResetCards(account.credential));
+          if (fresh) this.am.applyResetCards(account.index, fresh);
+        }
+      } else {
+        this.log(`[reset-card] ${account.name}: redeem FAILED card ${act.card.recordId}: ${r?.error}`);
+      }
+    } catch (e) { this.log(`[reset-card] ${account.name}: redeem error ${e.message}`); }
+  }
+
+  /** Execute a Claude cedar_ember claim decided by the policy. */
+  async _claimClaudeGrant(account, act) {
+    try {
+      const q = account.quota || {};
+      this.log(`[reset-grant] ${account.name}: claiming grant ${act.grant.id} (${act.reason}; ses=${q.unified5h ?? '?'} wk=${q.unified7d ?? '?'})`);
+      const r = await this._withTimeout(claimResetGrant(account.credential, act.grant.id));
+      if (r?.ok) this.log(`[reset-grant] ${account.name}: grant ${act.grant.id} claimed${r.alreadyUsed ? ' (already used — idempotent)' : ''}`);
+      else this.log(`[reset-grant] ${account.name}: claim FAILED ${act.grant.id}: ${r?.error}`);
+    } catch (e) { this.log(`[reset-grant] ${account.name}: claim error ${e.message}`); }
   }
 
   /** Probe one OAUTH account. Returns {ok, status} so probeAll can pace/back-off
@@ -193,6 +243,18 @@ export class Prober {
     // on 2solarmax@ between 2026-09-18 and 09-20.
     if (account.subscriptionGone) return { ok: false, status: 403 };
     try {
+      // Claude banked resets (cedar_ember) piggyback on the oauth poll — same
+      // OWNER GATE as z.ai cards: a DISABLED account is never listed or claimed.
+      try {
+        if (account.enabled !== false && account.credential && this.am.applyResetGrants) {
+          const listing = await this._withTimeout(listResetGrants(account.credential));
+          if (listing) {
+            this.am.applyResetGrants(account.index, listing);
+            const act = decideClaude(account, listing);
+            if (act) await this._claimClaudeGrant(account, act);
+          }
+        }
+      } catch { /* grants are best-effort; never break the quota probe */ }
       await this.am.ensureTokenFresh(account.index);
       let usage = await this._withTimeout(this.probeFn(account.credential));
       if (usage?.status === 401) {

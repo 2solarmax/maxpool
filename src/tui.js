@@ -255,6 +255,30 @@ function settingsTags(am, a) {
   }
   const capTag = capText(a, capBenched(am, a), am);
   if (capTag) tags.push(capTag);
+  // A switched-off account whose credentials ALSO died keeps "disabled" in the status
+  // column (so the disabled inventory stays readable at a glance) and carries the second
+  // problem here. Without this the row would hide the fact that re-enabling it later
+  // yields a broken account — the 2026-08-10 report that 8 disabled accounts were all
+  // sitting on dead credentials.
+  if (a?.enabled === false) {
+    if (a.refreshDead) tags.push(yellow('needs login'));
+    else if (a.subscriptionGone) tags.push(red('no sub'));
+    return tags;   // disabled: never show card inventory either (owner gate)
+  }
+  // Available limit resets — the pool redeems these automatically per policy
+  // (reset-policy.js). Shown so the owner can see banked value before it expires.
+  const rc = a?.resetCards;
+  if (rc) {
+    const live5 = (rc.fiveHour || []).filter(c => !c.expired).length;
+    const liveW = (rc.weekly || []).filter(c => !c.expired).length;
+    if (liveW) tags.push(green(`reset wk×${liveW}`));
+    if (live5) tags.push(green(`reset 5h×${live5}`));
+  }
+  const rg = a?.resetGrants;
+  if (rg?.eligible) {
+    const live = (rg.grants || []).filter(g => g.usableNow && !g.expired).length;
+    if (live) tags.push(green(`reset×${live}`));
+  }
   return tags;
 }
 
@@ -2084,7 +2108,9 @@ export class TUI {
     if (a.refreshDead) effectiveStatus = a.enabled === false ? 'disabled-reauth' : 'reauth';
     // Subscription gone (org-disabled 403): a DISTINCT state from reauth — re-logging in
     // will NOT fix it until the subscription is re-purchased. Says the actionable thing.
-    else if (a.subscriptionGone) effectiveStatus = 'no sub';
+    // Same precedence rule as reauth above: when the account is ALSO switched off,
+    // "disabled" stays the headline so the disabled inventory remains readable.
+    else if (a.subscriptionGone) effectiveStatus = a.enabled === false ? 'disabled-nosub' : 'no sub';
     switch (effectiveStatus) {
       case 'active':    status = isCur ? green('active') : 'active'; break;
       case 'reauth':    status = yellow('reauth'); break;
@@ -2093,9 +2119,19 @@ export class TUI {
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
-      // Disabled AND needs re-login — both facts matter: it won't serve because you
-      // switched it off, and it CAN'T serve until you log in again.
-      case 'disabled-reauth': status = red('✕ reauth'); break;
+      // Disabled AND needs re-login — both facts matter, and DISABLED LEADS.
+      // The owner's question that drove this (2026-09-30): "when I disable the account
+      // and then the token expires, does it show disabled or reauth? It needs to
+      // continue to show disabled otherwise I'm confused as to which ones I have
+      // disabled." Showing only '✕ reauth' made a deliberately-off account
+      // indistinguishable from a live one with dead credentials, so the disabled
+      // inventory could not be read off the screen at all. So the STATUS column always
+      // says 'disabled' for an account you switched off, and the reason it ALSO cannot
+      // serve rides as its own tag ("needs login" / "no sub") — collapsing both into one
+      // '+' marker would lose the distinction between "log in again" (fixable) and
+      // "subscription gone" (not fixable by logging in).
+      case 'disabled-reauth':
+      case 'disabled-nosub':  status = red('✕ disabled'); break;
       case 'no sub': status = red('✕ no sub'); break;
       case 'throttled': {
         // A transient auto-recovering cooldown — show the remaining time (from

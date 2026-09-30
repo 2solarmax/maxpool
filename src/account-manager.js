@@ -3423,6 +3423,33 @@ export class AccountManager {
    * (never the unified or scopedWeekly fields) so a provider reading can't reach
    * the OAuth quota gates.
    */
+  /** Store the latest Claude reset-grant listing (prober piggyback). */
+  applyResetGrants(accountIndex, listing) {
+    const account = this.accounts[accountIndex];
+    if (!account || !listing) return;
+    if (listing.error) { account.resetGrants = null; return; }
+    account.resetGrants = {
+      grants: listing.grants || [],
+      nextGrantId: listing.nextGrantId ?? null,
+      cooldownUntil: listing.cooldownUntil ?? null,
+      eligible: listing.eligible !== false,
+      checkedAt: Date.now(),
+    };
+  }
+
+  /** Store the latest reset-card listing for an account (prober piggyback).
+   *  Cards are display/decision state only — routing never reads them. */
+  applyResetCards(accountIndex, cards) {
+    const account = this.accounts[accountIndex];
+    if (!account || !cards) return;
+    if (cards.error) { account.resetCards = null; return; }   // never half-write
+    account.resetCards = {
+      fiveHour: cards.fiveHour || [],
+      weekly: cards.weekly || [],
+      checkedAt: Date.now(),
+    };
+  }
+
   applyProviderUsage(accountIndex, usage) {
     const account = this.accounts[accountIndex];
     if (!account || !usage) return;

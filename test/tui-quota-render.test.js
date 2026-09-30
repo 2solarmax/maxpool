@@ -669,3 +669,43 @@ test('the ramped cap names WHICH window is governing — 50%>75% means nothing w
   assert.equal(m[2], eff.window,
     `the label must name the governing window: tag says ${m[2]}, governing is ${eff.window}`);
 });
+
+// ── a DISABLED account must keep saying "disabled" when its token also dies ───
+// Owner, 2026-09-30: "when I disable the account and then the authentication token
+// expires, does it show disabled or reauth? It needs to continue to show disabled
+// otherwise I'm confused as to which ones I have disabled." Before this, refreshDead
+// REPLACED the status with "✕ reauth", so a deliberately-off account was
+// indistinguishable from a live one needing a login, and the disabled inventory
+// could not be read off the screen.
+
+test('disabled + dead refresh token still reads "disabled" (reason rides as a tag)', () => {
+  const am = oauthAM();
+  am.accounts[0].enabled = false;
+  am.accounts[0].refreshDead = true;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /disabled/, 'the switched-off fact stays in the status column');
+  assert.match(line, /needs login/, 'and the dead credential is still surfaced');
+  assert.doesNotMatch(line, /✕ reauth/, '"reauth" must not REPLACE "disabled"');
+});
+
+test('disabled + subscription gone still reads "disabled", tagged distinctly', () => {
+  const am = oauthAM();
+  am.accounts[0].enabled = false;
+  am.accounts[0].subscriptionGone = true;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /disabled/, 'switched-off stays primary');
+  assert.match(line, /no sub/, 'subscription-gone keeps its own word');
+  // The two reasons must stay tellable apart: logging in fixes one, not the other.
+  assert.doesNotMatch(line, /needs login/, 'no-sub is not a login problem');
+});
+
+test('an ENABLED account with a dead token still reads "reauth" (unchanged)', () => {
+  const am = oauthAM();
+  am.accounts[0].refreshDead = true;
+  const tui = new TUI({ accountManager: am });
+  const line = strip(tui._renderAcct(0, 11, true));
+  assert.match(line, /reauth/, 'the live-account path is untouched');
+  assert.doesNotMatch(line, /disabled/, 'nothing was switched off');
+});
