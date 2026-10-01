@@ -7,7 +7,7 @@
  * Endpoints (verified live 2026-09-30):
  *   GET  /api/biz/customer-package-reset/list?targetType=PERSONAL
  *        -> data.fiveHourResets[] / weekResets[], each {recordId, grantType,
- *           expireTime 'YYYY-MM-DD HH:mm:ss' (UTC), available}
+ *           expireTime 'YYYY-MM-DD HH:mm:ss' (Beijing, UTC+8), available}
  *   POST /api/biz/customer-package-reset/use
  *        body {recordId, targetType:'PERSONAL', resetType:'WEEK'|'FIVE_HOUR',
  *              requestId}  -> envelope; data echoes the recordId on success
@@ -31,12 +31,17 @@ const BASE = 'https://api.z.ai/api/biz/customer-package-reset';
 const LIST_URL = `${BASE}/list?targetType=PERSONAL`;
 const USE_URL = `${BASE}/use`;
 
-/** 'YYYY-MM-DD HH:mm:ss' (z.ai has no timezone suffix; it is UTC) -> epoch ms. */
+/** 'YYYY-MM-DD HH:mm:ss' (z.ai has no timezone suffix; it is UTC+8) -> epoch ms. */
 export function parseCardExpiry(s) {
   if (!s || typeof s !== 'string') return null;
   const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
   if (!m) return null;
-  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  // z.ai timestamps are BEIJING time (UTC+8), not UTC. Measured 2026-10-01: a card
+  // redeemed at 16:08:43 UTC came back as lastWeekResetTime "00:08:44" next day, and
+  // the weekly window it opened ends exactly 7d after 16:08:43 UTC. Reading these as
+  // UTC put every expiry 8 hours LATE — the dying-value rule would fire 8h too late
+  // and a card would look valid for 8h after it died.
+  return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) - 8 * 3600_000;
 }
 
 /** Normalize a raw card array -> [{recordId, expiresAt, expired}], available only. */

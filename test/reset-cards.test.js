@@ -12,9 +12,9 @@ function acct({ ses, wk, weeklyAbsent = false, enabled = true } = {}) {
 }
 
 // ── expiry parsing ────────────────────────────────────────────────────────────
-test('parseCardExpiry reads z.ai naive-UTC timestamps', () => {
+test('parseCardExpiry reads z.ai timestamps as Beijing time (UTC+8)', () => {
   const t = parseCardExpiry('2026-10-01 23:59:59');
-  assert.equal(t, Date.UTC(2026, 9, 1, 23, 59, 59));
+  assert.equal(t, Date.UTC(2026, 9, 1, 15, 59, 59), '23:59:59 Beijing = 15:59:59 UTC');
   assert.equal(parseCardExpiry('garbage'), null);
   assert.equal(parseCardExpiry(null), null);
 });
