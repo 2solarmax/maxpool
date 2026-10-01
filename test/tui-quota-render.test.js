@@ -746,3 +746,36 @@ test('Rst column shows 0 on a DISABLED account even with cards present', () => {
   assert.equal(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), '0',
     "disabled accounts' resets are not ours — the column must not advertise them");
 });
+
+const H1 = 3600_000;
+const DAY1 = 24 * H1;
+
+// ── Rst column expiry suffix: "1~2d" when the reset expires soon ──────────────
+test('Rst column appends ~Nd when the soonest card expires within 7 days', () => {
+  const am = oauthAM();
+  am.accounts[0].resetCards = { fiveHour: [], weekly: [
+    { recordId: 1, expiresAt: Date.now() + 2 * DAY1, expired: false },
+  ], checkedAt: Date.now() };
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(0, 11, true));
+  assert.match(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 6), /^1~2d/);
+});
+
+test('Rst column appends ~Nh under 24h; no suffix when expiry is far', () => {
+  const am = oauthAM();
+  am.accounts[0].resetCards = { fiveHour: [], weekly: [
+    { recordId: 1, expiresAt: Date.now() + 10 * H1, expired: false },
+  ], checkedAt: Date.now() };
+  am.accounts[1].resetGrants = { grants: [], eligible: true, checkedAt: Date.now() };
+  am.accounts[1].resetCards = { fiveHour: [], weekly: [
+    { recordId: 2, expiresAt: Date.now() + 20 * DAY1, expired: false },
+  ], checkedAt: Date.now() };
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const r0 = strip(tui._renderAcct(0, 11, true));
+  const r1 = strip(tui._renderAcct(1, 11, true));
+  assert.match(r0.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 6), /^1~10h/);
+  assert.match(r1.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), /^1/, 'far expiry shows bare count');
+  assert.doesNotMatch(r1.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 3), /~/, 'no expiry suffix when >7 days out');
+});

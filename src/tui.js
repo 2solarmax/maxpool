@@ -2150,7 +2150,28 @@ export class TUI {
         const rg = a.resetGrants;
         if (rg?.eligible) n += (rg.grants || []).filter(g => g.usableNow && !g.expired).length;
       }
-      resetsCell = rpad(n > 0 ? green(String(n)) : gray('0'), RESETS_W);
+      // Expiry rides with the count when it's tight: "1~2d" = 1 reset, expires in ~2 days.
+      // Claude grants end mid-Oct (weeks out) — a day-count would be noise; only the
+      // SOONEST-expiring card under 7 days gets a suffix, so the column stays narrow
+      // and the number it carries still answers "use it or lose it?".
+      let suffix = '';
+      if (n > 0) {
+        let soonest = Infinity;
+        const rc = a.resetCards;
+        if (rc) for (const c of [...(rc.fiveHour || []), ...(rc.weekly || [])]) {
+          if (!c.expired && c.expiresAt != null && c.expiresAt < soonest) soonest = c.expiresAt;
+        }
+        const rg = a.resetGrants;
+        if (rg?.eligible) for (const g of (rg.grants || [])) {
+          if (g.usableNow && !g.expired && g.endsAt != null && g.endsAt < soonest) soonest = g.endsAt;
+        }
+        const days = soonest === Infinity ? null : (soonest - Date.now()) / 86400_000;
+        if (days != null && days < 7) {
+          suffix = days < 1 ? '~' + Math.max(1, Math.round(days * 24)) + 'h'
+                            : '~' + Math.max(1, Math.round(days)) + 'd';
+        }
+      }
+      resetsCell = rpad(n > 0 ? green(String(n) + suffix) : gray('0'), RESETS_W + (suffix ? 2 : 0));
     }
 
     if (a.type === 'provider') {
