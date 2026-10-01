@@ -2165,8 +2165,11 @@ export class TUI {
         if (rg?.eligible) for (const g of (rg.grants || [])) {
           if (g.usableNow && !g.expired && g.endsAt != null && g.endsAt < soonest) soonest = g.endsAt;
         }
+        // Expiry is ALWAYS shown when a reset exists (owner 2026-10-01: "what is the
+        // proper way to communicate if we have a reset, and when does it expire" —
+        // both facts, always). Hours under 24h, days at or above.
         const days = soonest === Infinity ? null : (soonest - Date.now()) / 86400_000;
-        if (days != null && days < 7) {
+        if (days != null) {
           suffix = days < 1 ? '~' + Math.max(1, Math.round(days * 24)) + 'h'
                             : '~' + Math.max(1, Math.round(days)) + 'd';
         }

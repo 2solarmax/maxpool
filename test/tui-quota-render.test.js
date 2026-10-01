@@ -776,6 +776,6 @@ test('Rst column appends ~Nh under 24h; no suffix when expiry is far', () => {
   const r0 = strip(tui._renderAcct(0, 11, true));
   const r1 = strip(tui._renderAcct(1, 11, true));
   assert.match(r0.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 6), /^1~10h/);
-  assert.match(r1.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), /^1/, 'far expiry shows bare count');
-  assert.doesNotMatch(r1.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 3), /~/, 'no expiry suffix when >7 days out');
+  // 2026-10-01 owner rule: expiry ALWAYS shows when a reset exists — even weeks out.
+  assert.match(r1.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 5), /^1~20d/, 'far expiry shows ~20d, not a bare count');
 });
