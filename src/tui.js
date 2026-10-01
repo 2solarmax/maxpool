@@ -32,8 +32,8 @@ const vw = s => strip(s).length;
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
-const RESETS_W = 3;        // 'Rst' column — banked limit resets (cards/grants) the
-                           // pool can auto-redeem; '0' when none, count when some.
+const RESETS_W = 6;        // 'Rst' column — FIXED width (fits '2~21d'); a variable
+                           // width ('0' vs '1~21d') shifted every quota bar per row.
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
 
 // Human provider name for the accounts-table "Provider" column. account.provider
@@ -2174,7 +2174,7 @@ export class TUI {
                             : '~' + Math.max(1, Math.round(days)) + 'd';
         }
       }
-      resetsCell = rpad(n > 0 ? green(String(n) + suffix) : gray('0'), RESETS_W + (suffix ? 2 : 0));
+      resetsCell = rpad(n > 0 ? green(String(n) + suffix) : gray('0'), RESETS_W);
     }
 
     if (a.type === 'provider') {

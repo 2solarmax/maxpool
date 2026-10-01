@@ -470,8 +470,9 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   assert.equal(narrow.indexOf('Account'), 4);
   assert.equal(narrow.indexOf('Status'), 35);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  // +4 for the new Rst column (Status 13 + 'Rst' 3 + space) before Quota
-  assert.equal(narrow.indexOf('Quota'), 53);
+  // +7 for the fixed-width Rst column (Status 13 + 'Rst' 6 + space) before Quota —
+  // width 6 fits '2~21d' so a suffixed row never pushes its quota bars right.
+  assert.equal(narrow.indexOf('Quota'), 56);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
