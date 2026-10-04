@@ -276,6 +276,20 @@ const mitmServer = http.createServer((creq, cres) => {
     const DIRECT_RETRY_MAX = Number(process.env.RC_GATE_DIRECT_RETRY_MAX || 6);
     const DIRECT_RETRY_BACKOFF_MS = Number(process.env.RC_GATE_DIRECT_RETRY_BACKOFF_MS || 500);
     let retryN = 0;
+    // ORPHANED-LONG-POLL REAPER (2026-10-04). Long-poll requests (/worker/events,
+    // /heartbeat, presence) hold an upstream socket for the request's whole life and
+    // have no stall timer by design. When the CLI side dies first (session banner,
+    // disconnect, quit), nothing destroyed `dir` — the upstream long-poll stayed
+    // open forever, and the 2026-10-04 morning outage left ~500 of them: pool pinned
+    // at 512/512 from 07:40Z, every new session queued ("no socket in 10s") and the
+    // CLI reported "Session creation failed". cres 'close' now aborts the in-flight
+    // upstream request AND the pending retry timer. (TCP keepalive cannot reap these:
+    // the upstream peer ACKs probes because the long-poll is genuinely open.)
+    let curDir = null, retryTimer = null;
+    cres.on('close', () => {
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      if (curDir) { try { curDir.destroy(); } catch {} }
+    });
     // Body is buffered ONCE, outside dirSend: a retry re-runs the upstream request,
     // but creq's 'data'/'end' events only fire the first time. Waiting for them again
     // inside dirSend would hang every retry forever with a silently-empty body.
@@ -343,6 +357,7 @@ const mitmServer = http.createServer((creq, cres) => {
       cres.writeHead(ures.statusCode, ures.headers);
       ures.pipe(cres);
     });
+        curDir = dir;
         dir.on('error', err => {
           if (tStall) { clearTimeout(tStall); tStall = null; }
           if (cres.headersSent) return;               // mid-stream: never duplicate bytes
@@ -351,7 +366,7 @@ const mitmServer = http.createServer((creq, cres) => {
             const wait = DIRECT_RETRY_BACKOFF_MS * Math.min(retryN, 8);
             console.log('[direct-retry]', creq.url, `attempt ${retryN}/${DIRECT_RETRY_MAX} after`, String(err?.message || err), `— waiting ${wait}ms`);
             for (const sock of Object.values(directAgent.freeSockets).flat()) sock.destroy();  // never reuse a socket from the dead network
-            setTimeout(() => { if (!cres.destroyed && !cres.headersSent) dirSend(); }, wait);
+            retryTimer = setTimeout(() => { retryTimer = null; if (!cres.destroyed && !cres.headersSent) dirSend(); }, wait);
             return;
           }
           console.log('[direct-error]', creq.url, String(err?.message || err));
