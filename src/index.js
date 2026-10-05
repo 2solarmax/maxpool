@@ -748,6 +748,33 @@ async function serverWorkerCommand() {
   // background probe has gone stale (> 3× interval since last success).
   accountManager.quotaProbeIntervalMs = probeSeconds * 1000;
 
+  // SECRET RE-RESOLVE LOOP (2026-10-05). Provider keys resolve ONCE at startup; a
+  // transient gcloud/ADC failure at that moment benched all four z.ai providers as
+  // "secret-unresolved" permanently (measured 2026-10-05 20:18 startup: cache had
+  // been rewritten without the RESTRICTED_* entries, the gcloud path failed, and
+  // nothing retried — every GLM request 429'd "no_eligible_route" until restart).
+  // Re-attempt unresolved providers every 5 min until they resolve; a resolved
+  // provider is never touched again.
+  const unresolvedProviders = () =>
+    accountManager.accounts.filter(a => a.configSourced && a.type === 'provider' && a.secretName && !a.authToken);
+  if (unresolvedProviders().length) {
+    const secretTimer = setInterval(async () => {
+      const pending = unresolvedProviders();
+      if (!pending.length) { clearInterval(secretTimer); return; }
+      try {
+        const { resolveSecrets } = await import('./secret-resolver.js');
+        const resolved = await resolveSecrets(pending.map(a => a.secretName));
+        let fixed = 0;
+        for (const a of pending) {
+          const tok = resolved[a.secretName];
+          if (tok) { a.authToken = tok; a.status = 'unknown'; a.lastError = null; fixed++; }
+        }
+        if (fixed) console.log(`[Maxpool] Secret re-resolve: ${fixed} provider(s) recovered`);
+      } catch { /* next tick */ }
+    }, 5 * 60_000);
+    secretTimer.unref?.();
+  }
+
   // Seed the running version immediately so the TUI header always shows it, even
   // before (or without) the npm update check. The cold worker's update check below
   // fills in latest/hasUpdate.

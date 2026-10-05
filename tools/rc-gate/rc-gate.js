@@ -361,7 +361,23 @@ const mitmServer = http.createServer((creq, cres) => {
         dir.on('error', err => {
           if (tStall) { clearTimeout(tStall); tStall = null; }
           if (cres.headersSent) return;               // mid-stream: never duplicate bytes
-          if (retryN < DIRECT_RETRY_MAX) {
+          // REPLAY SAFETY (2026-10-05, corrects 29b58e7). A replayed /bridge or bare
+          // /worker registration makes the server evict the live connection (close
+          // 4090 — the header comment above; pinned by rc-gate.test.js "4090
+          // regression"), and a replayed session CREATE can double-create. So:
+          //  - a CONNECT-PHASE failure (request never left this machine) is safe to
+          //    retry for ANY path — that is the network-switch case this exists for;
+          //  - after the request may have reached the server, retry ONLY the
+          //    idempotent long-polls/telemetry (heartbeat, events, presence, batches);
+          //  - our own stall-destroy is never retried (it must settle — pinned by the
+          //    session-create stall test).
+          const msg = String(err?.message || err);
+          const connectPhase = err?.name === 'AggregateError' || msg.includes('AggregateError')
+            || ['ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ENOTFOUND', 'EAI_AGAIN'].includes(err?.code);
+          const idempotent = /\/worker\/heartbeat|\/worker\/events|\/client\/presence|\/api\/event_logging/.test(creq.url);
+          const ownStall = msg.startsWith('rc-gate: no response headers');
+          const replaySafe = !ownStall && (connectPhase || idempotent);
+          if (replaySafe && retryN < DIRECT_RETRY_MAX) {
             retryN++;
             const wait = DIRECT_RETRY_BACKOFF_MS * Math.min(retryN, 8);
             console.log('[direct-retry]', creq.url, `attempt ${retryN}/${DIRECT_RETRY_MAX} after`, String(err?.message || err), `— waiting ${wait}ms`);
