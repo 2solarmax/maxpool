@@ -5,6 +5,14 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.6] - 2026-10-05
+
+### Fixed
+
+- Transparent pre-response retry absorbs network flaps
+- Reap orphaned long-polls when the CLI side closes
+- Replay-safe retries; re-resolve secret-unresolved providers
+
 ## [1.24.5] - 2026-10-01
 
 ### Fixed
