@@ -107,3 +107,30 @@ export async function resolveSecrets(secretNames, opts = {}) {
   }
   return out;
 }
+
+/**
+ * Re-resolve config-sourced providers whose key never loaded. Accounts carry their
+ * key in `credential` (upsertRuntimeAccount maps authToken -> credential); the first
+ * version of this loop (v1.24.6) tested and wrote `authToken`, a field accounts never
+ * hold — so every provider looked unresolved forever, its status was reset to
+ * 'unknown' every 5 min, and a genuinely-unresolved one was never actually repaired.
+ * Returns the number of providers recovered.
+ */
+export function pendingProviders(accounts) {
+  return accounts.filter(a => a.configSourced && a.type === 'provider' && a.secretName && !a.credential);
+}
+
+export async function reresolveProviders(accounts, resolve = resolveSecrets) {
+  const pending = pendingProviders(accounts);
+  if (!pending.length) return 0;
+  const resolved = await resolve(pending.map(a => a.secretName));
+  let fixed = 0;
+  for (const a of pending) {
+    const tok = resolved[a.secretName];
+    if (!tok) continue;
+    a.credential = tok;
+    if (a.status === 'error' && a.lastError === 'secret-unresolved') { a.status = 'active'; a.lastError = null; }
+    fixed++;
+  }
+  return fixed;
+}

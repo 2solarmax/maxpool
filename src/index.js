@@ -755,24 +755,18 @@ async function serverWorkerCommand() {
   // nothing retried — every GLM request 429'd "no_eligible_route" until restart).
   // Re-attempt unresolved providers every 5 min until they resolve; a resolved
   // provider is never touched again.
-  const unresolvedProviders = () =>
-    accountManager.accounts.filter(a => a.configSourced && a.type === 'provider' && a.secretName && !a.authToken);
-  if (unresolvedProviders().length) {
-    const secretTimer = setInterval(async () => {
-      const pending = unresolvedProviders();
-      if (!pending.length) { clearInterval(secretTimer); return; }
-      try {
-        const { resolveSecrets } = await import('./secret-resolver.js');
-        const resolved = await resolveSecrets(pending.map(a => a.secretName));
-        let fixed = 0;
-        for (const a of pending) {
-          const tok = resolved[a.secretName];
-          if (tok) { a.authToken = tok; a.status = 'unknown'; a.lastError = null; fixed++; }
-        }
-        if (fixed) console.log(`[Maxpool] Secret re-resolve: ${fixed} provider(s) recovered`);
-      } catch { /* next tick */ }
-    }, 5 * 60_000);
-    secretTimer.unref?.();
+  {
+    const { pendingProviders, reresolveProviders } = await import('./secret-resolver.js');
+    if (pendingProviders(accountManager.accounts).length) {
+      const secretTimer = setInterval(async () => {
+        if (!pendingProviders(accountManager.accounts).length) { clearInterval(secretTimer); return; }
+        try {
+          const fixed = await reresolveProviders(accountManager.accounts);
+          if (fixed) console.log(`[Maxpool] Secret re-resolve: ${fixed} provider(s) recovered`);
+        } catch { /* next tick */ }
+      }, 5 * 60_000);
+      secretTimer.unref?.();
+    }
   }
 
   // Seed the running version immediately so the TUI header always shows it, even
