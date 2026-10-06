@@ -21,7 +21,7 @@ test('probeAll applies usage to every oauth account', async () => {
     fiveHour: { utilization: 0.30, resetAt: Date.now() + 3600_000 },
     sevenDay: { utilization: 0.50, resetAt: WEEK_OUT() },
   });
-  const prober = new Prober(am, { probeFn, log: () => {} });
+  const prober = new Prober(am, { grantsFn: async () => null, probeFn, log: () => {} });
   await prober.probeAll();
 
   assert.equal(am.accounts[0].quota.unified5h, 0.30);
@@ -37,7 +37,7 @@ test('a DISABLED account is still probed — quota stays visible while benched',
     fiveHour: { utilization: 0.20, resetAt: Date.now() + 3600_000 },
     sevenDay: { utilization: 0.40, resetAt: WEEK_OUT() },
   });
-  const prober = new Prober(am, { probeFn, log: () => {} });
+  const prober = new Prober(am, { grantsFn: async () => null, probeFn, log: () => {} });
   await prober.probeAll();
   // The disabled account's quota still refreshes, so the user sees it recover.
   assert.equal(am.accounts[1].quota.unified7d, 0.40, 'disabled account quota is still refreshed');
@@ -51,7 +51,7 @@ test('overlapping probe cycles are skipped', async () => {
     calls++;
     setTimeout(() => r({ sevenDay: { utilization: 0.1, resetAt: WEEK_OUT() } }), 20);
   });
-  const prober = new Prober(am, { probeFn, log: () => {} });
+  const prober = new Prober(am, { grantsFn: async () => null, probeFn, log: () => {} });
   const p1 = prober.probeAll();
   const p2 = prober.probeAll(); // running -> skipped
   await Promise.all([p1, p2]);
@@ -60,7 +60,7 @@ test('overlapping probe cycles are skipped', async () => {
 
 test('a transient probe error leaves quota untouched', async () => {
   const am = manager(1);
-  const prober = new Prober(am, { probeFn: async () => ({ error: 'HTTP 500', status: 500 }), log: () => {} });
+  const prober = new Prober(am, { grantsFn: async () => null, probeFn: async () => ({ error: 'HTTP 500', status: 500 }), log: () => {} });
   await prober.probeOne(am.accounts[0]);
   assert.equal(am.accounts[0].quota.unified7d, null);
 });
@@ -78,7 +78,7 @@ test('probeAll de-bursts oauth probes (paced, one at a time)', async () => {
   };
   // The old Promise.all fired all three at once → the shared usage endpoint 429'd
   // all but one. Paced, at most one is ever in flight and they're spread by the gap.
-  const prober = new Prober(am, { probeFn, usageGapMs: 40, log: () => {} });
+  const prober = new Prober(am, { grantsFn: async () => null, probeFn, usageGapMs: 40, log: () => {} });
   await prober.probeAll();
 
   assert.equal(starts.length, 3, 'all three probed');
@@ -89,7 +89,7 @@ test('probeAll de-bursts oauth probes (paced, one at a time)', async () => {
 
 test('a 429 is recorded (not swallowed) and backs off the usage gap', async () => {
   const am = manager(1);
-  const prober = new Prober(am, { probeFn: async () => ({ error: 'HTTP 429', status: 429 }), usageGapMs: 20, log: () => {} });
+  const prober = new Prober(am, { grantsFn: async () => null, probeFn: async () => ({ error: 'HTTP 429', status: 429 }), usageGapMs: 20, log: () => {} });
   await prober.probeAll();
 
   assert.equal(am.accounts[0].quota.unified7d, null, 'quota untouched on 429');
@@ -109,7 +109,7 @@ test('_baseUsageGap derives the probe spacing from the interval (interval/6, cla
 
 test('stop() aborts an in-flight pacing wait quickly', async () => {
   const am = manager(3);
-  const prober = new Prober(am, {
+  const prober = new Prober(am, { grantsFn: async () => null,
     probeFn: async () => ({ sevenDay: { utilization: 0.4, resetAt: WEEK_OUT() } }),
     usageGapMs: 5000, // long gap so the sweep is mid-pace when we stop it
     log: () => {},
@@ -129,7 +129,7 @@ test('a 401 forces a token refresh and retries once', async () => {
   const probeFn = async () => (++n === 1
     ? { status: 401, error: 'HTTP 401' }
     : { sevenDay: { utilization: 0.20, resetAt: WEEK_OUT() } });
-  const prober = new Prober(am, { probeFn, log: () => {} });
+  const prober = new Prober(am, { grantsFn: async () => null, probeFn, log: () => {} });
   await prober.probeOne(am.accounts[0]);
 
   assert.equal(forced, true);

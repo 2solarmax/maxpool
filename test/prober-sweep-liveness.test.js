@@ -25,7 +25,7 @@ function harness({ intervalMs = 60_000 } = {}) {
     seen.push(am.quotaProbeSweeping);
     return { ok: true, status: 200, data: {} };
   };
-  const prober = new Prober(am, {
+  const prober = new Prober(am, { grantsFn: async () => null,
     intervalMs, probeFn, providerProbeFn: async () => null,
     log: () => {}, usageGapMs: 0,
   });

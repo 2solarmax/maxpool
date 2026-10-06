@@ -48,7 +48,7 @@ test('the prober SKIPS a refreshDead account (no 60s probe storm)', async () => 
   am.accounts[0].refreshDead = true;
   am.ensureTokenFresh = async () => true; // stub — not under test here
   const probed = [];
-  const prober = new Prober(am, { probeFn: async (cred) => { probed.push(cred); return { sevenDay: { utilization: 0.1, resetAt: Date.now() + 8.64e7 } }; }, timeoutMs: 500 });
+  const prober = new Prober(am, { grantsFn: async () => null, probeFn: async (cred) => { probed.push(cred); return { sevenDay: { utilization: 0.1, resetAt: Date.now() + 8.64e7 } }; }, timeoutMs: 500 });
   await prober.probeAll();
   assert.ok(!probed.includes(am.accounts[0].credential), 'the dead account is NOT probed');
   assert.ok(probed.includes(am.accounts[1].credential), 'the healthy account IS probed');

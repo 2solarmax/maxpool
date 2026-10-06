@@ -13,8 +13,12 @@ import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
 import { decideZai, decideClaude } from './reset-policy.js';
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, timeoutMs = 10_000, log = console.log, usageGapMs = null } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null } = {}) {
     this.am = accountManager;
+    // Injectable like probeFn: the default hits api.anthropic.com, so a harness that
+    // doesn't stub it makes a REAL network call per oauth sweep (a test then passes
+    // or fails on internet latency — prober-sweep-liveness, 2026-10-06).
+    this.grantsFn = grantsFn;
     this.intervalMs = intervalMs;
     this.probeFn = probeFn;
     this.providerProbeFn = providerProbeFn;
@@ -247,7 +251,7 @@ export class Prober {
       // OWNER GATE as z.ai cards: a DISABLED account is never listed or claimed.
       try {
         if (account.enabled !== false && account.credential && this.am.applyResetGrants) {
-          const listing = await this._withTimeout(listResetGrants(account.credential));
+          const listing = await this._withTimeout(this.grantsFn(account.credential));
           if (listing) {
             this.am.applyResetGrants(account.index, listing);
             const act = decideClaude(account, listing);

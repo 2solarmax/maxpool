@@ -31,7 +31,7 @@ test('prober skips a latched account without touching the network', async () => 
   const am = new AccountManager([acct('x')], 0.9);
   am.accounts[0].subscriptionGone = true;
   let probed = 0;
-  const p = new Prober(am, { intervalMs: 0, probeFn: async () => { probed++; return {}; } });
+  const p = new Prober(am, { grantsFn: async () => null, intervalMs: 0, probeFn: async () => { probed++; return {}; } });
   const r = await p.probeOne(am.accounts[0]);
   assert.equal(r.ok, false);
   assert.equal(probed, 0, 'probeFn never called for a latched account');

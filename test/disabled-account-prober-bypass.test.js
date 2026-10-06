@@ -35,7 +35,7 @@ function harness({ enabled }) {
     return { status: 401 };               // upstream rejects the (expired) token
   };
 
-  const prober = new Prober(am, { intervalMs: 0, probeFn, providerProbeFn: async () => null, log: () => {} });
+  const prober = new Prober(am, { grantsFn: async () => null, intervalMs: 0, probeFn, providerProbeFn: async () => null, log: () => {} });
   return { am, prober, rotations, probeCalls };
 }
 
@@ -67,7 +67,7 @@ test('a disabled account with a VALID token is probed without any rotation', asy
   const rotations = [];
   am._refreshAccessToken = async () => { rotations.push(1); return {}; };
   let probes = 0;
-  const prober = new Prober(am, {
+  const prober = new Prober(am, { grantsFn: async () => null,
     intervalMs: 0, probeFn: async () => { probes++; return { fiveHour: { utilization: 0.1 } }; },
     providerProbeFn: async () => null, log: () => {},
   });
