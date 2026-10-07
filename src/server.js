@@ -39,6 +39,9 @@ const isNetworkCode = c => Boolean(c) && NETWORK_ERROR_CODES.has(c);
 const NETWORK_SOAK_NONSTREAM_MS = Math.max(5_000,
   Number(process.env.MAXPOOL_NETWORK_SOAK_NONSTREAM_MS) || 45_000);
 const QUEUE_KEEPALIVE = 'event: ping\ndata: {}\n\n';
+// Claude Code's absolute per-stream ceiling (binary-verified 2026-10-07: idle timeout =
+// min(env-or-300s-floor, 1800000)). Nothing resets it; the stream dies at 30 min.
+const CLI_STREAM_CEILING_MS = 25 * 60_000;   // bound network holds strictly below it
 // 240s, strictly BELOW Claude Code's hard 300s stall floor. At the old 300_000 the two
 // timers were a dead heat and the client always won — maxpool's clock starts when a chunk
 // is READ from upstream, strictly before the client parses it. Result: `upstream idle
@@ -1732,12 +1735,19 @@ function computeQueueWindowMs({
   // (the `cc` alias sets 3h) otherwise licenses a multi-hour hold on a connection that is
   // simply gone. Error-fast + client reconnect beats an unattended hold.
   // Network holds are NOT special-cased short any more. maxpool already re-polls every ~1s
-  // and each retry issues a FRESH fetch, so a hold IS "keep probing, resume the moment any
-  // route returns" — exactly what an unattended agent needs to survive a connectivity blip.
-  // Failing fast at 2 minutes handed the turn to Claude Code's retry loop, which is the
-  // thing that loses accumulated work. Visibility is paid for by logging/TUI, not by
-  // truncating the wait.
-  if (cause === 'network' && networkMaxWaitMs != null) windowMs = Math.min(windowMs, Math.max(networkMaxWaitMs, streamClientToleranceMs || 0));
+  // Network holds are NOT special-cased short any more — but they must stay under the
+  // CLI's ABSOLUTE stream ceiling (30 min: Claude Code kills the stream at
+  // min(idle-env, 1800000ms) regardless of bytes flowing — pings reset the idle
+  // watchdog, NOT this ceiling; 49 client-abandoned 30-33-min holds measured
+  // 2026-10-07 when the client's 3h idle header licensed a 3h network hold).
+  // A hold past the ceiling is worse than erroring: the client that started the
+  // request is already gone when capacity returns. The client's own retry loop
+  // (which survives outages natively) takes over after our fast error.
+  // streamClientToleranceMs may be 3h from x-maxpool-client-stream-idle-ms, so it
+  // cannot bound a NETWORK hold — only a capacity/quota hold with real content.
+  if (cause === 'network') {
+    windowMs = Math.min(windowMs, CLI_STREAM_CEILING_MS);
+  }
   return windowMs;
 }
 
@@ -2573,8 +2583,18 @@ async function queueAndRetry(
   // floor applies with nothing resetting it — we must give up well before that so the user
   // sees a real message instead of a client-side timeout.
   if (cause === 'network') {
+    // The client's ABSOLUTE stream ceiling (Claude Code binary, 2026-10-07: idle timeout
+    // is min(env/300s floor, 1800000ms)) kills a stream at 30 min NO MATTER WHAT bytes
+    // flow — pings reset the idle watchdog, not this ceiling. Measured 2026-10-07: 49
+    // client-abandoned holds clustered at 1700-2100s (30-33 min) while streamHoldMaxMs
+    // licensed 7-day holds; the user saw "Waiting for API response · will retry in X"
+    // across sessions with no recovery because the hold outlived every client that
+    // started it. Cap network holds at 25 min: when the network is actually back the
+    // hold resumes in seconds; when it is not, error-fast lets the CLI's OWN retry
+    // (which survives outages and reconnects — the native behavior the owner compared
+    // against) take over instead of dying on our silent 30-min ceiling.
     const budgetMs = requestInfo.stream
-      ? Math.max(60_000, Number(queueConfig.networkMaxWaitMs) || 120_000)
+      ? Math.min(Math.max(60_000, Number(queueConfig.networkMaxWaitMs) || 120_000), CLI_STREAM_CEILING_MS)
       : NETWORK_SOAK_NONSTREAM_MS;
     requestInfo.networkSoakDeadline ||= Date.now() + budgetMs;
     if (Date.now() >= requestInfo.networkSoakDeadline) {
