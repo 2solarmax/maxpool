@@ -219,6 +219,15 @@ const DEFAULT_SCHEDULER = {
   // undiscounted, as do the hard gates (safetyMaxActivePerAccount, usage cap,
   // cooldowns) — those are the anti-dogpile backstops, not price signals.
   fastRefillDiscount: 0.6,        // 0 = off (full cost), 0.6 = discount up to 60% of the two balancing terms
+  // RESET-AWARE PREFERENCE (2026-10-08, owner): an account holding a usable, unexpired
+  // limit reset (Claude cedar_ember grant / z.ai card) has capacity its siblings lack —
+  // when it reaches its wall the prober redeems the reset and it refills (reset-policy
+  // R1). So its BALANCING costs (pace, utilization, spread) are discounted: it soaks
+  // more traffic and spends the reset instead of letting it expire. The SAFETY terms
+  // (capPenalty, reserve/critical, ramp, failure) and every hard gate stay undiscounted,
+  // so it is never dogpiled and never preferred over an unhealthy-looking pick.
+  // 0 = off. 0.35 ≈ a 1.5x share at otherwise-equal health.
+  resetBoostDiscount: 0.35,
   fastRefillFadeUtil: 0.65,       // discount reaches 0 at this session utilization (weeklySoftThreshold)
   recoveryRampWeight: 4,          // decaying penalty applied to a just-recovered account
   recoveryRampMs: 5 * 60_000,     // how long the post-recovery ramp lasts
@@ -2770,6 +2779,31 @@ export class AccountManager {
    *   - ramp:        ease a just-recovered account back in instead of slamming it
    *   - failures:    direct per-account backoff after errors
    */
+  /**
+   * Does this account hold a banked reset that can actually lift its BINDING limit?
+   * Claude grants: usable, not paused, unexpired. z.ai cards: unexpired five-hour cards
+   * always count; weekly cards count only when the account HAS a weekly limit (a legacy
+   * plan has none — z.ai support, 2026-10-03 — so a weekly card there lifts nothing).
+   * Disabled accounts never count (owner gate R0). Display state only otherwise.
+   */
+  _holdsUsableReset(account, now = Date.now()) {
+    if (!account || account.enabled === false) return false;
+    const grants = account.resetGrants?.grants || [];
+    if (grants.some(g => g && g.usableNow !== false && !g.paused && (g.endsAt == null || g.endsAt > now))) return true;
+    const cards = account.resetCards;
+    if (!cards) return false;
+    const live = c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now);
+    if ((cards.fiveHour || []).some(live)) return true;
+    const hasWeeklyLimit = account.quota?.providerWk != null || account.quota?.providerWkReset != null;
+    return hasWeeklyLimit && (cards.weekly || []).some(live);
+  }
+
+  _resetMultiplier(account, now = Date.now()) {
+    const d = Number(this.scheduler.resetBoostDiscount) || 0;
+    if (d <= 0) return 1;
+    return this._holdsUsableReset(account, now) ? 1 - Math.min(d, 0.9) : 1;
+  }
+
   _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
     const now = ctx?.now ?? Date.now();
     const reqWeight = Math.max(1, requestInfo.weight || 1);
@@ -2826,7 +2860,9 @@ export class AccountManager {
     // FAST-REFILL DISCOUNT: applied to the pace and utilization terms for an
     // account whose only cap is a fast-refilling session window — see the
     // DEFAULT_SCHEDULER block for the full rationale (refillMult computed above).
-    const paceCost = this._accountScarcity(account, now) * this.scheduler.paceCostWeight * refillMult;
+    // RESET-AWARE: discounts the three BALANCING terms only (see resetBoostDiscount).
+    const resetMult = this._resetMultiplier(account, now);
+    const paceCost = this._accountScarcity(account, now) * this.scheduler.paceCostWeight * refillMult * resetMult;
 
     // RAW utilization cost — direct, not pace-adjusted. The pace cost above discounts
     // by how far into the window you are, so an account at 80% with 2h left is only
@@ -2834,7 +2870,7 @@ export class AccountManager {
     // benching, but wrong for load balancing: an account at 80% should be clearly less
     // attractive than one at 10% even if both are "on pace". Measured 2026-08-10: cc at
     // 80% scored 52.30 vs glm at 10% at 52.15 — a 0.15 gap drowned by round-robin.
-    const utilizationCost = this._rawUtilization(account) * this.scheduler.utilizationWeight * refillMult;
+    const utilizationCost = this._rawUtilization(account) * this.scheduler.utilizationWeight * refillMult * resetMult;
 
     // Per-model weekly de-preference: an account whose scoped weekly for THIS
     // request's model (e.g. Fable) is high-but-not-exhausted is a poor pick for
@@ -2860,7 +2896,7 @@ export class AccountManager {
     // 2.3x early in its window, fading to parity at the same ses 0.65 the multiplier
     // already uses. A multiplier of 1 makes every discounted term byte-identical to
     // pre-2026-08-25 behaviour; reserve/critical/ramp/failure are never discounted.
-    const spread = share * this.scheduler.spreadShareWeight * refillMult;
+    const spread = share * this.scheduler.spreadShareWeight * refillMult * resetMult;
 
     const ramp = this._recoveryRamp(account, now);
     const reserveCost = this._reserveCost(account, now, weeklyState);
@@ -3344,7 +3380,13 @@ export class AccountManager {
     }
 
     q.lastProbeOkAt = Date.now();
-    // A successful probe clears any recorded failure — freshness confirmed.
+    // A successful probe clears any recorded failure — freshness confirmed — including
+    // the org-403 streak (a healthy probe proves the org still accepts OAuth).
+    q.consecutiveOrgGone = 0;
+    if (account.subscriptionGone) {
+      account.subscriptionGone = false;
+      console.log(`[Maxpool] "${account.name}" subscription check passed — un-benched (the org-403 was transient)`);
+    }
     q.lastProbeError = null;
     q.lastProbeErrorAt = null;
     q.lastProbeErrorStatus = null;
@@ -3381,6 +3423,20 @@ export class AccountManager {
     // worth having; the diagnosis that motivated it was wrong.)
     q.consecutiveProbeFailures = (q.consecutiveProbeFailures || 0) + 1;
     const n = q.consecutiveProbeFailures;
+    // ORG-403 LATCH REQUIRES ITS OWN STRIKES (2026-10-08, false "no sub" on
+    // max@gomokka.com). `n` mixes EVERY probe failure — network timeouts first among
+    // them — so after a flapping-network morning one genuine org-403 can arrive with
+    // n already >= 3 and bench a LIVE subscription (measured: latch fired at "x6"
+    // with exactly one org-403 in the whole week's log; 104 successful requests the
+    // same day). The subscription verdict must count only consecutive org-403s.
+    const isOrgGone = status === 403
+      && /not allowed for this organization|disabled.*subscription|subscription.*disabled|organization has disabled/i.test(String(message));
+    if (isOrgGone) {
+      q.consecutiveOrgGone = (q.consecutiveOrgGone || 0) + 1;
+    } else {
+      q.consecutiveOrgGone = 0;   // any OTHER outcome breaks the org-gone streak
+    }
+    const orgN = q.consecutiveOrgGone;
     // A SUSTAINED ORG-403 is the subscription being gone (canceled Max plan lapsing
     // server-side — measured 2026-09-18/20: "OAuth authentication is currently not
     // allowed for this organization" on 2solarmax@ and privacy@, both canceled Sep 16).
@@ -3388,11 +3444,9 @@ export class AccountManager {
     // pure waste. Latch subscriptionGone (3 strikes, like the 401 rule): the prober
     // skips the account, the TUI says why, and routing treats it as unavailable. A
     // successful re-auth clears it (updateAccountTokens).
-    if (status === 403
-      && /not allowed for this organization|disabled.*subscription|subscription.*disabled|organization has disabled/i.test(String(message))
-      && n >= 3 && !account.subscriptionGone) {
+    if (isOrgGone && orgN >= 3 && !account.subscriptionGone) {
       account.subscriptionGone = true;
-      console.error(`[Maxpool] "${account.name}" subscription disabled at the organization (HTTP 403 x${n}) — benching it. Re-enable after re-subscribing, or remove the account (a → d).`);
+      console.error(`[Maxpool] "${account.name}" subscription disabled at the organization (HTTP 403 x${orgN}) — benching it. Re-enable after re-subscribing, or remove the account (a → d).`);
     }
     // A SUSTAINED 401 is dead credentials, not a blip. Latch refreshDead so (a) the
     // prober stops re-POSTing a rejected token every 60s forever — measured 2026-08-10:
@@ -3438,7 +3492,7 @@ export class AccountManager {
   }
 
   /** Store the latest reset-card listing for an account (prober piggyback).
-   *  Cards are display/decision state only — routing never reads them. */
+   *  Read by redeem policy AND by _scoreAccount's reset-aware preference. */
   applyResetCards(accountIndex, cards) {
     const account = this.accounts[accountIndex];
     if (!account || !cards) return;
@@ -4009,7 +4063,7 @@ export class AccountManager {
     // A dead refresh token (invalid_grant) is PERMANENT until browser re-auth —
     // never auto-retry it. Without this the prober re-POSTs the rejected token every
     // ~60s forever (hammering Anthropic's OAuth endpoint). Cleared on re-login.
-    if (account.refreshDead || account.subscriptionGone) return false;
+    if (account.refreshDead || (account.subscriptionGone && !account._subRecheck)) return false;
 
     // A DISABLED account never spends its single-use refresh token. The prober still
     // READS its quota by design (you disable an exhausted account and still want to

@@ -12,6 +12,10 @@ import { listResetCards, redeemResetCard } from './zai-reset-cards.js';
 import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
 import { decideZai, decideClaude } from './reset-policy.js';
 
+// How often a subscription-latched account is rechecked (one probe + at most one
+// token refresh per window — cheap, and bounded so a truly canceled plan isn't hammered).
+export const SUB_RECHECK_MS = 30 * 60_000;
+
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null } = {}) {
     this.am = accountManager;
@@ -245,7 +249,16 @@ export class Prober {
     // endpoint 403s before answering anything, so probing is pure waste until the org
     // accepts OAuth again. Skipping also stops the every-60s hammer that ran 700+ times
     // on 2solarmax@ between 2026-09-18 and 09-20.
-    if (account.subscriptionGone) return { ok: false, status: 403 };
+    // SELF-CLEAR RECHECK (2026-10-08): the latch used to be terminal — the account was
+    // skipped here AND by ensureTokenFresh, so a single transient org-403 benched a live
+    // subscription until manual re-auth. Recheck it at a low cadence: a 200 clears the
+    // latch (applyUsageData), another org-403 keeps it benched.
+    if (account.subscriptionGone) {
+      const since = Date.now() - (account._subRecheckAt || 0);
+      if (since < SUB_RECHECK_MS) return { ok: false, status: 403 };
+      account._subRecheckAt = Date.now();
+      account._subRecheck = true;
+    }
     try {
       // Claude banked resets (cedar_ember) piggyback on the oauth poll — same
       // OWNER GATE as z.ai cards: a DISABLED account is never listed or claimed.
@@ -288,6 +301,8 @@ export class Prober {
     } catch (e) { // best-effort; never let a probe throw
       this.am.recordProbeError?.(account.index, e?.message || String(e), null);
       return { ok: false, status: null };
+    } finally {
+      account._subRecheck = false;
     }
   }
 
