@@ -111,13 +111,15 @@ async function viaRest(secretName, project, timeoutMs) {
   const t = setTimeout(() => ctl.abort(), Math.min(timeoutMs, 15_000));
   try {
     const res = await restDeps.fetch(url, { headers: { Authorization: `Bearer ${tok}` }, signal: ctl.signal });
-    if (res.status === 401) tokenMemo = { value: null, at: 0 };   // stale token → refetch next time
+    if (res.status === 401) { tokenMemo = { value: null, at: 0 }; return null; }  // stale token → CLI fallback
+    // 403/404: the server answered definitively — the CLI would get the same answer.
+    if (res.status === 403 || res.status === 404) return { value: null, definitive: true };
     if (!res.ok) return null;
     const j = await res.json();
     const b64 = j?.payload?.data;
-    if (!b64) return null;
+    if (!b64) return { value: null, definitive: true };
     const v = Buffer.from(b64, 'base64').toString('utf8').trim();
-    return v || null;
+    return { value: v || null, definitive: true };
   } finally { clearTimeout(t); }
 }
 
@@ -127,10 +129,19 @@ export async function resolveSecret(secretName, { project = DEFAULT_PROJECT, tim
     const cached = fromCache(secretName);
     if (cached) return cached;
   }
+  // ONE time budget for the whole lookup: REST first, then the CLI with whatever is
+  // left. A definitive REST answer (the secret does not exist / no access) skips the
+  // CLI entirely — the CLI would only re-ask the same server, and on an IPv6-broken
+  // network it hangs for the full timeout anyway.
+  const deadline = Date.now() + timeoutMs;
   try {
-    const v = await viaRest(secretName, project, timeoutMs);
-    if (v) return v;
-  } catch { /* fall through to the CLI path */ }
+    const r = await viaRest(secretName, project, timeoutMs);
+    if (r?.value) return r.value;
+    if (r?.definitive) return null;
+  } catch { /* transport failure — fall through to the CLI path */ }
+  const remaining = deadline - Date.now();
+  if (remaining < 1000) return null;
+  timeoutMs = remaining;
   try {
     const { stdout } = await execFileAsync(
       'gcloud',
