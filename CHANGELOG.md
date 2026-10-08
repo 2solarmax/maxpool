@@ -5,6 +5,17 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.10] - 2026-10-08
+
+### Documentation
+
+- Never hand-signal the live worker — release.sh + auto-updater only
+
+### Fixed
+
+- Fetch provider keys over IPv4 REST — the gcloud CLI hangs on IPv6
+- One time budget per key lookup; a definitive REST answer skips the CLI
+
 ## [1.24.9] - 2026-10-08
 
 ### Fixed
