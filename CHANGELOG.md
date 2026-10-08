@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.11] - 2026-10-08
+
+### Documentation
+
+- Provider keys resolve over IPv4 REST — gcloud CLI hangs on IPv6-broken networks
+
+### Fixed
+
+- Blind-tunnel dual-stack race — IPv6-black-holed networks killed every non-Anthropic tunnel
+
 ## [1.24.10] - 2026-10-08
 
 ### Documentation
