@@ -3446,6 +3446,7 @@ export class AccountManager {
     // successful re-auth clears it (updateAccountTokens).
     if (isOrgGone && orgN >= 3 && !account.subscriptionGone) {
       account.subscriptionGone = true;
+      account._subRecheckAt = Date.now();   // first recheck one full window after latching
       console.error(`[Maxpool] "${account.name}" subscription disabled at the organization (HTTP 403 x${orgN}) — benching it. Re-enable after re-subscribing, or remove the account (a → d).`);
     }
     // A SUSTAINED 401 is dead credentials, not a blip. Latch refreshDead so (a) the

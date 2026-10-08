@@ -254,7 +254,10 @@ export class Prober {
     // subscription until manual re-auth. Recheck it at a low cadence: a 200 clears the
     // latch (applyUsageData), another org-403 keeps it benched.
     if (account.subscriptionGone) {
-      const since = Date.now() - (account._subRecheckAt || 0);
+      // A latch set outside recordProbeError (state restore, tests, older builds) has no
+      // stamp: treat NOW as the latch moment so the first recheck waits a full window.
+      if (!account._subRecheckAt) account._subRecheckAt = Date.now();
+      const since = Date.now() - account._subRecheckAt;
       if (since < SUB_RECHECK_MS) return { ok: false, status: 403 };
       account._subRecheckAt = Date.now();
       account._subRecheck = true;
