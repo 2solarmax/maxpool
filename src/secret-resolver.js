@@ -9,6 +9,7 @@
  * broken provider degrades to "disabled" instead of crashing the proxy.
  */
 import { execFile } from 'node:child_process';
+import https from 'node:https';
 import { promisify } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -57,12 +58,79 @@ function fromCache(secretName) {
   return (typeof v === 'string' && v.trim()) ? v.trim() : null;
 }
 
+// REST PATH FIRST (2026-10-08). `gcloud secrets versions access` hung on this machine
+// (>60s, 21 piled-up gcloud processes) while a plain Secret Manager REST call with the
+// same user's token answered in 0.75s. Every startup resolve AND every 5-minute
+// re-resolve went through the hung CLI, so all z.ai providers stayed
+// "secret-unresolved" until a manual restart happened to land on a good moment.
+// The token itself comes from `gcloud auth print-access-token` (fast — it reads the
+// stored credential, no Secret Manager round-trip) and is reused for ~45 min.
+let tokenMemo = { value: null, at: 0 };
+const TOKEN_TTL_MS = 45 * 60_000;
+
+async function accessToken(timeoutMs) {
+  if (tokenMemo.value && Date.now() - tokenMemo.at < TOKEN_TTL_MS) return tokenMemo.value;
+  const { stdout } = await execFileAsync('gcloud', ['auth', 'print-access-token'],
+    { timeout: Math.min(timeoutMs, 20_000), maxBuffer: 64 * 1024 });
+  const t = stdout.trim();
+  if (!t) throw new Error('empty token');
+  tokenMemo = { value: t, at: Date.now() };
+  return t;
+}
+
+// IPv4-PINNED GET (2026-10-08). On this network IPv6 to Google is black-holed:
+// secretmanager.googleapis.com advertises AAAA records, an IPv6 connect hangs until
+// timeout, and IPv4 answers fine (measured: `curl -6` 8s timeout, `curl -4` OK). gcloud's
+// own HTTP stack tries IPv6 first and HANGS — that is why every CLI resolve timed out.
+// `family: 4` makes this path immune; the CLI fallback below stays as a last resort.
+function ipv4Get(url, { headers, signal }) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers, family: 4, signal }, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8');
+        resolve({ status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 300, json: async () => JSON.parse(body) });
+      });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+  });
+}
+
+/** Test seam: inject a fetch + token source. */
+let restDeps = { fetch: ipv4Get, token: accessToken };
+export function __setRestDeps(d) { restDeps = { ...restDeps, ...d }; }
+export function __resetRestDeps() { restDeps = { fetch: ipv4Get, token: accessToken }; tokenMemo = { value: null, at: 0 }; }
+
+async function viaRest(secretName, project, timeoutMs) {
+  const tok = await restDeps.token(timeoutMs);
+  const url = `https://secretmanager.googleapis.com/v1/projects/${encodeURIComponent(project)}`
+    + `/secrets/${encodeURIComponent(secretName)}/versions/latest:access`;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), Math.min(timeoutMs, 15_000));
+  try {
+    const res = await restDeps.fetch(url, { headers: { Authorization: `Bearer ${tok}` }, signal: ctl.signal });
+    if (res.status === 401) tokenMemo = { value: null, at: 0 };   // stale token → refetch next time
+    if (!res.ok) return null;
+    const j = await res.json();
+    const b64 = j?.payload?.data;
+    if (!b64) return null;
+    const v = Buffer.from(b64, 'base64').toString('utf8').trim();
+    return v || null;
+  } finally { clearTimeout(t); }
+}
+
 export async function resolveSecret(secretName, { project = DEFAULT_PROJECT, timeoutMs = 45_000, useCache = true } = {}) {
   if (!secretName || typeof secretName !== 'string') return null;
   if (useCache) {
     const cached = fromCache(secretName);
     if (cached) return cached;
   }
+  try {
+    const v = await viaRest(secretName, project, timeoutMs);
+    if (v) return v;
+  } catch { /* fall through to the CLI path */ }
   try {
     const { stdout } = await execFileAsync(
       'gcloud',
