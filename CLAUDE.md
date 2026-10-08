@@ -144,3 +144,12 @@ never add IP/fingerprint spoofing or MITM — PRs adding them are rejected.
 > for maxpool work lives in `mokka-workspace/work/tooling/` (Max works from that
 > workspace). The key registry lives at
 > `mokka-workspace/knowledge/technical/maxpool-api-key-registry.md`.
+
+
+## Live worker safety
+
+NEVER hand-signal (kill/SIGTERM) the running maxpool worker on Max's Mac — its supervisor
+reads a signal as a user quit and the whole pool stays down until a human restarts it
+(measured 2026-10-07: overnight outage, all sessions broken). Shipping code to the live
+pool = ./scripts/release.sh, then the built-in auto-updater installs and gracefully
+restarts it (~30 min). No exceptions for "just a quick reload".
