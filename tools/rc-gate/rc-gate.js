@@ -523,7 +523,13 @@ gate.on('connect', (req, clientSocket, head) => {
   }
 
   // Blind tunnel: connect to the REAL host (gate's own traffic must not loop).
-  const up = net.connect(port, host, () => {
+  // DUAL-STACK FALLBACK (2026-10-08, peer-reported): Node's default resolver prefers
+  // AAAA; on a network whose IPv6 route is black-holed (measured today: IPv6 SYN_SENT
+  // forever to *.googleapis.com and others, IPv4 fine) the upstream connect never
+  // establishes and every blind-tunneled host (bridge, sentry, statsig, and whatever a
+  // dependent session tunnels) fails as a 0.76s reset. autoSelectFamily tries both
+  // families with a 250ms race — IPv6-first when it works, IPv4 the moment it doesn't.
+  const up = net.connect({ port, host, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250 }, () => {
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     up.write(head);
     up.pipe(clientSocket);
