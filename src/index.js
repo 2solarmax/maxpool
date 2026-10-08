@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 
 import net from 'node:net';
+
+// DUAL-STACK TUNING (2026-10-08). Node ≥20 enables happy-eyeballs with a 250ms
+// per-family attempt timeout. On networks where IPv6 is degraded-but-not-dead and the
+// IPv4 path needs >250ms to establish (measured today: every pool upstream call failed
+// ETIMEDOUT in ~270ms while IPv4 alone answered in 3s — the whole fleet saw
+// "connection dropped on every account (UPSTREAM_TTFB)"), 250ms aborts the fallback
+// before IPv4 can win. 2000ms covers a slow IPv4 start; a healthy IPv6 still wins
+// immediately, so well-connected networks are unaffected. Must run BEFORE any
+// connection is opened, hence here at module top.
+net.setDefaultAutoSelectFamilyAttemptTimeout(Number(process.env.MAXPOOL_FAMILY_ATTEMPT_MS) || 2000);
 import { stat } from 'node:fs/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
