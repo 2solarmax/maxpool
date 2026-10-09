@@ -119,17 +119,26 @@ export async function listResetGrants(accessToken, { signal } = {}) {
  *  random per CALL (server treats already_used as success), so a caller retry is
  *  safe but the id is not reused across distinct decisions. Returns
  *  { ok:true } | { ok:false, error, code }. */
-export async function claimResetGrant(accessToken, grantId, { signal, requestId } = {}) {
+export async function claimResetGrant(accessToken, grantId, { signal, requestId, fetchImpl } = {}) {
   if (!accessToken || !grantId) return { ok: false, error: 'missing args' };
+  const doFetch = fetchImpl || ((u, o) => fetch(u, o));
   try {
-    const prof = await fetch(PROFILE_URL, { headers: headers(accessToken), signal });
+    const prof = await doFetch(PROFILE_URL, { headers: headers(accessToken), signal });
     if (!prof.ok) return { ok: false, error: `profile HTTP ${prof.status}` };
-    const orgs = (await prof.json())?.organizations;
-    const org = Array.isArray(orgs) && orgs.length ? orgs[0].uuid : null;
+    const body = await prof.json();
+    // The profile returns `organization` (SINGULAR object) — measured live on
+    // maxim.krasnykh@gmail.com 2026-10-09: {account, organization, application}.
+    // v1.24.0-12 read only the plural `organizations` array (null for personal
+    // accounts), so EVERY cedar_ember claim on a personal account failed with
+    // 'no oauth organization' while the account sat exhausted with a usable reset
+    // (owner report: 'this account is exhausted but the reset is not being used').
+    // Accept both shapes; singular wins when present.
+    const org = body?.organization?.uuid
+      ?? (Array.isArray(body?.organizations) && body.organizations.length ? body.organizations[0].uuid : null);
     if (!org) return { ok: false, error: 'no oauth organization' };
 
     const rid = requestId || randomUUID();
-    const res = await fetch(`https://api.anthropic.com${CLAIM_PATH}/${org}/reset_rate_limits`, {
+    const res = await doFetch(`https://api.anthropic.com${CLAIM_PATH}/${org}/reset_rate_limits`, {
       method: 'POST',
       headers: { ...headers(accessToken), 'Content-Type': 'application/json' },
       body: JSON.stringify({ program: 'cedar_ember', grant_id: grantId, request_id: rid }),

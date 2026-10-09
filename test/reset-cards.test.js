@@ -115,3 +115,25 @@ test('listResetCards without a token returns an error, never throws', async () =
   const r = await listResetCards(null);
   assert.ok(r.error);
 });
+
+// ── Claude claim org resolution (2026-10-09: personal accounts return organization, singular) ──
+test('claim org: profile.organization.uuid wins; plural array is the fallback', async () => {
+  const { claimResetGrant } = await import('../src/claude-reset-grants.js');
+  const seen = [];
+  const fakeFetch = async (url, opts) => {
+    seen.push(url);
+    if (url.endsWith('/api/oauth/profile')) return { ok: true, json: async () => ({ account: { uuid: 'acc' }, organization: { uuid: 'org-singular' } }) };
+    return { ok: true, status: 200, json: async () => ({ result: 'reset', reset: true }) };
+  };
+  const r = await claimResetGrant('tok', 'g1', { fetchImpl: fakeFetch });
+  assert.match(seen[1], /\/api\/organizations\/org-singular\/reset_rate_limits$/, 'claimed against the SINGULAR org');
+  // plural-only shape still resolves
+  seen.length = 0;
+  const fakeFetch2 = async (url, opts) => {
+    seen.push(url);
+    if (url.endsWith('/api/oauth/profile')) return { ok: true, json: async () => ({ organizations: [{ uuid: 'org-plural' }] }) };
+    return { ok: true, status: 200, json: async () => ({ result: 'reset', reset: true }) };
+  };
+  await claimResetGrant('tok', 'g1', { fetchImpl: fakeFetch2 });
+  assert.match(seen[1], /\/api\/organizations\/org-plural\//, 'plural fallback intact');
+});
