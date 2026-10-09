@@ -1745,9 +1745,12 @@ function computeQueueWindowMs({
   // (which survives outages natively) takes over after our fast error.
   // streamClientToleranceMs may be 3h from x-maxpool-client-stream-idle-ms, so it
   // cannot bound a NETWORK hold — only a capacity/quota hold with real content.
-  if (cause === 'network') {
-    windowMs = Math.min(windowMs, CLI_STREAM_CEILING_MS);
-  }
+  // EVERY streaming hold is bounded by the CLI's absolute 30-min stream ceiling —
+  // measured again 2026-10-09: five CAPACITY-cause holds (network-storm cooldowns)
+  // from the 05:30 network switch died client-side at 1820-1848s with only pings
+  // sent; the network-cause cap alone (2026-10-07) left this class behind. No
+  // client survives past the ceiling, so a longer hold is always an orphan.
+  windowMs = Math.min(windowMs, CLI_STREAM_CEILING_MS);
   return windowMs;
 }
 

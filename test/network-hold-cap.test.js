@@ -24,10 +24,13 @@ test('a NETWORK-cause hold is capped below the CLI 30-min stream ceiling', () =>
   assert.ok(w > 120_000, 'still generous vs the pre-2026-08-02 2-minute cap');
 });
 
-test('a CAPACITY/quota hold is NOT shortened — a real reset is worth waiting for', () => {
+test('a CAPACITY/quota hold keeps a long window, bounded by the CLI stream ceiling', () => {
+  // REVISED 2026-10-09: 'still bounded by what the client will wait' was the intent;
+  // the client's absolute stream ceiling (30 min) is the real bound, not the 3h idle
+  // tolerance — capacity holds measured dying at 1820-1848s with only pings sent.
   const w = computeQueueWindowMs({ ...base, cause: 'capacity', retryPlanCause: 'capacity' });
-  assert.ok(w > 120_000, `quota holds keep their long window (got ${w})`);
-  assert.equal(w, base.streamClientToleranceMs, 'still bounded by what the client will wait');
+  assert.ok(w > 120_000, `quota holds keep a long window (got ${w})`);
+  assert.equal(w, 25 * 60_000, 'bounded by the CLI ceiling, not the 3h idle tolerance');
 });
 
 test('the network cap never EXTENDS a window that is already shorter', () => {
@@ -41,4 +44,12 @@ test('the network cap never EXTENDS a window that is already shorter', () => {
 test('non-streaming requests are unaffected by the network cap path', () => {
   const w = computeQueueWindowMs({ ...base, stream: false, cause: 'network', retryPlanCause: 'network' });
   assert.ok(w <= base.nonStreamMaxWaitMs);
+});
+
+
+test('a CAPACITY-cause streaming hold ALSO stays under the CLI ceiling (2026-10-09 orphans)', () => {
+  // Five capacity holds from the 05:30 network switch died client-side at
+  // 1820-1848s — the ceiling does not care WHY the pool is holding.
+  const w = computeQueueWindowMs({ ...base, cause: 'capacity', retryPlanCause: 'capacity' });
+  assert.ok(w <= 25 * 60_000, `capacity hold capped below 30-min ceiling (got ${w})`);
 });
