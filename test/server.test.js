@@ -51,15 +51,19 @@ test('hold window: a STREAMING capacity/throttle request holds for maxWaitMs, no
   // THE FIX: a streaming "temporarily limiting requests" throttle (cause='capacity')
   // must be held on the heartbeat up to maxWaitMs, so a session-cap (~3h) or a
   // sustained throttle recovers instead of failing after 15m.
+  // REVISED 2026-10-09 (the CLI stream-ceiling cap): every streaming hold is also
+  // bounded by the 25-min CLI_STREAM_CEILING_MS — a 24h hold can never be observed
+  // by the client that opened it (measured: capacity holds dying at 1820-1848s).
   assert.equal(
     computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'session_limit', ...cfg }),
-    cfg.maxWaitMs,
-    'streaming capacity holds 24h, not the 15m capacity cap (the bug)',
+    25 * 60_000,
+    'streaming capacity holds up to the CLI stream ceiling (25m), not 24h and not 15m',
   );
-  // Ordinary per-account quota 429 already held 7d — unchanged.
+  // Ordinary per-account quota 429: also bounded by the 25m CLI stream ceiling
+  // (was 7d — a hold the client that opened it can never observe).
   assert.equal(
     computeQueueWindowMs({ cause: 'quota', stream: true, retryPlanCause: 'session_limit', ...cfg }),
-    cfg.streamHoldMaxMs,
+    25 * 60_000,
   );
   // Non-streaming has no heartbeat → still short-capped under capacity.
   assert.equal(
@@ -89,16 +93,17 @@ test('hold window: a STREAMING capacity/throttle request holds for maxWaitMs, no
 test('hold window: streamClientToleranceMs clamps EVERY streaming cause (the Stream-idle fix)', () => {
   const tol = 3 * 3600_000; // 3h — the client-tolerance ceiling
   const cfg = { maxWaitMs: 24 * 3600_000, capacityMaxWaitMs: 15 * 60_000, nonStreamMaxWaitMs: 5 * 60_000, streamHoldMaxMs: 7 * 24 * 3600_000, streamClientToleranceMs: tol };
-  // capacity (was 24h) AND quota/throttle (was 7d) both clamp down to the tolerance —
-  // maxpool can't hold a stream past the client's own watchdog, so a 24h/7d park is moot.
-  assert.equal(computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'session_limit', ...cfg }), tol);
-  assert.equal(computeQueueWindowMs({ cause: 'quota', stream: true, retryPlanCause: 'session_limit', ...cfg }), tol);
+  // capacity AND quota/throttle clamp to min(tolerance, CLI stream ceiling = 25m).
+  // A tolerance above the ceiling still yields the ceiling: no client survives past it.
+  assert.equal(computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'session_limit', ...cfg }), 25 * 60_000);
+  assert.equal(computeQueueWindowMs({ cause: 'quota', stream: true, retryPlanCause: 'session_limit', ...cfg }), 25 * 60_000);
   // concurrency-cap (15m) is already below the tolerance → stays 15m.
   assert.equal(computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'concurrency_cap', ...cfg }), cfg.capacityMaxWaitMs);
   // NON-streaming is untouched by the streaming tolerance.
   assert.equal(computeQueueWindowMs({ cause: 'quota', stream: false, retryPlanCause: 'session_limit', ...cfg }), cfg.nonStreamMaxWaitMs);
-  // A tolerance ABOVE a cause's natural window never inflates it (min, not max).
-  assert.equal(computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'session_limit', ...cfg, streamClientToleranceMs: 48 * 3600_000 }), cfg.maxWaitMs);
+  // A tolerance ABOVE a cause's natural window never inflates it (min, not max) —
+  // and the CLI stream ceiling bounds the result regardless.
+  assert.equal(computeQueueWindowMs({ cause: 'capacity', stream: true, retryPlanCause: 'session_limit', ...cfg, streamClientToleranceMs: 48 * 3600_000 }), 25 * 60_000);
 });
 
 test('bug (ghost-leak): heartbeat reap releases the queue slot+bytes when the held client write throws EPIPE', async () => {
