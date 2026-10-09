@@ -1709,7 +1709,7 @@ function formatRetryDuration(seconds) {
 function computeQueueWindowMs({
   cause, stream, retryPlanCause,
   maxWaitMs, capacityMaxWaitMs, nonStreamMaxWaitMs, streamHoldMaxMs, streamClientToleranceMs,
-  isCountTokens, countTokensMaxWaitMs, networkMaxWaitMs,
+  isCountTokens, countTokensMaxWaitMs,
 }) {
   let windowMs;
   if (!stream) {
@@ -2649,9 +2649,6 @@ async function queueAndRetry(
   const streamClientToleranceMs = Number.isFinite(requestInfo.clientToleranceMs)
     ? requestInfo.clientToleranceMs
     : Math.max(0, Number(queueConfig.streamClientToleranceMs) || 0);
-  const networkMaxWaitMs = queueConfig.networkMaxWaitMs == null
-    ? 2 * 60 * 1000
-    : Math.max(0, Number(queueConfig.networkMaxWaitMs) || 0);
   const queueWindowMs = computeQueueWindowMs({
     cause,
     stream: Boolean(requestInfo.stream),
@@ -2659,7 +2656,6 @@ async function queueAndRetry(
     maxWaitMs,
     capacityMaxWaitMs,
     nonStreamMaxWaitMs,
-    networkMaxWaitMs,
     streamHoldMaxMs,
     streamClientToleranceMs,
     isCountTokens: Boolean(requestInfo.isCountTokens),

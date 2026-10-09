@@ -114,7 +114,7 @@ function netEvacTick(sampleSet) {
   _pendingLost = new Set(newlyLost);
   const lost = confirmedLost;
   if (!lost.length) return false;
-  console.log(`[net-evac] IPv4 source address(es) ${[..._pendingLost].join(', ')} gone for 2 consecutive samples — destroying pooled sockets`);
+  console.log(`[net-evac] IPv4 source address(es) ${lost.join(', ')} gone for 2 consecutive samples — destroying pooled sockets`);
   poolAgent.destroy();
   telemetryAgent.destroy();
   directAgent.destroy();

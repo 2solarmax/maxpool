@@ -777,6 +777,15 @@ async function serverWorkerCommand() {
       }, 5 * 60_000);
       secretTimer.unref?.();
     }
+    // Key rotation: a new secret version reaches the live pool within 30 min.
+    const { refreshRotatedProviders } = await import('./secret-resolver.js');
+    const rotateTimer = setInterval(async () => {
+      try {
+        const n = await refreshRotatedProviders(accountManager.accounts);
+        if (n) console.log(`[Maxpool] Key rotation: ${n} provider key(s) updated from Secret Manager`);
+      } catch { /* next tick */ }
+    }, 30 * 60_000);
+    rotateTimer.unref?.();
   }
 
   // Seed the running version immediately so the TUI header always shows it, even

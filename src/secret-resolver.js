@@ -199,6 +199,28 @@ export function pendingProviders(accounts) {
   return accounts.filter(a => a.configSourced && a.type === 'provider' && a.secretName && !a.credential);
 }
 
+/**
+ * Pick up ROTATED keys. A key resolves once at startup, so a new secret version (a
+ * key swap in Secret Manager) stayed invisible until the next restart — the pool kept
+ * calling with the old key (2026-10-09: all six z.ai keys moved to the account's
+ * "zcode-api-key", which is the only key z.ai issues reset cards for). Re-reads every
+ * loaded provider's secret, bypassing the local cache, and swaps `credential` when the
+ * value changed. A failed read keeps the current key. Returns the number swapped.
+ */
+export async function refreshRotatedProviders(accounts, resolve = (names) => resolveSecrets(names, { useCache: false })) {
+  const loaded = accounts.filter(a => a.configSourced && a.type === 'provider' && a.secretName && a.credential);
+  if (!loaded.length) return 0;
+  const resolved = await resolve([...new Set(loaded.map(a => a.secretName))]);
+  let swapped = 0;
+  for (const a of loaded) {
+    const tok = resolved[a.secretName];
+    if (!tok || tok === a.credential) continue;
+    a.credential = tok;
+    swapped++;
+  }
+  return swapped;
+}
+
 export async function reresolveProviders(accounts, resolve = resolveSecrets) {
   const pending = pendingProviders(accounts);
   if (!pending.length) return 0;
