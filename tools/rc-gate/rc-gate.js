@@ -94,15 +94,31 @@ function ipv4Set() {
   return out;
 }
 let _netIPv4 = ipv4Set();
+// PERSISTENCE-DEBOUNCED EVAC (2026-10-09). Interface enumeration briefly drops an
+// address that never actually went away — measured on the iPhone-hotspot link:
+// 172.20.10.12 'disappeared' 3x in 30s (13:01:29/44/59) while the interface kept it
+// and direct connectivity was healthy (200 in 0.5s). Each false evac destroyed EVERY
+// pooled socket including the healthy gate->maxpool ones — the owner's 502 'socket
+// hang up' retry storms, on a network that never changed. An address must be missing
+// from 2 CONSECUTIVE samples before we treat the loss as real.
+let _pendingLost = new Set();
 function netEvacTick(sampleSet) {
   const now = sampleSet === undefined ? ipv4Set() : sampleSet;
-  const lost = [..._netIPv4].filter(a => !now.has(a));
+  // A loss only counts if it was ALREADY pending (missed the previous tick too) OR
+  // the address vanished from the CURRENT sample again. Because _netIPv4 drops the
+  // address on first miss, the second observation must key on the PENDING set vs the
+  // current sample — not on re-deriving loss from _netIPv4.
+  const confirmedLost = [..._pendingLost].filter(a => !now.has(a));
+  const newlyLost = [..._netIPv4].filter(a => !now.has(a) && !_pendingLost.has(a));
   _netIPv4 = now;
+  _pendingLost = new Set(newlyLost);
+  const lost = confirmedLost;
   if (!lost.length) return false;
-  console.log(`[net-evac] IPv4 source address(es) ${lost.join(', ')} disappeared — destroying pooled sockets`);
+  console.log(`[net-evac] IPv4 source address(es) ${[..._pendingLost].join(', ')} gone for 2 consecutive samples — destroying pooled sockets`);
   poolAgent.destroy();
   telemetryAgent.destroy();
   directAgent.destroy();
+  _pendingLost = new Set();
   return true;
 }
 setInterval(() => netEvacTick(), 5_000).unref();
