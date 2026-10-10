@@ -3015,9 +3015,29 @@ function prepareRuntimeProviders(accountManager, headers) {
       .filter(a => a.configSourced && a.credential)
       .map(a => a.credential),
   );
+  // THE PROXY OWNS THE KEYS (2026-10-10). When config already manages accounts of a
+  // provider kind, a session-supplied key for that kind is ignored outright. Dedup by
+  // token alone was not enough: a session launched before a key rotation keeps sending
+  // the OLD key for its whole life, and it surfaced as a duplicate "glm-fallback"
+  // account for the same z.ai login (1,578 requests on the old key in 2 days).
+  // A kind counts as proxy-managed only while at least one of its config accounts
+  // HOLDS a key: if every one is unresolved (the secret-unresolved outages of
+  // 2026-10-05/08) the session key still stands in as the safety net.
+  const configKinds = new Set(
+    (accountManager.accounts || []).filter(a => a.configSourced && a.credential).map(a => a.provider),
+  );
+  // Self-clean: a fallback created before the config keys loaded (or restored from
+  // state) is dropped as soon as it is idle — no restart, no waiting for old sessions.
+  // (removeAccount itself refuses an account with a request in flight.)
+  for (const a of [...(accountManager.accounts || [])]) {
+    if (a.runtime && !a.configSourced && a.type === 'provider' && configKinds.has(a.provider)
+        && accountManager.removeAccount(accountManager.accounts.indexOf(a))) {
+      console.log(`[Maxpool] Dropped session-supplied "${a.name}" — ${a.provider} keys are managed by the pool config`);
+    }
+  }
 
   const zaiToken = headerValue(headers, 'x-maxpool-zai-token');
-  if (zaiToken && !configTokens.has(zaiToken)) {
+  if (zaiToken && !configKinds.has('zai') && !configTokens.has(zaiToken)) {
     const opus = headerValue(headers, 'x-maxpool-zai-opus-model') || headerValue(headers, 'x-maxpool-zai-model') || 'glm-5.3';
     const sonnet = headerValue(headers, 'x-maxpool-zai-sonnet-model') || headerValue(headers, 'x-maxpool-zai-model') || opus;
     const haiku = headerValue(headers, 'x-maxpool-zai-haiku-model') || 'glm-5.3';
@@ -3036,7 +3056,7 @@ function prepareRuntimeProviders(accountManager, headers) {
   }
 
   const kimiToken = headerValue(headers, 'x-maxpool-kimi-token');
-  if (kimiToken && !configTokens.has(kimiToken)) {
+  if (kimiToken && !configKinds.has('kimi') && !configTokens.has(kimiToken)) {
     // Fallback only — `cc all` always sends x-maxpool-kimi-model from the llm_config SSOT,
     // so this is what a bare/older client gets. Kept current deliberately: it read
     // 'kimi-k2.7' while the fleet had moved to k3.
@@ -3652,3 +3672,6 @@ function computeRetryAfter(accountManager, requestInfo = {}) {
   const ms = accountManager.nextRetryForRequest?.(requestInfo, new Set())?.retryAfterMs ?? Infinity;
   return ms === Infinity ? 60 : Math.max(1, Math.ceil(ms / 1000));
 }
+
+// Test seam: prepareRuntimeProviders with a plain headers object.
+export const __test = { prepareRuntimeProviders };

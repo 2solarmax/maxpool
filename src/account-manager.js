@@ -4375,8 +4375,12 @@ export class AccountManager {
     const configTokens = new Set(
       entries.map(e => e.token).filter(Boolean),
     );
+    // Same rule for a provider KIND config already covers: a header-derived fallback
+    // of that kind is a duplicate login even when its token differs (a pre-rotation key).
+    const configKinds = new Set(entries.filter(e => e.token).map(e => e.provider).filter(Boolean));
     for (const a of [...this.accounts]) {
-      if (!a.configSourced && a.type === 'provider' && a.credential && configTokens.has(a.credential)) {
+      if (!a.configSourced && a.type === 'provider' && a.credential
+          && (configTokens.has(a.credential) || (a.runtime && configKinds.has(a.provider)))) {
         const idx = this.accounts.indexOf(a);
         if (idx >= 0 && this.accounts[idx].inFlight === 0) this.removeAccount(idx);
       }

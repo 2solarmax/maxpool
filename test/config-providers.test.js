@@ -169,16 +169,14 @@ test('config providers REMOVE state-restored header providers with the same toke
   assert.equal(zai[0].configSourced, true);
 });
 
-test('a DIFFERENT token (second GLM account) is NOT removed — load balancing works', () => {
+test('a second GLM account load-balances as a CONFIG provider (the proxy owns the keys)', () => {
+  // Was: a header-derived 'glm-ahmed' kept beside config. Since 2026-10-10 a
+  // session-supplied key never adds an account once config manages that kind — a
+  // second account is a second config entry, so both keys are proxy-controlled.
   const am = new AccountManager([], 0.90);
-  // Ahmed's GLM in state.json
-  am.upsertRuntimeAccount({
-    name: 'glm-ahmed', type: 'provider', provider: 'zai', authToken: 'AHMED_KEY',
-    upstream: 'https://api.z.ai/api/anthropic',
-  });
-  // Max's GLM in config
   am.loadConfigProviders([
     { name: 'glm-max', provider: 'zai', token: 'MAX_KEY' },
+    { name: 'glm-ahmed', provider: 'zai', token: 'AHMED_KEY' },
   ]);
   const zai = am.accounts.filter(a => a.provider === 'zai');
   assert.equal(zai.length, 2, 'two different keys = two providers, load balanced');
@@ -239,4 +237,66 @@ test('removing ALL config providers leaves none behind', () => {
   ]);
   am.loadConfigProviders([]);
   assert.equal(am.accounts.length, 0);
+});
+
+// ── the proxy owns the keys (2026-10-10) ─────────────────────────────────────
+
+test('a state-restored fallback with a DIFFERENT (pre-rotation) key is removed when config manages that provider kind', () => {
+  // The reported duplicate: glm-fallback held max@'s OLD key (e8d3…) after ZAI_API_KEY
+  // rotated to its zcode key; token-dedup alone kept it as a second account.
+  const am = new AccountManager([], 0.90);
+  am.upsertRuntimeAccount({ name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'OLD', upstream: 'https://api.z.ai/api/anthropic' });
+  am.loadConfigProviders([{ name: 'glm max@gomokka.com', provider: 'zai', token: 'NEW' }]);
+  const zai = am.accounts.filter(a => a.provider === 'zai');
+  assert.deepEqual(zai.map(a => a.name), ['glm max@gomokka.com']);
+});
+
+test('a config-managed kind does NOT remove the other kind\'s fallback', () => {
+  const am = new AccountManager([], 0.90);
+  am.upsertRuntimeAccount({ name: 'kimi-fallback', type: 'provider', provider: 'kimi', authToken: 'K', upstream: 'https://api.kimi.com/coding' });
+  am.loadConfigProviders([{ name: 'glm max@gomokka.com', provider: 'zai', token: 'NEW' }]);
+  assert.ok(am.accounts.find(a => a.name === 'kimi-fallback'), 'kimi fallback survives a zai-only config');
+});
+
+test('a session header with a stale key never creates a fallback when config manages that kind', async () => {
+  const { __test } = await import('../src/server.js');
+  const am = new AccountManager([], 0.90);
+  am.loadConfigProviders([{ name: 'glm max@gomokka.com', provider: 'zai', token: 'NEW' }]);
+  __test.prepareRuntimeProviders(am, { 'x-maxpool-profile': 'all', 'x-maxpool-zai-token': 'OLD' });
+  assert.equal(am.accounts.filter(a => a.provider === 'zai').length, 1, 'no glm-fallback for a stale header key');
+});
+
+test('with NO config provider of that kind, the header key still creates the fallback (teammate without GCP)', async () => {
+  const { __test } = await import('../src/server.js');
+  const am = new AccountManager([], 0.90);
+  __test.prepareRuntimeProviders(am, { 'x-maxpool-profile': 'all', 'x-maxpool-zai-token': 'ONLY' });
+  assert.ok(am.accounts.find(a => a.name === 'glm-fallback'));
+});
+
+test('an existing idle fallback is dropped live on the next request once config holds a key of that kind', async () => {
+  const { __test } = await import('../src/server.js');
+  const am = new AccountManager([], 0.90);
+  am.loadConfigProviders([{ name: 'glm max@gomokka.com', provider: 'zai', token: 'NEW' }]);
+  am.upsertRuntimeAccount({ name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'OLD', upstream: 'https://api.z.ai/api/anthropic' });
+  __test.prepareRuntimeProviders(am, { 'x-maxpool-profile': 'all', 'x-maxpool-zai-token': 'OLD' });
+  assert.deepEqual(am.accounts.filter(a => a.provider === 'zai').map(a => a.name), ['glm max@gomokka.com']);
+  assert.equal(am.exportRuntimeProviders().length, 0, 'and it is no longer persisted across restarts');
+});
+
+test('a fallback with a request in flight is left alone until idle', async () => {
+  const { __test } = await import('../src/server.js');
+  const am = new AccountManager([], 0.90);
+  am.loadConfigProviders([{ name: 'glm max@gomokka.com', provider: 'zai', token: 'NEW' }]);
+  am.upsertRuntimeAccount({ name: 'glm-fallback', type: 'provider', provider: 'zai', authToken: 'OLD', upstream: 'https://api.z.ai/api/anthropic' });
+  am.accounts.find(a => a.name === 'glm-fallback').inFlight = 1;
+  __test.prepareRuntimeProviders(am, { 'x-maxpool-profile': 'all' });
+  assert.ok(am.accounts.find(a => a.name === 'glm-fallback'));
+});
+
+test('safety net: when every config key of that kind is unresolved, the session key still creates the fallback', async () => {
+  const { __test } = await import('../src/server.js');
+  const am = new AccountManager([], 0.90);
+  am.loadConfigProviders([{ name: 'glm max@gomokka.com', provider: 'zai', token: null }]);
+  __test.prepareRuntimeProviders(am, { 'x-maxpool-profile': 'all', 'x-maxpool-zai-token': 'SESSION' });
+  assert.ok(am.accounts.find(a => a.name === 'glm-fallback'), 'GLM stays reachable during a secret-unresolved outage');
 });
