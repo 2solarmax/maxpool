@@ -2205,3 +2205,42 @@ test('the latched effort level is applied UP FRONT on later turns (no repeat 400
     await close(upstream);
   }
 });
+
+// ── stalled-body 408 (2026-10-10/11 outage) ──────────────────────────────────
+// When a request body never finishes arriving (network death mid-upload), Node's
+// requestTimeout cuts the request with a BODY-LESS `408 Request Timeout`. Claude
+// Code shows that as a bare "API Error: 408 status code (no body)" — 1,711 times
+// overnight (measured), each indistinguishable from an upstream failure. The pool
+// must instead answer with the standard Anthropic error JSON the CLI can retry.
+// Raw-socket client (fetch/undici cannot express "stop sending mid-body").
+test('stalled request body gets a JSON error response, not a bodyless 408', async () => {
+  const am = new AccountManager([], 0.9, {});
+  // Scaled-down arrival timeout via the same env knobs the constructor reads
+  // (a property assignment after listen is a no-op in Node 20).
+  process.env.MAXPOOL_REQUEST_TIMEOUT_MS = '1500';
+  process.env.MAXPOOL_CONNECTIONS_CHECK_MS = '300';
+  const server = createProxyServer(am, { proxy: { port: 0, host: '127.0.0.1', apiKey: 'test' }, upstream: 'http://127.0.0.1:1' }, {});
+  try {
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const t0 = Date.now();
+    let onClose; const promise = new Promise(r => { onClose = r; });
+    const net = await import('node:net');
+    const c = net.connect(server.address().port, '127.0.0.1');
+    c.on('connect', () => c.write('POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nx-api-key: test\r\ncontent-type: application/json\r\ncontent-length: 100000\r\n\r\n{"model":"x"'));
+    let got = Buffer.alloc(0);
+    c.on('data', d => { got = Buffer.concat([got, d]); });
+    c.on('close', () => onClose());
+    await promise;
+    const text = got.toString('utf8');
+    const elapsed = Date.now() - t0;
+    const status = /^HTTP\/1\.1 (\d+)/.exec(text)?.[1];
+    assert.equal(status, '408');
+    const body = text.split('\r\n\r\n')[1] || '';
+    assert.match(body, /"type"\s*:\s*"error"/, `body must be an Anthropic-style error JSON, got: ${JSON.stringify(body.slice(0, 120))}`);
+    assert.ok(elapsed < 8_000, `should fail on the scaled-down timeout quickly (${elapsed}ms)`);
+  } finally {
+    delete process.env.MAXPOOL_REQUEST_TIMEOUT_MS;
+    delete process.env.MAXPOOL_CONNECTIONS_CHECK_MS;
+    server.close(); server.closeAllConnections?.();
+  }
+});

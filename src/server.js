@@ -163,7 +163,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // upstream-bound request headers elsewhere.
   const workerStamp = String(process.pid);
 
-  const server = http.createServer(async (req, res) => {
+  // REQUEST-ARRIVAL TIMEOUTS (2026-10-11 outage). Node's defaults (300s request
+  // timeout, 30s checking interval) are what fired live — but they must be in the
+  // constructor to be settable at all (property assignment after listen is a no-op
+  // in Node 20, measured), so they are read here, env-tunable, never mutated later.
+  const server = http.createServer({
+    requestTimeout: Math.max(1_000, Number(process.env.MAXPOOL_REQUEST_TIMEOUT_MS) || 300_000),
+    connectionsCheckingInterval: Math.max(100, Number(process.env.MAXPOOL_CONNECTIONS_CHECK_MS) || 30_000),
+  }, async (req, res) => {
     try {
       // Disable Nagle on the client socket: flush each SSE event immediately instead
       // of coalescing small writes into bursts. Smooths streaming cadence toward the
@@ -342,6 +349,28 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // keep-alive clients retire their socket and don't pipeline a new request onto
   // this releasing worker.
   server.maxpoolBeginDrain = () => { draining = true; };
+
+  // STALLED-UPLOAD ANSWER (2026-10-11 outage). When a request body never finishes
+  // arriving, Node's requestTimeout fires and its default handler writes a BODY-LESS
+  // `408 Request Timeout`, which Claude Code surfaces as the opaque "API Error: 408
+  // status code (no body)" (1,711 of them overnight, while the Mac's network stack
+  // was starved). Answer with the standard Anthropic error envelope instead, naming
+  // the actual cause, so the user sees a real message and the CLI treats it like any
+  // other retryable API error. Every other client error keeps Node's own handling.
+  server.on('clientError', (err, socket) => {
+    if (err?.code === 'ERR_HTTP_REQUEST_TIMEOUT' && socket.writable && !socket._httpMessage?.headersSent) {
+      const body = JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'request_timeout',
+          message: 'Maxpool did not receive the full request in time (the upload stalled — usually a network problem on this machine). Retrying should work once the network recovers.',
+        },
+      });
+      socket.end(`HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+      return;
+    }
+    socket.destroy(err);
+  });
 
   return server;
 }

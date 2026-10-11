@@ -519,3 +519,86 @@ gateDescribe('rc-gate: telemetry batches do not consume the Remote Control socke
     await telemetry;
   } finally { gate.kill(); await new Promise(r => ups.close(r)); }
 });
+
+// ── mbuf-leak regression (2026-10-10/11 outage) ───────────────────────────────
+// A killed CLI leaves a CONNECT tunnel whose request body never finishes. The gate
+// must reap it. Two measured shapes from the outage:
+//   RST shape — hard kill: socket destroy fires 'close' immediately.
+//   FIN shape — clean exit mid-upload: kernel FIN is queued BEHIND unread data
+//     (the gate stopped reading because the pool leg backpressured), so no event
+//     ever fires; the tunnel sat for HOURS holding 1.5-3.6MB of kernel network
+//     memory each (9 sockets measured), and the Mac's mbuf pool drained until
+//     every connection on the machine failed ("mbuf alloc failed" 32k/hr).
+// An explicit body-arrival deadline is what reaps the FIN shape (Node's own
+// requestTimeout is never enforced on the gate's emit('connection') server).
+async function gatePoolFds(gate, poolPort) {
+  // Count the GATE process's TCP sockets to the pool port — the sockets that
+  // leaked in the outage. (Measuring from the fake pool's side is unreliable: a
+  // paused server socket that never reads cannot observe the peer's RST/FIN.)
+  return new Promise(resolve => {
+    nodeChildProcess.execFile('lsof', ['-nP', '-a', '-p', String(gate.pid), '-iTCP'], (err, stdout) => {
+      if (!stdout) return resolve(err ? -1 : 0);
+      resolve(stdout.split('\n').filter(l => l.includes(`:${poolPort}`) && !l.includes('LISTEN')).length);
+    });
+  });
+}
+
+async function clientDeathCase(killMode, timeoutMs, { bodyChunks = 40, waitMs = Math.min(15_000, timeoutMs + 8000) } = {}) {
+  // A pool that does NOT read the body: backpressures the gate exactly like the
+  // outage (maxpool awaiting a body that never finishes while the kernel starves).
+  let requestsSeen = 0;
+  const poolSrv = http.createServer(() => { requestsSeen++; });
+  poolSrv.requestTimeout = 0; poolSrv.headersTimeout = 0; // isolate the gate's responsibility
+  await new Promise(r => poolSrv.listen(0, r));
+  const poolPort = poolSrv.address().port;
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_MAXPOOL_PORT: String(poolPort),
+    RC_GATE_PROFILE: 'all',
+    RC_GATE_MITM_BODY_DEADLINE_MS: String(timeoutMs),
+  });
+  try {
+    const { tls: tlsSock, sock } = await mitmConnect(gate.port);
+    tlsSock.on('error', () => {}); // stray errors after the client is killed
+    // Headers claim 8MB; send the first 64KB WITH the headers so the gate forwards.
+    const head = 'POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-type: application/json\r\ncontent-length: 8388608\r\n\r\n';
+    const chunk = 'x'.repeat(64 * 1024);
+    tlsSock.write(head + chunk);
+    // Wait until the gate has the pool request open — the outage shape is "pool leg
+    // open, body half-sent", not "client died before the forward".
+    const openBy = Date.now() + 5000;
+    while (!requestsSeen && Date.now() < openBy) await new Promise(r => setTimeout(r, 50));
+    assert.ok(requestsSeen, 'gate should have opened a pool request');
+    for (let i = 0; i < bodyChunks; i++) tlsSock.write(chunk); // >0: pool leg backpressures
+    await new Promise(r => setTimeout(r, 300));
+    assert.ok(await gatePoolFds(gate, poolPort) >= 1, 'precondition: gate holds an open pool socket');
+    if (killMode === 'rst') sock.destroy();   // hard kill: RST
+    else tlsSock.end();                       // clean exit: FIN behind undelivered body
+    const deadline = Date.now() + waitMs;
+    let open = -1;
+    while (Date.now() < deadline) {
+      open = await gatePoolFds(gate, poolPort);
+      if (open === 0) break;
+      await new Promise(r => setTimeout(r, 250));
+    }
+    assert.equal(open, 0, `gate must release its pool socket after client ${killMode}-death (still open: ${open})`);
+  } finally {
+    gate.kill('SIGKILL');
+    // closeAllConnections BEFORE close: close() waits for open connections, and a
+    // never-reaped pool socket would hang teardown and mask the real assertion.
+    poolSrv.closeAllConnections?.(); await new Promise(r => poolSrv.close(r));
+  }
+}
+
+gateDescribe('rc-gate: client hard-kill (RST) mid-upload destroys the pool request', async () => {
+  await clientDeathCase('rst', 2000);
+});
+gateDescribe('rc-gate: client clean-exit (FIN) mid-upload is reaped by the body-arrival deadline', async () => {
+  await clientDeathCase('fin', 2000);
+});
+gateDescribe('rc-gate: client hard-kill (RST) mid-upload frees the pool socket at once, no deadline needed', async () => {
+  // Small body (gate is still reading, not backpressured): the gate SEES the RST,
+  // so the close handler must free the pool leg immediately. Deadline set to 60s
+  // and the wait to 5s, so ONLY the close handler can make this pass.
+  await clientDeathCase('rst', 60_000, { bodyChunks: 0, waitMs: 5000 });
+});

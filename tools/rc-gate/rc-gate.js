@@ -143,6 +143,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GATE_PORT = Number(process.env.RC_GATE_PORT || 3457);
 const GATE_HOST = process.env.RC_GATE_HOST || '127.0.0.1';
 const MAXPOOL_PORT = Number(process.env.RC_GATE_MAXPOOL_PORT || 3456);
+// Max time for an inference request BODY to arrive (see the body-arrival deadline).
+// Message bodies are tens of KB to a few MB; 10 min is far above any real upload.
+const MITM_BODY_DEADLINE_MS = Number(process.env.RC_GATE_MITM_BODY_DEADLINE_MS) || 600_000;
 const MITM_HOSTS = new Set((process.env.RC_GATE_MITM_HOSTS || 'api.anthropic.com').split(',').map(s => s.trim()).filter(Boolean));
 const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
 // Direct-forward upstream (test seam; defaults are production values).
@@ -487,6 +490,13 @@ const mitmServer = http.createServer((creq, cres) => {
     if (!upstreamEnded && !cres.writableFinished) {
       clientAborted = true;
       console.log(`[resp-break] CLIENT closed before response completed ${creq.url} after ${bytes}B/${Date.now() - t0}ms`);
+      // CLIENT GONE => TEAR DOWN THE POOL LEG TOO (2026-10-11 outage). `creq.pipe(up)`
+      // does not end `up` when the client dies mid-upload, so the forwarded request sat
+      // open on both ends with its half-sent body parked in kernel socket buffers. A
+      // ~1,000-tunnel fleet of killed/restarted CLIs pinned 1.5-3.6MB each until the
+      // Mac's network-memory pool ran dry ("mbuf alloc failed" 32k/hr) and every
+      // connection on the machine failed until reboot.
+      try { up.destroy(); } catch {}
     }
   });
   cres.on('error', e => {
@@ -497,6 +507,22 @@ const mitmServer = http.createServer((creq, cres) => {
     try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
     cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_upstream_error', message: String(err?.message || err) } }));
   });
+  // BODY-ARRIVAL DEADLINE (2026-10-11 outage, the FIN shape). A CLI that exits
+  // mid-upload sends its FIN behind body bytes the gate has not read yet (the pool
+  // leg was backpressured), so no 'close'/'aborted' ever fires here and the tunnel
+  // held its kernel buffers for hours (9 sockets x 1.5-3.6MB until the Mac's
+  // network-memory pool ran dry). Node's own requestTimeout cannot do this job:
+  // it is never enforced on a server fed by emit('connection') (measured: no
+  // reaping at all). The deadline covers BODY ARRIVAL only and is cleared the
+  // moment the body ends, so a long streaming RESPONSE is never touched.
+  const bodyTimer = setTimeout(() => {
+    console.log(`[resp-break] request body never finished arriving ${creq.url} after ${Date.now() - t0}ms — destroying tunnel + pool leg`);
+    try { up.destroy(); } catch {}
+    try { creq.socket?.destroy(); } catch {}
+  }, MITM_BODY_DEADLINE_MS);
+  bodyTimer.unref?.();
+  creq.once('end', () => clearTimeout(bodyTimer));
+  creq.once('close', () => clearTimeout(bodyTimer));
   creq.pipe(up);
 });
 mitmServer.headersTimeout = 0;
