@@ -128,3 +128,60 @@ test('cold path STILL drains — the pre-drain earns its cost when the socket wi
   assert.equal(rc.pending, true, 'cold path enters drain');
   assert.equal(restarted, false, 'and waits');
 });
+
+// ── queued requests survive a seamless reload (2026-10-11) ───────────────────
+// The v1.24.18 auto-update dropped 24 requests that had been waiting in the queue
+// for 3-13 min: requestRestart() paused admission BEFORE taking the seamless path,
+// and paused admission makes nextRetryForRequest report "never recovers"
+// (retryAfterMs Infinity), so every queued waiter gave up at once. On a seamless
+// reload the old worker keeps serving what it holds — admission must stay open so
+// its queue keeps draining as capacity frees.
+test('seamless reload does NOT pause admission (queued requests keep waiting)', () => {
+  const events = [];
+  const rc = new RestartController({
+    pauseAdmission: () => events.push('paused'),
+    resumeAdmission: () => events.push('resumed'),
+    restartNow: () => events.push('restart'),
+    log: () => {},
+    drainTimeoutMs: 10_000,
+    setTimeoutFn: () => 1, clearTimeoutFn: () => {},
+    setIntervalFn: () => 2, clearIntervalFn: () => {},
+    isSeamless: () => true,
+  });
+  rc.requestStarted('q1');
+  rc.requestRouted('q1', '(queued)');   // a request waiting in the queue
+  rc.requestStarted('u1');
+  rc.requestRouted('u1', 'a1');         // and one streaming upstream
+  rc.requestRestart();
+  assert.ok(events.includes('restart'), 'seamless restart fires');
+  assert.ok(!events.includes('paused'), `admission must stay open on a seamless reload (events: ${events.join(',')})`);
+});
+
+test('seamless reload with NOTHING in flight also keeps admission open', () => {
+  const events = [];
+  const rc = new RestartController({
+    pauseAdmission: () => events.push('paused'),
+    resumeAdmission: () => {}, restartNow: () => events.push('restart'), log: () => {},
+    drainTimeoutMs: 10_000, setTimeoutFn: () => 1, clearTimeoutFn: () => {},
+    setIntervalFn: () => 2, clearIntervalFn: () => {},
+    isSeamless: () => true,
+  });
+  rc.requestStarted('q1');
+  rc.requestRouted('q1', '(queued)');   // only queued work, zero upstream
+  rc.requestRestart();
+  assert.ok(events.includes('restart'));
+  assert.ok(!events.includes('paused'), `queued-only seamless reload must not pause admission (events: ${events.join(',')})`);
+});
+
+test('cold restart STILL pauses admission (the socket closes; shedding is correct)', () => {
+  const events = [];
+  const rc = new RestartController({
+    pauseAdmission: () => events.push('paused'),
+    resumeAdmission: () => {}, restartNow: () => events.push('restart'), log: () => {},
+    drainTimeoutMs: 10_000, setTimeoutFn: () => 1, clearTimeoutFn: () => {},
+    setIntervalFn: () => 2, clearIntervalFn: () => {},
+    isSeamless: () => false,
+  });
+  rc.requestRestart();
+  assert.ok(events.includes('paused'), 'cold path pauses admission');
+});

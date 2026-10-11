@@ -87,17 +87,20 @@ export class RestartController {
     // Without the `pending` guard a second call (e.g. auto-apply firing while a manual
     // restart is draining) would orphan the first _drainTimer and re-log.
     if (this.restarting || this.pending) return;
-    this.pauseAdmission();
-    if (this.upstreamRequests.size === 0) {
+    // Seamless handoff → do not pre-drain AND do not pause admission. The old worker
+    // keeps serving everything it already holds after the baton passes — including
+    // requests WAITING in its queue. Pausing admission made the routing oracle report
+    // "no route will ever recover", so every queued waiter gave up at once: the
+    // v1.24.18 auto-update dropped 24 sessions that had waited 3-13 min (2026-10-11).
+    if (this.isSeamless()) {
+      if (this.upstreamRequests.size > 0) {
+        this.log(`[Maxpool] Restarting now — ${this.upstreamRequests.size} in-flight request(s) finish on the current version; new requests go to the updated one.`);
+      }
       this._restart();
       return;
     }
-
-    // Seamless handoff → do not pre-drain (see isSeamless above). The in-flight
-    // requests finish on the OLD worker after the baton passes; holding admission
-    // here would only 503 the rest of the fleet for nothing.
-    if (this.isSeamless()) {
-      this.log(`[Maxpool] Restarting now — ${this.upstreamRequests.size} in-flight request(s) finish on the current version; new requests go to the updated one.`);
+    this.pauseAdmission();
+    if (this.upstreamRequests.size === 0) {
       this._restart();
       return;
     }
