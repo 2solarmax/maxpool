@@ -507,7 +507,19 @@ async function forwardRequest(
     ctx.account = '(none available)';
     const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
     const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
-    const retryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
+    // CLI-RETRIABLE CAP (2026-10-11 "bricked sessions"). The real soonest reset can
+    // be hours out; sending `retry-after: 10800` makes Claude Code's SDK treat the
+    // 429 as terminal (binary-verified 2.1.296: a plain rate_limit 429 whose
+    // retry-after exceeds 60s + 25% headroom aborts with tengu_api_retry_after_too_long
+    // — it neither sleeps nor retries; the turn dies and the session looks dead).
+    // The pool has ALREADY decided not to hold this request, so the honest and
+    // useful header is "retry soon": every SDK retries ≤60s values with backoff,
+    // and the pool answers again immediately with a fresh estimate. The body text
+    // still carries the real wait.
+    const RETRY_AFTER_RETRIABLE_S = 60;
+    const retryAfter = willRecoverSoon
+      ? Math.min(Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)), RETRY_AFTER_RETRIABLE_S)
+      : 60;
     // Surface the routing decision (logs go to the TUI; this is the only record
     // of WHY a request was rejected rather than queued).
     console.log(`[Maxpool] No route for request — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);

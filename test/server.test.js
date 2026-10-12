@@ -2244,3 +2244,50 @@ test('stalled request body gets a JSON error response, not a bodyless 408', asyn
     server.close(); server.closeAllConnections?.();
   }
 });
+
+// ── 'Retry in ~1h' then bricked sessions (2026-10-11, Max report) ────────────
+// The pool returns a 429 rate_limit_error whose retry-after equals the SOONEST
+// account reset (measured live: "Retry in ~1h"). Claude Code's SDK (2.1.296,
+// binary-verified: tengu_api_retry_after_too_long) treats a plain rate_limit_429
+// with retry-after > 60s (Pgr=60000, +25% headroom) as a TERMINAL error — it does
+// NOT sleep and retry; the turn dies and the session looks bricked. The pool
+// KNOWS the request is streamable and queueable; erroring with a >60s retry-after
+// hands the client the one shape its SDK refuses to retry.
+// The pool must cap the retry-after it advertises on this fast-429 path at 60s
+// (retry-soon, the retriable shape) — or, better, hold the request. This test
+// pins the retry-after cap.
+test('fast-429 retry-after never exceeds the CLI-retriable bound (60s)', async () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90, {});
+  // All accounts session-limited with a reset 3h out — the reported state.
+  am.accounts[0].quota = {
+    unified5h: 0.95, unified7d: 0.3,
+    unified5hReset: Date.now() + 3 * 3600_000,
+    unified7dReset: Date.now() + 5 * 24 * 3600_000,
+  };
+  const upstream = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, pollMs: 25, nonStreamMaxWaitMs: 100, streamClientToleranceMs: 100 },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    assert.equal(res.status, 429);
+    const ra = Number(res.headers.get('retry-after'));
+    assert.ok(Number.isFinite(ra), 'retry-after header present');
+    assert.ok(ra <= 60, `retry-after must stay at/below the CLI's retriable bound (60s) — got ${ra}s; a longer value makes Claude Code give up permanently`);
+    const body = JSON.parse(await res.text());
+    assert.equal(body.error.type, 'rate_limit_error');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
