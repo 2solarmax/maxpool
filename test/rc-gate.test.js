@@ -565,8 +565,11 @@ async function clientDeathCase(killMode, timeoutMs, { bodyChunks = 40, waitMs = 
     const chunk = 'x'.repeat(64 * 1024);
     tlsSock.write(head + chunk);
     // Wait until the gate has the pool request open — the outage shape is "pool leg
-    // open, body half-sent", not "client died before the forward".
-    const openBy = Date.now() + 5000;
+    // open, body half-sent", not "client died before the forward". The gate reads the
+    // TLS stream asynchronously; under a loaded runner the first 64KB write can still be
+    // sitting in the gate's socket buffer when this check runs, so poll generously
+    // (release-suite flake 2026-10-12: 5s window starved on a busy machine).
+    const openBy = Date.now() + 15_000;
     while (!requestsSeen && Date.now() < openBy) await new Promise(r => setTimeout(r, 50));
     assert.ok(requestsSeen, 'gate should have opened a pool request');
     for (let i = 0; i < bodyChunks; i++) tlsSock.write(chunk); // >0: pool leg backpressures
