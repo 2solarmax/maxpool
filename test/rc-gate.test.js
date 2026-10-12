@@ -605,3 +605,133 @@ gateDescribe('rc-gate: client hard-kill (RST) mid-upload frees the pool socket a
   // and the wait to 5s, so ONLY the close handler can make this pass.
   await clientDeathCase('rst', 60_000, { bodyChunks: 0, waitMs: 5000 });
 });
+
+// ── red-team finding 1 (2026-10-12): the body deadline must NOT fire on a HEALTHY
+// request merely QUEUED for a pool socket. With every pool-leg socket busy holding
+// a LONG STREAMING RESPONSE (body complete — deadline correctly cleared), a new
+// request's body is backpressured (pipe paused — 'end' never fires) through no
+// fault of the client. A 600s deadline on ~1,000-tunnel fleets fires exactly at
+// peak load. The deadline must measure CLIENT-side arrival inactivity, not total
+// time-since-request-start.
+gateDescribe('rc-gate: a request queued behind a long stream is NOT killed by the body deadline', async () => {
+  let finishFirst = null;
+  const poolSrv = http.createServer((req, res) => {
+    const chunks = []; req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      if (!finishFirst) {
+        // Request 1: healthy stream — body complete, response held open (SSE long-poll shape).
+        finishFirst = () => { res.end('data: done\n\n'); };
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write('event: ping\ndata: {}\n\n');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, bytes: Buffer.concat(chunks).length }));
+    });
+  });
+  poolSrv.requestTimeout = 0; poolSrv.headersTimeout = 0; poolSrv.keepAliveTimeout = 0;
+  await new Promise(r => poolSrv.listen(0, r));
+  const DEADLINE_MS = 1200;
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_MAXPOOL_PORT: String(poolSrv.address().port),
+    RC_GATE_PROFILE: 'all',
+    RC_GATE_MITM_BODY_DEADLINE_MS: String(DEADLINE_MS),
+    RC_GATE_POOL_MAX_SOCKETS: '1',
+  });
+  try {
+    // Request 1: full small body, connection: keep-alive so the socket STAYS assigned
+    // while its response streams. Occupies the single pool socket.
+    const one = await mitmConnect(gate.port);
+    one.tls.on('error', () => {});
+    one.tls.write('POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-type: application/json\r\ncontent-length: 3\r\nconnection: keep-alive\r\n\r\nabc');
+    const until1 = Date.now() + 10_000;
+    while (!finishFirst && Date.now() < until1) await new Promise(r => setTimeout(r, 50));
+    assert.ok(finishFirst, 'precondition: request 1 holds the pool socket with an open stream');
+
+    // Request 2 (separate tunnel, own TLS): healthy client, sends its full 200KB body.
+    const two = await mitmConnect(gate.port);
+    two.tls.on('error', () => {});
+    const body2 = 'y'.repeat(200 * 1024);
+    let resp2 = '';
+    two.tls.on('data', d => { resp2 += d.toString(); });
+    two.tls.write(`POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-type: application/json\r\ncontent-length: ${body2.length}\r\n\r\n${body2}`);
+
+    // Wait WELL past the body deadline while request 2 sits queued for the busy socket.
+    await new Promise(r => setTimeout(r, DEADLINE_MS * 3));
+    // Now release request 1's stream → socket frees → request 2 must run and complete.
+    finishFirst();
+    const until2 = Date.now() + 15_000;
+    while (!/HTTP\/1\.1 200/.test(resp2) && Date.now() < until2) await new Promise(r => setTimeout(r, 100));
+    assert.match(resp2, /HTTP\/1\.1 200/, `queued healthy request must survive the wait and complete once the socket frees — got: ${JSON.stringify(resp2.slice(0, 160))}`);
+    assert.match(resp2, new RegExp(`"bytes":${body2.length}`), 'the full body reached the pool');
+  } finally {
+    gate.kill('SIGKILL');
+    poolSrv.closeAllConnections?.(); await new Promise(r => poolSrv.close(r));
+  }
+});
+
+// Pin the CLEAR side of the deadline: a healthy request whose body finishes, then
+// whose RESPONSE streams far longer than the deadline, must never be cut.
+gateDescribe('rc-gate: a completed body with a long streaming response is never cut by the deadline', async () => {
+  const DEADLINE_MS = 800;
+  const poolSrv = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      let n = 0;
+      const iv = setInterval(() => {
+        res.write(`data: tick${n}\n\n`);
+        if (++n >= 6) { clearInterval(iv); res.end('data: done\n\n'); }
+      }, 400);   // 6 × 400ms = 2.4s ≫ 800ms deadline
+    });
+  });
+  poolSrv.requestTimeout = 0; poolSrv.headersTimeout = 0;
+  await new Promise(r => poolSrv.listen(0, r));
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_MAXPOOL_PORT: String(poolSrv.address().port),
+    RC_GATE_PROFILE: 'all',
+    RC_GATE_MITM_BODY_DEADLINE_MS: String(DEADLINE_MS),
+  });
+  try {
+    const { tls: t } = await mitmConnect(gate.port);
+    const res = await httpOverTLS(t, 'POST', '/v1/messages?beta=true', { 'content-type': 'application/json' }, '{"model":"m"}');
+    assert.match(res, /data: done/, `long stream must complete past the body deadline — got: ${JSON.stringify(res.slice(-120))}`);
+  } finally {
+    gate.kill('SIGKILL');
+    poolSrv.closeAllConnections?.(); await new Promise(r => poolSrv.close(r));
+  }
+});
+
+gateDescribe('rc-gate: deadline timer is cleared when the body ends (unit-level pin)', async () => {
+  // The previous behavioral pin survived its own mutant: up/socket destroy after a
+  // completed body doesn't always kill the piped response, so the clear could be
+  // deleted with no visible failure. Pin the CLEAR directly via the debug line.
+  process.env.RC_GATE_DEBUG_DEADLINE = '1';
+  const mp = fakeMaxpool();
+  await new Promise(r => mp.server.listen(0, r));
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_MAXPOOL_PORT: String(mp.server.address().port),
+    RC_GATE_PROFILE: 'all',
+    RC_GATE_MITM_BODY_DEADLINE_MS: '60000',
+  });
+  try {
+    const { tls: t } = await mitmConnect(gate.port);
+    // KEEP-ALIVE (the real CLI's shape): the tunnel stays open after the response, so
+    // the request 'close' does not fire promptly — body 'end' is the only clear.
+    const body = '{"model":"m"}';
+    let resp = '';
+    t.on('data', d => { resp += d.toString(); });
+    t.write(`POST /v1/messages?beta=true HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\nconnection: keep-alive\r\n\r\n${body}`);
+    const until = Date.now() + 5000;
+    while (!/message_start/.test(resp) && Date.now() < until) await new Promise(r => setTimeout(r, 50));
+    await new Promise(r => setTimeout(r, 200));
+    assert.ok(/cleared via end/.test(gate.getLog()),
+      'body end must clear the deadline timer while the keep-alive tunnel is still open');
+  } finally {
+    delete process.env.RC_GATE_DEBUG_DEADLINE;
+    gate.kill('SIGKILL'); await new Promise(r => mp.server.close(r));
+  }
+});

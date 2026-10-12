@@ -37,7 +37,8 @@ import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
 // held their fds after close: measured 7,568 CLOSED sockets on one gate process,
 // which is what starved new CONNECTs and made Remote Control "keep dropping after
 // each reconnect". Pooled agents reuse connections and bound the socket count.
-const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 64, maxFreeSockets: 16 });
+const POOL_MAX_SOCKETS = Number(process.env.RC_GATE_POOL_MAX_SOCKETS || 64);
+const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: POOL_MAX_SOCKETS, maxFreeSockets: 16 });
 // DIRECT-POOL SATURATION (2026-09-26). The 64-socket cap was chosen on 2026-09-04 for the
 // fd-leak fix, when a handful of Remote Control sessions shared this gate. Measured today:
 // 43 live RC sessions, exactly 64 ESTABLISHED sockets to Anthropic (the cap, pinned) and 9
@@ -515,14 +516,26 @@ const mitmServer = http.createServer((creq, cres) => {
   // it is never enforced on a server fed by emit('connection') (measured: no
   // reaping at all). The deadline covers BODY ARRIVAL only and is cleared the
   // moment the body ends, so a long streaming RESPONSE is never touched.
-  const bodyTimer = setTimeout(() => {
-    console.log(`[resp-break] request body never finished arriving ${creq.url} after ${Date.now() - t0}ms — destroying tunnel + pool leg`);
-    try { up.destroy(); } catch {}
-    try { creq.socket?.destroy(); } catch {}
-  }, MITM_BODY_DEADLINE_MS);
-  bodyTimer.unref?.();
-  creq.once('end', () => clearTimeout(bodyTimer));
-  creq.once('close', () => clearTimeout(bodyTimer));
+  // DEADLINE SHAPE (red-team 2026-10-12): arm the timer only once the pool leg HAS a
+  // socket — a request QUEUED for one (all 64 busy holding long streams) is
+  // backpressured through no fault of its client ('end' cannot fire while the pipe is
+  // paused), and a start-anchored timer destroyed exactly those healthy requests at
+  // peak load. Once armed, the timer measures what it always meant to: the client has
+  // a live wire to the pool and still isn't finishing its upload.
+  let bodyTimer = null;
+  const armBodyDeadline = () => {
+    if (bodyTimer) return;
+    bodyTimer = setTimeout(() => {
+      console.log(`[resp-break] request body never finished arriving ${creq.url} after ${Date.now() - t0}ms — destroying tunnel + pool leg`);
+      try { up.destroy(); } catch {}
+      try { creq.socket?.destroy(); } catch {}
+    }, MITM_BODY_DEADLINE_MS);
+    bodyTimer.unref?.();
+  };
+  up.on('socket', armBodyDeadline);
+  const clearBodyDeadline = (why) => { if (bodyTimer) { clearTimeout(bodyTimer); bodyTimer = null; } if (process.env.RC_GATE_DEBUG_DEADLINE) console.log('[deadline-debug] cleared via', why); };
+  creq.once('end', () => clearBodyDeadline('end'));
+  creq.once('close', () => clearBodyDeadline('close'));
   creq.pipe(up);
 });
 mitmServer.headersTimeout = 0;

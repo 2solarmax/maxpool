@@ -366,7 +366,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           message: 'Maxpool did not receive the full request in time (the upload stalled — usually a network problem on this machine). Retrying should work once the network recovers.',
         },
       });
-      socket.end(`HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+      // end-then-DESTROY: a half-closed socket kept parsing, so a client that resumed its
+      // upload after the 408 got its request forwarded upstream anyway — a duplicate,
+      // possibly billed call (red-team 2026-10-12, finding 6).
+      socket.end(`HTTP/1.1 408 Request Timeout\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`, () => socket.destroy());
       return;
     }
     socket.destroy(err);
@@ -516,10 +519,10 @@ async function forwardRequest(
     // useful header is "retry soon": every SDK retries ≤60s values with backoff,
     // and the pool answers again immediately with a fresh estimate. The body text
     // still carries the real wait.
-    const RETRY_AFTER_RETRIABLE_S = 60;
-    const retryAfter = willRecoverSoon
-      ? Math.min(Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)), RETRY_AFTER_RETRIABLE_S)
-      : 60;
+    // Header = CLI-retriable cap; message = the REAL wait (2026-10-12: the capped
+    // number leaked into the text as "Retry in ~1m" while the real wait was ~1h).
+    const retryAfter = clientRetryAfterSeconds(retryPlan.retryAfterMs);
+    const realWaitS = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
     // Surface the routing decision (logs go to the TUI; this is the only record
     // of WHY a request was rejected rather than queued).
     console.log(`[Maxpool] No route for request — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
@@ -527,7 +530,7 @@ async function forwardRequest(
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: unavailableMessage(accountManager, requestInfo, retryAfter, willRecoverSoon),
+        message: unavailableMessage(accountManager, requestInfo, realWaitS, willRecoverSoon),
       },
     }, { 'retry-after': String(retryAfter) });
     return;
@@ -900,15 +903,15 @@ async function forwardRequest(
       if (logDir) writeRequestLog(logDir, reqId, logSections);
       const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
       const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
-      const clientRetryAfter = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
+      const realWaitS = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
       console.log(`[Maxpool] No route after failover — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
       sendErrorResponse(res, requestInfo, 429, {
         type: 'error',
         error: {
           type: 'rate_limit_error',
-          message: unavailableMessage(accountManager, requestInfo, clientRetryAfter, willRecoverSoon),
+          message: unavailableMessage(accountManager, requestInfo, realWaitS, willRecoverSoon),
         },
-      }, { 'retry-after': String(clientRetryAfter) });
+      }, { 'retry-after': String(clientRetryAfterSeconds(retryPlan.retryAfterMs)) });
       return;
     }
 
@@ -2727,8 +2730,11 @@ async function queueAndRetry(
     // the capacity window exists precisely to shed that load (the soft-deadlock
     // guard — pinned at cap forever must 429 within the window, never spin).
     // Only quota-class resets (a scheduled 5h/weekly rollover) chain.
+    // Keyed on WHAT the reset is (retryPlan.cause), never on the caller's coarse label:
+    // the failover path calls with cause='capacity' even when the plan is a scheduled
+    // quota rollover, which wrongly lost the chain (red-team 2026-10-12, finding 3).
     if (requestInfo.stream && queueWindowMs > 0 && Number.isFinite(retryAfterMs)
-        && retryPlan.cause !== 'concurrency_cap' && cause !== 'capacity') {
+        && !CAPACITY_CLASS_RETRY_CAUSES.has(retryPlan.cause)) {
       requestInfo.queueHoldChain = true;
     } else {
       return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
@@ -3729,9 +3735,24 @@ function markThinkingFromResponse(buffer, accountManager, requestInfo = {}) {
   }
 }
 
+// CLI-RETRIABLE retry-after (2026-10-11/12). Claude Code 2.1.296 retries a 429 whose
+// retry-after is ≤60s (+25% headroom) and treats anything longer as TERMINAL — the
+// turn dies (binary-verified, then reproduced against the real CLI: retry-after 3600
+// → "API Error: Request rejected (429)" at once; retry-after 60 → waits, retries,
+// recovers). Every 429 the pool emits goes through this cap; the real wait still
+// rides in the message text.
+const RETRY_AFTER_RETRIABLE_S = 60;
+// Retry causes whose 'reset' is a re-poll guess (load), not a scheduled quota rollover —
+// these shed within the capacity window instead of hold-chaining (soft-deadlock guard).
+const CAPACITY_CLASS_RETRY_CAUSES = new Set(['concurrency_cap']);
+function clientRetryAfterSeconds(retryAfterMs) {
+  if (!Number.isFinite(retryAfterMs)) return RETRY_AFTER_RETRIABLE_S;
+  return Math.min(Math.max(1, Math.ceil(retryAfterMs / 1000)), RETRY_AFTER_RETRIABLE_S);
+}
+
 function computeRetryAfter(accountManager, requestInfo = {}) {
   const ms = accountManager.nextRetryForRequest?.(requestInfo, new Set())?.retryAfterMs ?? Infinity;
-  return ms === Infinity ? 60 : Math.max(1, Math.ceil(ms / 1000));
+  return clientRetryAfterSeconds(ms);
 }
 
 // Test seam: prepareRuntimeProviders with a plain headers object.

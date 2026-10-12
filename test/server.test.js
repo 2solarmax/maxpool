@@ -2286,6 +2286,8 @@ test('fast-429 retry-after never exceeds the CLI-retriable bound (60s)', async (
     assert.ok(ra <= 60, `retry-after must stay at/below the CLI's retriable bound (60s) — got ${ra}s; a longer value makes Claude Code give up permanently`);
     const body = JSON.parse(await res.text());
     assert.equal(body.error.type, 'rate_limit_error');
+    // The MESSAGE carries the real wait (3h), never the capped header value.
+    assert.match(body.error.message, /~3h/, `message must state the real wait, got: ${body.error.message}`);
   } finally {
     await close(proxy);
     await close(upstream);
@@ -2338,4 +2340,61 @@ test('streaming request with finite-beyond-window reset is HELD the window, not 
     await close(proxy);
     await close(upstream);
   }
+});
+
+// ── every 429 the pool emits carries a CLI-retriable retry-after (2026-10-12
+// red-team finding 2: the failover path and the upstream-throttle path still
+// sent the raw multi-hour reset — the exact "bricked session" shape v1.24.20
+// fixed on the entry path). Verified against the real CLI 2.1.296: retry-after
+// 60 → the CLI waits 60s and retries, recovers when capacity returns;
+// retry-after 3600 → the turn DIES immediately ("API Error: Request rejected").
+const RETRIABLE_S = 60;
+async function collect429(mkAm, queueOpts) {
+  const am = mkAm();
+  const upstream = http.createServer((ureq, ures) => {
+    if (ureq.url.startsWith('/v1/messages') && !ureq.url.includes('count_tokens')) {
+      // A REAL quota rejection: 5h bucket full, resets in 3h; weekly 30%, 4 days.
+      const now = Math.floor(Date.now() / 1000);
+      ures.writeHead(429, {
+        'content-type': 'application/json', 'retry-after': String(3 * 3600),
+        'anthropic-ratelimit-unified-status': 'rejected',
+        'anthropic-ratelimit-unified-5h-utilization': '1.0',
+        'anthropic-ratelimit-unified-5h-reset': String(now + 3 * 3600),
+        'anthropic-ratelimit-unified-7d-utilization': '0.3',
+        'anthropic-ratelimit-unified-7d-reset': String(now + 4 * 86400),
+      });
+      ures.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'rejected' } }));
+      return;
+    }
+    ures.writeHead(200); ures.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, pollMs: 25, ...queueOpts },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ model: 'test', messages: [] }),   // non-streaming: the shape that fast-errors
+      signal: AbortSignal.timeout(8000),
+    });
+    const ra = Number(res.headers.get('retry-after'));
+    return { status: res.status, ra };
+  } finally { await close(proxy); await close(upstream); }
+}
+
+test('failover-exhausted 429 carries a CLI-retriable retry-after (≤60s)', async () => {
+  const { status, ra } = await collect429(() => {
+    const am = new AccountManager([
+      { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    ], 0.90, {});
+    return am;   // quota learned from the upstream's real 429 headers
+  }, { nonStreamMaxWaitMs: 100 });
+  assert.equal(status, 429);
+  assert.ok(Number.isFinite(ra) && ra <= RETRIABLE_S,
+    `failover-path retry-after must stay ≤${RETRIABLE_S}s (CLI-retriable) — got ${ra}s`);
 });
