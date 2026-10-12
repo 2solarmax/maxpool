@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.21] - 2026-10-12
+
+### Fixed
+
+- Hold a streaming request across the window when the reset is finite-but-far, instead of erroring every window
+
 ## [1.24.20] - 2026-10-12
 
 ### Changed
