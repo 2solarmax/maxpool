@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.20] - 2026-10-12
+
+### Changed
+
+- Widen pool-request-open wait to 15s (release-suite flake on a loaded machine)
+
+### Fixed
+
+- Cap fast-429 retry-after at 60s — a longer value bricks Claude Code sessions
+
 ## [1.24.19] - 2026-10-11
 
 ### Fixed
