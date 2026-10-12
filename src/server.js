@@ -2714,7 +2714,25 @@ async function queueAndRetry(
   // (all accounts logged out, the only healthy account removed, etc.).
   const retryAfterMs = retryPlan.retryAfterMs;
   if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) {
-    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
+    // FINITE-but-BEYOND-WINDOW (2026-10-12, "they should have just waited"): a
+    // STREAMING request with a known reset 1h out used to instant-429 here for the
+    // whole wait (measured 75 min, 08:13–09:34Z) while sessions burned their CLI
+    // retry budgets and some died entirely. Hold the stream for the window with
+    // the heartbeat keeping the client alive, then end with the retriable error —
+    // the client re-enters and the hold chains window-by-window until the reset
+    // lands. Non-streaming requests keep the fast error (no heartbeat = the hold
+    // would die on the client's idle timeout anyway).
+    // Capacity-class causes (concurrency cap, momentary saturation) are NOT
+    // chained: their "reset" is a re-poll guess, not a scheduled quota reset, and
+    // the capacity window exists precisely to shed that load (the soft-deadlock
+    // guard — pinned at cap forever must 429 within the window, never spin).
+    // Only quota-class resets (a scheduled 5h/weekly rollover) chain.
+    if (requestInfo.stream && queueWindowMs > 0 && Number.isFinite(retryAfterMs)
+        && retryPlan.cause !== 'concurrency_cap' && cause !== 'capacity') {
+      requestInfo.queueHoldChain = true;
+    } else {
+      return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
+    }
   }
 
   requestInfo.queueStartedAt ||= Date.now();
@@ -2741,12 +2759,14 @@ async function queueAndRetry(
 
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
-  console.log(`[Maxpool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause})`);
+  // Hold-chain note: when this hold expires still-full (queueHoldChain), the
+  // finishQueuedStreamIfNeeded below ends the stream with the retriable error and
+  // the client re-enters — the log line makes the chaining visible.
+  console.log(`[Maxpool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause}${requestInfo.queueHoldChain ? ', hold-chain: reset beyond window' : ''})`);
   ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
 
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
   if (!available) {
-    if (res.destroyed || req.destroyed) return true;
     accountManager.removeQueuedRequest?.(requestInfo);
     return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
   }

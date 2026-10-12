@@ -2278,7 +2278,7 @@ test('fast-429 retry-after never exceeds the CLI-retriable bound (60s)', async (
     const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
-      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+      body: JSON.stringify({ model: 'test', messages: [] }),  // non-streaming: the streaming shape is HELD (see the hold-chain test)
     });
     assert.equal(res.status, 429);
     const ra = Number(res.headers.get('retry-after'));
@@ -2286,6 +2286,54 @@ test('fast-429 retry-after never exceeds the CLI-retriable bound (60s)', async (
     assert.ok(ra <= 60, `retry-after must stay at/below the CLI's retriable bound (60s) — got ${ra}s; a longer value makes Claude Code give up permanently`);
     const body = JSON.parse(await res.text());
     assert.equal(body.error.type, 'rate_limit_error');
+  } finally {
+    await close(proxy);
+    await close(upstream);
+  }
+});
+
+// ── hold-chain for a finite reset beyond the window (2026-10-12, Max: "they
+// should have just waited") ────────────────────────────────────────────────────
+// Live 08:13-09:34Z: every account session-limited, soonest reset ~1h out; the
+// pool instant-429'd each streaming request (reset 3600s > hold window 240s) for
+// 75 minutes. Sessions churned the CLI's retry budget and some gave up entirely
+// before capacity returned. A STREAMING request whose reset is finite-but-beyond
+// the window must be HELD for the window (heartbeat keeps the client alive) and
+// then error retriable — the CLI re-enters and the hold chains, one window at a
+// time, until the reset arrives. Instant-429 at entry is the defect.
+test('streaming request with finite-beyond-window reset is HELD the window, not instant-429', async () => {
+  const am = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+  ], 0.90, {});
+  am.accounts[0].quota = {
+    unified5h: 0.95, unified7d: 0.3,
+    unified5hReset: Date.now() + 3600_000,   // 1h out — beyond every hold window
+    unified7dReset: Date.now() + 5 * 24 * 3600_000,
+  };
+  const upstream = http.createServer((_req, res) => { res.writeHead(200); res.end('{}'); });
+  const upstreamPort = await listen(upstream);
+  const WINDOW_MS = 800;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    queue: { enabled: true, pollMs: 25, streamClientToleranceMs: WINDOW_MS },
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }),
+    });
+    // HELD: headers commit immediately (200 SSE + heartbeat) — the HOLD duration
+    // is measured to the stream's END (the retriable error event), not to header
+    // arrival.
+    assert.equal(res.status, 200, 'held stream must be SSE 200, not an instant 429');
+    const text = await res.text();
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed >= WINDOW_MS, `should be held ~window (${WINDOW_MS}ms), errored after ${elapsed}ms`);
+    assert.match(text, /rate_limit_error/, `held stream should end with a retriable SSE error, got: ${JSON.stringify(text.slice(0, 120))}`);
   } finally {
     await close(proxy);
     await close(upstream);
