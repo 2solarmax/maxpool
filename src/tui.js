@@ -274,6 +274,20 @@ function settingsTags(am, a) {
 /** True when the reservation is what is currently keeping traffic off this account
  *  — either window at or past the cap. Reads the manager's own predicate so the
  *  label can never disagree with routing. */
+/** The 5h window is used up past the bench — same predicate the router's
+ *  _isSessionQuotaUnavailable applies, without its expiry-clearing side effect (a
+ *  window whose reset has passed is NOT full: the router clears it on next use). */
+function sessionFull(am, a) {
+  const q = a?.quota || {};
+  const now = Date.now();
+  const bench = am?._sessionBenchThreshold?.(a, now);
+  if (!Number.isFinite(bench)) return false;
+  const live = (util, reset) => util != null && !(reset && now >= reset) && util >= bench;
+  return a.type === 'provider'
+    ? live(q.providerSes, q.providerSesReset)
+    : live(q.unified5h, q.unified5hReset);
+}
+
 function capBenched(am, a) {
   if (a?.capUtilization == null) return false;
   const q = a.quota || {};
@@ -1002,8 +1016,8 @@ export class TUI {
   _keyRouting(k) {
     if (k === 'a') {
       this._confirm(
-        'Use automatic routing?',
-        'Spread new requests across healthy accounts using load, quota, and recent errors.',
+        'Unpin and use automatic routing?',
+        'Removes the pinned account. New requests are spread across all healthy accounts again.',
         () => this._setAutomaticRouting(),
       );
     } else if (k === 'p' && this.am.accounts.some(account => account.type !== 'provider')) {
@@ -1999,6 +2013,7 @@ export class TUI {
     // 2 = separator + footer; confirm adds its detail line; updates adds its detail block.
     const footerH = this.mode === 'confirm' ? 3
       : this.mode === 'updates' ? 2 + this._renderUpdatesDetail().length
+      : this.mode === 'routing' ? 2 + this._renderRoutingDetail().length
       : 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
@@ -2015,6 +2030,7 @@ export class TUI {
     // very bottom of a busy screen, which reads as "nothing happened" (reported twice).
     // Every other mode draws something visible; this one must too.
     if (this.mode === 'updates') lines.push(...this._renderUpdatesDetail());
+    if (this.mode === 'routing') lines.push(...this._renderRoutingDetail());
     lines.push(this._renderFooter());
 
     this._writeScreen(lines, W, H);
@@ -2094,6 +2110,20 @@ export class TUI {
     // credentials were fine or long dead, so re-enabling it later silently produced a
     // broken account. Reported 2026-08-10 with all 8 disabled accounts sitting on dead
     // credentials (HTTP 401) and no way to see it.
+    // HELD BY ITS OWN LIMITS (2026-10-13). An account the router refuses must not read
+    // "active": 16 requests sat parked for 35 minutes while two rows said "active" next
+    // to an account held at its usage cap and another whose 5h window was full. Only
+    // relabels an otherwise-active row; exhausted / throttled / auth states keep their
+    // own (more specific) word. "capped" = the owner's usage cap is holding it;
+    // "5h full" = its session window is used up until the reset shown on the row.
+    // READ-ONLY by design: _weeklyRawState/_isSessionQuotaUnavailable call
+    // _clearExpiredQuotas, which MUTATES the quota (nulls an expired window). A render
+    // must never change the state it is drawing — the row's own bars, read later in
+    // this function, then showed blanks. capBenched + _sessionBenchThreshold are pure.
+    if (a.enabled !== false && effectiveStatus === 'active') {
+      if (capBenched(this.am, a)) effectiveStatus = 'capped';
+      else if (sessionFull(this.am, a)) effectiveStatus = '5h full';
+    }
     if (a.refreshDead) effectiveStatus = a.enabled === false ? 'disabled-reauth' : 'reauth';
     // Subscription gone (org-disabled 403): a DISTINCT state from reauth — re-logging in
     // will NOT fix it until the subscription is re-purchased. Says the actionable thing.
@@ -2130,6 +2160,8 @@ export class TUI {
         break;
       }
       case 'exhausted': status = red('exhausted'); break;
+      case 'capped':    status = yellow('capped'); break;
+      case '5h full':   status = yellow('5h full'); break;
       case 'error':     status = red('error'); break;
       default:          status = a.status || 'ready';
     }
@@ -2493,6 +2525,37 @@ export class TUI {
     return out;
   }
 
+  /**
+   * Routing DETAIL — what each key on this screen controls and how to undo it.
+   * (2026-10-13: "the cap setting only changes GLM", "I pinned an account and have no
+   * idea how to switch it back", "where is the cap for individual accounts?")
+   */
+  _renderRoutingDetail() {
+    // Every line fits 80 columns: a truncated explanation is no explanation.
+    const out = [];
+    const pinned = this.am.routingMode === 'preferred' && this.am.preferredAccountName;
+    // The manual pin: state, what it does, and the way out — always visible.
+    if (pinned) {
+      out.push(` ${yellow(`Pinned to ${this.am.preferredAccountName}`)}  ${bold('a')} Unpin  ${bold('p')} Change`);
+      out.push(` ${dim('It gets every request it can take; the others only cover for it.')}`);
+    } else {
+      out.push(` ${bold('p')} Pin one Claude account ${dim('(undo:')} ${bold('a')}${dim(')')}`);
+      out.push(` ${dim('Sends everything to it first; the others only cover for it.')}`);
+    }
+    const hasPeak = this.am.accounts.some(a => a.type === 'provider'
+      && (this.am._peakSettingsFor?.(a.provider)?.windows || []).length > 0);
+    if (hasPeak) {
+      out.push(` ${bold('c')} GLM peak cap ${dim('— GLM accounts only, in GLM peak hours. Not Claude.')}`);
+    }
+    // Where the per-account cap actually is.
+    out.push(` ${dim('Usage cap for ONE account:')} ${bold('Esc')} ${dim('then')} ${bold('a')} ${dim('→')} ${bold('u')} ${dim('(Claude or GLM)')}`);
+    const capped = this.am.accounts.filter(a => a.capUtilization != null && a.enabled !== false);
+    if (capped.length) {
+      out.push(` ${dim('Capped now:')} ${capped.map(a => `${a.name} ${Math.round(a.capUtilization * 100)}%`).join(', ')}`);
+    }
+    return out;
+  }
+
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
@@ -2531,9 +2594,13 @@ export class TUI {
           const dep = ps.depreference ? yellow('GLM last') : cyan('normal');
           const cap = ps.cap >= 1 ? 'off' : ps.cap === 0 ? 'never' : `${Math.round(ps.cap * 100)}%`;
           const wk = this.am.scheduler.weeklyAwareScoring === false ? yellow('5h-only') : cyan('weekly');
-          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}cap ${cyan(cap)} ${bold(' w ')}score:${wk}`;
+          // "cap" alone read as THE usage cap for every account (2026-10-13). It is not:
+          // it only limits GLM accounts, only during GLM's peak hours. Say so.
+          peakPart = `  ${dim('│')} ${bold(' d ')}Peak${now}: ${dep} ${bold(' c ')}GLM peak cap ${cyan(cap)} ${bold(' w ')}score:${wk}`;
         }
-        return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('p')} Preference  ${bold('Esc')} Back`;
+        // The pin and the account-cap pointer live in the DETAIL block above this line
+        // (_renderRoutingDetail) — one footer line cannot carry them without truncating.
+        return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('Esc')} Back`;
       }
       case 'select': {
         const act = this.selAction === 'prefer'

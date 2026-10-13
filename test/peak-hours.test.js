@@ -396,7 +396,7 @@ test('U1 the routing footer shows peak state + its two controls, in AND out of w
   tui.mode = 'routing';
   const f = strip(tui._renderFooter());
   assert.match(f, /d Peak/, 'the depreference control is visible');
-  assert.match(f, /c cap/, 'the cap control is visible');
+  assert.match(f, /c GLM peak cap/, 'the cap control is visible and names its scope (GLM, peak hours)');
   assert.match(f, /GLM last|normal/, 'and it shows the CURRENT state, not just a key');
 });
 
