@@ -271,23 +271,31 @@ function settingsTags(am, a) {
   return tags;
 }
 
-/** True when the reservation is what is currently keeping traffic off this account
- *  — either window at or past the cap. Reads the manager's own predicate so the
- *  label can never disagree with routing. */
-/** The 5h window is used up past the bench — same predicate the router's
- *  _isSessionQuotaUnavailable applies, without its expiry-clearing side effect (a
- *  window whose reset has passed is NOT full: the router clears it on next use). */
+/** The session (5h) window is what keeps traffic off this account: a pure mirror of
+ *  the router's _isSessionQuotaUnavailable, without its expiry-clearing write.
+ *  Which readings expire on their reset is the ROUTER's rule, copied here: it clears
+ *  the Claude 5h reading and the API-key limits when their reset passes, but NEVER
+ *  a provider's (GLM/Kimi) providerSes — that stays until the next usage probe, so a
+ *  provider past its reset stamp is still refused and must not read "active". */
 function sessionFull(am, a) {
   const q = a?.quota || {};
   const now = Date.now();
   const bench = am?._sessionBenchThreshold?.(a, now);
   if (!Number.isFinite(bench)) return false;
-  const live = (util, reset) => util != null && !(reset && now >= reset) && util >= bench;
-  return a.type === 'provider'
-    ? live(q.providerSes, q.providerSesReset)
-    : live(q.unified5h, q.unified5hReset);
+  const expired = reset => reset != null && now >= reset;
+  if (q.unified5h != null && !expired(q.unified5hReset) && q.unified5h >= bench) return true;
+  const apiLive = !(q.resetsAt && now >= new Date(q.resetsAt).getTime());
+  if (apiLive && q.tokensLimit != null && q.tokensRemaining != null
+      && 1 - q.tokensRemaining / q.tokensLimit >= bench) return true;
+  if (apiLive && q.requestsLimit != null && q.requestsRemaining != null
+      && 1 - q.requestsRemaining / q.requestsLimit >= bench) return true;
+  if (q.providerSes != null && q.providerSes >= bench) return true;
+  return false;
 }
 
+/** True when the reservation is what is currently keeping traffic off this account
+ *  — either window at or past the cap. Reads the manager's own predicate so the
+ *  label can never disagree with routing. */
 function capBenched(am, a) {
   if (a?.capUtilization == null) return false;
   const q = a.quota || {};
@@ -296,7 +304,13 @@ function capBenched(am, a) {
   // Each reading is judged against ITS OWN window's cap — under the dynamic cap the
   // two differ (a 5h window nearly over is lifted while the weekly is still at its
   // floor), so passing the default window for both would mislabel one of them.
-  return !!(am?._capped?.(a, ses, 'ses') || am?._capped?.(a, wk, 'wk'));
+  if (am?._capped?.(a, ses, 'ses') || am?._capped?.(a, wk, 'wk')) return true;
+  // Providers: the router's weekly gate judges max(5h, weekly) against the WEEKLY
+  // cap (_weeklyRawState), so a 5h reading over the weekly cap benches it too.
+  if (a.type === 'provider' && (ses != null || wk != null)) {
+    return !!am?._capped?.(a, Math.max(ses ?? 0, wk ?? 0), 'wk');
+  }
+  return false;
 }
 
 export function weeklyPolicyText(am, account) {
@@ -1014,7 +1028,9 @@ export class TUI {
 
 
   _keyRouting(k) {
-    if (k === 'a') {
+    if (k === 'a' && this.am.routingMode !== 'preferred') {
+      this._addLog('No account is pinned — routing is already automatic');
+    } else if (k === 'a') {
       this._confirm(
         'Unpin and use automatic routing?',
         'Removes the pinned account. New requests are spread across all healthy accounts again.',
@@ -2020,6 +2036,15 @@ export class TUI {
       lines.push(`   ${gray(this.log[i].t)}  ${this.log[i].msg}`);
     }
 
+    // The footer is the screen's controls — it must never be pushed off. On a short
+    // terminal cut the BODY from the bottom, and say so.
+    if (lines.length > H - footerH) {
+      const keep = Math.max(0, H - footerH - 1);
+      const hidden = lines.length - keep;
+      lines.length = keep;
+      lines.push(` ${dim(`… ${hidden} more row${hidden === 1 ? '' : 's'} — make the window taller to see them`)}`);
+    }
+
     // Pad to fill
     while (lines.length < H - footerH) lines.push('');
 
@@ -2116,10 +2141,10 @@ export class TUI {
     // relabels an otherwise-active row; exhausted / throttled / auth states keep their
     // own (more specific) word. "capped" = the owner's usage cap is holding it;
     // "5h full" = its session window is used up until the reset shown on the row.
-    // READ-ONLY by design: _weeklyRawState/_isSessionQuotaUnavailable call
-    // _clearExpiredQuotas, which MUTATES the quota (nulls an expired window). A render
-    // must never change the state it is drawing — the row's own bars, read later in
-    // this function, then showed blanks. capBenched + _sessionBenchThreshold are pure.
+    // Pure predicates on purpose: _weeklyRawState/_isSessionQuotaUnavailable call
+    // _clearExpiredQuotas, which MUTATES the quota (nulls an expired window), so calling
+    // them here blanked this row's own bars mid-render. (_render already runs the
+    // manager's expiry refresh once per frame, before any row is drawn.)
     if (a.enabled !== false && effectiveStatus === 'active') {
       if (capBenched(this.am, a)) effectiveStatus = 'capped';
       else if (sessionFull(this.am, a)) effectiveStatus = '5h full';
@@ -2551,7 +2576,7 @@ export class TUI {
     out.push(` ${dim('Usage cap for ONE account:')} ${bold('Esc')} ${dim('then')} ${bold('a')} ${dim('→')} ${bold('u')} ${dim('(Claude or GLM)')}`);
     const capped = this.am.accounts.filter(a => a.capUtilization != null && a.enabled !== false);
     if (capped.length) {
-      out.push(` ${dim('Capped now:')} ${capped.map(a => `${a.name} ${Math.round(a.capUtilization * 100)}%`).join(', ')}`);
+      out.push(` ${dim('Caps set:')} ${capped.map(a => `${a.name} ${Math.round(a.capUtilization * 100)}%`).join(', ')}`);
     }
     return out;
   }

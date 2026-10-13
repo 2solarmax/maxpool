@@ -21,18 +21,18 @@ function rowFor(text, name) {
   return text.split('\n').find(l => l.includes(name) && /\b(Ses|Wk|Tok)\b/.test(l)) || '';
 }
 const oauth = (name, extra = {}) => ({ name, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...extra });
-const provider = (name) => ({ name, type: 'provider', provider: 'zai', authToken: 'k', upstream: 'http://x', profiles: ['all'] });
+const provider = (name, extra = {}) => ({ name, type: 'provider', provider: 'zai', authToken: 'k', upstream: 'http://x', profiles: ['all'], ...extra });
 const tuiFor = (am, config = {}) => new TUI({ accountManager: am, config: { proxy: { port: 3456 }, ...config }, saveConfig: async () => {} });
 
 test('an account held at its usage cap reads "capped" in the Status column, not "active"', () => {
-  const am = new AccountManager([oauth('capped-acct', { capUtilization: 0.5, capMode: 'fixed' }), oauth('free-acct')], 0.90);
+  const am = new AccountManager([oauth('held-acct', { capUtilization: 0.5, capMode: 'fixed' }), oauth('free-acct')], 0.90);
   const now = Date.now();
   am.accounts[0].quota = { ...am.accounts[0].quota, unified5h: 0.05, unified7d: 0.52, unified5hReset: now + 3600_000, unified7dReset: now + 3 * 86400_000 };
   am.accounts[1].quota = { ...am.accounts[1].quota, unified5h: 0.05, unified7d: 0.10, unified5hReset: now + 3600_000, unified7dReset: now + 3 * 86400_000 };
   assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: the router refuses this account');
   const text = captureRender(tuiFor(am));
-  assert.match(rowFor(text, 'capped-acct'), /capped/, `a capped account must not read "active": ${rowFor(text, 'capped-acct')}`);
-  assert.doesNotMatch(rowFor(text, 'capped-acct'), /\bactive\b/);
+  assert.match(rowFor(text, 'held-acct'), /\bcapped\b/, `a capped account must not read "active": ${rowFor(text, 'held-acct')}`);
+  assert.doesNotMatch(rowFor(text, 'held-acct'), /\bactive\b/);
   assert.match(rowFor(text, 'free-acct'), /\bactive\b/, 'a usable account still reads active');
 });
 
@@ -86,7 +86,7 @@ test('routing detail fits an 80-column terminal (a truncated explanation explain
   for (const line of tui._renderRoutingDetail()) {
     assert.ok(strip(line).length <= 80, `line is ${strip(line).length} cols: ${strip(line)}`);
   }
-  assert.match(tui._renderRoutingDetail().map(strip).join('\n'), /Capped now: max@gomokka\.com 50%, kira 50%/, 'lists the accounts that carry a cap');
+  assert.match(tui._renderRoutingDetail().map(strip).join('\n'), /Caps set: max@gomokka\.com 50%, kira 50%/, 'lists the accounts that carry a cap');
 });
 
 test('a 5h window whose reset has PASSED is not "5h full" — the account is free again', () => {
@@ -99,4 +99,51 @@ test('a 5h window whose reset has PASSED is not "5h full" — the account is fre
   // which would hide whether the row itself respects the reset time.
   const row = strip(tuiFor(am)._renderAcct(0, 11, true));
   assert.match(row, /\bactive\b/, `an expired window must not bench the account: ${row}`);
+});
+
+test('a GLM account past its 5h reset stamp is still refused (its reading is only cleared by the next usage check) — must not read "active"', () => {
+  const am = new AccountManager([provider('glm stale')], 0.95);
+  Object.assign(am.accounts[0].quota, { providerSes: 0.97, providerSesReset: Date.now() - 60_000, providerWk: 0.3 });
+  assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: the router still refuses it');
+  const row = strip(tuiFor(am)._renderAcct(0, 11, true));
+  assert.match(row, /5h full/, `row: ${row}`);
+  assert.doesNotMatch(row, /\bactive\b/);
+});
+
+test('a GLM account whose 5h reading is over its WEEKLY cap reads "capped" (the router judges GLM against the weekly cap)', () => {
+  const now = Date.now();
+  const am = new AccountManager([provider('glm dyn', { capUtilization: 0.5, capMode: 'dynamic' })], 0.95);
+  Object.assign(am.accounts[0].quota, { providerSes: 0.7, providerSesReset: now + 10 * 60e3, providerWk: 0.1, providerWkReset: now + 6.5 * 86400e3 });
+  assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: the router refuses it');
+  const row = strip(tuiFor(am)._renderAcct(0, 11, true));
+  assert.match(row, /\bcapped\b/, `row: ${row}`);
+});
+
+test('routing screen on a 24-row terminal: the controls line is never pushed off', () => {
+  const accts = [...Array(8)].map((_, i) => oauth('acct' + i, i < 2 ? { capUtilization: 0.5 } : {})).concat([provider('glm one')]);
+  const am = new AccountManager(accts, 0.95, {
+    providers: { zai: { peakWindows: [{ days: [0, 1, 2, 3, 4, 5, 6], startMin: 0, endMin: 1440 }], peakTimezone: 'UTC', peakCap: 0.5 } },
+  });
+  am.setRoutingMode('preferred', 'acct0');
+  const tui = tuiFor(am);
+  tui.mode = 'routing';
+  for (let i = 0; i < 3; i++) tui.active.set('r' + i, { started: Date.now(), t: '12:00', method: 'POST', path: '/v1/messages', account: 'acct1' });
+  const rows = process.stdout.rows, cols = process.stdout.columns;
+  process.stdout.rows = 24; process.stdout.columns = 100;
+  let lines;
+  try { lines = captureRender(tui).split(/\r?\n/); } finally { process.stdout.rows = rows; process.stdout.columns = cols; }
+  assert.equal(lines.length, 24);
+  assert.match(lines[23], /^ f Routing:/, `last row must be the controls line: ${lines[23]}`);
+  assert.ok(lines.some(l => /Pinned to acct0/.test(l)), 'the pin line is on screen');
+});
+
+test('pressing a with nothing pinned does not offer to "unpin"', () => {
+  const am = new AccountManager([oauth('a1'), oauth('a2')], 0.90);
+  const tui = tuiFor(am);
+  tui.mode = 'routing';
+  tui._keyRouting('a');
+  assert.notEqual(tui.mode, 'confirm', 'no confirm dialog when there is nothing to unpin');
+  am.setRoutingMode('preferred', 'a2');
+  tui._keyRouting('a');
+  assert.equal(tui.mode, 'confirm', 'with a pin, a asks to unpin');
 });
