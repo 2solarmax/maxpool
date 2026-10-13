@@ -5,6 +5,17 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.27] - 2026-10-13
+
+### Documentation
+
+- Comment matches the no-marker ruling
+- Comment grammar
+
+### Fixed
+
+- Red-team batch — peak discipline, floor on partial history, usable cap input
+
 ## [1.24.26] - 2026-10-13
 
 ### Removed
