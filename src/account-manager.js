@@ -3728,7 +3728,7 @@ export class AccountManager {
     spannedDays.add(new Date(now).toISOString().slice(0, 10));
     for (const name of this.capacity.accounts()) {
       if (this.capacity.openCycle(name, 'ses') || this.capacity.openCycle(name, 'wk')) {
-        this.capacity.markPartial(name);
+        this.capacity.markPartial(name, { reason: 'maxpool-downtime' });
       }
       for (const day of spannedDays) this.capacity.markDayPartial(name, day);
     }

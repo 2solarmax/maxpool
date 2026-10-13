@@ -1252,7 +1252,13 @@ export class TUI {
           ? `${Math.round(existing * 100)}%${existingMode === 'dynamic' ? ' dynamic' : ' fixed'}`
           : 'off';
         this.mode = 'input';
-        this.inputPrompt = `Usage cap for "${current}" — NN = dynamic floor (rises near reset), fNN = fixed, 0 = off, now ${nowLabel}`;
+        // Plain-English prompt (owner 2026-10-13: "I'm not sure how does this work.
+        // I want to keep the dynamic floor, but I also want to raise the basic cap").
+        // Type just a number = the dynamic cap's STARTING level (it holds the account
+        // to NN% early in each window, then rises toward ~95% as the window nears
+        // its reset, so unused capacity isn't stranded). fNN = fixed wall (no rise).
+        // 0 = no cap.
+        this.inputPrompt = `Usage cap for "${current}" — type a % like 75: the account stays free until it hits that, then unlocks gradually as the window refills (dynamic). f75 = never unlock early (fixed). 0 = remove. Now ${nowLabel}`;
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doSetCap(targetIdx, String(value || '').trim());
@@ -2508,7 +2514,7 @@ export class TUI {
       if (win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent) {
         const sesTank = this.am.capacityTank?.(i, 'ses');
         const approx = sesTank && sesTank.n > 0
-          ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
+          ? `≈ ${formatTokens(Math.round(sesTank.avg * (7 * 24) / 5))}` : '--';
         const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
         out.push('  ' + name + ' ' + prov + ' '
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
@@ -2532,12 +2538,14 @@ export class TUI {
         cur = formatTokens(Math.round(nowOpen.tokensSoFar / util));
       }
       const curPct = util != null && cur !== '--' ? dim(`@${Math.round(util * 100)}%`) : '';
-      const st = ledger.windowStats(a.name, win);
+      // Every history column is a TANK number (tokens ÷ closing %). Prev/N used to
+      // come from windowStats — delivered tokens and a different cycle set — so one
+      // row mixed units (2026-10-13 owner report; see tankStats' reading-set note).
       const cellsByName = {
         Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
-        Prev: (st?.prev != null ? formatTokens(st.prev) : '--'),
+        Prev: (tank?.source === 'cycles' && tank.prev != null ? formatTokens(tank.prev) : '--'),
         Avg: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
-        N: (st ? String(st.cycles) : '--'),
+        N: (tank?.source === 'cycles' ? String(tank.n) : '--'),
       };
       const row = '  ' + name + ' ' + prov + ' '
         + COLS.map(c => cellsByName[c].padStart(CW)).join('');

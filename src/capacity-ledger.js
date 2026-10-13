@@ -43,6 +43,14 @@ const READ_FLOOR_MS = { ses: 4 * 3600_000, wk: 5 * 86400_000 };
 // in-window estimate must apply the same floor; one guarding without the other is how
 // the absurd number reached the screen in the first place.
 export const TANK_MIN_UTIL = 0.05;
+
+// Nominal window length. A closed cycle much LONGER than its window swallowed a
+// rollover it never saw (measured live 2026-10-13: "weekly" cycles of 11.9d-14d,
+// "5h" cycles of 7-8h) — two tanks' tokens over one tank's percentage. Not an
+// observation of one window; excluded from tank stats.
+const WINDOW_MS = { ses: 5 * 3600_000, wk: 7 * 86400_000 };
+const WINDOW_CEIL_FACTOR = 1.25;
+
 const MAX_CYCLES_PER_WINDOW = 50;
 const MAX_DAY_BUCKETS = 10;
 
@@ -190,7 +198,7 @@ export class CapacityLedger {
 
   /** Mark the open cycles as partial (maxpool was down / an account was disabled).
    *  Called by the boot path when a gap is detected (B2), and by the disable hook. */
-  markPartial(name, { disabled = false } = {}) {
+  markPartial(name, { disabled = false, reason = null } = {}) {
     const rec = this._accounts.get(name);
     if (!rec) return;
     for (const w of ['ses', 'wk']) {
@@ -200,8 +208,15 @@ export class CapacityLedger {
       // account out of rotation. Setting both for a disable made the disabled flag
       // query-redundant and therefore untested (red-team F6-1) — each now excludes on
       // its own, and each is pinned by its own test.
+      // `reason` ('maxpool-downtime', 'no-weekly-plan', …) rides along for display;
+      // a bare-false (reason null) keeps the historic shape. It is NEVER
+      // 'pre-v3-unverified' — that reason alone means "never trust this row"
+      // (see tankStats' reason gate).
       if (disabled) rec[w].open.disabledDuring = true;
-      else rec[w].open.complete = false;
+      else {
+        rec[w].open.complete = false;
+        if (reason != null && !rec[w].open.partialReason) rec[w].open.partialReason = reason;
+      }
     }
   }
 
@@ -219,6 +234,15 @@ export class CapacityLedger {
     const rec = this._accounts.get(name);
     if (!rec || !rec[window]?.open) return null;
     const open = rec[window].open;
+    // The closing window's fullness is the HIGHEST reading the cycle saw, never
+    // merely the latest: fullness only rises inside a window, so a caller's reading
+    // BELOW the peak is the next window's, arrived before this close ran (measured
+    // live 2026-10-13: kira closed a 3.1M-token week at "3% full" ⇒ a 105M tank —
+    // the reading was the freshly-reset NEXT week's).
+    if (Number.isFinite(open.peakUtilization)
+        && !(Number.isFinite(finalUtilization) && finalUtilization >= open.peakUtilization)) {
+      finalUtilization = open.peakUtilization;
+    }
     // ONE CYCLE PER BOUNDARY CLOSURE — the structural backstop for the two-closer race
     // (round-2 F1). If both closers observe the SAME reset stamp within the same
     // rollover moment, the second close's tokens are a straddling tail of that same
@@ -332,9 +356,15 @@ export class CapacityLedger {
     if (!marks) return;
     this._utilMarks = this._utilMarks || new Map();
     for (const m of marks) {
-      if (!(m.utilization >= 0) || !(m.utilization < 1)) continue;
+      if (!Number.isFinite(m.utilization) || m.utilization < 0) continue;
       const open = this.openCycle(m.name, m.window);
       if (!open) continue;
+      // PEAK: fullness only rises inside one window, so the highest reading a cycle
+      // saw is its closing fullness (closeCycle prefers it over a later, lower one).
+      if (!Number.isFinite(open.peakUtilization) || m.utilization > open.peakUtilization) {
+        open.peakUtilization = Math.min(1, m.utilization);
+      }
+      if (!(m.utilization < 1)) continue;
       const key = `${m.name}:${m.window}`;
       const prev = this._utilMarks.get(key);
       // Keep the OLDEST usable mark within this cycle: a wider span means a larger
@@ -409,8 +439,24 @@ export class CapacityLedger {
   tankStats(name, window) {
     const rec = this._accounts.get(name);
     const floor = (this._readFloorOverride ?? READ_FLOOR_MS)[window] ?? 0;
+    // TANK READING SET (2026-10-13): partial cycles COUNT here. The strict
+    // `complete` gate was written for demand stats and quietly deleted every
+    // weekly observation — a 7d window outlives every maxpool restart/sleep, so
+    // restoreCapacityState's >60s downtime check marked nearly all of them
+    // partial and the Weekly (7d) page read "--" everywhere (owner report
+    // 2026-10-13). For TANK math a gap is already handled: tokens ÷ vendor % is
+    // a lower bound whenever spend was unseen, and exact/bounded/lowerBound
+    // exist to say so. Still excluded, hard: disabledDuring (operator benched
+    // the account — not a capacity observation) and `pre-v3-unverified` (the
+    // ONE reason that means "never trust this row").
     const closed = (rec?.[window]?.closed || []).filter(c =>
-      c.complete && !c.disabledDuring && (c.endedAt - c.startedAt) >= floor - 1_000);
+      !c.disabledDuring
+      && c.partialReason !== 'pre-v3-unverified'
+      && (c.endedAt - c.startedAt) >= floor - 1_000
+      // CEILING: a cycle far longer than its window swallowed a rollover it never
+      // saw — two tanks' tokens over one tank's percentage (see WINDOW_CEIL_FACTOR).
+      && (this._readFloorOverride != null
+          || (c.endedAt - c.startedAt) <= WINDOW_MS[window] * WINDOW_CEIL_FACTOR));
     // PHYSICAL FLOOR: a tank can never be smaller than the most tokens ever
     // delivered in one complete window — every token we count is a vendor token
     // (C ≤ V ≤ tank), so maxDelivered ≤ tank is an invariant, not a heuristic.
@@ -425,23 +471,34 @@ export class CapacityLedger {
     // floor rather than being thrown away — discarding left an account whose
     // every reading was contaminated with NOTHING to show. After a plan
     // downgrade the floor over-states until old cycles age out — conservative.
-    const maxDelivered = closed.reduce((m, c) => Math.max(m, c.tokens), 0);
+    // The floor's own base uses the complete windows only — a partial cycle's
+    // tokens may end mid-window, understating a single delivery.
+    const maxDelivered = closed.filter(c => c.complete)
+      .reduce((m, c) => Math.max(m, c.tokens), 0);
     const usable = closed.filter(c =>
       Number.isFinite(c.finalUtilization) && c.finalUtilization >= TANK_MIN_UTIL);
     if (!usable.length) return null;
     let sum = 0, exact = 0, bounded = 0;
     for (const c of usable) {
       const observedFromStart = c.startedAt != null && c.windowStartedAt != null
-        && c.startedAt <= c.windowStartedAt + 60_000;
+        && c.startedAt <= c.windowStartedAt + 60_000 && c.complete;
       sum += Math.max(c.tokens / c.finalUtilization, maxDelivered);
       if (observedFromStart) exact++; else bounded++;
     }
     const last = usable[usable.length - 1];
+    const prevCycle = usable[usable.length - 2];
     return {
       avg: Math.round(sum / usable.length),
       exact, bounded,
       n: usable.length,
-      last: Math.round(last.tokens / last.finalUtilization),
+      last: Math.round(Math.max(last.tokens / last.finalUtilization, maxDelivered)),
+      // PREV in TANK units (tokens ÷ that cycle's own reading) — the page's
+      // Prev column used to come from windowStats (delivered tokens), mixing
+      // units across one row (2026-10-13 owner report). Same physical floor as
+      // the average: a reading implying less than a past delivery is impossible.
+      prev: prevCycle != null
+        ? Math.round(Math.max(prevCycle.tokens / prevCycle.finalUtilization, maxDelivered))
+        : null,
       lowerBound: bounded > 0 && exact === 0,
     };
   }

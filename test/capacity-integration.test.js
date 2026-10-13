@@ -267,8 +267,11 @@ test('G1: the page shows a per-account row with the capacity columns once cycles
     assert.ok(page.includes(col), `column "${col}" is on the page`);
   }
   assert.match(page, /claude1/, 'the account is listed');
-  assert.match(page, /2k/, 'the prev cycle delivered 2k tokens');
-  assert.match(page, /\b3\b/, 'the cycle count column renders');
+  // These cycles carry no utilization reading, so no TANK can be computed and the
+  // columns honestly read "--" (a delivered number would mix units with the tank
+  // columns — the 2026-10-13 fix). windowStats still records the delivery:
+  assert.equal(am.capacity.windowStats('claude1', 'ses').prev, 2000);
+  assert.match(page, /--\s+--\s+--\s+--/, 'reading-less cycles render dashes, not fake tanks');
 });
 
 test('G2: a fresh install says WHY the page is empty instead of showing zeros', () => {
