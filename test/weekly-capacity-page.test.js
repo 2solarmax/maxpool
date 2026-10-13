@@ -71,6 +71,10 @@ test('P3: the no-weekly derived row is marked "≈" so it reads as derived', () 
     am.capacity.closeCycle('glm-legacy', 'ses', end, { resetAt: end, finalUtilization: u });
   }
   const row = renderWk(am).split('\n').find(l => l.includes('glm-legacy'));
-  assert.match(row, /≈\s*67M/, 'the ×33.6 derivation is marked approximate (2M tank × 33.6)');
-  assert.match(row, /no weekly limit/, 'and still says why');
+  // NO ≈ prefix: the owner removed it 2026-08-26 (bfe03bd) — "the row's own text
+  // already states the ×33.6 derivation". This test now pins BOTH the number and
+  // the absence of the marker, so it can't quietly come back.
+  assert.match(row, /\s67M\s/, 'the ×33.6 derivation renders (2M tank × 33.6)');
+  assert.match(row, /no weekly limit/, 'the row still says why');
+  assert.doesNotMatch(row, /≈/, 'the owner-removed ≈ marker stays out');
 });

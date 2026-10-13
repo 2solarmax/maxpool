@@ -2514,7 +2514,7 @@ export class TUI {
       if (win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent) {
         const sesTank = this.am.capacityTank?.(i, 'ses');
         const approx = sesTank && sesTank.n > 0
-          ? `≈ ${formatTokens(Math.round(sesTank.avg * (7 * 24) / 5))}` : '--';
+          ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
         const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
         out.push('  ' + name + ' ' + prov + ' '
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
