@@ -280,6 +280,7 @@ export class CapacityLedger {
       // (we only counted the tokens that flowed through maxpool, while the vendor's
       // percentage counts everything). Dropping it here made every tank read "bounded".
       ...(open.windowStartedAt != null ? { windowStartedAt: open.windowStartedAt } : {}),
+      ...(open.peakReset ? { spansRefill: true } : {}),
       resetAt,
     });
     if (rec[window].closed.length > MAX_CYCLES_PER_WINDOW) rec[window].closed.shift();
@@ -361,10 +362,19 @@ export class CapacityLedger {
       if (!open) continue;
       // PEAK: fullness only rises inside one window, so the highest reading a cycle
       // saw is its closing fullness (closeCycle prefers it over a later, lower one).
-      if (!Number.isFinite(open.peakUtilization) || m.utilization > open.peakUtilization) {
-        open.peakUtilization = Math.min(1, m.utilization);
-      }
       if (!(m.utilization < 1)) continue;
+      // A reading of 1.0 is the wall (throttled), not a fullness — the same reason
+      // estimateFromUtilization refuses u>=1 — so it never becomes the peak.
+      // A reading BELOW the peak by >=10pp means the tank was refilled under this
+      // open cycle (a redeemed reset, or a rollover whose stamp arrived late): the
+      // old peak no longer describes this window, so it is dropped rather than
+      // left to divide the new window's tokens (red-team 2026-10-13, finding 2).
+      if (Number.isFinite(open.peakUtilization) && open.peakUtilization - m.utilization >= 0.10) {
+        open.peakUtilization = m.utilization;
+        open.peakReset = true;
+      } else if (!Number.isFinite(open.peakUtilization) || m.utilization > open.peakUtilization) {
+        open.peakUtilization = m.utilization;
+      }
       const key = `${m.name}:${m.window}`;
       const prev = this._utilMarks.get(key);
       // Keep the OLDEST usable mark within this cycle: a wider span means a larger
@@ -452,6 +462,8 @@ export class CapacityLedger {
     const closed = (rec?.[window]?.closed || []).filter(c =>
       !c.disabledDuring
       && c.partialReason !== 'pre-v3-unverified'
+      && c.partialReason !== 'no-weekly-plan'
+      && !c.spansRefill
       && (c.endedAt - c.startedAt) >= floor - 1_000
       // CEILING: a cycle far longer than its window swallowed a rollover it never
       // saw — two tanks' tokens over one tank's percentage (see WINDOW_CEIL_FACTOR).
@@ -471,10 +483,12 @@ export class CapacityLedger {
     // floor rather than being thrown away — discarding left an account whose
     // every reading was contaminated with NOTHING to show. After a plan
     // downgrade the floor over-states until old cycles age out — conservative.
-    // The floor's own base uses the complete windows only — a partial cycle's
-    // tokens may end mid-window, understating a single delivery.
-    const maxDelivered = closed.filter(c => c.complete)
-      .reduce((m, c) => Math.max(m, c.tokens), 0);
+    // The floor is taken over EVERY admitted cycle, partial ones included: a
+    // partial cycle's token count is still tokens the vendor really delivered,
+    // so it is still a hard lower bound on the tank. Restricting it to complete
+    // cycles left it inert on weekly history, where nearly every cycle is partial
+    // (red-team 2026-10-13, finding 4).
+    const maxDelivered = closed.reduce((m, c) => Math.max(m, c.tokens), 0);
     const usable = closed.filter(c =>
       Number.isFinite(c.finalUtilization) && c.finalUtilization >= TANK_MIN_UTIL);
     if (!usable.length) return null;

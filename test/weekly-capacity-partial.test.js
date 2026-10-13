@@ -136,10 +136,70 @@ test('W8: a closing reading BELOW the cycle peak is the next window\'s — peak 
   assert.equal(t.avg, Math.round(3_100_000 / 0.86), 'divided by the peak, not the stale 3%');
 });
 
-test('W9: the PEAK is recorded from real readings via noteUtilizationObserved', () => {
+test('W9: the PEAK is recorded from real readings; small dips never lower it', () => {
   const l = new CapacityLedger();
   const end = Date.now();
   l.accrue('a', { input: 1_000_000, output: 0 }, end - SEVEN_D);
-  for (const u of [0.2, 0.6, 0.86, 0.03]) l.noteUtilizationObserved(end, [{ name: 'a', window: 'wk', utilization: u }]);
-  assert.equal(l.openCycle('a', 'wk').peakUtilization, 0.86, 'a later lower reading never lowers the peak');
+  for (const u of [0.2, 0.6, 0.86, 0.80]) l.noteUtilizationObserved(end, [{ name: 'a', window: 'wk', utilization: u }]);
+  assert.equal(l.openCycle('a', 'wk').peakUtilization, 0.86, 'a 6pp dip (rounding/jitter) never lowers the peak');
+});
+
+// ── red-team 2026-10-13 findings 2-6 ─────────────────────────────────────────
+
+test('W10: a >=10pp DROP means the tank refilled under the open cycle — the cycle is excluded', () => {
+  // Redeemed reset / late rollover stamp: the old window's peak must never divide
+  // the new window's tokens (reproduced: 1.37M ÷ 0.97 shown vs 1.0M truth).
+  const l = new CapacityLedger();
+  const end = Date.now();
+  l.accrue('a', { input: 1_370_000, output: 0 }, end - SEVEN_D);
+  for (const u of [0.5, 0.97, 0.05, 0.40]) l.noteUtilizationObserved(end, [{ name: 'a', window: 'wk', utilization: u }]);
+  const open = l.openCycle('a', 'wk');
+  open.windowStartedAt = end - SEVEN_D;
+  l.closeCycle('a', 'wk', end, { resetAt: end, finalUtilization: 0.40 });
+  assert.equal(l.tankStats('a', 'wk'), null, 'two tanks inside one cycle is not an observation');
+});
+
+test('W11: a 1.0 (wall) reading never becomes the peak', () => {
+  const l = new CapacityLedger();
+  const end = Date.now();
+  l.accrue('a', { input: 3_100_000, output: 0 }, end - SEVEN_D);
+  l.noteUtilizationObserved(end, [{ name: 'a', window: 'wk', utilization: 0.5 }]);
+  l.noteUtilizationObserved(end, [{ name: 'a', window: 'wk', utilization: 1.0 }]);
+  assert.equal(l.openCycle('a', 'wk').peakUtilization, 0.5, 'the wall says nothing about tank size');
+});
+
+test('W12: the physical floor holds on ALL-PARTIAL weekly history', () => {
+  // Reproduced by the reviewer: 3 downtime-partial weeks (1.53M@50%, 497k@95%
+  // contaminated, 2M@50%) showed Prev=523k — below the 1.53M actually delivered.
+  const l = new CapacityLedger();
+  const end = Date.now();
+  closeWeek(l, 'a', { tokens: 1_530_000, util: 0.5, startedAt: end - 3 * SEVEN_D, endedAt: end - 2 * SEVEN_D, complete: false });
+  closeWeek(l, 'a', { tokens: 497_000, util: 0.95, startedAt: end - 2 * SEVEN_D, endedAt: end - SEVEN_D, complete: false });
+  closeWeek(l, 'a', { tokens: 2_000_000, util: 0.5, startedAt: end - SEVEN_D, endedAt: end, complete: false });
+  const t = l.tankStats('a', 'wk');
+  assert.ok(t.prev >= 2_000_000, `prev never below a real delivery (got ${t.prev})`);
+  for (const v of [t.avg, t.last, t.prev]) assert.ok(v >= 2_000_000, 'every shown tank >= max delivered');
+});
+
+test('W13: a no-weekly-plan retired cycle never counts, even with a recorded peak', () => {
+  const l = new CapacityLedger();
+  const end = Date.now();
+  l.accrue('n1', { input: 7_000_000, output: 0 }, end - SEVEN_D);
+  l.noteUtilizationObserved(end, [{ name: 'n1', window: 'wk', utilization: 0.7 }]);
+  const open = l.openCycle('n1', 'wk');
+  open.complete = false;
+  open.partialReason = 'no-weekly-plan';
+  l.closeCycle('n1', 'wk', end, {});
+  assert.equal(l.tankStats('n1', 'wk'), null);
+});
+
+
+test('W14: the REAL restore path tags downtime-partial cycles "maxpool-downtime"', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const am = new AccountManager([{ name: 'k', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 }], 0.9);
+  am.capacity.accrue('k', { input: 1000, output: 0 }, Date.now() - 3600_000);
+  const payload = am.capacity.serialize();
+  am.restoreCapacityState(payload, Date.now(), 5 * 60_000);   // 5 min of maxpool downtime
+  assert.equal(am.capacity.openCycle('k', 'wk').partialReason, 'maxpool-downtime');
+  assert.equal(am.capacity.openCycle('k', 'wk').complete, false);
 });

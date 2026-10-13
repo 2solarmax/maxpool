@@ -1254,11 +1254,12 @@ export class TUI {
         this.mode = 'input';
         // Plain-English prompt (owner 2026-10-13: "I'm not sure how does this work.
         // I want to keep the dynamic floor, but I also want to raise the basic cap").
-        // Type just a number = the dynamic cap's STARTING level (it holds the account
-        // to NN% early in each window, then rises toward ~95% as the window nears
-        // its reset, so unused capacity isn't stranded). fNN = fixed wall (no rise).
-        // 0 = no cap.
-        this.inputPrompt = `Usage cap for "${current}" — type a % like 75: the account stays free until it hits that, then unlocks gradually as the window refills (dynamic). f75 = never unlock early (fixed). 0 = remove. Now ${nowLabel}`;
+        // Type just a number = the dynamic cap's STARTING level: routing USES the
+        // account up to NN% of each window, and the allowance rises toward the
+        // switch threshold as the window nears its reset (by elapsed time —
+        // _effectiveCap), so unused capacity isn't stranded. fNN = fixed stop at NN%.
+        // 0 / off = no cap. Kept short: the typed value must stay on an 80-col line.
+        this.inputPrompt = `Cap ${current}, now ${nowLabel}. 75=use to 75%+rises near reset f75=hard 0=off`;
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doSetCap(targetIdx, String(value || '').trim());
@@ -2646,8 +2647,23 @@ export class TUI {
               : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
-      case 'input':
-        return ` ${this.inputPrompt}: ${this.inputSensitive ? '•'.repeat(this.inputBuf.length) : this.inputBuf}█`;
+      case 'input': {
+        // The typed value and the cursor are the whole point of this line — they are
+        // NEVER truncated. On a narrow terminal the PROMPT gives way instead, keeping
+        // its last words (nearest the value). Red-team 2026-10-13: the long cap
+        // prompt pushed the input off a 200-column terminal entirely.
+        const shown = this.inputSensitive ? '•'.repeat(this.inputBuf.length) : this.inputBuf;
+        const full = ` ${this.inputPrompt}: ${shown}█`;
+        const visible = full.replace(ANSI_RE, '');
+        const budget = (process.stdout.columns || 80) - 2;
+        if (visible.length <= budget) return full;
+        const keep = Math.max(0, budget - (shown.length + 2)); // ' …' + value + cursor
+        const cut = visible.length - budget;
+        const trimmed = this.inputPrompt.length > cut + 1
+          ? this.inputPrompt.slice(0, Math.max(1, keep - 1)) + '…'
+          : this.inputPrompt;
+        return ` ${trimmed}: ${shown}█`;
+      }
       case 'confirm':
         return ` ${bold(this.confirmTitle)}  ${bold('y')} Yes  ${bold('n')} No`;
       default:

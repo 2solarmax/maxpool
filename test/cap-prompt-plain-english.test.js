@@ -29,13 +29,27 @@ function openCapPrompt(tui, idx) {
 test('C1: the prompt explains the dynamic cap in plain words and names the current setting', () => {
   const tui = tuiWith([oauth('kira', { capUtilization: 0.75, capMode: 'dynamic' })]);
   const p = openCapPrompt(tui, 0);
-  assert.ok(p.includes('75% dynamic'), `names the current cap+mode (got: ${p})`);
-  assert.match(p, /type a % like 75/, 'says what to type');
-  assert.match(p, /unlocks gradually as the window refills/, 'explains the dynamic behaviour');
-  assert.match(p, /dynamic\)/, 'names the mode');
-  assert.match(p, /fixed\)/, 'names the fixed option');
-  assert.match(p, /0 = remove/, 'says how to remove');
-  assert.doesNotMatch(p, /dynamic floor/, 'the old jargon is gone');
+  assert.ok(p.includes('now 75% dynamic'), `names the current cap+mode (got: ${p})`);
+  assert.match(p, /75=use to 75%\+rises near reset/, 'a number = USE up to it, then rises near reset');
+  assert.match(p, /f75=hard/, 'names the fixed option');
+  assert.match(p, /0=off/, 'says how to remove');
+  assert.doesNotMatch(p, /dynamic floor|stays free|refills/, 'no jargon, no inverted or wrong wording');
+});
+
+test('C3: prompt + typed value fit an 80-column terminal, and the value is never cut', () => {
+  const tui = tuiWith([oauth('kira', { capUtilization: 0.75, capMode: 'dynamic' })]);
+  openCapPrompt(tui, 0);
+  tui.inputBuf = '85';
+  const strip = x => x.replace(/\x1b\[[0-9;]*m/g, '');
+  const cols = process.stdout.columns;
+  try {
+    for (const w of [80, 60, 40]) {
+      process.stdout.columns = w;
+      const line = strip(tui._renderFooter());
+      assert.ok(line.length <= w, `fits ${w} cols (got ${line.length})`);
+      assert.ok(line.endsWith('85█'), `the typed value + cursor survive at ${w} cols: ${JSON.stringify(line)}`);
+    }
+  } finally { process.stdout.columns = cols; }
 });
 
 test('C2: typing 75 through the prompt sets kira to 75% dynamic', async () => {
