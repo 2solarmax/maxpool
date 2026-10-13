@@ -2510,7 +2510,8 @@ export class TUI {
 
       // The no-weekly plan has NO weekly window to complete — its weekly "capacity" is
       // derived: avg session tank × 33.6 (the number of 5h windows in 7 days). Shown as
-      // ≈ to mark the derivation; N is the count of session cycles it rests on.
+      // without a marker (owner 2026-08-26: the row's text states the derivation);
+      // N is the count of session cycles it rests on.
       if (win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent) {
         const sesTank = this.am.capacityTank?.(i, 'ses');
         const approx = sesTank && sesTank.n > 0
