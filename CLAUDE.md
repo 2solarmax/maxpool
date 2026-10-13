@@ -106,6 +106,19 @@ never add IP/fingerprint spoofing or MITM — PRs adding them are rejected.
   serially — reload tests are subprocess-heavy). `npm run lint` (eslint on src/).
 - **User-facing text** (TUI labels, README, release notes): plain and concrete,
   sentence case, no filler. Say what the user gets.
+- **Before changing an EXISTING TUI label/marker/column**, run
+  `git log -S'<the string>' -- src/tui.js` and read the commit messages — an
+  earlier owner ruling may have put it there deliberately (the ≈ marker,
+  bfe03bd 2026-08-26: re-added 2026-10-13, cost a whole release to revert).
+- **Render new/changed TUI text at 80 columns with realistic typed input and
+  READ it before releasing.** The input footer is ONE truncated line: prompt +
+  typed value + cursor. A prompt that long hides the typed value (2026-10-13:
+  198 chars — input invisible below ~206 cols).
+- **release.sh is the PR/merge step:** the independent review (red-team) runs
+  BEFORE it, not after the first release — releasing first costs a release
+  cycle + up to 30 min of auto-update wait per round.
+- **After a release, the TUI `u` key forces an immediate update check** — use it
+  instead of waiting out the 30-min poll when verifying a live cutover.
 - Skills in this repo are invoked `/name` and run inline in the thread (not
   subagents). `/maxpool-builder` owns the memory read/update ritual + wrap-up.
 
