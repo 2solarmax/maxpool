@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.28] - 2026-10-21
+
+### Documentation
+
+- Four working rules from the weekly-capacity task — history-check TUI labels, 80-col render, review before release, u-key cutover
+
+### Fixed
+
+- Back off on GLM 429 — 60s floor doubling to 15min, burst-safe, forgets after 1h
+
 ## [1.24.27] - 2026-10-13
 
 ### Documentation
