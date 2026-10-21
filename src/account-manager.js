@@ -327,6 +327,10 @@ const PERSISTED_QUOTA_FIELDS = [
   'providerQuotaSource', 'lastProbeOkAt',
 ];
 
+const PROVIDER_429_MIN_BENCH_SEC = 60;
+const PROVIDER_429_MAX_BENCH_SEC = 15 * 60;
+const PROVIDER_429_STREAK_FORGET_MS = 60 * 60 * 1000;
+
 function clampRetryAfterSeconds(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 60;
@@ -845,6 +849,7 @@ export class AccountManager {
     if (outcome.success) {
       account.completedRequests++;
       account.consecutiveFailures = 0;
+      account.providerRateLimitStreak = 0;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
       if (account.provisionalUpstreamFingerprint) {
@@ -3927,8 +3932,31 @@ export class AccountManager {
       return;
     }
 
+    // Provider "slow down" backoff (2026-10-21): z.ai answers a GLM 429 with a 3-12s
+    // hint, and honouring it re-selected the account seconds later — ~200 refusals on
+    // max+1 over 2026-10-16/17, then a z.ai usage-risk notice. Bench a provider 429
+    // for at least 60s, doubling per back-to-back 429 up to 15 min; a success resets
+    // the streak (releaseAccount). Claude accounts keep the exact retry-after.
+    // A parallel 429 landing while the account is already benched is the SAME refusal
+    // burst — it keeps the bench and does not escalate (red-team 2026-10-21: up to 50
+    // in-flight requests per account turned one burst into the 15-min cap). The streak
+    // also forgets after an hour with no refusals.
+    let benchSeconds = retryAfter;
+    if (account.type === 'provider' && (options.status || 429) === 429) {
+      const now = Date.now();
+      if (account.status === 'throttled' && account.rateLimitedUntil > now) {
+        benchSeconds = Math.max(retryAfter, Math.ceil((account.rateLimitedUntil - now) / 1000));
+      } else {
+        if (now - (account.providerRateLimitAt || 0) > PROVIDER_429_STREAK_FORGET_MS) account.providerRateLimitStreak = 0;
+        const streak = account.providerRateLimitStreak || 0;
+        benchSeconds = Math.max(retryAfter, Math.min(PROVIDER_429_MAX_BENCH_SEC, PROVIDER_429_MIN_BENCH_SEC * 2 ** streak));
+        account.providerRateLimitStreak = streak + 1;
+      }
+      account.providerRateLimitAt = now;
+    }
+
     account.status = 'throttled';
-    account.rateLimitedUntil = Date.now() + (retryAfter * 1000);
+    account.rateLimitedUntil = Date.now() + (benchSeconds * 1000);
     account.lastStatus = options.status || 429;
     account.lastError = 'rate_limited';
     account.lastErrorAt = Date.now();
@@ -3937,7 +3965,7 @@ export class AccountManager {
       account.failedRequests++;
       account.consecutiveFailures++;
     }
-    console.log(`[Maxpool] Account "${account.name}" rate limited for ${retryAfter}s`);
+    console.log(`[Maxpool] Account "${account.name}" rate limited for ${benchSeconds}s${benchSeconds > retryAfter ? ` (provider asked ${retryAfter}s; backing off)` : ''}`);
   }
 
   markAuthFailed(accountIndex, status = 403, reason = 'auth_failed') {
