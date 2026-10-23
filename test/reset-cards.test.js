@@ -137,3 +137,85 @@ test('claim org: profile.organization.uuid wins; plural array is the fallback', 
   await claimResetGrant('tok', 'g1', { fetchImpl: fakeFetch2 });
   assert.match(seen[1], /\/api\/organizations\/org-plural\//, 'plural fallback intact');
 });
+
+// ── grantType on the redeem wire (2026-10-23) ────────────────────────────────
+// z.ai began rejecting redeems that omit grantType with the misleading
+// "The specified reset attempt is unavailable" — 519 failed redeems over ~16h on
+// two weekly-walled accounts. The list payload carries grantType per card; the
+// redeem must echo it back, exactly as z.ai's own web UI does.
+test('listResetCards keeps each card\'s grantType from the list payload', async () => {
+  const fetchImpl = async () => ({ status: 200, json: async () => ({ code: 200, data: {
+    fiveHourResets: [],
+    weekResets: [{ recordId: 9, grantType: 'GLOBAL', expireTime: '2099-12-22 23:59:59', available: true }],
+  } }) });
+  const r = await listResetCards('tok', { fetchImpl });
+  assert.equal(r.weekly.length, 1);
+  assert.equal(r.weekly[0].grantType, 'GLOBAL');
+});
+
+test('redeemResetCard sends the card\'s grantType in the request body', async () => {
+  let sent = null;
+  const fetchImpl = async (_url, init) => { sent = JSON.parse(init.body);
+    return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) }; };
+  const r = await redeemResetCard('tok', 9, 'WEEK', { grantType: 'GLOBAL', fetchImpl });
+  assert.equal(r.ok, true);
+  assert.deepEqual(sent, { recordId: 9, targetType: 'PERSONAL', resetType: 'WEEK',
+    requestId: sent.requestId, grantType: 'GLOBAL' });
+});
+
+test('prober redeem path passes the policy-chosen card\'s grantType to the wire', async () => {
+  const { Prober } = await import('../src/prober.js');
+  let sent = null;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => { sent = init?.body ? JSON.parse(init.body) : null;
+    return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) }; };
+  try {
+    const logs = [];
+    const self = { log: (m) => logs.push(m), am: {}, _withTimeout: (p) => p };
+    await Prober.prototype._redeemZaiCard.call(self,
+      { name: 'glm t', credential: 'tok', quota: {} },
+      { card: { recordId: 9, grantType: 'GLOBAL' }, resetType: 'WEEK', reason: 'weekly at wall' });
+    assert.equal(sent?.grantType, 'GLOBAL', 'grantType reached the wire');
+    assert.ok(logs.some(l => /card 9 redeemed/.test(l)), 'success logged');
+  } finally { globalThis.fetch = realFetch; }
+});
+
+// ── failed-redeem backoff (2026-10-23) ────────────────────────────────────────
+// A failing redeem must not be retried every poll cycle: 519 identical failed
+// attempts over 16h (2026-10-22/23) is the rapid-retry shape that drew z.ai's
+// usage-risk notice. Backoff is per account+card, exponential 15m→6h, reset on success.
+test('failed redeem backs off; success clears it', async () => {
+  const { Prober } = await import('../src/prober.js');
+  const realFetch = globalThis.fetch;
+  const responses = [
+    { status: 200, json: async () => ({ code: 400, success: false, msg: 'unavailable' }) },
+    { status: 200, json: async () => ({ code: 400, success: false, msg: 'unavailable' }) },
+    { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) },
+  ];
+  let calls = 0;
+  globalThis.fetch = async () => responses[Math.min(calls, responses.length - 1)];
+  const logs = [];
+  const self = { log: m => logs.push(m), am: {}, _withTimeout: p => p,
+                 _cardTries: new Map(), _cardRetryUntil: new Map() };
+  const acct = { name: 'glm t', index: 0, credential: 'tok', quota: {} };
+  const act = { card: { recordId: 9, grantType: 'GLOBAL' }, resetType: 'WEEK', reason: 'r' };
+  const p = Object.create(Prober.prototype, { _cardTries: { value: self._cardTries }, _cardRetryUntil: { value: self._cardRetryUntil } });
+  p.log = self.log; p.am = self.am; p._withTimeout = self._withTimeout;
+  const call = () => Prober.prototype._redeemZaiCard.call(p, acct, act);
+
+  await call(); calls++;                       // fail 1 → backoff armed
+  assert.match(logs.at(-1), /try 1, next attempt in 15min/);
+  const until = self._cardRetryUntil.get('0:9');
+  assert.ok(until > Date.now(), 'backoff armed');
+  const wireCallsBefore = calls;
+  await call();                                 // suppressed — no wire call
+  assert.equal(calls, wireCallsBefore, 'suppressed during backoff');
+  self._cardRetryUntil.set('0:9', Date.now() - 1); // simulate backoff expiry
+  await call(); calls++;                       // fail 2 → 30min
+  assert.match(logs.at(-1), /try 2, next attempt in 30min/);
+  self._cardRetryUntil.set('0:9', Date.now() - 1);
+  await call(); calls++;                       // success → cleared
+  assert.match(logs.at(-1), /card 9 redeemed/);
+  assert.equal(self._cardRetryUntil.get('0:9'), 0, 'success clears backoff');
+  globalThis.fetch = realFetch;
+});

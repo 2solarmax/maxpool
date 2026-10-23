@@ -211,20 +211,37 @@ export class Prober {
     } catch { /* best-effort; never let a probe throw */ }
   }
 
-  /** Execute a z.ai card redeem decided by the policy. Logs before/after. */
+  /** Execute a z.ai card redeem decided by the policy. Logs before/after.
+   *  A FAILED redeem backs off exponentially per card (15m, 30m, 1h, cap 6h):
+   *  2026-10-22/23, a z.ai API change made every redeem fail "unavailable" and the
+   *  2-minute poll retried the same card 519 times over 16h — the exact
+   *  rapid-retry shape z.ai's usage-risk notice flagged before. A success resets
+   *  the backoff; the idempotent requestId keeps any overlapping attempt single-spend. */
   async _redeemZaiCard(account, act) {
     try {
+      const key = `${account.index}:${act.card.recordId}`;
+      const now = Date.now();
+      const until = this._cardRetryUntil?.get(key);
+      if (until && until > now) return;                 // still backing off
       const q = account.quota || {};
       this.log(`[reset-card] ${account.name}: redeeming ${act.resetType} card ${act.card.recordId} (${act.reason}; ses=${q.providerSes ?? '?'} wk=${q.providerWk ?? '?'})`);
-      const r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType));
+      const r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType, { grantType: act.card.grantType }));
       if (r?.ok) {
+        if (!this._cardRetryUntil) this._cardRetryUntil = new Map();
+        this._cardRetryUntil.set(key, 0);               // success clears any backoff
         this.log(`[reset-card] ${account.name}: card ${act.card.recordId} redeemed`);
         if (this.am.applyResetCards) {
           const fresh = await this._withTimeout(listResetCards(account.credential));
           if (fresh) this.am.applyResetCards(account.index, fresh);
         }
       } else {
-        this.log(`[reset-card] ${account.name}: redeem FAILED card ${act.card.recordId}: ${r?.error}`);
+        const tries = (this._cardTries?.get(key) || 0) + 1;
+        if (!this._cardTries) this._cardTries = new Map();
+        this._cardTries.set(key, tries);
+        const waitMs = Math.min(6 * 3600_000, 900_000 * 2 ** (tries - 1));
+        if (!this._cardRetryUntil) this._cardRetryUntil = new Map();
+        this._cardRetryUntil.set(key, now + waitMs);
+        this.log(`[reset-card] ${account.name}: redeem FAILED card ${act.card.recordId} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       }
     } catch (e) { this.log(`[reset-card] ${account.name}: redeem error ${e.message}`); }
   }

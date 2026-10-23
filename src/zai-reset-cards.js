@@ -44,7 +44,7 @@ export function parseCardExpiry(s) {
   return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) - 8 * 3600_000;
 }
 
-/** Normalize a raw card array -> [{recordId, expiresAt, expired}], available only. */
+/** Normalize a raw card array -> [{recordId, grantType, expiresAt, expired}], available only. */
 function normalizeCards(arr, now = Date.now()) {
   const out = [];
   for (const c of (Array.isArray(arr) ? arr : [])) {
@@ -52,7 +52,7 @@ function normalizeCards(arr, now = Date.now()) {
     const recordId = Number(c.recordId);
     if (!Number.isFinite(recordId)) continue;
     const expiresAt = parseCardExpiry(c.expireTime);
-    out.push({ recordId, expiresAt, expired: expiresAt != null && expiresAt <= now });
+    out.push({ recordId, grantType: typeof c.grantType === 'string' ? c.grantType : undefined, expiresAt, expired: expiresAt != null && expiresAt <= now });
   }
   // Soonest-expiring first — that's the one to spend first.
   out.sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity));
@@ -61,10 +61,10 @@ function normalizeCards(arr, now = Date.now()) {
 
 /** List this account's available reset cards. Zero-spend read.
  *  Returns { fiveHour: [], weekly: [] } | { error }. */
-export async function listResetCards(token, { signal } = {}) {
+export async function listResetCards(token, { signal, fetchImpl = fetch } = {}) {
   if (!token) return { error: 'no token' };
   try {
-    const res = await fetch(LIST_URL, {
+    const res = await fetchImpl(LIST_URL, {
       headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
       signal,
     });
@@ -93,19 +93,25 @@ function requestIdFor(recordId) {
 
 /** Redeem one card. NEVER retries on the wire here (the idempotency key makes a
  *  caller-level retry safe). Returns { ok:true, recordId } | { ok:false, error, code }. */
-export async function redeemResetCard(token, recordId, resetType, { signal } = {}) {
+export async function redeemResetCard(token, recordId, resetType, { grantType, signal, fetchImpl = fetch } = {}) {
   if (resetType !== 'WEEK' && resetType !== 'FIVE_HOUR') {
     return { ok: false, error: `invalid resetType ${resetType}` };
   }
   if (!Number.isFinite(recordId)) return { ok: false, error: 'invalid recordId' };
   try {
-    const res = await fetch(USE_URL, {
+    // grantType is REQUIRED (2026-10-23): z.ai started rejecting card redeems without
+    // it ("The specified reset attempt is unavailable") — their web UI sends
+    // {targetType, resetType, recordId, requestId, grantType:'GLOBAL'}. A bogus
+    // grantType answers "Unsupported coupon grant type" without spending anything.
+    const body = {
+      recordId, targetType: 'PERSONAL', resetType,
+      requestId: requestIdFor(recordId),
+    };
+    if (grantType) body.grantType = grantType;
+    const res = await fetchImpl(USE_URL, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        recordId, targetType: 'PERSONAL', resetType,
-        requestId: requestIdFor(recordId),
-      }),
+      body: JSON.stringify(body),
       signal,
     });
     const data = await res.json().catch(() => null);
