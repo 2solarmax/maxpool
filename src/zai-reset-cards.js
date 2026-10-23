@@ -85,15 +85,19 @@ export async function listResetCards(token, { signal, fetchImpl = fetch } = {}) 
 }
 
 /** Deterministic requestId for a card: retries of the SAME redeem are idempotent
- *  server-side, so a network blip mid-redeem can never double-spend. */
-function requestIdFor(recordId) {
-  const h = createHash('sha256').update(`maxpool-zai-card-${recordId}`).digest('hex').slice(0, 24);
+ *  server-side, so a network blip mid-redeem can never double-spend. The account
+ *  key scopes it too — recordIds collide across z.ai accounts (card 9 on max+1 AND
+ *  glm4, 2026-10-23); z.ai idempotency measured per-account, but scoping keeps the
+ *  two accounts' keys distinct even if that assumption ever changes (red-team).
+ *  accountKey never changes semantics for a given account, so retries stay stable. */
+function requestIdFor(recordId, accountKey = '') {
+  const h = createHash('sha256').update(`maxpool-zai-card-${accountKey}-${recordId}`).digest('hex').slice(0, 24);
   return `maxpool-${h}`;
 }
 
 /** Redeem one card. NEVER retries on the wire here (the idempotency key makes a
  *  caller-level retry safe). Returns { ok:true, recordId } | { ok:false, error, code }. */
-export async function redeemResetCard(token, recordId, resetType, { grantType, signal, fetchImpl = fetch } = {}) {
+export async function redeemResetCard(token, recordId, resetType, { grantType, accountKey = '', signal, fetchImpl = fetch } = {}) {
   if (resetType !== 'WEEK' && resetType !== 'FIVE_HOUR') {
     return { ok: false, error: `invalid resetType ${resetType}` };
   }
@@ -105,7 +109,7 @@ export async function redeemResetCard(token, recordId, resetType, { grantType, s
     // grantType answers "Unsupported coupon grant type" without spending anything.
     const body = {
       recordId, targetType: 'PERSONAL', resetType,
-      requestId: requestIdFor(recordId),
+      requestId: requestIdFor(recordId, accountKey),
     };
     if (grantType) body.grantType = grantType;
     const res = await fetchImpl(USE_URL, {

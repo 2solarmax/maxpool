@@ -205,17 +205,59 @@ test('failed redeem backs off; success clears it', async () => {
 
   await call(); calls++;                       // fail 1 → backoff armed
   assert.match(logs.at(-1), /try 1, next attempt in 15min/);
-  const until = self._cardRetryUntil.get('0:9');
+  const until = self._cardRetryUntil.get('glm t:9');
   assert.ok(until > Date.now(), 'backoff armed');
   const wireCallsBefore = calls;
   await call();                                 // suppressed — no wire call
   assert.equal(calls, wireCallsBefore, 'suppressed during backoff');
-  self._cardRetryUntil.set('0:9', Date.now() - 1); // simulate backoff expiry
+  self._cardRetryUntil.set('glm t:9', Date.now() - 1); // simulate backoff expiry
   await call(); calls++;                       // fail 2 → 30min
   assert.match(logs.at(-1), /try 2, next attempt in 30min/);
-  self._cardRetryUntil.set('0:9', Date.now() - 1);
+  self._cardRetryUntil.set('glm t:9', Date.now() - 1);
   await call(); calls++;                       // success → cleared
   assert.match(logs.at(-1), /card 9 redeemed/);
-  assert.equal(self._cardRetryUntil.get('0:9'), 0, 'success clears backoff');
+  assert.equal(self._cardRetryUntil.get('glm t:9'), 0, 'success clears backoff');
   globalThis.fetch = realFetch;
+});
+
+// ── red-team hardening (2026-10-23, verdict CONCERNS ×4 minor) ────────────────
+test('requestId idempotency key is account-scoped (card 9 on two accounts differ)', () => {
+  // same recordId, different accounts → different requestIds; same pair → identical (retry-stable)
+  const seen = [];
+  const fakeFetch = async (_u, init) => { seen.push(JSON.parse(init.body)); 
+    return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) }; };
+  const call = (acct) => redeemResetCard('tok', 9, 'WEEK', { grantType: 'GLOBAL', accountKey: acct, fetchImpl: fakeFetch });
+  return Promise.all([call('glm max+1@gomokka.com'), call('glm glm4@gomokka.com'), call('glm max+1@gomokka.com')]).then(rs => {
+    assert(rs.every(r => r.ok));
+    assert.notEqual(seen[0].requestId, seen[1].requestId, 'cross-account keys differ');
+    assert.equal(seen[0].requestId, seen[2].requestId, 'same account retry-stable');
+  });
+});
+
+test('grantType-less card gets one GLOBAL fallback retry on "unavailable"', async () => {
+  const { Prober } = await import('../src/prober.js');
+  const bodies = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_u, init) => { bodies.push(JSON.parse(init.body));
+    return bodies.length === 1
+      ? { status: 200, json: async () => ({ code: 400, success: false, msg: 'The specified reset attempt is unavailable' }) }
+      : { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) }; };
+  const logs = [];
+  const p = Object.create(Prober.prototype, { _cardTries: { value: new Map() }, _cardRetryUntil: { value: new Map() } });
+  p.log = m => logs.push(m); p.am = {}; p._withTimeout = x => x;
+  try {
+    await Prober.prototype._redeemZaiCard.call(p, { name: 'glm t', credential: 'tok', quota: {} },
+      { card: { recordId: 9 }, resetType: 'WEEK', reason: 'r' });   // NO grantType on the card
+    assert.equal(bodies.length, 2, 'exactly one fallback retry');
+    assert.equal(bodies[0].grantType, undefined);
+    assert.equal(bodies[1].grantType, 'GLOBAL');
+    assert.ok(logs.some(l => /card 9 redeemed/.test(l)));
+  } finally { globalThis.fetch = realFetch; }
+});
+
+test('backoff key is the account NAME (stable across reindex), and tries resets on success', async () => {
+  const { Prober } = await import('../src/prober.js');
+  const src = (await import('node:fs')).readFileSync(new URL('../src/prober.js', import.meta.url), 'utf8');
+  assert.match(src, /`\$\{account\.name\}:\$\{act\.card\.recordId\}`/, 'keyed by name');
+  assert.match(src, /_cardTries\?\.set\(key, 0\)/, 'tries reset on success');
 });

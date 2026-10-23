@@ -219,16 +219,23 @@ export class Prober {
    *  the backoff; the idempotent requestId keeps any overlapping attempt single-spend. */
   async _redeemZaiCard(account, act) {
     try {
-      const key = `${account.index}:${act.card.recordId}`;
+      const key = `${account.name}:${act.card.recordId}`;  // name, not index: index shifts on account removal
       const now = Date.now();
       const until = this._cardRetryUntil?.get(key);
       if (until && until > now) return;                 // still backing off
       const q = account.quota || {};
       this.log(`[reset-card] ${account.name}: redeeming ${act.resetType} card ${act.card.recordId} (${act.reason}; ses=${q.providerSes ?? '?'} wk=${q.providerWk ?? '?'})`);
-      const r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType, { grantType: act.card.grantType }));
+      let r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType, { grantType: act.card.grantType, accountKey: account.name }));
+      // grantType-less listing + "unavailable" is the exact 2026-10-22 outage shape; GLOBAL
+      // is the only grantType z.ai has ever issued and a wrong one answers 400 no-spend
+      // (measured, src/zai-reset-cards.js header) — so one fallback retry is safe.
+      if (!r?.ok && !act.card.grantType && /unavailable/i.test(r?.error || '')) {
+        r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType, { grantType: 'GLOBAL', accountKey: account.name }));
+      }
       if (r?.ok) {
         if (!this._cardRetryUntil) this._cardRetryUntil = new Map();
         this._cardRetryUntil.set(key, 0);               // success clears any backoff
+        this._cardTries?.set(key, 0);                   // ...and the failure count (red-team 2026-10-23)
         this.log(`[reset-card] ${account.name}: card ${act.card.recordId} redeemed`);
         if (this.am.applyResetCards) {
           const fresh = await this._withTimeout(listResetCards(account.credential));
