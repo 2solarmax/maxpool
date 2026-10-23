@@ -71,6 +71,7 @@ export function decideZai(account, cards, now = Date.now()) {
 
   const weeklyCard = weeklyCards[0] || null;
   const sesCard = sesCards[0] || null;
+  let weeklyHeld = false; // R6: weekly card HELD for the free refill (5h branch may still fire)
 
   // --- weekly card: clears BOTH windows (z.ai docs; measured: glm1 100%->0% both)
   if (weeklyCard) {
@@ -81,20 +82,24 @@ export function decideZai(account, cards, now = Date.now()) {
     if (atWall || dying) {
       // R6: a wall redeem waits when the FREE weekly refill is imminent and the
       // account isn't critically full (dying-value redeems stay exempt above).
+      // A HELD weekly card is spendable-redundant, not absent: the 5h branch below
+      // may still fire (red-team: holding must not starve a 5h wall — the 5h card
+      // sits redundant behind the free refill anyway, so spending it is pure gain).
       if (atWall && !dying && q.providerWkReset != null
           && msLeft(q.providerWkReset, now) < POLICY.freeRefillWaitMs
           && wkUtil < POLICY.freeRefillImmediate) {
-        return null; // hold — the free refill lands before the card would matter
+        weeklyHeld = true;   // fall through — do NOT return; the 5h branch checks this
+      } else {
+        return { kind: 'card', card: weeklyCard, resetType: 'WEEK',
+                 reason: atWall ? 'weekly at wall' : 'dying value' };
       }
-      return { kind: 'card', card: weeklyCard, resetType: 'WEEK',
-               reason: atWall ? 'weekly at wall' : 'dying value' };
     }
   }
 
   // --- 5h card: clears only the session window
   if (sesCard) {
     const atWall = sesUtil != null && sesUtil >= POLICY.wallSes
-      && (weeklyCard == null);   // R4: a weekly card can do this job AND more
+      && (weeklyCard == null || weeklyHeld);   // R4: a weekly card can do this job AND more — except when R6 HELD it for the free refill
     const dying = msLeft(sesCard.expiresAt, now) < POLICY.dyingWindowMs
       && (sesUtil ?? 0) >= POLICY.dyingMinUtilSes;
     if (atWall || dying) {

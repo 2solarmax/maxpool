@@ -317,3 +317,34 @@ test('W6: wall AND dying together with imminent free refill — dying wins over 
   const act = decideZai(a, cards);
   assert.ok(act?.kind === 'card' && act.card.recordId === 5, 'dying-value redeem must not be held by R6 (reason label may read "weekly at wall" when both are true)');
 });
+
+// ── R6 hold does not starve the 5h wall (red-team concern 1, 2026-10-23) ──────
+test('W7: during a weekly hold, a 5h wall still redeems the 5h card', () => {
+  const cards = {
+    weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
+    fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
+  };
+  const a = acct({ ses: 0.97, wk: 0.93 });
+  a.quota.providerWkReset = Date.now() + 12 * 3600_000;   // free refill in 12h → weekly HELD
+  const act = decideZai(a, cards);
+  assert.equal(act?.resetType, 'FIVE_HOUR', 'held weekly card must not block the 5h wall');
+  assert.equal(act?.card?.recordId, 6);
+});
+
+test('W8: R4 intact — 5h wall does NOT spend the 5h card when the weekly card is redeemable', () => {
+  const cards = {
+    weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
+    fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
+  };
+  const a = acct({ ses: 0.97, wk: 0.93 });
+  a.quota.providerWkReset = Date.now() + 30 * 3600_000;   // refill far → weekly redeemable → R4 rules
+  const act = decideZai(a, cards);
+  assert.equal(act?.resetType, 'WEEK', 'weekly card still preferred when not held');
+});
+
+test('W9: 24h boundary — refill exactly 24h+1s away redeems at the wall', () => {
+  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
+  const a = acct({ ses: 0.1, wk: 0.93 });
+  a.quota.providerWkReset = Date.now() + 24 * 3600_000 + 1000;
+  assert.equal(decideZai(a, cards)?.card?.recordId, 9, 'outside the wait window → redeem');
+});
