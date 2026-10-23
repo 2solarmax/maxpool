@@ -261,3 +261,59 @@ test('backoff key is the account NAME (stable across reindex), and tries resets 
   assert.match(src, /`\$\{account\.name\}:\$\{act\.card\.recordId\}`/, 'keyed by name');
   assert.match(src, /_cardTries\?\.set\(key, 0\)/, 'tries reset on success');
 });
+
+// ── wait-for-free-refill (owner-approved 2026-10-23) ──────────────────────────
+// A weekly card is NOT redeemed at the 90% wall when z.ai's free weekly refill
+// lands <24h away and the account is not critically full (<98%) — the free
+// refill makes the card redundant. At >=98% redeem regardless: the owner is
+// never blocked waiting for a free refill that is only hours away.
+test('W1 RED: holds weekly card when free refill <24h away and util <0.98', () => {
+  const soon = Date.now() + 12 * 3600_000;            // free refill in 12h
+  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
+  const a = acct({ ses: 0.2, wk: 0.93 });
+  a.quota.providerWkReset = soon;
+  assert.equal(decideZai(a, cards), null, 'must HOLD the card — free refill in 12h, util 93%');
+});
+
+test('W2: redeems at >=0.98 even with free refill imminent', () => {
+  const soon = Date.now() + 3 * 3600_000;             // refill in 3h but account critically full
+  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
+  const a = acct({ ses: 0.2, wk: 0.98 });
+  a.quota.providerWkReset = soon;
+  const act = decideZai(a, cards);
+  assert.equal(act?.card?.recordId, 9, 'never-block guarantee: redeem at 98%');
+});
+
+test('W3: refill >=24h away → existing wall behavior unchanged', () => {
+  const later = Date.now() + 30 * 3600_000;           // refill in 30h
+  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
+  const a = acct({ ses: 0.2, wk: 0.93 });
+  a.quota.providerWkReset = later;
+  assert.equal(decideZai(a, cards)?.card?.recordId, 9, 'wall redeem stands when refill is far');
+});
+
+test('W4: unknown refill time (null) → existing behavior unchanged', () => {
+  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
+  const a = acct({ ses: 0.2, wk: 0.93 });
+  a.quota.providerWkReset = null;
+  assert.equal(decideZai(a, cards)?.card?.recordId, 9, 'no refill info → redeem as today');
+});
+
+test('W5: hold does not affect 5h cards or dying-value weekly redeems', () => {
+  // dying-value (<24h on the CARD) still fires even with free refill imminent
+  const cards = { weekly: [{ recordId: 5, grantType: 'GLOBAL', expiresAt: Date.now() + 2 * H, expired: false }], fiveHour: [] };
+  const a = acct({ ses: 0.6, wk: 0.4 });
+  a.quota.providerWkReset = Date.now() + 5 * 3600_000;
+  const act = decideZai(a, cards);
+  assert.equal(act?.reason, 'dying value', 'dying card redeemed, not held');
+});
+
+test('W6: wall AND dying together with imminent free refill — dying wins over hold (card expiring)', () => {
+  // Card expires in 2h, util at wall 0.93, free refill in 5h. Holding burns the card's
+  // remaining life for a refill that lands after the card dies — must redeem (dying).
+  const cards = { weekly: [{ recordId: 5, grantType: 'GLOBAL', expiresAt: Date.now() + 2 * H, expired: false }], fiveHour: [] };
+  const a = acct({ ses: 0.1, wk: 0.93 });
+  a.quota.providerWkReset = Date.now() + 5 * 3600_000;
+  const act = decideZai(a, cards);
+  assert.ok(act?.kind === 'card' && act.card.recordId === 5, 'dying-value redeem must not be held by R6 (reason label may read "weekly at wall" when both are true)');
+});

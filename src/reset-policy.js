@@ -34,6 +34,13 @@
  * R5  PACE — at most ONE redeem per account per evaluation. The caller invokes the
  *     policy each poll cycle; the deterministic z.ai requestId makes an accidental
  *     double-fire harmless, but the policy still returns a single action.
+ *
+ * R6  WAIT FOR THE FREE REFILL (owner, 2026-10-23) — a wall redeem (R1) burns a card
+ *     that z.ai's free weekly refill is about to make redundant: when the refill
+ *     lands <24h away and weekly util < 0.98, HOLD the card. At >= 0.98 redeem
+ *     immediately — the owner is never blocked waiting for a free refill that is
+ *     merely hours away. Dying-value redeems (R2) are exempt: an expiring card's
+ *     value cannot survive a wait.
  */
 export const POLICY = {
   wallWeekly: 0.90,       // weekly at 90% = at the wall
@@ -41,6 +48,8 @@ export const POLICY = {
   dyingWindowMs: 24 * 3600 * 1000, // redeem-don't-save horizon
   dyingMinUtilWeekly: 0.30, // below this a dying weekly refill buys too little
   dyingMinUtilSes: 0.50,    // 5h refills are cheap capacity; demand more waste first
+  freeRefillWaitMs: 24 * 3600 * 1000, // R6: hold a wall redeem this close to the free refill
+  freeRefillImmediate: 0.98,          // R6: ...unless this full — never block the owner
 };
 
 function msLeft(t, now) { return t == null ? Infinity : t - now; }
@@ -70,6 +79,13 @@ export function decideZai(account, cards, now = Date.now()) {
     const dying = msLeft(weeklyCard.expiresAt, now) < POLICY.dyingWindowMs
       && worst >= POLICY.dyingMinUtilWeekly;
     if (atWall || dying) {
+      // R6: a wall redeem waits when the FREE weekly refill is imminent and the
+      // account isn't critically full (dying-value redeems stay exempt above).
+      if (atWall && !dying && q.providerWkReset != null
+          && msLeft(q.providerWkReset, now) < POLICY.freeRefillWaitMs
+          && wkUtil < POLICY.freeRefillImmediate) {
+        return null; // hold — the free refill lands before the card would matter
+      }
       return { kind: 'card', card: weeklyCard, resetType: 'WEEK',
                reason: atWall ? 'weekly at wall' : 'dying value' };
     }
