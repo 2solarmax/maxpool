@@ -4515,7 +4515,12 @@ export class AccountManager {
     return this.accounts.map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
-      return { accountUuid: a.accountUuid, name: a.name, quota };
+      const out = { accountUuid: a.accountUuid, name: a.name, quota };
+      // OUTSIDE-USAGE flag survives restart (red-team R1.2): a restart is exactly
+      // when a leak's cards are most at risk — remediation rotates keys and
+      // restarts the pool, and the in-memory flag would vanish mid-remediation.
+      if (a.outsideUsage?.outside) out.outsideUsage = { ...a.outsideUsage };
+      return out;
     });
   }
 
@@ -4549,6 +4554,12 @@ export class AccountManager {
       }
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
+      // OUTSIDE-USAGE restored: keep holding R7 and force the next sweep to
+      // re-verify immediately (fresh poolHourly can only re-prove the leak).
+      if (match.outsideUsage?.outside) {
+        account.outsideUsage = { ...match.outsideUsage, stale: true };
+        account._outsideCheckedAt = 0;
+      }
     }
   }
 

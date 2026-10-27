@@ -148,7 +148,7 @@ test('the check runs at most hourly per account', async () => {
   const prober = new Prober(am, {
     grantsFn: async () => null, log: () => {},
     providerProbeFn: async () => ({ ses: null, wk: null, source: 'zai' }),
-    zaiUsageFn: async () => { called++; return zaiData([], 0); },
+    zaiUsageFn: async () => { called++; return zaiData([hourFloor(t) - H], 0); },
     cardsFn: async () => ({ weekly: [], fiveHour: [] }),
     now: () => t,
   });
@@ -220,4 +220,99 @@ test('the REAL request path (acquireAccount) counts each send', () => {
   const glm = am.accounts.find(a => a.name === 'glm');
   const total = [...(glm.poolHourly?.values() || [])].reduce((s, v) => s + v, 0);
   assert.equal(total, 2, 'two real sends counted');
+});
+
+// ── review round 1 hardening (judge FAIL→fix): fail-open + persistence ────────
+test('R1.1 a FAILED z.ai fetch never clears a true flag (no fail-open)', async () => {
+  const am = zaiPool();
+  am.poolUpSince = NOW - 30 * H;
+  const hours = Array.from({ length: 24 }, (_, i) => hourFloor(NOW) - (24 - i) * H);
+  let failNow = false; let t = NOW;
+  const prober = new Prober(am, {
+    grantsFn: async () => null, log: () => {},
+    providerProbeFn: async () => ({ ses: null, wk: null, source: 'zai' }),
+    zaiUsageFn: async () => (failNow ? null : zaiData(hours, 600)),
+    cardsFn: async () => ({ weekly: [], fiveHour: [] }),
+    now: () => t,
+  });
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].outsideUsage.outside, true);
+  failNow = true; t += 61 * 60_000;              // next sweep: fetch fails
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].outsideUsage.outside, true, 'flag survives a failed fetch');
+  assert.ok(am.accounts[0].outsideUsage.stale, 'reading is marked stale');
+  // and the card gate still holds on stale
+  const cards = { weekly: [{ recordId: 9, expiresAt: NOW + 30 * 24 * H, expired: false }], fiveHour: [] };
+  const acct = { name: 'leak', enabled: true, quota: { providerSes: 0, providerWk: 1 }, outsideUsage: am.accounts[0].outsideUsage };
+  assert.equal(decideZai(acct, cards, NOW), null, 'R7 holds while stale');
+});
+
+test('R1.2 empty z.ai data (all-zero hours) never clears a true flag', async () => {
+  const am = zaiPool();
+  am.poolUpSince = NOW - 30 * H;
+  let mode = 'leak'; let t = NOW;
+  const hours = Array.from({ length: 24 }, (_, i) => hourFloor(NOW) - (24 - i) * H);
+  const prober = new Prober(am, {
+    grantsFn: async () => null, log: () => {},
+    providerProbeFn: async () => ({ ses: null, wk: null, source: 'zai' }),
+    zaiUsageFn: async () => (mode === 'leak' ? zaiData(hours, 600) : { x_time: hours.map(String), modelCallCount: [] }),
+    cardsFn: async () => ({ weekly: [], fiveHour: [] }),
+    now: () => t,
+  });
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].outsideUsage.outside, true);
+  mode = 'partial'; t += 61 * 60_000;
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].outsideUsage.outside, true, 'flag survives a partial/empty response');
+});
+
+test('R1.3 the flag persists across restart (export/restore)', () => {
+  const am = zaiPool();
+  am.accounts[0].outsideUsage = { outside: true, zaiCalls: 14400, poolCalls: 16, hours: 24, checkedAt: NOW };
+  const saved = am.exportQuotaState();
+  const am2 = zaiPool();                        // fresh process: fresh poolUpSince, empty poolHourly
+  am2.restoreQuotaState(saved);
+  assert.equal(am2.accounts[0].outsideUsage.outside, true, 'flag survives restart');
+});
+
+test('R1.4 hour-floor labels: ":30" rows are folded into their hour, never dropped', () => {
+  const m = zaiHourlyCalls({ x_time: ['2026-10-27 12:00', '2026-10-27 12:30', '2026-10-27 13:15'], modelCallCount: [10, 5, 2] });
+  assert.equal(m.get(at(4)), 15, '12:00+12:30 both fold into 04:00Z');
+  assert.equal(m.get(at(5)), 2, '13:15 folds into 05:00Z');
+});
+
+test('R1.5 a failed fetch retries next sweep, not an hour later', async () => {
+  const am = zaiPool();
+  am.poolUpSince = NOW - 30 * H;
+  let calls = 0; let t = NOW;
+  const prober = new Prober(am, {
+    grantsFn: async () => null, log: () => {},
+    providerProbeFn: async () => ({ ses: null, wk: null, source: 'zai' }),
+    zaiUsageFn: async () => { calls++; return calls === 1 ? null : zaiData([hourFloor(t) - H], 0); },
+    cardsFn: async () => ({ weekly: [], fiveHour: [] }),
+    now: () => t,
+  });
+  await prober.probeProvider(am.accounts[0]);   // fails
+  t += 5 * 60_000;                              // minutes, not an hour
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(calls, 2, 'retried on the next sweep');
+});
+
+test('R1.6 a well-formed all-zero reading DOES clear the flag (key rotated, leak stopped)', async () => {
+  const am = zaiPool();
+  am.poolUpSince = NOW - 30 * H;
+  let mode = 'leak'; let t = NOW;
+  const mk = () => Array.from({ length: 24 }, (_, i) => hourFloor(t) - (24 - i) * H);
+  const prober = new Prober(am, {
+    grantsFn: async () => null, log: () => {},
+    providerProbeFn: async () => ({ ses: null, wk: null, source: 'zai' }),
+    zaiUsageFn: async () => zaiData(mk(), mode === 'leak' ? 600 : 0),
+    cardsFn: async () => ({ weekly: [], fiveHour: [] }),
+    now: () => t,
+  });
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].outsideUsage.outside, true);
+  mode = 'quiet'; t += 25 * H;                 // a full window later, leak gone
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].outsideUsage.outside, false, 'clears once real data shows it stopped');
 });

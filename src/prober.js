@@ -11,7 +11,7 @@ import { fetchUsage, fetchProviderUsage } from './oauth.js';
 import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
 import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
 import { decideZai, decideClaude } from './reset-policy.js';
-import { zaiHourlyCalls, compareOutsideUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
+import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
 
 // How often a subscription-latched account is rechecked (one probe + at most one
 // token refresh per window — cheap, and bounded so a truly canceled plan isn't hammered).
@@ -228,13 +228,23 @@ export class Prober {
       if (account.provider !== 'zai' || !account.credential || account.enabled === false) return;
       const last = account._outsideCheckedAt || 0;
       if (now - last < OUTSIDE_CHECK_MS) return;
-      account._outsideCheckedAt = now;
       const data = await this._withTimeout(this.zaiUsageFn(account.credential, { now }));
+      if (!isUsableZaiUsage(data)) {
+        // FAILED or malformed read. Never downgrade a true flag on missing data (red-team R1.1:
+        // one 5xx un-protected a known leak and the SAME sweep redeemed a card into
+        // it). Keep the reading, mark it stale (R7 still holds), and RETRY next
+        // sweep — the hourly slot is only consumed by a successful read.
+        const prev = account.outsideUsage;
+        if (prev) account.outsideUsage = { ...prev, stale: true, checkedAt: now };
+        return;
+      }
+      account._outsideCheckedAt = now;          // stamp AFTER success (R1.5)
       const zai = zaiHourlyCalls(data);
       const res = compareOutsideUsage(zai, account.poolHourly, { now, poolUpSince: this.am.poolUpSince });
-      const prev = account.outsideUsage?.outside;
+      const prev = account.outsideUsage;
+      const wasOutside = Boolean(prev?.outside);
       account.outsideUsage = { ...res, checkedAt: now };
-      if (res.outside && !prev) {
+      if (res.outside && !wasOutside) {
         this.log(`[outside-usage] ${account.name}: z.ai counted ${res.zaiCalls} calls in the last ${res.hours}h but the pool sent ${res.poolCalls} — someone else holds this key; reset cards held`);
       }
     } catch { /* detector is best-effort; never block the probe */ }

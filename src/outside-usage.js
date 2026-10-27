@@ -16,6 +16,19 @@
 // up means a restart or an update cutover can never manufacture a false alarm.
 //
 // z.ai's monitor labels hours in UTC+8 ("2026-10-24 12:00" = 04:00Z).
+//
+// Operating limits (red-team 2026-10-27, accepted):
+// - ONE pool per key. A second maxpool sending on the same key IS outside traffic
+//   to this one and would trip the flag on both — share keys by giving each
+//   person their own account (the registry rule), not by running two pools.
+// - z.ai only. Kimi exposes no per-hour call monitor; its keys are single-holder.
+// - Detection, not prevention: a leak under 3x the pool's own volume, or one that
+//   started before the pool booted and has not yet produced 50 calls in complete
+//   hours since, is not flagged. The key-literal guard test and per-person keys
+//   are the prevention.
+// - Failure is fail-SAFE: an unreadable/malformed monitor reply never clears a
+//   flag (it marks the reading stale, R7 keeps holding, the next sweep retries);
+//   the flag persists across restarts. Only a well-formed reading clears it.
 
 export const OUTSIDE_FACTOR = 3;          // z.ai > 3x pool over the window = outside traffic
 export const OUTSIDE_MIN_CALLS = 50;      // below this the window is noise
@@ -25,6 +38,15 @@ const HOUR = 3600_000;
 const ZAI_TZ_OFFSET_MS = 8 * HOUR;
 
 export const hourFloor = (ms) => Math.floor(ms / HOUR) * HOUR;
+
+/** A z.ai model-usage payload we can trust: parallel non-empty arrays. A
+ *  malformed/partial payload is treated as a FAILED read (never as "zero calls"),
+ *  while a well-formed all-zero payload is real data — that is what lets a flag
+ *  clear after the key is rotated and the outside traffic stops. */
+export function isUsableZaiUsage(data) {
+  const xs = data?.x_time, cs = data?.modelCallCount;
+  return Array.isArray(xs) && Array.isArray(cs) && xs.length > 0 && xs.length === cs.length;
+}
 
 /** z.ai model-usage `data` ({x_time:["YYYY-MM-DD HH:mm"...], modelCallCount:[...]})
  *  → Map(utcHourStartMs → calls). Unparseable rows are skipped. */
@@ -36,7 +58,11 @@ export function zaiHourlyCalls(data) {
     const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(String(xs[i]));
     if (!m) continue;
     const labelAsUtc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
-    const utc = labelAsUtc - ZAI_TZ_OFFSET_MS;
+    // Floor to the hour: z.ai labels are hour-aligned today, but folding a finer
+    // bucket (":30", a summary row) into its hour is correct either way, while
+    // keying on the raw label would silently DROP it (hourFloor lookups miss) and
+    // read a leaking account as 0.
+    const utc = Math.floor((labelAsUtc - ZAI_TZ_OFFSET_MS) / HOUR) * HOUR;
     const c = Number(cs[i]) || 0;
     out.set(utc, (out.get(utc) || 0) + c);
   }
