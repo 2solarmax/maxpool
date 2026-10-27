@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint, sameUser, sameAccountIdentity } from './oauth.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
 
@@ -472,6 +472,7 @@ export class AccountManager {
       type: acct.type,
       provider: acct.provider || (acct.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acct.accountUuid || null,
+      organizationUuid: acct.organizationUuid || null,
       credential: acct.accessToken || acct.authToken || acct.apiKey,
       upstream: acct.upstream || null,
       authHeader: acct.authHeader || null,
@@ -4243,6 +4244,7 @@ export class AccountManager {
       type: acctData.type,
       provider: acctData.provider || (acctData.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acctData.accountUuid || null,
+      organizationUuid: acctData.organizationUuid || null,
       credential: acctData.accessToken || acctData.authToken || acctData.apiKey,
       upstream: acctData.upstream || null,
       authHeader: acctData.authHeader || null,
@@ -4500,11 +4502,17 @@ export class AccountManager {
     return true;
   }
 
-  // Match a saved state entry to a live account by stable identity: prefer the
-  // account UUID when both have one, otherwise fall back to the name.
+  /**
+   * Match a saved state entry to a live account by stable identity: the account
+   * UUID + organization UUID when both have a UUID, otherwise the name. A saved
+   * entry without an organization (written before organizations were recorded)
+   * also matches the same user under the same name, so quota survives the first
+   * restart after an account learns its organization.
+   */
   _sameIdentity(saved, account) {
-    if (saved.accountUuid && account.accountUuid) return saved.accountUuid === account.accountUuid;
-    return saved.name === account.name;
+    if (!saved.accountUuid || !account.accountUuid) return saved.name === account.name;
+    return sameAccountIdentity(saved, account)
+      || (!saved.organizationUuid && sameUser(saved, account) && saved.name === account.name);
   }
 
   /**
@@ -4515,7 +4523,7 @@ export class AccountManager {
     return this.accounts.map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
-      const out = { accountUuid: a.accountUuid, name: a.name, quota };
+      const out = { accountUuid: a.accountUuid, organizationUuid: a.organizationUuid, name: a.name, quota };
       // OUTSIDE-USAGE flag survives restart (red-team R1.2): a restart is exactly
       // when a leak's cards are most at risk — remediation rotates keys and
       // restarts the pool, and the in-memory flag would vanish mid-remediation.

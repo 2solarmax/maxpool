@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -862,7 +862,7 @@ export class TUI {
     } else if (k === 'l') {
       this._confirm(
         'Log in / re-authenticate via browser?',
-        'Opens a browser. Logging into an account that\'s already added RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Otherwise a new account is added.',
+        'Opens a browser. Logging into an account that\'s already added (same user, same organization) RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Another organization of the same user, or a new user, is added as a new account.',
         () => this._doLogin(),
       );
     } else if (k === 'n' && this.am.accounts.length > 0) {
@@ -902,7 +902,7 @@ export class TUI {
       this.mode = 'accounts';
       this._confirm(
         'Log in / re-authenticate via browser?',
-        'Opens a browser. Logging into an account that is already added RE-AUTHENTICATES it in place — no duplicate.',
+        'Opens a browser. Logging into an account that is already added (same user, same organization) RE-AUTHENTICATES it in place — no duplicate. Another organization of the same user is added as a new account.',
         () => this._doLogin(),
       );
       return;
@@ -1429,7 +1429,7 @@ export class TUI {
   }
 
   // Browser OAuth login — the SAME flow re-authenticates an existing account (matched
-  // by accountUuid) or adds a new one. When the login is for an account already added,
+  // by user + organization) or adds a new one. When the login is for an account already added,
   // we say so, keep its name, and skip the "name this account" prompt — so it's clear
   // it's a RE-AUTH in place (revives a dead-refresh/reauth account), not a duplicate.
   async _doLogin() {
@@ -1445,17 +1445,16 @@ export class TUI {
       process.stdout.write('\nOpening browser to log into Claude…\n');
       const creds = await loginOAuth();
       const profile = await fetchProfile(creds.accessToken);
-      const existing = this._findExistingOAuthAccount(profile);
+      const existing = await this._matchLogin(profile);
       let name;
       if (existing) {
         process.stdout.write(`\nThis Claude account is already added as "${existing.name}" — re-authenticating it in place (no duplicate).\n`);
         name = existing.name;
       } else {
-        const suggested = profile?.email
-          || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
-        const answer = await new Promise(resolve => rl.question(`Name this NEW account [${suggested}]: `, resolve));
-        rl.close();
+        const sibling = this._oauthAccounts().find(a => sameUser(a, profile));
+        if (sibling) process.stdout.write(`\nSame Claude user as "${sibling.name}": adding a second account.\n`);
+        const suggested = suggestAccountName(this.config.accounts, profile);
+        const answer = await this._askLine(`Name this NEW account [${suggested}]: `);
         name = String(answer || '').trim() || suggested;
       }
       // Lift the mute BEFORE the upsert so its persist-confirmation (a console.log,
@@ -1571,23 +1570,19 @@ export class TUI {
   }
 
   // Upsert an OAuth account into config + the running manager. Dedupes by
-  // accountUuid, then name. Shared by import and browser login.
+  // user + organization, then name. Shared by import and browser login.
   async _upsertOAuthAccount({ creds, profile, name, source, verb = 'Added' }) {
-    if (!name) {
-      name = profile?.email
-        || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
-    }
+    if (!name) name = suggestAccountName(this.config.accounts, profile);
     const entry = {
       name, type: 'oauth', source,
       accountUuid: profile?.accountUuid || null,
+      organizationUuid: profile?.organizationUuid || null,
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
     };
 
-    let idx = entry.accountUuid
-      ? this.config.accounts.findIndex(a => a.accountUuid === entry.accountUuid)
-      : -1;
+    let idx = this.config.accounts.findIndex(a => sameAccountIdentity(a, entry));
     if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
 
     if (idx >= 0) {
@@ -1603,13 +1598,14 @@ export class TUI {
       // heal disk (persistTokenRefresh's generation guard skips a disk token that
       // != _refreshedFrom), so disk must be made correct right here.
       const amAcct = this.am.accounts.find(account =>
-        (entry.accountUuid && account.accountUuid === entry.accountUuid) || account.name === name
+        sameAccountIdentity(account, entry) || account.name === name
       );
       if (amAcct) {
         amAcct.credential = creds.accessToken;
         amAcct.refreshToken = creds.refreshToken;
         amAcct.expiresAt = creds.expiresAt;
         amAcct.accountUuid = entry.accountUuid;
+        amAcct.organizationUuid = entry.organizationUuid;
         amAcct.name = name;
         // Fresh tokens from re-auth revive a dead-refresh account. This in-place
         // update is the actual re-login path (the index.js reconcile sees no change
@@ -1651,15 +1647,94 @@ export class TUI {
     }
   }
 
+  // Decide what a fresh browser-login profile is: an account already in the pool
+  // (re-authenticate in place) or a new one. Same-user entries that do not know
+  // their organization are read first; when one still cannot be read, the user decides.
+  async _matchLogin(profile) {
+    await this._resolveOrganizations(profile);
+    const existing = this._findExistingOAuthAccount(profile);
+    if (this._organizationUnknown(existing, profile)) return this._confirmReauth(existing);
+    return existing;
+  }
+
+  // Fill in the organization of same-user entries that lack one, reading each with
+  // the running account's live token (read only, never refreshed), and mirror the
+  // result to the manager. The upsert that follows persists it.
+  async _resolveOrganizations(profile) {
+    if (!profile?.accountUuid) return;
+    await resolveOrganizations(this._oauthAccounts(), profile.accountUuid, entry => this._liveCredentials(entry));
+    this._mirrorOrganizations(profile);
+  }
+
+  _liveCredentials(entry) {
+    const live = this._runningAccount(entry);
+    return live ? { accessToken: live.credential, expiresAt: live.expiresAt } : entry;
+  }
+
+  _mirrorOrganizations(profile) {
+    const known = this._oauthAccounts().filter(a => sameUser(a, profile) && a.organizationUuid);
+    for (const entry of known) this._mirrorOrganization(entry);
+  }
+
+  _mirrorOrganization(entry) {
+    const live = this._runningAccount(entry);
+    if (live) live.organizationUuid = entry.organizationUuid;
+  }
+
+  _runningAccount(entry) {
+    return this.am.accounts.find(a => a.name === entry.name);
+  }
+
+  _oauthAccounts() {
+    return this.config.accounts.filter(a => a.type === 'oauth');
+  }
+
   // Find an already-configured OAuth account matching a fresh browser-login profile —
-  // by accountUuid (primary), then name===email — the SAME precedence _upsertOAuthAccount
-  // dedupes on, so the login flow can honestly say "re-authenticating" vs "adding new".
+  // the same user in the same organization; else a same-user entry that does not know
+  // its organization (the login then asks); else, for a profile without a uuid,
+  // name===email; else an entry saved before uuids were stored. The SAME precedence
+  // _upsertOAuthAccount dedupes on, so the login flow can honestly say
+  // "re-authenticating" vs "adding new".
   _findExistingOAuthAccount(profile) {
-    const uuid = profile?.accountUuid || null;
+    const accounts = this._oauthAccounts();
     const email = profile?.email || null;
-    let acct = uuid ? this.config.accounts.find(a => a.type === 'oauth' && a.accountUuid === uuid) : null;
-    if (!acct && email) acct = this.config.accounts.find(a => a.type === 'oauth' && a.name === email);
-    return acct || null;
+    if (!profile?.accountUuid) return (email && accounts.find(a => a.name === email)) || null;
+    return accounts.find(a => sameAccountIdentity(a, profile))
+      || organizationUnknownMatch(accounts, profile)
+      || accounts.find(a => !a.accountUuid && a.name === email)
+      || null;
+  }
+
+  // True when the match rests on the user alone: the entry's organization is unknown
+  // while the login names one.
+  _organizationUnknown(existing, profile) {
+    return Boolean(existing?.accountUuid && profile?.organizationUuid && !existing.organizationUuid);
+  }
+
+  // The user decides a same-user login whose organization could not be read: Enter
+  // or r re-authenticates the entry, a adds a second account; anything else asks again.
+  async _confirmReauth(existing) {
+    const choice = await this._askReauthOrAdd(existing.name);
+    if (choice === 'add') return null;
+    if (choice === 'reauth') return existing;
+    return this._confirmReauth(existing);
+  }
+
+  async _askReauthOrAdd(name) {
+    const raw = await this._askLine(`Same Claude user as "${name}", organization unknown. Re-authenticate it (r) or add a second account (a)? [r] `);
+    const answer = String(raw || '').trim().toLowerCase();
+    if (['', 'r', 're-authenticate'].includes(answer)) return 'reauth';
+    return ['a', 'add'].includes(answer) ? 'add' : null;
+  }
+
+  // One line of input from the terminal while the dashboard is stopped.
+  async _askLine(question) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      return await new Promise(resolve => rl.question(question, resolve));
+    } finally {
+      rl.close();
+    }
   }
 
   async _doAddKey(apiKey) {
@@ -1712,7 +1787,7 @@ export class TUI {
   _configAccountIndex(account) {
     if (!account) return -1;
     if (account.accountUuid) {
-      const byUuid = this.config.accounts.findIndex(candidate => candidate.accountUuid === account.accountUuid);
+      const byUuid = this.config.accounts.findIndex(candidate => sameAccountIdentity(candidate, account));
       if (byUuid >= 0) return byUuid;
     }
     return this.config.accounts.findIndex(candidate => candidate.name === account.name);
