@@ -5,6 +5,21 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.33] - 2026-10-27
+
+### Added
+
+- Detect a z.ai key used outside the pool; hold reset cards for it (R7)
+
+### Changed
+
+- Replace a REAL z.ai key literal with a fake (public-repo leak root cause)
+- Fail the suite on any live credential literal in a tracked file
+
+### Fixed
+
+- Red-team hardening — no fail-open, restart persistence, hour-floor labels
+
 ## [1.24.32] - 2026-10-23
 
 ### Fixed
