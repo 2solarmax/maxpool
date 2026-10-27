@@ -80,8 +80,8 @@ test('Esc returns from the type picker to the accounts screen', () => {
 test('a GCP secret NAME is distinguished from a pasted API key', async () => {
   const tui = new TUI({ accountManager: am() });
   // A pasted key comes back unchanged (no GCP round-trip).
-  const pasted = await tui._resolveCredential('cfe7f0a84d9b494195f9785760889a7b.CzXESfxJjBx5N0QV');
-  assert.equal(pasted, 'cfe7f0a84d9b494195f9785760889a7b.CzXESfxJjBx5N0QV',
+  const pasted = await tui._resolveCredential('0123456789abcdef0123456789abcdef.FAKEtestKEY0000x');
+  assert.equal(pasted, '0123456789abcdef0123456789abcdef.FAKEtestKEY0000x',
     'a real key (dots, mixed case) is used verbatim');
   // A GCP-shaped name that does not exist resolves to null, with an actionable log.
   const missing = await tui._resolveCredential('NONEXISTENT_SECRET_XYZ_12345');
