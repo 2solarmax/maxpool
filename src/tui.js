@@ -27,8 +27,8 @@ const vw = s => strip(s).length;
 // ── Accounts-table columns ───────────────────────────────────
 // Fixed column widths shared by the header row (acctHeader) AND every data row, so
 // the header labels stay aligned with the columns they name. The Account/Provider/
-// Status/Quota start offsets (4/25/35/49) are pure functions of these widths + the
-// 4-col row prefix, independent of the quota-bar width.
+// Status/Rst/Quota start offsets (4/25/35/49/56) are pure functions of these widths +
+// the 4-col row prefix, independent of the quota-bar width.
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
@@ -51,8 +51,8 @@ function providerLabel(a) {
 
 /**
  * Aligned column header for the accounts table. Names the three columns that carry
- * NO inline label (Account / Type / Status) plus a group label over the two quota
- * bars (Quota). The per-bar naming (Ses/Wk for OAuth, Tok/Req for API keys) and the
+ * NO inline label (Account / Type / Status) plus a group label over the quota bars
+ * (Quota). The per-bar naming (Ses/Fbl/Wk for OAuth, Tok/Fbl/Req for API keys) and the
  * load fields (Now/15m/1h) stay inline per row — they're row-type-dependent and
  * begin at a variable offset — so the header stops after the Quota group label.
  */
@@ -64,6 +64,35 @@ function acctHeader(W) {
     + 'Status'.padEnd(STATUS_W) + ' '
     + 'Rst'.padEnd(RESETS_W) + ' '
     + quota;
+}
+
+/**
+ * Which quota bars fit a terminal W columns wide, and how wide each bar is. The
+ * space before the first bar comes from the column widths above, never from a
+ * hard-coded number (the old number went stale when the Rst column was added).
+ * Each extra bar costs its label gap ("  Fbl " or "  Wk  ") plus one bar width.
+ * Under 70 columns only the session bar shows, 5 to 20 wide; from 70 the weekly
+ * bar joins it, both 5 to 20 wide. The Fable bar joins only once all three can be
+ * 9 wide (99 columns), the narrowest bar that still shows "100% 2d5h", and three
+ * bars stop growing at 11 wide, so the row never passes column 105 and the tags
+ * after the bars (cap, prefer, staleness) keep the room they have with two bars.
+ * Narrower terminals keep today's two bars plus the "Fable NN%" tag.
+ */
+const BAR_START = ROW_PREFIX.length + NAME_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + RESETS_W + 1 + 'Ses '.length;
+const BAR_GAP = '  Wk  '.length;
+const BAR_MIN_W = 5;
+const BAR_MAX_W = 20;
+const THREE_BAR_MIN_W = 9;
+const THREE_BAR_MAX_W = 11;
+function barLayout(W) {
+  const showBoth = W >= 70;
+  const showFable = W >= BAR_START + 3 * THREE_BAR_MIN_W + 2 * BAR_GAP;
+  const bars = 1 + (showBoth ? 1 : 0) + (showFable ? 1 : 0);
+  const free = W - BAR_START - (bars - 1) * BAR_GAP;
+  const fit = Math.floor(free / bars);
+  const maxW = showFable ? THREE_BAR_MAX_W : BAR_MAX_W;
+  const bw = Math.max(BAR_MIN_W, Math.min(maxW, fit));
+  return { showBoth, showFable, bw };
 }
 
 function rpad(s, w) {
@@ -409,6 +438,20 @@ function emptyBar(label, w = 10) {
   return `${ESC}100m${' '.repeat(lp)}${text}${' '.repeat(rp)}${RESET}`;
 }
 
+/**
+ * The "Fbl" bar: one model family's weekly limit, which Anthropic counts separately
+ * from the account-wide weekly. Drawn with the same bar() as Ses and Wk, so it reads
+ * the same way (used% and time to reset). Shows the empty dash cell when there is
+ * nothing to show: a provider row, no probe result yet, or a limit Anthropic marks
+ * as inactive. Routing
+ * and the "Fable NN%" tag ignore an inactive limit too, so the bar stays quiet as well.
+ */
+function scopedWeeklyBar(quota, family, w) {
+  const e = quota?.scopedWeekly?.[family];
+  if (!e || e.isActive === false || e.utilization == null) return emptyBar('—', w);
+  return bar(e.utilization, w, e.resetAt);
+}
+
 /** Write a provider's enabled flag into the CONFIG entry `loadConfigProviders` reads.
  *
  *  A config-sourced provider is re-created from config on every reload
@@ -430,7 +473,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -1963,18 +2006,13 @@ export class TUI {
     } else {
       lines.push('');
       // Aligned column header (dim + underline so it reads as chrome, not data). It
-      // labels the fixed columns that have no inline label; the Ses/Wk/Tok/Req and
+      // labels the fixed columns that have no inline label; the Ses/Fbl/Wk/Tok/Req and
       // Now/15m/1h labels stay inline per row. It sits DIRECTLY above the rows — the
       // abbreviation glossary is a FOOTER below the rows (a caption), never between
       // the header and the data (a left-aligned sentence there reads as a broken,
       // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
-      const showBoth = W >= 70;
-      // 65/54 = the fixed pre-bar column span (prefix + Account + Provider + Status +
-      // gaps); grew by +4 with the wider 20-col Account column (was 61/50 at NAME_W 16).
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 65) / 2)))
-        : Math.max(5, Math.min(20, W - 54));
+      const { showBoth, showFable, bw } = barLayout(W);
 
       // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
       // display order over the canonical am.accounts array (which stays untouched so
@@ -1983,7 +2021,7 @@ export class TUI {
       let hidden = 0;
       for (const i of this._displayOrder()) {
         if (this.hideDisabled && this.am.accounts[i]?.enabled === false) { hidden++; continue; }
-        lines.push(this._renderAcct(i, bw, showBoth));
+        lines.push(this._renderAcct(i, bw, showBoth, showFable));
       }
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
@@ -2081,7 +2119,7 @@ export class TUI {
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth) {
+  _renderAcct(idx, bw, showBoth, showFable = showBoth) {
     const a = this.am.accounts[idx];
     // Highlight the ACTIVE account(s) — drives BOTH the ► marker and the green
     // "active" status color. In manual mode that's the single pinned account (all
@@ -2242,7 +2280,7 @@ export class TUI {
     }
 
     if (a.type === 'provider') {
-      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth);
+      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth, showFable);
     }
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
@@ -2266,6 +2304,9 @@ export class TUI {
     }
 
     let line = ` ${sel}${cur} ${name} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
+    // The Fable bar goes between the session and weekly bars on every row type, so
+    // the Wk column starts at the same offset on OAuth, API-key and provider rows.
+    if (showFable) line += `  Fbl ${scopedWeeklyBar(q, 'fable', bw)}`;
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
@@ -2330,7 +2371,9 @@ export class TUI {
     // so a BUSY oauth account with a header-fresh reading and no probe-only scoped
     // cap is NOT stale, even if its background probe is 429-throttled. Provider bars
     // and per-model scoped caps ARE probe-only, so for those a stale probe genuinely
-    // means stale data → keep flagging.
+    // means stale data → keep flagging. The Fbl bar shows the Fable reading at any
+    // level, but a stale low reading changes no routing decision, so this flag keeps
+    // the same reserve-floor gate as the tag.
     const q = a.quota || {};
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85; // mirrors _renderAcct's scoped-tag gate
     const hasDisplayedScopedCap = Object.values(q.scopedWeekly || {}).some(
@@ -2371,7 +2414,7 @@ export class TUI {
     return interval > 0 ? `every ${formatAge(interval)}` : 'shortly';
   }
 
-  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true) {
+  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true, showFable = showBoth) {
     const q = a.quota || {};
 
     // Ses/Wk bars in the SAME columns as OAuth rows (right after status) so the
@@ -2424,6 +2467,7 @@ export class TUI {
     for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
     let line = ` ${sel}${cur} ${name} ${type} ${status} Ses ${sesCell}`;
+    if (showFable) line += `  Fbl ${scopedWeeklyBar(q, 'fable', bw)}`;
     if (showBoth) line += `  Wk  ${wkCell}`;
     line += note;
     // Same recent-load columns as OAuth (providers track inFlight + load events),
