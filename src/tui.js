@@ -2388,6 +2388,10 @@ export class TUI {
       wkCell = q.providerWk != null ? bar(q.providerWk, bw, q.providerWkReset)
         : emptyBar(q.weeklyAbsent ? 'none' : '—', bw);
       note = this._probeHealthNote(a);
+      // OUTSIDE-USAGE tag (2026-10-27): someone else is spending this account's quota
+      // with the same key. Red and first, because it explains every other symptom on
+      // the row (wall hit too fast, cards vanishing) and the fix is a key rotation.
+      if (a.outsideUsage?.outside) note += `  ${red(`key used outside pool ×${Math.max(1, Math.round(a.outsideUsage.zaiCalls / Math.max(1, a.outsideUsage.poolCalls)))}`)}`;
       // PEAK row tag (SC9): mirrors the router's own predicates — hard-barred = off,
       // tier 2 = over cap, tier 1 = peak (or "cap n/a" when the weekly is unreadable,
       // so the soft cap is inert). The label can never disagree with routing because

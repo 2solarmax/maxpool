@@ -131,3 +131,27 @@ export async function redeemResetCard(token, recordId, resetType, { grantType, a
     return { ok: false, error: err.message || String(err) };
   }
 }
+
+// z.ai's own hourly per-account model-call counts (zero-spend monitor read). The
+// labels are UTC+8 ("YYYY-MM-DD HH:mm"); outside-usage.js converts. Consumed by
+// the outside-usage detector (2026-10-27) — never by routing.
+const MODEL_USAGE_URL = 'https://api.z.ai/api/monitor/usage/model-usage';
+const zaiStamp = (ms) => new Date(ms + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ');
+
+/** Fetch the last `hours` (default 26) of z.ai hourly model-call counts for a key.
+ *  Returns the raw `data` ({x_time, modelCallCount, ...}) or null on any failure. */
+export async function fetchZaiModelUsage(token, { hours = 26, now = Date.now(), signal, fetchImpl = fetch } = {}) {
+  if (!token) return null;
+  try {
+    const q = new URLSearchParams({ startTime: zaiStamp(now - hours * 3600_000), endTime: zaiStamp(now) });
+    const res = await fetchImpl(`${MODEL_USAGE_URL}?${q}`, {
+      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json', 'Accept-Language': 'en-US' },
+      signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.code === 200 && data?.data ? data.data : null;
+  } catch {
+    return null;
+  }
+}

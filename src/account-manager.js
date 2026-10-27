@@ -1,4 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
 
 // Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
@@ -464,6 +465,7 @@ export class AccountManager {
       else this.scheduler.routingMode = 'sticky';
     }
     this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
+    this.poolUpSince = Date.now();
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -785,6 +787,19 @@ export class AccountManager {
     }));
   }
 
+  /** OUTSIDE-USAGE (2026-10-27): count every request the pool sends on a provider
+   *  account, per UTC hour — the pool half of the outside-usage comparison. The
+   *  map is bounded (last 25 hours) and in-memory only. */
+  notePoolSend(account, at = Date.now()) {
+    if (!account || account.type !== 'provider') return;
+    account.poolHourly ||= new Map();
+    const h = hourFloor(at);
+    account.poolHourly.set(h, (account.poolHourly.get(h) || 0) + 1);
+    if (account.poolHourly.size > 25) {
+      for (const k of [...account.poolHourly.keys()].sort().slice(0, account.poolHourly.size - 25)) account.poolHourly.delete(k);
+    }
+  }
+
   acquireAccount(requestInfo = {}, excludedIndexes = new Set()) {
     this._noteRequestPolicy(requestInfo);
     // Capture the session's prior account BEFORE selection, so the caller can tell
@@ -806,6 +821,7 @@ export class AccountManager {
     account.inFlight++;
     account.activeWeight += weight;
     account.lastUsedAt = Date.now();
+    this.notePoolSend(account);
     // Non-null only when this acquire moved the session off its prior account.
     const migratedFromName = (prevCurrentName && account.name !== prevCurrentName) ? prevCurrentName : null;
     return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName };
@@ -4592,6 +4608,7 @@ export class AccountManager {
           ? new Date(Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)).toISOString()
           : null,
         quota: { ...a.quota },
+        outsideUsage: a.outsideUsage ? { ...a.outsideUsage } : null,
         weekly: {
           state: this._weeklyState(a),
           rawState: this._weeklyRawState(a),

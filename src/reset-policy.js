@@ -58,6 +58,7 @@ function msLeft(t, now) { return t == null ? Infinity : t - now; }
 export function decideZai(account, cards, now = Date.now()) {
   if (account?.enabled === false) return null;               // R0
   if (!cards || cards.error) return null;
+  if (account?.outsideUsage?.outside) return null;          // R7: key used by someone else — a card would feed the leak
   const q = account.quota || {};
   const ses = q.providerSes ?? null;
   const wk = q.weeklyAbsent ? null : (q.providerWk ?? null);
