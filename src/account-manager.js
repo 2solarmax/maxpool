@@ -465,6 +465,9 @@ export class AccountManager {
       else this.scheduler.routingMode = 'sticky';
     }
     this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
+    // Named-caller request attribution (team pools): callerName → requests served.
+    // Server-side (not TUI-side) so headless pools feed the web screen too.
+    this.callerCounts = new Map();
     this.poolUpSince = Date.now();
     this.accounts = accounts.map((acct, index) => ({
       index,
@@ -838,6 +841,13 @@ export class AccountManager {
     if (!binding) return;
     binding.currentName = name;
     this.sessionBindings.set(sessionKey, binding);
+  }
+
+  // Named-caller attribution: one bump per CLIENT request (server calls this
+  // right after auth, so retries/reroutes never double-count).
+  countRequest(callerName) {
+    if (!callerName) return;
+    this.callerCounts.set(callerName, (this.callerCounts.get(callerName) || 0) + 1);
   }
 
   releaseAccount(lease, outcome = {}) {
@@ -4677,6 +4687,7 @@ export class AccountManager {
           ? Math.max(0, now - this.queueState.waiting[0].queuedAt)
           : 0,
       },
+      callers: Object.fromEntries([...this.callerCounts.entries()].map(([n, c]) => [n, { requests: c }])),
       sessions: {
         stickyBindings: this.sessionBindings.size,
         thinkingProtected: [...this.sessionPolicies.values()].filter(p => p.requiresAnthropicThinkingIntegrity).length,

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Maxpool Accounts</title>
+<style>
+:root{
+  --bg:#f7f6f3; --fg:#1b1a17; --muted:#6c665c; --line:#e3ded5; --card:#fff;
+  --ok:#1f7a5c; --warn:#a86500; --bad:#b3261e; --bar:#e9e5dd; --chip:#efece6;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#131210; --fg:#ebe6dc; --muted:#a29a8c; --line:#2b2823; --card:#1b1a16;
+    --ok:#56c3a0; --warn:#e2a650; --bad:#f07b72; --bar:#2a2722; --chip:#24221d; color-scheme:dark; }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.wrap{max-width:980px;margin:0 auto;padding-block:24px 48px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 16px;margin-bottom:16px}
+h1{font-size:22px;margin:0;letter-spacing:-.3px}
+.meta{color:var(--muted);font-size:13px}
+.people{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}
+.chip{background:var(--chip);border:1px solid var(--line);border-radius:999px;padding:3px 11px;font-size:12.5px}
+.grid{display:grid;gap:10px}
+.acct{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:grid;
+  grid-template-columns:minmax(0,1.2fr) minmax(0,2fr) auto;gap:6px 16px;align-items:center}
+@media (max-width:640px){.acct{grid-template-columns:minmax(0,1fr) auto}.bars{grid-column:1/-1}}
+.name{font-weight:600;overflow-wrap:anywhere}
+.sub{color:var(--muted);font-size:12px}
+.bars{display:grid;gap:5px}
+.bar{display:grid;grid-template-columns:28px minmax(0,1fr) 42px;gap:8px;align-items:center;font-size:12px;color:var(--muted)}
+.track{height:8px;background:var(--bar);border-radius:99px;overflow:hidden}
+.fill{height:100%;background:var(--ok);border-radius:99px}
+.fill.warn{background:var(--warn)}.fill.bad{background:var(--bad)}
+.state{font-size:12.5px;font-weight:600;padding:3px 10px;border-radius:999px;white-space:nowrap;background:var(--chip)}
+.state.ok{color:var(--ok)}.state.warn{color:var(--warn)}.state.bad{color:#fff;background:var(--bad)}
+.acct.dead{border-color:var(--bad)}
+.gate{max-width:420px;margin:12vh auto;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px}
+.gate input{width:100%;font:inherit;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);margin:10px 0}
+.gate button,.link{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--chip);color:var(--fg);cursor:pointer}
+.err{color:var(--bad);font-size:13px;min-height:18px}
+.link{padding:3px 9px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<script>
+(function () {
+  var KEY_STORE = 'maxpool.screen.key';
+  var app = document.getElementById('app');
+  function getKey() { try { return localStorage.getItem(KEY_STORE) || ''; } catch (e) { return ''; } }
+  function setKey(k) { try { if (k) localStorage.setItem(KEY_STORE, k); else localStorage.removeItem(KEY_STORE); } catch (e) {} }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+  function pct(v) { if (v == null || !isFinite(v)) return null; return Math.max(0, Math.min(100, v > 1 ? v : v * 100)); }
+
+  function gate(msg) {
+    app.innerHTML = '<div class="gate"><h1>Maxpool accounts</h1>' +
+      '<p class="sub">Enter your personal pool key. It stays in this browser only.</p>' +
+      '<input id="k" type="password" autocomplete="off" placeholder="Pool key">' +
+      '<div class="err">' + esc(msg || '') + '</div><button id="go">Open</button></div>';
+    document.getElementById('go').onclick = function () { setKey(document.getElementById('k').value.trim()); load(); };
+    document.getElementById('k').onkeydown = function (e) { if (e.key === 'Enter') document.getElementById('go').click(); };
+  }
+
+  function bar(label, v) {
+    var p = pct(v);
+    if (p == null) return '';
+    var cls = p >= 90 ? 'bad' : p >= 75 ? 'warn' : '';
+    return '<div class="bar"><span>' + label + '</span><div class="track"><div class="fill ' + cls + '" style="width:' + p.toFixed(0) + '%"></div></div><span>' + p.toFixed(0) + '%</span></div>';
+  }
+
+  // status enum from account-manager: 'active' | 'throttled' | 'error'.
+  function stateOf(a) {
+    var q = a.quota || {};
+    var week = q.unified7d != null ? q.unified7d : q.providerWk;
+    if (a.enabled === false) return ['', 'Off'];
+    if (a.refreshDead) return ['bad', 'Needs login'];
+    if (a.status === 'error') return ['bad', 'Error'];
+    if (week != null && week >= 0.999) return ['warn', 'Used up this week'];
+    if (a.status === 'throttled' || a.rateLimitedUntil) return ['warn', 'Resting'];
+    return ['ok', 'Ready'];
+  }
+
+  function render(s) {
+    // Live needs-login accounts first; switched-off accounts last.
+    function rank(a) { return a.enabled === false ? 2 : (a.refreshDead ? 0 : 1); }
+    var accts = (s.accounts || []).slice().sort(function (x, y) {
+      return rank(x) - rank(y) || String(x.name).localeCompare(String(y.name));
+    });
+    var dead = accts.filter(function (a) { return a.refreshDead && a.enabled !== false; }).length;
+    var callers = s.callers || {};
+    var people = Object.keys(callers).sort().map(function (n) {
+      return '<span class="chip">' + esc(n) + ' · ' + callers[n].requests + ' requests</span>';
+    }).join('');
+    var rows = accts.map(function (a) {
+      var st = stateOf(a), q = a.quota || {};
+      // Field names from getStatus().accounts[].quota: Claude = unified5h/unified7d,
+      // providers (z.ai/kimi) = providerSes/providerWk. All 0..1 fractions.
+      var five = q.unified5h != null ? q.unified5h : q.providerSes;
+      var week = q.unified7d != null ? q.unified7d : q.providerWk;
+      return '<div class="acct' + (a.refreshDead ? ' dead' : '') + '">' +
+        '<div><div class="name">' + esc(a.name) + '</div><div class="sub">' + esc(a.provider || (a.type === 'oauth' ? 'Claude' : a.type)) +
+        (a.inFlight ? ' · ' + a.inFlight + ' running' : '') + '</div></div>' +
+        '<div class="bars">' + bar('5h', five) + bar('7d', week) + '</div>' +
+        '<span class="state ' + st[0] + '">' + st[1] + '</span></div>';
+    }).join('');
+    var ver = (s.runningVersion || (s.version && s.version.current) || '');
+    app.innerHTML = '<header><h1>Maxpool accounts</h1><span class="meta">' + accts.length + ' accounts' +
+      (dead ? ' · <b style="color:var(--bad)">' + dead + ' need login</b>' : '') +
+      (ver ? ' · v' + esc(ver) : '') + ' · updated ' + new Date().toLocaleTimeString() + '</span>' +
+      '<button class="link" id="out">Forget key</button></header>' +
+      (people ? '<div class="people">' + people + '</div>' : '') +
+      '<div class="grid">' + rows + '</div>';
+    document.getElementById('out').onclick = function () { setKey(''); gate(); };
+  }
+
+  var timer = null;
+  function load() {
+    var k = getKey();
+    if (!k) { gate(); return; }
+    fetch('/maxpool/status', { headers: { 'x-api-key': k }, cache: 'no-store' })
+      .then(function (r) {
+        if (r.status === 401) { setKey(''); gate('That key was not accepted.'); throw null; }
+        if (!r.ok) throw new Error('Pool returned ' + r.status);
+        return r.json();
+      })
+      .then(function (s) { render(s); clearTimeout(timer); timer = setTimeout(load, 5000); })
+      .catch(function (e) { if (e) { clearTimeout(timer); timer = setTimeout(load, 5000); } });
+  }
+  load();
+})();
+</script>
+</body>
+</html>

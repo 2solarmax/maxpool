@@ -144,6 +144,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const GATE_PORT = Number(process.env.RC_GATE_PORT || 3457);
 const GATE_HOST = process.env.RC_GATE_HOST || '127.0.0.1';
 const MAXPOOL_PORT = Number(process.env.RC_GATE_MAXPOOL_PORT || 3456);
+// Team-pool leg (2026-10-29): the gate normally lives beside its pool on one machine
+// (host hardcoded 127.0.0.1). With a REMOTE shared pool the gate stays on the laptop
+// (mkcert + HTTPS_PROXY are machine-local) and points at the pool over Tailscale.
+// KEY authenticates the gate's requests to a strict-auth pool (proxy.clients).
+const MAXPOOL_HOST = process.env.RC_GATE_MAXPOOL_HOST || '127.0.0.1';
+const MAXPOOL_KEY = process.env.RC_GATE_MAXPOOL_KEY || '';
 // Max time for an inference request BODY to arrive (see the body-arrival deadline).
 // Message bodies are tens of KB to a few MB; 10 min is far above any real upload.
 const MITM_BODY_DEADLINE_MS = Number(process.env.RC_GATE_MITM_BODY_DEADLINE_MS) || 600_000;
@@ -249,6 +255,7 @@ const mitmServer = http.createServer((creq, cres) => {
   const headers = { ...creq.headers };
   delete headers.authorization;           // pool accounts supply upstream auth
   delete headers['proxy-connection'];
+  if (MAXPOOL_KEY) headers['x-api-key'] = MAXPOOL_KEY;  // per-person pool key (remote pool)
   if (!headers['x-maxpool-profile']) headers['x-maxpool-profile'] = PROFILE;
 
   // `/v1/sessions/<id>` is the v1-COMPAT Remote Control session API (fetch / patch /
@@ -458,10 +465,10 @@ const mitmServer = http.createServer((creq, cres) => {
 
   // Inference paths go to maxpool: pool accounts supply upstream auth.
   const opts = {
-    host: '127.0.0.1', port: MAXPOOL_PORT, method: creq.method,
+    host: MAXPOOL_HOST, port: MAXPOOL_PORT, method: creq.method,
     path: creq.url, headers, agent: poolAgent,
   };
-  console.log(`[mitm] ${creq.method} https://${creq.headers.host}${creq.url}`);
+  console.log(`[mitm] ${creq.method} https://${creq.headers.host}${creq.url} → pool ${MAXPOOL_HOST}:${MAXPOOL_PORT}`);
   // RESPONSE-LEG ACCOUNTING (2026-09-07). maxpool can log a clean 200 while the client
   // still reports "Connection lost mid-response" — the break is then on THIS leg
   // (gate -> CLI) and was previously invisible: the response was piped with no error
@@ -624,7 +631,7 @@ gate.listen(GATE_PORT, GATE_HOST, () => {
   // connect to. Identical output in production, where the requested port is the bound one.
   const boundPort = gate.address()?.port ?? GATE_PORT;
   console.log(`rc-gate listening on ${GATE_HOST}:${boundPort}`);
-  console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool 127.0.0.1:${MAXPOOL_PORT} (profile: ${PROFILE})`);
+  console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool ${MAXPOOL_HOST}:${MAXPOOL_PORT} (profile: ${PROFILE}${MAXPOOL_KEY ? ', key: on' : ''})`);
   console.log(`  everything else: blind tunnel`);
 });
 

@@ -522,7 +522,7 @@ export class TUI {
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
-    this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null });
+    this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null, caller: info.caller || null });
     this.render();
   }
 
@@ -536,6 +536,9 @@ export class TUI {
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
+    // Named-caller attribution (team pools): prefix the log line with the person
+    // whose pool key authenticated the request. Null on legacy/local setups.
+    const who = info.caller || r?.caller ? `${info.caller || r?.caller} · ` : '';
     // Tag PROVIDER-routed requests with the maxpool session id so provider traffic
     // (when-exhausted overflow, or an incompatible-session pin) is traceable back to
     // the session that caused it: grep the event log for `→ glm-fallback … [sess X]`,
@@ -543,7 +546,7 @@ export class TUI {
     // guard — a header-less request has sessionKey '' (server.js headerValue) → no tag.
     const isProvider = this.am.accounts.find(a => a.name === acct)?.type === 'provider';
     const tag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
-    this._addLog(`${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tag}`);
+    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tag}`);
   }
 
   _addLog(msg) {

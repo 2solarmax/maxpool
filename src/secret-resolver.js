@@ -17,7 +17,9 @@ import { join } from 'node:path';
 
 const execFileAsync = promisify(execFile);
 
-const DEFAULT_PROJECT = 'mokka-business-automations';
+// Configurable so public-npm users point at their own GCP project (set
+// MAXPOOL_GCP_PROJECT); our team default stays ours.
+const DEFAULT_PROJECT = process.env.MAXPOOL_GCP_PROJECT || 'mokka-business-automations';
 
 // A single `gcloud secrets versions access` costs ~17-33s on this machine (python
 // interpreter start + an ADC round-trip), and running them CONCURRENTLY makes it

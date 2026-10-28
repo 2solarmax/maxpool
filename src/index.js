@@ -133,6 +133,10 @@ switch (command) {
     await envCommand();
     process.exit(0);
     break;
+  case 'pool':
+    await poolCommand();
+    process.exit(0);
+    break;
   case 'status':
     await statusCommand();
     process.exit(0);
@@ -1695,9 +1699,58 @@ async function loginOAuthCommand() {
 
 async function envCommand() {
   const config = await loadOrCreateConfig();
-  console.log(`export ANTHROPIC_BASE_URL=http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
+  // A `pool shared` switch redirects this machine's client traffic at the team
+  // pool; `env`/`run` must follow it or they'd keep hitting the local pool.
+  const client = config.client?.mode === 'shared' && config.client?.sharedHost
+    ? { host: config.client.sharedHost, key: config.client.sharedKey || '' }
+    : { host: `${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`, key: '' };
+  console.log(`export ANTHROPIC_BASE_URL=http://${client.host}`);
   if (args.includes('--with-key')) {
-    console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
+    console.log(`export ANTHROPIC_API_KEY=${client.key || config.proxy.apiKey}`);
+  }
+}
+
+// ── pool (client-side switch between local and shared pool) ─
+
+async function poolCommand() {
+  const sub = args[1];
+  const config = await loadOrCreateConfig();
+  config.client = config.client || {};
+
+  if (sub === 'shared') {
+    const host = args[2];
+    const key = args[3];
+    if (!host || !key || key.startsWith('-')) {
+      console.error('Usage: maxpool pool shared <host:port> <your-pool-key>');
+      console.error('  e.g. maxpool pool shared maxpool.tail-scale.ts.net:3456 mp-personal-key');
+      process.exit(1);
+    }
+    config.client.mode = 'shared';
+    config.client.sharedHost = host;
+    config.client.sharedKey = key;
+    await saveConfig(config);
+    console.log(`This machine now points at the SHARED pool: http://${host}`);
+    console.log('Apply it in your shells (or restart terminals):');
+    console.log(`  export ANTHROPIC_BASE_URL=http://${host}`);
+    console.log(`  export ANTHROPIC_API_KEY=${key}`);
+    console.log('rc-gate users: also set RC_GATE_MAXPOOL_HOST/PORT/KEY in the LaunchAgent and restart it.');
+  } else if (sub === 'local') {
+    config.client.mode = 'local';
+    delete config.client.sharedHost;
+    delete config.client.sharedKey;
+    await saveConfig(config);
+    console.log(`This machine points at its OWN local pool: http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
+    console.log('Unset ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY (or re-export the local ones) and restart terminals.');
+  } else if (sub === 'status') {
+    const mode = config.client?.mode || 'local';
+    if (mode === 'shared') {
+      console.log(`mode:    shared → http://${config.client.sharedHost}`);
+    } else {
+      console.log(`mode:    local  → http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
+    }
+  } else {
+    console.error('Usage: maxpool pool <shared <host:port> <key> | local | status>');
+    process.exit(1);
   }
 }
 
@@ -1718,7 +1771,11 @@ async function runCommand() {
     stdio: 'inherit',
     env: {
       ...process.env,
-      ANTHROPIC_BASE_URL: `http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`,
+      // Follows the `pool shared` switch like envCommand (client.mode 'shared'
+      // redirects run-subcommand traffic at the team pool).
+      ANTHROPIC_BASE_URL: config.client?.mode === 'shared' && config.client?.sharedHost
+        ? `http://${config.client.sharedHost}`
+        : `http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`,
     },
   });
 
@@ -2021,6 +2078,9 @@ Commands:
   login               OAuth login via browser (adds the account you're signed into at claude.ai)
   login --api         Add an API key account
   env [--with-key]    Print env vars to use with Claude
+  pool shared <host> <key>  Point this machine at a shared team pool
+  pool local          Point this machine back at its own local pool
+  pool status         Show which pool this machine points at
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
   accounts            List configured accounts

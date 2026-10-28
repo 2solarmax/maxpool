@@ -1,6 +1,8 @@
 import http from 'node:http';
+import { appendEventLog } from './event-log.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
 import { writeFile, mkdir } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { modelFamily } from './oauth.js';
 
@@ -39,6 +41,15 @@ const isNetworkCode = c => Boolean(c) && NETWORK_ERROR_CODES.has(c);
 const NETWORK_SOAK_NONSTREAM_MS = Math.max(5_000,
   Number(process.env.MAXPOOL_NETWORK_SOAK_NONSTREAM_MS) || 45_000);
 const QUEUE_KEEPALIVE = 'event: ping\ndata: {}\n\n';
+// Account screen shell (served keyless at /maxpool/screen; the page itself prompts
+// for a pool key and reads the key-gated /maxpool/status). Read once at boot.
+const SCREEN_HTML = (() => {
+  try {
+    return readFileSync(new URL('./screen.html', import.meta.url), 'utf8');
+  } catch {
+    return '<!doctype html><title>Maxpool</title><p>screen.html missing</p>';
+  }
+})();
 // Claude Code's absolute per-stream ceiling (binary-verified 2026-10-07: idle timeout =
 // min(env-or-300s-floor, 1800000)). Nothing resets it; the stream dies at 30 min.
 const CLI_STREAM_CEILING_MS = 25 * 60_000;   // bound network holds strictly below it
@@ -146,6 +157,38 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const logDir = config.logDir || null;
   let requestCounter = 0;
 
+  // ── team clients (per-person keys + caller identity) ──
+  // `clients: [{name, key}]` opts into strict auth: EVERY request (proxy traffic,
+  // /maxpool/status, /maxpool/screen) must carry a listed key, the loopback bypass
+  // is removed, and each request is attributed to the named person in logs/status.
+  // A non-loopback listen host also forces strict even without clients (a shared
+  // pool must never trust by address). Default local config (loopback host, no
+  // clients) keeps today's behavior exactly.
+  const clientList = Array.isArray(config.proxy?.clients)
+    ? config.proxy.clients.filter(c => c && typeof c.key === 'string' && c.key)
+    : [];
+  const clientByKey = new Map(clientList.map(c => [c.key, c.name]));
+  const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '0.0.0.0']);
+  const hostIsLoopback = (config.proxy?.host == null) || LOOPBACK_HOSTS.has(String(config.proxy.host).toLowerCase());
+  const strictClients = clientByKey.size > 0 || !hostIsLoopback;
+  const resolveCaller = (key, isLocal) => {
+    if (key != null && clientByKey.has(key)) return { name: clientByKey.get(key), ok: true };
+    // Legacy single key still works — including strict mode, so a solo user can
+    // point clients at a shared host without defining named clients.
+    if (proxyApiKey && key === proxyApiKey) return { name: null, ok: true };
+    if (!strictClients) {
+      // Legacy trust model: loopback callers are trusted; when NO key is
+      // configured at all the pool is open (today's no-apiKey behavior).
+      if (isLocal || !proxyApiKey) return { name: null, ok: true };
+    }
+    return { name: null, ok: false };
+  };
+  if (strictClients && clientByKey.size > 0) {
+    appendEventLog(`[Maxpool] Strict client auth ON (${clientByKey.size} named client${clientByKey.size > 1 ? 's' : ''}; loopback bypass removed)`);
+  } else if (strictClients) {
+    appendEventLog('[Maxpool] Strict client auth ON (non-loopback listen host; loopback bypass removed)');
+  }
+
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
   }
@@ -181,20 +224,41 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (draining) {
         try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
       }
-      // Auth check — skip for localhost connections
+      // Auth check — per-person clients when configured, legacy single key otherwise.
+      // strictClients (clients list present, or a non-loopback listen host) removes
+      // the loopback bypass entirely: every caller must present a known key.
       const clientKey = req.headers['x-api-key'];
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+      const caller = resolveCaller(clientKey, isLocal);
+
+      const rejectUnauthorized = () => {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error', message: strictClients ? 'Invalid or missing pool key' : 'Invalid proxy API key' },
+        }));
+      };
+
+      // Account screen: a static page with NO data in it — it asks the viewer for
+      // their pool key and reads /maxpool/status with it (which stays key-gated
+      // below), so serving the shell itself keyless leaks nothing.
+      if (req.method === 'GET' && (req.url === '/maxpool/screen' || req.url === '/maxpool/screen/')) {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Frame-Options': 'DENY',
+          'Referrer-Policy': 'no-referrer',
+        });
+        res.end(SCREEN_HTML);
+        return;
+      }
 
       // Status exposes account names and quota state, so require the local
       // proxy key even for loopback callers.
       if (req.method === 'GET' && req.url === '/maxpool/status') {
-        if (proxyApiKey && clientKey !== proxyApiKey) {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-          }));
+        if (strictClients ? !caller.ok : (proxyApiKey && clientKey !== proxyApiKey)) {
+          rejectUnauthorized();
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -202,14 +266,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-        }));
+      if (!caller.ok) {
+        rejectUnauthorized();
         return;
       }
+      req.callerName = caller.name;
+      accountManager.countRequest?.(caller.name);
 
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
@@ -217,7 +279,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
         const reqId = ++requestCounter;
         const ctx = { account: '(oauth relay)', status: null };
-        const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session') });
+        const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session'), caller: req.callerName || null });
         if (accepted === false) {
           res.writeHead(503, {
             'Content-Type': 'application/json',
@@ -253,7 +315,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // sessionKey (from the per-terminal x-maxpool-session header) lets the TUI show
       // how many distinct client sessions the in-flight requests span — so "N in-flight"
       // isn't misread as "N sessions" (subagents of one terminal share one session key).
-      const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session') });
+      const accepted = hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionKey: headerValue(req.headers, 'x-maxpool-session'), caller: req.callerName || null });
       if (accepted === false) {
         res.writeHead(503, {
           'Content-Type': 'application/json',
@@ -338,6 +400,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
           account: ctx.account, status: ctx.status,
+          caller: req.callerName || null,
         });
       }
     } catch (err) {
