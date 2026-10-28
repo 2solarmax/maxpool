@@ -497,7 +497,13 @@ test('B2: steady-state full-request throughput is 100% worker-served (parent nev
   const upstream = await startJsonUpstream();
   const port = await getFreePort();
   const apiKey = 'mp-test-key';
-  const configPath = await writeReloadConfig(port, upstream.port, apiKey);
+  // queue-never-fail (owner 2026-10-28): a burst that overflows capacity now HOLDS
+  // the queue window instead of instant-429ing. This test's 5s client timeout is a
+  // HANG detector (the supervisor-accept-swallow regression), so give the queue a
+  // short window here: held requests then resolve ≤300ms with the retriable 429 —
+  // bounded, observed, never hung. The supervisor invariant is unchanged.
+  const configPath = await writeReloadConfig(port, upstream.port, apiKey,
+    { queue: { nonStreamMaxWaitMs: 300, capacityMaxWaitMs: 300, pollMs: 25 } });
 
   let out = '';
   const child = spawn(process.execPath, [cliPath, 'server'], {
