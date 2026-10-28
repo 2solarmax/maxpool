@@ -35,7 +35,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
 .track{height:8px;background:var(--bar);border-radius:99px;overflow:hidden}
 .fill{height:100%;background:var(--ok);border-radius:99px}
 .fill.warn{background:var(--warn)}.fill.bad{background:var(--bad)}
-.state{font-size:12.5px;font-weight:600;padding:3px 10px;border-radius:999px;white-space:nowrap;background:var(--chip)}
+.state{justify-self:start;font-size:12.5px;font-weight:600;padding:3px 10px;border-radius:999px;white-space:nowrap;background:var(--chip)}
 .state.ok{color:var(--ok)}.state.warn{color:var(--warn)}.state.bad{color:#fff;background:var(--bad)}
 .acct.dead{border-color:var(--bad)}
 .gate{max-width:420px;margin:12vh auto;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px}
@@ -93,7 +93,8 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     var dead = accts.filter(function (a) { return a.refreshDead && a.enabled !== false; }).length;
     var callers = s.callers || {};
     var people = Object.keys(callers).sort().map(function (n) {
-      return '<span class="chip">' + esc(n) + ' · ' + callers[n].requests + ' requests</span>';
+      var c = callers[n].requests;
+      return '<span class="chip">' + esc(n) + ' · ' + c + (c === 1 ? ' request' : ' requests') + '</span>';
     }).join('');
     var rows = accts.map(function (a) {
       var st = stateOf(a), q = a.quota || {};
@@ -109,7 +110,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     }).join('');
     var ver = (s.runningVersion || (s.version && s.version.current) || '');
     app.innerHTML = '<header><h1>Maxpool accounts</h1><span class="meta">' + accts.length + ' accounts' +
-      (dead ? ' · <b style="color:var(--bad)">' + dead + ' need login</b>' : '') +
+      (dead ? ' · <b style="color:var(--bad)">' + dead + (dead === 1 ? ' needs login' : ' need login') + '</b>' : '') +
       (ver ? ' · v' + esc(ver) : '') + ' · updated ' + new Date().toLocaleTimeString() + '</span>' +
       '<button class="link" id="out">Forget key</button></header>' +
       (people ? '<div class="people">' + people + '</div>' : '') +

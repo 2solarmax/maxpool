@@ -15,7 +15,7 @@ import { stat } from 'node:fs/promises';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
-import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed } from './event-log.js';
+import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, appendEventLog } from './event-log.js';
 import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer, REQUEST_IDLE_MAX_MS } from './server.js';
@@ -951,7 +951,14 @@ async function serverWorkerCommand() {
     },
     onRequestEnd: (id, info) => {
       restartController.requestEnded(id);
-      tui?.onRequestEnd(id, info);
+      if (tui) {
+        tui.onRequestEnd(id, info);
+      } else if (info.caller) {
+        // Headless (service / shared VM) pools have no TUI log buffer, so named-caller
+        // attribution would otherwise reach no log at all. Only named callers are
+        // logged here — a solo headless pool stays as quiet as before.
+        appendEventLog(`[Maxpool] ${info.caller} · ${info.method} ${info.path} → ${info.account || '?'} (${info.status})`);
+      }
     },
   };
 
