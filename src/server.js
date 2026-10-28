@@ -183,10 +183,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     }
     return { name: null, ok: false };
   };
-  if (strictClients && clientByKey.size > 0) {
-    appendEventLog(`[Maxpool] Strict client auth ON (${clientByKey.size} named client${clientByKey.size > 1 ? 's' : ''}; loopback bypass removed)`);
-  } else if (strictClients) {
-    appendEventLog('[Maxpool] Strict client auth ON (non-loopback listen host; loopback bypass removed)');
+  if (strictClients) {
+    const who = clientByKey.size > 0 ? `${clientByKey.size} named client${clientByKey.size > 1 ? 's' : ''}` : 'non-loopback listen host';
+    appendEventLog(`[Maxpool] Strict client auth ON (${who}; loopback bypass removed)`);
   }
 
   if (logDir) {
