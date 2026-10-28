@@ -73,10 +73,16 @@ export function zaiHourlyCalls(data) {
  *  [max(poolUpSince ceiled to the next hour, now - window), floor(now)).
  *  Returns {hours, zaiCalls, poolCalls, outside, from, to}; hours=0 when no
  *  complete hour is comparable yet (then outside is always false). */
-export function compareOutsideUsage(zaiHours, poolHours, { now, poolUpSince, factor = OUTSIDE_FACTOR, minCalls = OUTSIDE_MIN_CALLS, windowHours = OUTSIDE_WINDOW_HOURS } = {}) {
+export function compareOutsideUsage(zaiHours, poolHours, { now, poolUpSince, sinceMs = null, factor = OUTSIDE_FACTOR, minCalls = OUTSIDE_MIN_CALLS, windowHours = OUTSIDE_WINDOW_HOURS } = {}) {
   const to = hourFloor(now);
   const upFrom = Math.ceil(poolUpSince / HOUR) * HOUR;   // first hour the pool saw in full
-  const from = Math.max(upFrom, to - windowHours * HOUR);
+  // A JUST-ADDED account (addedAt) may share its key with its previous owner —
+  // hours BEFORE the pool adopted it are that owner's usage, not a leak. Baseline
+  // the comparison at the later of pool-up and account-added (owner-shared keys,
+  // 2026-10-28: 3 accounts added at 10:04Z flagged "outside ×490" off Andrey's own
+  // overnight pool traffic).
+  const sinceFrom = sinceMs != null ? Math.ceil(sinceMs / HOUR) * HOUR : 0;
+  const from = Math.max(upFrom, sinceFrom, to - windowHours * HOUR);
   let zaiCalls = 0, poolCalls = 0, hours = 0;
   for (let h = from; h < to; h += HOUR) {
     hours++;

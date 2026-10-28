@@ -240,7 +240,7 @@ export class Prober {
       }
       account._outsideCheckedAt = now;          // stamp AFTER success (R1.5)
       const zai = zaiHourlyCalls(data);
-      const res = compareOutsideUsage(zai, account.poolHourly, { now, poolUpSince: this.am.poolUpSince });
+      const res = compareOutsideUsage(zai, account.poolHourly, { now, poolUpSince: this.am.poolUpSince, sinceMs: account.addedAt ?? null });
       const prev = account.outsideUsage;
       const wasOutside = Boolean(prev?.outside);
       account.outsideUsage = { ...res, checkedAt: now };

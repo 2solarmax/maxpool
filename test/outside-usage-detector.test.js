@@ -6,7 +6,7 @@ const H = 3600_000;
 const NOW = Date.UTC(2026, 9, 27, 12, 30, 0);          // 12:30Z
 const UP = Date.UTC(2026, 9, 26, 6, 10, 0);            // pool up since 06:10Z yesterday
 const hrs = (obj) => new Map(Object.entries(obj).map(([k, v]) => [Number(k), v]));
-const at = (h) => Date.UTC(2026, 9, 27, h);             // today hour h, UTC
+const at = (h) => h >= 0 ? Date.UTC(2026, 9, 27, h) : Date.UTC(2026, 9, 26, 24 + h); // h<0 → yesterday             // today hour h, UTC
 
 // ── zaiHourlyCalls: z.ai labels are UTC+8 ────────────────────────────────────
 test('z.ai "2026-10-27 12:00" is 04:00Z', () => {
@@ -315,4 +315,26 @@ test('R1.6 a well-formed all-zero reading DOES clear the flag (key rotated, leak
   mode = 'quiet'; t += 25 * H;                 // a full window later, leak gone
   await prober.probeProvider(am.accounts[0]);
   assert.equal(am.accounts[0].outsideUsage.outside, false, 'clears once real data shows it stopped');
+});
+
+// ── shared-key adoption (2026-10-28: 3 teammate accounts flagged ×490 on connect) ──
+test('a just-added shared account does not flag: hours before addedAt are the previous owner\'s', () => {
+  const z = new Map(), p = new Map();
+  for (let i = 0; i < 12; i++) z.set(Date.UTC(2026, 9, 26, 20) + i * H, 60);  // teammate overnight (Oct 26 20:00 → Oct 27 07:00)
+  for (let i = 0; i < 3; i++) p.set(Date.UTC(2026, 9, 27, 9 + i), 30);        // ours since adding
+  const addedAt = Date.UTC(2026, 9, 27, 8, 30);                                 // adopted 08:30
+  const r = compareOutsideUsage(z, p, { now: NOW, poolUpSince: NOW - 48 * H, sinceMs: addedAt });
+  assert.equal(r.zaiCalls, 0, 'pre-adoption teammate hours are excluded from the z.ai tally');
+  assert.equal(r.outside, false, 'nothing post-adoption → no flag');
+  // control: same data, no sinceMs (a pre-existing account) still flags
+  const r2 = compareOutsideUsage(z, p, { now: NOW, poolUpSince: NOW - 48 * H });
+  assert.equal(r2.zaiCalls, 720, 'control sees all 12 teammate hours');
+  assert.equal(r2.outside, true, 'control flags (720 vs 90)');
+});
+
+test('a shared account STILL flags if the OTHER owner outruns us after adoption', () => {
+  const z = new Map(), p = new Map();
+  z.set(at(-2), 400); p.set(at(-2), 10);                 // after adoption: 40x
+  const r = compareOutsideUsage(z, p, { now: NOW, poolUpSince: NOW - 48 * H, sinceMs: at(-3) });
+  assert.equal(r.outside, true, 'real post-adoption divergence still flags');
 });
