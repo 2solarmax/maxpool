@@ -1935,7 +1935,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2715,30 +2715,23 @@ async function queueAndRetry(
   // terminal (disabled / error / auth-dead)". This is what stops an indefinite
   // hold from silently hanging every session when something is actually broken
   // (all accounts logged out, the only healthy account removed, etc.).
-  const retryAfterMs = retryPlan.retryAfterMs;
-  if (!Number.isFinite(retryAfterMs) || retryAfterMs > queueWindowMs) {
-    // FINITE-but-BEYOND-WINDOW (2026-10-12, "they should have just waited"): a
-    // STREAMING request with a known reset 1h out used to instant-429 here for the
-    // whole wait (measured 75 min, 08:13–09:34Z) while sessions burned their CLI
-    // retry budgets and some died entirely. Hold the stream for the window with
-    // the heartbeat keeping the client alive, then end with the retriable error —
-    // the client re-enters and the hold chains window-by-window until the reset
-    // lands. Non-streaming requests keep the fast error (no heartbeat = the hold
-    // would die on the client's idle timeout anyway).
-    // Capacity-class causes (concurrency cap, momentary saturation) are NOT
-    // chained: their "reset" is a re-poll guess, not a scheduled quota reset, and
-    // the capacity window exists precisely to shed that load (the soft-deadlock
-    // guard — pinned at cap forever must 429 within the window, never spin).
-    // Only quota-class resets (a scheduled 5h/weekly rollover) chain.
-    // Keyed on WHAT the reset is (retryPlan.cause), never on the caller's coarse label:
-    // the failover path calls with cause='capacity' even when the plan is a scheduled
-    // quota rollover, which wrongly lost the chain (red-team 2026-10-12, finding 3).
-    if (requestInfo.stream && queueWindowMs > 0 && Number.isFinite(retryAfterMs)
-        && !CAPACITY_CLASS_RETRY_CAUSES.has(retryPlan.cause)) {
-      requestInfo.queueHoldChain = true;
-    } else {
-      return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
-    }
+  const retryAfterMs = retryPlan.retryMs ?? retryPlan.retryAfterMs;
+  // ALWAYS HOLD FIRST (owner 2026-10-28: "zero reason to drop those requests… even
+  // when I'm out of accounts completely, I buy new ones"). The old oracle errored
+  // fast whenever no FINITE scheduled reset existed (no_eligible_route,
+  // weekly_reset_unknown, reset beyond window) — but recovery does not need a
+  // schedule: config auto-sync adopts a newly bought account in ~15s, and a sibling
+  // completing frees a slot in seconds; hasAvailableRoute polls both every tick.
+  // So: hold the FULL window regardless of the plan, and only at expiry end with
+  // the ≤60s-retriable 429 (clientRetryAfterSeconds caps the header), which the
+  // CLI obeys silently — that IS the chaining mechanism, for streams and
+  // non-streams alike. Windows stay hard-capped at the client's own ceilings
+  // (25m stream / 5m non-stream), so nothing can hang past what the client
+  // survives. queueHoldChain is now purely informational in the log line.
+  if (queueWindowMs > 0 && Number.isFinite(retryAfterMs)
+      && retryAfterMs > queueWindowMs
+      && !CAPACITY_CLASS_RETRY_CAUSES.has(retryPlan.cause)) {
+    requestInfo.queueHoldChain = true;
   }
 
   requestInfo.queueStartedAt ||= Date.now();
@@ -2894,8 +2887,12 @@ async function waitForAvailableRoute(req, res, accountManager, requestInfo, queu
       // removed, or the reset is unknown → retryAfterMs Infinity), stop holding
       // and error fast instead of spinning to the 7d ceiling. Hold is valid only
       // while ≥1 eligible route has a finite, known reset.
-      const plan = accountManager.nextRetryForRequest?.(requestInfo, new Set());
-      if (plan && plan.cause !== 'available' && !Number.isFinite(plan.retryAfterMs)) return false;
+      // NOTE (owner 2026-10-28, queue-never-fail): the old non-finite-plan bail is
+      // GONE. hasAvailableRoute above is checked every tick and returns true the
+      // moment a route exists — including one created by config auto-sync adopting
+      // a newly added account, which nextRetryForRequest cannot foresee. The
+      // window (hard-capped at the client ceilings) bounds the poll; expiry hands
+      // back a ≤60s-retriable 429 the client retries silently.
 
       const remaining = maxWaitMs - (Date.now() - startedAt);
       // Jitter the poll so a synchronized weekly-reset event doesn't re-align

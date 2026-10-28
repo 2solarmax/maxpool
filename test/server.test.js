@@ -1104,7 +1104,11 @@ test('large request can queue before upstream send even when it is too large for
   }
 });
 
-test('request does not queue when reset is beyond auto queue window', async () => {
+test('reset beyond the window: request HOLDS the window, then errors retriable (owner 2026-10-28 queue-never-fail)', async () => {
+  // Old policy errored in <500ms when the reset (10 min throttle) exceeded the
+  // window. Owner reversed it: ALWAYS hold the window first (recovery does not
+  // need a schedule — a sibling finishing or a newly adopted account frees a
+  // route), then hand back the ≤60s-retriable 429 the CLI obeys silently.
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
@@ -1118,7 +1122,7 @@ test('request does not queue when reset is beyond auto queue window', async () =
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
-    queue: { enabled: true, maxWaitMs: 60 * 60_000, autoMaxWaitMs: 100, pollMs: 25 },
+    queue: { enabled: true, maxWaitMs: 60 * 60_000, autoMaxWaitMs: 100, nonStreamMaxWaitMs: 200, pollMs: 25 },
   });
   const proxyPort = await listen(proxy);
 
@@ -1128,9 +1132,14 @@ test('request does not queue when reset is beyond auto queue window', async () =
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'test', messages: [] }),
+      signal: AbortSignal.timeout(5000),
     });
+    const body = await res.text();
+    const elapsed = Date.now() - startedAt;
     assert.equal(res.status, 429);
-    assert.ok(Date.now() - startedAt < 500);
+    assert.ok(elapsed >= 150, `held the window first (${elapsed}ms) — no instant drop`);
+    assert.ok(elapsed < 1500, `bounded by the window, no spin (${elapsed}ms)`);
+    assert.match(body, /Retry in|rate_limit/i, 'retriable error at expiry');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1218,7 +1227,7 @@ test('weekly exhaustion with reset FAR beyond the window errors promptly (no poi
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
-    queue: { enabled: true, maxWaitMs: 2000, weeklyMaxWaitMs: 2000, pollMs: 25 },
+    queue: { enabled: true, maxWaitMs: 2000, weeklyMaxWaitMs: 2000, nonStreamMaxWaitMs: 200, pollMs: 25 },
   });
   const proxyPort = await listen(proxy);
 
@@ -1228,9 +1237,13 @@ test('weekly exhaustion with reset FAR beyond the window errors promptly (no poi
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'test', messages: [] }),
+      signal: AbortSignal.timeout(5000),
     });
-    assert.equal(res.status, 429);                 // nothing recovers in the window → honest prompt error
-    assert.ok(Date.now() - startedAt < 800, 'should not spin');
+    const body = await res.text();
+    const elapsed = Date.now() - startedAt;
+    assert.equal(res.status, 429);                 // holds the window, then honest bounded error
+    assert.ok(elapsed >= 150 && elapsed < 1500, `held then errored within the window bound (${elapsed}ms), no spin`);
+    assert.match(body, /Retry in|rate_limit/i, 'retriable error at expiry');
   } finally {
     await close(proxy);
     await close(upstream);
@@ -1906,7 +1919,10 @@ test('major: a concurrency-cap hold is bounded by the capacity window, not the 7
     // The decisive signal: the request RESOLVES bounded (vs hanging until the 7d
     // streamHoldMaxMs deadline, which would trip the 5s client timeout → throw).
     assert.ok(elapsed < 3000, `concurrency-cap hold bounded by the capacity window (${elapsed}ms), not the 7d streaming hold`);
-    assert.equal(res.status, 429, 'shed load with a rate-limit error, not an indefinite hold');
+    // Queue-never-fail (owner 2026-10-28): the hold runs FIRST (heartbeat commits the
+    // stream), so the give-up is an in-stream retriable error — status 200 with an
+    // SSE error event — rather than the old pre-hold 429. Either shape sheds load.
+    assert.ok([200, 429].includes(res.status), `shed load with a rate-limit error, not an indefinite hold (got ${res.status})`);
     assert.match(body, /Retry in|rate_limit|error/i, 'gave up with an error response');
   } finally {
     await close(proxy);
