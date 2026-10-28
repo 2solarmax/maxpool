@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.35] - 2026-10-28
+
+### Fixed
+
+- Baseline at adoption — hours before an account joined the pool are its previous owner's, not a leak
+
 ## [1.24.34] - 2026-10-27
 
 ### Changed
