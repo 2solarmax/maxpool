@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.46] - 2026-10-29
+
+### Changed
+
+- Team pool: sort by Where first (local then cloud, existing order within), h also hides guarded local duplicates
+
 ## [1.24.45] - 2026-10-29
 
 ### Changed
