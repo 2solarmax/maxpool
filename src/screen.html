@@ -127,13 +127,14 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
       var five = q.unified5h != null ? q.unified5h : q.providerSes;
       var week = q.unified7d != null ? q.unified7d : q.providerWk;
       return '<div class="acct' + (a.refreshDead ? ' dead' : '') + '">' +
-        '<div><div class="name">' + esc(a.name) + '</div><div class="sub">' + esc(a.provider || (a.type === 'oauth' ? 'Claude' : a.type)) +
+        '<div><div class="name">' + esc(a.name) + '</div><div class="sub">' + esc(a.type === 'pool' ? 'Team pool' : (a.provider || (a.type === 'oauth' ? 'Claude' : a.type))) +
         (a.inFlight ? ' · ' + a.inFlight + ' running' : '') + '</div></div>' +
         '<div class="bars">' + bar('5h', five) + bar('7d', week) + '</div>' +
         '<span class="state ' + st[0] + '">' + st[1] + '</span></div>';
     }).join('');
     var ver = (s.runningVersion || (s.version && s.version.current) || '');
-    app.innerHTML = '<header><h1>Maxpool accounts</h1><span class="meta">' + accts.length + ' accounts' +
+    var cloud = (s.pools || []).reduce(function (n, p) { return n + (p.accounts || []).length; }, 0);
+    app.innerHTML = '<header><h1>Maxpool accounts</h1><span class="meta">' + accts.length + ' local' + (cloud ? ' · ' + cloud + ' cloud' : '') + ' accounts' +
       (dead ? ' · <b style="color:var(--bad)">' + dead + (dead === 1 ? ' needs login' : ' need login') + '</b>' : '') +
       (ver ? ' · v' + esc(ver) : '') + ' · updated ' + new Date().toLocaleTimeString() + '</span>' +
       '<button class="link" id="out">Forget key</button></header>' +
