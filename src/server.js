@@ -288,7 +288,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // In strict mode the legacy single key is still accepted; label it so its
       // traffic is attributed and logged rather than anonymous.
       req.callerName = caller.name || (strictClients ? 'legacy-key' : null);
+      // SC22: count ONLY when this pool serves the request upstream. A request
+      // later routed to a linked pool is UN-counted at release time (the serving
+      // pool owns it) — see the pool-forward path's countRequest(name,{forwarded:true}).
       accountManager.countRequest?.(req.callerName);
+      req._caller = req.callerName;
 
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
@@ -387,6 +391,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         const pin = headerValue(req.headers, 'x-maxpool-pin-account');
         if (pin && req.callerName && req.callerName !== 'legacy-key') requestInfo.pinAccount = String(pin);
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
+        requestInfo.caller = req._caller || null;
         // The CLIENT tells us how long it will wait — the only source that is actually
         // true. A `cc` session exports CLAUDE_STREAM_IDLE_TIMEOUT_MS=3h and forwards it
         // here; a bare `claude` sends nothing and keeps the conservative 240s default,
@@ -594,8 +599,12 @@ async function forwardRequest(
 
     if (requestInfo.pinAccount != null) {
       ctx.status = 503;
-      ctx.account = `(pinned ${requestInfo.pinAccount} unavailable)`;
-      sendErrorResponse(res, requestInfo, 503, { type: 'error', error: { type: 'pinned_account_unavailable', message: `Account "${requestInfo.pinAccount}" is not available right now` } });
+      const busy = Boolean(requestInfo.pinRefusedBusy);
+      ctx.account = `(pinned ${requestInfo.pinAccount} ${busy ? 'busy' : 'unavailable'})`;
+      try { res.setHeader('retry-after', busy ? '2' : '30'); } catch { /* headers sent */ }
+      sendErrorResponse(res, requestInfo, 503, { type: 'error', error: {
+        type: busy ? 'pinned_account_busy' : 'pinned_account_unavailable',
+        message: `Account "${requestInfo.pinAccount}" is ${busy ? 'busy' : 'not available'} right now` } });
       return;
     }
     ctx.status = 429;
@@ -757,6 +766,7 @@ async function forwardRequest(
       // cloud pool turned them into runtime accounts — a key the owner had disabled
       // locally went live remotely). The remote pool owns its own accounts.
       if (/^x-maxpool-(zai|kimi)-/.test(lk)) continue;
+      if (lk === 'x-maxpool-pin-account') continue;   // M4: only this pool sets a pin
       linkHeaders[k] = v;
     }
     linkHeaders[HOP_HEADER] = String(hop);
@@ -777,14 +787,23 @@ async function forwardRequest(
       accountManager.releaseAccount(lease, outcome);
     };
     try {
-      const upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half' });
+      // P4a: a blackholed link must not hang the request (and hold a lease) for
+      // minutes — bound time-to-headers like the direct path's TTFB guard.
+      const linkCtl = new AbortController();
+      const linkTtfb = setTimeout(() => linkCtl.abort(), 15_000);
+      res.once('close', () => linkCtl.abort());
+      let upRes;
+      try {
+        upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half', signal: linkCtl.signal });
+      } finally { clearTimeout(linkTtfb); }
       ctx.status = upRes.status;
       // Pinned cloud account refused (rate-limited / unavailable) before any byte
       // streamed: cool THIS mirror row and fail over through the normal path to the
       // next-best account, local or cloud — exactly like a local account's 429.
-      if (account.remote && (upRes.status === 429 || upRes.status === 503) && retryCount + 1 < maxAttempts) {
+      if (account.remote && (upRes.status === 429 || upRes.status === 503) && retryCount + 1 < maxAttempts && !res.headersSent) {
         try { await upRes.body?.cancel(); } catch { /* drained */ }
         const ra = Number(upRes.headers.get('retry-after'));
+        // P3: "busy" is a 2s back-off on this row only; "unavailable"/429 cools longer.
         account.cooldownUntil = Date.now() + (Number.isFinite(ra) && ra > 0 ? Math.min(ra, 300) * 1000 : 30_000);
         finishLink({ status: upRes.status, error: 'remote_pinned_unavailable' });
         excludedIndexes.add(account.index);
@@ -808,9 +827,16 @@ async function forwardRequest(
       }
       res.end();
       finishLink({ success: ctx.status < 500, status: ctx.status });
+      // SC22 no-double-count: this request was counted at auth; the serving pool
+      // counted it too. Undo the local one.
+      if (req.callerName && ctx.status < 500) {
+        accountManager.callerCounts?.set(req.callerName, Math.max(0, (accountManager.callerCounts.get(req.callerName) || 1) - 1));
+        accountManager._unbumpCaller?.(req.callerName);
+      }
       hooks.onRequestRouted?.(reqId, { account: account.name });
     } catch (err) {
       finishLink({ status: 502, error: 'pool_link_unreachable' });
+      excludedIndexes.add(account.index);   // P4b: never re-pick a row that just failed
       const retried = retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
         ? await forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes)
         : null;
@@ -3831,9 +3857,11 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
     if (!requestInfo.isCountTokens) {
       if (data.type === 'message_start' && data.message?.usage) {
         accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+        accountManager.countCallerTokens?.(requestInfo.caller, data.message.usage.input_tokens);
         requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, data.message.usage.input_tokens || 0);
       } else if (data.type === 'message_delta' && data.usage) {
         accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+        accountManager.countCallerTokens?.(requestInfo.caller, data.usage.output_tokens);
         requestInfo._capacityOutput = Math.max(requestInfo._capacityOutput || 0, data.usage.output_tokens || 0);
       }
     }
@@ -3887,6 +3915,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo 
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.countCallerTokens?.(requestInfo.caller, (json.usage.input_tokens || 0) + (json.usage.output_tokens || 0));
       // CAPACITY LEDGER — M4: a /count_tokens response is a prompt-size echo with ZERO
       // work delivered. Claude Code calls it constantly; counting it would inflate every
       // cycle by whole prompt sizes.

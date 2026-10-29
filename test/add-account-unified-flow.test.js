@@ -183,7 +183,7 @@ test('MERGE: the providers screen is gone — one place to manage accounts', () 
   // And `p` no longer opens anything.
   tui.mode = 'normal';
   tui._keyNormal('p');
-  assert.equal(tui.mode, 'normal', 'p is a free key again');
+  assert.equal(tui.mode, 'people', 'p now opens the People analytics screen (SC22, 2026-10-29)');
 });
 
 test('MERGE: the GLM/Kimi add prompt does not say "undefined"', () => {

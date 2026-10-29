@@ -470,6 +470,14 @@ export class AccountManager {
     // Named-caller request attribution (team pools): callerName → requests served.
     // Server-side (not TUI-side) so headless pools feed the web screen too.
     this.callerCounts = new Map();
+    // Per-person usage analytics (owner 2026-10-29; red-team verdict: persisted
+    // buckets, requests AND tokens, never the rotating event log). caller -> {
+    //   hours: { 'YYYY-MM-DDTHH' UTC: {req, tok} } (rolling 48)
+    //   days:  { 'YYYY-MM-DD' UTC: {req, tok} }    (rolling 35)
+    //   total: {req, tok}
+    // }. A request ROUTED TO A LINKED POOL is not counted here (SC22: no double
+    // counting — the serving pool owns it), enforced by countRequest's caller.
+    this.callerStats = new Map();
     // Team-pool links (owner D8): remote pools as accounts + duplicate benching.
     this.poolLinks = [];
     this._remoteIdentities = new Map();
@@ -851,9 +859,97 @@ export class AccountManager {
 
   // Named-caller attribution: one bump per CLIENT request (server calls this
   // right after auth, so retries/reroutes never double-count).
-  countRequest(callerName) {
-    if (!callerName) return;
+  countRequest(callerName, { forwarded = false } = {}) {
+    if (!callerName || forwarded) return;
     this.callerCounts.set(callerName, (this.callerCounts.get(callerName) || 0) + 1);
+    this._bumpCaller(callerName, 1, 0);
+  }
+
+  /** Attribute response TOKENS to the caller (SC22: tokens + requests). */
+  countCallerTokens(callerName, tokens) {
+    if (!callerName || !tokens) return;
+    this._bumpCaller(callerName, 0, tokens);
+  }
+
+  _bumpCaller(callerName, req, tok) {
+    const now = new Date();
+    const hourKey = now.toISOString().slice(0, 13);        // 'YYYY-MM-DDTHH' UTC
+    const dayKey = now.toISOString().slice(0, 10);         // 'YYYY-MM-DD' UTC
+    let st = this.callerStats.get(callerName);
+    if (!st) { st = { hours: {}, days: {}, total: { req: 0, tok: 0 } }; this.callerStats.set(callerName, st); }
+    for (const [bucket, key] of [[st.hours, hourKey], [st.days, dayKey]]) {
+      bucket[key] = bucket[key] || { req: 0, tok: 0 };
+      bucket[key].req += req; bucket[key].tok += tok;
+    }
+    st.total.req += req; st.total.tok += tok;
+    this._pruneCallerBuckets(st);
+  }
+
+  /** SC22: reverse one request bucket entry (a forwarded request re-counted at auth). */
+  _unbumpCaller(callerName) {
+    const st = this.callerStats.get(callerName);
+    if (!st) return;
+    const now = new Date();
+    for (const [k, src] of [[now.toISOString().slice(0, 13), st.hours], [now.toISOString().slice(0, 10), st.days]]) {
+      if (src[k]) { src[k].req = Math.max(0, src[k].req - 1); }
+    }
+    st.total.req = Math.max(0, st.total.req - 1);
+  }
+
+  _pruneCallerBuckets(st) {
+    const now = Date.now();
+    for (const k of Object.keys(st.hours)) if (now - Date.parse(k + ':00:00Z') > 48 * 3600_000) delete st.hours[k];
+    for (const k of Object.keys(st.days)) if (now - Date.parse(k + 'T00:00:00Z') > 35 * 24 * 3600_000) delete st.days[k];
+  }
+
+  /** Restore persisted caller stats (restart survival). */
+  restoreCallerStats(saved) {
+    if (!saved || typeof saved !== 'object') return;
+    for (const [name, st] of Object.entries(saved)) {
+      if (st && st.hours && st.days && st.total) {
+        this._pruneCallerBuckets(st);
+        this.callerStats.set(name, st);
+      }
+    }
+  }
+
+  exportCallerStats() {
+    return Object.fromEntries([...this.callerStats.entries()].map(([n, st]) => [n, {
+      hours: st.hours, days: st.days, total: st.total,
+    }]));
+  }
+
+  /** SC22 windows: rolling 24h (from hourly buckets), 7d/30d + prior (daily). */
+  callerWindowStats() {
+    const now = Date.now();
+    const out = new Map();
+    const win = (st, ms, hourly) => {
+      let req = 0, tok = 0;
+      const src = hourly ? st.hours : st.days;
+      for (const [k, v] of Object.entries(src)) {
+        const t = Date.parse(hourly ? k + ':00:00Z' : k + 'T00:00:00Z');
+        if (t <= now && now - t < ms) { req += v.req; tok += v.tok; }
+      }
+      return { req, tok };
+    };
+    const winPrior = (st, fromMs, toMs) => {
+      let req = 0, tok = 0;
+      for (const [k, v] of Object.entries(st.days)) {
+        const t = Date.parse(k + 'T00:00:00Z');
+        const age = now - t;
+        if (t <= now && age >= fromMs && age < toMs) { req += v.req; tok += v.tok; }
+      }
+      return { req, tok };
+    };
+    for (const [name, st] of this.callerStats) {
+      out.set(name, {
+        h24: win(st, 24 * 3600_000, true), h24p: winPrior(st, 24 * 3600_000, 48 * 3600_000),
+        d7: win(st, 7 * 24 * 3600_000, false), d7p: winPrior(st, 7 * 24 * 3600_000, 14 * 24 * 3600_000),
+        d30: win(st, 30 * 24 * 3600_000, false), d30p: winPrior(st, 30 * 24 * 3600_000, 60 * 24 * 3600_000),
+        total: { ...st.total },
+      });
+    }
+    return out;
   }
 
   releaseAccount(lease, outcome = {}) {
@@ -1052,7 +1148,7 @@ export class AccountManager {
   }
 
   getGlobalInFlight() {
-    return this.accounts.reduce((sum, account) => sum + account.inFlight, 0);
+    return this.accounts.filter(a => !a.remote).reduce((sum, account) => sum + account.inFlight, 0);
   }
 
   setAdmissionPaused(paused) {
@@ -2375,6 +2471,18 @@ export class AccountManager {
     // never on a mirror row (no chained forwarding between pools).
     if (requestInfo.pinAccount != null) {
       if (account.remote || account.name !== requestInfo.pinAccount) return false;
+      // P1: the pin bypasses this pool's balancer, so keep its anti-dogpile floor
+      // here — refuse past 2x the soft per-account target; the caller fails over.
+      if ((account.inFlight || 0) >= 2 * this.scheduler.perAccountConcurrencyTarget) {
+        requestInfo.pinRefusedBusy = true;
+        return false;
+      }
+      // P3: a pinned request isn't competing in this pool's queue — it skips the
+      // queue-fairness gate (that alone 503'd every pinned Claude request). The
+      // upstream throttle STAYS: it describes this pool's real egress to Anthropic.
+      if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
+      if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) return false;
+      return true;
     }
     // Duplicate guard: a local account whose identity also lives in a team pool
     // never serves — the cloud copy is the single writer.
@@ -4137,6 +4245,7 @@ export class AccountManager {
       if (
         !account.enabled
         || account.type === 'provider'
+        || account.remote   // H4: cloud rows egress from the cloud, not this machine
         || !this._isRequestCompatible(account, requestInfo.profile || 'claude', requestInfo)
       ) {
         continue;
@@ -4482,7 +4591,7 @@ export class AccountManager {
     // being iterated makes the loop skip the element after each removal — so
     // dropping 2 of 3 config providers left one phantom behind.
     for (const a of [...this.accounts]) {
-      if (a.configSourced && !wantedNames.has(a.name)) {
+      if (a.configSourced && !a.remote && !wantedNames.has(a.name)) {
         const idx = this.accounts.indexOf(a);
         if (idx >= 0 && this.accounts[idx].inFlight === 0) this.removeAccount(idx);
       }
@@ -4733,7 +4842,10 @@ export class AccountManager {
       }
       a.remote = { linkName: link.name, remoteName: ra.name, url: link.url, key: link.key, link };
       a.credential = null; a.refreshToken = null;
-      a.accountUuid = ra.accountUuid || null;
+      // M2: keep the cloud's uuid OFF accountUuid so uuid-first matchers (config
+      // persistence, re-auth, disk sync) can never resolve to a mirror row.
+      a.accountUuid = null;
+      a.remoteUuid = ra.accountUuid || null;
       a.provider = ra.provider || a.provider;
       a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
       a.status = ra.status || 'active';
@@ -4741,6 +4853,10 @@ export class AccountManager {
       a.lastError = ra.lastError || null;
       a.rateLimitedUntil = ra.rateLimitedUntil ? Date.parse(ra.rateLimitedUntil) : null;
       a.capUtilization = ra.capUtilization ?? null;
+      a.capMode = ra.capMode ?? a.capMode;
+      a.capCeiling = ra.capCeiling ?? a.capCeiling;
+      a.capRampStart = ra.capRampStart ?? a.capRampStart;
+      a.addedAt = null;                        // H3: mirrors never count as "warming"
       a.resetCards = ra.resetCards || null;
       a.resetGrants = ra.resetGrants || null;
       // Other teammates' live load on this cloud account (remote inFlight minus our
@@ -4752,12 +4868,12 @@ export class AccountManager {
     }
     // A cloud account that left the cloud (or a down link): drop the mirror so
     // routing never targets it. Rows with in-flight leases drain first.
-    for (const a of [...this.accounts]) {
-      if (a.remote && a.remote.linkName === link.name && !seen.has(a.name)) {
-        if (a.inFlight > 0) { a.enabled = false; continue; }
-        const idx = this.accounts.indexOf(a);
-        if (idx >= 0) this.removeAccount(idx);
-      }
+    // Never REMOVE at runtime (red-team P5): removal reindexes every account while
+    // refreshes/exclusions hold numeric indexes. A gone or unreachable cloud account
+    // is disabled in place (out of routing, hidden from the list) and revived when
+    // it reappears.
+    for (const a of this.accounts) {
+      if (a.remote && a.remote.linkName === link.name && !seen.has(a.name)) a.enabled = false;
     }
   }
 
@@ -4791,6 +4907,7 @@ export class AccountManager {
         provider: a.provider,
         enabled: a.enabled,
         poolBenchedBy: a.poolBenchedBy || null,
+        remote: Boolean(a.remote),
         // Reset cards / grants (display + cross-pool routing preference). Card ids,
         // counts and expiry only — no credentials; the redeem stays with the holder.
         resetCards: a.resetCards ? { fiveHour: a.resetCards.fiveHour, weekly: a.resetCards.weekly, checkedAt: a.resetCards.checkedAt } : null,
@@ -4890,6 +5007,11 @@ export class AccountManager {
           : 0,
       },
       callers: Object.fromEntries([...this.callerCounts.entries()].map(([n, c]) => [n, { requests: c }])),
+      // SC22: per-person analytics for linked pools (day buckets + windows + tokens).
+      callerStats: Object.fromEntries([...this.callerStats.entries()].map(([n, st]) => [n, {
+        days: st.days, total: { ...st.total },
+      }])),
+      callerWindows: Object.fromEntries([...this.callerWindowStats().entries()].map(([n, w]) => [n, w])),
       pools: this.poolLinks.map(l => ({
         name: l.name,
         url: l.url,

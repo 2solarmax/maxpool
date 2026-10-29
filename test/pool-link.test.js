@@ -337,14 +337,16 @@ test('per-account cloud rows: every remote account mirrored individually, no cre
   assert.ok(cloud.every(a => a.credential == null && a.refreshToken == null), 'mirror rows hold no credential');
   assert.equal(cloud.find(a => a.remote.remoteName === 'glm a')._remoteOtherLoad, 2, 'teammates\' live load is visible to the balancer');
   assert.ok(am._matchesRequest(cloud[0], 'all', { path: '/v1/messages' }), 'cloud rows are routable');
-  // Cloud drops an account → its row disappears.
+  // Cloud drops an account → P5: its row is DISABLED in place, never removed.
   link.status.accounts = link.status.accounts.filter(a => a.name !== 'glm a');
   am.applyPoolLinks();
-  assert.equal(am.accounts.filter(a => a.remote).length, 1);
-  // Link down → all cloud rows leave routing (never target a dead link).
+  assert.equal(am.accounts.filter(a => a.remote).length, 2, 'rows stable (no reindex)');
+  assert.equal(am.accounts.find(a => a.remote?.remoteName === 'glm a').enabled, false, 'out of routing');
+  // Link down → same: disabled, not removed.
   link.lastError = 'network error';
   am.applyPoolLinks();
-  assert.equal(am.accounts.filter(a => a.remote).length, 0);
+  assert.equal(am.accounts.filter(a => a.remote).length, 2);
+  assert.equal(am.accounts.filter(a => a.remote && a.enabled).length, 0, 'all out of routing');
   am.setPoolLinks([]);
 });
 
@@ -397,4 +399,44 @@ test('SC20 automatic guard, FINAL shape: duplicate local copy stays LISTED with 
   assert.match(line, /in cloud/, 'status says in cloud');
   assert.match(line, /Local/, 'Where column still says Local — it IS the local copy');
   am.setPoolLinks([]);
+});
+
+test('red-team #3 fixes: mirrors never mirror a mirror, never removed at runtime, out of the local global cap, no uuid aliasing', async () => {
+  const am = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1' }], 0.9, { routingMode: 'balance' });
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.status = { accounts: [
+    { name: 'glm a', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 0, quota: {} },
+    { name: 'reports', type: 'oauth', accountUuid: 'R1', enabled: true, status: 'active', inFlight: 0, quota: {} },
+    { name: 'their mirror ☁', type: 'provider', provider: 'zai', enabled: true, remote: true },   // P2
+  ] };
+  link.identities = remoteIdentities(link.status);
+  am.setPoolLinks([link]);
+  const names = am.accounts.filter(a => a.remote).map(a => a.remote.remoteName).sort();
+  assert.deepEqual(names, ['glm a', 'reports'], 'P2: a remote mirror row is never mirrored again');
+  assert.equal(am.accounts.find(a => a.remote?.remoteName === 'reports').accountUuid, null, 'M2: mirror never carries accountUuid');
+  // P4: mirror leases don't count toward THIS machine's global in-flight cap.
+  const m = am.accounts.find(a => a.remote?.remoteName === 'glm a');
+  m.inFlight = 500; m.activeWeight = 500;
+  assert.equal(am.getGlobalInFlight(), 0, 'cloud rows never exhaust the local cap');
+  m.inFlight = 0; m.activeWeight = 0;
+  // P5: an account leaving the cloud is disabled in place — indexes stay stable.
+  const before = am.accounts.map(a => a.name).join('|');
+  link.status.accounts = link.status.accounts.filter(a => a.name !== 'glm a');
+  am.applyPoolLinks();
+  assert.equal(am.accounts.map(a => a.name).join('|'), before, 'no reindex');
+  assert.equal(am.accounts.find(a => a.remote?.remoteName === 'glm a').enabled, false, 'gone from cloud = out of routing');
+  am.setPoolLinks([]);
+});
+
+test('red-team #3 P1/P3: remote refuses a pin past 2x the soft target as BUSY, and a pin skips the remote queue gate', async () => {
+  const am = new AccountManager([{ name: 'r', type: 'oauth', accountUuid: 'U', accessToken: 'x', refreshToken: 'y' }], 0.9, { routingMode: 'balance' });
+  const a = am.accounts[0];
+  am.queueState.waiting.push({}); // a waiter in the remote's own queue
+  assert.equal(am._matchesRequest(a, 'claude', { pinAccount: 'r' }), true, 'P3: pinned request not blocked by the queue gate');
+  a.inFlight = 2 * am.scheduler.perAccountConcurrencyTarget;
+  const info = { pinAccount: 'r' };
+  assert.equal(am._matchesRequest(a, 'claude', info), false, 'P1: refused at the ceiling');
+  assert.equal(info.pinRefusedBusy, true, 'P1: refusal flagged as busy (distinct error)');
+  am.queueState.waiting.length = 0;
 });

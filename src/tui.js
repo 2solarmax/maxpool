@@ -620,6 +620,7 @@ export class TUI {
       case 'routing': this._keyRouting(k); break;
       case 'updates': this._keyUpdates(k); break;
       case 'capacity': this._keyCapacity(k); break;
+      case 'people': this._keyPeople(k); break;
       case 'addtype': this._keyAddType(k); break;
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
@@ -665,6 +666,8 @@ export class TUI {
       this.mode = 'updates';
     } else if (k === 'y') {
       this.mode = 'capacity';
+    } else if (k === 'p') {
+      this.mode = 'people';
     } else if (k === 'h') {
       this.hideDisabled = !this.hideDisabled;
       this._addLog(this.hideDisabled ? 'Hiding disabled accounts' : 'Showing all accounts');
@@ -1991,6 +1994,14 @@ export class TUI {
       this._writeScreen(lines, W, H);
       return;
     }
+    if (this.mode === 'people') {
+      lines.push(...this._renderPeoplePage(W));
+      while (lines.length < H - 2) lines.push('');
+      lines.push(' ' + dim('─'.repeat(W - 2)));
+      lines.push(this._renderFooter());
+      this._writeScreen(lines, W, H);
+      return;
+    }
 
     // ── Accounts
     if (this.am.accounts.length === 0) {
@@ -2510,9 +2521,72 @@ export class TUI {
     };
   }
 
+  /** PEOPLE page (SC22) — usage by teammate. Rolling windows (24h/7d/30d, priors
+   *  as DELTAS) + cumulative, requests AND tokens; merges this pool's served traffic
+   *  with linked pools' callerWindows — each request counted once, at the pool that
+   *  served it (red-team verdict 2026-10-29: delta = % on base>=50, raw otherwise;
+   *  honesty footer for coverage + link sync; nobody-yet state, not zeros). */
+  _renderPeoplePage(W = 80) {
+    const out = [];
+    out.push('');
+    out.push(` ${bold('Usage by person')}  ${dim('— requests · ~7d = tokens · rolling windows · no double counting')}`);
+    out.push('');
+
+    const merged = new Map();
+    const addWin = (name, w) => {
+      const cur = merged.get(name) || { h24: 0, h24p: 0, d7: 0, d7p: 0, d30: 0, d30p: 0, total: 0, tok7: 0 };
+      for (const k of ['h24', 'h24p', 'd7', 'd7p', 'd30', 'd30p', 'total']) cur[k] += (w[k]?.req ?? 0);
+      cur.tok7 += (w.d7?.tok ?? 0);
+      merged.set(name, cur);
+    };
+    for (const [n, w] of this.am.callerWindowStats?.() || []) addWin(n, w);
+    for (const l of this.am.poolLinks || []) {
+      const cw = l.status?.callerWindows || {};
+      for (const [n, w] of Object.entries(cw)) addWin(n, w);
+    }
+    merged.delete('legacy-key');
+    if (!merged.size) {
+      out.push(dim('  Nobody has made a named request yet. Rows appear once requests'));
+      out.push(dim('  carry personal pool keys.'));
+      return out;
+    }
+
+    const fmt = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
+    const fmtTok = t => t >= 1e6 ? (t / 1e6).toFixed(1) + 'M' : t >= 1000 ? Math.round(t / 1000) + 'k' : String(t);
+    const delta = (cur, prior) => {
+      if (!prior) return dim('--');
+      const d = prior >= 50 ? `${cur > prior ? '+' : ''}${Math.round(((cur - prior) / prior) * 100)}%` : `${cur - prior >= 0 ? '+' : ''}${cur - prior}`;
+      return d.startsWith('+') ? green(d) : d.startsWith('-') ? yellow(d) : dim(d);
+    };
+    const CW = 9;
+    const header = '  ' + 'person'.padEnd(10)
+      + ['24h', 'Δ24h', '7d', 'Δ7d', '30d', 'Δ30d', 'total', '~7d tok'].map(c => c.padStart(CW)).join('');
+    out.push(dimUnderline(fitLine(header, W)));
+
+    const rows = [...merged.entries()].sort((a, b) => b[1].d7 - a[1].d7);
+    const tot = { h24: 0, h24p: 0, d7: 0, d7p: 0, d30: 0, d30p: 0, total: 0, tok7: 0 };
+    for (const [name, w] of rows) {
+      for (const k of Object.keys(tot)) tot[k] += w[k];
+      out.push('  ' + name.slice(0, 10).padEnd(10)
+        + [fmt(w.h24), delta(w.h24, w.h24p), fmt(w.d7), delta(w.d7, w.d7p), fmt(w.d30), delta(w.d30, w.d30p), fmt(w.total), fmtTok(w.tok7)]
+          .map(c => String(c).padStart(CW)).join(''));
+    }
+    out.push(dim('  ' + 'total'.padEnd(10)
+      + [fmt(tot.h24), delta(tot.h24, tot.h24p), fmt(tot.d7), delta(tot.d7, tot.d7p), fmt(tot.d30), delta(tot.d30, tot.d30p), fmt(tot.total), fmtTok(tot.tok7)]
+        .map(c => String(c).padStart(CW)).join('')));
+
+    const link = (this.am.poolLinks || []).find(l => l.lastOkAt);
+    out.push(dim(`  data since boot${link ? ` · team pool synced ${new Date(link.lastOkAt).toLocaleTimeString()}` : ''}`));
+    return out;
+  }
+
   _keyCapacity(k) {
     if (k === 'w') { this.capacityWindow = this.capacityWindow === 'wk' ? 'ses' : 'wk'; }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  _keyPeople(k) {
+    if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
   }
 
   /**
@@ -2646,11 +2720,13 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('p')} People  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
       case 'capacity': {
         const other = this.capacityWindow === 'wk' ? '5h session' : 'weekly (7d)';
         return ` ${bold('w')} Show ${cyan(other)}  ${bold('Esc')} Back`;
       }
+      case 'people':
+        return ` ${bold('Esc')} Back`;
       case 'updates': {
         const state = this._autoUpdateOn() ? green('on') : dim('off');
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;

@@ -647,6 +647,7 @@ async function serverWorkerCommand() {
   // self-healing window as an abrupt SIGKILL. A cold restart reads the clean-shutdown
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
+  if (savedState?.callerStats) accountManager.restoreCallerStats?.(savedState.callerStats);
 
   // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
   // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
@@ -743,6 +744,9 @@ async function serverWorkerCommand() {
         // OPEN cycle must persist or a mid-cycle restart records a near-empty cycle as
         // a real capacity observation and poisons the averages forever (B1).
         capacity: accountManager.capacity?.serialize?.() || null,
+        // SC22 per-person analytics — same generation-guarded payload, survives
+        // restarts and seamless reloads.
+        callerStats: accountManager.exportCallerStats?.() || {},
       },
       { expectedGeneration },
     )
