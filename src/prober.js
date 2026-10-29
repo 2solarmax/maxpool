@@ -202,7 +202,9 @@ export class Prober {
       // OWNER GATE (2026-09-30): disabled accounts are excluded from listing AND
       // redemption entirely — a readable key on a disabled account (someone else
       // uses it) is not authority to act.
-      if (account.enabled !== false && account.credential) {
+      // A duplicate-guard-benched copy never redeems: the team pool owns that key now,
+      // and two pools redeeming one key would burn two cards for one reset.
+      if (account.enabled !== false && account.credential && !account.poolBenchedBy) {
         if (account.provider === 'zai' && this.am.applyResetCards) {
           try {
             const cards = await this._withTimeout(this.cardsFn(account.credential));
@@ -226,7 +228,8 @@ export class Prober {
    *  else legitimately using the key is WHY the account is benched. */
   async _checkOutsideUsage(account, now = this._now()) {
     try {
-      if (account.provider !== 'zai' || !account.credential || account.enabled === false) return;
+      // Benched duplicate: the team pool's traffic on this key is NOT outside usage.
+      if (account.provider !== 'zai' || !account.credential || account.enabled === false || account.poolBenchedBy) return;
       const last = account._outsideCheckedAt || 0;
       if (now - last < OUTSIDE_CHECK_MS) return;
       const data = await this._withTimeout(this.zaiUsageFn(account.credential, { now }));

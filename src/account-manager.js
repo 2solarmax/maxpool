@@ -4656,6 +4656,19 @@ export class AccountManager {
     return a;
   }
 
+  /** The linked pool's LIVE row for a benched local account (by identity), or null.
+   *  The local copy's own quota/counters go stale the moment it's benched — the
+   *  display must read the cloud's numbers (owner 2026-10-29: "I don't know if I can
+   *  trust the session and weekly limits I'm seeing"). */
+  remoteRowFor(account) {
+    if (!account?.poolBenchedBy) return null;
+    for (const l of this.poolLinks) {
+      const row = (l.status?.accounts || []).find(ra => ra.name === account.poolBenchedBy);
+      if (row) return { row, linkOk: l.lastOkAt != null && !l.lastError, linkName: l.name };
+    }
+    return null;
+  }
+
   /** True when account is benched by the duplicate guard. */
   isPoolBenched(account) {
     return Boolean(account && account.poolBenchedBy);
@@ -4795,6 +4808,11 @@ export class AccountManager {
           refreshDead: Boolean(ra.refreshDead),
           quota: ra.quota || null,
           status: ra.status || null,
+          inFlight: ra.inFlight || 0,
+          completedRequests: ra.completedRequests || 0,
+          failedRequests: ra.failedRequests || 0,
+          lastError: ra.lastError || null,
+          load: ra.load || null,
         })),
       })),
       sessions: {

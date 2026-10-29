@@ -45,6 +45,7 @@ const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the 
 const PROVIDER_LABELS = { anthropic: 'Anthropic', zai: 'z.ai', kimi: 'Moonshot', openai: 'OpenAI', codex: 'Codex', grok: 'Grok', xai: 'Grok' };
 function providerLabel(a) {
   if (a.type === 'pool') return 'Team pool';
+  if (a._cloud) return (PROVIDER_LABELS[a.provider] || a.provider || 'Cloud').slice(0, PROVIDER_W - 1) + '☁';
   const key = a.provider || (a.type === 'provider' ? 'provider' : 'anthropic');
   const label = PROVIDER_LABELS[key] || (key.charAt(0).toUpperCase() + key.slice(1));
   return label.slice(0, PROVIDER_W);
@@ -2109,7 +2110,15 @@ export class TUI {
   }
 
   _renderAcct(idx, bw, showBoth) {
-    const a = this.am.accounts[idx];
+    let a = this.am.accounts[idx];
+    // A row benched by the duplicate guard renders the CLOUD's live copy (status,
+    // bars, in-flight, request counts) — never the stale local snapshot. Identity
+    // and name stay local so the row doesn't move.
+    const remote = this.am.remoteRowFor?.(a);
+    if (remote) {
+      a = { ...a, ...remote.row, name: a.name, index: a.index, poolBenchedBy: a.poolBenchedBy,
+        _cloud: true, _cloudOk: remote.linkOk, enabled: true };
+    }
     // Highlight the ACTIVE account(s) — drives BOTH the ► marker and the green
     // "active" status color. In manual mode that's the single pinned account (all
     // traffic goes there). In automatic load-balancing there is no single "current"
@@ -2146,7 +2155,9 @@ export class TUI {
     // the one running the recovery probe as "probing" and the rest "waiting"
     // (the pool-wide throttle banner above conveys the cause).
     const upstreamBlocking = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
-    let effectiveStatus = a.poolBenchedBy ? 'pool-benched' : (a.enabled === false ? 'disabled' : a.status);
+    let effectiveStatus = a._cloud
+      ? (a._cloudOk ? a.status : 'cloud-down')
+      : (a.poolBenchedBy ? 'pool-benched' : (a.enabled === false ? 'disabled' : a.status));
     if (a.enabled !== false && upstreamBlocking && a.status === 'active') {
       effectiveStatus = a.inFlight > 0 ? 'probing' : 'waiting';
     }
@@ -2198,6 +2209,7 @@ export class TUI {
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
       case 'pool-benched': status = gray('⟐ team pool'); break;
+      case 'cloud-down': status = red('⟐ cloud ✕'); break;
       // Disabled AND needs re-login — both facts matter, and DISABLED LEADS.
       // The owner's question that drove this (2026-09-30): "when I disable the account
       // and then the token expires, does it show disabled or reauth? It needs to

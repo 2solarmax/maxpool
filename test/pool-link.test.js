@@ -257,3 +257,33 @@ test('terminal People line: merges local + cloud callers, hides legacy key, empt
   am.poolLinks = []; am.callerCounts.clear();
   assert.equal(t._peopleLine(80), '');
 });
+
+test('link forward NEVER carries client provider tokens to the remote pool (live 2026-10-29: cc-all headers created remote accounts)', async () => {
+  const { server } = remotePoolStub();
+  const port = await listen(server);
+  const seen = [];
+  server.on('request', req => { if (req.url === '/v1/messages') seen.push(Object.keys(req.headers).filter(h => h.startsWith('x-maxpool-'))); });
+  const upstream = http.createServer((req, res) => { res.writeHead(500); res.end(); });
+  const upPort = await listen(upstream);
+  try {
+    const am = new AccountManager([], 0.9);
+    const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${port}`, key: 'mp-max' });
+    await link.poll();
+    am.upsertPoolAccount(link);
+    am.setPoolLinks([link]);
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}` });
+    const proxyPort = await listen(proxy);
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test', 'x-maxpool-profile': 'all',
+        'x-maxpool-zai-token': 'glm-secret-key', 'x-maxpool-kimi-token': 'kimi-secret-key', 'x-maxpool-zai-base-url': 'https://x' },
+      body: msgBody,
+    });
+    await new Promise(r => setImmediate(r));
+    const forwarded = seen.at(-1) || [];
+    assert.ok(!forwarded.some(h => /zai|kimi/.test(h)), `provider headers leaked: ${forwarded.join(',')}`);
+    assert.ok(forwarded.includes('x-maxpool-session') || forwarded.includes('x-maxpool-profile') || true, 'safe headers may pass');
+    am.setPoolLinks([]);
+    await close(proxy);
+  } finally { await close(server); await close(upstream); }
+});

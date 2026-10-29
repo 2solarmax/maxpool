@@ -741,6 +741,11 @@ async function forwardRequest(
     for (const [k, v] of Object.entries(req.headers)) {
       const lk = k.toLowerCase();
       if (HOP_BY_HOP_HEADERS.has(lk) || lk === 'content-length' || lk === 'host' || lk === 'connection') continue;
+      // NEVER forward the client's provider credentials to a linked pool (live finding
+      // 2026-10-29: `cc all` sends x-maxpool-zai-token / x-maxpool-kimi-token and the
+      // cloud pool turned them into runtime accounts — a key the owner had disabled
+      // locally went live remotely). The remote pool owns its own accounts.
+      if (/^x-maxpool-(zai|kimi)-/.test(lk)) continue;
       linkHeaders[k] = v;
     }
     linkHeaders[HOP_HEADER] = String(hop);
