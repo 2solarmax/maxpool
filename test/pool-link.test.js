@@ -115,6 +115,24 @@ test('pool link: routing forwards to the remote pool with key + hop header', asy
     });
     assert.equal(rec.key, 'mp-max', 'person key forwarded');
     assert.equal(rec.hop, '1', 'hop header added');
+    // Lease accounting (live-rehearsal bug 2026-10-29): one successful forward =
+    // inFlight back to 0, one completed, zero failed — never a leaked/doubled lease.
+    // Bounded wait: the client socket must CLOSE first — that is the event whose
+    // listener used to double-release. Then also drain one macrotask so a leaked
+    // close-listener release (which would decrement below/after) is observed.
+    await new Promise(r => {
+      const t = setTimeout(r, 1500);
+      res.body.cancel().catch(() => {}).finally(() => { clearTimeout(t); r(); });
+    });
+    await new Promise(r => setImmediate(r));
+    assert.equal(row.inFlight, 0, 'lease released exactly once');
+    assert.equal(row.completedRequests, 1, 'success counted');
+    assert.equal(row.failedRequests, 0, 'success not counted as failure');
+    // status-only release = failure (verified directly against releaseAccount) —
+    // pin the success-flag shape, not just the counter arithmetic.
+    const l2 = am.acquireAccount({});
+    am.releaseAccount(l2, { status: 200 });
+    assert.equal(row.failedRequests, 1, 'control: status-only release counts failed');
   } finally { am.setPoolLinks([]); if (proxy) await close(proxy); await close(server); await close(upstream); }
 });
 

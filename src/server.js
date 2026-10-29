@@ -748,6 +748,15 @@ async function forwardRequest(
     delete linkHeaders.authorization;
     const linkUrl = `${account.upstream}${req.url}`;
     ctx.account = account.name;
+    // The client-gone listener from the pre-response window would release the
+    // lease a SECOND time when the stream closes normally — remove just the
+    // listener (calling releaseOnClientGone would release the lease itself).
+    res.off('close', onClientClose);
+    let linkDone = false;
+    const finishLink = (outcome) => {
+      if (linkDone) return; linkDone = true;
+      accountManager.releaseAccount(lease, outcome);
+    };
     try {
       const upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half' });
       ctx.status = upRes.status;
@@ -766,10 +775,10 @@ async function forwardRequest(
         } finally { try { await reader.cancel(); } catch { /* already done */ } }
       }
       res.end();
-      accountManager.releaseAccount(lease, { status: ctx.status });
+      finishLink({ success: ctx.status < 500, status: ctx.status });
       hooks.onRequestRouted?.(reqId, { account: account.name });
     } catch (err) {
-      accountManager.releaseAccount(lease, { status: 502, error: 'pool_link_unreachable' });
+      finishLink({ status: 502, error: 'pool_link_unreachable' });
       const retried = retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
         ? await forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes)
         : null;
