@@ -168,6 +168,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     ? config.proxy.clients.filter(c => c && typeof c.key === 'string' && c.key)
     : [];
   const clientByKey = new Map(clientList.map(c => [c.key, c.name]));
+  // '0.0.0.0' stays in the trusted set for backward compatibility (a solo user who
+  // binds every interface keeps keyless local use); it is warned about at startup
+  // because it also exposes the pool to the network. Shared pools set `clients`.
   const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '0.0.0.0']);
   const hostIsLoopback = (config.proxy?.host == null) || LOOPBACK_HOSTS.has(String(config.proxy.host).toLowerCase());
   const strictClients = clientByKey.size > 0 || !hostIsLoopback;
@@ -186,6 +189,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   if (strictClients) {
     const who = clientByKey.size > 0 ? `${clientByKey.size} named client${clientByKey.size > 1 ? 's' : ''}` : 'non-loopback listen host';
     appendEventLog(`[Maxpool] Strict client auth ON (${who}; loopback bypass removed)`);
+  } else if (String(config.proxy?.host) === '0.0.0.0') {
+    appendEventLog('[Maxpool] WARNING: listening on every interface (0.0.0.0) with local callers trusted keyless — set proxy.clients to require a key from everyone');
   }
 
   if (logDir) {
@@ -269,8 +274,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         rejectUnauthorized();
         return;
       }
-      req.callerName = caller.name;
-      accountManager.countRequest?.(caller.name);
+      // In strict mode the legacy single key is still accepted; label it so its
+      // traffic is attributed and logged rather than anonymous.
+      req.callerName = caller.name || (strictClients ? 'legacy-key' : null);
+      accountManager.countRequest?.(req.callerName);
 
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
@@ -304,6 +311,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             path: req.url,
             account: ctx.account,
             status: ctx.status,
+            caller: req.callerName || null,
           });
         }
         return;

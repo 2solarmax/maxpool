@@ -24,3 +24,9 @@ test('rc-gate: forward leg uses MAXPOOL_HOST (no hardcoded 127.0.0.1 remains)', 
 test('rc-gate: authorization strip preserved (pool accounts supply upstream auth)', () => {
   assert.match(src, /delete headers\.authorization/);
 });
+
+test('rc-gate: a pool key (mp-…) is stripped from the DIRECT-to-Anthropic leg (redteam 2026-10-29)', () => {
+  // Static pin, like its neighbours: rc-gate runs as a standalone daemon with no
+  // importable seam for the direct leg.
+  assert.match(src, /if \(String\(dirHeaders\['x-api-key'\] \|\| ''\)\.startsWith\('mp-'\)\) delete dirHeaders\['x-api-key'\];/);
+});

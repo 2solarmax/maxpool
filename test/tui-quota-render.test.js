@@ -662,12 +662,19 @@ test('the ramped cap names WHICH window is governing — 50%>75% means nothing w
   // strictly lower and the label cannot flip.
   a.quota.unified5h = 0.1; a.quota.unified5hReset = t0 + 0.05 * 5 * 3600_000;
   a.quota.unified7d = 0.2; a.quota.unified7dReset = t0 + 0.05 * 7 * DAY;
-  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  // Freeze the clock across render AND oracle: both read Date.now() internally, and
+  // under a loaded full-suite run the two reads drifted far enough to disagree.
+  const realNow = Date.now;
+  Date.now = () => t0;
+  let line, eff;
+  try {
+    line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+    eff = __tuiTest.capEffectivePct(am, a);
+  } finally { Date.now = realNow; }
   const m = /cap 50%>(\d+)% (5h|wk)/.exec(line);
   assert.ok(m, `expected a window-labelled ramped cap, got: ${line}`);
   // The named window must BE the governing (lower) one — assert against the source of
   // truth rather than a hard-coded '5h', which makes the test brittle to clock skew.
-  const eff = __tuiTest.capEffectivePct(am, a);
   assert.equal(m[2], eff.window,
     `the label must name the governing window: tag says ${m[2]}, governing is ${eff.window}`);
 });

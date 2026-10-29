@@ -152,3 +152,24 @@ test('STATUS under strict clients: wrong key AND missing key both 401', async ()
     }
   } finally { await close(proxy); }
 });
+
+test('STRICT: legacy single key is attributed as "legacy-key", never anonymous (redteam 2026-10-29)', async () => {
+  const upstream = okUpstream();
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts(), 0.90);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test', clients: [{ name: 'max', key: 'mp-max' }] },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' }, body: msgBody,
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+    const st = await (await fetch(`http://127.0.0.1:${port}/maxpool/status`, { headers: { 'x-api-key': 'mp-max' } })).json();
+    assert.equal(st.callers['legacy-key']?.requests, 1);
+  } finally { await close(proxy); await close(upstream); }
+});
+

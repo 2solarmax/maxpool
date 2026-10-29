@@ -272,6 +272,9 @@ const mitmServer = http.createServer((creq, cres) => {
     const dirHeaders = { ...creq.headers, host: DIRECT_HOST };
     try { _titleSync?.noteAuthHeaders(creq.url, creq.headers); } catch {}
     for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
+    // A pool key (mp-…) exported as ANTHROPIC_API_KEY for a shared pool must never
+    // travel to Anthropic on the direct leg.
+    if (String(dirHeaders['x-api-key'] || '').startsWith('mp-')) delete dirHeaders['x-api-key'];
     // Session-create responses: force identity encoding so the body is readable end-to-end.
     // The CLI negotiates zstd (server advertises zstd,gzip) and Node cannot decode zstd — a
     // zstd body reached the CLI un-decoded while the create-status tee failed to parse it

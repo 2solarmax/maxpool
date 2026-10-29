@@ -1732,20 +1732,22 @@ async function poolCommand() {
       console.error('  e.g. maxpool pool shared maxpool.tail-scale.ts.net:3456 mp-personal-key');
       process.exit(1);
     }
-    config.client.mode = 'shared';
-    config.client.sharedHost = host;
-    config.client.sharedKey = key;
-    await saveConfig(config);
+    // atomicConfigUpdate, not load→save: a running local pool may rotate an OAuth
+    // token in the same instant, and a whole-file save would undo that refresh.
+    await atomicConfigUpdate(c => {
+      c.client = { ...(c.client || {}), mode: 'shared', sharedHost: host, sharedKey: key };
+    });
     console.log(`This machine now points at the SHARED pool: http://${host}`);
     console.log('Apply it in your shells (or restart terminals):');
     console.log(`  export ANTHROPIC_BASE_URL=http://${host}`);
     console.log(`  export ANTHROPIC_API_KEY=${key}`);
     console.log('rc-gate users: also set RC_GATE_MAXPOOL_HOST/PORT/KEY in the LaunchAgent and restart it.');
   } else if (sub === 'local') {
-    config.client.mode = 'local';
-    delete config.client.sharedHost;
-    delete config.client.sharedKey;
-    await saveConfig(config);
+    await atomicConfigUpdate(c => {
+      c.client = { ...(c.client || {}), mode: 'local' };
+      delete c.client.sharedHost;
+      delete c.client.sharedKey;
+    });
     console.log(`This machine points at its OWN local pool: http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
     console.log('Unset ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY (or re-export the local ones) and restart terminals.');
   } else if (sub === 'status') {
@@ -1774,15 +1776,19 @@ async function runCommand() {
   // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
   // lets Claude Code stay in subscription mode (full model access).
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
+  const shared = config.client?.mode === 'shared' && !!config.client?.sharedHost;
   const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
     env: {
       ...process.env,
       // Follows the `pool shared` switch like envCommand (client.mode 'shared'
       // redirects run-subcommand traffic at the team pool).
-      ANTHROPIC_BASE_URL: config.client?.mode === 'shared' && config.client?.sharedHost
+      ANTHROPIC_BASE_URL: shared
         ? `http://${config.client.sharedHost}`
         : `http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`,
+      // A shared pool trusts no address, so it needs the person's key; the local
+      // pool keeps today's keyless subscription-mode behavior.
+      ...(shared && config.client.sharedKey ? { ANTHROPIC_API_KEY: config.client.sharedKey } : {}),
     },
   });
 
