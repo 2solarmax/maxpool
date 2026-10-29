@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.39] - 2026-10-29
+
+### Changed
+
+- Team pool: cloud pool as one account (D8) — link status poll, duplicate auto-bench, per-account cloud rows, loop guard, 7/7 mutants killed
+- Team pool: link-forward lease accounting — success flag + single release (live-rehearsal bug: failed counter and stuck inFlight on the screen)
+- Team pool: links carry /v1 API traffic only — browser noise (favicon) pinned link leases for the remote hold window (live rehearsal)
+- Team pool: screen shows local/cloud account counts, link row labelled Team pool
+- Team pool: drop unused import caught by release lint
+
 ## [1.24.38] - 2026-10-29
 
 ### Changed
