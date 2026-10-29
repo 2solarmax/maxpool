@@ -5,6 +5,15 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.44] - 2026-10-29
+
+### Changed
+
+- Team pool: every cloud account is its own row (Where: Local/Cloud), balanced by the unchanged routing logic; pinned forwarding with fast failover; reset cards exported for cloud rows
+- Team pool: SC20 test — auto-guarded duplicate stays listed (Where=Local, status 'in cloud'), never routes/refreshes
+- Team pool: red-team #3 P1-P5+H/M fixes (pin ceiling, no mirror-of-mirror, pins skip queue gate, link timeout/exclusion/cap, never-remove mirrors, uuid non-aliasing) + People analytics screen (SC22: persisted buckets, tokens+requests, delta columns, no double counting)
+- Team pool: drop duplicate capUtilization key (release lint)
+
 ## [1.24.43] - 2026-10-29
 
 ### Changed
