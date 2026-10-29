@@ -76,6 +76,12 @@ function acctHeader(W) {
     + quota;
 }
 
+/** padStart by VISIBLE width (ANSI color codes take no columns). */
+function lpadVis(s, w) {
+  const gap = w - vw(s);
+  return gap > 0 ? ' '.repeat(gap) + s : s;
+}
+
 function rpad(s, w) {
   const gap = w - vw(s);
   return gap > 0 ? s + ' '.repeat(gap) : s;
@@ -2569,11 +2575,11 @@ export class TUI {
       for (const k of Object.keys(tot)) tot[k] += w[k];
       out.push('  ' + name.slice(0, 10).padEnd(10)
         + [fmt(w.h24), delta(w.h24, w.h24p), fmt(w.d7), delta(w.d7, w.d7p), fmt(w.d30), delta(w.d30, w.d30p), fmt(w.total), fmtTok(w.tok7)]
-          .map(c => String(c).padStart(CW)).join(''));
+          .map(c => lpadVis(String(c), CW)).join(''));
     }
     out.push(dim('  ' + 'total'.padEnd(10)
       + [fmt(tot.h24), delta(tot.h24, tot.h24p), fmt(tot.d7), delta(tot.d7, tot.d7p), fmt(tot.d30), delta(tot.d30, tot.d30p), fmt(tot.total), fmtTok(tot.tok7)]
-        .map(c => String(c).padStart(CW)).join('')));
+        .map(c => lpadVis(String(c), CW)).join('')));
 
     const link = (this.am.poolLinks || []).find(l => l.lastOkAt);
     out.push(dim(`  data since boot${link ? ` · team pool synced ${new Date(link.lastOkAt).toLocaleTimeString()}` : ''}`));

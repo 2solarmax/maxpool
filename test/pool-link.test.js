@@ -440,3 +440,25 @@ test('red-team #3 P1/P3: remote refuses a pin past 2x the soft target as BUSY, a
   assert.equal(info.pinRefusedBusy, true, 'P1: refusal flagged as busy (distinct error)');
   am.queueState.waiting.length = 0;
 });
+
+test('SC22 People screen: columns align by visible width, merges cloud windows, delta rule, nobody-yet state', async () => {
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const am = new AccountManager([], 0.9);
+  const t = new TUI({ accountManager: am });
+  assert.match(strip(t._renderPeoplePage(100).join('\n')), /Nobody has made a named request yet/);
+  am.poolLinks = [{ lastOkAt: Date.now(), status: { callerWindows: {
+    max: { h24: { req: 120, tok: 0 }, h24p: { req: 100, tok: 0 }, d7: { req: 500, tok: 2e6 }, d7p: { req: 0, tok: 0 }, d30: { req: 500, tok: 0 }, d30p: { req: 0, tok: 0 }, total: { req: 500, tok: 0 } },
+    ahmed: { h24: { req: 10, tok: 0 }, h24p: { req: 4, tok: 0 }, d7: { req: 30, tok: 5000 }, d7p: { req: 0, tok: 0 }, d30: { req: 30, tok: 0 }, d30p: { req: 0, tok: 0 }, total: { req: 30, tok: 0 } },
+  } } }];
+  const lines = t._renderPeoplePage(100).map(strip);
+  const hdr = lines.find(l => l.includes('person'));
+  const maxRow = lines.find(l => l.trim().startsWith('max'));
+  const ahmedRow = lines.find(l => l.trim().startsWith('ahmed'));
+  assert.ok(maxRow && ahmedRow);
+  assert.equal(maxRow.length, ahmedRow.length, 'rows the same visible width (color codes do not shift columns)');
+  assert.match(maxRow, /\+20%/, 'base >= 50 → percent delta');
+  assert.match(ahmedRow, /\+6\b/, 'base < 50 → raw delta');
+  assert.ok(lines.indexOf(maxRow) < lines.indexOf(ahmedRow), 'sorted by 7d descending');
+  assert.ok(hdr.indexOf('7d') > 0);
+});
