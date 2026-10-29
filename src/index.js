@@ -679,6 +679,34 @@ async function serverWorkerCommand() {
     }
   }
 
+  // ── team-pool links (owner D8): each remote pool becomes ONE routable account ──
+  // config.pools: [{ name, url, keySecret? | key? }]. The person's pool key is
+  // resolved from GCP Secret Manager when keySecret is set (never written to disk),
+  // or taken literally from `key`. The link polls the remote status; duplicates of
+  // local accounts are auto-benched (single writer per login/key).
+  if (Array.isArray(config.pools) && config.pools.length > 0) {
+    try {
+      const { PoolLink } = await import('./pool-link.js');
+      const defs = config.pools.filter(p => p && p.name && p.url);
+      const secretNames = defs.map(p => p.keySecret).filter(Boolean);
+      let resolved = {};
+      if (secretNames.length) {
+        const { resolveSecrets } = await import('./secret-resolver.js');
+        resolved = await resolveSecrets(secretNames);
+      }
+      const links = defs.map(p => new PoolLink({
+        ...p,
+        key: p.keySecret ? (resolved[p.keySecret] || null) : (p.key || null),
+      }));
+      for (const l of links) accountManager.upsertPoolAccount(l);
+      accountManager.setPoolLinks(links);
+      const armed = links.filter(l => l.key).length;
+      console.log(`[Maxpool] Team pools: ${armed} linked${links.length - armed ? `, ${links.length - armed} unresolved key` : ''}`);
+    } catch (err) {
+      console.error(`[Maxpool] Team pool link setup failed: ${err.message}`);
+    }
+  }
+
   // Track the state-file generation we last observed so a stale flush is refused.
   let stateGeneration = Number(savedState?._generation) || 0;
 

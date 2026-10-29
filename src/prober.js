@@ -103,7 +103,8 @@ export class Prober {
         // Skip only auth-dead accounts (dead refresh token): probing them just re-POSTs
         // the rejected token every cycle — a 400 storm. They recover only on re-auth.
         const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential && !a.refreshDead);
-        const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);
+        // Pool links are probed by their own PoolLink status poll, not here.
+        const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);  // 'pool' rows are excluded by type
 
         // Providers read DISTINCT hosts (z.ai monitor / Kimi) — no collision — so
         // they run concurrently. Every OAuth account, though, reads the SAME

@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { appendEventLog } from './event-log.js';
+import { HOP_HEADER, nextHopCount } from './pool-link.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
@@ -12,6 +13,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 const MAXPOOL_HEADER_PREFIX = 'x-maxpool-';
+const MAX_HOPS_SRV = 2;
 
 const DEFAULT_RETRY = {
   maxAttemptsPerRequest: 0,
@@ -228,6 +230,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (draining) {
         try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
       }
+      // Loop guard (owner D8): a request forwarded by another pool carries a hop
+      // count. Refuse beyond MAX_HOPS with a clear error instead of cycling pools.
+      const inboundHops = headerValue(req.headers, HOP_HEADER);
+      if (inboundHops != null && Number.parseInt(inboundHops, 10) >= MAX_HOPS_SRV) {
+        res.writeHead(508, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'request_loop', message: 'Maxpool hop limit reached — two pools are forwarding to each other. Check each pool\'s `pools` config.' } }));
+        return;
+      }
+
       // Auth check — per-person clients when configured, legacy single key otherwise.
       // strictClients (clients list present, or a non-loopback listen host) removes
       // the loopback bypass entirely: every caller must present a known key.
@@ -712,6 +723,61 @@ async function forwardRequest(
   } else if (account.authHeader === 'x-api-key' || !isOAuth) {
     headers['x-api-key'] = account.credential;
     delete headers['authorization'];
+  }
+
+  // POOL LINK (owner D8): this "account" is another maxpool. Forward the raw
+  // request to it with the person's key, a stepped hop header, and the client's
+  // session header preserved — the remote pool does its own account selection,
+  // so no body rewriting, no credential substitution.
+  if (account.type === 'pool') {
+    const hop = nextHopCount(headerValue(req.headers, HOP_HEADER));
+    if (hop == null) {
+      accountManager.releaseAccount(lease, { neutral: true });
+      ctx.status = 508;
+      sendErrorResponse(res, requestInfo, 508, { type: 'error', error: { type: 'request_loop', message: 'Maxpool hop limit reached — pools are forwarding in a circle.' } });
+      return;
+    }
+    const linkHeaders = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      const lk = k.toLowerCase();
+      if (HOP_BY_HOP_HEADERS.has(lk) || lk === 'content-length' || lk === 'host' || lk === 'connection') continue;
+      linkHeaders[k] = v;
+    }
+    linkHeaders[HOP_HEADER] = String(hop);
+    linkHeaders['x-api-key'] = account.credential;   // person's pool key
+    delete linkHeaders.authorization;
+    const linkUrl = `${account.upstream}${req.url}`;
+    ctx.account = account.name;
+    try {
+      const upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half' });
+      ctx.status = upRes.status;
+      const outHeaders = {};
+      upRes.headers.forEach((v, k) => { if (!HOP_BY_HOP_HEADERS.has(k) && k !== 'content-length' && k !== 'transfer-encoding') outHeaders[k] = v; });
+      res.writeHead(upRes.status, outHeaders);
+      if (upRes.body) {
+        const reader = upRes.body.getReader();
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (res.destroyed) { try { await reader.cancel(); } catch { } break; }
+            res.write(Buffer.from(value));
+          }
+        } finally { try { await reader.cancel(); } catch { /* already done */ } }
+      }
+      res.end();
+      accountManager.releaseAccount(lease, { status: ctx.status });
+      hooks.onRequestRouted?.(reqId, { account: account.name });
+    } catch (err) {
+      accountManager.releaseAccount(lease, { status: 502, error: 'pool_link_unreachable' });
+      const retried = retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
+        ? await forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes)
+        : null;
+      if (retried) return;
+      ctx.status = 502;
+      sendErrorResponse(res, requestInfo, 502, { type: 'error', error: { type: 'api_error', message: `Team pool "${account.name}" unreachable: ${err?.message || err}` } });
+    }
+    return;
   }
 
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;

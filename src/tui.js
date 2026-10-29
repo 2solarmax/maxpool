@@ -44,6 +44,7 @@ const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the 
 // the column width so a long name can never misalign the row.
 const PROVIDER_LABELS = { anthropic: 'Anthropic', zai: 'z.ai', kimi: 'Moonshot', openai: 'OpenAI', codex: 'Codex', grok: 'Grok', xai: 'Grok' };
 function providerLabel(a) {
+  if (a.type === 'pool') return 'Team pool';
   const key = a.provider || (a.type === 'provider' ? 'provider' : 'anthropic');
   const label = PROVIDER_LABELS[key] || (key.charAt(0).toUpperCase() + key.slice(1));
   return label.slice(0, PROVIDER_W);
@@ -2122,7 +2123,7 @@ export class TUI {
     // the one running the recovery probe as "probing" and the rest "waiting"
     // (the pool-wide throttle banner above conveys the cause).
     const upstreamBlocking = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
-    let effectiveStatus = a.enabled === false ? 'disabled' : a.status;
+    let effectiveStatus = a.poolBenchedBy ? 'pool-benched' : (a.enabled === false ? 'disabled' : a.status);
     if (a.enabled !== false && upstreamBlocking && a.status === 'active') {
       effectiveStatus = a.inFlight > 0 ? 'probing' : 'waiting';
     }
@@ -2173,6 +2174,7 @@ export class TUI {
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
+      case 'pool-benched': status = gray('⟐ team pool'); break;
       // Disabled AND needs re-login — both facts matter, and DISABLED LEADS.
       // The owner's question that drove this (2026-09-30): "when I disable the account
       // and then the token expires, does it show disabled or reauth? It needs to

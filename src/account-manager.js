@@ -1,4 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { accountIdentity, computeDuplicates, credentialFp } from './pool-link.js';
+import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
 
@@ -468,17 +470,21 @@ export class AccountManager {
     // Named-caller request attribution (team pools): callerName → requests served.
     // Server-side (not TUI-side) so headless pools feed the web screen too.
     this.callerCounts = new Map();
+    // Team-pool links (owner D8): remote pools as accounts + duplicate benching.
+    this.poolLinks = [];
+    this._remoteIdentities = new Map();
+    this._benchedByPool = [];
     this.poolUpSince = Date.now();
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
       type: acct.type,
-      provider: acct.provider || (acct.type === 'provider' ? 'provider' : 'anthropic'),
+      provider: acct.provider || (acct.type === 'provider' ? 'provider' : acct.type === 'pool' ? 'pool' : 'anthropic'),
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.authToken || acct.apiKey,
       upstream: acct.upstream || null,
       authHeader: acct.authHeader || null,
-      profiles: acct.profiles || (acct.type === 'provider' ? ['all'] : ['claude', 'all']),
+      profiles: acct.profiles || (acct.type === 'provider' || acct.type === 'pool' ? ['all'] : ['claude', 'all']),
       priority: Number.isFinite(acct.priority) ? acct.priority : 0,
       // USAGE CAP (owner-directed 2026-08-26): reserve capacity on this account —
       // the proxy benches it at capUtilization of BOTH the 5h and 7d windows, keeping
@@ -966,6 +972,14 @@ export class AccountManager {
     // Subscription latched gone (org-disabled 403): benched until re-subscribed. The
     // clear path is a successful re-auth (updateAccountTokens) after re-purchasing.
     if (account.subscriptionGone) return false;
+    // Pool link: available only while its last poll succeeded AND the remote has a
+    // usable account — a down/empty team pool must not swallow requests that local
+    // accounts could serve.
+    if (account.type === 'pool') {
+      const link = account._link;
+      if (!link || link.lastError || link.lastOkAt == null) return false;
+      if (!link.summary || link.summary.usable < 1) return false;
+    }
     const now = options.now ?? Date.now();
 
     // Check rate limit expiry
@@ -1176,7 +1190,7 @@ export class AccountManager {
   _hasAvailableProvider(requestInfo = {}, excludedIndexes = new Set()) {
     const profile = requestInfo.profile || 'claude';
     return this.accounts.some(account => {
-      if (account.type !== 'provider' || excludedIndexes.has(account.index)) return false;
+      if ((account.type !== 'provider' && account.type !== 'pool') || excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
       return this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true });
     });
@@ -2349,14 +2363,18 @@ export class AccountManager {
 
   _matchesRequest(account, profile, requestInfo = {}) {
     if (this.admissionPaused) return false;
+    // Duplicate guard: a local account whose identity also lives in a team pool
+    // never serves — the cloud copy is the single writer.
+    if (account.poolBenchedBy) return false;
     if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
+    const providerLike = account.type === 'provider' || account.type === 'pool';
     if (
-      account.type !== 'provider'
+      !providerLike
       && this.queueState.waiting.length
       && !requestInfo.queueTicket
       && !requestInfo.queueAdmitted
     ) return false;
-    if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) return false;
+    if (!providerLike && this._isUpstreamThrottleBlocking()) return false;
     return true;
   }
 
@@ -2391,7 +2409,7 @@ export class AccountManager {
     const incompatible = this._effectiveIncompatible(requestInfo).incompatible;
     // An incompatible session is pinned to its provider family — no mode overrides that.
     if (incompatible) {
-      const isHome = account.type === 'provider'
+      const isHome = (account.type === 'provider' || account.type === 'pool')
         && (mode === 'prefer-zai' ? account.provider === 'zai'
           : mode === 'prefer-kimi' ? account.provider === 'kimi' : true);
       return isHome ? 0 : base;
@@ -2638,7 +2656,7 @@ export class AccountManager {
       // providerCrossFallback is explicitly off; by default GLM↔Kimi crossing stays
       // allowed even under 'never' (that reliable direction is governed separately
       // from the Claude→provider policy).
-      if (account.type !== 'provider') return false;
+      if (account.type !== 'provider' && account.type !== 'pool') return false;
       if (policy === 'never' && homeProvider && account.provider !== homeProvider
         && this.scheduler.providerCrossFallback === false) return false;
       return true;
@@ -4130,6 +4148,10 @@ export class AccountManager {
     // read-only probing, and re-enabling refreshes on the next real request.
     // `force` still wins: an explicit re-auth/enable path may need the rotation.
     if (!force && account.enabled === false) return true;
+    // Duplicate guard: a benched local copy must NEVER spend its single-use
+    // refresh token — the cloud pool owns rotation now; a local rotation would
+    // invalidate the cloud's token (invalid_grant → bricked account).
+    if (account.poolBenchedBy) return true;
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return true;
 
@@ -4576,6 +4598,64 @@ export class AccountManager {
   /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
+  /** Register pool links (from config.pools). Each link polls its remote pool's
+   *  status; duplicate benching is re-computed on every poll tick. */
+  setPoolLinks(links, onPoll) {
+    for (const l of this.poolLinks) l.stop?.();
+    this.poolLinks = Array.isArray(links) ? links : [];
+    this._remoteIdentities = new Map();
+    const recompute = () => this.applyPoolLinks();
+    for (const l of this.poolLinks) l.start(() => { recompute(); onPoll?.(l); });
+    this.applyPoolLinks();
+  }
+
+  /** Apply duplicate benching + link health from the links' last polls. Idempotent. */
+  applyPoolLinks() {
+    const ids = new Map();
+    for (const l of this.poolLinks) {
+      if (l.identities) for (const [k, v] of l.identities) ids.set(k, v);
+    }
+    const dups = computeDuplicates(this.accounts, ids);
+    const benchedIdx = new Set(dups.map(d => d.index));
+    for (const a of this.accounts) {
+      const wasBenched = Boolean(a.poolBenchedBy);
+      const d = dups.find(x => x.index === a.index);
+      a.poolBenchedBy = d ? (d.remoteName || 'team pool') : null;
+      if (d && !wasBenched) {
+        console.log(`[Maxpool] Duplicate guard: local account "${a.name}" also lives in team pool (${a.poolBenchedBy}) — benched locally, no routing, no token refresh`);
+        appendEventLog(`[Maxpool] Duplicate guard benched "${a.name}" (also in team pool as ${a.poolBenchedBy})`);
+      } else if (!d && wasBenched) {
+        console.log(`[Maxpool] Duplicate guard released "${a.name}" (no longer in team pool)`);
+        appendEventLog(`[Maxpool] Duplicate guard released "${a.name}"`);
+      }
+    }
+    this._benchedByPool = [...benchedIdx];
+    this._remoteIdentities = ids;
+  }
+
+  /** Add (or update) the routable account row for a pool link. */
+  upsertPoolAccount(link) {
+    let a = this.accounts.find(x => x.type === 'pool' && x.name === link.name);
+    if (!a) {
+      this.upsertRuntimeAccount({
+        name: link.name, type: 'pool', provider: 'pool',
+        authToken: link.key, upstream: String(link.url).replace(/\/+$/, ''),
+        profiles: ['claude', 'all'], priority: 0, configSourced: true,
+      });
+      a = this.accounts.find(x => x.type === 'pool' && x.name === link.name);
+    }
+    a.credential = link.key;
+    a.upstream = String(link.url).replace(/\/+$/, '');
+    a._link = link;
+    a.configSourced = true;
+    return a;
+  }
+
+  /** True when account is benched by the duplicate guard. */
+  isPoolBenched(account) {
+    return Boolean(account && account.poolBenchedBy);
+  }
+
   getStatus() {
     const now = Date.now();
     return {
@@ -4600,6 +4680,8 @@ export class AccountManager {
         type: a.type,
         provider: a.provider,
         enabled: a.enabled,
+        poolBenchedBy: a.poolBenchedBy || null,
+        keyFingerprint: (a.type === 'provider' && a.credential) ? credentialFp(a.credential) : null,
         upstream: a.upstream,
         profiles: a.profiles,
         priority: a.priority,
@@ -4688,6 +4770,23 @@ export class AccountManager {
           : 0,
       },
       callers: Object.fromEntries([...this.callerCounts.entries()].map(([n, c]) => [n, { requests: c }])),
+      pools: this.poolLinks.map(l => ({
+        name: l.name,
+        url: l.url,
+        ok: l.lastOkAt != null && !l.lastError,
+        lastError: l.lastError,
+        lastOkAt: l.lastOkAt ? new Date(l.lastOkAt).toISOString() : null,
+        summary: l.summary,
+        accounts: (l.status?.accounts || []).map(ra => ({
+          name: ra.name,
+          type: ra.type,
+          provider: ra.provider,
+          enabled: ra.enabled,
+          refreshDead: Boolean(ra.refreshDead),
+          quota: ra.quota || null,
+          status: ra.status || null,
+        })),
+      })),
       sessions: {
         stickyBindings: this.sessionBindings.size,
         thinkingProtected: [...this.sessionPolicies.values()].filter(p => p.requiresAnthropicThinkingIntegrity).length,

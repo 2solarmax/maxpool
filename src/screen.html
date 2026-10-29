@@ -84,6 +84,29 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     return ['ok', 'Ready'];
   }
 
+  // Team-pool rows (owner D8/D11): each remote pool's accounts shown individually,
+  // tagged with the pool name so cloud vs local is visible at a glance.
+  function poolRows(s) {
+    var pools = s.pools || [];
+    var out = '';
+    for (var i = 0; i < pools.length; i++) {
+      var pl = pools[i];
+      var tag = '<span class="chip" style="background:var(--chip)">' + esc(pl.name) + (pl.ok ? '' : ' · unreachable') + '</span>';
+      var accts = (pl.accounts || []).map(function (ra) {
+        var q = ra.quota || {};
+        var five = q.unified5h != null ? q.unified5h : q.providerSes;
+        var week = q.unified7d != null ? q.unified7d : q.providerWk;
+        var st = ra.refreshDead ? ['bad', 'Needs login'] : ra.status === 'error' ? ['bad', 'Error'] : (week != null && week >= 0.999) ? ['warn', 'Used up this week'] : ra.status === 'throttled' ? ['warn', 'Resting'] : ['ok', 'Ready'];
+        return '<div class="acct">' +
+          '<div><div class="name">' + esc(ra.name) + '</div><div class="sub">' + esc(ra.provider || (ra.type === 'oauth' ? 'Claude' : ra.type)) + ' · cloud</div></div>' +
+          '<div class="bars">' + bar('5h', five) + bar('7d', week) + '</div>' +
+          '<span class="state ' + st[0] + '">' + st[1] + '</span></div>';
+      }).join('');
+      out += '<div style="margin:14px 0 4px" class="sub">' + tag + '</div><div class="grid">' + accts + '</div>';
+    }
+    return out;
+  }
+
   function render(s) {
     // Live needs-login accounts first; switched-off accounts last.
     function rank(a) { return a.enabled === false ? 2 : (a.refreshDead ? 0 : 1); }
@@ -98,6 +121,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     }).join('');
     var rows = accts.map(function (a) {
       var st = stateOf(a), q = a.quota || {};
+      if (a.poolBenchedBy) st = ['', 'In team pool'];
       // Field names from getStatus().accounts[].quota: Claude = unified5h/unified7d,
       // providers (z.ai/kimi) = providerSes/providerWk. All 0..1 fractions.
       var five = q.unified5h != null ? q.unified5h : q.providerSes;
@@ -114,7 +138,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
       (ver ? ' · v' + esc(ver) : '') + ' · updated ' + new Date().toLocaleTimeString() + '</span>' +
       '<button class="link" id="out">Forget key</button></header>' +
       (people ? '<div class="people">' + people + '</div>' : '') +
-      '<div class="grid">' + rows + '</div>';
+      '<div class="grid">' + rows + '</div>' + poolRows(s);
     document.getElementById('out').onclick = function () { setKey(''); gate(); };
   }
 
