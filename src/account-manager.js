@@ -4686,6 +4686,11 @@ export class AccountManager {
         provider: a.provider,
         enabled: a.enabled,
         poolBenchedBy: a.poolBenchedBy || null,
+        // Identity for duplicate matching by linked pools (D12). The Claude account
+        // UUID is an identifier, not a credential; provider keys export only a
+        // fingerprint. Without these a linked pool can't see a duplicate Claude login
+        // (live-rehearsal 2026-10-29: status omitted accountUuid → no bench).
+        accountUuid: a.type === 'oauth' ? (a.accountUuid || null) : null,
         keyFingerprint: (a.type === 'provider' && a.credential) ? credentialFp(a.credential) : null,
         upstream: a.upstream,
         profiles: a.profiles,

@@ -225,3 +225,22 @@ test('duplicate guard: a benched local Claude copy NEVER spends its refresh toke
   am.setPoolLinks([]);
 });
 
+test('duplicate guard end-to-end: the REMOTE status (real getStatus shape) carries the Claude identity', async () => {
+  // The remote side is a REAL AccountManager — not a hand-built stub — so the test
+  // fails if getStatus ever stops exporting the identity a link matches on.
+  const remoteAm = new AccountManager([
+    { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U-REAL', accessToken: 'x', refreshToken: 'r' },
+  ], 0.9);
+  remoteAm.loadConfigProviders([{ name: 'glm shared', provider: 'zai', token: 'glm-key-real' }]);
+  const status = JSON.parse(JSON.stringify(remoteAm.getStatus())); // wire round-trip
+  const fakeLink = { identities: remoteIdentities(status), start() {}, stop() {} };
+  const am = new AccountManager([
+    { name: 'reports-local', type: 'oauth', accountUuid: 'U-REAL', accessToken: 'x', refreshToken: 'r2' },
+  ], 0.9);
+  am.loadConfigProviders([{ name: 'glm local', provider: 'zai', token: 'glm-key-real' }]);
+  am.setPoolLinks([fakeLink]);
+  assert.equal(am.accounts.find(a => a.name === 'reports-local').poolBenchedBy, 'reports@gomokka.com', 'Claude duplicate benched via real status');
+  assert.equal(am.accounts.find(a => a.name === 'glm local').poolBenchedBy, 'glm shared', 'GLM duplicate benched via real status');
+  am.setPoolLinks([]);
+});
+
