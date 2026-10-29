@@ -287,3 +287,27 @@ test('link forward NEVER carries client provider tokens to the remote pool (live
     await close(proxy);
   } finally { await close(server); await close(upstream); }
 });
+
+test('link scoring: a loaded/exhausted cloud scores WORSE than a fresh one (routing respects remote capacity)', async () => {
+  const am = new AccountManager([], 0.9);
+  const fresh = { name: 't1', type: 'apikey', apiKey: 'k1' };
+  am.upsertRuntimeAccount(fresh);
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.summary = { total: 9, usable: 9, needsLogin: 0 };
+  link.status = { scheduler: { globalInFlight: 0 }, accounts: [] };
+  am.upsertPoolAccount(link);
+  am.setPoolLinks([link]);
+  const row = am.accounts.find(a => a.type === 'pool');
+  const s1 = am._scoreAccount(row, {});
+  link.status.scheduler.globalInFlight = 12; // cloud busy
+  link.summary = { total: 9, usable: 2, needsLogin: 1 }; // and nearly exhausted
+  const s2 = am._scoreAccount(row, {});
+  assert.ok(s2 > s1, `loaded cloud must score worse: ${s2} > ${s1}`);
+  // And a healthy link must still beat a locally-throttled account (routable, not benched).
+  const local = am.accounts.find(a => a.name === 't1');
+  local.status = 'throttled'; local.rateLimitedUntil = Date.now() + 60000;
+  const localScore = am._scoreAccount(local, {});
+  assert.ok(s1 < localScore, `fresh link should outrank a throttled local: ${s1} < ${localScore}`);
+  am.setPoolLinks([]);
+});

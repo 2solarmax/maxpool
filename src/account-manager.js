@@ -2861,8 +2861,27 @@ export class AccountManager {
   _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
     const now = ctx?.now ?? Date.now();
     const reqWeight = Math.max(1, requestInfo.weight || 1);
+    // POOL LINK scores as the cloud's WORST-case load (owner 2026-10-29: "the team
+    // pool will respect the accounts within it... included in the balancing act").
+    // The link row's inFlight is mirrored from the remote status poll, so the
+    // concurrency term already treats one link request as N remote requests.
     const inflight = account.activeWeight + reqWeight;
     const refillMult = this._fastRefillMultiplier(account);
+    if (account.type === 'pool' && account._link) {
+      // Utilization = the cloud's own reported fraction of usable accounts spent
+      // (weekly windows), so a near-exhausted cloud pool de-preferences like a
+      // near-exhausted local account rather than pretending to be empty-fresh.
+      const link = account._link;
+      const remoteUtil = link.summary && link.summary.total
+        ? (link.summary.total - link.summary.usable) / link.summary.total : 0;
+      // Same shape as a provider's weekly utilization cost, keyed to remote load.
+      const remoteLoad = Math.max(account.activeWeight, link.status?.scheduler?.globalInFlight || 0);
+      return (
+        remoteLoad * this.scheduler.concurrencyWeight
+        + Math.max(0, remoteLoad - this.scheduler.perAccountConcurrencyTarget) * this.scheduler.capPenaltyWeight
+        + remoteUtil * this.scheduler.capPenaltyWeight
+      );
+    }
 
     // DOMINANT term: in-flight concurrency. Short-term throttling is driven by
     // how many requests pile on one account, so least-loaded-first spread is
