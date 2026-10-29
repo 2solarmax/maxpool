@@ -4912,7 +4912,6 @@ export class AccountManager {
         // counts and expiry only — no credentials; the redeem stays with the holder.
         resetCards: a.resetCards ? { fiveHour: a.resetCards.fiveHour, weekly: a.resetCards.weekly, checkedAt: a.resetCards.checkedAt } : null,
         resetGrants: a.resetGrants ? { grants: a.resetGrants.grants, cooldownUntil: a.resetGrants.cooldownUntil, checkedAt: a.resetGrants.checkedAt } : null,
-        capUtilization: a.capUtilization ?? null,
         // Identity for duplicate matching by linked pools (D12). The Claude account
         // UUID is an identifier, not a credential; provider keys export only a
         // fingerprint. Without these a linked pool can't see a duplicate Claude login
