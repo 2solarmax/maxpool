@@ -244,3 +244,16 @@ test('duplicate guard end-to-end: the REMOTE status (real getStatus shape) carri
   am.setPoolLinks([]);
 });
 
+
+test('terminal People line: merges local + cloud callers, hides legacy key, empty when nobody named', async () => {
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const am = new AccountManager([], 0.9);
+  am.callerCounts.set('max', 12);
+  am.callerCounts.set('legacy-key', 3);
+  am.poolLinks = [{ status: { callers: { ahmed: { requests: 40 }, max: { requests: 30 } } } }];
+  const t = new TUI({ accountManager: am });
+  assert.equal(strip(t._peopleLine(80)), ' People   ahmed 40 · max 30');
+  am.poolLinks = []; am.callerCounts.clear();
+  assert.equal(t._peopleLine(80), '');
+});

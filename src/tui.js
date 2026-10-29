@@ -751,6 +751,25 @@ export class TUI {
     return parts.join('  ');
   }
 
+  /** ` People  max 120 · ahmed 40 · andrey 7` — requests per person since start.
+   *  Merges this pool's named callers with every linked team pool's callers (the
+   *  cloud's view of who used it). '' when nobody named has used the pool. */
+  _peopleLine(W = 80) {
+    const totals = new Map();
+    for (const [n, c] of this.am.callerCounts || []) totals.set(n, (totals.get(n) || 0) + c);
+    for (const l of this.am.poolLinks || []) {
+      for (const [n, v] of Object.entries(l.status?.callers || {})) {
+        totals.set(n, Math.max(totals.get(n) || 0, v?.requests || 0));
+      }
+    }
+    totals.delete('legacy-key');
+    if (!totals.size) return '';
+    const parts = [...totals.entries()].sort((x, y) => y[1] - x[1])
+      .map(([n, c]) => `${n} ${cyan(String(c))}`);
+    const line = ` People   ${parts.join(dim(' · '))}`;
+    return vw(line) > W ? line.slice(0, W) : line;
+  }
+
   _routingLine(routing, xpText) {
     return ` Routing  ${cyan(routing)}${xpText}`;
   }
@@ -1848,6 +1867,10 @@ export class TUI {
     const right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
+    // Usage by person (owner 2026-10-29: "the only thing missing is usage by person").
+    // Local named callers + each linked team pool's callers, one compact line.
+    const people = this._peopleLine(W);
+    if (people) lines.push(people);
     // Restart/reload in progress: admission is paused while active requests drain, then
     // the process swaps. Without live feedback the screen looks FROZEN (identical
     // dashboard, nothing moving) from R→Yes until the swap — the reported bug. Show an
