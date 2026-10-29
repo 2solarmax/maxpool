@@ -30,6 +30,7 @@ const vw = s => strip(s).length;
 // Status/Quota start offsets (4/25/35/49) are pure functions of these widths + the
 // 4-col row prefix, independent of the quota-bar width.
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
+const WHERE_W = 5;         // 'Local' / 'Cloud' — where the account is provisioned
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
 const RESETS_W = 6;        // 'Rst' column — FIXED width (fits '2~21d'); a variable
@@ -43,8 +44,14 @@ const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the 
 // Titlecase default so a future provider (Codex/Grok) renders sanely; truncated to
 // the column width so a long name can never misalign the row.
 const PROVIDER_LABELS = { anthropic: 'Anthropic', zai: 'z.ai', kimi: 'Moonshot', openai: 'OpenAI', codex: 'Codex', grok: 'Grok', xai: 'Grok' };
+/** 'Cloud' for an account mirrored from a linked team pool, 'Local' otherwise. */
+function whereCell(a) {
+  return a?.remote ? cyan('Cloud'.padEnd(WHERE_W)) : dim('Local'.padEnd(WHERE_W));
+}
+
 function providerLabel(a) {
   if (a.type === 'pool') return 'Team pool';
+
   if (a._cloud) return (PROVIDER_LABELS[a.provider] || a.provider || 'Cloud').slice(0, PROVIDER_W - 1) + '☁';
   const key = a.provider || (a.type === 'provider' ? 'provider' : 'anthropic');
   const label = PROVIDER_LABELS[key] || (key.charAt(0).toUpperCase() + key.slice(1));
@@ -62,6 +69,7 @@ function acctHeader(W) {
   const quota = W >= 88 ? 'Quota (used% · resets-in)' : 'Quota';
   return ROW_PREFIX
     + 'Account'.padEnd(NAME_W) + ' '
+    + 'Where'.padEnd(WHERE_W) + ' '
     + 'Provider'.padEnd(PROVIDER_W) + ' '
     + 'Status'.padEnd(STATUS_W) + ' '
     + 'Rst'.padEnd(RESETS_W) + ' '
@@ -2011,6 +2019,8 @@ export class TUI {
       let hidden = 0;
       for (const i of this._displayOrder()) {
         if (this.hideDisabled && this.am.accounts[i]?.enabled === false) { hidden++; continue; }
+        // The legacy single team-pool row is superseded by per-account cloud rows.
+        if (this.am.accounts[i]?.type === 'pool') continue;
         lines.push(this._renderAcct(i, bw, showBoth));
       }
       if (hidden > 0) {
@@ -2114,11 +2124,7 @@ export class TUI {
     // A row benched by the duplicate guard renders the CLOUD's live copy (status,
     // bars, in-flight, request counts) — never the stale local snapshot. Identity
     // and name stay local so the row doesn't move.
-    const remote = this.am.remoteRowFor?.(a);
-    if (remote) {
-      a = { ...a, ...remote.row, name: a.name, index: a.index, poolBenchedBy: a.poolBenchedBy,
-        _cloud: true, _cloudOk: remote.linkOk, enabled: true };
-    }
+
     // Highlight the ACTIVE account(s) — drives BOTH the ► marker and the green
     // "active" status color. In manual mode that's the single pinned account (all
     // traffic goes there). In automatic load-balancing there is no single "current"
@@ -2136,7 +2142,9 @@ export class TUI {
     const cur = isCur ? green('►') : ' ';
 
     // Name (bold if selected)
-    const rawName = a.name.slice(0, NAME_W).padEnd(NAME_W);
+    // A cloud row is named exactly like the account (the Where column says Cloud);
+    // its internal name carries a suffix only to stay unique next to a local copy.
+    const rawName = (a.remote ? a.remote.remoteName : a.name).slice(0, NAME_W).padEnd(NAME_W);
     // A disabled account reads as "off" — dim the whole name. Applied as a SINGLE SGR
     // (never dim(bold(...)) — bold()'s trailing RESET would cancel the dim mid-string),
     // so a disabled row is never also bold-selected.
@@ -2208,7 +2216,7 @@ export class TUI {
       case 'waiting':   status = yellow('waiting'); break;
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
-      case 'pool-benched': status = gray('⟐ team pool'); break;
+      case 'pool-benched': status = gray('in cloud'); break;
       case 'cloud-down': status = red('⟐ cloud ✕'); break;
       // Disabled AND needs re-login — both facts matter, and DISABLED LEADS.
       // The owner's question that drove this (2026-09-30): "when I disable the account
@@ -2305,7 +2313,7 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
@@ -2463,7 +2471,7 @@ export class TUI {
     // setting whenever the probe is quiet is how a shipped feature reads as absent.
     for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} Ses ${sesCell}`;
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} Ses ${sesCell}`;
     if (showBoth) line += `  Wk  ${wkCell}`;
     line += note;
     // Same recent-load columns as OAuth (providers track inFlight + load events),

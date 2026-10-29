@@ -821,7 +821,7 @@ export class AccountManager {
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
-    const upstreamThrottleProbe = account.type !== 'provider' && this._claimUpstreamThrottleProbe();
+    const upstreamThrottleProbe = account.type !== 'provider' && !account.remote && this._claimUpstreamThrottleProbe();
     if (requestInfo.sessionKey) {
       // Same clock the selection above used, so the peak-failover guard can never
       // disagree with the peak tier that caused the move (defaults to real time).
@@ -972,6 +972,14 @@ export class AccountManager {
     // Subscription latched gone (org-disabled 403): benched until re-subscribed. The
     // clear path is a successful re-auth (updateAccountTokens) after re-purchasing.
     if (account.subscriptionGone) return false;
+    // Remote mirror: available while its link is live and the cloud row itself is
+    // usable (not needs-login, not error). Quota benches are handled by scoring /
+    // the caller's weekly gates, mirroring local accounts.
+    if (account.remote) {
+      const l = account.remote.link;
+      if (!l || l.lastError || l.lastOkAt == null) return false;
+      if (account.refreshDead || account.status === 'error') return false;
+    }
     // Pool link: available only while its last poll succeeded AND the remote has a
     // usable account — a down/empty team pool must not swallow requests that local
     // accounts could serve.
@@ -2363,11 +2371,18 @@ export class AccountManager {
 
   _matchesRequest(account, profile, requestInfo = {}) {
     if (this.admissionPaused) return false;
+    // A pinned request (from a linked pool) may ONLY run on the named account, and
+    // never on a mirror row (no chained forwarding between pools).
+    if (requestInfo.pinAccount != null) {
+      if (account.remote || account.name !== requestInfo.pinAccount) return false;
+    }
     // Duplicate guard: a local account whose identity also lives in a team pool
     // never serves — the cloud copy is the single writer.
     if (account.poolBenchedBy) return false;
     if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
-    const providerLike = account.type === 'provider' || account.type === 'pool';
+    // Cloud mirrors egress from the cloud's own IP — this machine's upstream throttle
+    // and local queue fairness don't describe them.
+    const providerLike = account.type === 'provider' || account.type === 'pool' || Boolean(account.remote);
     if (
       !providerLike
       && this.queueState.waiting.length
@@ -2865,7 +2880,10 @@ export class AccountManager {
     // pool will respect the accounts within it... included in the balancing act").
     // The link row's inFlight is mirrored from the remote status poll, so the
     // concurrency term already treats one link request as N remote requests.
-    const inflight = account.activeWeight + reqWeight;
+    // A cloud mirror's depth includes OTHER teammates' live load on that same cloud
+    // account (mirrored from the link poll), so every routing term below — the
+    // unchanged balancing logic — sees it as busy as it really is.
+    const inflight = account.activeWeight + reqWeight + (account._remoteOtherLoad || 0);
     const refillMult = this._fastRefillMultiplier(account);
     if (account.type === 'pool' && account._link) {
       // Utilization = the cloud's own reported fraction of usable accounts spent
@@ -4568,7 +4586,7 @@ export class AccountManager {
    * by account identity so it can be matched back after a restart.
    */
   exportQuotaState() {
-    return this.accounts.map(a => {
+    return this.accounts.filter(a => !a.remote).map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
       const out = { accountUuid: a.accountUuid, name: a.name, quota };
@@ -4639,7 +4657,8 @@ export class AccountManager {
     for (const l of this.poolLinks) {
       if (l.identities) for (const [k, v] of l.identities) ids.set(k, v);
     }
-    const dups = computeDuplicates(this.accounts, ids);
+    for (const l of this.poolLinks) this.syncRemoteMirrors(l);
+    const dups = computeDuplicates(this.accounts.filter(a => !a.remote), ids);
     const benchedIdx = new Set(dups.map(d => d.index));
     for (const a of this.accounts) {
       const wasBenched = Boolean(a.poolBenchedBy);
@@ -4688,6 +4707,60 @@ export class AccountManager {
     return null;
   }
 
+  /** MIRROR the linked pool's accounts as individual routable rows (owner
+   *  2026-10-29: "every cloud account listed the same way the local ones are ...
+   *  pulled together without any aggregation"). Each mirror row carries the remote's
+   *  live quota/status and NO credential — prober, token refresh, card redemption and
+   *  persistence all skip credential-less rows by construction. A request routed to a
+   *  mirror row is forwarded to its pool PINNED to that remote account. */
+  syncRemoteMirrors(link) {
+    if (!link) return;
+    const rows = link.lastError || link.lastOkAt == null ? [] : (link.status?.accounts || []);
+    const seen = new Set();
+    for (const ra of rows) {
+      if (ra.remote) continue;                 // never mirror a mirror (no chained hops)
+      if (ra.enabled === false) continue;      // benched on the cloud = not offered
+      const name = `${ra.name} ☁`;
+      seen.add(name);
+      let a = this.accounts.find(x => x.remote && x.name === name);
+      if (!a) {
+        this.addAccount({
+          name, type: ra.type === 'oauth' ? 'oauth' : (ra.type === 'provider' ? 'provider' : ra.type),
+          provider: ra.provider, profiles: ra.type === 'provider' ? ['all'] : ['claude', 'all'],
+          configSourced: true, runtime: false,
+        });
+        a = this.accounts[this.accounts.length - 1];
+      }
+      a.remote = { linkName: link.name, remoteName: ra.name, url: link.url, key: link.key, link };
+      a.credential = null; a.refreshToken = null;
+      a.accountUuid = ra.accountUuid || null;
+      a.provider = ra.provider || a.provider;
+      a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
+      a.status = ra.status || 'active';
+      a.refreshDead = Boolean(ra.refreshDead);
+      a.lastError = ra.lastError || null;
+      a.rateLimitedUntil = ra.rateLimitedUntil ? Date.parse(ra.rateLimitedUntil) : null;
+      a.capUtilization = ra.capUtilization ?? null;
+      a.resetCards = ra.resetCards || null;
+      a.resetGrants = ra.resetGrants || null;
+      // Other teammates' live load on this cloud account (remote inFlight minus our
+      // own leases) — so the balancer sees the account as busy as it really is.
+      a._remoteOtherLoad = Math.max(0, (ra.inFlight || 0) - (a.inFlight || 0));
+      a._remoteLoad = ra.load || null;
+      a.probing = false;
+      a.enabled = true;
+    }
+    // A cloud account that left the cloud (or a down link): drop the mirror so
+    // routing never targets it. Rows with in-flight leases drain first.
+    for (const a of [...this.accounts]) {
+      if (a.remote && a.remote.linkName === link.name && !seen.has(a.name)) {
+        if (a.inFlight > 0) { a.enabled = false; continue; }
+        const idx = this.accounts.indexOf(a);
+        if (idx >= 0) this.removeAccount(idx);
+      }
+    }
+  }
+
   /** True when account is benched by the duplicate guard. */
   isPoolBenched(account) {
     return Boolean(account && account.poolBenchedBy);
@@ -4718,6 +4791,11 @@ export class AccountManager {
         provider: a.provider,
         enabled: a.enabled,
         poolBenchedBy: a.poolBenchedBy || null,
+        // Reset cards / grants (display + cross-pool routing preference). Card ids,
+        // counts and expiry only — no credentials; the redeem stays with the holder.
+        resetCards: a.resetCards ? { fiveHour: a.resetCards.fiveHour, weekly: a.resetCards.weekly, checkedAt: a.resetCards.checkedAt } : null,
+        resetGrants: a.resetGrants ? { grants: a.resetGrants.grants, cooldownUntil: a.resetGrants.cooldownUntil, checkedAt: a.resetGrants.checkedAt } : null,
+        capUtilization: a.capUtilization ?? null,
         // Identity for duplicate matching by linked pools (D12). The Claude account
         // UUID is an identifier, not a credential; provider keys export only a
         // fingerprint. Without these a linked pool can't see a duplicate Claude login

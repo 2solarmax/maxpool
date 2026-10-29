@@ -445,8 +445,10 @@ test('the column header sits exactly over the Account/Provider/Status/Quota colu
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
   assert.equal(hdr.indexOf('Account'), 4, 'Account over the name column');
-  assert.equal(hdr.indexOf('Provider'), 25, 'Provider over the provider column (shifted by the 20-wide Account col)');
-  assert.equal(hdr.indexOf('Status'), 35, 'Status over the status column');
+  assert.equal(hdr.indexOf('Where'), 25, 'Where (Local/Cloud) right after the 20-wide Account col');
+  assert.equal(hdr.indexOf('Where'), row.indexOf('Local'), 'Where header over the Local/Cloud cell');
+  assert.equal(hdr.indexOf('Provider'), 31, 'Provider over the provider column (after Where)');
+  assert.equal(hdr.indexOf('Status'), 41, 'Status over the status column');
   // the Quota group label lands exactly on the inline Ses/Tok quota label
   assert.equal(hdr.indexOf('Quota'), row.indexOf('Ses '), 'Quota over the quota bars');
 });
@@ -468,11 +470,11 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   const wide = strip(__tuiTest.acctHeader(100));
   const narrow = strip(__tuiTest.acctHeader(72));
   assert.equal(narrow.indexOf('Account'), 4);
-  assert.equal(narrow.indexOf('Status'), 35);
+  assert.equal(narrow.indexOf('Status'), 41);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
   // +7 for the fixed-width Rst column (Status 13 + 'Rst' 6 + space) before Quota —
   // width 6 fits '2~21d' so a suffixed row never pushes its quota bars right.
-  assert.equal(narrow.indexOf('Quota'), 56);
+  assert.equal(narrow.indexOf('Quota'), 62);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 

@@ -698,7 +698,9 @@ async function serverWorkerCommand() {
         ...p,
         key: p.keySecret ? (resolved[p.keySecret] || null) : (p.key || null),
       }));
-      for (const l of links) accountManager.upsertPoolAccount(l);
+      // Owner 2026-10-29: no single "team" account — each cloud account is mirrored
+      // as its own row (syncRemoteMirrors on every link poll) and balanced with the
+      // local accounts by the unchanged routing logic.
       accountManager.setPoolLinks(links);
       const armed = links.filter(l => l.key).length;
       console.log(`[Maxpool] Team pools: ${armed} linked${links.length - armed ? `, ${links.length - armed} unresolved key` : ''}`);

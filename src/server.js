@@ -381,6 +381,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           requestInfo.queueBlockedReason = `request body ${body.length} bytes exceeds queue.maxQueuedBodyBytes ${maxQueuedBodyBytes}`;
         }
         requestInfo.profile = getMaxpoolProfile(req.headers);
+        // PIN (owner D8 per-account shape): a linked pool chose a specific account
+        // here. Honored only for an authenticated NAMED client — an anonymous/legacy
+        // caller can't steer routing. Applied by selection as an exclusive filter.
+        const pin = headerValue(req.headers, 'x-maxpool-pin-account');
+        if (pin && req.callerName && req.callerName !== 'legacy-key') requestInfo.pinAccount = String(pin);
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
         // The CLIENT tells us how long it will wait — the only source that is actually
         // true. A `cc` session exports CLAUDE_STREAM_IDLE_TIMEOUT_MS=3h and forwards it
@@ -587,6 +592,12 @@ async function forwardRequest(
     );
     if (queued) return;
 
+    if (requestInfo.pinAccount != null) {
+      ctx.status = 503;
+      ctx.account = `(pinned ${requestInfo.pinAccount} unavailable)`;
+      sendErrorResponse(res, requestInfo, 503, { type: 'error', error: { type: 'pinned_account_unavailable', message: `Account "${requestInfo.pinAccount}" is not available right now` } });
+      return;
+    }
     ctx.status = 429;
     ctx.account = '(none available)';
     const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
@@ -729,7 +740,7 @@ async function forwardRequest(
   // request to it with the person's key, a stepped hop header, and the client's
   // session header preserved — the remote pool does its own account selection,
   // so no body rewriting, no credential substitution.
-  if (account.type === 'pool') {
+  if (account.type === 'pool' || account.remote) {
     const hop = nextHopCount(headerValue(req.headers, HOP_HEADER));
     if (hop == null) {
       accountManager.releaseAccount(lease, { neutral: true });
@@ -749,9 +760,12 @@ async function forwardRequest(
       linkHeaders[k] = v;
     }
     linkHeaders[HOP_HEADER] = String(hop);
-    linkHeaders['x-api-key'] = account.credential;   // person's pool key
+    // person's pool key: the link row holds it; a mirror row carries its link's key
+    linkHeaders['x-api-key'] = account.remote ? account.remote.key : account.credential;
     delete linkHeaders.authorization;
-    const linkUrl = `${account.upstream}${req.url}`;
+    if (account.remote) linkHeaders['x-maxpool-pin-account'] = account.remote.remoteName;
+    const linkBase = account.remote ? String(account.remote.url).replace(/\/+$/, '') : account.upstream;
+    const linkUrl = `${linkBase}${req.url}`;
     ctx.account = account.name;
     // The client-gone listener from the pre-response window would release the
     // lease a SECOND time when the stream closes normally — remove just the
@@ -765,6 +779,19 @@ async function forwardRequest(
     try {
       const upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half' });
       ctx.status = upRes.status;
+      // Pinned cloud account refused (rate-limited / unavailable) before any byte
+      // streamed: cool THIS mirror row and fail over through the normal path to the
+      // next-best account, local or cloud — exactly like a local account's 429.
+      if (account.remote && (upRes.status === 429 || upRes.status === 503) && retryCount + 1 < maxAttempts) {
+        try { await upRes.body?.cancel(); } catch { /* drained */ }
+        const ra = Number(upRes.headers.get('retry-after'));
+        account.cooldownUntil = Date.now() + (Number.isFinite(ra) && ra > 0 ? Math.min(ra, 300) * 1000 : 30_000);
+        finishLink({ status: upRes.status, error: 'remote_pinned_unavailable' });
+        excludedIndexes.add(account.index);
+        if (hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+        }
+      }
       const outHeaders = {};
       upRes.headers.forEach((v, k) => { if (!HOP_BY_HOP_HEADERS.has(k) && k !== 'content-length' && k !== 'transfer-encoding') outHeaders[k] = v; });
       res.writeHead(upRes.status, outHeaders);
@@ -2769,6 +2796,10 @@ async function queueAndRetry(
   // a real outage doesn't spin. A non-streaming network failure (no keepalive) still
   // fails fast — it would die on the client's own timeout anyway.
   if (cause === 'proxy') return false;
+  // A PINNED request (a linked pool chose one specific account here) never holds:
+  // the caller owns failover across its whole pool, so answer fast and let it pick
+  // the next-best account instead of parking the request on one busy account.
+  if (requestInfo.pinAccount != null) return false;
   if (cause === 'network' && !canQueueBufferedBody) return false;
   // NETWORK SOAK, hard-bounded. A brief connectivity blip should not throw away a turn —
   // but an unbounded soak is worse than a fast error (it presents as a hang, which is the

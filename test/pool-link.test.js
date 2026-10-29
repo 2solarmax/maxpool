@@ -44,6 +44,13 @@ function remotePoolStub() {
 
 const msgBody = JSON.stringify({ model: 'test', messages: [] });
 
+function okUpstream() {
+  return http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+}
+
 test('pool link: identities + duplicate benching (uuid + provider key)', async () => {
   const { server, keyFp } = remotePoolStub();
   const port = await listen(server);
@@ -310,4 +317,59 @@ test('link scoring: a loaded/exhausted cloud scores WORSE than a fresh one (rout
   const localScore = am._scoreAccount(local, {});
   assert.ok(s1 < localScore, `fresh link should outrank a throttled local: ${s1} < ${localScore}`);
   am.setPoolLinks([]);
+});
+
+test('per-account cloud rows: every remote account mirrored individually, no credential, removed when gone', async () => {
+  // Owner's live routing mode (balance) — the default 'sticky' keeps GLM off unless
+  // claudeFallback allows it, which is the UNCHANGED rule, applied to cloud rows too.
+  const am = new AccountManager([{ name: 'kira', type: 'oauth', accountUuid: 'K', accessToken: 'x', refreshToken: 'r' }], 0.9, { routingMode: 'balance' });
+  const link = new PoolLink({ name: 'team', url: 'http://127.0.0.1:1', key: 'mp-max' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.status = { accounts: [
+    { name: 'glm a', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 2, quota: { providerSes: 0.2, providerWk: 0.3 } },
+    { name: 'reports', type: 'oauth', accountUuid: 'R', enabled: true, status: 'active', inFlight: 0, quota: { unified5h: 0.1, unified7d: 0.4 } },
+    { name: 'off one', type: 'provider', provider: 'zai', enabled: false },
+  ] };
+  link.identities = remoteIdentities(link.status);
+  am.setPoolLinks([link]);
+  const cloud = am.accounts.filter(a => a.remote);
+  assert.deepEqual(cloud.map(a => a.remote.remoteName).sort(), ['glm a', 'reports'], 'each enabled cloud account is its own row');
+  assert.ok(cloud.every(a => a.credential == null && a.refreshToken == null), 'mirror rows hold no credential');
+  assert.equal(cloud.find(a => a.remote.remoteName === 'glm a')._remoteOtherLoad, 2, 'teammates\' live load is visible to the balancer');
+  assert.ok(am._matchesRequest(cloud[0], 'all', { path: '/v1/messages' }), 'cloud rows are routable');
+  // Cloud drops an account → its row disappears.
+  link.status.accounts = link.status.accounts.filter(a => a.name !== 'glm a');
+  am.applyPoolLinks();
+  assert.equal(am.accounts.filter(a => a.remote).length, 1);
+  // Link down → all cloud rows leave routing (never target a dead link).
+  link.lastError = 'network error';
+  am.applyPoolLinks();
+  assert.equal(am.accounts.filter(a => a.remote).length, 0);
+  am.setPoolLinks([]);
+});
+
+test('pin: remote serves a pinned request ONLY on the named account; pinned-unavailable is a fast 503 the caller fails over on', async () => {
+  // Remote side: a real proxy with two GLM accounts, one rate-limited.
+  const upstream = okUpstream();
+  const upPort = await listen(upstream);
+  const remoteAm = new AccountManager([], 0.9, { routingMode: 'balance' });
+  remoteAm.loadConfigProviders([
+    { name: 'glm a', provider: 'zai', token: 'ka', upstream: `http://127.0.0.1:${upPort}` },
+    { name: 'glm b', provider: 'zai', token: 'kb', upstream: `http://127.0.0.1:${upPort}` },
+  ]);
+  const b = remoteAm.accounts.find(a => a.name === 'glm b');
+  b.status = 'throttled'; b.rateLimitedUntil = Date.now() + 60_000;
+  const remote = createProxyServer(remoteAm, { proxy: { clients: [{ name: 'max', key: 'mp-max' }] }, upstream: `http://127.0.0.1:${upPort}` });
+  const rPort = await listen(remote);
+  try {
+    const hdr = { 'content-type': 'application/json', 'x-api-key': 'mp-max', 'x-maxpool-profile': 'all' };
+    const ok = await fetch(`http://127.0.0.1:${rPort}/v1/messages`, { method: 'POST', headers: { ...hdr, 'x-maxpool-pin-account': 'glm a' }, body: msgBody });
+    assert.equal(ok.status, 200);
+    await ok.text();
+    assert.equal(remoteAm.accounts.find(a => a.name === 'glm a').completedRequests, 1, 'served by the pinned account');
+    const busy = await fetch(`http://127.0.0.1:${rPort}/v1/messages`, { method: 'POST', headers: { ...hdr, 'x-maxpool-pin-account': 'glm b' }, body: msgBody, signal: AbortSignal.timeout(5000) });
+    assert.equal(busy.status, 503, 'pinned-unavailable answers fast instead of holding');
+    // Anonymous caller can't pin (no steering without a named key).
+    assert.equal(remoteAm.accounts.find(a => a.name === 'glm b').completedRequests, 0);
+  } finally { await close(remote); await close(upstream); }
 });
