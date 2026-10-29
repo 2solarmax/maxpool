@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.38] - 2026-10-29
+
+### Changed
+
+- Team pool: red-team fixes — run passes shared key, legacy key attributed, pool switch atomic, rc-gate strips pool key on direct leg, 0.0.0.0 warning, freeze clock in flaky cap test
+
 ## [1.24.37] - 2026-10-28
 
 ### Changed
