@@ -39,7 +39,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 );
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
 import { TUI } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
@@ -835,8 +835,7 @@ async function serverWorkerCommand() {
         // Pick up any new accounts from disk so index matching stays correct
         // (only add, don't refresh credentials — we're about to write the authoritative tokens)
         for (const diskAcct of diskConfig.accounts) {
-          const known = (diskAcct.accountUuid && config.accounts.some(a => a.accountUuid === diskAcct.accountUuid))
-            || config.accounts.some(a => a.name === diskAcct.name);
+          const known = config.accounts.some(a => sameAccountIdentity(a, diskAcct) || a.name === diskAcct.name);
           if (!known) {
             config.accounts.push(diskAcct);
             accountManager.addAccount(diskAcct);
@@ -1216,7 +1215,7 @@ async function serverWorkerCommand() {
         // Use live tokens from AccountManager (not the stale config.accounts copy).
         diskConfig.accounts = config.accounts.map(a => {
           const am = accountManager.accounts.find(candidate =>
-            (a.accountUuid && candidate.accountUuid === a.accountUuid) || candidate.name === a.name
+            sameAccountIdentity(candidate, a) || candidate.name === a.name
           );
           const live = am ? {
             ...a,
@@ -1225,7 +1224,7 @@ async function serverWorkerCommand() {
             expiresAt: am.expiresAt,
           } : a;
           const diskAcct = diskConfig.accounts.find(
-            d => (a.accountUuid && d.accountUuid === a.accountUuid) || d.name === a.name
+            d => sameAccountIdentity(d, a) || d.name === a.name
           );
           return diskAcct ? { ...diskAcct, ...live } : live;
         });
@@ -1905,23 +1904,28 @@ async function accountsCommand() {
     )
   );
 
-  // Deduplicate by accountUuid — keep the last (most recently added) entry
+  // Deduplicate by user + organization — keep the last (most recently added) entry
   const seen = new Map();
   let removed = 0;
   for (let i = config.accounts.length - 1; i >= 0; i--) {
     const a = config.accounts[i];
     const uuid = profiles[i]?.accountUuid || a.accountUuid;
-    if (uuid) {
-      if (seen.has(uuid)) {
+    const org = profiles[i]?.organizationUuid || a.organizationUuid || '';
+    const identity = uuid ? `${uuid}/${org}` : null;
+    if (identity) {
+      if (seen.has(identity)) {
         config.accounts.splice(i, 1);
         profiles.splice(i, 1);
         removed++;
       } else {
-        seen.set(uuid, i);
-        // Update stored UUID and name from profile
+        seen.set(identity, i);
+        // Update stored UUIDs and name from profile. Two organizations of one user
+        // share the email, so the name is only taken when no other account has it.
         if (profiles[i] && !profiles[i].error) {
           a.accountUuid = profiles[i].accountUuid;
-          if (profiles[i].email) a.name = profiles[i].email;
+          a.organizationUuid = profiles[i].organizationUuid;
+          const email = profiles[i].email;
+          if (email && !config.accounts.some((other, j) => j !== i && other.name === email)) a.name = email;
         }
       }
     }
@@ -2126,30 +2130,31 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   if (!profileOk) {
     console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
   }
+  if (profileOk) await resolveOrganizations(config.accounts.filter(a => a.type === 'oauth'), profile.accountUuid);
+  const uncertain = profileOk && !name ? organizationUnknownMatch(config.accounts, profile) : null;
+  if (uncertain) {
+    name = uncertain.name;
+    console.log(`Same Claude user as "${name}", and its organization could not be checked: re-authenticating it in place. To add this login as a second account, run again with --name <new name>.`);
+  }
   if (!name && profile?.email) {
-    name = profile.email;
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  if (!name) {
-    const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-    name = `account-${n}`;
-  }
+  if (!name) name = suggestAccountName(config.accounts, profile);
 
   const account = {
     name,
     type: 'oauth',
     source,
     accountUuid: profile?.accountUuid || null,
+    organizationUuid: profile?.organizationUuid || null,
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
   };
 
-  // Deduplicate: match by UUID first, then by name
-  let idx = profile?.accountUuid
-    ? config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-    : -1;
+  // Deduplicate: match by user + organization first, then by name
+  let idx = config.accounts.findIndex(a => sameAccountIdentity(a, account));
   if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
 
   if (idx >= 0) {
@@ -2167,13 +2172,12 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find a config account entry matching an in-memory account (by UUID, then name).
+ * Find a config account entry matching an in-memory account (by user + organization,
+ * then name).
  */
 function findConfigAccount(diskConfig, account) {
-  if (account.accountUuid) {
-    const idx = diskConfig.accounts.findIndex(a => a.accountUuid === account.accountUuid);
-    if (idx >= 0) return idx;
-  }
+  const idx = diskConfig.accounts.findIndex(a => sameAccountIdentity(a, account));
+  if (idx >= 0) return idx;
   return diskConfig.accounts.findIndex(a => a.name === account.name);
 }
 
@@ -2185,9 +2189,7 @@ function findConfigAccount(diskConfig, account) {
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
   for (const diskAcct of diskConfig.accounts) {
-    const matchByUuid = diskAcct.accountUuid
-      ? memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid)
-      : -1;
+    const matchByUuid = memConfig.accounts.findIndex(a => sameAccountIdentity(a, diskAcct));
     const matchByName = memConfig.accounts.findIndex(a => a.name === diskAcct.name);
     const memIdx = (matchByUuid >= 0 ? matchByUuid : null) ?? (matchByName >= 0 ? matchByName : -1);
 
@@ -2214,7 +2216,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 
     // Find the corresponding AccountManager entry and update credentials
     const mgr = accountManager.accounts.find(a =>
-      (diskAcct.accountUuid && a.accountUuid === diskAcct.accountUuid) || a.name === diskAcct.name
+      sameAccountIdentity(a, diskAcct) || a.name === diskAcct.name
     );
     if (!mgr) continue;
     const enabled = diskAcct.enabled !== false;
