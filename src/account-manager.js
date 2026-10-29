@@ -2627,6 +2627,11 @@ export class AccountManager {
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
     if (!this._matchesProfile(account, profile)) return false;
+    // A pool link carries Anthropic-API traffic only (/v1/…). Browser noise
+    // (favicon, stray GETs) must never be forwarded — on the remote it finds no
+    // route, queues up to the hold window, and pins a link lease the whole time
+    // (live-rehearsal 2026-10-29: 4 favicon GETs showed as "4 running").
+    if (account.type === 'pool' && !String(requestInfo.path || '').startsWith('/v1/')) return false;
 
     // Kimi (Moonshot) 400s on images Anthropic/GLM accept ("failed to decode
     // image") — and a provider 400 is TERMINAL (not retried to another account), so

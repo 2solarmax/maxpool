@@ -96,7 +96,8 @@ test('pool link: routing forwards to the remote pool with key + hop header', asy
     const row = am.upsertPoolAccount(link);
     assert.equal(row.type, 'pool');
     am.setPoolLinks([link]);
-    assert.ok(am._matchesRequest(row, 'all', {}), 'pool row is routable');
+    assert.ok(am._matchesRequest(row, 'all', { path: '/v1/messages' }), 'pool row is routable for API traffic');
+    assert.equal(am._matchesRequest(row, 'all', { path: '/favicon.ico' }), false, 'browser noise never forwarded');
     assert.ok(am._isAvailable(row), 'healthy link is available');
 
     proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}` });
@@ -130,7 +131,8 @@ test('pool link: routing forwards to the remote pool with key + hop header', asy
     assert.equal(row.failedRequests, 0, 'success not counted as failure');
     // status-only release = failure (verified directly against releaseAccount) —
     // pin the success-flag shape, not just the counter arithmetic.
-    const l2 = am.acquireAccount({});
+    const l2 = am.acquireAccount({ path: '/v1/messages' });
+    assert.equal(l2?.account?.name, 'team', 'control lease lands on the link');
     am.releaseAccount(l2, { status: 200 });
     assert.equal(row.failedRequests, 1, 'control: status-only release counts failed');
   } finally { am.setPoolLinks([]); if (proxy) await close(proxy); await close(server); await close(upstream); }
