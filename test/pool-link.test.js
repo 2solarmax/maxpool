@@ -373,3 +373,28 @@ test('pin: remote serves a pinned request ONLY on the named account; pinned-unav
     assert.equal(remoteAm.accounts.find(a => a.name === 'glm b').completedRequests, 0);
   } finally { await close(remote); await close(upstream); }
 });
+
+test('SC20 automatic guard, FINAL shape: duplicate local copy stays LISTED with "in cloud" status, never routes, never refreshes, never redeems', async () => {
+  let refreshed = 0;
+  const am = new AccountManager([
+    { name: 'glm shared', type: 'oauth', accountUuid: 'U1', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() - 60_000 },
+  ], 0.9, { routingMode: 'balance' }, { refreshAccessToken: async () => { refreshed++; return { accessToken: 'n', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 }; } });
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.status = { accounts: [{ name: 'glm shared', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active' }] };
+  link.identities = new Map([['uuid:U1', { name: 'glm shared' }]]);
+  am.setPoolLinks([link]);
+  const a = am.accounts.find(x => x.name === 'glm shared');
+  assert.ok(a.poolBenchedBy, 'auto-guarded by identity match');
+  assert.equal(am._matchesRequest(a, 'all', { path: '/v1/messages' }), false, 'never routed');
+  await am.ensureTokenFresh(a.index);
+  assert.equal(refreshed, 0, 'single-use refresh token never spent');
+  // TUI shows the row with the in-cloud status (SC20 display requirement).
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const t = new TUI({ accountManager: am });
+  const line = strip(t._renderAcct(a.index, 11, true));
+  assert.match(line, /in cloud/, 'status says in cloud');
+  assert.match(line, /Local/, 'Where column still says Local — it IS the local copy');
+  am.setPoolLinks([]);
+});
