@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
-import { accountIdentity, computeDuplicates, credentialFp } from './pool-link.js';
+import { computeDuplicates, credentialFp } from './pool-link.js';
 import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
