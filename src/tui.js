@@ -1344,7 +1344,11 @@ export class TUI {
       familyFirstSeen.get(fam).push(idx);
     }
     const provGrouped = [...familyFirstSeen.values()].flat();
-    return [...nonProv, ...provGrouped];
+    // Owner 2026-10-29: Where is the PRIMARY grouping — local rows first, cloud rows
+    // after — and the existing ordering (providers grouped by family, OAuth as-added)
+    // stays intact WITHIN each group.
+    const all = [...nonProv, ...provGrouped];
+    return [...all.filter(i => !this.am.accounts[i].remote), ...all.filter(i => this.am.accounts[i].remote)];
   }
 
   _selectableIndexes(action) {
@@ -2036,6 +2040,10 @@ export class TUI {
       let hidden = 0;
       for (const i of this._displayOrder()) {
         if (this.hideDisabled && this.am.accounts[i]?.enabled === false) { hidden++; continue; }
+        // Same key also hides local copies guarded by the duplicate guard — they are
+        // effectively off (owner 2026-10-29: "should it hide the local ones that are
+        // in the cloud... they're effectively disabled as well"). No separate key.
+        if (this.hideDisabled && this.am.accounts[i]?.poolBenchedBy) { hidden++; continue; }
         // The legacy single team-pool row is superseded by per-account cloud rows.
         if (this.am.accounts[i]?.type === 'pool') continue;
         lines.push(this._renderAcct(i, bw, showBoth));

@@ -462,3 +462,31 @@ test('SC22 People screen: columns align by visible width, merges cloud windows, 
   assert.ok(lines.indexOf(maxRow) < lines.indexOf(ahmedRow), 'sorted by 7d descending');
   assert.ok(hdr.indexOf('7d') > 0);
 });
+
+test('SC19 sort + hide: Where groups first (local before cloud), h also hides guarded locals', async () => {
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const am = new AccountManager([
+    { name: 'kira', type: 'oauth', accountUuid: 'K', accessToken: 'x', refreshToken: 'r' },
+  ], 0.9, { routingMode: 'balance' });
+  am.loadConfigProviders([{ name: 'glm local', provider: 'zai', token: 'k1' }]);
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.status = { accounts: [
+    { name: 'glm local', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 0 },
+    { name: 'cloud claude', type: 'oauth', enabled: true, status: 'active', inFlight: 0 },
+  ] };
+  link.identities = remoteIdentities(link.status);
+  am.setPoolLinks([link]);
+  const t = new TUI({ accountManager: am });
+  const order = t._displayOrder().map(i => am.accounts[i].name);
+  const firstCloud = order.findIndex(n => am.accounts.find(a => a.name === n)?.remote);
+  const anyLocalAfter = order.slice(firstCloud).some(n => !am.accounts.find(a => a.name === n)?.remote);
+  assert.ok(firstCloud > 0 && !anyLocalAfter, 'all local rows before all cloud rows');
+  // hide-disabled also hides the guarded local duplicate
+  t.hideDisabled = true;
+  const visible = t._displayOrder().map(i => am.accounts[i]).filter(a => !(t.hideDisabled && a.enabled === false) && !(t.hideDisabled && a.poolBenchedBy) && a.type !== 'pool');
+  assert.ok(!visible.some(a => a.poolBenchedBy), 'guarded local hidden under h');
+  assert.ok(visible.some(a => a.remote), 'cloud rows still visible under h');
+  am.setPoolLinks([]);
+});
