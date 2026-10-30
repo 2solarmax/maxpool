@@ -788,9 +788,13 @@ async function forwardRequest(
     };
     try {
       // P4a: a blackholed link must not hang the request (and hold a lease) for
-      // minutes — bound time-to-headers like the direct path's TTFB guard.
+      // minutes — bound time-to-headers like the direct path's TTFB guard. GLM
+      // thinking turns regularly sit silent 20-60s before headers, so the link
+      // TTFB must match the direct path's UPSTREAM_TTFB_MS (120s default), not a
+      // flat 15s (owner report 2026-10-30: every pinned GLM turn 502-aborted).
+      const linkTtfbMs = Math.max(15_000, Number(process.env.MAXPOOL_LINK_TTFB_MS) || UPSTREAM_TTFB_MS);
       const linkCtl = new AbortController();
-      const linkTtfb = setTimeout(() => linkCtl.abort(), 15_000);
+      const linkTtfb = setTimeout(() => linkCtl.abort(), linkTtfbMs);
       res.once('close', () => linkCtl.abort());
       let upRes;
       try {
