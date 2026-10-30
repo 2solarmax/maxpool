@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { appendEventLog } from './event-log.js';
+import { atomicConfigUpdate } from './config.js';
 import { HOP_HEADER, nextHopCount } from './pool-link.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
 import { writeFile, mkdir } from 'node:fs/promises';
@@ -278,6 +279,74 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        return;
+      }
+
+      // Remote login inject (owner decision D15/D16, 2026-10-30): a linked pool
+      // re-authenticates one of ITS accounts through the front door instead of
+      // SSH. Any valid key may add or re-auth (one permission level — the door
+      // is the per-person key + the audit log, not per-item rules). A uuid
+      // match can only ever re-authorize the SAME account (the browser login
+      // for X replaces the saved login for X), so no healthy-row refusal:
+      // runtime refreshDead lags reality at boot anyway (scratch E2E 2026-10-30:
+      // a dead-on-disk row read "healthy" and a real re-auth was refused 409).
+      if (req.method === 'POST' && req.url === '/maxpool/accounts') {
+        if (strictClients ? !caller.ok : (proxyApiKey && clientKey !== proxyApiKey)) {
+          rejectUnauthorized();
+          return;
+        }
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        let body;
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { body = null; }
+        const acct = body?.account;
+        if (!acct || acct.type !== 'oauth' || typeof acct.accountUuid !== 'string' || !acct.accountUuid ||
+            typeof acct.refreshToken !== 'string' || !acct.refreshToken || typeof acct.accessToken !== 'string' || !acct.accessToken) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'bad_request', message: 'Expected {account: {type:"oauth", accountUuid, accessToken, refreshToken, name?}}' }));
+          return;
+        }
+        const who = caller.name || 'legacy-key';
+        const amAcct = accountManager.accounts.find(a => a.accountUuid === acct.accountUuid);
+        const tokenFields = {
+          accessToken: acct.accessToken,
+          refreshToken: acct.refreshToken,
+          expiresAt: typeof acct.expiresAt === 'number' ? acct.expiresAt : Date.now() + 3600_000,
+          source: acct.source || 'remote-inject',
+        };
+        if (amAcct) {
+          // In-place revive, mirroring the TUI re-auth field set: fresh tokens
+          // BEFORE persisting (the disk writer derives from the AM), refreshDead
+          // cleared here or the row stays benched after a successful re-auth.
+          amAcct.credential = tokenFields.accessToken;
+          amAcct.refreshToken = tokenFields.refreshToken;
+          amAcct.expiresAt = tokenFields.expiresAt;
+          amAcct.refreshDead = false;
+          if (amAcct.status === 'error') amAcct.status = 'active';
+          appendEventLog(`[Maxpool] Remote re-auth: "${amAcct.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
+        } else {
+          const entry = { name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields };
+          accountManager.addAccount(entry);
+          appendEventLog(`[Maxpool] Remote add: "${entry.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
+        }
+        try {
+          await atomicConfigUpdate(diskConfig => {
+            const onDisk = diskConfig.accounts.find(a => a.accountUuid === acct.accountUuid);
+            if (onDisk) {
+              Object.assign(onDisk, tokenFields);
+            } else {
+              diskConfig.accounts.push({ name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields });
+            }
+          });
+          // Keep the in-memory config mirror in step so a later TUI saveConfig
+          // can't clobber the fresh tokens with stale ones.
+          const mem = config.accounts.find(a => a.accountUuid === acct.accountUuid);
+          if (mem) Object.assign(mem, tokenFields);
+        } catch (err) {
+          console.error(`[Maxpool] Remote inject persisted to memory but NOT disk for uuid ${acct.accountUuid.slice(0, 8)}: ${err?.message || err}`);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result: amAcct ? 'reauthed' : 'added', name: amAcct ? amAcct.name : (acct.name || acct.accountUuid.slice(0, 8)) }));
         return;
       }
 

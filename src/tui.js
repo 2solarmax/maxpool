@@ -1447,6 +1447,17 @@ export class TUI {
       process.stdout.write('\nOpening browser to log into Claude…\n');
       const creds = await loginOAuth();
       const profile = await fetchProfile(creds.accessToken);
+      // Owner shape (D15/D16, 2026-10-30): if the browser login belongs to an
+      // account that LIVES in a linked team pool, the fresh login goes STRAIGHT
+      // there — never persisted locally (single writer: one account, one home).
+      // Same keystroke as a local re-auth; the routing is by where the account
+      // lives, so nothing is selected and no menu appears.
+      const mirror = this._findRemoteMirrorFor(profile);
+      if (mirror) {
+        setConsoleStdoutSuppressed(false);
+        await this._sendLoginToRemote(mirror, creds, profile);
+        return;
+      }
       const existing = this._findExistingOAuthAccount(profile);
       let name;
       if (existing) {
@@ -1479,6 +1490,57 @@ export class TUI {
     } finally {
       setConsoleStdoutSuppressed(false);   // restore on every path (incl. the catch)
       if (wasRunning) this.start();
+    }
+  }
+
+  // The browser login belongs to a linked team pool iff a mirror row carries the
+  // same account uuid (M2: mirrors hold remoteUuid, never accountUuid, so a
+  // uuid-first matcher cannot alias onto a local account).
+  _findRemoteMirrorFor(profile) {
+    if (!profile?.accountUuid) return null;
+    return this.am.accounts.find(a => a.remote && a.remoteUuid === profile.accountUuid) || null;
+  }
+
+  // Send a fresh browser login to the linked team pool that OWNS this account
+  // (D15/D16). Never falls back to a local save — a network failure here must
+  // surface, not silently create a second writer on this laptop.
+  async _sendLoginToRemote(mirror, creds, profile) {
+    const remote = mirror.remote;
+    const name = remote.remoteName || mirror.name;
+    const replace = Boolean(mirror.refreshDead || mirror.status === 'error');
+    process.stdout.write(`\n"${name}" lives in the team pool (${remote.linkName}) — sending the fresh login there…\n`);
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 20_000);
+    try {
+      const res = await fetch(`${String(remote.url).replace(/\/+$/, '')}/maxpool/accounts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': remote.key || '' },
+        body: JSON.stringify({
+          account: {
+            name, type: 'oauth',
+            accountUuid: profile?.accountUuid,
+            accessToken: creds.accessToken,
+            refreshToken: creds.refreshToken,
+            expiresAt: creds.expiresAt,
+            source: 'remote-login',
+          },
+          replace,
+        }),
+        signal: ctl.signal,
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.status === 409) {
+        process.stdout.write(`\nTeam pool says "${name}" is already healthy — nothing to do. Nothing was saved on this laptop.\n`);
+      } else if (res.ok && json.ok) {
+        process.stdout.write(`\nDone: "${name}" ${json.result === 'added' ? 'added to' : 're-authenticated in'} the team pool. Nothing was saved on this laptop.\n`);
+        this._addLog(`Remote login: "${name}" → team pool ${remote.linkName} (${json.result})`);
+      } else {
+        process.stdout.write(`\nTeam pool rejected the login (HTTP ${res.status}: ${json?.message || json?.error || 'unknown error'}). NOTHING was saved on this laptop — not retried locally.\n`);
+      }
+    } catch (e) {
+      process.stdout.write(`\nCould not reach the team pool (${e?.name === 'AbortError' ? 'timed out' : e?.message}). NOTHING was saved on this laptop — try again in a moment.\n`);
+    } finally {
+      clearTimeout(t);
     }
   }
 
