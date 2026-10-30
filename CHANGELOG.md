@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.47] - 2026-10-30
+
+### Changed
+
+- Link forward: TTFB guard follows direct-path budget (120s default, MAXPOOL_LINK_TTFB_MS, floor 15s)
+
 ## [1.24.46] - 2026-10-29
 
 ### Changed
