@@ -1,7 +1,27 @@
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
+
+// ISOLATION (2026-10-30 incident): the inject endpoint persists through
+// atomicConfigUpdate(), which resolves the config path from the ENVIRONMENT.
+// Without this pin, `node --test test/remote-inject.test.js` on a dev machine
+// wrote "injected"/"fresh@x.io" test rows into the developer's REAL pool config
+// (owner report: "What the hell is all this crap?"). node:test runs each file
+// in its own process, so pinning here cannot leak into other test files.
+const ISOLATED_DIR = mkdtempSync(join(tmpdir(), 'mp-inject-test-'));
+const ISOLATED_CONFIG = join(ISOLATED_DIR, 'config.json');
+writeFileSync(ISOLATED_CONFIG, JSON.stringify({ proxy: {}, accounts: [] }));
+process.env.MAXPOOL_CONFIG = ISOLATED_CONFIG;
+// The pin must be in effect before any import reads the path lazily at call
+// time — assert it so a future refactor to import-time resolution fails here
+// instead of writing to the real config again.
+import('../src/config.js').then(({ getConfigPath }) => {
+  assert.equal(getConfigPath(), ISOLATED_CONFIG, 'test config isolation broken — ABORT before touching a real config');
+});
 
 function listen(server) { return new Promise(r => server.listen(0, '127.0.0.1', () => r(server.address().port))); }
 function close(server) { return new Promise(r => server.close(r)); }
@@ -90,4 +110,10 @@ test('malformed body is 400, nothing applied', async () => {
   const { status } = await post(port, JSON.stringify({ account: { type: 'oauth' } }));
   assert.equal(status, 400);
   assert.equal(am.accounts.find(a => a.accountUuid === 'D1').refreshToken, 'dead-ref');
+});
+
+test('disk persist lands in the ISOLATED test config, never the real one', async () => {
+  await post(port, injectBody('N9', { name: 'disk-check' }));
+  const isolated = JSON.parse(readFileSync(ISOLATED_CONFIG, 'utf8'));
+  assert.ok(isolated.accounts.some(a => a.accountUuid === 'N9'), 'persisted to isolated config');
 });
