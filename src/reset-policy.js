@@ -65,14 +65,10 @@ export function decideZai(account, cards, now = Date.now()) {
   const wkUtil = wk; const sesUtil = ses;
 
   const weeklyCards = (cards.weekly || []).filter(c => !c.expired && c.recordId != null);
-  const sesCards = (cards.fiveHour || []).filter(c => !c.expired && c.recordId != null);
   // R4: soonest expiry first inside each class.
   weeklyCards.sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity));
-  sesCards.sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity));
 
   const weeklyCard = weeklyCards[0] || null;
-  const sesCard = sesCards[0] || null;
-  let weeklyHeld = false; // R6: weekly card HELD for the free refill (5h branch may still fire)
 
   // --- weekly card: clears BOTH windows (z.ai docs; measured: glm1 100%->0% both)
   if (weeklyCard) {
@@ -83,13 +79,10 @@ export function decideZai(account, cards, now = Date.now()) {
     if (atWall || dying) {
       // R6: a wall redeem waits when the FREE weekly refill is imminent and the
       // account isn't critically full (dying-value redeems stay exempt above).
-      // A HELD weekly card is spendable-redundant, not absent: the 5h branch below
-      // may still fire (red-team: holding must not starve a 5h wall — the 5h card
-      // sits redundant behind the free refill anyway, so spending it is pure gain).
       if (atWall && !dying && q.providerWkReset != null
           && msLeft(q.providerWkReset, now) < POLICY.freeRefillWaitMs
           && wkUtil < POLICY.freeRefillImmediate) {
-        weeklyHeld = true;   // fall through — do NOT return; the 5h branch checks this
+        /* HELD for the free refill — do not redeem */
       } else {
         return { kind: 'card', card: weeklyCard, resetType: 'WEEK',
                  reason: atWall ? 'weekly at wall' : 'dying value' };
@@ -97,17 +90,10 @@ export function decideZai(account, cards, now = Date.now()) {
     }
   }
 
-  // --- 5h card: clears only the session window
-  if (sesCard) {
-    const atWall = sesUtil != null && sesUtil >= POLICY.wallSes
-      && (weeklyCard == null || weeklyHeld);   // R4: a weekly card can do this job AND more — except when R6 HELD it for the free refill
-    const dying = msLeft(sesCard.expiresAt, now) < POLICY.dyingWindowMs
-      && (sesUtil ?? 0) >= POLICY.dyingMinUtilSes;
-    if (atWall || dying) {
-      return { kind: 'card', card: sesCard, resetType: 'FIVE_HOUR',
-               reason: atWall ? 'session at wall' : 'dying value' };
-    }
-  }
+  // --- 5h card: NEVER SPENT (owner, 2026-10-30: "never spend resets on session
+  // limits, only on weekly"). The 5h window refills ~33x per week on its own, so a
+  // 5h card buys minutes of capacity at the cost of a scarce card. Historically
+  // both the atWall and dying-value branches spent them; both are gone.
   return null;
 }
 
@@ -128,13 +114,15 @@ export function decideClaude(account, listing, now = Date.now()) {
   const sesUtil = q.unified5h ?? null;
   const clearsWk = chosen.clears?.includes('seven_day');
 
-  let atWall = false;
-  if (clearsWk) atWall = wkUtil != null && wkUtil >= POLICY.wallWeekly;
-  else atWall = sesUtil != null && sesUtil >= POLICY.wallSes;
+  // Owner, 2026-10-30: "never spend resets on session limits, only on weekly."
+  // A grant that clears ONLY the session window is never spent, at wall or dying.
+  if (!clearsWk) return null;
+
+  const atWall = wkUtil != null && wkUtil >= POLICY.wallWeekly;
 
   // use_requires_limit: some grants may only fire AT the wall (server-enforced).
   const dying = msLeft(chosen.endsAt, now) < POLICY.dyingWindowMs
-    && Math.max(wkUtil ?? 0, sesUtil ?? 0) >= (clearsWk ? POLICY.dyingMinUtilWeekly : POLICY.dyingMinUtilSes);
+    && Math.max(wkUtil ?? 0, sesUtil ?? 0) >= POLICY.dyingMinUtilWeekly;
   // A requires-limit grant cannot be redeemed pre-wall even for dying value.
   if (atWall || (dying && !chosen.requiresLimit)) {
     return { kind: 'grant', grant: chosen, reason: atWall ? 'at wall' : 'dying value' };
