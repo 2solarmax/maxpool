@@ -21,7 +21,7 @@ function amWithUltra() {
 test('null-5h account is never session-benched (no such window)', () => {
   const am = amWithUltra();
   const ultra = am.accounts[0];
-  assert.equal(am._sessionUnavailable?.(ultra) ?? sessionFullByReader(am, ultra), false);
+  assert.equal(am._isSessionQuotaUnavailable(ultra), false);
 });
 
 test('weekly still governs a null-5h account at the wall', () => {
@@ -30,7 +30,7 @@ test('weekly still governs a null-5h account at the wall', () => {
   ultra.quota.unified7d = 0.99;
   assert.equal(am._weeklyRawState(ultra), 'critical', 'weekly wall must still bench a 5h-less account');
   // and the availability reader consults the weekly tier
-  assert.equal(am._isAvailable(ultra, Date.now()), false, 'critical weekly benches the account');
+  assert.equal(am._isAvailable(ultra), false, 'critical weekly benches the account');
 });
 
 test('header path: a 5h header that stops arriving leaves a stale value cleared by reset expiry', () => {
@@ -51,11 +51,3 @@ test('restore path: persisted 5h without a reset is nulled (already guarded)', (
   am.restoreQuotaState(saved);
   assert.equal(am.accounts[0].quota.unified5h, null);
 });
-
-// helper mirroring the TUI reader for the bench check
-function sessionFullByReader(am, a) {
-  const q = a.quota || {};
-  const bench = 0.95;
-  if (q.unified5h != null && q.unified5h >= bench) return true;
-  return false;
-}

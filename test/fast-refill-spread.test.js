@@ -283,7 +283,7 @@ test('K4: the preference holds nearly to the top of the session window, then rea
 test('K5: soaking never routes past a HARD gate — session bench, cap and request cap all hold', () => {
   const { am, u } = pair({ unlSes: 0.10 });
   // The session window is the ONLY thing bounding a soak, so it must still bench.
-  u.quota.providerSes = 0.99;
+  u.quota.providerSes = 1;
   assert.equal(am._isSessionQuotaUnavailable(u), true,
     'a full session window benches the account no matter how cheap soak makes it score');
   // A usage cap still wins over cheapness.

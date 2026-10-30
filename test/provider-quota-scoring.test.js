@@ -65,7 +65,9 @@ test('_isSessionQuotaUnavailable sees providerSes (the session cap)', () => {
   const am = fleet();
   const glm = am.accounts.find(a => a.provider === 'zai');
   glm.quota.providerSes = 0.95;
-  assert.equal(am._isSessionQuotaUnavailable(glm), true, '95% of 5h session is unavailable');
+  assert.equal(am._isSessionQuotaUnavailable(glm), false, 'owner 2026-10-30: 95% of a 5h session still serves');
+  glm.quota.providerSes = 1;
+  assert.equal(am._isSessionQuotaUnavailable(glm), true, '100% of 5h session is unavailable');
   glm.quota.providerSes = 0.50;
   assert.equal(am._isSessionQuotaUnavailable(glm), false);
 });

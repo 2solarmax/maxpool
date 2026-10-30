@@ -611,7 +611,7 @@ async function forwardRequest(
   // anything and a 2-account fleet got exactly one repair, while the chain is now six
   // deep. Each repair latches its own flag, so this budget is a backstop, not the bound.
   const repairCount = requestInfo.repairCount || 0;
-  const canRepairBody = repairCount < 6 && !res.headersSent;
+  const canRepairBody = repairCount < 6 && !clientHasRealBytes(res, requestInfo);
 
   // PRE-STRIP a session already known to carry provider-authored thinking. The client
   // resends the whole poisoned history every turn, so without this each turn pays another
@@ -873,20 +873,41 @@ async function forwardRequest(
       // Pinned cloud account refused (rate-limited / unavailable) before any byte
       // streamed: cool THIS mirror row and fail over through the normal path to the
       // next-best account, local or cloud — exactly like a local account's 429.
-      if (account.remote && (upRes.status === 429 || upRes.status === 503) && retryCount + 1 < maxAttempts && !res.headersSent) {
+      if (account.remote && (upRes.status === 429 || upRes.status === 503) && !clientHasRealBytes(res, requestInfo)) {
         try { await upRes.body?.cancel(); } catch { /* drained */ }
         const ra = Number(upRes.headers.get('retry-after'));
         // P3: "busy" is a 2s back-off on this row only; "unavailable"/429 cools longer.
         account.cooldownUntil = Date.now() + (Number.isFinite(ra) && ra > 0 ? Math.min(ra, 300) * 1000 : 30_000);
         finishLink({ status: upRes.status, error: 'remote_pinned_unavailable' });
         excludedIndexes.add(account.index);
-        if (hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+        if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+        }
+        // Every route refused: that is capacity, so it waits here. The body was cancelled
+        // above, so falling through handed the client a 503 with no body.
+        const queued = await queueAndRetry(
+          `all routes failed after ${upRes.status} from "${account.name}"`,
+          req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'capacity',
+        );
+        if (queued) return;
+        ctx.status = upRes.status;
+        sendErrorResponse(res, requestInfo, upRes.status, { type: 'error', error: { type: 'overloaded_error', message: `Team pool account "${account.name}" is at capacity` } });
+        return;
+      }
+      // A request released from the queue already holds a committed keep-alive stream.
+      if (requestInfo.queueHeartbeatActive) {
+        clearQueueHeartbeat(requestInfo);
+        if (upRes.status >= 400) {
+          const errorText = await readErrorBody(upRes);
+          sendErrorBody(res, requestInfo, upRes.status, errorText, upRes.headers);
+          finishLink({ success: upRes.status < 500, status: upRes.status });
+          return;
         }
       }
       const outHeaders = {};
       upRes.headers.forEach((v, k) => { if (!HOP_BY_HOP_HEADERS.has(k) && k !== 'content-length' && k !== 'transfer-encoding') outHeaders[k] = v; });
-      res.writeHead(upRes.status, outHeaders);
+      if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
       if (upRes.body) {
         const reader = upRes.body.getReader();
         try {
@@ -910,10 +931,17 @@ async function forwardRequest(
     } catch (err) {
       finishLink({ status: 502, error: 'pool_link_unreachable' });
       excludedIndexes.add(account.index);   // P4b: never re-pick a row that just failed
-      const retried = retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
-        ? await forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes)
-        : null;
-      if (retried) return;
+      if (!clientHasRealBytes(res, requestInfo)) {
+        if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+        }
+        const queued = await queueAndRetry(
+          `all routes failed after a link error on "${account.name}"`,
+          req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'network',
+        );
+        if (queued) return;
+      }
       ctx.status = 502;
       sendErrorResponse(res, requestInfo, 502, { type: 'error', error: { type: 'api_error', message: `Team pool "${account.name}" unreachable: ${err?.message || err}` } });
     }
@@ -1315,7 +1343,7 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" cooling down, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
       }
 
-      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
@@ -1466,7 +1494,7 @@ async function forwardRequest(
           : null;
         const issuerIsClaude = issuer && issuer.type !== 'provider';
         if (lease.migratedFromName && issuerIsClaude && requestInfo.sessionKey
-          && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+          && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
           accountManager.revertSessionBinding(requestInfo.sessionKey, lease.migratedFromName);
           excludedIndexes.add(account.index);
           console.log(`[Maxpool] Thinking-signature fail-safe: reverting session to issuer "${lease.migratedFromName}" and retrying`);
@@ -1481,7 +1509,7 @@ async function forwardRequest(
       // EFFORT REPAIR. A rejected output_config.effort is a hard failure of whatever the
       // client was doing (a web search, a tool call) — worth healing rather than surfacing.
       if (effortMode && !requestInfo.effortRepaired
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         const fix = repairEffort(body, effortMode, errorBody);
         if (fix.body) {
           // Latch it so LATER turns apply the working level up front: the client resends the
@@ -1623,7 +1651,7 @@ async function forwardRequest(
       // it when a provider can actually serve it (profile=all with a GLM/Kimi token).
       const providerAvailable = accountManager.accounts?.some(a => a.type === 'provider' && a.enabled !== false);
       if (anthropicIncompat && requestInfo.sessionKey && providerAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         accountManager.markSessionIncompatible?.(requestInfo.sessionKey, requestInfo.homeProvider);
         excludedIndexes.add(account.index);
         console.log(`[Maxpool] Anthropic rejected this transcript (server_tool_use/thinking); pinning session to GLM/Kimi and retrying`);
@@ -1644,7 +1672,7 @@ async function forwardRequest(
       // Claude account exists to serve it; with none, the 400 surfaces (nothing bigger).
       const claudeAvailable = accountManager.accounts?.some(a => a.type !== 'provider' && a.enabled !== false);
       if (providerTooSmall && requestInfo.sessionKey && claudeAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         accountManager.markSessionLargeContext?.(requestInfo.sessionKey);
         // Bench EVERY provider: today's GLM + Kimi coding legs both cap at ~256K, so once
         // one 400s on size the others can't hold it either. If a genuine 1M-context
@@ -1666,7 +1694,7 @@ async function forwardRequest(
       // latch the session — the fault is one request's shape, not a durable property of
       // the conversation, and latching would evict a session from GLM on a single blip.
       if (providerRejectedShape && claudeAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         for (const a of (accountManager.accounts || [])) {
           if (a.type === 'provider') excludedIndexes.add(a.index);
         }
@@ -1684,7 +1712,7 @@ async function forwardRequest(
       // Trigger on the DETERMINISTIC signature rejection only — never the fuzzy
       // isAnthropicIncompatBody heuristic, so an unrelated malformed request keeps its
       // own upstream error instead of being mislabelled a provider-contamination.
-      if (isSignatureRejection && !res.headersSent) {
+      if (isSignatureRejection && !clientHasRealBytes(res, requestInfo)) {
         const provs = (accountManager.accounts || []).filter(a => a.type === 'provider');
         // Say only what ACTUALLY happened. `thinkingStripped` is set only when the strip
         // ran; without it we found nothing provider-shaped, so claiming we stripped —
@@ -1964,7 +1992,7 @@ async function forwardRequest(
     }
 
     accountManager.releaseAccount(lease, { error: err.message });
-    if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+    if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
       account.status = 'error';
       excludedIndexes.add(account.index);
       return forwardRequest(
@@ -2872,6 +2900,13 @@ function sendErrorBody(res, requestInfo, status, body, headers) {
   responseHeaders['content-type'] ||= 'application/json';
   res.writeHead(status, responseHeaders);
   res.end(body);
+}
+
+/** True once the client received REAL response bytes. The queue/grace keep-alive commits
+ *  headers plus pings, so res.headersSent is true while nothing is delivered yet: repairs
+ *  and failover stay safe until streamResponse stops the keep-alive. */
+function clientHasRealBytes(res, requestInfo) {
+  return res.headersSent && !requestInfo.queueHeartbeatActive;
 }
 
 async function queueAndRetry(

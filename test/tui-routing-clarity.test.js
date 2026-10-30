@@ -38,7 +38,7 @@ test('an account held at its usage cap reads "capped" in the Status column, not 
 
 test('a provider whose 5h window is full reads "5h full" in the Status column, not "active"', () => {
   const am = new AccountManager([provider('glm full'), provider('glm ok')], 0.95);
-  am.accounts[0].quota = { ...am.accounts[0].quota, providerSes: 0.97, providerSesReset: Date.now() + 2 * 3600_000, providerWk: 0.5 };
+  am.accounts[0].quota = { ...am.accounts[0].quota, providerSes: 1, providerSesReset: Date.now() + 2 * 3600_000, providerWk: 0.5 };
   am.accounts[1].quota = { ...am.accounts[1].quota, providerSes: 0.10, providerWk: 0.5 };
   assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: the router refuses this account');
   const text = captureRender(tuiFor(am));
@@ -103,7 +103,7 @@ test('a 5h window whose reset has PASSED is not "5h full" — the account is fre
 
 test('a GLM account past its 5h reset stamp is still refused (its reading is only cleared by the next usage check) — must not read "active"', () => {
   const am = new AccountManager([provider('glm stale')], 0.95);
-  Object.assign(am.accounts[0].quota, { providerSes: 0.97, providerSesReset: Date.now() - 60_000, providerWk: 0.3 });
+  Object.assign(am.accounts[0].quota, { providerSes: 1, providerSesReset: Date.now() - 60_000, providerWk: 0.3 });
   assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: the router still refuses it');
   const row = strip(tuiFor(am)._renderAcct(0, 11, true));
   assert.match(row, /5h full/, `row: ${row}`);

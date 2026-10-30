@@ -7,6 +7,7 @@ import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
 // Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
 // local table so account-manager does not import a private constant).
 const WINDOW_MS_BY_KIND = { ses: 5 * 3600_000, wk: 7 * 86400_000 };
+const PROVIDER_SES_WALL = 1;  // provider 5h bench: serve to 100% (owner 2026-10-30); a usage cap still wins
 
 // A capacity window boundary must move by at least this much to count as a real
 // window ADVANCE rather than reset-stamp jitter (see noteCapacityWindowAdvance).
@@ -1567,7 +1568,8 @@ export class AccountManager {
    */
   _sessionBenchThreshold(account, now = Date.now()) {
     const cap = this._effectiveCap(account, 'ses', now);
-    return (cap != null && cap < this.switchThreshold) ? cap : this.switchThreshold;
+    const wall = account?.type === 'provider' ? PROVIDER_SES_WALL : this.switchThreshold;
+    return (cap != null && cap < wall) ? cap : wall;
   }
 
   /**
