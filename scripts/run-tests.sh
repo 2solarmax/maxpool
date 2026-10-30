@@ -9,6 +9,7 @@
 # subprocess-heavy reload file runs in its OWN node process — process exit frees
 # those resources between files.
 set -euo pipefail
+shopt -s nullglob
 cd "$(dirname "$0")/.."
 
 # Tests spawn real supervisor+worker subprocesses; on macOS the sleep-guard would
@@ -28,7 +29,7 @@ if [ -f "$_mkcert_root" ]; then export NODE_EXTRA_CA_CERTS="$_mkcert_root"; fi
 
 # Fast, in-process tests (everything except the subprocess-spawning reload files).
 fast=()
-for f in test/*.test.js; do
+for f in test/*.test.js test/*.test.mjs; do
   case "$f" in
     *reload-*) ;;            # handled per-file below
     *) fast+=("$f") ;;
