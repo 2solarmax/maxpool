@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.51] - 2026-10-30
+
+### Changed
+
+- Widen glob to *.test.mjs + nullglob (link-ttfb/ultra tests now run at release); rename to .test.js
+
 ## [1.24.50] - 2026-10-30
 
 ### Changed
