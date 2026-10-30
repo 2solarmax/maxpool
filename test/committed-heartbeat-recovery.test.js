@@ -149,13 +149,15 @@ test('a signature 400 on a request released from the queue is still repaired', a
 });
 
 test('a GLM row keeps serving past 95% of its session and benches at 100%; a cap still wins', () => {
-  const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.95);
+  const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z' }], 0.95, { crossProviderFallbackPolicy: 'always' });
   const a = am.accounts[0];
-  const info = { profile: 'all', path: '/v1/messages' };
+  const acquire = () => am.acquireAccount({ profile: 'all', path: '/v1/messages' }, new Set());
   a.quota.providerSes = 0.96; a.quota.providerSesReset = Date.now() + 3600_000;
-  assert.equal(am.hasAvailableRoute(info, new Set()), true, 'the ROUTER must serve it, not just the session helper');
+  const lease = acquire();
+  assert.equal(lease?.account?.name, 'glm', 'the ROUTER must serve it, not just the session helper');
+  am.releaseAccount(lease, { success: true, status: 200 });
   a.quota.providerSes = 1;
-  assert.equal(am.hasAvailableRoute(info, new Set()), false, 'benched at the real wall');
-  a.quota.providerSes = 0.96; a.capUtilization = 0.5;
-  assert.equal(am.hasAvailableRoute(info, new Set()), false, 'an owner cap outranks the wall');
+  assert.equal(acquire(), null, 'benched at the real wall');
+  a.quota.providerSes = 0.96; a.capUtilization = 0.5; a.capMode = 'fixed';
+  assert.equal(acquire(), null, 'an owner cap outranks the wall');
 });
