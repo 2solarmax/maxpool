@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.54] - 2026-10-31
+
+### Changed
+
+- Redteam fixes: boot-time single-writer seed (blocking), benched rows never claim grants, suite-wide test isolation, rc-gate 405 logging, token-divergence alarm
+
 ## [1.24.53] - 2026-10-31
 
 ### Changed
