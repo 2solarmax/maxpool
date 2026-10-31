@@ -173,3 +173,14 @@ test('STRICT: legacy single key is attributed as "legacy-key", never anonymous (
   } finally { await close(proxy); await close(upstream); }
 });
 
+
+test('STRICT fails CLOSED on malformed clients entries (a typo never reverts to keyless loopback)', async () => {
+  const am = new AccountManager(accounts(), 0.90);
+  // key not a string → the entry is unusable, but `clients` was ASKED FOR: strict stays ON.
+  const proxy = createProxyServer(am, { proxy: { clients: [{ name: 'max', key: 12345 }] } });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/maxpool/status`);
+    assert.equal(res.status, 401, 'loopback keyless rejected even though no usable key exists');
+  } finally { await close(proxy); }
+});

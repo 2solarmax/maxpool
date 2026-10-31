@@ -129,6 +129,34 @@ export function summarizeRemote(status) {
 }
 
 /** Test seam holder for PoolLink's timer (so tests don't leak handles). */
+/** Strip terminal control characters (ESC + C0/C1 except tab) from a string that
+ *  came off-box. Remote pool/account/caller names are rendered raw into the owner's
+ *  terminal; an OSC 52 / CSI sequence there can rewrite the clipboard or blank the
+ *  screen (security review 2026-10-31). Sanitized at INGRESS so no renderer has to. */
+export function safeText(v) {
+  if (typeof v !== 'string') return v;
+  return v.replace(/[\u0000-\u0008\u000A-\u001F\u007F-\u009F]/g, '');
+}
+
+function sanitizeRemoteStatus(json) {
+  if (!json || typeof json !== 'object') return json;
+  for (const a of Array.isArray(json.accounts) ? json.accounts : []) {
+    if (a && typeof a === 'object') { a.name = safeText(a.name); a.provider = safeText(a.provider); a.lastError = safeText(a.lastError); }
+  }
+  for (const p of Array.isArray(json.pools) ? json.pools : []) {
+    if (p && typeof p === 'object') {
+      p.name = safeText(p.name);
+      for (const a of Array.isArray(p.accounts) ? p.accounts : []) if (a && typeof a === 'object') a.name = safeText(a.name);
+    }
+  }
+  if (json.callers && typeof json.callers === 'object') {
+    const clean = {};
+    for (const [k, v] of Object.entries(json.callers)) clean[safeText(k)] = v;
+    json.callers = clean;
+  }
+  return json;
+}
+
 export class PoolLink {
   constructor(def, deps = {}) {
     this.name = def.name;
@@ -154,7 +182,7 @@ export class PoolLink {
     try {
       const r = await this._fetchRemoteStatus(this.url, this.key);
       if (r.ok) {
-        this.status = r.json;
+        this.status = sanitizeRemoteStatus(r.json);
         this.lastOkAt = r.at;
         this.lastError = null;
         this.identities = remoteIdentities(r.json);

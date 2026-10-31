@@ -272,8 +272,11 @@ const mitmServer = http.createServer((creq, cres) => {
     const dirHeaders = { ...creq.headers, host: DIRECT_HOST };
     try { _titleSync?.noteAuthHeaders(creq.url, creq.headers); } catch {}
     for (const h of Object.keys(dirHeaders)) if (h.startsWith('x-maxpool-')) delete dirHeaders[h];
-    // A pool key (mp-…) exported as ANTHROPIC_API_KEY for a shared pool must never
-    // travel to Anthropic on the direct leg.
+    // A pool key exported as ANTHROPIC_API_KEY for a shared pool must never travel
+    // to Anthropic on the direct leg. Compared by VALUE (not the mp- prefix): the
+    // per-person keys minted into Secret Manager have no guaranteed prefix, and a
+    // prefix match would silently leak any key that lacks it (security review 2026-10-31).
+    if (MAXPOOL_KEY && dirHeaders['x-api-key'] === MAXPOOL_KEY) delete dirHeaders['x-api-key'];
     if (String(dirHeaders['x-api-key'] || '').startsWith('mp-')) delete dirHeaders['x-api-key'];
     // Session-create responses: force identity encoding so the body is readable end-to-end.
     // The CLI negotiates zstd (server advertises zstd,gzip) and Node cannot decode zstd — a

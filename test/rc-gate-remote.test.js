@@ -30,3 +30,9 @@ test('rc-gate: a pool key (mp-…) is stripped from the DIRECT-to-Anthropic leg 
   // importable seam for the direct leg.
   assert.match(src, /if \(String\(dirHeaders\['x-api-key'\] \|\| ''\)\.startsWith\('mp-'\)\) delete dirHeaders\['x-api-key'\];/);
 });
+
+test('rc-gate: the pool key is stripped by VALUE too, not only by mp- prefix (security review 2026-10-31)', () => {
+  // Per-person keys minted into Secret Manager carry no guaranteed prefix; only an
+  // exact-value comparison stops one from riding the direct leg to api.anthropic.com.
+  assert.match(src, /if \(MAXPOOL_KEY && dirHeaders\['x-api-key'\] === MAXPOOL_KEY\) delete dirHeaders\['x-api-key'\];/);
+});

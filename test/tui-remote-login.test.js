@@ -63,19 +63,20 @@ test('remote login is POSTed with the remote name, dead row implies replace, not
   await t._sendLoginToRemote(MIRROR, creds, { accountUuid: 'R1', email: 'reports@gomokka.com' });
   assert.equal(received.length, 1);
   const b = received[0].body;
-  assert.equal(b.replace, true, 'dead mirror → replace semantics');
+  assert.equal('replace' in b, false, 'no dead replace field — the pool always applies a fresh login');
   assert.equal(b.account.accountUuid, 'R1');
   assert.equal(b.account.refreshToken, 'ref-1');
   assert.equal(b.account.name, 'reports@gomokka.com', 'remote name used, not any local alias');
   assert.ok(t.logs.some(l => l.includes('team pool')), 'log line written');
 });
 
-test('healthy mirror sends replace:false (the pool decides 409 vs apply)', async () => {
+test('healthy mirror: the fresh login is sent and applied the same way (pool always applies)', async () => {
   const MIRROR = makeMirror();
   const healthy = { ...MIRROR, refreshDead: false, status: 'active' };
   const t = stubTui([healthy]);
   await t._sendLoginToRemote(healthy, { accessToken: 'a', refreshToken: 'r', expiresAt: 1 }, { accountUuid: 'R1' });
-  assert.equal(received[0].body.replace, false);
+  assert.equal(received.length, 1);
+  assert.equal(received[0].body.account.refreshToken, 'r');
 });
 
 test('unreachable pool surfaces the error and never writes anything locally', async () => {

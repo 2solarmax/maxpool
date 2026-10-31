@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { appendEventLog } from './event-log.js';
 import { atomicConfigUpdate } from './config.js';
-import { HOP_HEADER, nextHopCount } from './pool-link.js';
+import { HOP_HEADER, nextHopCount, safeText } from './pool-link.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
@@ -167,16 +167,23 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // A non-loopback listen host also forces strict even without clients (a shared
   // pool must never trust by address). Default local config (loopback host, no
   // clients) keeps today's behavior exactly.
-  const clientList = Array.isArray(config.proxy?.clients)
-    ? config.proxy.clients.filter(c => c && typeof c.key === 'string' && c.key)
-    : [];
+  const rawClients = Array.isArray(config.proxy?.clients) ? config.proxy.clients : [];
+  const clientList = rawClients.filter(c => c && typeof c.key === 'string' && c.key);
+  // Fail CLOSED on intent: a non-empty `clients` list means the operator asked for
+  // per-person keys, even if every entry is malformed (hand-edited VM config, a key
+  // quoted as a number). Each dropped entry is logged so the typo is visible.
+  for (const c of rawClients) {
+    if (!(c && typeof c.key === 'string' && c.key)) {
+      console.error(`[Maxpool] proxy.clients entry ignored (missing/invalid key): name=${safeText(String(c?.name ?? '?'))}`);
+    }
+  }
   const clientByKey = new Map(clientList.map(c => [c.key, c.name]));
   // '0.0.0.0' stays in the trusted set for backward compatibility (a solo user who
   // binds every interface keeps keyless local use); it is warned about at startup
   // because it also exposes the pool to the network. Shared pools set `clients`.
   const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '0.0.0.0']);
   const hostIsLoopback = (config.proxy?.host == null) || LOOPBACK_HOSTS.has(String(config.proxy.host).toLowerCase());
-  const strictClients = clientByKey.size > 0 || !hostIsLoopback;
+  const strictClients = rawClients.length > 0 || !hostIsLoopback;
   const resolveCaller = (key, isLocal) => {
     if (key != null && clientByKey.has(key)) return { name: clientByKey.get(key), ok: true };
     // Legacy single key still works — including strict mode, so a solo user can
@@ -295,11 +302,22 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           rejectUnauthorized();
           return;
         }
-        const chunks = [];
-        for await (const c of req) chunks.push(c);
+        // An oauth payload is ~2 KB; cap well above that so a key holder can't grow the heap.
+        const chunks = []; let bodyBytes = 0;
+        for await (const c of req) {
+          bodyBytes += c.length;
+          if (bodyBytes > 256 * 1024) {
+            res.writeHead(413, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'too_large' }));
+            req.destroy();
+            return;
+          }
+          chunks.push(c);
+        }
         let body;
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { body = null; }
         const acct = body?.account;
+        if (acct && typeof acct.name === 'string') acct.name = safeText(acct.name);
         if (!acct || acct.type !== 'oauth' || typeof acct.accountUuid !== 'string' || !acct.accountUuid ||
             typeof acct.refreshToken !== 'string' || !acct.refreshToken || typeof acct.accessToken !== 'string' || !acct.accessToken) {
           res.writeHead(400, { 'Content-Type': 'application/json' });

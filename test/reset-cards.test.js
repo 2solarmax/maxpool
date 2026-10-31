@@ -342,3 +342,21 @@ test('W9: 24h boundary — refill exactly 24h+1s away redeems at the wall', () =
   a.quota.providerWkReset = Date.now() + 24 * 3600_000 + 1000;
   assert.equal(decideZai(a, cards)?.card?.recordId, 9, 'outside the wait window → redeem');
 });
+
+test('owner 2026-10-30: a dying weekly card/grant is never spent because of the SESSION window alone', () => {
+  const now = Date.now();
+  const soon = now + 3 * 3600 * 1000;   // < 24h left — dying
+  // z.ai: weekly 10%, session 96%, weekly card expiring in 3h
+  const zai = { enabled: true, quota: { providerSes: 0.96, providerWk: 0.10 } };
+  const cards = { weekly: [{ recordId: 'w1', expiresAt: soon, expired: false }], fiveHour: [] };
+  assert.equal(decideZai(zai, cards, now), null, 'session-driven dying spend refused');
+  // control: same card, weekly at 40% → dying value on the WEEKLY window → spend
+  const zaiWk = { enabled: true, quota: { providerSes: 0.10, providerWk: 0.40 } };
+  assert.equal(decideZai(zaiWk, cards, now)?.reason, 'dying value', 'weekly-driven dying spend still allowed');
+  // Claude: weekly-clearing grant, weekly 10%, session 96%, dying
+  const cl = { enabled: true, quota: { unified5h: 0.96, unified7d: 0.10 } };
+  const listing = { eligible: true, grants: [{ id: 'g1', usableNow: true, endsAt: soon, clears: ['five_hour', 'seven_day'] }] };
+  assert.equal(decideClaude(cl, listing, now), null, 'session-driven dying grant refused');
+  const clWk = { enabled: true, quota: { unified5h: 0.10, unified7d: 0.40 } };
+  assert.equal(decideClaude(clWk, listing, now)?.reason, 'dying value', 'weekly-driven dying grant still allowed');
+});

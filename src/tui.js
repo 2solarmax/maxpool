@@ -52,7 +52,6 @@ function whereCell(a) {
 function providerLabel(a) {
   if (a.type === 'pool') return 'Team pool';
 
-  if (a._cloud) return (PROVIDER_LABELS[a.provider] || a.provider || 'Cloud').slice(0, PROVIDER_W - 1) + '☁';
   const key = a.provider || (a.type === 'provider' ? 'provider' : 'anthropic');
   const label = PROVIDER_LABELS[key] || (key.charAt(0).toUpperCase() + key.slice(1));
   return label.slice(0, PROVIDER_W);
@@ -1507,7 +1506,6 @@ export class TUI {
   async _sendLoginToRemote(mirror, creds, profile) {
     const remote = mirror.remote;
     const name = remote.remoteName || mirror.name;
-    const replace = Boolean(mirror.refreshDead || mirror.status === 'error');
     process.stdout.write(`\n"${name}" lives in the team pool (${remote.linkName}) — sending the fresh login there…\n`);
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), 20_000);
@@ -1524,14 +1522,11 @@ export class TUI {
             expiresAt: creds.expiresAt,
             source: 'remote-login',
           },
-          replace,
         }),
         signal: ctl.signal,
       });
       const json = await res.json().catch(() => ({}));
-      if (res.status === 409) {
-        process.stdout.write(`\nTeam pool says "${name}" is already healthy — nothing to do. Nothing was saved on this laptop.\n`);
-      } else if (res.ok && json.ok) {
+      if (res.ok && json.ok) {
         process.stdout.write(`\nDone: "${name}" ${json.result === 'added' ? 'added to' : 're-authenticated in'} the team pool. Nothing was saved on this laptop.\n`);
         this._addLog(`Remote login: "${name}" → team pool ${remote.linkName} (${json.result})`);
       } else {
@@ -2211,6 +2206,17 @@ export class TUI {
     // A row benched by the duplicate guard renders the CLOUD's live copy (status,
     // bars, in-flight, request counts) — never the stale local snapshot. Identity
     // and name stay local so the row doesn't move.
+    const live = a?.poolBenchedBy ? this.am.remoteRowFor?.(a) : null;
+    if (live) {
+      const r = live.row;
+      a = Object.assign(Object.create(Object.getPrototypeOf(a)), a, {
+        quota: { ...a.quota, ...(r.quota || {}) },
+        inFlight: r.inFlight ?? 0,
+        completedRequests: r.completedRequests ?? a.completedRequests,
+        refreshDead: Boolean(r.refreshDead),
+        rateLimitedUntil: r.rateLimitedUntil ? Date.parse(r.rateLimitedUntil) : null,
+      });
+    }
 
     // Highlight the ACTIVE account(s) — drives BOTH the ► marker and the green
     // "active" status color. In manual mode that's the single pinned account (all
@@ -2250,8 +2256,12 @@ export class TUI {
     // the one running the recovery probe as "probing" and the rest "waiting"
     // (the pool-wide throttle banner above conveys the cause).
     const upstreamBlocking = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
-    let effectiveStatus = a._cloud
-      ? (a._cloudOk ? a.status : 'cloud-down')
+    // A mirror row whose link is down/stale is benched by syncRemoteMirrors with
+    // enabled=false — show it as cloud-unreachable, never as "disabled" (which reads
+    // as "I switched this off"). _cloud/_cloudOk were never set; key on a.remote.
+    const linkDown = a.remote && (a.remote.link?.lastError || a.remote.link?.lastOkAt == null);
+    let effectiveStatus = a.remote && (linkDown || a.enabled === false)
+      ? (linkDown ? 'cloud-down' : 'disabled')
       : (a.poolBenchedBy ? 'pool-benched' : (a.enabled === false ? 'disabled' : a.status));
     if (a.enabled !== false && upstreamBlocking && a.status === 'active') {
       effectiveStatus = a.inFlight > 0 ? 'probing' : 'waiting';
@@ -2652,7 +2662,7 @@ export class TUI {
         .map(c => lpadVis(String(c), CW)).join('')));
 
     const link = (this.am.poolLinks || []).find(l => l.lastOkAt);
-    out.push(dim(`  data since boot${link ? ` · team pool synced ${new Date(link.lastOkAt).toLocaleTimeString()}` : ''}`));
+    out.push(dim(`  rolling windows · restarts included${link ? ` · team pool synced ${new Date(link.lastOkAt).toLocaleTimeString()}` : ''}`));
     return out;
   }
 

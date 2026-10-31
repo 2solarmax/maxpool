@@ -401,6 +401,28 @@ test('SC20 automatic guard, FINAL shape: duplicate local copy stays LISTED with 
   am.setPoolLinks([]);
 });
 
+test('SC20 live bars: a benched local copy renders the CLOUD row\'s quota, never its own frozen snapshot', async () => {
+  const am = new AccountManager([
+    { name: 'shared', type: 'oauth', accountUuid: 'U1', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.9, { routingMode: 'balance' });
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.status = { accounts: [{ name: 'shared', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active',
+    inFlight: 0, quota: { unified5h: 0.17, unified7d: 0.83 } }] };
+  link.identities = new Map([['uuid:U1', { name: 'shared' }]]);
+  am.setPoolLinks([link]);
+  const a = am.accounts.find(x => x.name === 'shared');
+  assert.ok(a.poolBenchedBy);
+  a.quota.unified5h = 0.04; a.quota.unified7d = 0.31;   // stale local snapshot from before the bench
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const line = strip(new TUI({ accountManager: am })._renderAcct(a.index, 11, true));
+  assert.match(line, /83%/, 'weekly bar reads the cloud copy');
+  assert.doesNotMatch(line, /31%/, 'stale local weekly never shown');
+  assert.equal(a.quota.unified7d, 0.31, 'render never mutates the local account');
+  am.setPoolLinks([]);
+});
+
 test('red-team #3 fixes: mirrors never mirror a mirror, never removed at runtime, out of the local global cap, no uuid aliasing', async () => {
   const am = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1' }], 0.9, { routingMode: 'balance' });
   const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
@@ -488,5 +510,25 @@ test('SC19 sort + hide: Where groups first (local before cloud), h also hides gu
   const visible = t._displayOrder().map(i => am.accounts[i]).filter(a => !(t.hideDisabled && a.enabled === false) && !(t.hideDisabled && a.poolBenchedBy) && a.type !== 'pool');
   assert.ok(!visible.some(a => a.poolBenchedBy), 'guarded local hidden under h');
   assert.ok(visible.some(a => a.remote), 'cloud rows still visible under h');
+  am.setPoolLinks([]);
+});
+
+test('link down: cloud mirror rows read "cloud ✕", never "disabled"', async () => {
+  const am = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1' }], 0.9, { routingMode: 'balance' });
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.status = { accounts: [{ name: 'glm a', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 0, quota: {} }] };
+  link.identities = remoteIdentities(link.status);
+  am.setPoolLinks([link]);
+  const m = am.accounts.find(x => x.remote);
+  assert.ok(m, 'mirror row exists');
+  link.lastError = 'ECONNREFUSED';
+  am.syncRemoteMirrors(link);
+  assert.equal(m.enabled, false, 'down link takes the mirror out of routing');
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const line = strip(new TUI({ accountManager: am })._renderAcct(m.index, 11, true));
+  assert.match(line, /cloud ✕/, 'reads as cloud unreachable');
+  assert.doesNotMatch(line, /disabled/, 'never "disabled"');
   am.setPoolLinks([]);
 });

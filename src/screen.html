@@ -110,7 +110,9 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
   function render(s) {
     // Live needs-login accounts first; switched-off accounts last.
     function rank(a) { return a.enabled === false ? 2 : (a.refreshDead ? 0 : 1); }
-    var accts = (s.accounts || []).slice().sort(function (x, y) {
+    // Mirror rows (a.remote) render only under their pool chip below — keeping
+    // them in the main grid duplicated every cloud account on the linking machine.
+    var accts = (s.accounts || []).filter(function (a) { return !a.remote; }).sort(function (x, y) {
       return rank(x) - rank(y) || String(x.name).localeCompare(String(y.name));
     });
     var dead = accts.filter(function (a) { return a.refreshDead && a.enabled !== false; }).length;
@@ -134,7 +136,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     }).join('');
     var ver = (s.runningVersion || (s.version && s.version.current) || '');
     var cloud = (s.pools || []).reduce(function (n, p) { return n + (p.accounts || []).length; }, 0);
-    app.innerHTML = '<header><h1>Maxpool accounts</h1><span class="meta">' + accts.length + ' local' + (cloud ? ' · ' + cloud + ' cloud' : '') + ' accounts' +
+    app.innerHTML = '<header><h1>Maxpool accounts</h1><span class="meta">' + accts.length + ' on this Mac' + (cloud ? ' · ' + cloud + ' cloud' : '') + ' accounts' +
       (dead ? ' · <b style="color:var(--bad)">' + dead + (dead === 1 ? ' needs login' : ' need login') + '</b>' : '') +
       (ver ? ' · v' + esc(ver) : '') + ' · updated ' + new Date().toLocaleTimeString() + '</span>' +
       '<button class="link" id="out">Forget key</button></header>' +

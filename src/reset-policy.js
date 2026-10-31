@@ -72,10 +72,12 @@ export function decideZai(account, cards, now = Date.now()) {
 
   // --- weekly card: clears BOTH windows (z.ai docs; measured: glm1 100%->0% both)
   if (weeklyCard) {
-    const worst = Math.max(wkUtil ?? 0, sesUtil ?? 0);
     const atWall = wkUtil != null && wkUtil >= POLICY.wallWeekly;
+    // Dying gate reads the WEEKLY window alone (owner 2026-10-30: resets are never
+    // spent on session limits). The old Math.max(wk,ses) let a 96% 5h window redeem
+    // a scarce weekly card — the exact trade the owner banned.
     const dying = msLeft(weeklyCard.expiresAt, now) < POLICY.dyingWindowMs
-      && worst >= POLICY.dyingMinUtilWeekly;
+      && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;
     if (atWall || dying) {
       // R6: a wall redeem waits when the FREE weekly refill is imminent and the
       // account isn't critically full (dying-value redeems stay exempt above).
@@ -122,7 +124,7 @@ export function decideClaude(account, listing, now = Date.now()) {
 
   // use_requires_limit: some grants may only fire AT the wall (server-enforced).
   const dying = msLeft(chosen.endsAt, now) < POLICY.dyingWindowMs
-    && Math.max(wkUtil ?? 0, sesUtil ?? 0) >= POLICY.dyingMinUtilWeekly;
+    && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;  // weekly window only (owner 2026-10-30)
   // A requires-limit grant cannot be redeemed pre-wall even for dying value.
   if (atWall || (dying && !chosen.requiresLimit)) {
     return { kind: 'grant', grant: chosen, reason: atWall ? 'at wall' : 'dying value' };
