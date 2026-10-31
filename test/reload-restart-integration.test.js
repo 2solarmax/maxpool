@@ -142,6 +142,8 @@ test('boot with unreachable team pool keeps duplicates benched via persisted ide
     child = spawn(process.execPath, [cliPath, 'server'], {
       env: { ...process.env, MAXPOOL_CONFIG: configPath },
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,   // own process group: `server` forks a worker; killing only the
+                        // supervisor left the worker holding the pipes (suite hang)
     });
     child.stdout.on('data', c => { out += c; });
     child.stderr.on('data', c => { out += c; });
@@ -153,7 +155,7 @@ test('boot with unreachable team pool keeps duplicates benched via persisted ide
     assert.match(out, /Duplicate guard: local account "shared"/, 'the SEED benched the local copy before any poll could run — the pool is unreachable, so no other bench source exists');
     assert.ok(!/Duplicate guard released/.test(out), 'no un-bench at boot');
   } finally {
-    child?.kill('SIGKILL');
+    if (child) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } }
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 });
