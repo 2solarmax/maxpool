@@ -5,6 +5,13 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.53] - 2026-10-31
+
+### Changed
+
+- Council review fixes (product+security): live bars for benched rows, weekly-only dying spend, screen de-dupe, cloud-down status, ingress sanitizer, fail-closed clients, value-based key strip, inject body cap
+- Drop session-util locals the weekly-only dying gate no longer reads
+
 ## [1.24.52] - 2026-10-30
 
 ### Changed
