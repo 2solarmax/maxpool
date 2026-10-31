@@ -5,6 +5,14 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.60] - 2026-10-31
+
+### Changed
+
+- Thinking-signature 400s: stop charging healthy Claude accounts a failure (owner 2026-10-31 'why so many errors')
+- Boot-seed integration test kills its whole process group (release suite hang)
+- /v1/environments/* goes DIRECT — Remote Control machine registration is identity-bound
+
 ## [1.24.59] - 2026-10-31
 
 ### Changed
