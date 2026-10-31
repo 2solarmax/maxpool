@@ -555,8 +555,14 @@ mitmServer.headersTimeout = 0;
 mitmServer.requestTimeout = 0;
 mitmServer.keepAliveTimeout = 0;
 
+let plain405 = 0;
 const gate = http.createServer((req, res) => {
-  // Plain (non-CONNECT) requests shouldn't arrive; answer honestly.
+  // Plain (non-CONNECT) requests shouldn't arrive; answer honestly — and SAY SO.
+  // A plain request means some client treats this gate as a plain HTTP proxy
+  // (HTTP_PROXY pointing here, a global-agent setup) — invisible without a trace
+  // (the 2026-10-31 session-death diagnosis had zero gate-side evidence).
+  plain405++;
+  console.error(`[rc-gate] plain ${req.method} ${req.url} from ${req.socket.remoteAddress} → 405 (client is using this as a non-CONNECT proxy)`);
   res.writeHead(405).end('rc-gate: CONNECT only');
 });
 gate.on('connect', (req, clientSocket, head) => {

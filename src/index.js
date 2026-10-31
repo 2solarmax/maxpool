@@ -648,6 +648,12 @@ async function serverWorkerCommand() {
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
   if (savedState?.callerStats) accountManager.restoreCallerStats?.(savedState.callerStats);
+  // Boot-time single-writer guard: seed each link's identity map from the last
+  // persisted run so a boot during a link outage doesn't un-bench local copies
+  // (red-team 2026-10-31). Replaced by the first successful poll.
+  if (savedState?.poolIdentities) {
+    accountManager.seedPoolLinks?.(savedState.poolIdentities, savedState.poolIdentitiesAt);
+  }
 
   // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
   // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
@@ -747,6 +753,10 @@ async function serverWorkerCommand() {
         // SC22 per-person analytics — same generation-guarded payload, survives
         // restarts and seamless reloads.
         callerStats: accountManager.exportCallerStats?.() || {},
+        // Last-good remote identity maps — the boot-time single-writer guard reads
+        // these (see restore above). Rides the same generation-guarded payload.
+        poolIdentities: accountManager.exportPoolIdentities?.() || null,
+        poolIdentitiesAt: Date.now(),
       },
       { expectedGeneration },
     )

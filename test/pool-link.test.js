@@ -532,3 +532,24 @@ test('link down: cloud mirror rows read "cloud ✕", never "disabled"', async ()
   assert.doesNotMatch(line, /disabled/, 'never "disabled"');
   am.setPoolLinks([]);
 });
+
+test('boot during link outage keeps local copies benched (persisted identities seed the guard)', async () => {
+  const am = new AccountManager([
+    { name: 'shared', type: 'oauth', accountUuid: 'U9', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.9, { routingMode: 'balance' });
+  // Boot: a FRESH link — no successful poll yet, identities empty, link not erroring either.
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  am.setPoolLinks([link]);
+  am.applyPoolLinks();
+  assert.equal(am.accounts.find(a => a.name === 'shared').poolBenchedBy, null,
+    'without a seed, a fresh boot during an outage RELEASES the copy (the red-team scenario)');
+  // The fix: seed from persisted state before the first poll.
+  link.identities = new Map();
+  am.seedPoolLinks({ team: { 'uuid:U9': { name: 'shared' } } }, Date.now());
+  const a = am.accounts.find(x => x.name === 'shared');
+  assert.equal(a.poolBenchedBy, 'shared', 'seeded identities bench the local copy at boot');
+  assert.equal(am._matchesRequest(a, 'all', { path: '/v1/messages' }), false, 'never routed while benched');
+  await am.ensureTokenFresh(a.index);
+  assert.equal(a.refreshToken, 'r', 'single-use refresh token never spent during the outage window');
+  am.setPoolLinks([]);
+});

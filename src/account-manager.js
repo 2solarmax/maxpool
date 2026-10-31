@@ -4762,6 +4762,28 @@ export class AccountManager {
     this.applyPoolLinks();
   }
 
+  /** Boot-time single-writer guard: seed each link's persisted identity map
+   *  (state.json) so a boot during a link outage keeps local copies benched
+   *  until the first successful poll (red-team 2026-10-31). */
+  seedPoolLinks(saved, savedAt) {
+    if (!saved || typeof saved !== 'object') return;
+    for (const l of this.poolLinks) {
+      const byName = saved[l.name];
+      if (byName) l.seedPoolIdentities?.(byName, savedAt);
+    }
+    this.applyPoolLinks();
+  }
+
+  /** Per-link identity maps for state.json (keyed by link name). */
+  exportPoolIdentities() {
+    const out = {};
+    for (const l of this.poolLinks) {
+      const ids = l.exportPoolIdentities?.();
+      if (ids) out[l.name] = ids;
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
   /** Apply duplicate benching + link health from the links' last polls. Idempotent. */
   applyPoolLinks() {
     const ids = new Map();
@@ -4774,6 +4796,19 @@ export class AccountManager {
     for (const a of this.accounts) {
       const wasBenched = Boolean(a.poolBenchedBy);
       const d = dups.find(x => x.index === a.index);
+      // Token-divergence alarm (red-team 2026-10-31): the cloud row for this
+      // identity is refreshDead while the local copy holds a healthy credential —
+      // both sides went dark in the boot-outage scenario. Name it loudly instead
+      // of silently benching the only working copy.
+      if (d) {
+        const remoteRow = (this.poolLinks || [])
+          .flatMap(l => (l.status?.accounts || []).filter(r => r.name === d.remoteName))[0];
+        if (remoteRow?.refreshDead && !a.refreshDead && a.refreshToken) {
+          const msg = `[Maxpool] Token divergence: team pool's "${d.remoteName}" is refreshDead but local "${a.name}" holds a live token — run /login on the local row to re-auth the team pool (one keystroke), or the account stays dark on both sides`;
+          console.log(msg);
+          appendEventLog(msg);
+        }
+      }
       a.poolBenchedBy = d ? (d.remoteName || 'team pool') : null;
       if (d && !wasBenched) {
         console.log(`[Maxpool] Duplicate guard: local account "${a.name}" also lives in team pool (${a.poolBenchedBy}) — benched locally, no routing, no token refresh`);

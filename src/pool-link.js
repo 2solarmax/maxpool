@@ -157,6 +157,17 @@ function sanitizeRemoteStatus(json) {
   return json;
 }
 
+/**
+ * Boot-time single-writer guard (red-team 2026-10-31, blocking): a fresh PoolLink
+ * starts with EMPTY identities, so a boot during a link outage saw ids={} and the
+ * duplicate guard RELEASED every local copy — which then served and rotated tokens
+ * the cloud still held (invalid_grant on the cloud row when the link returned; the
+ * healthy local copy re-benched → account dark on BOTH sides). The last good
+ * identity map is persisted in state.json; seedPoolIdentities() restores it at boot
+ * so a link that hasn't polled yet still benches what it benched last run.
+ */
+const BOOT_IDS_TTL_MS = 14 * 24 * 3600 * 1000;  // stale beyond this → trust a fresh boot instead
+
 export class PoolLink {
   constructor(def, deps = {}) {
     this.name = def.name;
@@ -174,6 +185,25 @@ export class PoolLink {
     this.lastOkAt = null;
     this.identities = new Map();
     this.summary = null;
+  }
+
+  /** Seed identities persisted from a previous run (state.json). Used until the
+   *  first successful poll replaces them; old seeds (>14d) are ignored. */
+  seedPoolIdentities(saved, savedAt) {
+    if (!saved || typeof saved !== 'object') return;
+    if (savedAt != null && Date.now() - savedAt > BOOT_IDS_TTL_MS) return;
+    if (this.identities && this.identities.size > 0) return;   // a real poll already ran
+    const m = new Map(Object.entries(saved).map(([k, v]) => [k, v]));
+    if (m.size > 0) {
+      this.identities = m;
+      this._bootSeeded = true;
+    }
+  }
+
+  /** Identity map for persistence (plain object). */
+  exportPoolIdentities() {
+    return this.identities && this.identities.size > 0
+      ? Object.fromEntries(this.identities) : null;
   }
 
   async poll() {
