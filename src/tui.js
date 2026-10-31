@@ -468,7 +468,7 @@ export class TUI {
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
     this.mode = 'normal';    // normal | accounts | routing | capacity | select | input | confirm | providers | addtype
-    this.capacityWindow = 'ses'; // capacity page window: 'ses' (5h) | 'wk' (weekly)
+    this.capacityWindow = 'wk'; // default weekly — the true tank (owner 2026-10-31); 'w' toggles to 5h
     // Hide disabled accounts from the table. With 8 dead/disabled accounts the live
     // ones scroll off the top; `h` collapses them to a one-line summary.
     // Restored from config so an auto-update/reload does not un-hide what the user hid.
