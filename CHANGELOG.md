@@ -5,6 +5,13 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.55] - 2026-10-31
+
+### Changed
+
+- Integration test proving the seed benches at boot (mutant-verified); seed moved into the link-setup tick; divergence alarm once per episode
+- Tests for the review fixes that had none (sanitizer, body cap, screen, double count); persisted identities now age from the last good poll; boot test no longer races its own config write
+
 ## [1.24.54] - 2026-10-31
 
 ### Changed
