@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.62] - 2026-10-31
+
+### Changed
+
+- Delete the aggregate type:'pool' row mechanism — mirrors are the only link rows (architect#5, second attempt, by hand)
+
 ## [1.24.61] - 2026-10-31
 
 ### Changed
