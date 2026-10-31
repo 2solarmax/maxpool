@@ -2703,11 +2703,11 @@ export class TUI {
     // Current is the live window (estimate while it runs; frozen into the columns at
     // close). Prev/Avg/N are the completed-cycle history. The no-weekly account's
     // weekly view approximates capacity as avg session tank × 33.6 (7×24/5h windows).
-    const ALL_COLS = ['Current', 'Prev', 'Avg', 'N'];
+    const ALL_COLS = ['Current', 'Prev', 'Avg', 'N', '$/1M'];
     const CW = 11;
     const nameW = 12;
     let COLS = ALL_COLS;
-    while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 14) > W) {
+    while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 22) > W) {
       COLS = COLS.slice(0, -1);
     }
     const header = '  ' + 'Account'.padEnd(nameW) + ' ' + 'Provider'.padEnd(PROVIDER_W) + ' '
@@ -2730,6 +2730,11 @@ export class TUI {
         const approx = sesTank && sesTank.n > 0
           ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
         const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
+        // Same price cell as the main path: this account's weekly capacity IS the
+        // derived tank (avg 5h × 33.6) — the price column must not go blank here.
+        const p2 = this.am.monthlyPriceFor?.(a);
+        cellsByName['$/1M'] = gray((sesTank?.avg && p2)
+          ? ('$' + (p2 / (Math.round(sesTank.avg * (7 * 24) / 5) / 1e6)).toFixed(2)).padStart(CW) : '--'.padStart(CW));
         out.push('  ' + name + ' ' + prov + ' '
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
           + dim('  no weekly limit · avg 5h × 33.6'));
@@ -2761,6 +2766,19 @@ export class TUI {
         Avg: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
         N: (tank?.source === 'cycles' ? String(tank.n) : '--'),
       };
+      // $/1M (owner 2026-10-31 "price per token, not per subscription"): the measured
+      // weekly tank divided by the plan's monthly-normalized price. Weekly in BOTH
+      // views — a 5h tank refills ~33.6x per week, so the weekly figure is what a
+      // month of subscription actually buys. '--' until a tank reading AND a price exist.
+      const sesTankObj = this.am.capacityTank?.(i, 'ses');
+      const wkTank = (a.quota?.weeklyAbsent && a.type === 'provider')
+        ? (sesTankObj?.avg ? Math.round(sesTankObj.avg * (7 * 24) / 5) : null)
+        : (this.am.capacityTank?.(i, 'wk')?.avg ?? null);
+      const price = this.am.monthlyPriceFor?.(a);
+      const priceCell = (wkTank && price)
+        ? '$' + (price / (wkTank / 1e6)).toFixed(2)
+        : '--';
+      cellsByName['$/1M'] = gray(priceCell.padStart(CW));
       const row = '  ' + name + ' ' + prov + ' '
         + COLS.map(c => cellsByName[c].padStart(CW)).join('');
       out.push(row + (curPct ? ' ' + curPct : ''));
@@ -2769,6 +2787,7 @@ export class TUI {
     out.push('');
     out.push(' ' + dim('Capacity = tokens ÷ how full the provider said the window was, at close.'));
     out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
+    out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized). -- = no price or tank yet.'));
     return out;
   }
 

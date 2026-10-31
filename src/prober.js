@@ -9,6 +9,7 @@
 
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
 import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
+import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
 import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
 import { decideZai, decideClaude } from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
@@ -205,6 +206,16 @@ export class Prober {
       // A duplicate-guard-benched copy never redeems: the team pool owns that key now,
       // and two pools redeeming one key would burn two cards for one reset.
       if (account.enabled !== false && account.credential && !account.poolBenchedBy) {
+        // Subscription (price-per-token column): same cadence, same key, best-effort.
+        if (account.provider === 'zai' && this.am.applyMonthlyPrice) {
+          try {
+            if (!account._subsCheckedAt || Date.now() - account._subsCheckedAt > 24 * 3600_000) {
+              const subs = await this._withTimeout(listSubscriptions(account.credential));
+              account._subsCheckedAt = Date.now();
+              if (subs && !subs.error) this.am.applyMonthlyPrice(account.index, monthlyPriceUSD(subs.subscriptions));
+            }
+          } catch { /* price is display-only */ }
+        }
         if (account.provider === 'zai' && this.am.applyResetCards) {
           try {
             const cards = await this._withTimeout(this.cardsFn(account.credential));

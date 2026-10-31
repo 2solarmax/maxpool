@@ -3706,6 +3706,25 @@ export class AccountManager {
 
   /** Store the latest reset-card listing for an account (prober piggyback).
    *  Read by redeem policy AND by _scoreAccount's reset-aware preference. */
+  /** Monthly-normalized price for the Capacity page's $/1M column (display-only;
+   *  never touches routing). Claude accounts read config.scheduler.monthlyPriceUSD
+   *  (name → USD/mo; no per-account price API exists), providers get theirs from
+   *  the z.ai subscription API via the prober. */
+  applyMonthlyPrice(accountIndex, usd) {
+    const a = this.accounts[accountIndex];
+    if (a) a.monthlyPriceUSD = usd;
+  }
+
+  monthlyPriceFor(account) {
+    if (account?.type === 'provider') return account.monthlyPriceUSD ?? null;
+    const tbl = this.scheduler?.monthlyPriceUSD;
+    if (tbl && typeof tbl === 'object') {
+      const hit = tbl[account?.name] ?? tbl['*'];
+      if (Number.isFinite(hit)) return hit;
+    }
+    return null;
+  }
+
   applyResetCards(accountIndex, cards) {
     const account = this.accounts[accountIndex];
     if (!account || !cards) return;

@@ -615,3 +615,34 @@ test('pin drop with a legacy-key link is named loudly, not silent (council 2026-
   assert.match(src, /pin-account dropped: the link authenticated with the remote\\'s legacy apiKey/,
     'the misconfiguration is named in the log');
 });
+
+test('capacity page $/1M: price ÷ measured weekly tank, monthly-normalized (owner 2026-10-31)', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { monthlyPriceUSD } = await import('../src/zai-subs.js');
+  // quarterly $403.2 → $134.4/mo; annual $1411.2 → $117.6/mo
+  assert.equal(monthlyPriceUSD([{ status: 'VALID', autoRenew: true, billingCycle: 'quarterly', price: 403.2 }]), 134.4);
+  assert.ok(Math.abs(monthlyPriceUSD([{ status: 'VALID', autoRenew: true, billingCycle: 'annually', price: 1411.2 }]) - 117.6) < 1e-9);
+  assert.equal(monthlyPriceUSD([]), null);
+  assert.equal(monthlyPriceUSD([{ status: 'VALID', autoRenew: true, billingCycle: 'weekly', price: 5 }]), null, 'unknown cycle → null');
+  // end-to-end render: provider row with wk tank 8M and $134.4/mo → $16.80/1M
+  const am = new AccountManager([
+    { name: 'glm q', type: 'provider', provider: 'zai', credential: 'k', profiles: ['all'] },
+    { name: 'claude priced', type: 'oauth', accountUuid: 'C9', accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.9, { routingMode: 'balance', monthlyPriceUSD: { 'claude priced': 200 } });
+  // Open a weekly cycle, accrue tokens, then close at 80% full — exactly the
+  // production path (accrue opens, utilization observations set peak, close freezes).
+  for (const [nm, toks] of [['glm q', 6_400_000], ['claude priced', 1_600_000]]) {
+    const L = am.capacity;
+    L.accrue(nm, { input: Math.round(toks / 2), output: Math.round(toks / 2) }, Date.now() - 6 * 86400e3, ['wk']);
+    L.estimateFromUtilization(nm, 'wk', 0.8);
+    L.closeCycle(nm, 'wk', Date.now(), { finalUtilization: 0.8 });
+  }
+  am.applyMonthlyPrice(am.accounts[0].index, 134.4);
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const page = new TUI({ accountManager: am, config: {} })._renderCapacityPage(140).map(strip).join('\n');
+  assert.match(page, /\$16\.80/, 'glm q: 134.4 ÷ 8M');
+  assert.match(page, /\$100\.00/, 'claude priced: $200 ÷ measured 2M tank');
+  assert.match(page, /\$\/1M/, 'header present');
+  assert.match(page, /price per token|monthly-normalized/, 'legend names the derivation');
+});

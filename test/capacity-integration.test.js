@@ -488,7 +488,7 @@ test('J2 (M4): at W=80 the page drops trailing columns instead of truncating mid
     const header = page.split('\n').find(l => l.includes('Account') && l.includes('Current'));
     assert.ok(header, `the header renders at W=${width}`);
     assert.ok(header.length <= width, `the header fits W=${width}`);
-    assert.ok(/(Current|Prev|Avg|N)\s*$/.test(header.trimEnd()),
+    assert.ok(/(Current|Prev|Avg|N|\$\/1M)\s*$/.test(header.trimEnd()),
       `no half-rendered header cell at W=${width}: "${header.trimEnd().slice(-14)}"`);
     const row = page.split('\n').find(l => l.includes('claude1'));
     // renderCapacity already strips ANSI; visible width is what fits the terminal.
