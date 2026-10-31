@@ -1495,7 +1495,13 @@ async function forwardRequest(
       const effortMode = classifyEffortRejection(errorBody);
       // A rejected effort level is a REQUEST-shaped fault, not an account-health signal —
       // release neutral so it never charges a consecutive-failure to a healthy account.
-      accountManager.releaseAccount(lease, effortMode
+      // Same for a thinking-signature rejection: the TRANSCRIPT carries another
+      // account's/provider's thinking, the Claude account itself is healthy, and the
+      // strip-and-retry below recovers the request. Charging it a failure cooled healthy
+      // accounts and filled the screen with red counts (2026-10-31: 26 such 400s across
+      // 14 sessions, every one recovered, while kira + max@gomokka.com showed 39/40 failed).
+      const neutral = Boolean(effortMode) || errorType === 'invalid_thinking_signature';
+      accountManager.releaseAccount(lease, neutral
         ? { status: upstreamRes.status, error: errorType, neutral: true }
         : { status: upstreamRes.status, error: errorType });
 
@@ -1505,7 +1511,7 @@ async function forwardRequest(
         writeRequestLog(logDir, reqId, logSections);
       }
       if (errorType === 'invalid_thinking_signature') {
-        console.log(`[Maxpool] Non-retryable Anthropic thinking signature error on "${account.name}"`);
+        console.log(`[Maxpool] Transcript carries another provider's thinking; stripping and retrying (account "${account.name}" is fine, not penalized)`);
         // Fail-safe: if this request had been MIGRATED to a different Claude account
         // this turn (cross-account thinking rebalance), the rejected block was issued
         // by the PRE-MIGRATION account. Revert the session there, exclude the failed

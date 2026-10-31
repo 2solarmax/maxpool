@@ -7,6 +7,7 @@
 // session (incl. signed thinking) can fall to GLM/Kimi when Claude is unavailable.
 
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { __serverTest } from '../src/server.js';
@@ -228,4 +229,14 @@ test('describeRequest wires anthropicIncompatible/homeProvider onto requestInfo 
   assert.equal(kimi.homeProvider, 'kimi', 'but the home-provider hint is recorded');
   const fresh = describeRequest(req, body({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'hi' }] }));
   assert.equal(fresh.anthropicIncompatible, undefined);
+});
+
+test('owner 2026-10-31: a thinking-signature rejection does NOT charge the Claude account a failure (transcript fault, not account fault)', async () => {
+  // Static-contract pin (the full 4xx pipeline needs a live upstream; the release
+  // predicate is one expression — pin it directly).
+  const src = readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  assert.match(src, /const neutral = Boolean\(effortMode\) \|\| errorType === 'invalid_thinking_signature';/,
+    'signature rejections release neutral');
+  assert.doesNotMatch(src, /Non-retryable Anthropic thinking signature error/,
+    'the old alarming log line is gone');
 });

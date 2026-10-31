@@ -1347,8 +1347,11 @@ test('nonretryable 400 is recorded as failure and passed through', async () => {
     assert.match(body.error.message, /Start a new session/, 'leads with the way out');
     assert.match(body.error.message, /could not repair automatically/,
       'honest: does not fabricate a GLM/Kimi story when nothing was repaired');
-    assert.equal(am.accounts[0].failedRequests, 1);
-    assert.equal(am.accounts[0].lastError, 'invalid_thinking_signature');
+    // 2026-10-31: a thinking-signature rejection is a TRANSCRIPT fault — the account
+    // releases NEUTRAL now (no failure charge, no cooldown); the strip-and-retry or the
+    // surfaced remedy handles the request. The account stays at 0 failed.
+    assert.equal(am.accounts[0].failedRequests, 0, 'signature 400 no longer charges the account');
+    assert.equal(am.accounts[0].lastError, null);
     assert.equal(am.accounts[1].usage.totalRequests, 0);
   } finally {
     await close(proxy);
