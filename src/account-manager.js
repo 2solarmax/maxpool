@@ -1385,7 +1385,20 @@ export class AccountManager {
     const ticket = requestInfo.queueTicket;
     if (!ticket) return true;
     this._reapStaleQueueHead();
-    if (this.queueState.waiting[0]?.id !== ticket.id) return false;
+    // BOUNDED HEAD-SKIP (council red-team #5, 2026-10-31): strict FIFO let an
+    // unserveable HEAD (claude-profile with every Claude weekly-walled) block a
+    // serveable follower (all-profile, healthy GLM) for the head's full window —
+    // up to 25 min of "pool dead" while capacity idled. A waiter that has already
+    // waited HEAD_SKIP_MS may be admitted even when tickets ahead of it exist.
+    // Fairness stays: the skip only fires after a real wait, and the head's own
+    // window (queueAndRetry's ceiling) still bounds IT.
+    const HEAD_SKIP_MS = 60_000;
+    if (this.queueState.waiting[0]?.id === ticket.id) {
+      // fast path: unchanged FIFO
+    } else {
+      const waited = Date.now() - (ticket.queuedAt ?? Date.now());
+      if (waited < HEAD_SKIP_MS) return false;
+    }
     const now = Date.now();
     if (now < this.queueState.rampUntil && now - this.queueState.lastAdmissionAt < 250) return false;
     this.queueState.waiting.shift();

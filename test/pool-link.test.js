@@ -646,3 +646,21 @@ test('capacity page $/1M: price ÷ measured weekly tank, monthly-normalized (own
   assert.match(page, /\$\/1M/, 'header present');
   assert.match(page, /price per token|monthly-normalized/, 'legend names the derivation');
 });
+
+test('queue head-skip: a serveable waiter is not blocked forever by an unserveable head (redteam#5)', () => {
+  const am = new AccountManager([{ name: 'glm', type: 'provider', provider: 'zai', credential: 'k', profiles: ['all'] }], 0.9, { routingMode: 'balance' });
+  // Head: enqueued 2 min ago (beyond the 60s bound). Follower: enqueued now.
+  const head = { queueTicket: { id: 1, queuedAt: Date.now() - 120_000, bytes: 100 } };
+  const follower = { queueTicket: { id: 2, queuedAt: Date.now(), bytes: 100 } };
+  am.queueState.waiting.push(head.queueTicket, follower.queueTicket);
+  // Follower within the bound: FIFO holds (no starvation of the head).
+  assert.equal(am.canAdmitQueuedRequest({ ...follower }), false, 'fresh follower still waits its turn');
+  // The HEAD itself always admits (unchanged FIFO fast path).
+  assert.equal(am.canAdmitQueuedRequest({ ...head }), true, 'head admits');
+  // Re-queue both; now let the FOLLOWER wait past the bound with a stuck head.
+  am.queueState.waiting.length = 0;
+  const stuckHead = { queueTicket: { id: 3, queuedAt: Date.now() - 300_000, bytes: 100 } };
+  const slowFollower = { queueTicket: { id: 4, queuedAt: Date.now() - 90_000, bytes: 100 } };
+  am.queueState.waiting.push(stuckHead.queueTicket, slowFollower.queueTicket);
+  assert.equal(am.canAdmitQueuedRequest({ ...slowFollower }), true, 'a 90s-waited follower skips the stuck head');
+});
