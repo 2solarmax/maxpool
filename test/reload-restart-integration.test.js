@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -118,5 +118,41 @@ test('restart with an in-flight request completes bounded and the server comes b
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
     upstream.close();
     held.forEach(res => { try { res.destroy(); } catch { /* noop */ } });
+  }
+});
+
+test('boot with unreachable team pool keeps duplicates benched via persisted identities (redteam 2026-10-31)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-bootseed-'));
+  const configPath = join(dir, 'config.json');
+  const child = spawn(process.execPath, [cliPath, 'server'], {
+    env: { ...process.env, MAXPOOL_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  child.stdout.on('data', c => { out += c; });
+  child.stderr.on('data', c => { out += c; });
+  try {
+    await writeFile(configPath, JSON.stringify({
+      proxy: { host: '127.0.0.1', port: 0, apiKey: 'bootseed-test' },
+      pools: [{ name: 'team', url: 'http://127.0.0.1:1', key: 'k', intervalMs: 60000 }],
+      accounts: [{ name: 'shared', type: 'oauth', accountUuid: 'U42', accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }],
+    }));
+    // Persisted identities from "last run": uuid:U42 benched on the cloud. The pool
+    // URL points at a dead port, so NOTHING but the seed can bench the local row.
+    await writeFile(configPath.replace(/\.json$/, '.state.json'), JSON.stringify({
+      _generation: 1,
+      poolIdentities: { team: { 'uuid:U42': { name: 'shared' } } },
+      poolIdentitiesAt: Date.now(),
+    }));
+    await new Promise((resolve) => {
+      const iv = setInterval(() => { if (/Team pools: 1 linked/.test(out)) { clearInterval(iv); resolve(); } }, 100);
+      setTimeout(() => { clearInterval(iv); resolve(); }, 8000);
+    });
+    assert.match(out, /Team pools: 1 linked/, 'boot reached link setup');
+    assert.match(out, /Duplicate guard: local account "shared"/, 'the SEED benched the local copy before any poll could run — the pool is unreachable, so no other bench source exists');
+    assert.ok(!/Duplicate guard released/.test(out), 'no un-bench at boot');
+  } finally {
+    child.kill('SIGKILL');
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 });

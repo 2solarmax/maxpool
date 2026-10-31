@@ -648,12 +648,6 @@ async function serverWorkerCommand() {
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
   if (savedState?.callerStats) accountManager.restoreCallerStats?.(savedState.callerStats);
-  // Boot-time single-writer guard: seed each link's identity map from the last
-  // persisted run so a boot during a link outage doesn't un-bench local copies
-  // (red-team 2026-10-31). Replaced by the first successful poll.
-  if (savedState?.poolIdentities) {
-    accountManager.seedPoolLinks?.(savedState.poolIdentities, savedState.poolIdentitiesAt);
-  }
 
   // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
   // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
@@ -709,6 +703,10 @@ async function serverWorkerCommand() {
       // as its own row (syncRemoteMirrors on every link poll) and balanced with the
       // local accounts by the unchanged routing logic.
       accountManager.setPoolLinks(links);
+      // Boot-time single-writer guard: seed from the last persisted run in the SAME
+      // tick as setPoolLinks, before the first poll or probe can run. Links must exist
+      // first (a seed above this point looped over an empty list and did nothing).
+      accountManager.seedPoolLinks(savedState?.poolIdentities, savedState?.poolIdentitiesAt);
       const armed = links.filter(l => l.key).length;
       console.log(`[Maxpool] Team pools: ${armed} linked${links.length - armed ? `, ${links.length - armed} unresolved key` : ''}`);
     } catch (err) {

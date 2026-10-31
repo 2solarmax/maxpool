@@ -4804,9 +4804,15 @@ export class AccountManager {
         const remoteRow = (this.poolLinks || [])
           .flatMap(l => (l.status?.accounts || []).filter(r => r.name === d.remoteName))[0];
         if (remoteRow?.refreshDead && !a.refreshDead && a.refreshToken) {
-          const msg = `[Maxpool] Token divergence: team pool's "${d.remoteName}" is refreshDead but local "${a.name}" holds a live token — run /login on the local row to re-auth the team pool (one keystroke), or the account stays dark on both sides`;
-          console.log(msg);
-          appendEventLog(msg);
+          // Once per episode: this runs on every 30s poll.
+          if (!a._divergenceLogged) {
+            a._divergenceLogged = true;
+            const msg = `[Maxpool] Token divergence: team pool's "${d.remoteName}" needs login while local "${a.name}" still has a stored token — log in again on that row, or the account stays unavailable on both sides`;
+            console.log(msg);
+            appendEventLog(msg);
+          }
+        } else {
+          a._divergenceLogged = false;
         }
       }
       a.poolBenchedBy = d ? (d.remoteName || 'team pool') : null;
