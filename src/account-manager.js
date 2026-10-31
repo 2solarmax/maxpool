@@ -4774,6 +4774,13 @@ export class AccountManager {
     this.applyPoolLinks();
   }
 
+  /** When these identities were last CONFIRMED by a good poll (a seed keeps its own
+   *  age, so the expiry in seedPoolIdentities can actually fire in a long outage). */
+  poolIdentitiesAt() {
+    const times = this.poolLinks.map(l => l.lastOkAt ?? l._seedAt ?? 0);
+    return times.length ? Math.max(...times) : null;
+  }
+
   /** Per-link identity maps for state.json (keyed by link name). */
   exportPoolIdentities() {
     const out = {};

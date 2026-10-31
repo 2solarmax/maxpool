@@ -553,3 +553,42 @@ test('boot during link outage keeps local copies benched (persisted identities s
   assert.equal(a.refreshToken, 'r', 'single-use refresh token never spent during the outage window');
   am.setPoolLinks([]);
 });
+
+test('polled status: control characters are stripped from every name a terminal renders', async () => {
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link._fetchRemoteStatus = async () => ({ ok: true, at: 1, json: {
+    accounts: [{ name: 'a\x1b]52;c;x\x07b', type: 'provider', provider: 'z\x1bai', lastError: 'e\x1b[2Jr' }],
+    pools: [{ name: 'p\x1bq', accounts: [{ name: 'r\x1bs' }] }],
+    callers: { 'c\x1bd': { requests: 1 } },
+    callerWindows: { 'e\x1bf': { total: 1 } },
+  } });
+  await link.poll();
+  assert.doesNotMatch(JSON.stringify(link.status), /\\u001b|\\u0007/);
+  assert.deepEqual(Object.keys(link.status.callerWindows), ['ef']);
+  assert.equal(link.status.accounts[0].name, 'a]52;c;xb');
+});
+
+test('no double count: undoing a forwarded request removes exactly one request from every window', () => {
+  const am = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1' }], 0.9, { routingMode: 'balance' });
+  am._bumpCaller('max', 1, 0);
+  am._bumpCaller('max', 1, 0);
+  am._unbumpCaller('max');
+  const st = am.callerStats.get('max');
+  const hour = new Date().toISOString().slice(0, 13), day = hour.slice(0, 10);
+  assert.deepEqual([st.total.req, st.hours[hour].req, st.days[day].req], [1, 1, 1]);
+});
+
+test('persisted identities age from the last good poll: an old seed is ignored, re-saving never refreshes it', () => {
+  const am = new AccountManager([
+    { name: 'shared', type: 'oauth', accountUuid: 'U9', accessToken: 'x', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.9, { routingMode: 'balance' });
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  am.setPoolLinks([link]);
+  const threeDaysAgo = Date.now() - 3 * 24 * 3600 * 1000;
+  am.seedPoolLinks({ team: { 'uuid:U9': { name: 'shared' } } }, threeDaysAgo);
+  assert.equal(am.poolIdentitiesAt(), threeDaysAgo, 'a re-save keeps the seed age');
+  link.identities = new Map(); link._seedAt = null;
+  am.seedPoolLinks({ team: { 'uuid:U9': { name: 'shared' } } }, Date.now() - 15 * 24 * 3600 * 1000);
+  assert.equal(am.accounts[0].poolBenchedBy, null, 'a seed older than 14 days is ignored');
+  am.setPoolLinks([]);
+});

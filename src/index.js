@@ -754,7 +754,7 @@ async function serverWorkerCommand() {
         // Last-good remote identity maps — the boot-time single-writer guard reads
         // these (see restore above). Rides the same generation-guarded payload.
         poolIdentities: accountManager.exportPoolIdentities?.() || null,
-        poolIdentitiesAt: Date.now(),
+        poolIdentitiesAt: accountManager.poolIdentitiesAt?.() ?? null,
       },
       { expectedGeneration },
     )

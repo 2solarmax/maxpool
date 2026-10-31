@@ -117,3 +117,34 @@ test('disk persist lands in the ISOLATED test config, never the real one', async
   const isolated = JSON.parse(readFileSync(ISOLATED_CONFIG, 'utf8'));
   assert.ok(isolated.accounts.some(a => a.accountUuid === 'N9'), 'persisted to isolated config');
 });
+
+test('inject: terminal control characters are stripped from the account name before it is stored', async () => {
+  const am = new AccountManager([], 0.9);
+  const proxy = createProxyServer(am, { proxy: { apiKey: KEY } });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/maxpool/accounts`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+      body: injectBody('NEW1', { name: 'evil\x1b]52;c;aGk=\x07row' }),
+    });
+    assert.equal(res.status, 200);
+    const names = am.accounts.map(a => a.name).join('|') + JSON.parse(readFileSync(ISOLATED_CONFIG, 'utf8')).accounts.map(a => a.name).join('|');
+    assert.doesNotMatch(names, /\x1b|\x07/, 'no control byte reaches memory or disk');
+    assert.match(names, /evil\]52;c;aGk=row/);
+  } finally { await close(proxy); }
+});
+
+test('inject: an oversized body answers 413 and stores nothing', async () => {
+  const am = new AccountManager([], 0.9);
+  const proxy = createProxyServer(am, { proxy: { apiKey: KEY } });
+  const port = await listen(proxy);
+  try {
+    const before = am.accounts.length;
+    const res = await fetch(`http://127.0.0.1:${port}/maxpool/accounts`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+      body: 'x'.repeat(300 * 1024),
+    });
+    assert.equal(res.status, 413);
+    assert.equal(am.accounts.length, before);
+  } finally { await close(proxy); }
+});

@@ -149,10 +149,13 @@ function sanitizeRemoteStatus(json) {
       for (const a of Array.isArray(p.accounts) ? p.accounts : []) if (a && typeof a === 'object') a.name = safeText(a.name);
     }
   }
-  if (json.callers && typeof json.callers === 'object') {
-    const clean = {};
-    for (const [k, v] of Object.entries(json.callers)) clean[safeText(k)] = v;
-    json.callers = clean;
+  // Person names key both maps; the People page reads callerWindows.
+  for (const field of ['callers', 'callerWindows']) {
+    if (json[field] && typeof json[field] === 'object') {
+      const clean = {};
+      for (const [k, v] of Object.entries(json[field])) clean[safeText(k)] = v;
+      json[field] = clean;
+    }
   }
   return json;
 }
@@ -196,7 +199,7 @@ export class PoolLink {
     const m = new Map(Object.entries(saved).map(([k, v]) => [k, v]));
     if (m.size > 0) {
       this.identities = m;
-      this._bootSeeded = true;
+      this._seedAt = savedAt ?? null;
     }
   }
 

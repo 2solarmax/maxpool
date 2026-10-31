@@ -124,13 +124,8 @@ test('restart with an in-flight request completes bounded and the server comes b
 test('boot with unreachable team pool keeps duplicates benched via persisted identities (redteam 2026-10-31)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-bootseed-'));
   const configPath = join(dir, 'config.json');
-  const child = spawn(process.execPath, [cliPath, 'server'], {
-    env: { ...process.env, MAXPOOL_CONFIG: configPath },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  let child = null;
   let out = '';
-  child.stdout.on('data', c => { out += c; });
-  child.stderr.on('data', c => { out += c; });
   try {
     await writeFile(configPath, JSON.stringify({
       proxy: { host: '127.0.0.1', port: 0, apiKey: 'bootseed-test' },
@@ -144,6 +139,12 @@ test('boot with unreachable team pool keeps duplicates benched via persisted ide
       poolIdentities: { team: { 'uuid:U42': { name: 'shared' } } },
       poolIdentitiesAt: Date.now(),
     }));
+    child = spawn(process.execPath, [cliPath, 'server'], {
+      env: { ...process.env, MAXPOOL_CONFIG: configPath },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.on('data', c => { out += c; });
+    child.stderr.on('data', c => { out += c; });
     await new Promise((resolve) => {
       const iv = setInterval(() => { if (/Team pools: 1 linked/.test(out)) { clearInterval(iv); resolve(); } }, 100);
       setTimeout(() => { clearInterval(iv); resolve(); }, 8000);
@@ -152,7 +153,7 @@ test('boot with unreachable team pool keeps duplicates benched via persisted ide
     assert.match(out, /Duplicate guard: local account "shared"/, 'the SEED benched the local copy before any poll could run — the pool is unreachable, so no other bench source exists');
     assert.ok(!/Duplicate guard released/.test(out), 'no un-bench at boot');
   } finally {
-    child.kill('SIGKILL');
+    child?.kill('SIGKILL');
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 });
