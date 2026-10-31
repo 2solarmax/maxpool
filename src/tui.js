@@ -2771,9 +2771,16 @@ export class TUI {
       // views — a 5h tank refills ~33.6x per week, so the weekly figure is what a
       // month of subscription actually buys. '--' until a tank reading AND a price exist.
       const sesTankObj = this.am.capacityTank?.(i, 'ses');
+      // Weekly-plan accounts: a measured weekly tank, or the derived form ses × 5.5 —
+      // MEASURED weekly tanks run 5-7× the 5h tank (2026-10-31: glm1 1.27M→8.58M,
+      // glm2 1.26M→6.85M, max+4 1.53M→7.21M): the weekly window holds ~5 full 5h
+      // refills, not 33.6. The owner caught the ×33.6 error here ("your math seems
+      // completely off"). weeklyAbsent plans (no weekly limit at all) keep ×33.6.
+      const WK_PER_SES = 5.5;
       const wkTank = (a.quota?.weeklyAbsent && a.type === 'provider')
         ? (sesTankObj?.avg ? Math.round(sesTankObj.avg * (7 * 24) / 5) : null)
-        : (this.am.capacityTank?.(i, 'wk')?.avg ?? null);
+        : (this.am.capacityTank?.(i, 'wk')?.avg
+          ?? (a.type === 'provider' && sesTankObj?.avg ? Math.round(sesTankObj.avg * WK_PER_SES) : null));
       const price = this.am.monthlyPriceFor?.(a);
       const priceCell = (wkTank && price)
         ? '$' + (price / (wkTank / 1e6)).toFixed(2)

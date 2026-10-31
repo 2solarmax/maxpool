@@ -673,3 +673,23 @@ test('architect#5 pin: the aggregate pool-row mechanism is DEAD — production n
   const callers = (amSrc.match(/upsertPoolAccount/g) || []).length;
   assert.equal(callers, 1, 'the only mention is the dead definition itself (no production caller)');
 });
+
+test('price cell derivation: weekly-plan accounts derive weekly tank at 5h × 5.5 (measured), not × 33.6 (owner 2026-10-31)', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const am = new AccountManager([
+    { name: 'glm wkplan', type: 'provider', provider: 'zai', credential: 'k', profiles: ['all'] },
+  ], 0.9, { routingMode: 'balance' });
+  const a = am.accounts[0];
+  a.quota.weeklyAbsent = false;          // a weekly-plan account
+  am.applyMonthlyPrice(0, 134.4);
+  // No wk cycle; one ses cycle → 5h tank 1.2M. Derived weekly = 6.6M → $20.36/1M.
+  const L = am.capacity;
+  L.accrue('glm wkplan', { input: 480_000, output: 480_000 }, Date.now() - 4.5 * 3600e3, ['ses']);
+  L.estimateFromUtilization('glm wkplan', 'ses', 0.8);
+  L.closeCycle('glm wkplan', 'ses', Date.now(), { finalUtilization: 0.8 });
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const page = new TUI({ accountManager: am, config: {} })._renderCapacityPage(140).map(strip).join('\n');
+  assert.match(page, /\$20\.36/, '134.4 ÷ (1.2M × 5.5)');
+  assert.doesNotMatch(page, /\$3\.\d\d/, 'the ×33.6 figure ($3.34) must not appear');
+});
