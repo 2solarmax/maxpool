@@ -213,6 +213,53 @@ gateDescribe('rc-gate: create POST arrives upstream COMPLETE (stream-abort regre
   }
 });
 
+gateDescribe('rc-gate: /v1/environments/* routes DIRECT (identity), not through the pool', async () => {
+  // The Remote Control MACHINE registration (bridge create / credential renew / work poll)
+  // renews on the saved claude.ai login; pool-routed renewal lands on the wrong account and
+  // the server rejects it ("could not renew this environment's credential", launchd hosts
+  // offline on the phone, 2026-10-31). Pin the classification both ways.
+  const directPath = { requests: [] };
+  const up = asTLS(http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      directPath.requests.push({ method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks) });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  }));
+  await new Promise(r => up.listen(0, r));
+  const mp = fakeMaxpool();
+  await new Promise(r => mp.server.listen(0, r));
+  const gate = await startGate({
+    RC_GATE_PORT: '0',
+    RC_GATE_MAXPOOL_PORT: String(mp.server.address().port),
+    RC_GATE_DIRECT_HOST: '127.0.0.1',
+    RC_GATE_DIRECT_PORT: String(up.address().port),
+    RC_GATE_PROFILE: 'all',
+  });
+  try {
+    // One request per CONNECT: httpOverTLS sends `connection: close`, so a second
+    // request on the same tunnel EPIPEs. Two tunnels = two independent requests.
+    const { tls: t } = await mitmConnect(gate.port);
+    const res = await httpOverTLS(t, 'POST', '/v1/environments/bridge', { 'content-type': 'application/json' }, '{}');
+    assert.match(res, /HTTP\/1\.1 200/);
+    assert.ok(directPath.requests.some(r2 => r2.url === '/v1/environments/bridge'),
+      'environment bridge call reached the DIRECT upstream');
+    const { tls: t2 } = await mitmConnect(gate.port);
+    const res2 = await httpOverTLS(t2, 'GET', '/v1/environments/env_01TEST/work/poll?timeout_ms=5000', { accept: 'application/json' }, '');
+    assert.match(res2, /HTTP\/1\.1 200/);
+    assert.ok(directPath.requests.some(r2 => r2.url.startsWith('/v1/environments/env_01TEST/work/poll')),
+      'environment work poll reached the DIRECT upstream');
+    assert.ok(!mp.state.requests.some(r2 => (r2.url || '').startsWith('/v1/environments')),
+      'environment calls must NOT reach the pool');
+  } finally {
+    gate.kill();
+    await new Promise(r => up.close(r));
+    await new Promise(r => mp.server.close(r));
+  }
+});
+
 gateDescribe('rc-gate: /v1/sessions/<id> routes DIRECT (identity), not through the pool', async () => {
   // CLI 2.1.269 emits ~21 v1-compat session call sites; routing them through the pool
   // rotated identity-bound CRUD across accounts and 404'd on every non-owner

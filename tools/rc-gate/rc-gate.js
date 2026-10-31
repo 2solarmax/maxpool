@@ -265,8 +265,16 @@ const mitmServer = http.createServer((creq, cres) => {
   // every one that didn't own the session (measured 2026-09-12: the same id failing on
   // mk@gomokka, privacy@, mk@dubner.io, 2solarmax in turn). Inference stays on the pool:
   // only the sessions APIs go direct.
+  // `/v1/environments/*` is the Remote Control MACHINE registration (bridge create /
+  // credential renew / work poll) — identity-bound the same way: it renews on the saved
+  // claude.ai login, so a pool-routed renewal lands on the wrong account and is rejected.
+  // Symptom (2026-10-31, launchd hosts com.mokka.claude-rc-*): "could not renew this
+  // environment's credential after repeated attempts" ~300×/host/day, laptop device
+  // entry offline on the phone; gate.log showed 5,710 POST /v1/environments/bridge all
+  // "→ pool" plus 1,478 failed forwards. Same fix class as the sessions split above.
   const isIdentityPath = !creq.url.startsWith('/v1/')
     || creq.url.startsWith('/v1/code/sessions')
+    || creq.url.startsWith('/v1/environments')
     || /^\/v1\/sessions(\/|$)/.test(creq.url);
   if (isIdentityPath) {
     const dirHeaders = { ...creq.headers, host: DIRECT_HOST };
