@@ -148,3 +148,29 @@ test('inject: an oversized body answers 413 and stores nothing', async () => {
     assert.equal(am.accounts.length, before);
   } finally { await close(proxy); }
 });
+
+test('inject: a disk-persist failure answers an error, never "ok" (the login must be retried)', async () => {
+  const am = managerWithRows();
+  const proxy = createProxyServer(am, { proxy: { apiKey: KEY } });
+  const port = await listen(proxy);
+  // Poisons nothing: config.js caches the resolved path per process, so the
+  // endpoint still targets the ISOLATED config. Force the persist to fail by
+  // making the isolated file a DIRECTORY (rename aside, mkdir in its place).
+  const { renameSync, mkdirSync, rmSync } = await import('node:fs');
+  renameSync(ISOLATED_CONFIG, ISOLATED_CONFIG + '.aside');
+  mkdirSync(ISOLATED_CONFIG);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/maxpool/accounts`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': KEY },
+      body: injectBody('D1'),
+    });
+    const json = await res.json();
+    assert.notEqual(res.status, 200);
+    assert.equal(json.ok, false);
+    assert.equal(json.error, 'not_persisted');
+  } finally {
+    rmSync(ISOLATED_CONFIG, { recursive: true });
+    renameSync(ISOLATED_CONFIG + '.aside', ISOLATED_CONFIG);
+    await close(proxy);
+  }
+});

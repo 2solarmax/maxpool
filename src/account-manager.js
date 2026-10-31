@@ -3437,12 +3437,23 @@ export class AccountManager {
     if (account.type === 'provider') {
       const sesUsed = q.providerSes != null ? clamp01(q.providerSes) : null;
       const wkUsed = q.providerWk != null ? clamp01(q.providerWk) : null;
-      const used = Math.max(sesUsed ?? 0, wkUsed ?? 0);
+      // The WEEKLY ladder tiers on the weekly window ALONE when the plan HAS one
+      // (owner 2026-10-30: GLM serves to 100% of the session window; the old
+      // Math.max(ses, wk) demoted a 97%-session / 20%-weekly key to 'critical' —
+      // last-resort behind every Claude account with four-fifths of its weekly
+      // window empty — council review 2026-10-31). A weeklyAbsent plan (providerWk
+      // null: z.ai unlimited-weekly) keeps its historical ses-driven tiering — the
+      // session window is its ONLY quota signal. Session availability otherwise
+      // belongs to _isSessionQuotaUnavailable + PROVIDER_SES_WALL.
+      const used = wkUsed != null ? wkUsed : (sesUsed ?? 0);
       // USAGE CAP — checked FIRST, before every tier: a reservation is owner intent
       // and outranks both the tier ladder and the upstream verdict. There is no
       // upstreamAllows carve-out for providers anyway, but the ordering documents
-      // that a cap can never be talked out of by the vendor's "allowed".
-      if (this._capped(account, used, 'wk', now)) return 'capped';
+      // that a cap can never be talked out of by the vendor's "allowed". The cap
+      // reads the WORST window (max of ses/wk): a z.ai cap bounds total spend, and
+      // the 5h reading is real consumption against it.
+      const capUsed = Math.max(sesUsed ?? 0, wkUsed ?? 0);
+      if (this._capped(account, capUsed, 'wk', now)) return 'capped';
       if (used >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
       if (used >= this.scheduler.weeklyCriticalThreshold) return 'critical';
       if (used >= this.scheduler.weeklyReserveThreshold) return 'reserve';

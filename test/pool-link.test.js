@@ -592,3 +592,26 @@ test('persisted identities age from the last good poll: an old seed is ignored, 
   assert.equal(am.accounts[0].poolBenchedBy, null, 'a seed older than 14 days is ignored');
   am.setPoolLinks([]);
 });
+
+test('owner 2026-10-30: a GLM key at 97% session / 20% weekly stays FIRST-CLASS (no session-driven demotion)', () => {
+  const am = new AccountManager([
+    { name: 'claude', type: 'oauth', accountUuid: 'C1', accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'glm', type: 'provider', provider: 'zai', credential: 'k', profiles: ['all'] },
+  ], 0.9, { routingMode: 'prefer-zai' });
+  const glm = am.accounts.find(a => a.name === 'glm');
+  const claude = am.accounts.find(a => a.name === 'claude');
+  glm.quota = { providerSes: 0.97, providerWk: 0.20 };
+  claude.quota = { unified5h: 0.1, unified7d: 0.1 };
+  // Tier: the weekly ladder must read the WEEKLY window alone (old Math.max(ses,wk)
+  // read 0.97 → 'critical' → last-resort pass 2 only, behind every Claude account).
+  assert.equal(am._weeklyRawState(glm), 'normal', 'weekly 20% → normal, not critical');
+  // Availability: 97% session with wall 1.0 stays SERVEABLE (owner: to 100%).
+  assert.equal(am._isAvailable(glm, { allowWeeklyReserve: true }), true, 'pass-1 eligible');
+  assert.equal(am._isSessionQuotaUnavailable(glm), false, 'not session-benched under the wall');
+});
+
+test('pin drop with a legacy-key link is named loudly, not silent (council 2026-10-31)', async () => {
+  const src = (await import('node:fs')).readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  assert.match(src, /pin-account dropped: the link authenticated with the remote's legacy apiKey/,
+    'the misconfiguration is named in the log');
+});

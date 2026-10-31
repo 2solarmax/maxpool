@@ -358,10 +358,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
           // Keep the in-memory config mirror in step so a later TUI saveConfig
           // can't clobber the fresh tokens with stale ones.
-          const mem = config.accounts.find(a => a.accountUuid === acct.accountUuid);
+          const mem = (config.accounts || []).find(a => a.accountUuid === acct.accountUuid);
           if (mem) Object.assign(mem, tokenFields);
         } catch (err) {
+          // A single-use credential write is only "ok" when it is DURABLE: the browser
+          // login may have invalidated the previous refresh token, so memory-only means
+          // a restart bricks the account while both sides recorded success (council
+          // review 2026-10-31). Tell the caller to retry instead of claiming Done.
           console.error(`[Maxpool] Remote inject persisted to memory but NOT disk for uuid ${acct.accountUuid.slice(0, 8)}: ${err?.message || err}`);
+          res.writeHead(507, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'not_persisted', message: 'Saved in memory only — the pool could not write it to disk. Log in again.' }));
+          return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, result: amAcct ? 'reauthed' : 'added', name: amAcct ? amAcct.name : (acct.name || acct.accountUuid.slice(0, 8)) }));
@@ -477,6 +484,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // caller can't steer routing. Applied by selection as an exclusive filter.
         const pin = headerValue(req.headers, 'x-maxpool-pin-account');
         if (pin && req.callerName && req.callerName !== 'legacy-key') requestInfo.pinAccount = String(pin);
+      else if (pin) {
+        // A pin from a legacy-key link is silently dropped — the local pool has
+        // already made mirror-specific decisions on it. Name the misconfiguration
+        // once instead (council review 2026-10-31: no warning fired anywhere).
+        console.error('[Maxpool] x-maxpool-pin-account dropped: the link authenticated with the remote\'s legacy apiKey — mint a named client key (proxy.clients) so pins and per-person attribution work');
+      }
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
         requestInfo.caller = req._caller || null;
         // The CLIENT tells us how long it will wait — the only source that is actually
