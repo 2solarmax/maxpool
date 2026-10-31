@@ -60,9 +60,7 @@ export function decideZai(account, cards, now = Date.now()) {
   if (!cards || cards.error) return null;
   if (account?.outsideUsage?.outside) return null;          // R7: key used by someone else — a card would feed the leak
   const q = account.quota || {};
-  const ses = q.providerSes ?? null;
-  const wk = q.weeklyAbsent ? null : (q.providerWk ?? null);
-  const wkUtil = wk; const sesUtil = ses;
+  const wkUtil = q.weeklyAbsent ? null : (q.providerWk ?? null);
 
   const weeklyCards = (cards.weekly || []).filter(c => !c.expired && c.recordId != null);
   // R4: soonest expiry first inside each class.
@@ -113,7 +111,6 @@ export function decideClaude(account, listing, now = Date.now()) {
 
   const q = account.quota || {};
   const wkUtil = q.unified7d ?? null;
-  const sesUtil = q.unified5h ?? null;
   const clearsWk = chosen.clears?.includes('seven_day');
 
   // Owner, 2026-10-30: "never spend resets on session limits, only on weekly."
