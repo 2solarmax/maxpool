@@ -664,3 +664,12 @@ test('queue head-skip: a serveable waiter is not blocked forever by an unserveab
   am.queueState.waiting.push(stuckHead.queueTicket, slowFollower.queueTicket);
   assert.equal(am.canAdmitQueuedRequest({ ...slowFollower }), true, 'a 90s-waited follower skips the stuck head');
 });
+
+test('architect#5 pin: the aggregate pool-row mechanism is DEAD — production never creates type:pool rows', async () => {
+  const { readFileSync } = await import('node:fs');
+  const idx = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  assert.ok(!/upsertPoolAccount/.test(idx), 'index.js must not create aggregate rows (mirrors only)');
+  const amSrc = readFileSync(new URL('../src/account-manager.js', import.meta.url), 'utf8');
+  const callers = (amSrc.match(/upsertPoolAccount/g) || []).length;
+  assert.equal(callers, 1, 'the only mention is the dead definition itself (no production caller)');
+});
