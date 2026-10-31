@@ -488,12 +488,12 @@ export class AccountManager {
       index,
       name: acct.name,
       type: acct.type,
-      provider: acct.provider || (acct.type === 'provider' ? 'provider' : acct.type === 'pool' ? 'pool' : 'anthropic'),
+      provider: acct.provider || (acct.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.authToken || acct.apiKey,
       upstream: acct.upstream || null,
       authHeader: acct.authHeader || null,
-      profiles: acct.profiles || (acct.type === 'provider' || acct.type === 'pool' ? ['all'] : ['claude', 'all']),
+      profiles: acct.profiles || (acct.type === 'provider' ? ['all'] : ['claude', 'all']),
       priority: Number.isFinite(acct.priority) ? acct.priority : 0,
       // USAGE CAP (owner-directed 2026-08-26): reserve capacity on this account —
       // the proxy benches it at capUtilization of BOTH the 5h and 7d windows, keeping
@@ -1076,14 +1076,6 @@ export class AccountManager {
       const l = account.remote.link;
       if (!l || l.lastError || l.lastOkAt == null) return false;
       if (account.refreshDead || account.status === 'error') return false;
-    }
-    // Pool link: available only while its last poll succeeded AND the remote has a
-    // usable account — a down/empty team pool must not swallow requests that local
-    // accounts could serve.
-    if (account.type === 'pool') {
-      const link = account._link;
-      if (!link || link.lastError || link.lastOkAt == null) return false;
-      if (!link.summary || link.summary.usable < 1) return false;
     }
     const now = options.now ?? Date.now();
 
@@ -2509,7 +2501,7 @@ export class AccountManager {
     if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
     // Cloud mirrors egress from the cloud's own IP — this machine's upstream throttle
     // and local queue fairness don't describe them.
-    const providerLike = account.type === 'provider' || account.type === 'pool' || Boolean(account.remote);
+    const providerLike = account.type === 'provider' || Boolean(account.remote);
     if (
       !providerLike
       && this.queueState.waiting.length
@@ -2551,7 +2543,7 @@ export class AccountManager {
     const incompatible = this._effectiveIncompatible(requestInfo).incompatible;
     // An incompatible session is pinned to its provider family — no mode overrides that.
     if (incompatible) {
-      const isHome = (account.type === 'provider' || account.type === 'pool')
+      const isHome = (account.type === 'provider')
         && (mode === 'prefer-zai' ? account.provider === 'zai'
           : mode === 'prefer-kimi' ? account.provider === 'kimi' : true);
       return isHome ? 0 : base;
@@ -2769,11 +2761,18 @@ export class AccountManager {
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
     if (!this._matchesProfile(account, profile)) return false;
-    // A pool link carries Anthropic-API traffic only (/v1/…). Browser noise
+    // A cloud mirror carries Anthropic-API traffic only (/v1/…). Browser noise
     // (favicon, stray GETs) must never be forwarded — on the remote it finds no
     // route, queues up to the hold window, and pins a link lease the whole time
     // (live-rehearsal 2026-10-29: 4 favicon GETs showed as "4 running").
-    if (account.type === 'pool' && !String(requestInfo.path || '').startsWith('/v1/')) return false;
+    if (account.remote && !String(requestInfo.path || '').startsWith('/v1/')) return false;
+    // A cloud mirror carries Anthropic-API traffic only (/v1/…). Browser noise
+    // (favicon, stray GETs) must never be forwarded — on the remote it finds no
+    // route, queues up to the hold window, and pins a link lease the whole time
+    // (live-rehearsal 2026-10-29: 4 favicon GETs showed as "4 running"). This guard
+    // used to key on the aggregate type:'pool' row; mirrors (account.remote) are the
+    // only link rows now, so it moves to them.
+
 
     // Kimi (Moonshot) 400s on images Anthropic/GLM accept ("failed to decode
     // image") — and a provider 400 is TERMINAL (not retried to another account), so
@@ -3012,21 +3011,6 @@ export class AccountManager {
     // unchanged balancing logic — sees it as busy as it really is.
     const inflight = account.activeWeight + reqWeight + (account._remoteOtherLoad || 0);
     const refillMult = this._fastRefillMultiplier(account);
-    if (account.type === 'pool' && account._link) {
-      // Utilization = the cloud's own reported fraction of usable accounts spent
-      // (weekly windows), so a near-exhausted cloud pool de-preferences like a
-      // near-exhausted local account rather than pretending to be empty-fresh.
-      const link = account._link;
-      const remoteUtil = link.summary && link.summary.total
-        ? (link.summary.total - link.summary.usable) / link.summary.total : 0;
-      // Same shape as a provider's weekly utilization cost, keyed to remote load.
-      const remoteLoad = Math.max(account.activeWeight, link.status?.scheduler?.globalInFlight || 0);
-      return (
-        remoteLoad * this.scheduler.concurrencyWeight
-        + Math.max(0, remoteLoad - this.scheduler.perAccountConcurrencyTarget) * this.scheduler.capPenaltyWeight
-        + remoteUtil * this.scheduler.capPenaltyWeight
-      );
-    }
 
     // DOMINANT term: in-flight concurrency. Short-term throttling is driven by
     // how many requests pile on one account, so least-loaded-first spread is
@@ -4880,24 +4864,6 @@ export class AccountManager {
     }
     this._benchedByPool = [...benchedIdx];
     this._remoteIdentities = ids;
-  }
-
-  /** Add (or update) the routable account row for a pool link. */
-  upsertPoolAccount(link) {
-    let a = this.accounts.find(x => x.type === 'pool' && x.name === link.name);
-    if (!a) {
-      this.upsertRuntimeAccount({
-        name: link.name, type: 'pool', provider: 'pool',
-        authToken: link.key, upstream: String(link.url).replace(/\/+$/, ''),
-        profiles: ['claude', 'all'], priority: 0, configSourced: true,
-      });
-      a = this.accounts.find(x => x.type === 'pool' && x.name === link.name);
-    }
-    a.credential = link.key;
-    a.upstream = String(link.url).replace(/\/+$/, '');
-    a._link = link;
-    a.configSourced = true;
-    return a;
   }
 
   /** The linked pool's LIVE row for a benched local account (by identity), or null.

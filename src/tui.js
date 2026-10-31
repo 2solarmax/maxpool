@@ -50,7 +50,6 @@ function whereCell(a) {
 }
 
 function providerLabel(a) {
-  if (a.type === 'pool') return 'Team pool';
 
   const key = a.provider || (a.type === 'provider' ? 'provider' : 'anthropic');
   const label = PROVIDER_LABELS[key] || (key.charAt(0).toUpperCase() + key.slice(1));
@@ -2101,8 +2100,6 @@ export class TUI {
         // effectively off (owner 2026-10-29: "should it hide the local ones that are
         // in the cloud... they're effectively disabled as well"). No separate key.
         if (this.hideDisabled && this.am.accounts[i]?.poolBenchedBy) { hidden++; continue; }
-        // The legacy single team-pool row is superseded by per-account cloud rows.
-        if (this.am.accounts[i]?.type === 'pool') continue;
         lines.push(this._renderAcct(i, bw, showBoth));
       }
       if (hidden > 0) {

@@ -849,7 +849,7 @@ async function forwardRequest(
   // request to it with the person's key, a stepped hop header, and the client's
   // session header preserved — the remote pool does its own account selection,
   // so no body rewriting, no credential substitution.
-  if (account.type === 'pool' || account.remote) {
+  if (account.remote) {
     const hop = nextHopCount(headerValue(req.headers, HOP_HEADER));
     if (hop == null) {
       accountManager.releaseAccount(lease, { neutral: true });

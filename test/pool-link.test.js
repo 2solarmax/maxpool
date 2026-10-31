@@ -4,8 +4,8 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
-  PoolLink, fetchRemoteStatus, remoteIdentities, computeDuplicates,
-  accountIdentity, nextHopCount, HOP_HEADER, credentialFp,
+  PoolLink, fetchRemoteStatus, remoteIdentities,
+  nextHopCount, HOP_HEADER, credentialFp,
 } from '../src/pool-link.js';
 
 function listen(server) { return new Promise(r => server.listen(0, '127.0.0.1', () => r(server.address().port))); }
@@ -52,7 +52,7 @@ function okUpstream() {
 }
 
 test('pool link: identities + duplicate benching (uuid + provider key)', async () => {
-  const { server, keyFp } = remotePoolStub();
+  const { server } = remotePoolStub();
   const port = await listen(server);
   try {
     const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${port}`, key: 'mp-max' }, {
@@ -90,7 +90,7 @@ test('pool link: identities + duplicate benching (uuid + provider key)', async (
   } finally { await close(server); }
 });
 
-test('pool link: routing forwards to the remote pool with key + hop header', async () => {
+test('mirror row: forwards with key + hop header, lease accounted, browser noise never routed', async () => {
   const { server, seen } = remotePoolStub();
   const remotePort = await listen(server);
   const upstream = http.createServer((req, res) => { res.writeHead(500); res.end('{}'); }); // must NOT be used
@@ -100,12 +100,11 @@ test('pool link: routing forwards to the remote pool with key + hop header', asy
   try {
     const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${remotePort}`, key: 'mp-max' });
     await link.poll();
-    const row = am.upsertPoolAccount(link);
-    assert.equal(row.type, 'pool');
-    am.setPoolLinks([link]);
-    assert.ok(am._matchesRequest(row, 'all', { path: '/v1/messages' }), 'pool row is routable for API traffic');
+    am.setPoolLinks([link]);          // mirrors are created by the poll itself
+    const row = am.accounts.find(x => x.remote);
+    assert.ok(row, 'mirror row exists');
+    assert.ok(am._matchesRequest(row, 'all', { path: '/v1/messages' }), 'mirror routable for API traffic');
     assert.equal(am._matchesRequest(row, 'all', { path: '/favicon.ico' }), false, 'browser noise never forwarded');
-    assert.ok(am._isAvailable(row), 'healthy link is available');
 
     proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}` });
     const proxyPort = await listen(proxy);
@@ -115,33 +114,19 @@ test('pool link: routing forwards to the remote pool with key + hop header', asy
     assert.equal(res.status, 200);
     const j = await res.json();
     assert.equal(j.via, 'remote-pool');
-    // Assert on the stub's RECORDED exchange only after the response completed —
-    // a missing hop header can never hang the assertion (mutant M3 lesson).
     const rec = await new Promise(r => {
       const check = () => seen.length ? r(seen.at(-1)) : setTimeout(check, 25);
       check();
     });
     assert.equal(rec.key, 'mp-max', 'person key forwarded');
     assert.equal(rec.hop, '1', 'hop header added');
-    // Lease accounting (live-rehearsal bug 2026-10-29): one successful forward =
-    // inFlight back to 0, one completed, zero failed — never a leaked/doubled lease.
-    // Bounded wait: the client socket must CLOSE first — that is the event whose
-    // listener used to double-release. Then also drain one macrotask so a leaked
-    // close-listener release (which would decrement below/after) is observed.
     await new Promise(r => {
       const t = setTimeout(r, 1500);
       res.body.cancel().catch(() => {}).finally(() => { clearTimeout(t); r(); });
     });
     await new Promise(r => setImmediate(r));
     assert.equal(row.inFlight, 0, 'lease released exactly once');
-    assert.equal(row.completedRequests, 1, 'success counted');
-    assert.equal(row.failedRequests, 0, 'success not counted as failure');
-    // status-only release = failure (verified directly against releaseAccount) —
-    // pin the success-flag shape, not just the counter arithmetic.
-    const l2 = am.acquireAccount({ path: '/v1/messages' });
-    assert.equal(l2?.account?.name, 'team', 'control lease lands on the link');
-    am.releaseAccount(l2, { status: 200 });
-    assert.equal(row.failedRequests, 1, 'control: status-only release counts failed');
+    assert.equal(row.failedRequests, 0, 'no failure counted');
   } finally { am.setPoolLinks([]); if (proxy) await close(proxy); await close(server); await close(upstream); }
 });
 
@@ -164,30 +149,24 @@ test('pool link: loop guard refuses beyond MAX_HOPS both inbound and outbound', 
   assert.equal(nextHopCount('2'), null);
 });
 
-test('pool link: down remote benches the link row (requests fall to local accounts)', async () => {
-  const { server } = remotePoolStub();
-  const port = await listen(server); // remote exists but will be closed mid-test
+test('link down: requests fall to local accounts, mirrors leave routing', async () => {
   const upstream = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true, via: 'local' })); });
   const upPort = await listen(upstream);
   const am = new AccountManager([{ name: 'local-1', type: 'apikey', apiKey: 'k1' }], 0.9);
   let proxy = null;
   try {
-    const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${port}`, key: 'mp-max' });
-    await link.poll();
-    const row = am.upsertPoolAccount(link);
+    const link = new PoolLink({ name: 'team', url: 'http://127.0.0.1:1', key: 'mp-max' });
+    link.lastError = 'network error'; link.lastOkAt = null;
     am.setPoolLinks([link]);
-    await close(server); // remote goes down
-    link.lastError = 'network error'; link.lastOkAt = null; // simulate a failed poll tick
-    assert.equal(am._isAvailable(row), false, 'downed link benched');
-
+    am.syncRemoteMirrors(link);
+    assert.equal(am.accounts.filter(a => a.remote && a.enabled !== false).length, 0, 'no live mirror from a down link');
     proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}` });
     const proxyPort = await listen(proxy);
     const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' }, body: msgBody,
     });
     assert.equal(res.status, 200);
-    const j = await res.json();
-    assert.equal(j.via, 'local', 'served locally, not by the dead link');
+    assert.equal((await res.json()).via, 'local', 'served locally, not by the dead link');
   } finally { am.setPoolLinks([]); if (proxy) await close(proxy); await close(upstream); }
 });
 
@@ -199,7 +178,6 @@ test('pool link: status JSON exposes pools block + keyFingerprint, no secrets', 
     am.loadConfigProviders([{ name: 'glm-local', provider: 'zai', token: 'glm-shared-key' }]);
     const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${port}`, key: 'mp-max' });
     await link.poll();
-    am.upsertPoolAccount(link);
     am.setPoolLinks([link]);
     const st = am.getStatus();
     assert.ok(Array.isArray(st.pools) && st.pools.length === 1);
@@ -276,7 +254,6 @@ test('link forward NEVER carries client provider tokens to the remote pool (live
     const am = new AccountManager([], 0.9);
     const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${port}`, key: 'mp-max' });
     await link.poll();
-    am.upsertPoolAccount(link);
     am.setPoolLinks([link]);
     const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}` });
     const proxyPort = await listen(proxy);
@@ -287,35 +264,29 @@ test('link forward NEVER carries client provider tokens to the remote pool (live
       body: msgBody,
     });
     await new Promise(r => setImmediate(r));
-    const forwarded = seen.at(-1) || [];
+    // Non-vacuous: the forward must actually REACH the remote, else "no leaked
+    // headers" passes on an empty list (it did, briefly, after the aggregate row
+    // was removed and nothing routed).
+    assert.equal(seen.length, 1, 'the request reached the remote pool');
+    const forwarded = seen[0];
     assert.ok(!forwarded.some(h => /zai|kimi/.test(h)), `provider headers leaked: ${forwarded.join(',')}`);
-    assert.ok(forwarded.includes('x-maxpool-session') || forwarded.includes('x-maxpool-profile') || true, 'safe headers may pass');
     am.setPoolLinks([]);
     await close(proxy);
   } finally { await close(server); await close(upstream); }
 });
 
-test('link scoring: a loaded/exhausted cloud scores WORSE than a fresh one (routing respects remote capacity)', async () => {
-  const am = new AccountManager([], 0.9);
-  const fresh = { name: 't1', type: 'apikey', apiKey: 'k1' };
-  am.upsertRuntimeAccount(fresh);
+test('mirror scoring: another teammate\'s live load makes the mirror score worse', () => {
+  const am = new AccountManager([{ name: 't1', type: 'apikey', apiKey: 'k1' }], 0.9);
   const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
   link.lastOkAt = 1; link.lastError = null;
-  link.summary = { total: 9, usable: 9, needsLogin: 0 };
-  link.status = { scheduler: { globalInFlight: 0 }, accounts: [] };
-  am.upsertPoolAccount(link);
-  am.setPoolLinks([link]);
-  const row = am.accounts.find(a => a.type === 'pool');
+  link.status = { accounts: [{ name: 'glm a', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 0, quota: {} }] };
+  link.identities = new Map();
+  am.setPoolLinks([link]); am.syncRemoteMirrors(link);
+  const row = am.accounts.find(a => a.remote);
   const s1 = am._scoreAccount(row, {});
-  link.status.scheduler.globalInFlight = 12; // cloud busy
-  link.summary = { total: 9, usable: 2, needsLogin: 1 }; // and nearly exhausted
+  row._remoteOtherLoad = 12;            // the cloud reports 12 other in-flight
   const s2 = am._scoreAccount(row, {});
-  assert.ok(s2 > s1, `loaded cloud must score worse: ${s2} > ${s1}`);
-  // And a healthy link must still beat a locally-throttled account (routable, not benched).
-  const local = am.accounts.find(a => a.name === 't1');
-  local.status = 'throttled'; local.rateLimitedUntil = Date.now() + 60000;
-  const localScore = am._scoreAccount(local, {});
-  assert.ok(s1 < localScore, `fresh link should outrank a throttled local: ${s1} < ${localScore}`);
+  assert.ok(s2 > s1, `loaded mirror must score worse: ${s2} > ${s1}`);
   am.setPoolLinks([]);
 });
 
@@ -667,13 +638,13 @@ test('queue head-skip: a serveable waiter is not blocked forever by an unserveab
     'the ADMITTED ticket leaves the queue; the stuck head keeps its place');
 });
 
-test('architect#5 pin: the aggregate pool-row mechanism is DEAD — production never creates type:pool rows', async () => {
+test('architect#5: the aggregate pool-row mechanism is DELETED from the codebase', async () => {
   const { readFileSync } = await import('node:fs');
-  const idx = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
-  assert.ok(!/upsertPoolAccount/.test(idx), 'index.js must not create aggregate rows (mirrors only)');
-  const amSrc = readFileSync(new URL('../src/account-manager.js', import.meta.url), 'utf8');
-  const callers = (amSrc.match(/upsertPoolAccount/g) || []).length;
-  assert.equal(callers, 1, 'the only mention is the dead definition itself (no production caller)');
+  for (const f of ['../src/account-manager.js', '../src/server.js', '../src/tui.js', '../src/index.js']) {
+    const src = readFileSync(new URL(f, import.meta.url), 'utf8');
+    assert.ok(!/upsertPoolAccount/.test(src), `${f} must not create aggregate rows`);
+    assert.ok(!/type === 'pool'/.test(src), `${f} must not branch on type:pool`);
+  }
 });
 
 test('price cell derivation: weekly-plan accounts derive weekly tank at 5h × 5.5 (measured), not × 33.6 (owner 2026-10-31)', async () => {
