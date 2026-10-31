@@ -666,3 +666,50 @@ test('price cell derivation: weekly-plan accounts derive weekly tank at 5h × 5.
   assert.match(page, /\$20\.36/, '134.4 ÷ (1.2M × 5.5)');
   assert.doesNotMatch(page, /\$3\.\d\d/, 'the ×33.6 figure ($3.34) must not appear');
 });
+
+test('capacity page on the REAL two-pool shape: cloud rows get their price and tank (owner 2026-10-31 screen showed "--")', async () => {
+  const { CapacityLedger } = await import('../src/capacity-ledger.js');
+  const { TUI } = await import('../src/tui.js');
+  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const am = new AccountManager([], 0.9, { routingMode: 'balance' });
+  am.capacity = new CapacityLedger();
+  // Months of history measured LOCALLY before the move, under the pre-migration name.
+  am.capacity.accrue('personal', { input: 4_000_000, output: 4_000_000 }, Date.now() - 6 * 86400e3, ['wk']);
+  am.capacity.estimateFromUtilization('personal', 'wk', 0.8);
+  am.capacity.closeCycle('personal', 'wk', Date.now(), { finalUtilization: 0.8 });
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link.lastOkAt = 1; link.lastError = null; link.identities = new Map();
+  link.status = { accounts: [
+    { name: 'personal', type: 'oauth', accountUuid: 'P1', enabled: true, status: 'active', inFlight: 0, quota: {} },
+    { name: 'glm q', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 0, quota: {},
+      monthlyPriceUSD: 134.4, tank: { wk: { avg: 8_000_000, n: 7, prev: null, last: 8_000_000, lowerBound: false } } },
+  ] };
+  am.setPoolLinks([link]); am.syncRemoteMirrors(link);
+  const t = new TUI({ accountManager: am, config: {} });
+  t.capacityWindow = 'wk';
+  const page = t._renderCapacityPage(140).map(strip).join('\n');
+  assert.match(page, /\$20\.00/, 'Claude mirror: $200 ÷ 10M local pre-migration tank');
+  assert.match(page, /\$16\.80/, 'GLM mirror: $134.4 cloud-read price ÷ 8M cloud tank');
+  am.setPoolLinks([]);
+});
+
+test('cloud row tank: months of local history beat a 1-cycle cloud reading', async () => {
+  const { CapacityLedger } = await import('../src/capacity-ledger.js');
+  const am = new AccountManager([], 0.9, { routingMode: 'balance' });
+  am.capacity = new CapacityLedger();
+  for (let k = 3; k >= 1; k--) {   // three local weekly cycles of 10M-equivalent
+    am.capacity.accrue('glm z', { input: 4_000_000, output: 4_000_000 }, Date.now() - (k * 7 + 6) * 86400e3, ['wk']);
+    am.capacity.estimateFromUtilization('glm z', 'wk', 0.8);
+    am.capacity.closeCycle('glm z', 'wk', Date.now() - k * 7 * 86400e3, { finalUtilization: 0.8 });
+  }
+  const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
+  link.lastOkAt = 1; link.lastError = null; link.identities = new Map();
+  link.status = { accounts: [{ name: 'glm z', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 0, quota: {},
+    tank: { wk: { avg: 2_000_000, n: 1, prev: null, last: 2_000_000, lowerBound: true } } }] };
+  am.setPoolLinks([link]); am.syncRemoteMirrors(link);
+  const row = am.accounts.find(x => x.remote);
+  const t = am.capacityTank(row.index, 'wk');
+  assert.equal(t.n, 3, 'the 3-cycle local history wins');
+  assert.equal(t.avg, 10_000_000);
+  am.setPoolLinks([]);
+});

@@ -3717,12 +3717,19 @@ export class AccountManager {
   }
 
   monthlyPriceFor(account) {
+    // A cloud mirror carries no credential, so this pool cannot read its subscription;
+    // the cloud pool reads it and exports it per row (remoteMonthlyPriceUSD).
+    if (account?.remote && account.remoteMonthlyPriceUSD != null) return account.remoteMonthlyPriceUSD;
     if (account?.type === 'provider') return account.monthlyPriceUSD ?? null;
     const tbl = this.scheduler?.monthlyPriceUSD;
     if (tbl && typeof tbl === 'object') {
       const hit = tbl[account?.name] ?? tbl['*'];
       if (Number.isFinite(hit)) return hit;
     }
+    // Owner 2026-10-31: "Claude monthly price is fixed, it's 200 dollars per month."
+    // Anthropic has no per-account price API, so this is the default for every Claude
+    // login; scheduler.monthlyPriceUSD (name or '*') overrides it.
+    if (account?.type === 'oauth') return 200;
     return null;
   }
 
@@ -3988,6 +3995,19 @@ export class AccountManager {
   capacityTank(accountIndex, window) {
     const a = this.accounts[accountIndex];
     if (!a) return null;
+    // A cloud mirror's history lives in TWO ledgers: this pool's, under the account's
+    // pre-migration name (months of cycles measured locally before it moved), and the
+    // cloud pool's own, exported per row as remoteTank. Mirror rows are named
+    // "<name> ☁", which matched neither — so every cloud row read "--" (2026-10-31).
+    if (a.remote) {
+      // Prefer whichever ledger holds MORE cycles: the cloud pool only started
+      // measuring at migration (2026-10-29), so for weeks its 0-2 cycles would
+      // otherwise override months of history measured here.
+      const cloud = a.remoteTank?.[window] || null;
+      const local = this.capacity.tankStats(a.remote.remoteName || a.name, window);
+      const best = (cloud && local) ? ((cloud.n || 0) >= (local.n || 0) ? cloud : local) : (cloud || local);
+      return best ? { ...best, source: 'cycles' } : null;
+    }
     const measured = this.capacity.tankStats(a.name, window);
     if (measured) return { ...measured, source: 'cycles' };
     const est = this.capacityEstimate(accountIndex, window);
@@ -4922,6 +4942,8 @@ export class AccountManager {
       a.addedAt = null;                        // H3: mirrors never count as "warming"
       a.resetCards = ra.resetCards || null;
       a.resetGrants = ra.resetGrants || null;
+      a.remoteMonthlyPriceUSD = Number.isFinite(ra.monthlyPriceUSD) ? ra.monthlyPriceUSD : null;
+      a.remoteTank = ra.tank || null;
       // Other teammates' live load on this cloud account (remote inFlight minus our
       // own leases) — so the balancer sees the account as busy as it really is.
       a._remoteOtherLoad = Math.max(0, (ra.inFlight || 0) - (a.inFlight || 0));
@@ -4975,6 +4997,15 @@ export class AccountManager {
         // counts and expiry only — no credentials; the redeem stays with the holder.
         resetCards: a.resetCards ? { fiveHour: a.resetCards.fiveHour, weekly: a.resetCards.weekly, checkedAt: a.resetCards.checkedAt } : null,
         resetGrants: a.resetGrants ? { grants: a.resetGrants.grants, cooldownUntil: a.resetGrants.cooldownUntil, checkedAt: a.resetGrants.checkedAt } : null,
+        // Capacity-page inputs for linked pools (a mirror has no credential and no
+        // local cycles): this pool's plan price and measured tanks, per window.
+        monthlyPriceUSD: a.remote ? null : this.monthlyPriceFor(a),
+        tank: a.remote ? null : (() => {
+          const pick = w => { const t = this.capacity?.tankStats(a.name, w);
+            return t ? { avg: t.avg, n: t.n, prev: t.prev, last: t.last, lowerBound: t.lowerBound } : null; };
+          const ses = pick('ses'), wk = pick('wk');
+          return ses || wk ? { ses, wk } : null;
+        })(),
         // Identity for duplicate matching by linked pools (D12). The Claude account
         // UUID is an identifier, not a credential; provider keys export only a
         // fingerprint. Without these a linked pool can't see a duplicate Claude login
