@@ -1401,7 +1401,11 @@ export class AccountManager {
     }
     const now = Date.now();
     if (now < this.queueState.rampUntil && now - this.queueState.lastAdmissionAt < 250) return false;
-    this.queueState.waiting.shift();
+    // Remove THIS ticket, not the head: with the head-skip above, the admitted ticket
+    // may not be waiting[0]. shift() here dropped the stuck head's ticket and left the
+    // admitted one queued (found 2026-10-31 re-reading the shipped change).
+    const pos = this.queueState.waiting.findIndex(t => t.id === ticket.id);
+    if (pos >= 0) this.queueState.waiting.splice(pos, 1);
     this.queueState.bytes = Math.max(0, this.queueState.bytes - (ticket.bytes || 0));
     this.queueState.lastAdmissionAt = now;
     requestInfo.queueTicket = null;

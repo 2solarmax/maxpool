@@ -663,6 +663,8 @@ test('queue head-skip: a serveable waiter is not blocked forever by an unserveab
   const slowFollower = { queueTicket: { id: 4, queuedAt: Date.now() - 90_000, bytes: 100 } };
   am.queueState.waiting.push(stuckHead.queueTicket, slowFollower.queueTicket);
   assert.equal(am.canAdmitQueuedRequest({ ...slowFollower }), true, 'a 90s-waited follower skips the stuck head');
+  assert.deepEqual(am.queueState.waiting.map(t => t.id), [3],
+    'the ADMITTED ticket leaves the queue; the stuck head keeps its place');
 });
 
 test('architect#5 pin: the aggregate pool-row mechanism is DEAD — production never creates type:pool rows', async () => {
