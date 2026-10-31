@@ -1,4 +1,6 @@
 import { createInterface } from 'node:readline';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 
@@ -1986,6 +1988,15 @@ export class TUI {
       // and cross-provider fragments off the right edge at 120 columns.
       routing = this._routingModeDef(this.am.scheduler?.routingMode || 'sticky').label;
     }
+    // WHERE CLAUDE CODE ROUTES (owner 2026-11-01: "can the app show where the Claude
+    // Code app is routing to now?"). Reads the same switch file rc-gate re-reads per
+    // request, so the header always agrees with the live path. Direct mode is RED —
+    // it means the pool is bypassed and accounts are idle.
+    try {
+      let mode = 'pool';
+      try { mode = readFileSync(homedir() + '/.config/rc-gate-route', 'utf8').trim() || 'pool'; } catch { /* absent = pool */ }
+      routing += mode === 'direct' ? `  ·  Claude Code: ${red('DIRECT (pool bypassed)')}` : `  ·  Claude Code: ${green('pool')}`;
+    } catch { /* display-only */ }
     // Cross-provider fallback policy — only meaningful when GLM/Kimi providers are in
     // the pool (profile=all). never=strict pin (yellow), when-exhausted=default (cyan),
     // always=peer (green).

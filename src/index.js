@@ -137,6 +137,10 @@ switch (command) {
     await poolCommand();
     process.exit(0);
     break;
+  case 'route':
+    await routeCommand();
+    process.exit(0);
+    break;
   case 'status':
     await statusCommand();
     process.exit(0);
@@ -1760,6 +1764,39 @@ async function envCommand() {
 }
 
 // ── pool (client-side switch between local and shared pool) ─
+
+/** `maxpool route [pool|direct|status]` — flip rc-gate routing LIVE (owner
+ *  2026-11-01: "if there is a way to make the routing switch without having to
+ *  restart the app, that would be amazing"). The gate re-reads the switch file
+ *  per request (1s cache), so already-running Claude Code sessions change route
+ *  instantly — no restart of anything. status shows what Claude Code routes
+ *  through RIGHT NOW. */
+async function routeCommand() {
+  const { homedir } = await import('node:os');
+  const { writeFile, readFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const file = join(homedir(), '.config', 'rc-gate-route');
+  const arg = process.argv[3] || 'status';
+  const readIt = async () => { try { return (await readFile(file, 'utf8')).trim() || 'pool'; } catch { return 'pool'; } };
+  if (arg === 'pool' || arg === 'direct') {
+    await writeFile(file, arg + '\n', { mode: 0o600 }).catch(async () => {
+      const { mkdir } = await import('node:fs/promises');
+      await mkdir(join(homedir(), '.config'), { recursive: true });
+      await writeFile(file, arg + '\n', { mode: 0o600 });
+    });
+    console.log(`Routing: ${arg === 'pool' ? 'through maxpool (all accounts, cloud + local)' : 'direct to Anthropic (pool bypassed)'} — takes effect on the next request, no restart needed`);
+    return;
+  }
+  // status
+  const mode = await readIt();
+  const gateUp = await (async () => { try { await fetch('http://127.0.0.1:3457/', { signal: AbortSignal.timeout(1000) }).catch(() => {}); return true; } catch { return false; } })();
+  console.log('Claude Code routes through: ' + (gateUp
+    ? (mode === 'direct'
+      ? 'rc-gate → DIRECT to Anthropic (pool bypassed)'
+      : 'rc-gate → maxpool (local :3456, cloud accounts via the team tunnel)')
+    : 'no rc-gate on :3457 — sessions use whatever ANTHROPIC_BASE_URL they started with'));
+  console.log(`Switch file: ${file} = ${mode}`);
+}
 
 async function poolCommand() {
   const sub = args[1];

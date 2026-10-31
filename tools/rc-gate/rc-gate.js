@@ -155,6 +155,26 @@ const MAXPOOL_KEY = process.env.RC_GATE_MAXPOOL_KEY || '';
 const MITM_BODY_DEADLINE_MS = Number(process.env.RC_GATE_MITM_BODY_DEADLINE_MS) || 600_000;
 const MITM_HOSTS = new Set((process.env.RC_GATE_MITM_HOSTS || 'api.anthropic.com').split(',').map(s => s.trim()).filter(Boolean));
 const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
+
+// LIVE ROUTING SWITCH (owner 2026-11-01: "make the routing switch without having to
+// restart the app"). A running Claude session pins its proxy env at launch, but every
+// request still passes through THIS gate — so the gate is the one place a flip can
+// take effect instantly for all running sessions. Control file, re-read per request,
+// cached 1s: "direct" routes api.anthropic.com traffic straight to Anthropic (pool
+// bypassed), anything else (or missing file) = the normal pool path. Flipped by
+// `touch`-style writes; never requires a gate restart.
+const ROUTE_SWITCH_FILE = process.env.RC_GATE_ROUTE_FILE
+  || path.join(os.homedir(), '.config', 'rc-gate-route');
+let _routeCache = { at: 0, val: 'pool' };
+function routeMode() {
+  const now = Date.now();
+  if (now - _routeCache.at < 1000) return _routeCache.val;
+  let v = 'pool';
+  try { v = (readFileSync(ROUTE_SWITCH_FILE, 'utf8').trim() || 'pool'); } catch { /* absent = pool */ }
+  if (v !== 'direct') v = 'pool';
+  _routeCache = { at: now, val: v };
+  return v;
+}
 // Direct-forward upstream (test seam; defaults are production values).
 const DIRECT_HOST = process.env.RC_GATE_DIRECT_HOST || 'api.anthropic.com';
 const DIRECT_PORT = Number(process.env.RC_GATE_DIRECT_PORT || 443);
@@ -272,7 +292,8 @@ const mitmServer = http.createServer((creq, cres) => {
   // environment's credential after repeated attempts" ~300×/host/day, laptop device
   // entry offline on the phone; gate.log showed 5,710 POST /v1/environments/bridge all
   // "→ pool" plus 1,478 failed forwards. Same fix class as the sessions split above.
-  const isIdentityPath = !creq.url.startsWith('/v1/')
+  const routeDirect = routeMode() === 'direct';   // live switch, no restart
+  const isIdentityPath = routeDirect || !creq.url.startsWith('/v1/')
     || creq.url.startsWith('/v1/code/sessions')
     || creq.url.startsWith('/v1/environments')
     || /^\/v1\/sessions(\/|$)/.test(creq.url);
