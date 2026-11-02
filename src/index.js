@@ -1821,6 +1821,26 @@ async function poolCommand() {
     console.log(`  export ANTHROPIC_BASE_URL=http://${host}`);
     console.log(`  export ANTHROPIC_API_KEY=${key}`);
     console.log('rc-gate users: also set RC_GATE_MAXPOOL_HOST/PORT/KEY in the LaunchAgent and restart it.');
+  } else if (sub === 'team') {
+    // The onboarding command the team DMs should name (2026-11-02: `pool shared`
+    // was mistakenly sent to teammates — it redirects the WHOLE machine at an
+    // address that is only reachable through the tunnel, and adds no cloud rows).
+    // This adds a pools[] link: the remote pool's accounts appear as extra rows
+    // beside the local ones; duplicates auto-bench. With no args it operates on
+    // the standard wireproxy tunnel (127.0.0.1:13456 → 10.7.0.1:3456).
+    const url = args[2] || 'http://127.0.0.1:13456';
+    const key = args[3];
+    if (key && key.startsWith('-')) {
+      console.error('Usage: maxpool pool team [url] <your-pool-key>');
+      process.exit(1);
+    }
+    await atomicConfigUpdate(c => {
+      c.pools = (c.pools || []).filter(p => p.name !== 'team');
+      c.pools.push(key ? { name: 'team', url, key } : { name: 'team', url });
+    });
+    console.log(`Team pool linked: cloud accounts will appear as extra rows marked Cloud.`);
+    console.log('Restart your local pool (maxpool restart, or quit and start again) to load them.');
+    console.log('If a local account also exists in the cloud, the local copy pauses itself automatically.');
   } else if (sub === 'local') {
     await atomicConfigUpdate(c => {
       c.client = { ...(c.client || {}), mode: 'local' };
@@ -1837,7 +1857,7 @@ async function poolCommand() {
       console.log(`mode:    local  → http://${config.proxy.host || '127.0.0.1'}:${config.proxy.port}`);
     }
   } else {
-    console.error('Usage: maxpool pool <shared <host:port> <key> | local | status>');
+    console.error('Usage: maxpool pool <team [url] <key> | shared <host:port> <key> | local | status>');
     process.exit(1);
   }
 }
