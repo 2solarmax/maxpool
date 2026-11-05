@@ -174,3 +174,20 @@ test('inject: a disk-persist failure answers an error, never "ok" (the login mus
     await close(proxy);
   }
 });
+
+test('inject add: the new row lands in the server config mirror too, so the disk sync cannot add it a second time', async () => {
+  const am = new AccountManager([], 0.9);
+  const cfg = { proxy: { apiKey: KEY }, accounts: [] };
+  const proxy = createProxyServer(am, cfg);
+  const port = await listen(proxy);
+  try {
+    const { status, json } = await post(port, injectBody('DUP1', { name: 'dup-check' }));
+    assert.equal(status, 200);
+    assert.equal(json.result, 'added');
+    // syncAccountsFromDisk (index.js) adds any disk row whose uuid is absent from
+    // this mirror — a missing entry here is exactly the live duplicate-row bug
+    // (partnerships 2026-11-02, privacy 2026-11-05: two rows, one uuid).
+    assert.equal(cfg.accounts.filter(a => a.accountUuid === 'DUP1').length, 1, 'mirror carries the new row exactly once');
+    assert.equal(am.accounts.filter(a => a.accountUuid === 'DUP1').length, 1, 'one live row');
+  } finally { await close(proxy); }
+});

@@ -358,8 +358,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
           // Keep the in-memory config mirror in step so a later TUI saveConfig
           // can't clobber the fresh tokens with stale ones.
+          // A NEW row must enter the mirror too: the disk sync adds any disk row whose
+          // uuid the mirror lacks, so a missing entry became a second live row.
           const mem = (config.accounts || []).find(a => a.accountUuid === acct.accountUuid);
           if (mem) Object.assign(mem, tokenFields);
+          else if (Array.isArray(config.accounts)) config.accounts.push({ name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields });
         } catch (err) {
           // A single-use credential write is only "ok" when it is DURABLE: the browser
           // login may have invalidated the previous refresh token, so memory-only means
