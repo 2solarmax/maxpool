@@ -133,7 +133,7 @@ maxpool server
 ```
 
 When running from a TTY, shows an interactive TUI with:
-- Account table with session/weekly quota progress bars and reset countdowns
+- Account table with session, Fable weekly and weekly quota progress bars and reset countdowns
 - Real-time activity log with request tracking
 - Keyboard shortcuts (see below)
 
