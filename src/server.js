@@ -1870,6 +1870,12 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
+      // SCRUB VISIBILITY (E2E verification V1): the counter existed but was never
+      // surfaced — client-side "no thinking" is indistinguishable from "z.ai emitted
+      // none". One line whenever the scrub actually removed blocks.
+      if (requestInfo._scrubbed) {
+        console.log(`[Maxpool] scrub: removed ${requestInfo._scrubbed} provider thinking block(s) from "${account.name}" response [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
+      }
     } else {      // Bound the non-streaming body read so a mid-body upstream stall can't hang
       // the request forever and leak the lease (same class as the streaming idle
       // guard). On timeout → UPSTREAM_BODY → the caller frees the lease.
@@ -1932,8 +1938,13 @@ async function forwardRequest(
         if (scrubEnabledFor(account, { providerThinkingScrub: requestInfo.providerThinkingScrub })) {
           const scrubbed = scrubProviderResponseBody(safeJsonParse(outBuf));
           if (scrubbed) {
+            const removedBlocks = (JSON.parse(buf.toString('utf8')).content || [])
+              .filter(b => b && (b.type === 'thinking' || b.type === 'redacted_thinking')).length;
             outBuf = Buffer.from(JSON.stringify(scrubbed));
             requestInfo._scrubbed = (requestInfo._scrubbed || 0) + 1;
+            // SCRUB VISIBILITY (E2E V1): buffered lane logs what it removed, matching
+            // the streaming lane's line.
+            console.log(`[Maxpool] scrub: removed ${removedBlocks} provider thinking block(s) from "${account.name}" response (buffered)`);
           }
         }
         const outHeaders = outBuf === buf
