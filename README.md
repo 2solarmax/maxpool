@@ -297,6 +297,7 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
       "name": "user@example.com",
       "type": "oauth",
       "accountUuid": "...",
+      "organizationUuid": "...",
       "accessToken": "sk-ant-oat01-...",
       "refreshToken": "sk-ant-ort01-...",
       "expiresAt": 1774384968427

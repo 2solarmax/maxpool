@@ -191,3 +191,16 @@ test('inject add: the new row lands in the server config mirror too, so the disk
     assert.equal(am.accounts.filter(a => a.accountUuid === 'DUP1').length, 1, 'one live row');
   } finally { await close(proxy); }
 });
+
+test('inject for another organization of the same user adds an account and leaves the first untouched', async () => {
+  am.accounts[1].organizationUuid = 'O1';
+  const body = JSON.parse(injectBody('H1', { name: 'second-org' }));
+  body.account.organizationUuid = 'O2';
+  const { status, json } = await post(port, JSON.stringify(body));
+  assert.equal(status, 200);
+  assert.equal(json.result, 'added');
+  const first = am.accounts.find(a => a.name === 'healthy-row');
+  assert.equal(first.refreshToken, 'h-ref', 'the first organization keeps its own token');
+  const second = am.accounts.find(a => a.name === 'second-org');
+  assert.equal(second.organizationUuid, 'O2');
+});

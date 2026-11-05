@@ -36,7 +36,8 @@ export function credentialFp(credential) {
 export function accountIdentity(account) {
   if (!account) return null;
   if (account.type === 'oauth') {
-    return account.accountUuid ? `uuid:${account.accountUuid}` : null;
+    if (!account.accountUuid) return null;
+    return account.organizationUuid ? `uuid:${account.accountUuid}:${account.organizationUuid}` : `uuid:${account.accountUuid}`;
   }
   if (account.type === 'provider' && account.provider && account.credential) {
     return `key:${account.provider}:${credentialFp(account.credential)}`;
@@ -54,7 +55,7 @@ export function remoteIdentities(status) {
   for (const a of status.accounts) {
     if (a.enabled === false) continue; // a benched remote row doesn't bench the local copy
     let id = null;
-    if (a.type === 'oauth' && a.accountUuid) id = `uuid:${a.accountUuid}`;
+    if (a.type === 'oauth') id = accountIdentity(a);
     else if (a.type === 'provider' && a.keyFingerprint) id = `key:${a.provider}:${a.keyFingerprint}`;
     if (id) out.set(id, { name: a.name, provider: a.provider, type: a.type });
   }

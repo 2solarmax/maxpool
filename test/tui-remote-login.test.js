@@ -87,3 +87,17 @@ test('unreachable pool surfaces the error and never writes anything locally', as
   await t._sendLoginToRemote(MIRROR, { accessToken: 'a', refreshToken: 'r', expiresAt: 1 }, { accountUuid: 'R1' });
   assert.equal(JSON.stringify(t.am.accounts), before, 'NO local mutation on remote failure');
 });
+
+test('mirror match uses the organization too: another org of the same user stays local', () => {
+  const MIRROR = { ...makeMirror(), remoteOrganizationUuid: 'O1' };
+  const t = stubTui([MIRROR]);
+  assert.equal(t._findRemoteMirrorFor({ accountUuid: 'R1', organizationUuid: 'O1' }), MIRROR);
+  assert.equal(t._findRemoteMirrorFor({ accountUuid: 'R1', organizationUuid: 'O2' }), null);
+});
+
+test('the remote login carries the organization of the browser login', async () => {
+  const MIRROR = makeMirror();
+  const t = stubTui([MIRROR]);
+  await t._sendLoginToRemote(MIRROR, { accessToken: 'a', refreshToken: 'r', expiresAt: 1 }, { accountUuid: 'R1', organizationUuid: 'O1' });
+  assert.equal(received[0].body.account.organizationUuid, 'O1');
+});
