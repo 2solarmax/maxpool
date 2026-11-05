@@ -32,8 +32,9 @@ function stubTui({ links, accounts = [], answers }) {
     _ask: async q => { asked.push(q); return answers.shift(); },
     _upsertOAuthAccount: async a => { local.push(a); return { updated: false }; },
     _findExistingOAuthAccount: () => null,
+    _matchLogin: async () => null,
   };
-  for (const k of ['_routeLogin', '_findRemoteMirrorFor', '_sendLoginToRemote', '_sendLoginToTarget']) t[k] = TUI.prototype[k];
+  for (const k of ['_routeLogin', '_findRemoteMirrorFor', '_sendLoginToRemote', '_sendLoginToTarget', '_oauthAccounts']) t[k] = TUI.prototype[k];
   return t;
 }
 const creds = { accessToken: 'acc', refreshToken: 'ref', expiresAt: 42 };
