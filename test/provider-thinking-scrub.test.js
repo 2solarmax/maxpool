@@ -149,11 +149,14 @@ import { __serverTest } from '../src/server.js';
 const { streamResponse } = __serverTest;
 
 function mockRes(chunks) {
+  chunks.join = () => Buffer.concat(chunks.slice()).toString('utf8');
   const listeners = {};
   return {
     headersSent: false, destroyed: false, writableEnded: false,
     writeHead() { this.headersSent = true; },
-    write(c) { chunks.push(typeof c === 'string' ? c : Buffer.from(c).toString('utf8')); return true; },
+    // Collect RAW bytes and decode once at read time: a real socket carries bytes, so
+    // decoding each write separately would invent U+FFFD at a split multi-byte char.
+    write(c) { chunks.push(typeof c === 'string' ? Buffer.from(c, 'utf8') : Buffer.from(c)); return true; },
     end() { this.writableEnded = true; },
     once(ev, cb) { (listeners[ev] ||= []).push(cb); },
     off(ev, cb) { if (listeners[ev]) listeners[ev] = listeners[ev].filter(f => f !== cb); },
@@ -206,3 +209,29 @@ test('wiring CHUNKED: identical client bytes whether the stream arrives whole or
   assert.match(whole, /Answer/);
   assert.doesNotMatch(whole, /thinking/);
 });
+
+// B1 (build review 2026-11-06): every chunk must be decoded ONCE. A second
+// decode({stream:true}) on the same shared TextDecoder flushes a pending partial
+// UTF-8 sequence as U+FFFD — invisible with ASCII fixtures, so the payload here
+// splits a 3-byte char (中) across two chunks.
+for (const flagOn of [false, true]) {
+  test(`B1: multi-byte char split across chunks survives in client bytes AND streamLog (flag ${flagOn ? 'ON' : 'OFF'})`, async () => {
+    const sse = stream([
+      { type: 'message_start', message: { id: 'msg_u', type: 'message', role: 'assistant', model: 'glm-5.3', content: [], usage: { input_tokens: 3, output_tokens: 0 } } },
+      ...text(0, 'A中B'),
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } },
+      { type: 'message_stop' },
+    ]);
+    const bytes = Buffer.from(sse, 'utf8');
+    const cut = bytes.indexOf(Buffer.from('中', 'utf8')) + 1;   // inside the 3-byte sequence
+    const got = []; const log = [];
+    const enc = [bytes.subarray(0, cut), bytes.subarray(cut)];
+    const body = new ReadableStream({ start(c) { for (const b of enc) c.enqueue(new Uint8Array(b)); c.close(); } });
+    await streamResponse(body, mockRes(got), 200, {}, 0, dummyManager(), log, { model: null }, undefined,
+      flagOn ? new ProviderThinkingScrubber() : null);
+    const client = got.join('');
+    assert.doesNotMatch(client, /�/, 'client bytes carry no replacement char');
+    assert.match(client, /A中B/);
+    assert.equal(log.join(''), sse, 'streamLog (the usage/capacity lane) equals the original stream exactly');
+  });
+}

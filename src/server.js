@@ -3884,14 +3884,15 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         }
       }
 
-      // Forward chunk immediately. The SCRUB (when armed) rewrites the CLIENT-facing
-      // bytes only — usage parsing and streamLog below read the ORIGINAL upstream text,
-      // so accounting stays honest about what the provider actually produced.
-      const scrubbedOut = scrubber ? scrubber.push(decoder.decode(out, { stream: true })) : null;
-      const writeText = scrubber ? scrubbedOut : decoder.decode(out, { stream: true });
+      // Forward chunk immediately. Decode ONCE (B1, build review 2026-11-06): a second
+      // decode({stream:true}) on this shared TextDecoder flushes a pending partial UTF-8
+      // sequence as U+FFFD — the usage/streamLog lane garbled in BOTH flag states. The
+      // single decoded text feeds the scrubber (client lane) and the accounting lane.
+      const chunkText = decoder.decode(out, { stream: true });
+      const writeText = scrubber ? scrubber.push(chunkText) : null;
       const ok = scrubber ? (writeText ? res.write(writeText) : true) : res.write(out);
 
-      const text = decoder.decode(out, { stream: true });
+      const text = chunkText;
 
       // Capture for logging
       if (streamLog) streamLog.push(text);
