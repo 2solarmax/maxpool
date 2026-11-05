@@ -713,3 +713,13 @@ test('cloud row tank: months of local history beat a 1-cycle cloud reading', asy
   assert.equal(t.avg, 10_000_000);
   am.setPoolLinks([]);
 });
+
+test('two organizations of one Claude user are not duplicates of each other; the same organization is', async () => {
+  const { computeDuplicates } = await import('../src/pool-link.js');
+  const remote = remoteIdentities({ accounts: [{ name: 'team', type: 'oauth', accountUuid: 'U1', organizationUuid: 'O-team', enabled: true }] });
+  const local = [
+    { index: 0, type: 'oauth', accountUuid: 'U1', organizationUuid: 'O-personal' },
+    { index: 1, type: 'oauth', accountUuid: 'U1', organizationUuid: 'O-team' },
+  ];
+  assert.deepEqual(computeDuplicates(local, remote).map(d => d.index), [1]);
+});
