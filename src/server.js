@@ -681,6 +681,12 @@ async function forwardRequest(
     if (pre.body) {
       body = pre.body;
       requestInfo = { ...requestInfo, thinkingStripped: true };
+      // Never hide a repair (Anthropic gateway guidance): this pre-strip rewrites the
+      // request body on EVERY turn of a latched session and was silent — the only
+      // visible trace was the one-time latch line, so per-turn rewrites (each a cache
+      // prefix change) were uncountable. One line per rewrite, same prefix as the
+      // reactive repair so a single grep counts both.
+      console.log(`[Maxpool] Recovering session on Claude: pre-strip removed ${pre.removed} provider thinking block(s), converted ${pre.converted} provider search block(s) [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
       if (pre.converted) {
         // The body now replays cleanly on Claude, so drop the predictive verdict —
         // otherwise routing still exiles it and _noteRequestPolicy latches it sticky.
