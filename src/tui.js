@@ -93,22 +93,32 @@ function lpadVis(s, w) {
  * bars stop growing at 11 wide, so the row never passes column 111 and the tags
  * after the bars (cap, prefer, staleness) keep the room they have with two bars.
  * Narrower terminals keep today's two bars plus the "Fable NN%" tag.
+ * When no account reports a session window, the session bar is left out: the
+ * weekly bar always shows and the Fable bar joins it from 90 columns.
  */
 const BAR_START = ROW_PREFIX.length + NAME_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + RESETS_W + 1 + 'Ses '.length;
 const BAR_GAP = '  Wk  '.length;
 const BAR_MIN_W = 5;
 const BAR_MAX_W = 20;
-const THREE_BAR_MIN_W = 9;
+const FABLE_BAR_MIN_W = 9;
 const THREE_BAR_MAX_W = 11;
-function barLayout(W) {
-  const showBoth = W >= 70;
-  const showFable = W >= BAR_START + 3 * THREE_BAR_MIN_W + 2 * BAR_GAP;
-  const bars = 1 + (showBoth ? 1 : 0) + (showFable ? 1 : 0);
+function barLayout(W, showSession = true) {
+  const showBoth = W >= 70 || !showSession;
+  const others = (showSession ? 1 : 0) + (showBoth ? 1 : 0);
+  const showFable = W >= BAR_START + (others + 1) * FABLE_BAR_MIN_W + others * BAR_GAP;
+  const bars = others + (showFable ? 1 : 0);
   const free = W - BAR_START - (bars - 1) * BAR_GAP;
   const fit = Math.floor(free / bars);
-  const maxW = showFable ? THREE_BAR_MAX_W : BAR_MAX_W;
+  const maxW = bars === 3 ? THREE_BAR_MAX_W : BAR_MAX_W;
   const bw = Math.max(BAR_MIN_W, Math.min(maxW, fit));
-  return { showBoth, showFable, bw };
+  return { showSession, showBoth, showFable, bw };
+}
+
+/** True when the account's first bar (Ses, or Tok for an API key) has a reading. */
+function hasSessionReading(a) {
+  const q = a?.quota || {};
+  if (a?.type === 'provider') return q.providerSes != null;
+  return q.unified5h != null || (q.tokensLimit != null && q.tokensRemaining != null);
 }
 
 function rpad(s, w) {
@@ -2213,7 +2223,7 @@ export class TUI {
       // the header and the data (a left-aligned sentence there reads as a broken,
       // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
-      const { showBoth, showFable, bw } = barLayout(W);
+      const { showSession, showBoth, showFable, bw } = barLayout(W, this.am.accounts.some(hasSessionReading));
 
       // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
       // display order over the canonical am.accounts array (which stays untouched so
@@ -2226,7 +2236,7 @@ export class TUI {
         // effectively off (owner 2026-10-29: "should it hide the local ones that are
         // in the cloud... they're effectively disabled as well"). No separate key.
         if (this.hideDisabled && this.am.accounts[i]?.poolBenchedBy) { hidden++; continue; }
-        lines.push(this._renderAcct(i, bw, showBoth, showFable));
+        lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession));
       }
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
@@ -2324,7 +2334,7 @@ export class TUI {
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth, showFable = showBoth) {
+  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true) {
     let a = this.am.accounts[idx];
     // A row benched by the duplicate guard renders the CLOUD's live copy (status,
     // bars, in-flight, request counts) — never the stale local snapshot. Identity
@@ -2510,7 +2520,7 @@ export class TUI {
     }
 
     if (a.type === 'provider') {
-      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth, showFable);
+      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth, showFable, showSession);
     }
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
@@ -2533,18 +2543,20 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
+    const bars = [];
+    if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
     // The Fable bar goes between the session and weekly bars on every row type, so
     // the Wk column starts at the same offset on OAuth, API-key and provider rows.
-    if (showFable) line += `  Fbl ${scopedWeeklyBar(q, 'fable', bw)}`;
+    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
       // (privacy@gomokka.com, measured 2026-08-06) doesn't read as broken.
-      line += (r2 == null && q.weeklyAbsent)
-        ? `  ${l2} ${emptyBar('none', bw)}`
-        : `  ${l2} ${bar(r2, bw, t2)}`;
+      bars.push((r2 == null && q.weeklyAbsent)
+        ? `${l2} ${emptyBar('none', bw)}`
+        : `${l2} ${bar(r2, bw, t2)}`);
     }
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${bars.join('  ')}`;
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
     // Per-account SETTINGS (preferred pin, usage cap), whatever the account is
@@ -2644,7 +2656,7 @@ export class TUI {
     return interval > 0 ? `every ${formatAge(interval)}` : 'shortly';
   }
 
-  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true, showFable = showBoth) {
+  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true, showFable = showBoth, showSession = true) {
     const q = a.quota || {};
 
     // Ses/Wk bars in the SAME columns as OAuth rows (right after status) so the
@@ -2696,9 +2708,11 @@ export class TUI {
     // setting whenever the probe is quiet is how a shipped feature reads as absent.
     for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
-    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} Ses ${sesCell}`;
-    if (showFable) line += `  Fbl ${scopedWeeklyBar(q, 'fable', bw)}`;
-    if (showBoth) line += `  Wk  ${wkCell}`;
+    const bars = [];
+    if (showSession) bars.push(`Ses ${sesCell}`);
+    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+    if (showBoth) bars.push(`Wk  ${wkCell}`);
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${bars.join('  ')}`;
     line += note;
     // Same recent-load columns as OAuth (providers track inFlight + load events),
     // plus a compact Last <status> <ms> — the one signal that matters for a
