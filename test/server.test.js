@@ -1170,7 +1170,10 @@ test('capacity failures use capacity queue window instead of long quota window',
       body: JSON.stringify({ model: 'test', messages: [] }),
     });
     assert.equal(res.status, 503);
-    assert.ok(Date.now() - startedAt < 500);
+    // Order-of-magnitude check (the window is 50ms vs the 2000ms quota window it must
+    // NOT use). A hard 500ms bound flakes on a loaded Mac (v1.24.68 release run
+    // 2026-11-06: failed once under full-suite load, 3/3 green in isolation).
+    assert.ok(Date.now() - startedAt < 1500, `capacity window took ${Date.now() - startedAt}ms`);
   } finally {
     await close(proxy);
     await close(upstream);
