@@ -680,9 +680,13 @@ test('capacity page on the REAL two-pool shape: cloud rows get their price and t
   const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
   link.lastOkAt = 1; link.lastError = null; link.identities = new Map();
   link.status = { accounts: [
-    { name: 'personal', type: 'oauth', accountUuid: 'P1', enabled: true, status: 'active', inFlight: 0, quota: {} },
+    { name: 'personal', type: 'oauth', accountUuid: 'P1', enabled: true, status: 'active', inFlight: 0, quota: {},
+      plan: { tier: 'Max 20x', cadence: 'monthly', priceUsd: 200, billingMonths: 1 } },
     { name: 'glm q', type: 'provider', provider: 'zai', enabled: true, status: 'active', inFlight: 0, quota: {},
-      monthlyPriceUSD: 134.4, tank: { wk: { avg: 8_000_000, n: 7, prev: null, last: 8_000_000, lowerBound: false } } },
+      monthlyPriceUSD: 134.4,
+      // v5: only all-token CYCLES are capacity; a bare aggregate `tank` (legacy axis) is ignored.
+      cycles: { ses: [], wk: [{ startedAt: Date.now() - 8 * 86400e3, endedAt: Date.now() - 86400e3, resetAt: Date.now() - 86400e3,
+        tokens: 8_000_000, finalUtilization: 1.0, complete: true, axis: 'all' }] } },
   ] };
   am.setPoolLinks([link]); am.syncRemoteMirrors(link);
   const t = new TUI({ accountManager: am, config: {} });

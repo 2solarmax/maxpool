@@ -26,7 +26,33 @@
 // The OAuth reset-stamp jitter (see AccountManager.noteCapacityWindowAdvance) shredded
 // real windows into slivers and recorded future-dated weekly cycles, so a v1 payload's
 // averages are wrong for weeks. Starting empty costs one window; keeping it costs trust.
-const SCHEMA_VERSION = 3;
+//
+// v4 (2026-11-06): open and closed cycles carry per-reading SAMPLES ({t, tokens, util})
+// so a cycle's capacity is a MEDIAN OF SEGMENT SLOPES (Δtokens/Δutil) instead of one
+// tokens/util division at close; plus recorded-not-used model-family and cache
+// counters. v3 payloads restore unchanged (their cycles simply have no samples).
+//
+// v5 (2026-11-06): TOKEN AXIS CHANGE. Capacity tokens = input + cache_read + cache_creation
+// + output — every token the provider processed — for Anthropic AND z.ai, so the two sit
+// on one axis. Everything recorded before v5 counted input+output only (axis 'io') and
+// is NOT comparable: it is never blended into a median. On restore from <v5, closed
+// rows are tagged axis 'io' (kept, excluded from the tank) and each in-flight cycle is
+// closed as a legacy row; the next accrual opens a fresh axis-'all' cycle. A row with no
+// `axis` field (an older linked pool's export) is legacy by definition.
+export const SCHEMA_VERSION = 5;
+const READABLE_SCHEMAS = new Set([3, 4, 5]);
+export const AXIS_ALL = 'all';
+
+// Samples kept per cycle. Beyond the cap the series is thinned to evenly spaced points.
+const MAX_SAMPLES_PER_CYCLE = 64;
+// A slope is only taken across a utilization move at least this wide (vendors report
+// whole percents; 1pp over 5pp is already 20% noise, over 1pp it is 100%).
+const MIN_SEGMENT_DUTIL = 0.05;
+// Close-time tokens/util is a lone-sample fallback; trusted only when the window was
+// nearly full (1pp of rounding is then <=2%).
+const CLOSE_FALLBACK_MIN_UTIL = 0.5;
+// Samples exported per cycle to a linked pool (bounded payload).
+const EXPORT_SAMPLES = 16;
 
 // Two closes this far apart are the SAME boundary observed twice (a clock-close and a
 // stamp-advance racing across the boundary second), not two windows.
@@ -65,6 +91,175 @@ function demote(c) {
   return { ...c, complete: false, partialReason: 'pre-v3-unverified' };
 }
 
+
+// Concurrent-cycle tolerance for merging two pools' histories of the SAME account window.
+const MERGE_TOLERANCE_MS = 10 * 60_000;
+
+/** Model family tag for the recorded (not yet used) per-model accrual breakdown. */
+export function capacityModelFamily(model) {
+  const s = String(model || '').toLowerCase();
+  if (s.includes('opus')) return 'opus';
+  if (s.includes('sonnet')) return 'sonnet';
+  if (s.includes('haiku')) return 'haiku';
+  if (s.includes('glm')) return 'glm';
+  return 'other';
+}
+
+function median(arr) {
+  if (!arr.length) return null;
+  const a = arr.slice().sort((x, y) => x - y);
+  const m = a.length >> 1;
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+/** Keep `max` evenly spaced samples (first and last always survive). */
+function thin(samples, max = MAX_SAMPLES_PER_CYCLE) {
+  if (samples.length <= max) return samples;
+  const out = [];
+  for (let i = 0; i < max; i++) out.push(samples[Math.round(i * (samples.length - 1) / (max - 1))]);
+  return out;
+}
+
+/** Segment slopes Δtokens/Δutil over a cycle's samples. Greedy non-overlapping
+ *  segments: anchor at a sample, close the segment at the first later sample whose
+ *  utilization is >= MIN_SEGMENT_DUTIL higher, then anchor there. Pairs with a
+ *  narrower move are skipped (whole-percent rounding turns them into noise); pairs
+ *  with no token flow carry no information and are skipped too. */
+export function segmentSlopes(samples) {
+  const out = [];
+  if (!Array.isArray(samples)) return out;
+  let anchor = null;
+  for (const s of samples) {
+    if (!Number.isFinite(s?.util) || !Number.isFinite(s?.tokens)) continue;
+    if (!anchor) { anchor = s; continue; }
+    if (s.util < anchor.util) { anchor = s; continue; }   // refill inside the cycle
+    const du = s.util - anchor.util;
+    if (du >= MIN_SEGMENT_DUTIL - 1e-9 && s.util >= TANK_MIN_UTIL) {
+      const dt = s.tokens - anchor.tokens;
+      if (dt > 0) out.push(dt / du);
+      anchor = s;
+    }
+  }
+  return out;
+}
+
+/** ONE cycle's capacity estimate (no cross-cycle clamp — the old "physical floor"
+ *  turned one big cycle into a floor under every other cycle):
+ *   1. median of segment slopes (the owner's "many measurements per cycle")
+ *   2. an exported estimate (`est`) from a pool whose samples we do not hold
+ *   3. close-time tokens/util, ONLY when the window ended nearly full (>= 0.5)
+ *  else null = too little data (never shown as a bogus number). */
+export function cycleEstimate(c) {
+  const slopes = segmentSlopes(c.samples);
+  if (slopes.length) return { tokens: median(slopes), method: 'slopes', segments: slopes.length };
+  if (Number.isFinite(c.est) && c.est > 0 && !c.merged) return { tokens: c.est, method: 'exported', segments: 0 };
+  if (Number.isFinite(c.finalUtilization) && c.finalUtilization >= CLOSE_FALLBACK_MIN_UTIL && c.tokens > 0) {
+    return { tokens: c.tokens / c.finalUtilization, method: 'close', segments: 0 };
+  }
+  return null;
+}
+
+/** Tank stats from a list of closed cycles (local ledger rows, remote exports, or a
+ *  merge of both). Per cycle: cycleEstimate. Across cycles: MEDIAN (not mean).
+ *  `n` = contributing cycles; `tooLittleData` = admitted cycles that yielded nothing. */
+export function tankStatsFromCycles(cycles, window, { readFloor = null, ignoreCeiling = false } = {}) {
+  const floor = (readFloor ?? READ_FLOOR_MS)[window] ?? 0;
+  // AXIS GATE: only all-token cycles are capacity observations. Legacy input+output rows
+  // (axis 'io', or no axis from an older linked pool) are a different unit and are never
+  // blended into the median — they stay in the ledger as history only.
+  const admitted = (cycles || []).filter(c =>
+    c.axis === AXIS_ALL
+    && !c.disabledDuring
+    && c.partialReason !== 'pre-v3-unverified'
+    && c.partialReason !== 'no-weekly-plan'
+    && !c.spansRefill
+    && (ignoreCeiling || (c.endedAt - c.startedAt) <= WINDOW_MS[window] * WINDOW_CEIL_FACTOR));
+  const ests = [];
+  let tooLittle = 0;
+  for (const c of admitted) {
+    const est = cycleEstimate(c);
+    const span = c.endedAt - c.startedAt;
+    // Read floor: a cycle shorter than 80% of its window is junk UNLESS it is a real
+    // observation — it ended nearly full AND holds >= 2 qualifying samples (reports@
+    // joined mid-week: a 4.3-day weekly tail at util 1.0 is a true reading, and the
+    // slope method does not care that we joined late).
+    const short = span < floor - 1_000;
+    const realShort = est?.method === 'slopes' && c.finalUtilization >= CLOSE_FALLBACK_MIN_UTIL;
+    if (!est || (short && !realShort)) { tooLittle++; continue; }
+    ests.push({ c, est });
+  }
+  if (!ests.length) return null;
+  let exact = 0, bounded = 0;
+  for (const { c, est } of ests) {
+    const fromStart = c.startedAt != null && c.windowStartedAt != null
+      && c.startedAt <= c.windowStartedAt + 60_000 && c.complete;
+    // A slope is invariant to when we started counting, so it is never a late-join lower bound.
+    if (est.method === 'slopes' || est.method === 'exported' || fromStart) exact++; else bounded++;
+  }
+  const vals = ests.map(e => e.est.tokens);
+  const last = ests[ests.length - 1], prev = ests[ests.length - 2];
+  return {
+    avg: Math.round(median(vals)),          // field name kept for consumers: it IS the median
+    exact, bounded, n: ests.length, tooLittleData: tooLittle,
+    // contributing cycles that are two-pool merges (samples dropped → close-time precision)
+    mergedCount: ests.filter(e => e.c.merged).length,
+    last: Math.round(last.est.tokens),
+    prev: prev ? Math.round(prev.est.tokens) : null,
+    lowerBound: bounded > 0 && exact === 0,
+  };
+}
+
+const cycleKey = (c) => c.resetAt ?? c.endedAt;
+
+/** Union two pools' closed-cycle histories for ONE account. A window both pools saw
+ *  (resetAt within ±10 min) is ONE vendor window that each pool measured from its OWN
+ *  traffic only: tokens SUM, utilization is the vendor's global reading (MAX, never
+ *  summed). Measured: mk@gomokka wk reset 11-04 — Mac 9.04M + cloud 1.34M at util 1.0
+ *  is a 10.38M cycle; deduping would drop the cloud's 1.3M.
+ *  Sample alignment across pools is impractical (different clocks, polling cadence,
+ *  each series counts only its own pool's tokens), so a merged cycle drops its samples
+ *  and is estimated as summed tokens / max util at close (needs util >= 0.5, as for any
+ *  close-time reading). Disjoint cycles pass through untouched, samples included. */
+export function mergeCycles(localCycles, remoteCycles) {
+  const local = (localCycles || []).map(c => ({ ...c }));
+  const used = new Set();
+  const out = [];
+  const remotes = (remoteCycles || []).slice().sort((a, b) => cycleKey(a) - cycleKey(b));
+  const matched = new Map();   // local idx -> merged cycle
+  for (const r of remotes) {
+    let best = -1, bestD = Infinity;
+    for (let i = 0; i < local.length; i++) {
+      if (used.has(i)) continue;
+      if ((local[i].axis ?? 'io') !== (r.axis ?? 'io')) continue;   // never sum across token axes
+      const d = Math.abs(cycleKey(local[i]) - cycleKey(r));
+      if (d <= MERGE_TOLERANCE_MS && d < bestD) { best = i; bestD = d; }
+    }
+    if (best < 0) { out.push({ ...r }); continue; }
+    used.add(best);
+    const l = local[best];
+    const utils = [l.finalUtilization, r.finalUtilization].filter(Number.isFinite);
+    const starts = [l.windowStartedAt, r.windowStartedAt].filter(v => v != null);
+    const merged = {
+      startedAt: Math.min(l.startedAt, r.startedAt),
+      endedAt: Math.max(l.endedAt, r.endedAt),
+      tokens: (l.tokens || 0) + (r.tokens || 0),
+      complete: Boolean(l.complete || r.complete),
+      disabledDuring: Boolean(l.disabledDuring || r.disabledDuring),
+      spansRefill: Boolean(l.spansRefill || r.spansRefill),
+      resetAt: l.resetAt ?? r.resetAt,
+      merged: true, sources: 2, axis: l.axis ?? r.axis,
+      ...(utils.length ? { finalUtilization: Math.max(...utils) } : {}),
+      ...(starts.length ? { windowStartedAt: Math.min(...starts) } : {}),
+      ...((l.partialReason || r.partialReason) ? { partialReason: l.partialReason || r.partialReason } : {}),
+    };
+    // pre-v3-unverified on EITHER side must keep the merged row out (never-trust reason)
+    if (l.partialReason === 'pre-v3-unverified' || r.partialReason === 'pre-v3-unverified') merged.partialReason = 'pre-v3-unverified';
+    matched.set(best, merged);
+  }
+  local.forEach((l, i) => out.push(matched.get(i) || l));
+  return out.sort((a, b) => cycleKey(a) - cycleKey(b));
+}
+
 export class CapacityLedger {
   constructor({ now = () => Date.now() } = {}) {
     this._now = now;
@@ -98,7 +293,7 @@ export class CapacityLedger {
       }
       return CapacityLedger.fromSerialized(migrated, { now });
     }
-    if (!payload || payload.schemaVersion !== SCHEMA_VERSION) {
+    if (!payload || !READABLE_SCHEMAS.has(payload.schemaVersion)) {
       // No history to continue: whatever window each account is in RIGHT NOW is
       // already in progress, so the next cycle we close saw only its tail. Flag it so
       // it is shown but never averaged (live 2026-08-23: the first GLM cycle after the
@@ -111,7 +306,7 @@ export class CapacityLedger {
       for (const [name, rec] of Object.entries(payload.accounts || {})) {
         const a = { ses: { open: null, closed: [] }, wk: { open: null, closed: [] }, days: {} };
         for (const w of ['ses', 'wk']) {
-          if (rec[w]?.open) a[w].open = { ...rec[w].open };
+          if (rec[w]?.open) a[w].open = JSON.parse(JSON.stringify(rec[w].open));
           if (Array.isArray(rec[w]?.closed)) {
             // LOAD-TIME REPAIR, applied at EVERY version — not inside the v2→v3 branch,
             // which is where it was first (wrongly) placed: a future-dated row can be
@@ -120,10 +315,27 @@ export class CapacityLedger {
             // 2026-08-23: a row ending 19:54 survived the v3 migration untouched because
             // the state was already v3. A cycle cannot end after now; such a row is
             // corrupt, so demote it and clamp it rather than let it re-alert until evicted.
-            a[w].closed = rec[w].closed.slice(-MAX_CYCLES_PER_WINDOW).map(c =>
+            a[w].closed.push(...rec[w].closed.slice(-MAX_CYCLES_PER_WINDOW).map(c => ({ ...c, axis: c.axis === AXIS_ALL ? AXIS_ALL : 'io' })).map(c =>
               (c.endedAt > Date.now() + 60_000)
                 ? { ...c, endedAt: c.startedAt, complete: false, partialReason: 'repaired-future-endedAt' }
-                : c);
+                : c));
+          }
+          // AXIS: an in-flight cycle counted input+output only. It cannot continue on the
+          // all-tokens axis (half its tokens would be on the old definition), so it is
+          // closed as a LEGACY row and the next accrual opens a fresh axis-'all' cycle.
+          if (a[w].open && a[w].open.axis !== AXIS_ALL) {
+            const o = a[w].open;
+            if (o.tokensSoFar > 0) {
+              a[w].closed.push({
+                startedAt: o.startedAt, endedAt: Math.min(o.lastAccrualAt || o.startedAt, Date.now()),
+                tokens: o.tokensSoFar, complete: false, disabledDuring: Boolean(o.disabledDuring),
+                partialReason: 'legacy-axis', axis: 'io',
+                ...(Number.isFinite(o.peakUtilization) ? { finalUtilization: o.peakUtilization } : {}),
+                ...(o.windowStartedAt != null ? { windowStartedAt: o.windowStartedAt } : {}),
+                resetAt: null,
+              });
+            }
+            a[w].open = null;
           }
         }
         if (rec.days && typeof rec.days === 'object') {
@@ -139,8 +351,8 @@ export class CapacityLedger {
     const accounts = {};
     for (const [name, rec] of this._accounts) {
       accounts[name] = {
-        ses: { open: rec.ses.open ? { ...rec.ses.open } : null, closed: rec.ses.closed.slice() },
-        wk: { open: rec.wk.open ? { ...rec.wk.open } : null, closed: rec.wk.closed.slice() },
+        ses: { open: rec.ses.open ? JSON.parse(JSON.stringify(rec.ses.open)) : null, closed: rec.ses.closed.slice() },
+        wk: { open: rec.wk.open ? JSON.parse(JSON.stringify(rec.wk.open)) : null, closed: rec.wk.closed.slice() },
         days: Object.fromEntries(Object.entries(rec.days).map(([d, v]) => [d, { ...v }])),
       };
     }
@@ -163,8 +375,15 @@ export class CapacityLedger {
    *  M3 in the pre-mortem — Anthropic interim deltas are CUMULATIVE, so the SSE seam
    *  passes the running max, and this adds it exactly once per request).
    *  count_tokens requests are the CALLER's job to skip (M4) — they never reach here. */
-  accrue(name, { input, output }, at = this._now(), windows = ['ses', 'wk']) {
-    if (!(input > 0) && !(output > 0)) return;
+  accrue(name, { input, output, cacheRead = 0, cacheCreation = 0, model = null }, at = this._now(), windows = ['ses', 'wk']) {
+    // TOKEN DEFINITION (v5, owner 2026-11-06): every token the provider processed =
+    // input + cache_read + cache_creation + output, identical for Anthropic and z.ai so
+    // both sit on one axis. (The cache counters are also kept separately per cycle.)
+    const cr = cacheRead > 0 ? cacheRead : 0, cc = cacheCreation > 0 ? cacheCreation : 0;
+    const total = (input > 0 ? input : 0) + (output > 0 ? output : 0) + cr + cc;
+    if (!(total > 0)) return;
+    // `model` is recorded as a per-family token breakdown (open.models), never used by the tank.
+    const fam = capacityModelFamily(model);
     const rec = this._rec(name);
     for (const w of windows) {
       // Open the window lazily if nothing is open (a mid-cycle boot or a window whose
@@ -174,16 +393,21 @@ export class CapacityLedger {
         const joined = this._joinedMidWindow && rec[w].closed.length === 0;
         rec[w].open = {
           startedAt: at, tokensSoFar: 0, lastAccrualAt: at,
-          complete: !joined, disabledDuring: false,
+          complete: !joined, disabledDuring: false, axis: AXIS_ALL,
           ...(joined ? { partialReason: 'joined-mid-window' } : {}),
         };
       }
-      rec[w].open.tokensSoFar += input + output;
-      rec[w].open.lastAccrualAt = at;
+      const o = rec[w].open;
+      o.tokensSoFar += total;
+      o.cacheRead = (o.cacheRead || 0) + cr;
+      o.cacheCreation = (o.cacheCreation || 0) + cc;
+      o.models = o.models || {};
+      o.models[fam] = (o.models[fam] || 0) + total;
+      o.lastAccrualAt = at;
     }
     const day = new Date(at).toISOString().slice(0, 10);
     rec.days[day] = rec.days[day] || { tokens: 0, partial: false };
-    rec.days[day].tokens += input + output;
+    rec.days[day].tokens += total;
     this._evictDays(rec);
   }
 
@@ -281,6 +505,10 @@ export class CapacityLedger {
       // percentage counts everything). Dropping it here made every tank read "bounded".
       ...(open.windowStartedAt != null ? { windowStartedAt: open.windowStartedAt } : {}),
       ...(open.peakReset ? { spansRefill: true } : {}),
+      ...(open.samples?.length ? { samples: thin(open.samples) } : {}),
+      axis: open.axis || 'io',
+      ...(open.cacheRead !== undefined ? { cacheRead: open.cacheRead, cacheCreation: open.cacheCreation || 0 } : {}),
+      ...(open.models ? { models: open.models } : {}),
       resetAt,
     });
     if (rec[window].closed.length > MAX_CYCLES_PER_WINDOW) rec[window].closed.shift();
@@ -372,8 +600,22 @@ export class CapacityLedger {
       if (Number.isFinite(open.peakUtilization) && open.peakUtilization - m.utilization >= 0.10) {
         open.peakUtilization = m.utilization;
         open.peakReset = true;
+        open.samples = [];     // pre-refill readings describe a different tank
       } else if (!Number.isFinite(open.peakUtilization) || m.utilization > open.peakUtilization) {
         open.peakUtilization = m.utilization;
+      }
+      // SAMPLE: {t, tokens (cumulative in-window), util, + cumulative cache/model counters}.
+      // Only a CHANGED utilization is a new measurement: the first reading at a level is
+      // the closest bracket of when that level was crossed; repeats add nothing.
+      open.samples = open.samples || [];
+      const lastS = open.samples[open.samples.length - 1];
+      if (!lastS || lastS.util !== m.utilization) {
+        open.samples.push({
+          t: at, tokens: open.tokensSoFar, util: m.utilization,
+          cr: open.cacheRead || 0, cc: open.cacheCreation || 0,
+          ...(open.models ? { m: { ...open.models } } : {}),
+        });
+        if (open.samples.length > MAX_SAMPLES_PER_CYCLE * 2) open.samples = thin(open.samples);
       }
       const key = `${m.name}:${m.window}`;
       const prev = this._utilMarks.get(key);
@@ -447,74 +689,38 @@ export class CapacityLedger {
    *    into the average as fake precision.
    *  Returns { avg, exact, n, bounded, last } or null when no usable readings. */
   tankStats(name, window) {
-    const rec = this._accounts.get(name);
-    const floor = (this._readFloorOverride ?? READ_FLOOR_MS)[window] ?? 0;
-    // TANK READING SET (2026-10-13): partial cycles COUNT here. The strict
-    // `complete` gate was written for demand stats and quietly deleted every
-    // weekly observation — a 7d window outlives every maxpool restart/sleep, so
-    // restoreCapacityState's >60s downtime check marked nearly all of them
-    // partial and the Weekly (7d) page read "--" everywhere (owner report
-    // 2026-10-13). For TANK math a gap is already handled: tokens ÷ vendor % is
-    // a lower bound whenever spend was unseen, and exact/bounded/lowerBound
-    // exist to say so. Still excluded, hard: disabledDuring (operator benched
-    // the account — not a capacity observation) and `pre-v3-unverified` (the
-    // ONE reason that means "never trust this row").
-    const closed = (rec?.[window]?.closed || []).filter(c =>
-      !c.disabledDuring
-      && c.partialReason !== 'pre-v3-unverified'
-      && c.partialReason !== 'no-weekly-plan'
-      && !c.spansRefill
-      && (c.endedAt - c.startedAt) >= floor - 1_000
-      // CEILING: a cycle far longer than its window swallowed a rollover it never
-      // saw — two tanks' tokens over one tank's percentage (see WINDOW_CEIL_FACTOR).
-      && (this._readFloorOverride != null
-          || (c.endedAt - c.startedAt) <= WINDOW_MS[window] * WINDOW_CEIL_FACTOR));
-    // PHYSICAL FLOOR: a tank can never be smaller than the most tokens ever
-    // delivered in one complete window — every token we count is a vendor token
-    // (C ≤ V ≤ tank), so maxDelivered ≤ tank is an invariant, not a heuristic.
-    // A reading implying a smaller tank is contaminated: the vendor % counted
-    // spend maxpool never saw (usage outside the proxy — an account also used
-    // directly), or the reading was stale. Measured live 2026-08-26: a window
-    // that delivered 497k at a reported "95% full" implied a 523k tank while an
-    // earlier window of the SAME account had delivered 1.53M — impossible, and
-    // the understated reading silently dragged the average down 3.6x.
-    // CLAMP, never discard: the contaminated reading is still a real lower bound
-    // (the tank is at least the tokens we saw), so it joins the average AT the
-    // floor rather than being thrown away — discarding left an account whose
-    // every reading was contaminated with NOTHING to show. After a plan
-    // downgrade the floor over-states until old cycles age out — conservative.
-    // The floor is taken over EVERY admitted cycle, partial ones included: a
-    // partial cycle's token count is still tokens the vendor really delivered,
-    // so it is still a hard lower bound on the tank. Restricting it to complete
-    // cycles left it inert on weekly history, where nearly every cycle is partial
-    // (red-team 2026-10-13, finding 4).
-    const maxDelivered = closed.reduce((m, c) => Math.max(m, c.tokens), 0);
-    const usable = closed.filter(c =>
-      Number.isFinite(c.finalUtilization) && c.finalUtilization >= TANK_MIN_UTIL);
-    if (!usable.length) return null;
-    let sum = 0, exact = 0, bounded = 0;
-    for (const c of usable) {
-      const observedFromStart = c.startedAt != null && c.windowStartedAt != null
-        && c.startedAt <= c.windowStartedAt + 60_000 && c.complete;
-      sum += Math.max(c.tokens / c.finalUtilization, maxDelivered);
-      if (observedFromStart) exact++; else bounded++;
-    }
-    const last = usable[usable.length - 1];
-    const prevCycle = usable[usable.length - 2];
-    return {
-      avg: Math.round(sum / usable.length),
-      exact, bounded,
-      n: usable.length,
-      last: Math.round(Math.max(last.tokens / last.finalUtilization, maxDelivered)),
-      // PREV in TANK units (tokens ÷ that cycle's own reading) — the page's
-      // Prev column used to come from windowStats (delivered tokens), mixing
-      // units across one row (2026-10-13 owner report). Same physical floor as
-      // the average: a reading implying less than a past delivery is impossible.
-      prev: prevCycle != null
-        ? Math.round(Math.max(prevCycle.tokens / prevCycle.finalUtilization, maxDelivered))
-        : null,
-      lowerBound: bounded > 0 && exact === 0,
-    };
+    return tankStatsFromCycles(this.closedCycles(name, window), window,
+      { readFloor: this._readFloorOverride, ignoreCeiling: this._readFloorOverride != null });
+  }
+
+  /** Closed cycles of one account window (shallow copies). The tank reading set:
+   *  partial cycles COUNT (a 7d window outlives every restart, so a complete-only gate
+   *  deleted all weekly history — owner report 2026-10-13); disabledDuring and
+   *  pre-v3-unverified are excluded in tankStatsFromCycles. */
+  closedCycles(name, window) {
+    return (this._accounts.get(name)?.[window]?.closed || []).map(c => ({ ...c }));
+  }
+
+  /** Bounded export for a linked pool (B1): closed cycles of one window, newest last,
+   *  samples thinned. `est` carries this pool's own per-cycle estimate so a consumer
+   *  that cannot re-derive it still has the slope-based number. */
+  exportCycles(name, window, limit) {
+    const closed = (this._accounts.get(name)?.[window]?.closed || []).slice(-limit);
+    return closed.map(c => {
+      const e = cycleEstimate(c);
+      const o = {
+        startedAt: c.startedAt, endedAt: c.endedAt, resetAt: c.resetAt ?? null,
+        axis: c.axis ?? 'io',
+        tokens: c.tokens, complete: c.complete, disabledDuring: Boolean(c.disabledDuring),
+        ...(c.partialReason ? { partialReason: c.partialReason } : {}),
+        ...(c.spansRefill ? { spansRefill: true } : {}),
+        ...(Number.isFinite(c.finalUtilization) ? { finalUtilization: c.finalUtilization } : {}),
+        ...(c.windowStartedAt != null ? { windowStartedAt: c.windowStartedAt } : {}),
+        ...(e && e.method === 'slopes' ? { est: Math.round(e.tokens) } : {}),
+      };
+      if (c.samples?.length) o.samples = thin(c.samples, EXPORT_SAMPLES).map(({ t, tokens, util }) => ({ t, tokens, util }));
+      return o;
+    });
   }
 
   rollingThroughput(name, days = 7) {

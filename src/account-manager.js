@@ -1,8 +1,8 @@
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
-import { computeDuplicates, credentialFp } from './pool-link.js';
+import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity } from './pool-link.js';
 import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
-import { CapacityLedger, TANK_MIN_UTIL } from './capacity-ledger.js';
+import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 
 // Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
 // local table so account-manager does not import a private constant).
@@ -386,6 +386,35 @@ function parseResetHeader(value) {
  * also logs once so a hand-edited config doesn't silently fail open (a NaN cap makes
  * every `util >= cap` comparison false = uncapped, with no error anywhere).
  */
+const PLAN_CADENCE_MONTHS = { monthly: 1, quarterly: 3, annual: 12, annually: 12, yearly: 12 };
+
+/** Optional per-account plan config: { tier, cadence, priceUsd, billingMonths }.
+ *  Display-only (Capacity page Plan column + $/1M). Tolerant: anything malformed → null,
+ *  never a guessed value. billingMonths defaults from the cadence word. */
+export function sanitizePlan(plan) {
+  if (!plan || typeof plan !== 'object') return null;
+  const priceUsd = Number(plan.priceUsd);
+  const cadence = typeof plan.cadence === 'string' ? plan.cadence.toLowerCase() : null;
+  let billingMonths = Number(plan.billingMonths);
+  if (!(billingMonths > 0)) billingMonths = PLAN_CADENCE_MONTHS[cadence] || NaN;
+  const out = {
+    tier: typeof plan.tier === 'string' ? plan.tier.slice(0, 40) : null,
+    cadence,
+    priceUsd: priceUsd >= 0 && Number.isFinite(priceUsd) ? priceUsd : null,
+    billingMonths: billingMonths > 0 ? billingMonths : null,
+  };
+  return (out.tier || out.priceUsd != null) ? out : null;
+}
+
+/** Default plan of every Anthropic (OAuth) account when none is configured (owner 2026-11-06). */
+export const DEFAULT_CLAUDE_PLAN = { tier: 'Claude Max', cadence: 'monthly', priceUsd: 200, billingMonths: 1 };
+
+/** Monthly-normalized USD from a plan, or null when it cannot be derived. */
+export function planMonthlyUSD(plan) {
+  const p = sanitizePlan(plan);
+  return (p && p.priceUsd != null && p.billingMonths) ? p.priceUsd / p.billingMonths : null;
+}
+
 function _sanitizeCap(value, name, quiet = false) {
   if (value == null) return null;
   const n = Number(value);
@@ -516,6 +545,7 @@ export class AccountManager {
       capRampStart: _sanitizeRampStart(acct.capRampStart, acct.name),
       model: acct.model || null,
       modelMap: acct.modelMap || null,
+      plan: sanitizePlan(acct.plan),
       stripBetaHeaders: Boolean(acct.stripBetaHeaders),
       runtime: Boolean(acct.runtime),
       enabled: acct.enabled !== false,
@@ -3718,19 +3748,24 @@ export class AccountManager {
 
   monthlyPriceFor(account) {
     // A cloud mirror carries no credential, so this pool cannot read its subscription;
-    // the cloud pool reads it and exports it per row (remoteMonthlyPriceUSD).
-    if (account?.remote && account.remoteMonthlyPriceUSD != null) return account.remoteMonthlyPriceUSD;
-    if (account?.type === 'provider') return account.monthlyPriceUSD ?? null;
+    // the cloud pool reads it and exports it per row (remotePlan / remoteMonthlyPriceUSD).
+    if (account?.remote) {
+      const rp = planMonthlyUSD(account.remotePlan);
+      if (rp != null) return rp;
+      if (account.remoteMonthlyPriceUSD != null) return account.remoteMonthlyPriceUSD;
+    }
+    // GLM: the live z.ai subscription value (renewPrice ÷ cycle months, from the prober)
+    // is authoritative; a configured `plan` (receipts) is only the fallback.
+    if (account?.type === 'provider') return account.monthlyPriceUSD ?? planMonthlyUSD(account?.plan);
+    const pm = planMonthlyUSD(account?.plan);
+    if (pm != null) return pm;
     const tbl = this.scheduler?.monthlyPriceUSD;
     if (tbl && typeof tbl === 'object') {
       const hit = tbl[account?.name] ?? tbl['*'];
       if (Number.isFinite(hit)) return hit;
     }
-    // Owner 2026-10-31: "Claude monthly price is fixed, it's 200 dollars per month."
-    // Anthropic has no per-account price API, so this is the default for every Claude
-    // login; scheduler.monthlyPriceUSD (name or '*') overrides it.
-    if (account?.type === 'oauth') return 200;
-    return null;
+    // Owner 2026-11-06: every Anthropic account is monthly $200 — the default plan below.
+    return account?.type === 'oauth' ? DEFAULT_CLAUDE_PLAN.priceUsd / DEFAULT_CLAUDE_PLAN.billingMonths : null;
   }
 
   applyResetCards(accountIndex, cards) {
@@ -3995,18 +4030,17 @@ export class AccountManager {
   capacityTank(accountIndex, window) {
     const a = this.accounts[accountIndex];
     if (!a) return null;
-    // A cloud mirror's history lives in TWO ledgers: this pool's, under the account's
-    // pre-migration name (months of cycles measured locally before it moved), and the
-    // cloud pool's own, exported per row as remoteTank. Mirror rows are named
-    // "<name> ☁", which matched neither — so every cloud row read "--" (2026-10-31).
-    if (a.remote) {
-      // Prefer whichever ledger holds MORE cycles: the cloud pool only started
-      // measuring at migration (2026-10-29), so for weeks its 0-2 cycles would
-      // otherwise override months of history measured here.
-      const cloud = a.remoteTank?.[window] || null;
-      const local = this.capacity.tankStats(a.remote.remoteName || a.name, window);
-      const best = (cloud && local) ? ((cloud.n || 0) >= (local.n || 0) ? cloud : local) : (cloud || local);
-      return best ? { ...best, source: 'cycles' } : null;
+    // One account = one history, wherever it ran. A mirror/benched pair (same identity)
+    // is the SAME account seen from two pools: union this pool's ledger cycles with the
+    // cycles every linked pool exported — never "the ledger with more cycles wins".
+    if (a.remote || a.poolBenchedBy) {
+      const merged = this.capacityHistory(a, window);
+      const t = tankStatsFromCycles(merged, window, {
+        readFloor: this.capacity._readFloorOverride, ignoreCeiling: this.capacity._readFloorOverride != null });
+      if (t) return { ...t, source: 'cycles' };
+      // An older cloud's exported aggregate (remoteTank) is on the legacy input+output
+      // axis: never shown, never blended.
+      return null;
     }
     const measured = this.capacity.tankStats(a.name, window);
     if (measured) return { ...measured, source: 'cycles' };
@@ -4023,7 +4057,95 @@ export class AccountManager {
     };
   }
 
-  accrueCapacity(accountIndex, { input = 0, output = 0 } = {}) {
+  /** Identity of a row: local → accountIdentity; mirror → the remote's uuid / key
+   *  fingerprint (same key shape). null = unresolvable (never merged by name). */
+  capacityIdentity(a) {
+    if (!a) return null;
+    if (a.remote) return remoteAccountIdentity({ type: a.type, provider: a.provider, accountUuid: a.remoteUuid, keyFingerprint: a.remoteKeyFp });
+    return accountIdentity(a);
+  }
+
+  /** Every row of one identity (local rows + mirrors). An unresolvable row is alone. */
+  capacityGroupOf(a) {
+    const id = this.capacityIdentity(a);
+    if (!id) return [a];
+    return this.accounts.filter(x => this.capacityIdentity(x) === id);
+  }
+
+  /** Merged closed-cycle history of an account's whole identity: this pool's ledger
+   *  (under the local name, and under a mirror's pre-migration remote name) plus every
+   *  linked pool's exported cycles. */
+  capacityHistory(a, window) {
+    const group = this.capacityGroupOf(a);
+    const names = new Set();
+    for (const x of group) names.add(x.remote ? (x.remote.remoteName || x.name) : x.name);
+    let local = [];
+    for (const n of names) local = mergeCycles(local, this.capacity.closedCycles(n, window));
+    let remote = [];
+    for (const x of group) {
+      if (x.remote && Array.isArray(x.remoteCycles?.[window])) remote = mergeCycles(remote, x.remoteCycles[window]);
+    }
+    return mergeCycles(local, remote);
+  }
+
+  /** Where an account's measurements live: 'cloud' | 'laptop' | 'both' (ledgers with
+   *  activity in the last 14 days, else where the live row routes). */
+  capacityWhere(a, now = Date.now()) {
+    const group = this.capacityGroupOf(a);
+    const cutoff = now - 14 * 86400_000;
+    let laptop = false, cloud = false;
+    const hasMirror = group.some(x => x.remote && x.enabled !== false);
+    for (const x of group) {
+      if (x.remote) {
+        const rc = x.remoteCycles || {};
+        if ([...(rc.ses || []), ...(rc.wk || [])].some(c => c.endedAt >= cutoff)) cloud = true;
+        const n = x.remote.remoteName || x.name;
+        if (this._ledgerActiveSince(n, cutoff)) laptop = true;
+      } else if (this._ledgerActiveSince(x.name, cutoff)) laptop = true;
+    }
+    if (hasMirror) cloud = true;           // the live row routes through the cloud
+    if (!laptop && !cloud) return group.some(x => !x.remote) ? 'laptop' : 'cloud';
+    return laptop && cloud ? 'both' : (cloud ? 'cloud' : 'laptop');
+  }
+
+  _ledgerActiveSince(name, cutoff) {
+    for (const w of ['ses', 'wk']) {
+      if (this.capacity.closedCycles(name, w).some(c => c.endedAt >= cutoff)) return true;
+      if ((this.capacity.openCycle(name, w)?.lastAccrualAt || 0) >= cutoff) return true;
+    }
+    return false;
+  }
+
+  /** Capacity-page rows: ONE per identity. Primary = the live authority (mirror when
+   *  present, else the local row). Rows with no resolvable identity stay separate and
+   *  are marked `unresolved` (never merged by name alone). */
+  capacityRows(order, { hideDisabled = false } = {}) {
+    const rows = [];
+    const seen = new Set();
+    for (const i of order) {
+      const a = this.accounts[i];
+      if (!a || seen.has(a.index)) continue;
+      const id = this.capacityIdentity(a);
+      const group = id ? this.capacityGroupOf(a) : [a];
+      for (const x of group) seen.add(x.index);
+      const visible = group.filter(x => !(hideDisabled && x.enabled === false));
+      if (!visible.length) continue;
+      const primary = visible.find(x => x.remote && x.enabled !== false) || visible.find(x => !x.remote) || visible[0];
+      const localRow = group.find(x => !x.remote);
+      const withPrice = [primary, ...group].find(x => x && this.monthlyPriceFor(x) != null) || primary;
+      const withPlan = [primary, ...group].find(x => x && (x.plan || x.remotePlan)) || null;
+      rows.push({
+        index: primary.index, group: group.map(x => x.index), unresolved: !id,
+        displayName: (localRow || primary).name.replace(/ ☁$/, ''),
+        where: this.capacityWhere(primary),
+        priceAccount: withPrice,
+        plan: withPlan ? sanitizePlan(withPlan.plan || withPlan.remotePlan) : (primary.type === 'oauth' ? DEFAULT_CLAUDE_PLAN : null),
+      });
+    }
+    return rows;
+  }
+
+  accrueCapacity(accountIndex, { input = 0, output = 0, cacheRead = 0, cacheCreation = 0, model = null } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     // A no-weekly plan (z.ai legacy TOKENS_LIMIT, weeklyAbsent) has no weekly window to
@@ -4032,7 +4154,7 @@ export class AccountManager {
     // window + day buckets (the 7d volume) are the real signals for such accounts.
     const windows = account.type === 'provider' && account.quota?.weeklyAbsent
       ? ['ses'] : ['ses', 'wk'];
-    this.capacity.accrue(account.name, { input, output }, undefined, windows);
+    this.capacity.accrue(account.name, { input, output, cacheRead, cacheCreation, model }, undefined, windows);
   }
 
   /** The vendor's CURRENT fullness reading for a window — the tank numerator's
@@ -4486,6 +4608,7 @@ export class AccountManager {
       priority: Number.isFinite(acctData.priority) ? acctData.priority : 0,
       model: acctData.model || null,
       modelMap: acctData.modelMap || null,
+      plan: sanitizePlan(acctData.plan),
       stripBetaHeaders: Boolean(acctData.stripBetaHeaders),
       runtime: Boolean(acctData.runtime),
       configSourced: Boolean(acctData.configSourced),
@@ -4944,6 +5067,9 @@ export class AccountManager {
       a.resetGrants = ra.resetGrants || null;
       a.remoteMonthlyPriceUSD = Number.isFinite(ra.monthlyPriceUSD) ? ra.monthlyPriceUSD : null;
       a.remoteTank = ra.tank || null;
+      a.remoteKeyFp = ra.keyFingerprint || null;
+      a.remoteCycles = ra.cycles || null;
+      a.remotePlan = sanitizePlan(ra.plan);
       // Other teammates' live load on this cloud account (remote inFlight minus our
       // own leases) — so the balancer sees the account as busy as it really is.
       a._remoteOtherLoad = Math.max(0, (ra.inFlight || 0) - (a.inFlight || 0));
@@ -5012,6 +5138,14 @@ export class AccountManager {
         // (live-rehearsal 2026-10-29: status omitted accountUuid → no bench).
         accountUuid: a.type === 'oauth' ? (a.accountUuid || null) : null,
         keyFingerprint: (a.type === 'provider' && a.credential) ? credentialFp(a.credential) : null,
+        // Plan config (display-only) + this pool's closed cycles per window so a linked
+        // pool can UNION history instead of picking one ledger (bounded: 12 weekly /
+        // 60 session). 
+        plan: a.remote ? null : (a.plan || null),
+        cycles: a.remote ? null : {
+          wk: this.capacity?.exportCycles(a.name, 'wk', 12) || [],
+          ses: this.capacity?.exportCycles(a.name, 'ses', 60) || [],
+        },
         upstream: a.upstream,
         profiles: a.profiles,
         priority: a.priority,

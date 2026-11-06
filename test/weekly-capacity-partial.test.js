@@ -93,7 +93,7 @@ test('W4: markPartial records a reason; restore passes "maxpool-downtime"', () =
 test('W5: tankStats exposes prev — second-newest usable reading, same units as avg', () => {
   const l = new CapacityLedger();
   const end = Date.now();
-  closeWeek(l, 'a', { tokens: 3_000_000, util: 0.3, startedAt: end - 2 * SEVEN_D, endedAt: end - SEVEN_D, complete: false });
+  closeWeek(l, 'a', { tokens: 5_000_000, util: 0.5, startedAt: end - 2 * SEVEN_D, endedAt: end - SEVEN_D, complete: false });
   closeWeek(l, 'a', { tokens: 6_000_000, util: 0.6, startedAt: end - SEVEN_D, endedAt: end, complete: false });
   const t = l.tankStats('a', 'wk');
   assert.equal(t.last, 10_000_000);
@@ -168,17 +168,18 @@ test('W11: a 1.0 (wall) reading never becomes the peak', () => {
   assert.equal(l.openCycle('a', 'wk').peakUtilization, 0.5, 'the wall says nothing about tank size');
 });
 
-test('W12: the physical floor holds on ALL-PARTIAL weekly history', () => {
-  // Reproduced by the reviewer: 3 downtime-partial weeks (1.53M@50%, 497k@95%
-  // contaminated, 2M@50%) showed Prev=523k — below the 1.53M actually delivered.
+test('W12: all-partial weekly history — no clamp; median of per-cycle tanks', () => {
+  // v1 clamped every reading up to the biggest delivery (Prev read 2M+ for a 523k
+  // reading). v2: a contaminated reading stays what it measured; the MEDIAN absorbs it.
   const l = new CapacityLedger();
   const end = Date.now();
   closeWeek(l, 'a', { tokens: 1_530_000, util: 0.5, startedAt: end - 3 * SEVEN_D, endedAt: end - 2 * SEVEN_D, complete: false });
   closeWeek(l, 'a', { tokens: 497_000, util: 0.95, startedAt: end - 2 * SEVEN_D, endedAt: end - SEVEN_D, complete: false });
   closeWeek(l, 'a', { tokens: 2_000_000, util: 0.5, startedAt: end - SEVEN_D, endedAt: end, complete: false });
   const t = l.tankStats('a', 'wk');
-  assert.ok(t.prev >= 2_000_000, `prev never below a real delivery (got ${t.prev})`);
-  for (const v of [t.avg, t.last, t.prev]) assert.ok(v >= 2_000_000, 'every shown tank >= max delivered');
+  assert.equal(t.avg, 3_060_000, 'median of [3.06M, 523k, 4.0M]');
+  assert.equal(t.prev, 523_158, 'the contaminated reading is shown as measured');
+  assert.equal(t.last, 4_000_000);
 });
 
 test('W13: a no-weekly-plan retired cycle never counts, even with a recorded peak', () => {

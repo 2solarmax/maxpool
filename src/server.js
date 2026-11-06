@@ -1879,6 +1879,9 @@ async function forwardRequest(
         accountManager.accrueCapacity?.(account.index, {
           input: requestInfo._capacityInput || 0,
           output: requestInfo._capacityOutput || 0,
+          cacheRead: requestInfo._capacityCacheRead || 0,
+          cacheCreation: requestInfo._capacityCacheCreation || 0,
+          model: requestInfo.model,
         });
       }
       accountManager.releaseAccount(lease, { success: true, status: upstreamRes.status });
@@ -4062,6 +4065,14 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   }
 }
 
+/** Running-max the cache counters of one usage object into the request's capacity book.
+ *  Capacity tokens = input + cache_read + cache_creation + output (every token the
+ *  provider processed), the same definition for Anthropic and z.ai. */
+function noteCapacityCache(requestInfo, usage) {
+  requestInfo._capacityCacheRead = Math.max(requestInfo._capacityCacheRead || 0, usage?.cache_read_input_tokens || 0);
+  requestInfo._capacityCacheCreation = Math.max(requestInfo._capacityCacheCreation || 0, usage?.cache_creation_input_tokens || 0);
+}
+
 function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
@@ -4077,10 +4088,17 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
         accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
         accountManager.countCallerTokens?.(requestInfo.caller, data.message.usage.input_tokens);
         requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, data.message.usage.input_tokens || 0);
+        noteCapacityCache(requestInfo, data.message.usage);
       } else if (data.type === 'message_delta' && data.usage) {
         accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
         accountManager.countCallerTokens?.(requestInfo.caller, data.usage.output_tokens);
         requestInfo._capacityOutput = Math.max(requestInfo._capacityOutput || 0, data.usage.output_tokens || 0);
+        // Providers differ in WHICH event carries the cache/input counters (z.ai: all of
+        // them on message_delta, message_start is zeros — captured 2026-11-06, pinned by
+        // test/capacity-seam.test.js + test/fixtures/zai-sse-usage.txt), so every field is
+        // a running max over BOTH events.
+        requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, data.usage.input_tokens || 0);
+        noteCapacityCache(requestInfo, data.usage);
       }
     }
     if (sseEventContainsThinking(data)) {
@@ -4141,6 +4159,9 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo 
         accountManager.accrueCapacity?.(accountIndex, {
           input: json.usage.input_tokens || 0,
           output: json.usage.output_tokens || 0,
+          cacheRead: json.usage.cache_read_input_tokens || 0,
+          cacheCreation: json.usage.cache_creation_input_tokens || 0,
+          model: requestInfo.model,
         });
       }
     }
