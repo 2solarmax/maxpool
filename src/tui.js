@@ -456,7 +456,7 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 /** Compact plan cell: "Max Q $134/mo". '--' when no plan is configured (no guessing). */
-function planLabel(plan, priceAccount, am) {
+function planLabel(plan) {
   if (!plan) return '--';
   const cad = { monthly: 'M', quarterly: 'Q', annual: 'A', annually: 'A', yearly: 'A' }[plan.cadence] || '';
   const tier = (plan.tier || '').replace(/^(claude|glm coding)\s+/i, '');
