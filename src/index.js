@@ -16,6 +16,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, appendEventLog } from './event-log.js';
+import { sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
 import { SleepGuard } from './sleep-guard.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer, REQUEST_IDLE_MAX_MS } from './server.js';
@@ -1745,7 +1746,65 @@ async function loginOAuthCommand() {
     process.exit(1);
   }
 
-  await upsertOAuthAccount(config, name, creds, 'login');
+  // Cloud-aware: a linked team pool with a usable key may receive the login instead.
+  // Profile FIRST (once): a local match must win over the cloud default.
+  const profile = await fetchProfile(creds.accessToken);
+  const localMatch = (profile?.accountUuid && config.accounts.find(a => a.type === 'oauth' && a.accountUuid === profile.accountUuid))
+    || (profile?.email && config.accounts.find(a => a.type === 'oauth' && a.name === profile.email))
+    || null;
+  const { usable, unresolved, error } = await resolveUsablePools(config.pools, async (names) => {
+    const { resolveSecrets } = await import('./secret-resolver.js');
+    return resolveSecrets(names);
+  });
+  const flags = { local: args.includes('--local'), cloud: args.includes('--cloud'), pool: argValue('--pool') };
+  const isTTY = !!(process.stdin.isTTY && process.stdout.isTTY);
+  const ask = async (q) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    const a = await new Promise(resolve => rl.question(q, resolve));
+    rl.close();
+    return a;
+  };
+  const input = { usable, unresolved, error, localMatch, flags, isTTY };
+  let plan = planCliLogin(input);
+  if (plan.action === 'ask-fallback') {
+    console.error(plan.message);
+    input.fallbackAnswer = await ask('Save on this laptop instead? [y/N]: ');
+    plan = planCliLogin(input);
+  }
+  if (plan.action === 'ask-pool') {
+    usable.forEach((p, i) => console.error(`  ${i + 1}. ${p.name}`));
+    input.poolAnswer = await ask(`Which team pool? [1-${usable.length}, default 1]: `);
+    plan = planCliLogin(input);
+  }
+  if (plan.action === 'ask-target') {
+    input.answer = await ask(`Add/update this account in the team pool "${plan.pool.name}" (recommended) or this laptop only? [T/l]: `);
+    plan = planCliLogin(input);
+  }
+  if (plan.action === 'fail') {
+    console.error(plan.message);
+    process.exit(1);
+  }
+  if (plan.action === 'local') {
+    await upsertOAuthAccount(config, name, creds, 'login', profile);
+    return;
+  }
+
+  const pool = plan.pool;
+  if (!profile?.accountUuid) {
+    // Without the uuid the server cannot match a re-authorization and would ADD a
+    // duplicate row — the exact bug class v1.24.67 fixed on the server side. Abort.
+    console.error(`Could not fetch the account profile (${profile?.error || 'no token'}) — the team pool needs the account id to add or re-authorize safely. NOTHING was saved on this laptop. Try again, or use --local.`);
+    process.exit(1);
+  }
+  if (!name) name = profile?.email || `account-${Date.now().toString(36)}`;
+  console.log(`Sending "${name}" to the team pool "${pool.name}"...`);
+  const r = await sendLoginToPool({ url: pool.url, key: pool.key, name, profile, creds });
+  if (r.ok) {
+    console.log(`Done: "${r.name || name}" ${r.result === 'added' ? 'added to' : 're-authenticated in'} the team pool "${pool.name}". Nothing was saved on this laptop.`);
+    return;
+  }
+  console.error(`${r.error}. NOTHING was saved on this laptop — not retried locally. Try again, or use --local to save here only.`);
+  process.exit(1);
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -2189,6 +2248,7 @@ Commands:
   server              Start the proxy server (default)
   login               OAuth login via browser (adds the account you're signed into at claude.ai)
   login --api         Add an API key account
+  login --cloud|--local [--pool <name>]  Send the login to the linked team pool (default when one is configured) or keep it on this laptop
   env [--with-key]    Print env vars to use with Claude
   pool shared <host> <key>  Point this machine at a shared team pool
   pool local          Point this machine back at its own local pool
@@ -2217,9 +2277,9 @@ Config: ${getConfigPath()}
 
 // ── shared account upsert ────────────────────────────────────
 
-async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
-  // Fetch profile to auto-name and deduplicate by account UUID
-  const profile = await fetchProfile(creds.accessToken);
+async function upsertOAuthAccount(config, name, creds, source = 'unknown', prefetchedProfile = null) {
+  // Fetch profile to auto-name and deduplicate by account UUID (reuse one already fetched)
+  const profile = prefetchedProfile || await fetchProfile(creds.accessToken);
   const profileOk = profile && !profile.error;
 
   if (!profileOk) {

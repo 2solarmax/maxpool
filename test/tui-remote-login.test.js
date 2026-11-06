@@ -13,6 +13,7 @@ function stubTui(accounts, logs = []) {
     _addLog: m => logs.push(m),
     _findRemoteMirrorFor: TUI.prototype._findRemoteMirrorFor,
     _sendLoginToRemote: TUI.prototype._sendLoginToRemote,
+    _sendLoginToTarget: TUI.prototype._sendLoginToTarget,
     logs,
   };
 }
