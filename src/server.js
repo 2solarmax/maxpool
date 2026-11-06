@@ -3,7 +3,7 @@ import { appendEventLog } from './event-log.js';
 import { atomicConfigUpdate } from './config.js';
 import { HOP_HEADER, nextHopCount, safeText } from './pool-link.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
-import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor } from './provider-thinking-scrub.js';
+import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor, foreignToolBlockText, describeScrub } from './provider-thinking-scrub.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -679,7 +679,6 @@ async function forwardRequest(
       || accountManager.isSessionThinkingContaminated?.(requestInfo.sessionKey))) {
     const pre = stripForeignThinkingBlocks(body);
     if (pre.body) {
-      if (pre.converted) console.log(`[Maxpool] Up-front repair: stripped ${pre.removed} provider thinking block(s), converted ${pre.converted} provider tool block(s) before routing [sess ${requestInfo.sessionKey || '?'}]`);
       body = pre.body;
       requestInfo = { ...requestInfo, thinkingStripped: true };
       // Never hide a repair (Anthropic gateway guidance): this pre-strip rewrites the
@@ -1908,8 +1907,8 @@ async function forwardRequest(
       // SCRUB VISIBILITY (E2E verification V1): the counter existed but was never
       // surfaced — client-side "no thinking" is indistinguishable from "z.ai emitted
       // none". One line whenever the scrub actually removed blocks.
-      if (requestInfo._scrubbed) {
-        console.log(`[Maxpool] scrub: removed ${requestInfo._scrubbed} provider thinking block(s) from "${account.name}" response [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
+      if (scrubber && (requestInfo._scrubbed || scrubber.convertedCount)) {
+        console.log(`[Maxpool] scrub: ${describeScrub(scrubber.stats())} from "${account.name}" response [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
       }
     } else {      // Bound the non-streaming body read so a mid-body upstream stall can't hang
       // the request forever and leak the lease (same class as the streaming idle
@@ -1971,15 +1970,14 @@ async function forwardRequest(
         // would re-poison histories on the degraded path). Same header rule applies.
         let outBuf = normalizeModelEcho(buf, requestInfo.model);
         if (scrubEnabledFor(account, { providerThinkingScrub: requestInfo.providerThinkingScrub })) {
-          const scrubbed = scrubProviderResponseBody(safeJsonParse(outBuf));
+          const scrubStats = {};
+          const scrubbed = scrubProviderResponseBody(safeJsonParse(outBuf), scrubStats);
           if (scrubbed) {
-            const removedBlocks = (JSON.parse(buf.toString('utf8')).content || [])
-              .filter(b => b && (b.type === 'thinking' || b.type === 'redacted_thinking')).length;
             outBuf = Buffer.from(JSON.stringify(scrubbed));
-            requestInfo._scrubbed = (requestInfo._scrubbed || 0) + 1;
-            // SCRUB VISIBILITY (E2E V1): buffered lane logs what it removed, matching
-            // the streaming lane's line.
-            console.log(`[Maxpool] scrub: removed ${removedBlocks} provider thinking block(s) from "${account.name}" response (buffered)`);
+            requestInfo._scrubbed = (requestInfo._scrubbed || 0) + scrubStats.thinking + scrubStats.unknown.length;
+            // SCRUB VISIBILITY (E2E V1): ONE summary line per response, matching the
+            // streaming lane's line.
+            console.log(`[Maxpool] scrub: ${describeScrub(scrubStats)} from "${account.name}" response (buffered)`);
           }
         }
         const outHeaders = outBuf === buf
@@ -2861,41 +2859,13 @@ function convertForeignServerTools(content, foreignIds) {
   let converted = 0;
   const out = [];
   for (const b of content) {
-    if (b?.type === 'server_tool_use' && foreignIds.has(b.id)) {
-      const q = b.input?.query;
-      out.push({ type: 'text', text: q ? `[searched the web for: ${q}]` : `[used ${b.name || 'a tool'}]` });
-      converted++;
-      continue;
-    }
-    if (b?.type === 'mcp_tool_use' && foreignIds.has(b.id)) {
-      const inp = JSON.stringify(b.input ?? {});
-      // Truncate by CODE POINTS: a raw .slice can split a surrogate pair (an emoji at
-      // char 299), and a lone surrogate makes the body invalid JSON-UTF8 Anthropic 400s
-      // with no repair path — killing the session the conversion is saving (red-team M1).
-      out.push({ type: 'text', text: `[called ${b.name || 'a tool'}${b.server_name ? ` (${b.server_name})` : ''} on ${Array.from(inp).slice(0, 300).join('')}]` });
-      converted++;
-      continue;
-    }
+    // Text conventions live in provider-thinking-scrub.js (foreignToolBlockText) so the
+    // request-side repair and the response-side scrub can never drift apart.
+    const isCall = (b?.type === 'server_tool_use' || b?.type === 'mcp_tool_use') && foreignIds.has(b.id);
     // Any result block referring to a foreign call — web_search_tool_result, mcp_tool_result and friends.
-    if (b?.tool_use_id && foreignIds.has(b.tool_use_id)) {
-      const rows = Array.isArray(b.content) ? b.content : [];
-      // Fall back through the shapes a PROVIDER may use — the point of converting rather
-      // than dropping is to keep what the search found; assuming Anthropic's {title,url}
-      // would silently discard a GLM row that carries text instead.
-      if (typeof b.content === 'string' && b.content) rows.push(b.content);   // a plain-string result (e.g. an error row) — keep it (red-team M6)
-      const found = rows
-        .map(r => [r?.title, r?.url].filter(Boolean).join(' — ')
-          || (typeof r === 'string' ? r : (r?.text ?? r?.content ?? r?.snippet ?? '')))
-        .map(t => (typeof t === 'string' ? Array.from(t).slice(0, 300).join('') : ''))
-        .filter(Boolean).slice(0, 10);
-      if (b?.type === 'mcp_tool_result') {
-        // An MCP result carries {type:'text'} rows, not {title,url} — label it as the
-        // tool's answer rather than "[search results]" so the transcript stays honest.
-        out.push({ type: 'text', text: found.length ? `[${b.name || 'mcp tool'} result: ${found.join(' | ')}]` : '[mcp tool returned no usable results]' });
-        converted++;
-        continue;
-      }
-      out.push({ type: 'text', text: found.length ? `[search results: ${found.join(' | ')}]` : '[search returned no usable results]' });
+    const isResult = !isCall && b?.tool_use_id && foreignIds.has(b.tool_use_id);
+    if (isCall || isResult) {
+      out.push({ type: 'text', text: foreignToolBlockText(b) });
       converted++;
       continue;
     }
@@ -4094,19 +4064,23 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       // means the upstream died mid-event (an event without its '\n\n' terminator).
       // Complete-event streams without a terminal message_stop (z.ai compat shape,
       // test fixtures) end with an EMPTY residual and pass through unchanged.
-      if ((committed || res.headersSent) && sseBuffer.trim() && !res.destroyed && !res.writableEnded) {
+      const truncatedMidEvent = Boolean(sseBuffer.trim());
+      // Scrubber tail flush (an SSE event without its trailing '\n\n' is still buffered
+      // inside the scrubber). Runs BEFORE the sentinel so the error frame is always the
+      // last thing the client sees; skipped when the sentinel fires — the scrubber tail is
+      // then the same half-event the sentinel reports, and emitting it would hand the
+      // client a corrupt frame ahead of the error.
+      if (scrubber && !truncatedMidEvent && !res.destroyed && !res.writableEnded) {
+        const tail = scrubber.flush();
+        if (tail) { try { res.write(tail); } catch { /* client gone */ } }
+      }
+      if ((committed || res.headersSent) && truncatedMidEvent && !res.destroyed && !res.writableEnded) {
         try {
           res.write(`event: error\ndata: ${JSON.stringify({
             type: 'error',
             error: { type: 'api_error', message: 'Upstream closed the stream before the response completed. Retry the message.' },
           })}\n\n`);
         } catch { /* client already gone */ }
-      }
-      // Scrubber tail flush (an SSE event without its trailing '\n\n' is still buffered
-      // inside the scrubber; drop it only if the stream was truncated mid-event anyway).
-      if (scrubber && !res.destroyed && !res.writableEnded) {
-        const tail = scrubber.flush();
-        if (tail) { try { res.write(tail); } catch { /* client gone */ } }
       }
       if (!res.writableEnded) res.end();
     }

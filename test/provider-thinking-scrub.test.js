@@ -235,3 +235,119 @@ for (const flagOn of [false, true]) {
     assert.equal(log.join(''), sse, 'streamLog (the usage/capacity lane) equals the original stream exactly');
   });
 }
+
+// ── Round-3 red-team (2026-11-06): CONVERT provider tool blocks, never drop them.
+import { foreignToolBlockText } from '../src/provider-thinking-scrub.js';
+
+const mcpUse = (i) => [
+  { type: 'content_block_start', index: i, content_block: { type: 'mcp_tool_use', id: 'call_0', name: 'webReader', server_name: 'web-reader', input: {} } },
+  { type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: '{"url":"https:' } },
+  { type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: '//a.example/x"}' } },
+  { type: 'content_block_stop', index: i },
+];
+const mcpResult = (i) => [
+  { type: 'content_block_start', index: i, content_block: { type: 'mcp_tool_result', tool_use_id: 'call_0', name: 'webReader', content: [{ type: 'text', text: 'page body' }] } },
+  { type: 'content_block_stop', index: i },
+];
+const srvUse = (i) => [
+  { type: 'content_block_start', index: i, content_block: { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: {} } },
+  { type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: '{"query":"maxpool"}' } },
+  { type: 'content_block_stop', index: i },
+];
+const srvResult = (i) => [
+  { type: 'content_block_start', index: i, content_block: { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_1', content: [{ title: 'Maxpool', url: 'https://m.example' }] } },
+  { type: 'content_block_stop', index: i },
+];
+const EXPECT = [
+  '[called webReader (web-reader) on {"url":"https://a.example/x"}]',
+  '[webReader result: page body]',
+  '[searched the web for: maxpool]',
+  '[search results: Maxpool — https://m.example]',
+];
+
+test('streaming: mcp + server tool blocks convert to text at contiguous indexes; no mcp_/server_ block reaches client', () => {
+  const full = stream([...head, ...thinking(0), ...mcpUse(1), ...mcpResult(2), ...srvUse(3), ...srvResult(4), ...text(5, 'done'), ...tail]);
+  const s = new ProviderThinkingScrubber();
+  const outStr = s.push(full) + s.flush();
+  const out = parse(outStr);
+  assert.deepEqual(out.filter(j => j.type === 'content_block_start').map(j => j.index), [0, 1, 2, 3, 4]);
+  assert.deepEqual(out.filter(j => j.type === 'content_block_stop').map(j => j.index), [0, 1, 2, 3, 4]);
+  assert.deepEqual(pushReducer(out).map(b => b.text), [...EXPECT, 'done']);
+  assert.doesNotMatch(outStr, /mcp_tool|server_tool|web_search_tool_result|input_json_delta/);
+  assert.doesNotMatch(outStr, /\(reasoning omitted\)/);
+  assert.equal(s.convertedCount, 4);
+});
+
+test('streaming: tool-only turn has text (no placeholder)', () => {
+  const s = new ProviderThinkingScrubber();
+  const out = parse(s.push(stream([...head, ...mcpUse(0), ...mcpResult(1), ...tail])) + s.flush());
+  assert.deepEqual(pushReducer(out).map(b => b.text), EXPECT.slice(0, 2));
+});
+
+test('streaming conversion: identical bytes at chunk sizes 1/7/33', () => {
+  const full = stream([...head, ...thinking(0), ...mcpUse(1), ...mcpResult(2), ...srvUse(3), ...srvResult(4), ...tail]);
+  const w = new ProviderThinkingScrubber();
+  const a = w.push(full) + w.flush();
+  for (const size of [1, 7, 33]) {
+    const s = new ProviderThinkingScrubber();
+    let b = '';
+    for (let i = 0; i < full.length; i += size) b += s.push(full.slice(i, i + size));
+    assert.equal(b + s.flush(), a, `chunk size ${size}`);
+  }
+});
+
+test('buffered lane: converts to the request-side text convention, keeps order, counts blocks', () => {
+  const body = { content: [
+    { type: 'thinking', thinking: 'x' },
+    { type: 'mcp_tool_use', id: 'call_0', name: 'webReader', server_name: 'web-reader', input: { url: 'https://a.example/x' } },
+    { type: 'mcp_tool_result', tool_use_id: 'call_0', name: 'webReader', content: [{ type: 'text', text: 'page body' }] },
+    { type: 'server_tool_use', id: 's1', name: 'web_search', input: { query: 'maxpool' } },
+    { type: 'web_search_tool_result', tool_use_id: 's1', content: [{ title: 'Maxpool', url: 'https://m.example' }] },
+    { type: 'mystery' }] };
+  const stats = {};
+  const out = scrubProviderResponseBody(body, stats);
+  assert.deepEqual(out.content.map(b => b.type), ['text', 'text', 'text', 'text']);
+  assert.deepEqual(out.content.map(b => b.text), EXPECT);
+  assert.deepEqual([stats.thinking, stats.converted, stats.unknown], [1, 4, ['mystery']]);
+  assert.equal(foreignToolBlockText(body.content[1]), EXPECT[0]);
+});
+
+test('buffered lane: tool-only body gets no placeholder; surrogate pair is not split at the 300 cut', () => {
+  const out = scrubProviderResponseBody({ content: [{ type: 'mcp_tool_use', id: 'c', name: 'n', input: { q: '😀'.repeat(400) } }] });
+  assert.equal(out.content.length, 1);
+  assert.doesNotMatch(out.content[0].text, /reasoning omitted/);
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(out.content[0].text), 'no lone surrogate');
+});
+
+test('thinking-only stream ending in message_stop (no message_delta) gets the placeholder before message_stop', () => {
+  const s = new ProviderThinkingScrubber();
+  const out = parse(s.push(stream([...head, ...thinking(0), { type: 'message_stop' }])) + s.flush());
+  assert.deepEqual(pushReducer(out).map(b => b.text), ['(reasoning omitted)']);
+  const types = out.map(j => j.type);
+  assert.ok(types.indexOf('content_block_stop') < types.indexOf('message_stop'));
+  assert.equal(types.filter(x => x === 'content_block_start').length, 1);
+});
+
+test('placeholder is injected once when both message_delta and message_stop follow', () => {
+  const s = new ProviderThinkingScrubber();
+  const out = parse(s.push(stream([...head, ...thinking(0), ...tail])));
+  assert.equal(out.filter(j => j.type === 'content_block_start').length, 1);
+});
+
+test('sentinel ordering: scrubber flushed BEFORE the truncation error frame; skipped when sentinel fires', async () => {
+  // Properly terminated stream: the scrubber tail is empty (nothing buffered past the
+  // last \n\n), so no flush output and NO sentinel — the client sees a clean message_stop.
+  const full = stream([...head, ...text(0, 'hi'), { type: 'message_stop' }]);
+  const got = [];
+  await streamResponse(sseBody([full]), mockRes(got), 200, {}, 0, dummyManager(), [], { model: null }, undefined, new ProviderThinkingScrubber());
+  assert.match(got.join(''), /message_stop/);
+  assert.doesNotMatch(got.join(''), /event: error/);
+  // Truncated mid-event: sentinel fires, no half-event ahead of it.
+  const cut = stream([...head, ...text(0, 'hi')]) + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"del';
+  const got2 = [];
+  await streamResponse(sseBody([cut]), mockRes(got2), 200, {}, 0, dummyManager(), [], { model: null }, undefined, new ProviderThinkingScrubber());
+  const s2 = got2.join('');
+  assert.ok(s2.trimEnd().endsWith('}}'), 'error frame is last');
+  assert.match(s2, /event: error/);
+  assert.doesNotMatch(s2, /"index":1,"del/);
+});
