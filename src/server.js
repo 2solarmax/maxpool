@@ -675,6 +675,7 @@ async function forwardRequest(
       || accountManager.isSessionThinkingContaminated?.(requestInfo.sessionKey))) {
     const pre = stripForeignThinkingBlocks(body);
     if (pre.body) {
+      if (pre.converted) console.log(`[Maxpool] Up-front repair: stripped ${pre.removed} provider thinking block(s), converted ${pre.converted} provider tool block(s) before routing [sess ${requestInfo.sessionKey || '?'}]`);
       body = pre.body;
       requestInfo = { ...requestInfo, thinkingStripped: true };
       if (pre.converted) {
@@ -1689,7 +1690,38 @@ async function forwardRequest(
       // is buffered, so latch the session Anthropic-incompatible (sticky → once per
       // session) and retry PROVIDER-only, rather than surfacing the 400. Only worth
       // it when a provider can actually serve it (profile=all with a GLM/Kimi token).
+      //
+      // REPAIR FIRST (2026-11-06, "customer fups"): the broad strip + coordinate repair
+      // above may both have found nothing while the transcript is still curable — the
+      // measured case is a GLM-authored `mcp_tool_use`/`mcp_tool_result` pair, which
+      // both repairs predate. Try the conversion once here; if it changes the body,
+      // retry THAT on Claude instead of pinning. Pin only when the conversion finds
+      // nothing (a genuinely unrepairable transcript). This kills the pin loop: pin →
+      // provider exhausts → "can only run on GLM" with ~59h Retry — while a text-
+      // converted body replays 200 (verified live, count_tokens, 2026-11-06).
       const providerAvailable = accountManager.accounts?.some(a => a.type === 'provider' && a.enabled !== false);
+      // Exact-shape gate (red-team M2): the loose isAnthropicIncompatBody matcher also
+      // fires on unrelated unknown-tag 400s (its expected-tags list mentions
+      // server_tool_use); a rewrite must key on the two MCP wordings or the
+      // deterministic server-tool-id wording, never the fuzzy predicate.
+      const incompatRepairable = /server_tool_use\.id: String should match pattern/i.test(errorBody)
+        || /mcp_tool_(use|result)/.test(errorBody)
+          && /(does not match any of the expected tags|without a corresponding)/i.test(errorBody);
+      if (anthropicIncompat && incompatRepairable && !requestInfo.incompatRepairTried && canRepairBody) {
+        const repaired = stripForeignThinkingBlocks(body);
+        if (repaired.body) {
+          // Latch the pre-strip sticky so the NEXT turn repairs up front instead of
+          // re-paying this rejected round-trip every turn (the client resends the whole
+          // poisoned history each turn — same cache-churn the audit is about).
+          accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
+          console.log(`[Maxpool] Recovering session on Claude: incompatibility repair removed ${repaired.removed} thinking block(s), converted ${repaired.converted} provider tool block(s) — retrying on Claude before pinning`);
+          return forwardRequest(
+            req, res, repaired.body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, { ...requestInfo, incompatRepairTried: true, anthropicIncompatible: false, repairCount: repairCount + 1 },
+            repaired.body.length <= retryConfig.maxRetryBufferBytes, canQueueBufferedBody, excludedIndexes,
+          );
+        }
+      }
       if (anthropicIncompat && requestInfo.sessionKey && providerAvailable
         && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         accountManager.markSessionIncompatible?.(requestInfo.sessionKey, requestInfo.homeProvider);
@@ -2756,7 +2788,12 @@ function repairEffort(body, mode, errorBody = '') {
 
 /** Collect foreign server-tool ids across the WHOLE transcript first — a call sits on the
  *  assistant turn but its result is often carried on the FOLLOWING user turn, so a
- *  per-message scan would leave that result behind (and it alone still 400s). */
+ *  per-message scan would leave that result behind (and it alone still 400s).
+ *  `mcp_tool_use` is collected the same way: GLM emits provider-authored MCP calls
+ *  (webReader etc. with `call_…` ids), and Anthropic rejects them BOTH ways — the plain
+ *  Messages API lists no `mcp_tool_use` tag at all, and the mcp beta rejects the pair
+ *  because the provider puts the `mcp_tool_result` on the assistant turn (measured live
+ *  2026-11-06, "customer fups" session). Conversion to text is accepted either way. */
 function collectForeignServerToolIds(messages) {
   const ids = new Set();
   const clientIds = new Set();
@@ -2764,7 +2801,8 @@ function collectForeignServerToolIds(messages) {
     if (!Array.isArray(blocks)) return;
     for (const b of blocks) {
       if (b?.type === 'tool_use' && b.id) clientIds.add(b.id);
-      if (b?.type === 'server_tool_use' && !ANTHROPIC_TOOL_ID.test(String(b.id || ''))) ids.add(b.id);
+      if ((b?.type === 'server_tool_use' || b?.type === 'mcp_tool_use')
+        && !ANTHROPIC_TOOL_ID.test(String(b.id || ''))) ids.add(b.id);
       if (Array.isArray(b?.content)) walk(b.content);   // nested, mirrors detectTranscriptOrigin
     }
   };
@@ -2789,17 +2827,34 @@ function convertForeignServerTools(content, foreignIds) {
       converted++;
       continue;
     }
-    // Any result block referring to a foreign call — web_search_tool_result and friends.
+    if (b?.type === 'mcp_tool_use' && foreignIds.has(b.id)) {
+      const inp = JSON.stringify(b.input ?? {});
+      // Truncate by CODE POINTS: a raw .slice can split a surrogate pair (an emoji at
+      // char 299), and a lone surrogate makes the body invalid JSON-UTF8 Anthropic 400s
+      // with no repair path — killing the session the conversion is saving (red-team M1).
+      out.push({ type: 'text', text: `[called ${b.name || 'a tool'}${b.server_name ? ` (${b.server_name})` : ''} on ${Array.from(inp).slice(0, 300).join('')}]` });
+      converted++;
+      continue;
+    }
+    // Any result block referring to a foreign call — web_search_tool_result, mcp_tool_result and friends.
     if (b?.tool_use_id && foreignIds.has(b.tool_use_id)) {
       const rows = Array.isArray(b.content) ? b.content : [];
       // Fall back through the shapes a PROVIDER may use — the point of converting rather
       // than dropping is to keep what the search found; assuming Anthropic's {title,url}
       // would silently discard a GLM row that carries text instead.
+      if (typeof b.content === 'string' && b.content) rows.push(b.content);   // a plain-string result (e.g. an error row) — keep it (red-team M6)
       const found = rows
         .map(r => [r?.title, r?.url].filter(Boolean).join(' — ')
           || (typeof r === 'string' ? r : (r?.text ?? r?.content ?? r?.snippet ?? '')))
-        .map(t => (typeof t === 'string' ? t.slice(0, 300) : ''))
+        .map(t => (typeof t === 'string' ? Array.from(t).slice(0, 300).join('') : ''))
         .filter(Boolean).slice(0, 10);
+      if (b?.type === 'mcp_tool_result') {
+        // An MCP result carries {type:'text'} rows, not {title,url} — label it as the
+        // tool's answer rather than "[search results]" so the transcript stays honest.
+        out.push({ type: 'text', text: found.length ? `[${b.name || 'mcp tool'} result: ${found.join(' | ')}]` : '[mcp tool returned no usable results]' });
+        converted++;
+        continue;
+      }
       out.push({ type: 'text', text: found.length ? `[search results: ${found.join(' | ')}]` : '[search returned no usable results]' });
       converted++;
       continue;
@@ -3332,8 +3387,12 @@ const ANTHROPIC_TOOL_ID = /^(toolu|srvtoolu)_/;
 // from the tool-use id shapes in its `messages`. Returns { anthropicIncompatible,
 // homeProvider }.
 //   anthropicIncompatible = the transcript has a `server_tool_use` id NOT matching
-//     ^srvtoolu_ — the ONE DETERMINISTIC incompatibility (Anthropic 400s on replay,
-//     the reported bug). Anthropic validates a client `tool_use.id` LOOSELY
+//     ^srvtoolu_, OR a foreign `mcp_tool_use` id (2026-11-06: GLM emits provider-authored
+//     MCP calls with `call_…` ids; Anthropic rejects the block type on the plain API and
+//     the mis-roled result pair under the mcp beta — both measured live). Either means
+//     Anthropic 400s on replay, but BOTH are repairable by the pre-strip conversion, so
+//     a `true` here routes into the up-front repair rather than a permanent exile.
+//     Anthropic validates a client `tool_use.id` LOOSELY
 //     (^[a-zA-Z0-9_-]+$), so GLM `call_…` / Kimi `tool_…` client ids PASS and a
 //     Kimi/GLM session without server-tools is FINE on Claude — we do NOT predict
 //     those (a rejected thinking signature, if it ever happens, self-heals via the
@@ -3353,7 +3412,12 @@ function detectTranscriptOrigin(json) {
     if (Array.isArray(value)) { for (const v of value) { visit(v); if (incompatible) return; } return; }
     if (!value || typeof value !== 'object') return;
     const t = value.type;
-    if (t === 'server_tool_use' && typeof value.id === 'string' && !ANTHROPIC_TOOL_ID.test(value.id)) {
+    // Incompatible only when the CONVERTER can also cure it (red-team M4): flagging a
+    // nested or id-colliding block the converter skips would exile the session to GLM
+    // before Claude is ever tried — the incident's dead-session outcome. The id set is
+    // computed by the converter's own collector (nested-walking, collision-guarded).
+    const convertibleIds = collectForeignServerToolIds(json?.messages || []);
+    if ((t === 'server_tool_use' || t === 'mcp_tool_use') && typeof value.id === 'string' && convertibleIds.has(value.id)) {
       incompatible = true; noteForeign(value.id); return;
     }
     if (t === 'tool_use' && typeof value.id === 'string' && !ANTHROPIC_TOOL_ID.test(value.id)) noteForeign(value.id);
@@ -3372,13 +3436,19 @@ function detectTranscriptOrigin(json) {
 // self-heal onto a provider instead of surfacing the 400.
 function isAnthropicIncompatBody(body) {
   if (!body) return false;
-  // The deterministic server-tool-id 400, the known invalid-signature error, or a
+  // The deterministic server-tool-id 400, the known invalid-signature error, a
   // thinking-block signature VALIDATION error (missing/invalid) — the last gated on
   // a validation verb so a user message merely echoing "thinking"/"signature" can't
-  // false-latch the session provider-pinned for life.
+  // false-latch the session provider-pinned for life — and the two MCP shapes
+  // (2026-11-06, verbatim, measured live): the plain API's unknown-tag rejection and
+  // the mcp beta's mis-roled-pair rejection. NB the plain-API text lists
+  // 'server_tool_use' among its expected tags, which USED to be the only reason an
+  // mcp-only transcript tripped this predicate — an accident of wording, now pinned.
   return /srvtoolu_|server_tool_use/.test(body)
     || /invalid `signature` in `thinking`/i.test(body)
-    || (/thinking/.test(body) && /signature/.test(body) && /(should match|required|invalid|expected|must )/i.test(body));
+    || (/thinking/.test(body) && /signature/.test(body) && /(should match|required|invalid|expected|must )/i.test(body))
+    || (/mcp_tool_(use|result)/.test(body)
+      && /(does not match any of the expected tags|without a corresponding)/i.test(body));
 }
 
 function containsThinkingBlock(value) {
