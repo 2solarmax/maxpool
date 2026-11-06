@@ -3,6 +3,7 @@ import { appendEventLog } from './event-log.js';
 import { atomicConfigUpdate } from './config.js';
 import { HOP_HEADER, nextHopCount, safeText } from './pool-link.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount } from './thread-gate.js';
+import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor } from './provider-thinking-scrub.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -495,6 +496,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
         requestInfo.caller = req._caller || null;
+        // Read per request (not captured at boot) so a config flip + seamless reload
+        // takes effect on the next request with no restart.
+        requestInfo.providerThinkingScrub = Boolean(config.providerThinkingScrub);
         // The CLIENT tells us how long it will wait — the only source that is actually
         // true. A `cc` session exports CLAUDE_STREAM_IDLE_TIMEOUT_MS=3h and forwards it
         // here; a bare `claude` sends nothing and keeps the conservative 240s default,
@@ -678,6 +682,12 @@ async function forwardRequest(
       if (pre.converted) console.log(`[Maxpool] Up-front repair: stripped ${pre.removed} provider thinking block(s), converted ${pre.converted} provider tool block(s) before routing [sess ${requestInfo.sessionKey || '?'}]`);
       body = pre.body;
       requestInfo = { ...requestInfo, thinkingStripped: true };
+      // Never hide a repair (Anthropic gateway guidance): this pre-strip rewrites the
+      // request body on EVERY turn of a latched session and was silent — the only
+      // visible trace was the one-time latch line, so per-turn rewrites (each a cache
+      // prefix change) were uncountable. One line per rewrite, same prefix as the
+      // reactive repair so a single grep counts both.
+      console.log(`[Maxpool] Recovering session on Claude: pre-strip removed ${pre.removed} provider thinking block(s), converted ${pre.converted} provider search block(s) [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
       if (pre.converted) {
         // The body now replays cleanly on Claude, so drop the predictive verdict —
         // otherwise routing still exiles it and _noteRequestPolicy latches it sticky.
@@ -1868,13 +1878,19 @@ async function forwardRequest(
 
     if (isStreaming) {
       const streamLog = logDir ? [] : null;
+      // PROVIDER-THINKING SCRUB (owner 2026-11-05): applied inside streamResponse at the
+      // res.write boundary only — usage accounting, capacity and streamLog below still
+      // see the ORIGINAL upstream stream (red-team finding 6).
+      const scrubber = scrubEnabledFor(account, { providerThinkingScrub: requestInfo.providerThinkingScrub })
+        ? new ProviderThinkingScrubber({ onScrub: () => requestInfo._scrubbed = (requestInfo._scrubbed || 0) + 1 })
+        : null;
       // CAPACITY LEDGER: accrue in a FINALLY — a stream that dies mid-flight throws
       // from streamResponse, and the tokens genuinely delivered before the failure
       // are real capacity; skipping them under-counts exactly the longest
       // generations (red-team F5). One accrual per request, per-stream running max
       // (M3 — cumulative interim deltas must not be summed).
       try {
-        await streamResponse(upstreamRes.body, res, upstreamRes.status, responseHeaders, account.index, accountManager, streamLog, requestInfo);
+        await streamResponse(upstreamRes.body, res, upstreamRes.status, responseHeaders, account.index, accountManager, streamLog, requestInfo, undefined, scrubber);
       } finally {
         accountManager.accrueCapacity?.(account.index, {
           input: requestInfo._capacityInput || 0,
@@ -1888,6 +1904,12 @@ async function forwardRequest(
       if (logDir) {
         logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
+      }
+      // SCRUB VISIBILITY (E2E verification V1): the counter existed but was never
+      // surfaced — client-side "no thinking" is indistinguishable from "z.ai emitted
+      // none". One line whenever the scrub actually removed blocks.
+      if (requestInfo._scrubbed) {
+        console.log(`[Maxpool] scrub: removed ${requestInfo._scrubbed} provider thinking block(s) from "${account.name}" response [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
       }
     } else {      // Bound the non-streaming body read so a mid-body upstream stall can't hang
       // the request forever and leak the lease (same class as the streaming idle
@@ -1944,7 +1966,22 @@ async function forwardRequest(
         // body reaches Claude Code. Computed BEFORE writeHead so a length change lands
         // in the SAME header block — setting content-length after writeHead is a no-op
         // and would ship a body/length mismatch (the client then hangs or truncates).
-        const outBuf = normalizeModelEcho(buf, requestInfo.model);
+        // PROVIDER-THINKING SCRUB runs in the SAME lane (red team finding 2: CC falls
+        // back to non-streaming exactly when providers misbehave; an SSE-only scrub
+        // would re-poison histories on the degraded path). Same header rule applies.
+        let outBuf = normalizeModelEcho(buf, requestInfo.model);
+        if (scrubEnabledFor(account, { providerThinkingScrub: requestInfo.providerThinkingScrub })) {
+          const scrubbed = scrubProviderResponseBody(safeJsonParse(outBuf));
+          if (scrubbed) {
+            const removedBlocks = (JSON.parse(buf.toString('utf8')).content || [])
+              .filter(b => b && (b.type === 'thinking' || b.type === 'redacted_thinking')).length;
+            outBuf = Buffer.from(JSON.stringify(scrubbed));
+            requestInfo._scrubbed = (requestInfo._scrubbed || 0) + 1;
+            // SCRUB VISIBILITY (E2E V1): buffered lane logs what it removed, matching
+            // the streaming lane's line.
+            console.log(`[Maxpool] scrub: removed ${removedBlocks} provider thinking block(s) from "${account.name}" response (buffered)`);
+          }
+        }
         const outHeaders = outBuf === buf
           ? responseHeaders
           : { ...responseHeaders, 'content-length': String(outBuf.length) };
@@ -3785,7 +3822,7 @@ function totalLen(chunks) {
   return n;
 }
 
-async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog, requestInfo = {}, idleMs = STREAM_IDLE_MS) {
+async function streamResponse(webStream, res, status, responseHeaders, accountIndex, accountManager, streamLog, requestInfo = {}, idleMs = STREAM_IDLE_MS, scrubber = null) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -3931,10 +3968,15 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         }
       }
 
-      // Forward chunk immediately
-      const ok = res.write(out);
+      // Forward chunk immediately. Decode ONCE (B1, build review 2026-11-06): a second
+      // decode({stream:true}) on this shared TextDecoder flushes a pending partial UTF-8
+      // sequence as U+FFFD — the usage/streamLog lane garbled in BOTH flag states. The
+      // single decoded text feeds the scrubber (client lane) and the accounting lane.
+      const chunkText = decoder.decode(out, { stream: true });
+      const writeText = scrubber ? scrubber.push(chunkText) : null;
+      const ok = scrubber ? (writeText ? res.write(writeText) : true) : res.write(out);
 
-      const text = decoder.decode(out, { stream: true });
+      const text = chunkText;
 
       // Capture for logging
       if (streamLog) streamLog.push(text);
@@ -4059,6 +4101,12 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
             error: { type: 'api_error', message: 'Upstream closed the stream before the response completed. Retry the message.' },
           })}\n\n`);
         } catch { /* client already gone */ }
+      }
+      // Scrubber tail flush (an SSE event without its trailing '\n\n' is still buffered
+      // inside the scrubber; drop it only if the stream was truncated mid-event anyway).
+      if (scrubber && !res.destroyed && !res.writableEnded) {
+        const tail = scrubber.flush();
+        if (tail) { try { res.write(tail); } catch { /* client gone */ } }
       }
       if (!res.writableEnded) res.end();
     }
@@ -4203,3 +4251,8 @@ function computeRetryAfter(accountManager, requestInfo = {}) {
 
 // Test seam: prepareRuntimeProviders with a plain headers object.
 export const __test = { prepareRuntimeProviders };
+
+/** Parse-or-null helper for the buffered scrub lane (never throws on a non-JSON body). */
+function safeJsonParse(buf) {
+  try { return JSON.parse(buf.toString('utf8')); } catch { return null; }
+}

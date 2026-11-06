@@ -70,6 +70,13 @@ export function createDefaultConfig() {
     // is blind to idle / out-of-band-used accounts and the scorer will pile traffic
     // onto exactly the account it cannot see. 0 = off.
     quotaProbeSeconds: 60,
+    // Provider-thinking scrub (owner 2026-11-05): drop `thinking`/`redacted_thinking`
+    // blocks (and any unknown block type) from PROVIDER responses before they reach the
+    // client, so a mixed GLM+Claude session never stores foreign thinking — the stored
+    // blocks are what Anthropic signature-400s on and the repair strips, breaking the
+    // cache prefix. Claude-account responses are NEVER scrubbed. Default OFF until the
+    // E2E package is owner-approved.
+    providerThinkingScrub: false,
     routing: {
       mode: 'automatic',
       preferredAccount: null,
