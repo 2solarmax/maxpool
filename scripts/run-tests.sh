@@ -41,8 +41,28 @@ for f in test/*.test.js test/*.test.mjs; do
     *) fast+=("$f") ;;
   esac
 done
-echo "== fast tests (${#fast[@]} files, concurrent) =="
-node --test "${fast[@]}"
+# Concurrency scales DOWN with machine load (2026-11-06): the v1.24.68 release failed
+# 5x on a different network-timing test each time with the Mac at load 35-95 (calls +
+# many sessions) — 16 concurrent files starved the timing tests; never a code failure.
+# MAXPOOL_TEST_CONCURRENCY overrides.
+_cpus=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+_load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print int($2)}' || awk '{print int($1)}' /proc/loadavg 2>/dev/null || echo 0)
+_conc="${MAXPOOL_TEST_CONCURRENCY:-}"
+if [ -z "$_conc" ]; then
+  _conc=$(( _cpus - _load / 4 )); [ "$_conc" -lt 2 ] && _conc=2; [ "$_conc" -gt "$_cpus" ] && _conc=$_cpus
+fi
+echo "== fast tests (${#fast[@]} files, concurrency $_conc; load $_load on $_cpus cpus) =="
+# One retry of the FAILED files only: a timing flake under load passes on re-run, a real
+# defect fails twice. Both attempts print, and a file that fails twice fails the suite.
+_fast_log="$(mktemp "${TMPDIR:-/tmp}/maxpool-fast.XXXXXX")"
+if node --test --test-concurrency="$_conc" "${fast[@]}" 2>&1 | tee "$_fast_log"; then :; else
+  _failed=$(grep -E '^not ok [0-9]+ - ' "$_fast_log" >/dev/null && grep -oE "location: '[^:']+" "$_fast_log" | sed "s/location: '//" | sed "s|^$(pwd)/||" | sort -u)
+  if [ -z "$_failed" ]; then echo "== fast tests failed with no attributable file — not retrying ==" >&2; exit 1; fi
+  echo "== retrying failed file(s) once, serially: $(echo $_failed | tr '\n' ' ') =="
+  node --test --test-concurrency=1 $_failed || { echo "== failed twice — real failure ==" >&2; exit 1; }
+  echo "== retry passed (timing flake under load) =="
+fi
+rm -f "$_fast_log"
 
 # Subprocess-heavy reload tests: one fresh node process per file.
 for f in test/reload-*.test.js; do
