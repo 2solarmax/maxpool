@@ -5,6 +5,21 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.68] - 2026-11-06
+
+### Changed
+
+- Repair GLM mcp_tool_use/mcp_tool_result blocks on Claude replay — no more GLM-only pin when the repair cures it
+- Honest per-account tank — no clamp, multi-sample medians, all-token axis, one row per account
+- Red-team fixes — tested SSE accrual seam, rollback-safe state, Med column, merged-cycle marker, real z.ai usage fixture
+- Provision NEW Claude accounts straight into the linked cloud team pool (TUI + CLI)
+- Med-3 and Med-all columns — recent-3-cycle median beside the all-time median
+- Raise the test-stage ceiling to 40 min (env-overridable) — the suite outgrew 15 min
+- De-flake the capacity-window timing bound (order-of-magnitude, not hard 500ms)
+- Retry the pool-link first poll under load (de-flake)
+- Drop unused planLabel params (release lint gate)
+- Load-aware concurrency + one retry of failed files (release-stage de-flake)
+
 ## [1.24.67] - 2026-11-05
 
 ### Changed
