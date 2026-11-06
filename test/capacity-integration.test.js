@@ -263,7 +263,7 @@ test('G1: the page shows a per-account row with the capacity columns once cycles
     i--;
   }
   const page = renderCapacity(am);
-  for (const col of ['Current', 'Prev', 'Avg', 'N']) {
+  for (const col of ['Current', 'Prev', 'Med', 'N']) {
     assert.ok(page.includes(col), `column "${col}" is on the page`);
   }
   assert.match(page, /claude1/, 'the account is listed');
@@ -478,7 +478,7 @@ test('J2 (M4): at W=80 the page drops trailing columns instead of truncating mid
   am.accounts[0].quota.unified5hReset = boundary;
   am.closeExpiredCapacityCycles();                       // closes WITH the reading
   const wide = renderCapacity(am, { width: 200 });
-  assert.ok(wide.includes('Avg'), 'full width shows every column');
+  assert.ok(wide.includes('Med'), 'full width shows every column');
   // The real invariant: nothing is ever CHOPPED mid-cell. Whatever columns survive at a
   // given width must fit it — the COLS loop drops whole columns rather than let fitLine
   // slice a number in half. Assert the property across widths, not a specific surviving
@@ -488,7 +488,7 @@ test('J2 (M4): at W=80 the page drops trailing columns instead of truncating mid
     const header = page.split('\n').find(l => l.includes('Account') && l.includes('Current'));
     assert.ok(header, `the header renders at W=${width}`);
     assert.ok(header.length <= width, `the header fits W=${width}`);
-    assert.ok(/(Current|Prev|Avg|N|\$\/1M)\s*$/.test(header.trimEnd()),
+    assert.ok(/(Current|Prev|Med|N|\$\/1M)\s*$/.test(header.trimEnd()),
       `no half-rendered header cell at W=${width}: "${header.trimEnd().slice(-14)}"`);
     const row = page.split('\n').find(l => l.includes('claude1'));
     // renderCapacity already strips ANSI; visible width is what fits the terminal.

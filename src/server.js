@@ -4023,8 +4023,10 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
         accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
         accountManager.countCallerTokens?.(requestInfo.caller, data.usage.output_tokens);
         requestInfo._capacityOutput = Math.max(requestInfo._capacityOutput || 0, data.usage.output_tokens || 0);
-        // Providers differ in WHICH event carries the cache/input counters (z.ai's stream
-        // shape is unverified), so every field is a running max over BOTH events.
+        // Providers differ in WHICH event carries the cache/input counters (z.ai: all of
+        // them on message_delta, message_start is zeros — captured 2026-11-06, pinned by
+        // test/capacity-seam.test.js + test/fixtures/zai-sse-usage.txt), so every field is
+        // a running max over BOTH events.
         requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, data.usage.input_tokens || 0);
         noteCapacityCache(requestInfo, data.usage);
       }

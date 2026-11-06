@@ -39,7 +39,7 @@
 // rows are tagged axis 'io' (kept, excluded from the tank) and each in-flight cycle is
 // closed as a legacy row; the next accrual opens a fresh axis-'all' cycle. A row with no
 // `axis` field (an older linked pool's export) is legacy by definition.
-const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 5;
 const READABLE_SCHEMAS = new Set([3, 4, 5]);
 export const AXIS_ALL = 'all';
 
@@ -201,6 +201,8 @@ export function tankStatsFromCycles(cycles, window, { readFloor = null, ignoreCe
   return {
     avg: Math.round(median(vals)),          // field name kept for consumers: it IS the median
     exact, bounded, n: ests.length, tooLittleData: tooLittle,
+    // contributing cycles that are two-pool merges (samples dropped → close-time precision)
+    mergedCount: ests.filter(e => e.c.merged).length,
     last: Math.round(last.est.tokens),
     prev: prev ? Math.round(prev.est.tokens) : null,
     lowerBound: bounded > 0 && exact === 0,

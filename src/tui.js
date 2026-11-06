@@ -2716,14 +2716,14 @@ export class TUI {
     if (!ledger) { out.push(yellow('  Capacity ledger unavailable on this worker.')); return out; }
 
     // Owner-specified table (2026-08-26): the same shape for BOTH views —
-    //   Current cycle (tokens + % used) · Prev cycle · Avg across all cycles · N cycles.
+    //   Current cycle (tokens + % used) · Prev cycle · Med (median) across all cycles · N cycles.
     // Current is the live window (estimate while it runs; frozen into the columns at
     // close). Prev/Avg/N are the completed-cycle history. The no-weekly account's
     // weekly view approximates capacity as avg session tank × 33.6 (7×24/5h windows).
     // Plan/Where are the leftmost extras and drop first when the terminal is narrow
     // (the numeric columns are the point of the page). Where = which pool's ledger holds
     // this account's cycles (cloud / laptop / both) — ONE row per account identity.
-    const ALL_COLS = ['Current', 'Prev', 'Avg', 'N', '$/1M'];
+    const ALL_COLS = ['Current', 'Prev', 'Med', 'N', '$/1M'];
     const CW = 11;
     const nameW = 12;
     const WHERE_W = 7, PLAN_W = 16;
@@ -2760,7 +2760,7 @@ export class TUI {
         const sesTank = this.am.capacityTank?.(i, 'ses');
         const approx = sesTank && sesTank.n > 0
           ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
-        const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
+        const cellsByName = { Current: cyan(approx), Prev: '--', Med: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
         // Same price cell as the main path: this account's weekly capacity IS the
         // derived tank (avg 5h × 33.6) — the price column must not go blank here.
         const p2 = this.am.monthlyPriceFor?.(cr.priceAccount);
@@ -2794,8 +2794,10 @@ export class TUI {
       const cellsByName = {
         Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
         Prev: (tank?.source === 'cycles' && tank.prev != null ? formatTokens(tank.prev) : '--'),
-        Avg: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
-        N: (tank?.source === 'cycles' ? String(tank.n) : '--'),
+        Med: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
+        // `n*` = at least one contributing cycle is a two-pool merge (no per-reading
+        // samples survive a merge, so it is estimated from close-time tokens only).
+        N: (tank?.source === 'cycles' ? String(tank.n) + (tank.mergedCount > 0 ? '*' : '') : '--'),
       };
       // $/1M (owner 2026-10-31 "price per token, not per subscription"): the measured
       // weekly tank divided by the plan's monthly-normalized price. Weekly in BOTH
@@ -2826,6 +2828,7 @@ export class TUI {
     out.push(' ' + dim('Capacity = median of tokens ÷ % full across readings in each cycle, median across cycles.'));
     out.push(' ' + dim('One row per account. Where = which side holds its history: cloud, laptop or both. ? = identity unknown.'));
     out.push(' ' + dim('Tokens = everything the provider processed (input + cached + output), same for Claude and GLM.'));
+    out.push(' ' + dim('N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise.'));
     out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
     out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized). -- = no price or tank yet.'));
     return out;
