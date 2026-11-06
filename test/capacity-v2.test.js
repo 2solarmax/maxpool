@@ -23,6 +23,19 @@ test('V1: clamp removed — median of [5,6,6,18]M cycles is 6M, not 18M-floored'
   assert.equal(t.n, 4);
 });
 
+test('V1b: Med-3 is the median of the LAST 3 cycles, Med-all of every cycle ([5,6,6,18,7]M)', () => {
+  const cycles = [5e6, 6e6, 6e6, 18e6, 7e6].map((t, i) => cyc(t, 1.0, 5 - i)); // oldest first
+  const t = tankStatsFromCycles(cycles, 'wk');
+  assert.equal(t.recent, 7_000_000, 'last three 6,18,7 -> 7');
+  assert.equal(t.recentN, 3);
+  assert.equal(t.avg, 6_000_000, 'all five -> 6');
+  assert.equal(t.n, 5);
+  const two = tankStatsFromCycles(cycles.slice(-2), 'wk');
+  assert.equal(two.recent, 12_500_000, 'two cycles -> median of those two');
+  assert.equal(two.recentN, 2);
+  assert.equal(tankStatsFromCycles(cycles.slice(-1), 'wk').recent, 7_000_000);
+});
+
 test('V2: across cycles is a MEDIAN, not a mean', () => {
   const t = tankStatsFromCycles([1e6, 1e6, 10e6].map((x, i) => cyc(x, 1.0, 3 - i)), 'wk');
   assert.equal(t.avg, 1_000_000, 'mean would be 4M');

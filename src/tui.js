@@ -2723,13 +2723,16 @@ export class TUI {
     // Plan/Where are the leftmost extras and drop first when the terminal is narrow
     // (the numeric columns are the point of the page). Where = which pool's ledger holds
     // this account's cycles (cloud / laptop / both) — ONE row per account identity.
-    const ALL_COLS = ['Current', 'Prev', 'Med', 'N', '$/1M'];
+    const ALL_COLS = ['Current', 'Prev', 'Med-3', 'Med-all', 'N', '$/1M'];
+    // Narrow terminals drop from the right, but Med-3 goes before Med-all.
+    const DROP_ORDER = ['$/1M', 'N', 'Med-3', 'Med-all', 'Prev', 'Current'];
     const CW = 11;
     const nameW = 12;
     const WHERE_W = 7, PLAN_W = 16;
     let COLS = ALL_COLS;
     while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 22) > W) {
-      COLS = COLS.slice(0, -1);
+      const drop = DROP_ORDER.find(c => COLS.includes(c));
+      COLS = COLS.filter(c => c !== drop);
     }
     const showWhere = (nameW + PROVIDER_W + 2 + COLS.length * CW + WHERE_W + 1 + 22) <= W;
     const showPlan = showWhere && (nameW + PROVIDER_W + 2 + COLS.length * CW + WHERE_W + PLAN_W + 2 + 22) <= W;
@@ -2760,7 +2763,7 @@ export class TUI {
         const sesTank = this.am.capacityTank?.(i, 'ses');
         const approx = sesTank && sesTank.n > 0
           ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
-        const cellsByName = { Current: cyan(approx), Prev: '--', Med: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
+        const cellsByName = { Current: cyan(approx), Prev: '--', 'Med-3': '--', 'Med-all': '--', N: sesTank?.n ? String(sesTank.n) : '--' };
         // Same price cell as the main path: this account's weekly capacity IS the
         // derived tank (avg 5h × 33.6) — the price column must not go blank here.
         const p2 = this.am.monthlyPriceFor?.(cr.priceAccount);
@@ -2794,7 +2797,8 @@ export class TUI {
       const cellsByName = {
         Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
         Prev: (tank?.source === 'cycles' && tank.prev != null ? formatTokens(tank.prev) : '--'),
-        Med: (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
+        'Med-3': (tank?.source === 'cycles' && tank.recent != null ? formatTokens(tank.recent) : '--'),
+        'Med-all': (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
         // `n*` = at least one contributing cycle is a two-pool merge (no per-reading
         // samples survive a merge, so it is estimated from close-time tokens only).
         N: (tank?.source === 'cycles' ? String(tank.n) + (tank.mergedCount > 0 ? '*' : '') : '--'),
@@ -2825,10 +2829,10 @@ export class TUI {
     }
 
     out.push('');
-    out.push(' ' + dim('Capacity = median of tokens ÷ % full across readings in each cycle, median across cycles.'));
+    out.push(' ' + dim('Capacity = median of tokens ÷ % full across readings in each cycle. Med-3 = median of last 3 cycles, Med-all = every cycle.'));
     out.push(' ' + dim('One row per account. Where = which side holds its history: cloud, laptop or both. ? = identity unknown.'));
     out.push(' ' + dim('Tokens = everything the provider processed (input + cached + output), same for Claude and GLM.'));
-    out.push(' ' + dim('N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise.'));
+    out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise.'));
     out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
     out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized). -- = no price or tank yet.'));
     return out;

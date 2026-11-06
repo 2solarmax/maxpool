@@ -54,7 +54,7 @@ test('P2: an open weekly cycle renders as the live Current, not empty', () => {
   // an empty Current with history sitting right there.
   const row = renderWk(am).split('\n').find(l => l.includes('kira'));
   assert.ok(row, 'row present');
-  assert.match(row, /10M\s+--\s+10M\s+1/, 'closed history renders (Current=tank avg, Avg, N)');
+  assert.match(row, /10M\s+--\s+10M\s+10M\s+1/, 'closed history renders (Current=tank avg, Med-3, Med-all, N)');
 });
 
 test('P3: the no-weekly derived row is marked "≈" so it reads as derived', () => {

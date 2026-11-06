@@ -186,7 +186,7 @@ test('M1: tankStatsFromCycles exposes mergedCount and the TUI marks N with * whe
   const row = () => {
     const tui = new TUI({ accountManager: am, config: {} }); tui.capacityWindow = 'wk';
     const text = tui._renderCapacityPage(160).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
-    assert.ok(text.includes('Med'), 'header says Med, not Avg');
+    assert.ok(text.includes('Med-all') && text.includes('Med-3'), 'header says Med-3/Med-all, not Avg');
     return text.split('\n').find(l => l.includes('kira'));
   };
   closeWk(2, false); closeWk(1, false);

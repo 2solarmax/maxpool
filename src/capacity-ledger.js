@@ -159,6 +159,8 @@ export function cycleEstimate(c) {
   return null;
 }
 
+const RECENT_CYCLES = 3;
+
 /** Tank stats from a list of closed cycles (local ledger rows, remote exports, or a
  *  merge of both). Per cycle: cycleEstimate. Across cycles: MEDIAN (not mean).
  *  `n` = contributing cycles; `tooLittleData` = admitted cycles that yielded nothing. */
@@ -198,8 +200,13 @@ export function tankStatsFromCycles(cycles, window, { readFloor = null, ignoreCe
   }
   const vals = ests.map(e => e.est.tokens);
   const last = ests[ests.length - 1], prev = ests[ests.length - 2];
+  // `recent` = median over the LAST 3 qualifying cycles (fewer if fewer exist). `ests`
+  // keeps the input order, which closedCycles delivers oldest-first.
+  const recentVals = vals.slice(-RECENT_CYCLES);
   return {
-    avg: Math.round(median(vals)),          // field name kept for consumers: it IS the median
+    avg: Math.round(median(vals)),          // field name kept for consumers: it IS the median over ALL cycles
+    recent: recentVals.length ? Math.round(median(recentVals)) : null,
+    recentN: recentVals.length,
     exact, bounded, n: ests.length, tooLittleData: tooLittle,
     // contributing cycles that are two-pool merges (samples dropped → close-time precision)
     mergedCount: ests.filter(e => e.c.merged).length,
