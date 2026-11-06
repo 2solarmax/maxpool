@@ -52,7 +52,10 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-run_stage "Running tests" 900 bash scripts/run-tests.sh
+# Ceiling raised 2026-11-06: the suite outgrew 900s (1462 tests, ~20-25 min on this
+# Mac) and the v1.24.68 release aborted at rc=124 with 770 green, 0 failed. Override
+# with RELEASE_TEST_CEILING.
+run_stage "Running tests" "${RELEASE_TEST_CEILING:-2400}" bash scripts/run-tests.sh
 
 run_stage "Linting" 120 npx eslint src/ || true   # warnings do not block a release
 
