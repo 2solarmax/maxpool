@@ -454,6 +454,15 @@ function timestamp() {
 
 // ── TUI class ────────────────────────────────────────────────
 
+/** Compact plan cell: "Max Q $134/mo". '--' when no plan is configured (no guessing). */
+function planLabel(plan, priceAccount, am) {
+  if (!plan) return '--';
+  const cad = { monthly: 'M', quarterly: 'Q', annual: 'A', annually: 'A', yearly: 'A' }[plan.cadence] || '';
+  const tier = (plan.tier || '').replace(/^(claude|glm coding)\s+/i, '');
+  const monthly = plan.priceUsd != null && plan.billingMonths ? plan.priceUsd / plan.billingMonths : null;
+  return [tier, cad, monthly != null ? `$${Math.round(monthly)}/mo` : ''].filter(Boolean).join(' ') || '--';
+}
+
 export class TUI {
   constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart }) {
     this.am = accountManager;
@@ -2711,23 +2720,37 @@ export class TUI {
     // Current is the live window (estimate while it runs; frozen into the columns at
     // close). Prev/Avg/N are the completed-cycle history. The no-weekly account's
     // weekly view approximates capacity as avg session tank × 33.6 (7×24/5h windows).
+    // Plan/Where are the leftmost extras and drop first when the terminal is narrow
+    // (the numeric columns are the point of the page). Where = which pool's ledger holds
+    // this account's cycles (cloud / laptop / both) — ONE row per account identity.
     const ALL_COLS = ['Current', 'Prev', 'Avg', 'N', '$/1M'];
     const CW = 11;
     const nameW = 12;
+    const WHERE_W = 7, PLAN_W = 16;
     let COLS = ALL_COLS;
     while (COLS.length > 1 && (nameW + PROVIDER_W + 2 + COLS.length * CW + 22) > W) {
       COLS = COLS.slice(0, -1);
     }
+    const showWhere = (nameW + PROVIDER_W + 2 + COLS.length * CW + WHERE_W + 1 + 22) <= W;
+    const showPlan = showWhere && (nameW + PROVIDER_W + 2 + COLS.length * CW + WHERE_W + PLAN_W + 2 + 22) <= W;
     const header = '  ' + 'Account'.padEnd(nameW) + ' ' + 'Provider'.padEnd(PROVIDER_W) + ' '
+      + (showWhere ? 'Where'.padEnd(WHERE_W) : '')
+      + (showPlan ? 'Plan'.padEnd(PLAN_W) + ' ' : '')
       + COLS.map(c => c.padStart(CW)).join('');
     out.push(dimUnderline(fitLine(header, W)));
 
-    for (const i of this._displayOrder()) {
+    const capRows = this.am.capacityRows
+      ? this.am.capacityRows(this._displayOrder(), { hideDisabled: this.hideDisabled })
+      : this._displayOrder().map(i => ({ index: i, group: [i], unresolved: false, displayName: this.am.accounts[i]?.name, where: null, priceAccount: this.am.accounts[i], plan: null, cache: null }));
+    for (const cr of capRows) {
+      const i = cr.index;
       const a = this.am.accounts[i];
       if (!a) continue;
-      if (this.hideDisabled && a.enabled === false) continue;
-      const name = truncate(a.name, nameW).padEnd(nameW);
+      const name = truncate(cr.displayName + (cr.unresolved ? '?' : ''), nameW).padEnd(nameW);
       const prov = gray(providerLabel(a).padEnd(PROVIDER_W));
+      const whereCell = showWhere ? gray((cr.where || '--').padEnd(WHERE_W)) : '';
+      const planCell = showPlan ? gray(planLabel(cr.plan, cr.priceAccount, this.am).padEnd(PLAN_W) + ' ') : '';
+      const lead = name + ' ' + prov + ' ' + whereCell + planCell;
 
       // The no-weekly plan has NO weekly window to complete — its weekly "capacity" is
       // derived: avg session tank × 33.6 (the number of 5h windows in 7 days). Shown
@@ -2740,10 +2763,10 @@ export class TUI {
         const cellsByName = { Current: cyan(approx), Prev: '--', Avg: '--', N: sesTank?.n ? String(sesTank.n) : '--' };
         // Same price cell as the main path: this account's weekly capacity IS the
         // derived tank (avg 5h × 33.6) — the price column must not go blank here.
-        const p2 = this.am.monthlyPriceFor?.(a);
+        const p2 = this.am.monthlyPriceFor?.(cr.priceAccount);
         cellsByName['$/1M'] = gray((sesTank?.avg && p2)
           ? ('$' + (p2 / (Math.round(sesTank.avg * (7 * 24) / 5) / 1e6)).toFixed(2)).padStart(CW) : '--'.padStart(CW));
-        out.push('  ' + name + ' ' + prov + ' '
+        out.push('  ' + lead
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
           + dim('  no weekly limit · avg 5h × 33.6'));
         continue;
@@ -2789,18 +2812,20 @@ export class TUI {
         ? (sesTankObj?.avg ? Math.round(sesTankObj.avg * (7 * 24) / 5) : null)
         : (this.am.capacityTank?.(i, 'wk')?.avg
           ?? (a.type === 'provider' && sesTankObj?.avg ? Math.round(sesTankObj.avg * WK_PER_SES) : null));
-      const price = this.am.monthlyPriceFor?.(a);
+      const price = this.am.monthlyPriceFor?.(cr.priceAccount);
       const priceCell = (wkTank && price)
         ? '$' + (price / (wkTank / 1e6)).toFixed(2)
         : '--';
       cellsByName['$/1M'] = gray(priceCell.padStart(CW));
-      const row = '  ' + name + ' ' + prov + ' '
+      const row = '  ' + lead
         + COLS.map(c => cellsByName[c].padStart(CW)).join('');
       out.push(row + (curPct ? ' ' + curPct : ''));
     }
 
     out.push('');
-    out.push(' ' + dim('Capacity = tokens ÷ how full the provider said the window was, at close.'));
+    out.push(' ' + dim('Capacity = median of tokens ÷ % full across readings in each cycle, median across cycles.'));
+    out.push(' ' + dim('One row per account. Where = which side holds its history: cloud, laptop or both. ? = identity unknown.'));
+    out.push(' ' + dim('Tokens = everything the provider processed (input + cached + output), same for Claude and GLM.'));
     out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
     out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized). -- = no price or tank yet.'));
     return out;

@@ -44,6 +44,14 @@ export function accountIdentity(account) {
   return null;
 }
 
+/** Identity of a REMOTE status row (same key shape as accountIdentity). */
+export function remoteAccountIdentity(a) {
+  if (!a) return null;
+  if (a.type === 'oauth') return a.accountUuid ? `uuid:${a.accountUuid}` : null;
+  if (a.type === 'provider' && a.provider && a.keyFingerprint) return `key:${a.provider}:${a.keyFingerprint}`;
+  return null;
+}
+
 /** Identity map from a REMOTE pool's status JSON (key-gated /maxpool/status):
  *  { accounts: [{name,type,provider,accountUuid,enabled,...}], callers, ... }.
  *  Provider rows don't carry credentials — the remote pool exports a

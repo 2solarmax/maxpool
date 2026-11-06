@@ -33,7 +33,7 @@ function renderWk(am, width = 120) {
 test('P1: a downtime-partial weekly cycle fills Prev/Avg/N — no more "--"', () => {
   const am = amWith('kira');
   const end = Date.now();
-  closeWeek(am, 'kira', { tokens: 3_000_000, util: 0.3, endedAt: end - SEVEN_D, complete: false });
+  closeWeek(am, 'kira', { tokens: 5_000_000, util: 0.5, endedAt: end - SEVEN_D, complete: false });
   closeWeek(am, 'kira', { tokens: 6_000_000, util: 0.6, endedAt: end, complete: false });
   const row = renderWk(am).split('\n').find(l => l.includes('kira'));
   assert.match(row, /10M\s+10M\s+10M\s+2/, 'Prev, Avg AND N all render from partial cycles');
@@ -42,7 +42,7 @@ test('P1: a downtime-partial weekly cycle fills Prev/Avg/N — no more "--"', ()
 test('P2: an open weekly cycle renders as the live Current, not empty', () => {
   const am = amWith('kira');
   const end = Date.now();
-  closeWeek(am, 'kira', { tokens: 3_000_000, util: 0.3, endedAt: end - SEVEN_D, complete: false });
+  closeWeek(am, 'kira', { tokens: 5_000_000, util: 0.5, endedAt: end - SEVEN_D, complete: false });
   // open cycle ticking + a live reading
   am.accrueCapacity(0, { input: 1_000_000, output: 0 });
   am.accounts[0].quota.unified7d = 0.5;

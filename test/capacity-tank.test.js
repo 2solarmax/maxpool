@@ -44,10 +44,10 @@ test('T1b: the 99%-full case the owner named — Kimi-style, near-exact', () => 
 
 test('T1c: tank averages ACROSS cycles, each divided by its own utilization', () => {
   // Two cycles that delivered wildly different amounts but describe the same plan:
-  // 300k@30% and 900k@90% are both a 1.0M tank. A delivered-token average would say
+  // 500k@50% and 900k@90% are both a 1.0M tank (close-time fallback needs util >= 0.5). A delivered-token average would say
   // 600k — the exact conflation of demand with capacity this replaces.
   const l = new CapacityLedger();
-  for (const [tok, util, i] of [[300_000, 0.3, 2], [900_000, 0.9, 1]]) {
+  for (const [tok, util, i] of [[500_000, 0.5, 2], [900_000, 0.9, 1]]) {
     const b = Date.now() - i * FIVE_H;
     l.accrue('a', { input: tok, output: 0 }, b - FIVE_H);
     l.openCycle('a', 'ses').windowStartedAt = b - FIVE_H;
@@ -64,14 +64,14 @@ test('T1d: `last` is the MOST RECENT cycle\'s tank, distinct from the average', 
   // last must track the newest observation; if it silently returns the average, a plan
   // upgrade takes many cycles to show and the page misreports the current limit.
   const l = new CapacityLedger();
-  for (const [tok, util, i] of [[500_000, 0.5, 2], [600_000, 0.3, 1]]) {   // 1.0M then 2.0M
+  for (const [tok, util, i] of [[500_000, 0.5, 2], [1_000_000, 0.5, 1]]) {   // 1.0M then 2.0M
     const b = Date.now() - i * FIVE_H;
     l.accrue('a', { input: tok, output: 0 }, b - FIVE_H);
     l.openCycle('a', 'ses').windowStartedAt = b - FIVE_H;
     l.closeCycle('a', 'ses', b, { resetAt: b, finalUtilization: util });
   }
   const t = l.tankStats('a', 'ses');
-  assert.equal(t.last, 2_000_000, 'the newest cycle: 600k ÷ 0.3');
+  assert.equal(t.last, 2_000_000, 'the newest cycle: 1.0M ÷ 0.5');
   assert.equal(t.avg, 1_500_000, 'the average of 1.0M and 2.0M');
   assert.notEqual(t.last, t.avg, 'last must not silently be the average');
 });
@@ -85,10 +85,20 @@ test('T2: a cycle closing under 5% full is EXCLUDED — vendor whole-percent rou
   assert.equal(l.tankStats('a', 'ses'), null, 'no tank from a rounding-dominated reading');
 });
 
-test('T2b: 5% and above IS counted — the guard excludes noise, not data', () => {
-  const l = ledgerWithCycle({ tokens: 50_000, util: 0.05 });
+test('T2b: a lone close-time reading below 50% is TOO LITTLE DATA — but two readings 5pp apart are a measurement', () => {
+  // v2 math (2026-11-06): close-time tokens/util is trusted only when the window ended
+  // >= 0.5 full; below that the cycle needs >= 2 samples with delta-util >= 0.05.
+  assert.equal(ledgerWithCycle({ tokens: 50_000, util: 0.05 }).tankStats('a', 'ses'), null);
+  const l = new CapacityLedger();
+  const start = Date.now() - FIVE_H;
+  l.accrue('a', { input: 50_000, output: 0 }, start);
+  l.noteUtilizationObserved(start, [{ name: 'a', window: 'ses', utilization: 0.05 }]);
+  l.accrue('a', { input: 50_000, output: 0 }, start + 1000);
+  l.noteUtilizationObserved(start + 1000, [{ name: 'a', window: 'ses', utilization: 0.10 }]);
+  l.openCycle('a', 'ses').windowStartedAt = start;
+  l.closeCycle('a', 'ses', Date.now(), { resetAt: Date.now(), finalUtilization: 0.10 });
   const t = l.tankStats('a', 'ses');
-  assert.ok(t, 'a 5% reading is usable');
+  assert.ok(t, 'two samples 5pp apart are usable');
   assert.equal(t.avg, 1_000_000);
 });
 
@@ -219,41 +229,28 @@ test('T7: the LIVE estimate obeys the same rounding floor as closed cycles', () 
   assert.equal(t.avg, 9_100_000, '455k ÷ 0.05');
 });
 
-test('T8: a reading implying a tank SMALLER than a past delivery is rejected — the physical floor', () => {
-  // Measured live (2026-08-26, 2solarmax): a window delivered 497k at a reported
-  // 95% ⇒ an implied 523k tank, while an earlier window of the same account had
-  // DELIVERED 1.53M. Impossible — the vendor % counted spend maxpool never saw
-  // (the account is also used outside the proxy), and the contaminated reading
-  // dragged the average 3.6x down. Every counted token is a vendor token, so
-  // maxDelivered <= tank is an invariant the math may never violate.
+test('T8: NO physical-floor clamp — one big outlier cycle does not floor the others', () => {
+  // The v1 clamp turned max(tokens/util, biggest-ever-delivery) into a floor under every
+  // cycle: 6-8 of 10 cycles per account were inflated by one runaway (lane1, 2026-11-06).
+  // Cycles of 5M, 6M, 6M and an 18M outlier (tank = tokens ÷ 1.0): the median is 6M,
+  // not 18M-floored.
   const l = new CapacityLedger();
-  // history: two clean readings and one huge delivery (no reading)
-  for (const [tok, util, i] of [[600_000, 0.6, 4], [1_530_000, null, 3], [800_000, 0.8, 2]]) {
-    const b = Date.now() - i * FIVE_H;
+  let i = 4;
+  for (const tok of [5_000_000, 6_000_000, 6_000_000, 18_000_000]) {
+    const b = Date.now() - i-- * FIVE_H;
     l.accrue('a', { input: tok, output: 0 }, b - FIVE_H);
     l.openCycle('a', 'ses').windowStartedAt = b - FIVE_H;
-    l.closeCycle('a', 'ses', b, { resetAt: b, finalUtilization: util });
+    l.closeCycle('a', 'ses', b, { resetAt: b, finalUtilization: 1.0 });
   }
-  // the contaminated reading: 497k at 95% ⇒ implied 523k < 1.53M delivered once
-  const b2 = Date.now() - FIVE_H;
-  l.accrue('a', { input: 497_000, output: 0 }, b2 - FIVE_H);
-  l.openCycle('a', 'ses').windowStartedAt = b2 - FIVE_H;
-  l.closeCycle('a', 'ses', b2, { resetAt: b2, finalUtilization: 0.95 });
-
-  // CLAMP semantics: every reading joins the average AT the physical floor —
-  // 1.0M and 1.0M both clamp to 1.53M, 523k clamps to 1.53M → avg 1.53M.
   const t = l.tankStats('a', 'ses');
-  assert.equal(t.n, 3, 'all three readings survive, clamped');
-  assert.equal(t.avg, 1_530_000, 'each contributes max(reading, 1.53M)');
-  assert.ok(t.avg >= 1_530_000, 'a tank smaller than a delivered window can never be reported');
+  assert.equal(t.n, 4);
+  assert.equal(t.avg, 6_000_000, 'median of [5,6,6,18]M — not 18M, not the 8.75M mean');
 });
 
-test('T8b: the floor uses ALL complete windows, including reading-less ones', () => {
-  // The 1.53M delivery carried NO finalUtilization (pre-v1.13 history). A floor
-  // computed only from reading-carrying cycles would miss it entirely.
+test('T8b: a contaminated low reading simply stays low (no clamp up to a past delivery)', () => {
   const l = new CapacityLedger();
   const b = Date.now() - 2 * FIVE_H;
-  l.accrue('a', { input: 1_530_000, output: 0 }, b - FIVE_H);   // no reading
+  l.accrue('a', { input: 1_530_000, output: 0 }, b - FIVE_H);   // no reading: contributes nothing
   l.openCycle('a', 'ses').windowStartedAt = b - FIVE_H;
   l.closeCycle('a', 'ses', b, { resetAt: b, finalUtilization: null });
   const b2 = Date.now() - FIVE_H;
@@ -261,6 +258,7 @@ test('T8b: the floor uses ALL complete windows, including reading-less ones', ()
   l.openCycle('a', 'ses').windowStartedAt = b2 - FIVE_H;
   l.closeCycle('a', 'ses', b2, { resetAt: b2, finalUtilization: 0.95 });
   const t = l.tankStats('a', 'ses');
-  assert.ok(t, 'the contaminated reading still yields a tank');
-  assert.equal(t.avg, 1_530_000, 'clamped to the physical floor: the 1.53M delivery');
+  assert.equal(t.n, 1, 'the reading-less cycle is not a tank observation');
+  assert.equal(t.avg, Math.round(497_000 / 0.95));
 });
+

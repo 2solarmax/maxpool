@@ -277,7 +277,7 @@ test('G1: the page shows a per-account row with the capacity columns once cycles
 test('G2: a fresh install says WHY the page is empty instead of showing zeros', () => {
   // Zeros would read as "this account delivers nothing", which is the opposite of true.
   const page = renderCapacity(amWithOauth());
-  assert.match(page, /Capacity = tokens/, 'the formula footer explains the table');
+  assert.match(page, /Capacity = median of tokens/, 'the formula footer explains the table');
   assert.doesNotMatch(page, /no completed cycle yet/,
     'never the old jargon — it was true and told the reader nothing (2026-08-25)');
   assert.match(page,/--\s+--\s+--\s+--/, 'a fresh install shows dashes, never zeros');
@@ -730,13 +730,13 @@ test('L5: the v2→v3 migration KEEPS history and demotes it, rather than droppi
     wk: { open: null, closed: [] }, days: { [new Date(Date.now() - 3 * 86400_000).toISOString().slice(0, 10)]: { tokens: 21_192, partial: false } } } } };
 
   const l = CapacityLedger.fromSerialized(v2);
-  assert.equal(l.serialize().schemaVersion, 3);
+  assert.equal(l.serialize().schemaVersion, 5);
   const closed = l.serialize().accounts.a.ses.closed;
-  assert.equal(closed.length, 1, 'the row is KEPT (not dropped like v1)');
+  assert.equal(closed.length, 2, 'the row is KEPT (not dropped like v1); the in-flight input+output cycle is closed as a legacy row (v5 axis change)');
   assert.equal(closed[0].complete, false, 'but demoted');
   assert.equal(closed[0].partialReason, 'pre-v3-unverified', 'with a reason the monitor recognizes');
   assert.equal(l.windowStats('a', 'ses'), null, 'so it never reaches an average');
-  assert.equal(l.openCycle('a', 'ses').tokensSoFar, 99, 'the in-flight cycle carries on');
+  assert.equal(l.openCycle('a', 'ses'), null, 'v5: the in-flight cycle cannot continue across the token-axis change');
   assert.equal(l.rollingThroughput('a', 7).tokens, 21_192, 'day buckets are real traffic — untouched');
 });
 
