@@ -58,7 +58,10 @@ test('pool link: identities + duplicate benching (uuid + provider key)', async (
     const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${port}`, key: 'mp-max' }, {
       fetchRemoteStatus: (url, key) => fetchRemoteStatus(url, key, { timeoutMs: 2000 }),
     });
-    await link.poll();
+    // Retry the first poll: under full-suite load a 2s HTTP timeout to the local
+    // stub can expire once (release run 2026-11-06: failed only under load, green in
+    // isolation). The assertion's subject is identity/benching, not poll timing.
+    for (let i = 0; i < 3 && !link.lastOkAt; i++) await link.poll();
     assert.ok(link.lastOkAt, 'link poll ok');
     assert.equal(link.summary.usable, 2);
 
