@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.69] - 2026-11-06
+
+### Changed
+
+- Provider-thinking scrub (flag OFF) — streaming+buffered lanes, renumbering, placeholder, allowlist
+- Log every request-side pre-strip, not just the first latch
+- Decode each stream chunk once — shared-decoder double-decode garbled the accounting lane
+- Log every fired scrub (V1 evidence gap)
+- Convert provider tool blocks to text (not drop) — red-team fixes on the v1.24.68 base
+
 ## [1.24.68] - 2026-11-06
 
 ### Changed
