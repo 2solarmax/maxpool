@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
+import { sendLoginToPool } from './cloud-login.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -461,6 +462,19 @@ function planLabel(plan, priceAccount, am) {
   const tier = (plan.tier || '').replace(/^(claude|glm coding)\s+/i, '');
   const monthly = plan.priceUsd != null && plan.billingMonths ? plan.priceUsd / plan.billingMonths : null;
   return [tier, cad, monthly != null ? `$${Math.round(monthly)}/mo` : ''].filter(Boolean).join(' ') || '--';
+}
+
+/** Where a finished browser login goes. mirror → that team pool; a brand-new
+ *  account (no mirror, not already local) with a keyed linked pool → ask (first
+ *  keyed link); else local. */
+export function decideLoginTarget({ mirror, links, existing, accountUuid }) {
+  if (mirror) return { kind: 'mirror', mirror };
+  if (existing) return { kind: 'local' };
+  const link = (Array.isArray(links) ? links : []).find(l => l && l.url && l.key);
+  if (!link) return { kind: 'local' };
+  // The team pool dedupes by account id; without it a re-login would ADD a duplicate.
+  if (!accountUuid) return { kind: 'no-uuid' };
+  return { kind: 'ask-team', link };
 }
 
 export class TUI {
@@ -1461,35 +1475,7 @@ export class TUI {
       // there — never persisted locally (single writer: one account, one home).
       // Same keystroke as a local re-auth; the routing is by where the account
       // lives, so nothing is selected and no menu appears.
-      const mirror = this._findRemoteMirrorFor(profile);
-      if (mirror) {
-        setConsoleStdoutSuppressed(false);
-        await this._sendLoginToRemote(mirror, creds, profile);
-        return;
-      }
-      const existing = this._findExistingOAuthAccount(profile);
-      let name;
-      if (existing) {
-        process.stdout.write(`\nThis Claude account is already added as "${existing.name}" — re-authenticating it in place (no duplicate).\n`);
-        name = existing.name;
-      } else {
-        const suggested = profile?.email
-          || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
-        const answer = await new Promise(resolve => rl.question(`Name this NEW account [${suggested}]: `, resolve));
-        rl.close();
-        name = String(answer || '').trim() || suggested;
-      }
-      // Lift the mute BEFORE the upsert so its persist-confirmation (a console.log,
-      // deliberately visible during the stopped-TUI login) reaches the user.
-      setConsoleStdoutSuppressed(false);
-      // Message honors the ACTUAL result: if a manually-typed name collided with a
-      // different existing account, upsert updates in place → "Re-authenticated", never
-      // a false "Added new account".
-      const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
-      process.stdout.write(updated
-        ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
-        : `\nAdded new account "${name}". Returning to maxpool…\n`);
+      await this._routeLogin(creds, profile);
     } catch (e) {
       if (isLoginCancelled(e)) {
         process.stdout.write('\nLogin cancelled.\n');
@@ -1500,6 +1486,69 @@ export class TUI {
       setConsoleStdoutSuppressed(false);   // restore on every path (incl. the catch)
       if (wasRunning) this.start();
     }
+  }
+
+  // Where a finished browser login goes. Pure decision (see decideLoginTarget):
+  // a mirror match → that team pool; a brand-new account with a linked team pool →
+  // ask once (default team pool); otherwise the local save path.
+  async _routeLogin(creds, profile) {
+    const decision = decideLoginTarget({
+      mirror: this._findRemoteMirrorFor(profile),
+      links: this.am.poolLinks,
+      existing: this._findExistingOAuthAccount(profile),
+      accountUuid: profile?.accountUuid,
+    });
+    if (decision.kind === 'no-uuid') {
+      setConsoleStdoutSuppressed(false);
+      process.stdout.write("\nCould not read this account's id — the team pool needs it. Nothing was saved; try again.\n");
+      return;
+    }
+    if (decision.kind === 'mirror') {
+      setConsoleStdoutSuppressed(false);
+      await this._sendLoginToRemote(decision.mirror, creds, profile);
+      return;
+    }
+    const existing = this._findExistingOAuthAccount(profile);
+    let name;
+    if (existing) {
+      process.stdout.write(`\nThis Claude account is already added as "${existing.name}" — re-authenticating it in place (no duplicate).\n`);
+      name = existing.name;
+    } else {
+      const suggested = profile?.email
+        || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
+      let toTeam = false;
+      if (decision.kind === 'ask-team') {
+        const where = String(await this._ask(`\nThis is a new account. Add it to the team pool "${decision.link.name}" (recommended) or this laptop only? [T/l]: `) || '').trim().toLowerCase();
+        toTeam = where !== 'l';
+      }
+      const answer = await this._ask(`Name this NEW account [${suggested}]: `);
+      name = String(answer || '').trim() || suggested;
+      if (toTeam) {
+        setConsoleStdoutSuppressed(false);
+        await this._sendLoginToTarget(
+          { url: decision.link.url, key: decision.link.key, linkName: decision.link.name },
+          name, creds, profile, { newAccount: true });
+        return;
+      }
+    }
+    // Lift the mute BEFORE the upsert so its persist-confirmation (a console.log,
+    // deliberately visible during the stopped-TUI login) reaches the user.
+    setConsoleStdoutSuppressed(false);
+    // Message honors the ACTUAL result: if a manually-typed name collided with a
+    // different existing account, upsert updates in place → "Re-authenticated", never
+    // a false "Added new account".
+    const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
+    process.stdout.write(updated
+      ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
+      : `\nAdded new account "${name}". Returning to maxpool…\n`);
+  }
+
+  // One readline question → answer string.
+  async _ask(question) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise(resolve => rl.question(question, resolve));
+    rl.close();
+    return answer;
   }
 
   // The browser login belongs to a linked team pool iff a mirror row carries the
@@ -1516,36 +1565,23 @@ export class TUI {
   async _sendLoginToRemote(mirror, creds, profile) {
     const remote = mirror.remote;
     const name = remote.remoteName || mirror.name;
-    process.stdout.write(`\n"${name}" lives in the team pool (${remote.linkName}) — sending the fresh login there…\n`);
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 20_000);
-    try {
-      const res = await fetch(`${String(remote.url).replace(/\/+$/, '')}/maxpool/accounts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': remote.key || '' },
-        body: JSON.stringify({
-          account: {
-            name, type: 'oauth',
-            accountUuid: profile?.accountUuid,
-            accessToken: creds.accessToken,
-            refreshToken: creds.refreshToken,
-            expiresAt: creds.expiresAt,
-            source: 'remote-login',
-          },
-        }),
-        signal: ctl.signal,
-      });
-      const json = await res.json().catch(() => ({}));
-      if (res.ok && json.ok) {
-        process.stdout.write(`\nDone: "${name}" ${json.result === 'added' ? 'added to' : 're-authenticated in'} the team pool. Nothing was saved on this laptop.\n`);
-        this._addLog(`Remote login: "${name}" → team pool ${remote.linkName} (${json.result})`);
-      } else {
-        process.stdout.write(`\nTeam pool rejected the login (HTTP ${res.status}: ${json?.message || json?.error || 'unknown error'}). NOTHING was saved on this laptop — not retried locally.\n`);
-      }
-    } catch (e) {
-      process.stdout.write(`\nCould not reach the team pool (${e?.name === 'AbortError' ? 'timed out' : e?.message}). NOTHING was saved on this laptop — try again in a moment.\n`);
-    } finally {
-      clearTimeout(t);
+    return this._sendLoginToTarget(remote, name, creds, profile, { newAccount: false });
+  }
+
+  // Shared sender. target = {url, key, linkName}. Same single-writer rule for a
+  // NEW account: a failure never falls back to a local save.
+  async _sendLoginToTarget(remote, name, creds, profile, { newAccount }) {
+    process.stdout.write(newAccount
+      ? `\nSending new account "${name}" to the team pool (${remote.linkName})…\n`
+      : `\n"${name}" lives in the team pool (${remote.linkName}) — sending the fresh login there…\n`);
+    const r = await sendLoginToPool({ url: remote.url, key: remote.key, name, profile, creds });
+    if (r.ok) {
+      process.stdout.write(`\nDone: "${name}" ${r.result === 'added' ? 'added to' : 're-authenticated in'} the team pool${newAccount ? ` (${remote.linkName})` : ''}. Nothing was saved on this laptop.\n`);
+      this._addLog(`Remote login: "${name}" → team pool ${remote.linkName} (${r.result})`);
+    } else if (r.kind === 'unreachable') {
+      process.stdout.write(`\n${r.error}. NOTHING was saved on this laptop — try again in a moment.\n`);
+    } else {
+      process.stdout.write(`\n${r.error}. NOTHING was saved on this laptop — not retried locally.\n`);
     }
   }
 
