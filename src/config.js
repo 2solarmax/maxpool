@@ -77,13 +77,17 @@ export function createDefaultConfig() {
     // cache prefix. Claude-account responses are NEVER scrubbed. Default OFF until the
     // E2E package is owner-approved.
     providerThinkingScrub: false,
+    // Each upstream account presents ONE fixed Claude Code identity (device id +
+    // machine profile) regardless of who sent the request — pooled accounts stop
+    // showing several installs alternating within seconds. On by default; false = verbatim.
+    accountIdentity: true,
     routing: {
       mode: 'automatic',
       preferredAccount: null,
     },
     scheduler: {
       mode: 'adaptive-least-loaded',
-      safetyMaxActivePerAccount: 50,
+      safetyMaxActivePerAccount: 3,
       safetyMaxGlobalActive: 150,
       cooldownMs: 30_000,
       maxCooldownMs: 15 * 60_000,

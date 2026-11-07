@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { normalizeClientHeaders, rewriteMetadataUserIdRaw } from './client-identity.js';
 import { appendEventLog } from './event-log.js';
 import { atomicConfigUpdate } from './config.js';
 import { HOP_HEADER, nextHopCount, safeText } from './pool-link.js';
@@ -499,6 +500,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // Read per request (not captured at boot) so a config flip + seamless reload
         // takes effect on the next request with no restart.
         requestInfo.providerThinkingScrub = Boolean(config.providerThinkingScrub);
+        // On unless switched off: each account presents as one fixed Claude Code install.
+        requestInfo.accountIdentity = config.accountIdentity !== false;
         // The CLIENT tells us how long it will wait — the only source that is actually
         // true. A `cc` session exports CLAUDE_STREAM_IDLE_TIMEOUT_MS=3h and forwards it
         // here; a bare `claude` sends nothing and keeps the conservative 240s default,
@@ -857,6 +860,7 @@ async function forwardRequest(
     headers['x-api-key'] = account.credential;
     delete headers['authorization'];
   }
+  if (requestInfo.accountIdentity && !account.remote) normalizeClientHeaders(headers);
 
   // POOL LINK (owner D8): this "account" is another maxpool. Forward the raw
   // request to it with the person's key, a stepped hop header, and the client's
@@ -994,7 +998,7 @@ async function forwardRequest(
 
   const upstreamUrl = `${account.upstream || upstream}${req.url}`;
   const method = req.method;
-  const upstreamBody = rewriteBodyForAccount(body, account);
+  const upstreamBody = rewriteBodyForAccount(body, account, { identity: requestInfo.accountIdentity });
 
   // A threaded follow-up routed to an account that does not hold the thread cannot be
   // served by it: a different Anthropic account 404s, a provider rejects the truncated
@@ -3657,8 +3661,18 @@ function describeBodyShape(buf) {
 const threadOwners = new ThreadOwners();
 const THREAD_GATE_ENABLED = process.env.MAXPOOL_THREAD_GATE !== '0';
 
-function rewriteBodyForAccount(body, account) {
+function rewriteBodyForAccount(body, account, { identity = false } = {}) {
   const needsProviderSanitize = account.type === 'provider';
+  // Identity first, on the RAW string: splicing only the metadata.user_id value keeps
+  // every other byte identical (a parse→serialize round-trip corrupts >2^53 integers
+  // in tool results — red-team M1, 2026-11-07).
+  if (identity && body.length && body.includes('"metadata"')) {
+    const rewritten = rewriteMetadataUserIdRaw(body.toString(), account);
+    if (rewritten != null && (!account.model && !account.modelMap && !needsProviderSanitize)) {
+      return Buffer.from(rewritten);
+    }
+    if (rewritten != null) body = Buffer.from(rewritten);
+  }
   if (!body.length || (!account.model && !account.modelMap && !needsProviderSanitize)) return body;
 
   try {

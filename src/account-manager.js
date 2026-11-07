@@ -108,7 +108,10 @@ function emptyQuota() {
 }
 
 const DEFAULT_SCHEDULER = {
-  safetyMaxActivePerAccount: 50,
+  // One busy person's Claude Code runs ~2-3 parallel helper requests; more than that
+  // on one account reads as a shared key at the provider (z.ai risk notices
+  // 2026-11-07). Excess spills to other accounts (this is the routing gate, not a queue).
+  safetyMaxActivePerAccount: 3,
   safetyMaxGlobalActive: 150,
   cooldownMs: 30_000,
   maxCooldownMs: 15 * 60_000,

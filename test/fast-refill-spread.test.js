@@ -210,7 +210,7 @@ test('S8: in-flight terms carry the discount; the hard gate does not', () => {
   assert.ok(marginalPastD >= am.scheduler.concurrencyWeight * mult - 1e-9,
     `marginal in-flight cost never falls below the discounted linear rate (got ${marginalPastD.toFixed(3)})`);
   // And the HARD gate is a count, not a score — an account can never route past it.
-  assert.equal(am.scheduler.safetyMaxActivePerAccount, 50, 'hard per-account request gate exists');
+  assert.equal(am.scheduler.safetyMaxActivePerAccount, 3, 'hard per-account request gate exists');
 });
 
 test('S9: a capped unlimited account is still BENCHED — the discount never buys past a cap', () => {
@@ -292,7 +292,7 @@ test('K5: soaking never routes past a HARD gate — session bench, cap and reque
   u.capMode = 'fixed';
   assert.equal(am._isAvailable(u), false, 'an owner cap outranks soak');
   // And the hard per-account in-flight gate is a count, not a score.
-  assert.equal(am.scheduler.safetyMaxActivePerAccount, 50, 'hard request gate unchanged');
+  assert.equal(am.scheduler.safetyMaxActivePerAccount, 3, 'hard request gate unchanged');
 });
 
 test('K6: soakDiscount = 0 turns the feature off and restores fast-refill exactly', () => {
