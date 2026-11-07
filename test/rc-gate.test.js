@@ -793,7 +793,7 @@ test('rc-gate live route switch: direct mode routes api.anthropic.com traffic pa
   assert.match(idx, /case 'route':/, 'maxpool route subcommand exists');
 });
 
-test('rc-gate live route switch BEHAVIOR: file=direct bypasses the pool mid-flight, no gate restart (owner 2026-11-01)', async () => {
+gateDescribe('rc-gate live route switch BEHAVIOR: file=direct bypasses the pool mid-flight, no gate restart (owner 2026-11-01)', async () => {
   const switchFile = mkdtempSync(join(tmpdir(), 'rt-')) + '/route';
   writeFileSync(switchFile, 'direct\n');
   const poolHits = [];
