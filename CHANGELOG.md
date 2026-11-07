@@ -5,6 +5,24 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.71] - 2026-11-07
+
+### Added
+
+- One fixed client identity per upstream account; per-account concurrency cap 3
+
+### Changed
+
+- Adapt to the per-account cap of 3 (load markers stay below the cap; rebalance tests keep their intent)
+
+### Fixed
+
+- Untrack an accidentally committed node_modules symlink; ignore node_modules as file or dir
+
+### Removed
+
+- Per-account concurrency cap back to 50 (measured against real traffic first)
+
 ## [1.24.70] - 2026-11-07
 
 ### Changed
