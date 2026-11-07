@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
+import { describeLinkError } from './pool-link.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -813,6 +814,22 @@ export class TUI {
 
   _routingLine(routing, xpText) {
     return ` Routing  ${cyan(routing)}${xpText}`;
+  }
+
+  /** One line per unreachable team pool, so a lost connection reads as ONE cause
+   *  instead of every cloud row turning red. '' lines are skipped by the caller. */
+  _cloudLinkLines(W = 80, now = Date.now()) {
+    const out = [];
+    for (const l of this.am.poolLinks || []) {
+      if (!l.lastError && l.lastOkAt != null) continue;
+      const since = l.downSince ?? l.lastOkAt;
+      const forTxt = since ? ` for ${formatAge(now - since)}` : '';
+      const synced = l.lastOkAt ? ` · last synced ${new Date(l.lastOkAt).toLocaleTimeString()}` : '';
+      const why = l.lastOkAt == null && !l.lastError ? 'connecting…' : describeLinkError(l.lastError);
+      const line = ` Cloud    ${yellow(`⟐ ${l.name} unreachable${forTxt}`)} ${dim('—')} ${why}${dim(`. Cloud accounts paused; local accounts still serving${synced}.`)}`;
+      out.push(fitLine(line, W));
+    }
+    return out;
   }
 
   _renderUpdatesDetail() {
@@ -2076,6 +2093,7 @@ export class TUI {
       if (provReq > 0) xpText += `  ${dim('·')}  ${yellow(`providers: ${provReq} req/15m`)}`;
     }
     lines.push(this._routingLine(routing, xpText));
+    lines.push(...this._cloudLinkLines(W));
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     // Throttle and WAITING are different things and used to share one line labelled
     // "Anthropic upstream throttled" — so a request parked purely because every account
@@ -2367,7 +2385,8 @@ export class TUI {
       case 'paused':    status = yellow('paused'); break;
       case 'disabled':  status = red('✕ disabled'); break;
       case 'pool-benched': status = gray('in cloud'); break;
-      case 'cloud-down': status = red('⟐ cloud ✕'); break;
+      // The banner above names the cause once; each row just says it is out of reach.
+      case 'cloud-down': status = yellow('⟐ offline'); break;
       // Disabled AND needs re-login — both facts matter, and DISABLED LEADS.
       // The owner's question that drove this (2026-09-30): "when I disable the account
       // and then the token expires, does it show disabled or reauth? It needs to

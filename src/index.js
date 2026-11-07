@@ -18,6 +18,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, appendEventLog } from './event-log.js';
 import { sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
 import { SleepGuard } from './sleep-guard.js';
+import { controllingTerminalAlive } from './terminal-alive.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer, REQUEST_IDLE_MAX_MS } from './server.js';
 
@@ -1638,7 +1639,18 @@ async function serverWorkerCommand() {
   // drain + exit cleanly so we never reload into a headless orphan that outlives
   // the terminal and squats the port. Headless/service mode keeps SIGHUP as the
   // conventional reload signal (baton under the supervisor, else exit-75).
-  process.on('SIGHUP', () => { if (isInteractiveTerminal()) shutdownGracefully('SIGHUP', { terminalClose: true }); else requestReload(); });
+  // A SIGHUP while the terminal is still open came from another program (`kill
+  // -HUP`), not a closed window — ignore it rather than kill every session using
+  // the pool. Re-check shortly after, in case the signal raced the terminal revoke.
+  const hangupShutdown = () => shutdownGracefully('SIGHUP', { terminalClose: true });
+  process.on('SIGHUP', () => {
+    if (!isInteractiveTerminal()) return requestReload();
+    if (!controllingTerminalAlive()) return hangupShutdown();
+    console.log('[Maxpool] Ignored SIGHUP: this terminal is still open, so another program sent it (not a closed window). Maxpool keeps running — press r to restart it.');
+    for (const ms of [500, 2000]) {
+      setTimeout(() => { if (!draining && !controllingTerminalAlive()) hangupShutdown(); }, ms).unref?.();
+    }
+  });
 }
 
 function logPlainServerStart({ host, port, accounts, threshold, config }) {

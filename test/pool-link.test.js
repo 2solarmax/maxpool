@@ -487,7 +487,7 @@ test('SC19 sort + hide: Where groups first (local before cloud), h also hides gu
   am.setPoolLinks([]);
 });
 
-test('link down: cloud mirror rows read "cloud ✕", never "disabled"', async () => {
+test('link down: cloud mirror rows read "offline", never "disabled"', async () => {
   const am = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1' }], 0.9, { routingMode: 'balance' });
   const link = new PoolLink({ name: 'team', url: 'http://x', key: 'k' });
   link.lastOkAt = 1; link.lastError = null;
@@ -502,7 +502,7 @@ test('link down: cloud mirror rows read "cloud ✕", never "disabled"', async ()
   const { TUI } = await import('../src/tui.js');
   const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
   const line = strip(new TUI({ accountManager: am })._renderAcct(m.index, 11, true));
-  assert.match(line, /cloud ✕/, 'reads as cloud unreachable');
+  assert.match(line, /⟐ offline/, 'reads as cloud unreachable');
   assert.doesNotMatch(line, /disabled/, 'never "disabled"');
   am.setPoolLinks([]);
 });

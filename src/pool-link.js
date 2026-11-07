@@ -178,6 +178,17 @@ function sanitizeRemoteStatus(json) {
  * so a link that hasn't polled yet still benches what it benched last run.
  */
 const BOOT_IDS_TTL_MS = 14 * 24 * 3600 * 1000;  // stale beyond this → trust a fresh boot instead
+export const FAILS_BEFORE_DOWN = 2;
+
+/** Plain-English cause of a link failure, for the one-line cloud banner. */
+export function describeLinkError(err) {
+  const e = String(err || '');
+  if (e === 'key rejected') return "the cloud pool rejected this laptop's key";
+  if (/^HTTP 5\d\d$/.test(e)) return `the cloud pool answered with an error (${e})`;
+  if (/^HTTP /.test(e)) return `the cloud pool answered ${e}`;
+  // timeout, ECONNREFUSED/RESET, "fetch failed", DNS… — from here they look alike.
+  return `no connection — check your internet or the tunnel (${e || 'network error'})`;
+}
 
 export class PoolLink {
   constructor(def, deps = {}) {
@@ -194,6 +205,8 @@ export class PoolLink {
     this.status = null;        // raw remote status JSON when ok
     this.lastError = null;
     this.lastOkAt = null;
+    this.failStreak = 0;       // consecutive failed checks
+    this.downSince = null;     // when lastError was first set (the outage start)
     this.identities = new Map();
     this.summary = null;
   }
@@ -226,13 +239,23 @@ export class PoolLink {
         this.status = sanitizeRemoteStatus(r.json);
         this.lastOkAt = r.at;
         this.lastError = null;
+        this.failStreak = 0;
+        this.downSince = null;
         this.identities = remoteIdentities(r.json);
         this.summary = summarizeRemote(r.json);
       } else {
-        // Keep the LAST good status for display, but mark the link degraded so
-        // routing benches it and the UI names the error.
-        this.lastError = r.error;
-        this.summary = null;
+        // One missed check on a flaky network is not an outage: a single timeout
+        // used to flip every cloud row to ✕ while requests were still getting
+        // through. Mark the link down only after FAILS_BEFORE_DOWN checks in a row
+        // (a rejected key is never transient — down at once). Keep the LAST good
+        // status for display; down → routing benches it and the UI names the cause.
+        this.failStreak = (this.failStreak || 0) + 1;
+        this.lastPollError = r.error;
+        if (this.failStreak >= FAILS_BEFORE_DOWN || r.error === 'key rejected' || this.lastOkAt == null) {
+          if (!this.lastError) this.downSince = r.at;
+          this.lastError = r.error;
+          this.summary = null;
+        }
       }
       return r;
     } finally {
