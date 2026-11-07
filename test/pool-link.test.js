@@ -234,8 +234,8 @@ test('duplicate guard end-to-end: the REMOTE status (real getStatus shape) carri
 
 
 test('terminal People line: merges local + cloud callers, hides legacy key, empty when nobody named', async () => {
-  const { TUI } = await import('../src/tui.js');
   const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const { TUI } = await import('../src/tui.js');
   const am = new AccountManager([], 0.9);
   am.callerCounts.set('max', 12);
   am.callerCounts.set('legacy-key', 3);
@@ -461,7 +461,7 @@ test('SC22 People screen: columns align by visible width, merges cloud windows, 
 
 test('SC19 sort + hide: Where groups first (local before cloud), h also hides guarded locals', async () => {
   const { TUI } = await import('../src/tui.js');
-  const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const _strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
   const am = new AccountManager([
     { name: 'kira', type: 'oauth', accountUuid: 'K', accessToken: 'x', refreshToken: 'r' },
   ], 0.9, { routingMode: 'balance' });
