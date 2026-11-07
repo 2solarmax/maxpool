@@ -19,7 +19,7 @@ test('adaptive scheduler distributes concurrent leases across healthy accounts',
   const am = manager(3);
   const leases = [];
 
-  const per = am.scheduler.safetyMaxActivePerAccount;   // 3 since 2026-11-07 (shared-key look)
+  const per = 5;   // spread check: 15 leases over 3 healthy accounts
   for (let i = 0; i < per * 3; i++) {
     leases.push(am.acquireAccount({ weight: 1 }));
   }
@@ -1188,7 +1188,7 @@ test('rebalance: a thinking-SAFE request migrates a bound session off a HOT acco
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   assert.equal(first.account.name, 'a1');           // bound to a1
   am.releaseAccount(first, { success: true, status: 200 });
-  hot(a1); a1.inFlight = 2;   // loaded but UNDER the per-account cap (3 since 2026-11-07); hot
+  hot(a1); a1.inFlight = 2;   // hot + loaded
 
   fresh(a2);
   const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
@@ -1207,7 +1207,7 @@ test('rebalance: with crossAccountThinkingMigration OFF, signed thinking never m
   const a1 = am.accounts[0], a2 = am.accounts[1];
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   am.releaseAccount(first, { success: true, status: 200 });
-  hot(a1); a1.inFlight = 2;   // loaded but UNDER the per-account cap (3 since 2026-11-07)
+  hot(a1); a1.inFlight = 2;
   fresh(a2); a2.inFlight = 0;
   // Flag OFF → a signed-thinking request must stay put even on a hot account.
   const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, requiresAnthropicThinkingIntegrity: true });
@@ -1221,7 +1221,7 @@ test('acquireAccount reports migratedFromName only when the session actually mov
   assert.equal(first.account.name, 'a1');
   assert.equal(first.migratedFromName, null, 'first bind is not a migration');
   am.releaseAccount(first, { success: true, status: 200 });
-  hot(a1); a1.inFlight = 2;   // loaded but UNDER the per-account cap (3 since 2026-11-07)
+  hot(a1); a1.inFlight = 2;
   fresh(a2); a2.inFlight = 0;
   const moved = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   assert.equal(moved.account.name, 'a2');
@@ -1253,7 +1253,7 @@ test('rebalance: an UNSCANNED body fails closed (no migration)', () => {
   const a1 = am.accounts[0], a2 = am.accounts[1];
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   am.releaseAccount(first, { success: true, status: 200 });
-  hot(a1); a1.inFlight = 2;   // loaded but UNDER the per-account cap (3 since 2026-11-07)
+  hot(a1); a1.inFlight = 2;
   fresh(a2); a2.inFlight = 0;
   // No bodyThinkingScanned (e.g. non-JSON / parse failure) → treated as unsafe.
   const next = am.acquireAccount({ weight: 1, sessionKey: 's1' });
@@ -1276,7 +1276,7 @@ test('rebalance: suppressed while the request is consuming a queue admission', (
   const a1 = am.accounts[0], a2 = am.accounts[1];
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   am.releaseAccount(first, { success: true, status: 200 });
-  hot(a1); a1.inFlight = 2;   // loaded but UNDER the per-account cap (3 since 2026-11-07)
+  hot(a1); a1.inFlight = 2;
   fresh(a2); a2.inFlight = 0;
   const next = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true, queueAdmitted: true });
   assert.equal(next.account.name, 'a1', 'no migration mid queue-admission');
@@ -1287,7 +1287,7 @@ test('rebalance: does not flap — once on the fresh account it stays (HOT gate 
   const a1 = am.accounts[0], a2 = am.accounts[1];
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   am.releaseAccount(first, { success: true, status: 200 });
-  hot(a1); a1.inFlight = 2;   // loaded but UNDER the per-account cap (3 since 2026-11-07)
+  hot(a1); a1.inFlight = 2;
   fresh(a2); a2.inFlight = 0;
   const moved = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   assert.equal(moved.account.name, 'a2');
@@ -1313,7 +1313,7 @@ test('rebalance: a fast-BURNER (raw-normal, pace-reserve) migrates — the raw t
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   assert.equal(first.account.name, 'a1');
   am.releaseAccount(first, { success: true, status: 200 });
-  paceHot(a1); a1.inFlight = 2;   // loaded but UNDER the per-account cap (3 since 2026-11-07)
+  paceHot(a1); a1.inFlight = 2;
   fresh(a2);
   assert.equal(am._weeklyRawState(a1), 'normal', 'raw state is normal — old trigger would not fire');
   assert.ok(['reserve', 'critical'].includes(am._weeklyPaceState(a1)), 'pace state is hot');
@@ -1333,7 +1333,7 @@ test('rebalance: signed thinking MIGRATES across Claude accounts when crossAccou
   const a1 = am.accounts[0], a2 = am.accounts[1];
   const first = am.acquireAccount({ weight: 1, sessionKey: 's1', bodyThinkingScanned: true });
   am.releaseAccount(first, { success: true, status: 200 });
-  hot(a1); a1.inFlight = 2;   // loaded but UNDER the per-account cap (3 since 2026-11-07)
+  hot(a1); a1.inFlight = 2;
   fresh(a2); a2.inFlight = 0;
   // Signed-thinking request: with the flag ON it may move to another CLAUDE account
   // (signature is content/model integrity, not account-bound). Providers are still

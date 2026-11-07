@@ -108,10 +108,11 @@ function emptyQuota() {
 }
 
 const DEFAULT_SCHEDULER = {
-  // One busy person's Claude Code runs ~2-3 parallel helper requests; more than that
-  // on one account reads as a shared key at the provider (z.ai risk notices
-  // 2026-11-07). Excess spills to other accounts (this is the routing gate, not a queue).
-  safetyMaxActivePerAccount: 3,
+  // Kept high on purpose. A cap of 3 was tried 2026-11-07 (to look like one person)
+  // and measured against the owner's real traffic first: peaks of 79 simultaneous
+  // requests from his many sessions, with only ~4 accounts usable that day, would
+  // have queued and failed. Spreading load is the router's job, not a hard cap's.
+  safetyMaxActivePerAccount: 50,
   safetyMaxGlobalActive: 150,
   cooldownMs: 30_000,
   maxCooldownMs: 15 * 60_000,

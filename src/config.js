@@ -87,7 +87,7 @@ export function createDefaultConfig() {
     },
     scheduler: {
       mode: 'adaptive-least-loaded',
-      safetyMaxActivePerAccount: 3,
+      safetyMaxActivePerAccount: 50,
       safetyMaxGlobalActive: 150,
       cooldownMs: 30_000,
       maxCooldownMs: 15 * 60_000,
