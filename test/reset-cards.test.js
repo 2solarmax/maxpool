@@ -159,13 +159,13 @@ test('redeemResetCard sends the card\'s grantType in the request body', async ()
 });
 
 test('prober redeem path passes the policy-chosen card\'s grantType to the wire', async () => {
-  const { Prober } = await import('../src/prober.js');
   let sent = null;
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (_url, init) => { sent = init?.body ? JSON.parse(init.body) : null;
     return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) }; };
   try {
     const logs = [];
+    const { Prober } = await import('../src/prober.js');
     const self = { log: (m) => logs.push(m), am: {}, _withTimeout: (p) => p };
     await Prober.prototype._redeemZaiCard.call(self,
       { name: 'glm t', credential: 'tok', quota: {} },
@@ -251,7 +251,7 @@ test('grantType-less card gets one GLOBAL fallback retry on "unavailable"', asyn
 });
 
 test('backoff key is the account NAME (stable across reindex), and tries resets on success', async () => {
-  const { Prober } = await import('../src/prober.js');
+  const { Prober: _Prober } = await import('../src/prober.js');
   const src = (await import('node:fs')).readFileSync(new URL('../src/prober.js', import.meta.url), 'utf8');
   assert.match(src, /`\$\{account\.name\}:\$\{act\.card\.recordId\}`/, 'keyed by name');
   assert.match(src, /_cardTries\?\.set\(key, 0\)/, 'tries reset on success');

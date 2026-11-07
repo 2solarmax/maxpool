@@ -1,0 +1,7 @@
+# Maxbar — passwordless sleep toggle (one-time setup, admin password needed once).
+# Install as /etc/sudoers.d/sleep-control (see tools/maxbar/README.md):
+#   sed "s/YOURNAME/$(whoami)/" tools/maxbar/sudoers-example | sudo tee /etc/sudoers.d/sleep-control >/dev/null
+#   sudo chown root:wheel /etc/sudoers.d/sleep-control && sudo chmod 0440 /etc/sudoers.d/sleep-control
+#   sudo visudo -cf /etc/sudoers.d/sleep-control
+# Grants exactly two commands — nothing else can be run without a password.
+YOURNAME ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0

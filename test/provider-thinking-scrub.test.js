@@ -178,7 +178,7 @@ const providerSSE = stream([
 
 test('wiring STREAM: streamResponse with a scrubber drops provider thinking; usage still parsed from the ORIGINAL stream', async () => {
   const got = [];
-  const am = { ...dummyManager(), updateUsage(idx, inp, out) { got._usageIn = inp; } };
+  const am = { ...dummyManager(), updateUsage(idx, inp, _out) { got._usageIn = inp; } };
   const sc = new ProviderThinkingScrubber();
   await streamResponse(sseBody([providerSSE]), mockRes(got), 200, { 'content-type': 'text/event-stream' }, 0, am, [], { model: 'claude-opus-5', stream: true }, undefined, sc);
   assert.doesNotMatch(got.join(''), /thinking/);

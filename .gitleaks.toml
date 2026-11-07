@@ -1,0 +1,28 @@
+# gitleaks config: default ruleset + a narrow allowlist of known false positives.
+# Each entry is an EXACT literal (anchored regex), never a path or a rule
+# exemption, so a real secret in the same files is still caught.
+#
+#  - rt_9aZ-bc.dEf01, AKIA1234567890abcd: fixtures in test/event-log.test.js for
+#    the secret-redactor the test verifies (obvious fakes).
+#  - dGhlIHNhbXBsZSBub25jZQ==: the SAMPLE WebSocket key from RFC 6455 section 1.3
+#    (test/cliproxy-api.test.js, test/upgrade-*.test.js).
+#  - 9d1c250a-...: Claude Code's public OAuth client id (src/oauth.js,
+#    test/providers.test.js); ships inside the Claude Code npm package and
+#    identifies the app, not a user.
+#  - a.quota.unified5h: a JS expression (test/tui-split-panes.test.js) matched by
+#    the generic keyword heuristic.
+title = "maxpool gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives (exact literals)"
+regexTarget = "secret"
+regexes = [
+  '''^rt_9aZ-bc\.dEf01$''',
+  '''^AKIA1234567890abcd$''',
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
+  '''^9d1c250a-e61b-44d9-88ed-5944d1962f5e$''',
+  '''^a\.quota\.unified5h$''',
+]

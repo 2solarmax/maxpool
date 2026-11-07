@@ -159,7 +159,7 @@ test('R2: a state file whose capacity schema is NEWER than this build is never o
 });
 
 test('R3: a file with no capacity block (fresh / quota-only) writes normally with no backup', async () => {
-  await withState(async (dir, statePath) => {
+  await withState(async (dir, _statePath) => {
     await saveState({ quota: {}, capacity: { schemaVersion: SCHEMA_VERSION, accounts: {} } });
     await saveState({ quota: { a: 1 }, capacity: null });
     assert.equal((await baks(dir)).length, 0);
