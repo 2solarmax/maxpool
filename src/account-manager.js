@@ -2340,6 +2340,13 @@ export class AccountManager {
         if (switched) {
           console.log(`[Maxpool] Switched to account "${best.name}"`);
         }
+        // Evidence for the next cache measurement: one line each time a KNOWN
+        // conversation leaves its last account (bounded by moves, not by requests).
+        const ckey = this._affinityKey(requestInfo);
+        const lastName = ckey ? this.conversationLastAccount.get(ckey) : null;
+        if (lastName && lastName !== best.name) {
+          console.log(`[Maxpool] conversation moved: ${lastName} → ${best.name} (${requestInfo.bodyBytes ?? '?'}B)`);
+        }
         return best;
       }
     }
@@ -3205,6 +3212,12 @@ export class AccountManager {
     if (base <= 0 || this.scheduler.routingMode === 'sticky') return 0;
     const key = this._affinityKey(requestInfo);
     if (!key || this.conversationLastAccount.get(key) !== account.name) return 0;
+    // Scale with the CONVERSATION'S SIZE too: losing the cache costs the prefix a
+    // hop re-writes, and requestInfo.bodyBytes ≈ prefix + this turn. Checkpoint
+    // 2026-11-08 11:07Z: a flat 400 cut full re-writes only 18.9%→14.8% of turns —
+    // the rest were 100K-500K-token conversations whose single in-flight turn
+    // already outweighed it. 1x below 150KB, rising to 3x at 450KB+.
+    const sizeMult = Math.min(3, Math.max(1, (requestInfo.bodyBytes || 0) / 150_000));
     // No readable quota (Kimi's coding key is console-only) → nothing would ever
     // release the hold before a 429; give such rows plain balancing (red-team r1).
     if (account.type === 'provider' && account.quota?.providerQuotaSource === 'console-only') return 0;
@@ -3224,7 +3237,7 @@ export class AccountManager {
       ? this._fastRefillMultiplier(account, { capFloor: true }) : refillMult;
     const unit = this.scheduler.concurrencyWeight * refillMult + this.scheduler.capPenaltyWeight * safetyMult;
     const fullUnit = this.scheduler.concurrencyWeight + this.scheduler.capPenaltyWeight;
-    return base * Math.min(1, unit / fullUnit);
+    return base * sizeMult * Math.min(1, unit / fullUnit);
   }
 
   /**

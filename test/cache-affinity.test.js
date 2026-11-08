@@ -185,3 +185,13 @@ test('conversation hash: stable across turns, distinct per conversation (main vs
   assert.ok(t1.conversationHash && t1.conversationHash === t2.conversationHash, 'same conversation, later turn → same key');
   assert.notEqual(t1.conversationHash, sub.conversationHash, 'a subagent is its own conversation');
 });
+
+test('bonus scales with conversation size: a 500K-token conversation holds harder than a small one', () => {
+  const m = am(2); am_ref = m;
+  const first = m.acquireAccount({ sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 20_000 });
+  const home = first.account.name; m.releaseAccount(first, { status: 200, success: true });
+  const small = m._cacheAffinity(m.accounts.find(a => a.name === home), { sessionKey: 's', affinityKey: 's:h', bodyBytes: 20_000 });
+  const big = m._cacheAffinity(m.accounts.find(a => a.name === home), { sessionKey: 's', affinityKey: 's:h', bodyBytes: 500_000 });
+  assert.equal(small, 400, 'small conversation: base bonus');
+  assert.equal(big, 1200, '500K conversation: 3x cap');
+});
