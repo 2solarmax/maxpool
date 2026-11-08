@@ -343,6 +343,12 @@ const PERSISTED_QUOTA_FIELDS = [
 ];
 
 const CONVERSATION_AFFINITY_MAX = 5000;
+const IDENTITY_WINDOW_MS = 15 * 60_000;
+const IDENTITY_MAX_SAMPLES = 4000;
+const IDENTITY_MIN_PER_SESSION = 8;
+const IDENTITY_MIN_SAMPLE = 60;
+const IDENTITY_DEGRADED_RATE = 0.9;
+const IDENTITY_RECOVER_RATE = 0.7;
 const PROVIDER_429_MIN_BENCH_SEC = 60;
 const PROVIDER_429_MAX_BENCH_SEC = 15 * 60;
 const PROVIDER_429_STREAK_FORGET_MS = 60 * 60 * 1000;
@@ -603,6 +609,12 @@ export class AccountManager {
     // Bounded LRU — oldest conversations drop first; a dropped entry only means the
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
+    // Conversation-identity HEALTH (owner 2026-11-08: "make sure this cannot degrade
+    // silently"). Twice in one day a Claude Code request-shape detail (a moving
+    // cache_control marker, then a per-request billing checksum) made every turn hash
+    // to a new conversation id — affinity went silently inert. Rolling sample of
+    // (terminal, conversation id) per request; see _noteIdentityHealth.
+    this.identityHealth = { samples: [], degraded: false, since: null, lastRate: null, lastN: 0 };
     this._peakCache = null;   // per-UTC-minute peak-window memo (see _peakStateFor)
     // CAPACITY LEDGER (2026-08-22): observed tokens per completed window cycle, so
     // "true capacity" is comparable across providers. Restored from state on boot.
@@ -882,6 +894,7 @@ export class AccountManager {
       // disagree with the peak tier that caused the move (defaults to real time).
       this._bindSession(requestInfo.sessionKey, account, requestInfo.model, requestInfo.now);
     }
+    this._noteIdentityHealth(requestInfo);
     this._noteConversationAccount(requestInfo, account);
     account.inFlight++;
     account.activeWeight += weight;
@@ -3202,7 +3215,48 @@ export class AccountManager {
    *  falls back to the terminal session key (callers that never set the hash,
    *  e.g. tests and pre-hash call sites). */
   _affinityKey(requestInfo = {}) {
+    // SELF-HEAL: while conversation identity looks broken, fall back to the
+    // per-terminal key — cruder (subagents share it) but immune to request-shape
+    // drift, so stickiness degrades instead of switching off.
+    if (this.identityHealth.degraded) return requestInfo.sessionKey || requestInfo.affinityKey || null;
     return requestInfo.affinityKey || requestInfo.sessionKey || null;
+  }
+
+  /** Track how often each terminal's requests START a new conversation id. Healthy
+   *  traffic reuses ids (measured 2026-11-08 on 1.24.77: 68 turns → 19 conversations;
+   *  a busy terminal 32 requests → 6 ids). A broken identity gives ~every request a
+   *  fresh id. Window: last IDENTITY_WINDOW_MS; judged only over terminals with at
+   *  least IDENTITY_MIN_PER_SESSION requests in it (a terminal sending 2 requests
+   *  proves nothing) and IDENTITY_MIN_SAMPLE requests in total. Flip to degraded at
+   *  ≥ IDENTITY_DEGRADED_RATE new-id share; recover below IDENTITY_RECOVER_RATE
+   *  (hysteresis — no flapping). One log line per transition; status shows the state. */
+  _noteIdentityHealth(requestInfo, now = Date.now()) {
+    if (!requestInfo.sessionKey || !requestInfo.conversationHash) return;
+    const h = this.identityHealth;
+    h.samples.push({ t: now, s: requestInfo.sessionKey, c: requestInfo.conversationHash });
+    const cutoff = now - IDENTITY_WINDOW_MS;
+    while (h.samples.length && h.samples[0].t < cutoff) h.samples.shift();
+    if (h.samples.length > IDENTITY_MAX_SAMPLES) h.samples.splice(0, h.samples.length - IDENTITY_MAX_SAMPLES);
+    const perSession = new Map();
+    for (const x of h.samples) {
+      if (!perSession.has(x.s)) perSession.set(x.s, []);
+      perSession.get(x.s).push(x.c);
+    }
+    let reqs = 0; let fresh = 0;
+    for (const ids of perSession.values()) {
+      if (ids.length < IDENTITY_MIN_PER_SESSION) continue;
+      reqs += ids.length; fresh += new Set(ids).size;
+    }
+    if (reqs < IDENTITY_MIN_SAMPLE) return;
+    const rate = fresh / reqs;
+    h.lastRate = rate; h.lastN = reqs;
+    if (!h.degraded && rate >= IDENTITY_DEGRADED_RATE) {
+      h.degraded = true; h.since = now;
+      console.log(`[Maxpool] cache affinity: conversation identity looks BROKEN (${Math.round(rate * 100)}% of ${reqs} requests started a new conversation) — Claude Code's request shape probably changed. Falling back to per-terminal stickiness until it recovers; the hash in describeRequest needs updating.`);
+    } else if (h.degraded && rate < IDENTITY_RECOVER_RATE) {
+      h.degraded = false; h.since = now;
+      console.log(`[Maxpool] cache affinity: conversation identity healthy again (${Math.round(rate * 100)}% new over ${reqs} requests) — per-conversation stickiness restored.`);
+    }
   }
 
   _cacheAffinity(account, requestInfo = {}) {
@@ -5213,6 +5267,14 @@ export class AccountManager {
       // verifies the wrong thing (measured 2026-08-23: reported 1.8.7 while executing
       // 1.8.6). This field is the one to assert on.
       runningVersion: this.runningVersion || null,
+      // Cache-affinity identity health — 'ok' | 'degraded' (+ the measured new-id
+      // share). A post-release check asserts 'ok' on live traffic.
+      affinityIdentity: {
+        state: this.identityHealth.degraded ? 'degraded' : 'ok',
+        newConversationShare: this.identityHealth.lastRate,
+        sampledRequests: this.identityHealth.lastN,
+        since: this.identityHealth.since,
+      },
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
       routing: {
