@@ -5,6 +5,24 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.73] - 2026-11-08
+
+### Added
+
+- Cache affinity in balance mode — a conversation stays on its last healthy Anthropic account unless load/quota/exclusion says move (default for all users)
+- Per-conversation cache affinity (terminal + prefix hash) so subagent fan-out no longer drags the main thread; bonus scaled to each row's per-unit price; no affinity without a quota signal (Kimi); bounded LRU (red-team r1)
+
+### Changed
+
+- Affinity uniform across account types per owner (GLM included, gated by its own 5h reading)
+- GLM 5h release pinned (low weekly + high session window)
+- Reload-oauth waitFor names the stalled step and keeps the child's log tail (flaked twice on 2026-11-08 with no evidence)
+
+### Fixed
+
+- Affinity gates ordered (5h/failure before unknown-weekly neutral); sticky excluded; prefer-* covered; tests for every release condition + 6 mutants killed
+- Affinity holds through the soft weekly tier (releases at reserve 85%, as designed)
+
 ## [1.24.72] - 2026-11-08
 
 ### Added
