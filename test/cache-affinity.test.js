@@ -195,3 +195,19 @@ test('bonus scales with conversation size: a 500K-token conversation holds harde
   assert.equal(small, 400, 'small conversation: base bonus');
   assert.equal(big, 1200, '500K conversation: 3x cap');
 });
+
+test('conversation-move evidence log: fires once when a known conversation changes account', async () => {
+  const logs = [];
+  const origLog = console.log; console.log = l => { if (typeof l === 'string' && l.startsWith('[Maxpool]')) logs.push(l); };
+  try {
+    const m = am(2); am_ref = m;
+    const first = m.acquireAccount({ sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 10_000 });
+    m.releaseAccount(first, { status: 200, success: true });
+    m._noteConversationAccount({ affinityKey: 's:h' }, m.accounts.find(a => a.name !== first.account.name)); // pretend it ran elsewhere
+    // Force a move back: exclude everyone except the first account.
+    const excl = new Set(m.accounts.filter(a => a.name !== first.account.name).map(a => a.index));
+    const next = m.acquireAccount({ sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 10_000 }, excl);
+    m.releaseAccount(next, { status: 200, success: true });
+    assert.ok(logs.some(l => l.includes('conversation moved:') && l.includes('→')), `log line present: ${logs.filter(Boolean).join(' | ')}`);
+  } finally { console.log = origLog; }
+});
