@@ -186,6 +186,13 @@ const DEFAULT_SCHEDULER = {
   // and a Claude Code turn weighs 3-30 units: 400 ≈ 33 units, about two large
   // turns of extra depth before the conversation moves. 0 = pure per-request.
   cacheAffinityBonus: 400,
+  // HOLD-UNTIL-CANNOT-SERVE (owner 2026-11-08): a bound conversation leaves its last
+  // account only when that account truly cannot serve it. A re-store costs the same
+  // whether the conversation leaves at 85% or at the wall, so leaving early buys
+  // nothing and staying avoids it if the conversation ends / the window resets first.
+  // This is the 5-hour-window level at which the hold lets go (providers; Claude
+  // benches at switchThreshold anyway). Weekly reserve/soft tiers do NOT release.
+  cacheAffinityFiveHourWall: 0.97,
   concurrencyWeight: 2,            // multiplies in-flight load (activeWeight+reqWeight) — dominant
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
@@ -2358,7 +2365,9 @@ export class AccountManager {
         const ckey = this._affinityKey(requestInfo);
         const lastName = ckey ? this.conversationLastAccount.get(ckey) : null;
         if (lastName && lastName !== best.name) {
-          console.log(`[Maxpool] conversation moved: ${lastName} → ${best.name} (${requestInfo.bodyBytes ?? '?'}B)`);
+          let why = 'unknown';
+          try { why = this._moveReason(lastName, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(best.name) || null, now); } catch (e) { why = `error:${e.message}`; }
+          console.log(`[Maxpool] conversation moved: ${lastName} → ${best.name} (${requestInfo.bodyBytes ?? '?'}B) why=${why}`);
         }
         return best;
       }
@@ -3066,10 +3075,10 @@ export class AccountManager {
     return this._holdsUsableReset(account, now) ? 1 - Math.min(d, 0.9) : 1;
   }
 
-  _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
+  _scoreTerms(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
     const now = ctx?.now ?? Date.now();
     // CACHE AFFINITY — see _cacheAffinity.
-    const affinity = this._cacheAffinity(account, requestInfo);
+    const affinity = this._cacheAffinity(account, requestInfo, criticalUnlock);
     const reqWeight = Math.max(1, requestInfo.weight || 1);
     // POOL LINK scores as the cloud's WORST-case load (owner 2026-10-29: "the team
     // pool will respect the accounts within it... included in the balancing act").
@@ -3173,15 +3182,24 @@ export class AccountManager {
     const reserveCost = this._reserveCost(account, now, weeklyState);
     const criticalCost = this._criticalCost(account, now, criticalUnlock, weeklyState);
     const failurePenalty = account.consecutiveFailures * 5;
-    // NO unknown-quota bonus. An account whose quota we cannot see must never be
-    // MORE attractive than a known-healthy one — the old -0.5 nudge (safe only
-    // while the prober quickly resolved "unknown") turned into a relentless pull
-    // toward blind accounts once probing was off, driving an out-of-band-burned
-    // account to exhaustion. Unknown now scores neutral; the prober (on by
-    // default) learns the real number within a cycle. `probing`/requalify still
-    // flags a never-seen account for learning — that path is unchanged.
+    // HELD conversation: the quota/steering terms (pace, utilization, scoped pace,
+    // spread, recovery ramp, reserve/critical overflow cost) exist to steer NEW work
+    // away from tight accounts. They must not, by themselves, pull an already-bound
+    // conversation off an account that can still serve it — a re-store costs more
+    // than any of them. Zeroed for the bound account only while the hold is live; the
+    // LOAD terms (concurrency, capPenalty) stay, so the load-gap escape is untouched.
+    // Structural, not a bonus-size accident: holds at any cacheAffinityBonus > the load gap.
+    const held = affinity > 0;
+    const steer = held ? { paceCost: 0, utilizationCost: 0, scopedPace: 0, spread: 0, ramp: 0, reserveCost: 0, criticalCost: 0 }
+      : { paceCost, utilizationCost, scopedPace, spread, ramp, reserveCost, criticalCost };
+    const terms = { concurrency, capPenalty, ...steer, failurePenalty, affinity };
+    return terms;
+  }
 
-    return Math.max(0, concurrency + capPenalty + paceCost + utilizationCost + scopedPace + spread + ramp + reserveCost + criticalCost + failurePenalty - affinity);
+  /** Routing cost — lower is preferred. Sum of the named terms minus the affinity bonus. */
+  _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
+    const t = this._scoreTerms(account, requestInfo, ctx, criticalUnlock);
+    return Math.max(0, t.concurrency + t.capPenalty + t.paceCost + t.utilizationCost + t.scopedPace + t.spread + t.ramp + t.reserveCost + t.criticalCost + t.failurePenalty - t.affinity);
   }
 
   /**
@@ -3259,7 +3277,35 @@ export class AccountManager {
     }
   }
 
-  _cacheAffinity(account, requestInfo = {}) {
+  /**
+   * HOLD-UNTIL-CANNOT-SERVE (owner 2026-11-08). Returns null while the hold is live,
+   * or the NAME of the gate that lets the conversation go. The hold survives the
+   * weekly reserve (85%) and soft tiers and a high-but-not-walled 5-hour window: a
+   * move costs one full re-store whenever it happens, so leaving early only spends
+   * the re-store sooner. It releases only when the account truly cannot serve:
+   *   critical-no-unlock / exhausted / capped weekly, the 5h window at/over
+   *   cacheAffinityFiveHourWall, a failure streak, or Kimi's unreadable console-only
+   *   quota (nothing would ever release the hold before a 429). Availability gates
+   *   (cooldown, 429 bench, exclusion, in-flight cap) never reach here — the account
+   *   is not a candidate at all — so a throttled account releases on the very next request.
+   */
+  _affinityRelease(account, criticalUnlock = null) {
+    if (account.type === 'provider' && account.quota?.providerQuotaSource === 'console-only') return 'console-only';
+    const weeklyState = this._weeklyRawState(account);
+    if (weeklyState === 'critical') {
+      if (!criticalUnlock) return 'critical-no-unlock';
+    } else if (weeklyState === 'exhausted' || weeklyState === 'capped') {
+      return `weekly-${weeklyState}`;
+    }
+    // 5-hour window: Anthropic reports unified5h; GLM/Kimi report providerSes.
+    const five = account.type === 'provider' ? account.quota?.providerSes : account.quota?.unified5h;
+    if (five != null && five >= this.scheduler.cacheAffinityFiveHourWall) return `5h-${five.toFixed(2)}`;
+    const failures = account.consecutiveFailures || 0;
+    if (failures > 0) return `failures-${failures}`;
+    return null;
+  }
+
+  _cacheAffinity(account, requestInfo = {}, criticalUnlock = null) {
     const base = Number(this.scheduler.cacheAffinityBonus) || 0;
     // Sticky mode has its own binding; its score loop runs only once the session has
     // decided to LEAVE a hot account — a discount there would pull it straight back.
@@ -3272,17 +3318,7 @@ export class AccountManager {
     // the rest were 100K-500K-token conversations whose single in-flight turn
     // already outweighed it. 1x below 150KB, rising to 3x at 450KB+.
     const sizeMult = Math.min(3, Math.max(1, (requestInfo.bodyBytes || 0) / 150_000));
-    // No readable quota (Kimi's coding key is console-only) → nothing would ever
-    // release the hold before a 429; give such rows plain balancing (red-team r1).
-    if (account.type === 'provider' && account.quota?.providerQuotaSource === 'console-only') return 0;
-    const weeklyState = this._weeklyRawState(account);
-    // Holds through 'soft' (≥65% weekly — most accounts by mid-week) and 'unknown'
-    // (never probed); reserve/critical/exhausted/capped release the conversation.
-    if (!['normal', 'soft', 'unknown'].includes(weeklyState)) return 0;
-    // 5-hour window: Anthropic reports unified5h; GLM/Kimi report providerSes.
-    const five = account.type === 'provider' ? account.quota?.providerSes : account.quota?.unified5h;
-    if (five != null && five >= this.scheduler.weeklyReserveThreshold) return 0;
-    if ((account.consecutiveFailures || 0) > 0) return 0;
+    if (this._affinityRelease(account, criticalUnlock)) return 0;
     // Scale to THIS row's price of one in-flight unit, so every account tolerates the
     // same extra DEPTH (~33 units) — a fast-refill/soak-discounted GLM row prices a
     // unit at ~0.4x, and an unscaled bonus let it run ~2.5x deeper (red-team r1).
@@ -3292,6 +3328,48 @@ export class AccountManager {
     const unit = this.scheduler.concurrencyWeight * refillMult + this.scheduler.capPenaltyWeight * safetyMult;
     const fullUnit = this.scheduler.concurrencyWeight + this.scheduler.capPenaltyWeight;
     return base * sizeMult * Math.min(1, unit / fullUnit);
+  }
+
+  /**
+   * WHY a known conversation left its last account — one short string for the
+   * `conversation moved:` log line. `released:<gate>` = the hold let go (the gate
+   * names the reason, incl. availability causes); `outscored:` = the hold was live and
+   * the sibling still won, with the dominant score terms that beat the bonus.
+   */
+  _moveReason(lastName, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlock, now) {
+    const last = this.accounts.find(a => a.name === lastName);
+    if (!last) return 'released:account-gone';
+    if (excludedIndexes.has(last.index)) return 'released:excluded';
+    if (!this._matchesRequest(last, requestInfo.profile || 'claude', requestInfo)) return 'released:not-eligible';
+    const unlock = weeklyOptions.allowWeeklyCritical ? null : this._criticalUnlock(last, requestInfo, excludedIndexes, null, now);
+    const avail = { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!unlock, model: requestInfo.model, now };
+    if (!this._isAvailable(last, avail)) return `released:unavailable(${this._unavailableCause(last, now)})`;
+    const gate = this._affinityRelease(last, unlock);
+    if (gate) return `released:${gate}`;
+    if (this._effectivePriority(last, requestInfo, now) > this._effectivePriority(best, requestInfo, now)) return 'released:priority-tier';
+    if (this._cacheAffinity(last, requestInfo, unlock) <= 0) return 'released:no-hold';
+    const lt = this._scoreTerms(last, requestInfo, scoringCtx, unlock);
+    const bt = this._scoreTerms(best, requestInfo, scoringCtx, bestUnlock);
+    const sum = t => t.concurrency + t.capPenalty + t.paceCost + t.utilizationCost + t.scopedPace + t.spread + t.ramp + t.reserveCost + t.criticalCost + t.failurePenalty - t.affinity;
+    const delta = sum(lt) - sum(bt);
+    const diffs = ['concurrency', 'capPenalty', 'paceCost', 'utilizationCost', 'scopedPace', 'spread', 'ramp', 'reserveCost', 'criticalCost', 'failurePenalty', 'affinity']
+      .map(k => [k, (k === 'affinity' ? -(lt[k] - bt[k]) : lt[k] - bt[k])])
+      .filter(([, d]) => d > 0.05).sort((x, y) => y[1] - x[1]).slice(0, 2)
+      .map(([k, d]) => `${k}+${d.toFixed(1)}`);
+    return `outscored:${delta.toFixed(1)}(${diffs.join(',') || 'rank'};bonus=${lt.affinity.toFixed(0)};depth=${last.activeWeight}/${best.activeWeight})`;
+  }
+
+  /** Short human cause for a not-available account (log text only). */
+  _unavailableCause(account, now) {
+    if (!account.enabled) return 'disabled';
+    if (account.status === 'throttled' && account.rateLimitedUntil && now < account.rateLimitedUntil) return 'rate-limited';
+    if (account.cooldownUntil && now < account.cooldownUntil) return 'cooldown';
+    if (account.provisionalUpstreamUntil && now < account.provisionalUpstreamUntil) return 'upstream-failure';
+    if (account.inFlight >= this.scheduler.safetyMaxActivePerAccount) return 'in-flight-cap';
+    if (this._isSessionQuotaUnavailable(account, now)) return '5h-wall';
+    const w = this._weeklyRawState(account, now);
+    if (w !== 'normal' && w !== 'soft' && w !== 'unknown') return `weekly-${w}`;
+    return account.status || 'other';
   }
 
   /**
