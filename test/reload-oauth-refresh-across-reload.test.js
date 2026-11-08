@@ -123,10 +123,14 @@ function status(port, apiKey) {
   });
 }
 
-async function waitFor(predicate, timeoutMs = 20000, stepMs = 100) {
+async function waitFor(predicate, timeoutMs = 20000, stepMs = 100, what = '', tail = () => '') {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) { if (await predicate()) return true; await new Promise(r => setTimeout(r, stepMs)); }
-  throw new Error('waitFor predicate never became true');
+  // Include the child's captured output: this test's three waitFors all poll LOG TEXT
+  // of a spawned supervisor, and a timing failure was indistinguishable from a real
+  // bug ("never became true") with the only evidence discarded. Flaky twice in one
+  // day (release gate 2026-11-08) at exactly this blindness.
+  throw new Error(`waitFor never true${what ? ` (${what})` : ''} — child output tail:\n${String(tail()).slice(-1500)}`);
 }
 
 function killGroup(child) {
@@ -163,13 +167,13 @@ test('in-flight OAuth refresh across a reload rotates the single-use token EXACT
   let out = ''; child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(() => /Maxpool Proxy|Listening on/.test(out), 20000);
+    await waitFor(() => /Maxpool Proxy|Listening on/.test(out), 20000, 'server-ready', () => out);
 
     // Fire a request — its routing triggers ensureTokenFresh (token is expired),
     // which POSTs to the held stub. Don't await (it blocks on the held refresh).
     proxyGet(port, apiKey).catch(() => {});
     // Wait until the refresh POST is actually in flight (held) at the stub.
-    await waitFor(() => stub.isHolding(), 20000);
+    await waitFor(() => stub.isHolding(), 20000, 'refresh POST arrived at stub', () => out);
 
     // Reload NOW, mid-refresh. The baton must drain the in-flight refresh before
     // MSG_RELEASED so the new worker never re-rotates the same single-use token.
@@ -178,7 +182,7 @@ test('in-flight OAuth refresh across a reload rotates the single-use token EXACT
     await new Promise(r => setTimeout(r, 600));
     stub.releaseHeld();
 
-    await waitFor(() => /cutover complete/.test(out), 20000);
+    await waitFor(() => /cutover complete/.test(out), 20000, 'reload cutover', () => out);
     // Settle: let any (forbidden) second rotation attempt happen if the bug exists.
     await new Promise(r => setTimeout(r, 800));
 
