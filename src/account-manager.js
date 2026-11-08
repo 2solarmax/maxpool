@@ -3169,8 +3169,10 @@ export class AccountManager {
    *     or over the same mark, or a failure streak → affinity off, plain balancing;
    *   - it carries roughly two more large requests than the best sibling (one
    *     weight unit in flight costs ~12 points past the per-account target).
-   * Anthropic subscription rows only (local + cloud mirrors): GLM's cache already
-   * hits 98.6% under plain balancing and z.ai flags heavy single-key patterns.
+   * Every account type (owner 2026-11-08: treat GLM the same). Measured the same
+   * day: GLM conversations hopped accounts on 39% of turns yet z.ai still reported
+   * 98.6% cache reads, so z.ai's cache is not per-key — affinity buys GLM nothing
+   * there but costs nothing either, and one rule is simpler to reason about.
    * Applies in every scored mode (balance, prefer-*); never in sticky (see below).
    */
   _cacheAffinity(account, requestInfo = {}) {
@@ -3178,13 +3180,14 @@ export class AccountManager {
     // Sticky mode has its own binding; its score loop runs only once the session has
     // decided to LEAVE a hot account — a discount there would pull it straight back.
     if (bonus <= 0 || this.scheduler.routingMode === 'sticky') return 0;
-    if (account.type !== 'oauth' || !requestInfo.sessionKey) return 0;
+    if (!requestInfo.sessionKey) return 0;
     if (this._sessionBinding(requestInfo.sessionKey)?.currentName !== account.name) return 0;
     const weeklyState = this._weeklyRawState(account);
     // 'unknown' (weekly never probed yet) is neutral; every other non-normal tier
     // (reserve/critical/exhausted/capped) releases the conversation.
     if (weeklyState !== 'normal' && weeklyState !== 'unknown') return 0;
-    const five = account.quota?.unified5h;
+    // 5-hour window: Anthropic reports unified5h; GLM/Kimi report providerSes.
+    const five = account.type === 'provider' ? account.quota?.providerSes : account.quota?.unified5h;
     if (five != null && five >= this.scheduler.weeklyReserveThreshold) return 0;
     if ((account.consecutiveFailures || 0) > 0) return 0;
     return bonus;

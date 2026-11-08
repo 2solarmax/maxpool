@@ -88,12 +88,14 @@ test('affinity releases when the last-used account is in its weekly reserve tier
   release(next);
 });
 
-test('GLM/provider rows never get affinity', () => {
+test('GLM rows get the same affinity, released by GLM\'s own 5-hour reading', () => {
   const m = am(1); am_ref = m;
   m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
   const glm = m.accounts.find(a => a.type === 'provider');
   m._bindSession('sess-g', glm, 'claude-opus-5-5');
-  assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 0);
+  assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 400, 'same rule as Anthropic');
+  glm.quota.providerSes = 0.87;
+  assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 0, 'GLM near its 5h wall → released');
 });
 
 test('affinity releases after a failure on the last-used account', () => {
