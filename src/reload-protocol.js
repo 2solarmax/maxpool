@@ -30,6 +30,7 @@ export const MSG_FAILED = 'failed';       // worker failed to boot/bind/restore
 export const MSG_RELEASED = 'released';   // old worker stopped accepting + writing, flushed
 export const MSG_PRIMARY = 'primary';     // new worker is now sole acceptor + lease holder
 export const MSG_QUOTA_STATE = 'quota-state'; // old worker hands its in-memory quota to supervisor
+export const MSG_CONN = 'conn';           // (with socket) supervisor-accepted connection handed to a worker to serve
 
 /**
  * Outcome codes for a reload attempt, surfaced to the supervisor so it can log

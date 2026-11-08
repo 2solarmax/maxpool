@@ -51,7 +51,7 @@ import {
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
   MSG_LISTEN, MSG_RELEASE, MSG_TAKEOVER, MSG_PROBE_READY,
   MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
-  MSG_TTY_REASSERT,
+  MSG_TTY_REASSERT, MSG_CONN,
 } from './reload-protocol.js';
 
 const args = process.argv.slice(2);
@@ -222,12 +222,25 @@ async function supervisorCommand() {
 
   // Bind once. EADDRINUSE / EACCES here is a cold-start failure → exit(1) is
   // correct (there's no worker to keep alive yet).
-  let masterServer = createServer();
-  // We DROP any connection the supervisor accidentally accepts while a worker is
-  // also accepting on the shared handle — but the design avoids that: the
-  // supervisor's acceptor is only LIVE during the brief cutover gap (it stops
-  // once a worker confirms it is the sole acceptor). A bare handler is required
-  // so the rare gap-accepted socket isn't left dangling.
+  // pauseOnConnect: a socket the supervisor accepts must reach the worker with every
+  // byte still unread, so the supervisor never consumes the request it is relaying.
+  let masterServer = createServer({ pauseOnConnect: true });
+  // The supervisor's accept loop is LIVE from bind until a worker confirms it is the
+  // sole acceptor (MSG_PRIMARY), and again over the reload cutover gap. It shares the
+  // listening socket with the worker, so it WINS some accepts. A connection accepted
+  // here used to be left dangling (this server had no 'connection' handler): the client
+  // hung, then got ECONNRESET, and the request never reached any worker (the flaky
+  // reload-oauth-refresh test, 2026-11-08). Hand every such socket to the worker that
+  // is serving, or about to: `acceptTarget` (the incoming worker during a reload) else
+  // the active one. No live worker → close it so the client retries now, never hangs.
+  let acceptTarget = null;
+  masterServer.on('connection', sock => {
+    const target = acceptTarget || activeWorker;
+    if (!target || !target.child.connected) { sock.destroy(); return; }
+    try {
+      target.child.send({ type: MSG_CONN }, sock, err => { if (err) sock.destroy(); });
+    } catch { sock.destroy(); }
+  });
   const relistenMaster = (retriesOnBusy = 20) => new Promise((resolve, reject) => {
     if (masterServer.listening) { resolve(); return; }
     const onListen = () => { masterServer.removeListener('error', onErr); resolve(); };
@@ -246,6 +259,14 @@ async function supervisorCommand() {
     masterServer.once('listening', onListen);
     masterServer.listen(port, host);
   });
+  // What goes over IPC to a worker: the RAW listening handle, not the net.Server wrapper.
+  // Sent as a net.Server, Node builds an intermediate net.Server in the worker that
+  // listen()s on it and ACCEPTS whatever is already queued before user code can attach
+  // a listener (measured: with 8 connections queued, the worker's HTTP server got 0-5
+  // and the rest sat unread in that intermediate server, black-holed). The raw handle
+  // has no such wrapper: the worker's http.Server listen()s on it directly.
+  // Falls back to the wrapper if a future Node hides the handle (old behaviour).
+  const masterHandle = () => masterServer._handle || masterServer;
   const closeMasterAccept = () => new Promise(resolve => {
     if (!masterServer.listening) { resolve(); return; }
     masterServer.close(() => resolve());
@@ -327,7 +348,7 @@ async function supervisorCommand() {
     const worker = makeWorkerChannel(child);
     if (!reload) {
       // Cold start: hand the socket and tell it to go primary immediately.
-      worker.send({ type: MSG_LISTEN }, masterServer);
+      worker.send({ type: MSG_LISTEN }, masterHandle());
     }
     return worker;
   };
@@ -373,11 +394,13 @@ async function supervisorCommand() {
       const outcome = await runReloadBaton({
         oldWorker,
         newWorker,
-        handle: masterServer,
+        handle: masterHandle(),
         // After the OLD worker has released its fd, re-arm the supervisor's own
         // listener to cover the cutover gap, then hand THAT live handle to the
         // new worker. The new worker's MSG_PRIMARY then closes it again.
-        prepareHandle: async () => { await relistenMaster(); return masterServer; },
+        // The old worker has released, so gap-accepted connections now belong to the
+        // incoming worker (before this point the still-serving old one is the target).
+        prepareHandle: async () => { acceptTarget = newWorker; await relistenMaster(); return masterHandle(); },
         // Generous, env-tunable readiness/takeover budgets — the 10s default rolled back
         // on this user's loaded Mac (the update never landed). See RELOAD_READY_MS.
         readyTimeoutMs: RELOAD_READY_MS,
@@ -427,6 +450,7 @@ async function supervisorCommand() {
       activeWorker = null;
       endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
     } finally {
+      acceptTarget = null;
       reloadInFlight = false;
     }
   };
@@ -1564,6 +1588,11 @@ async function serverWorkerCommand() {
           // never sit alive-but-not-primary (the blank-screen `r`-restart hang).
           console.error('[Maxpool] Cold worker received MSG_LISTEN with no socket handle — exiting for respawn.');
           process.exit(SERVER_RESTART_EXIT_CODE);
+        } else if (msg?.type === MSG_CONN) {
+          // A connection the supervisor's own accept loop won the race for (cold start
+          // before MSG_PRIMARY, or the reload cutover gap). Serve it exactly as if we
+          // had accepted it: http.Server wires up on the 'connection' event.
+          if (handle) { handle.resume?.(); server.emit('connection', handle); }
         } else if (msg?.type === MSG_PROBE_READY) {
           // Headless reload worker: we've booted the new code and restored quota
           // in memory. Confirm readiness (we are NOT yet accepting / writing).

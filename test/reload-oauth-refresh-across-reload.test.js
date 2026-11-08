@@ -167,13 +167,13 @@ test('in-flight OAuth refresh across a reload rotates the single-use token EXACT
   let out = ''; child.stdout.on('data', d => out += d); child.stderr.on('data', d => out += d);
 
   try {
-    await waitFor(() => /Maxpool Proxy|Listening on/.test(out), 20000, 'server-ready', () => out);
+    await waitFor(() => /Maxpool Proxy|Listening on/.test(out), 20000, 100, 'server-ready', () => out);
 
     // Fire a request — its routing triggers ensureTokenFresh (token is expired),
     // which POSTs to the held stub. Don't await (it blocks on the held refresh).
     proxyGet(port, apiKey).catch(() => {});
     // Wait until the refresh POST is actually in flight (held) at the stub.
-    await waitFor(() => stub.isHolding(), 20000, 'refresh POST arrived at stub', () => out);
+    await waitFor(() => stub.isHolding(), 20000, 100, 'refresh POST arrived at stub', () => out);
 
     // Reload NOW, mid-refresh. The baton must drain the in-flight refresh before
     // MSG_RELEASED so the new worker never re-rotates the same single-use token.
@@ -182,7 +182,7 @@ test('in-flight OAuth refresh across a reload rotates the single-use token EXACT
     await new Promise(r => setTimeout(r, 600));
     stub.releaseHeld();
 
-    await waitFor(() => /cutover complete/.test(out), 20000, 'reload cutover', () => out);
+    await waitFor(() => /cutover complete/.test(out), 20000, 100, 'reload cutover', () => out);
     // Settle: let any (forbidden) second rotation attempt happen if the bug exists.
     await new Promise(r => setTimeout(r, 800));
 
