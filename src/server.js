@@ -918,6 +918,15 @@ async function forwardRequest(
         upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half', signal: linkCtl.signal });
       } finally { clearTimeout(linkTtfb); }
       ctx.status = upRes.status;
+      // The linked pool refused the request's SHAPE (not Claude Code) — the cloud
+      // account is healthy and every route would refuse it identically. Pass the
+      // answer through; cooling the mirror row would bench it for real sessions.
+      if (account.remote && upRes.status === 429 && upRes.headers.get(REQUEST_SHAPE_REFUSAL_HEADER) && !clientHasRealBytes(res, requestInfo)) {
+        const errorText = await readErrorBody(upRes);
+        finishLink({ status: 429, error: 'request_shape_refused', neutral: true });
+        sendErrorBody(res, requestInfo, 429, errorText, upRes.headers);
+        return;
+      }
       // Pinned cloud account refused (rate-limited / unavailable) before any byte
       // streamed: cool THIS mirror row and fail over through the normal path to the
       // next-best account, local or cloud — exactly like a local account's 429.
@@ -1122,6 +1131,29 @@ async function forwardRequest(
       const errorBody = await readErrorBody(upstreamRes);
       const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
+      // REQUEST-SHAPE refusal (2026-11-08): on a subscription login Anthropic serves
+      // Opus/Sonnet only to Claude-Code-shaped requests; anything else gets a bare 429
+      // ("Error", no quota headers) while Haiku on the same account is served —
+      // bisected live, the identity system line alone flips 429 → 200. The ACCOUNT is
+      // healthy, so benching it (60s) blocked every real session on it, and failing
+      // over just collected the same refusal from every other account. Answer THIS
+      // request and leave the account untouched.
+      if (account.type !== 'provider' && isRequestShapeRefusal(rateLimitHeaders, errorBody, body)) {
+        accountManager.releaseAccount(lease, { status: 429, error: 'request_shape_refused', neutral: true });
+        console.log(`[Maxpool] 429 on "${account.name}" is a request-shape refusal (not Claude Code) — account left active, not failing over`);
+        if (logDir) {
+          logSections.push(`=== RESPONSE 429 — "${account.name}" refused request shape (account untouched) ===\n${formatHeaders(upstreamRes.headers)}`);
+          if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        ctx.status = 429;
+        sendErrorResponse(res, requestInfo, 429, {
+          type: 'error',
+          error: { type: 'rate_limit_error', message: REQUEST_SHAPE_REFUSAL_MESSAGE },
+        }, { [REQUEST_SHAPE_REFUSAL_HEADER]: '1' });
+        return;
+      }
+
       const rateLimit = classifyRateLimit(account, rateLimitHeaders, errorBody, { model: requestInfo.model, retryAfter });
       if (rateLimit.scope === 'upstream') {
         const parsedError = parseJsonError(errorBody);
@@ -2353,7 +2385,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -2384,9 +2416,13 @@ function parseProviderRetryAfter(body, provider) {
   const message = parsed?.message || '';
 
   if (provider === 'zai') {
-    const nextFlush = message.match(/reset at\s+`?([^`\n]+?)`?$/i)?.[1]
-      || message.match(/next_flush_time[:\s]+`?([^`\n]+?)`?$/i)?.[1];
-    const resetSeconds = secondsUntilParsedTime(nextFlush);
+    // z.ai embeds the reset as "...will reset at 2026-11-12 04:28:53][<request-id>]"
+    // (measured 2026-11-08, code 1310): the bracketed request id trails the time, so
+    // an anchor to end-of-string never matches and the parsed time became garbage.
+    // Capture the time inside ITS bracket and hand only that to the time parser.
+    const resetMatch = message.match(/reset at\s+`?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)`?/i)
+      || message.match(/next_flush_time[:\s]+`?([^`\n]+?)`?$/i);
+    const resetSeconds = secondsUntilParsedTime(resetMatch?.[1], { tzOffsetMs: ZAI_TZ_OFFSET_MS });
     if (resetSeconds) return resetSeconds;
 
     if (['1302', '1303', '1305'].includes(String(code))) return 60;
@@ -2416,6 +2452,34 @@ function parseJsonError(body) {
   } catch {
     return { message: body };
   }
+}
+
+const REQUEST_SHAPE_REFUSAL_HEADER = 'x-maxpool-request-shape-refused';
+const REQUEST_SHAPE_REFUSAL_MESSAGE = 'Anthropic serves this model on subscription accounts only to Claude Code requests. '
+  + 'This request does not identify as Claude Code (its system prompt lacks the Claude Code identity line), '
+  + 'so every pooled account refuses it the same way. Send it from Claude Code, or use a Haiku model.';
+const CLAUDE_CODE_IDENTITY = /^You are (Claude Code, Anthropic's official CLI for Claude|a Claude agent, built on Anthropic's Claude Agent SDK)/;
+
+/** True when the request carries Claude Code's identity line as a leading system
+ *  block. Parse failure → true (unknown shape is never treated as a refusal). */
+function looksLikeClaudeCode(requestBody) {
+  let parsed;
+  try { parsed = JSON.parse(Buffer.isBuffer(requestBody) ? requestBody.toString() : String(requestBody)); } catch { return true; }
+  const sys = parsed?.system;
+  const blocks = typeof sys === 'string' ? [sys] : Array.isArray(sys) ? sys.map(b => b?.text) : [];
+  return blocks.slice(0, 3).some(t => typeof t === 'string' && CLAUDE_CODE_IDENTITY.test(t.trimStart()));
+}
+
+/** A 429 that refuses the request's SHAPE, not the account's quota: NO unified quota
+ *  headers at all, Anthropic's bare `rate_limit_error` "Error" body, and a request
+ *  that does not identify as Claude Code. All three must hold — a headerless 429 on a
+ *  real Claude Code request keeps the account-wide handling (red-team: a genuine cap
+ *  with stripped headers must still bench). */
+function isRequestShapeRefusal(headers, errorBody, requestBody) {
+  if (Object.keys(headers).some(k => k.toLowerCase().startsWith('anthropic-ratelimit-unified'))) return false;
+  const parsed = parseJsonError(errorBody);
+  if (String(parsed?.type || '') !== 'rate_limit_error' || String(parsed?.message || '').trim() !== 'Error') return false;
+  return !looksLikeClaudeCode(requestBody);
 }
 
 function classifyRateLimit(account, headers, body, opts = {}) {
@@ -2514,11 +2578,24 @@ function recordRequestIncident(requestInfo, fingerprint, accountIndex, retryAfte
   return incident;
 }
 
-function secondsUntilParsedTime(value) {
+// z.ai prints its reset timestamps in China time (UTC+8) with no zone marker —
+// measured 2026-11-08: the 1310 message said 04:28:53 while the account's own
+// quota API reported the same window as 20:28:53Z. Parsing it as UTC made every
+// reset 8h too late and once even landed in the past. Anthropic's own header
+// times are ISO-with-zone and never carry a raw offset.
+const ZAI_TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+function secondsUntilParsedTime(value, { tzOffsetMs = 0 } = {}) {
   if (!value) return null;
   const trimmed = String(value).trim();
-  const dateMs = Date.parse(trimmed);
-  if (!Number.isNaN(dateMs)) {
+  const naive = trimmed.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)$/);
+  const asUtcMs = naive
+    ? Date.parse(`${naive[1]}T${naive[2]}Z`)
+    : Date.parse(trimmed);
+  if (!Number.isNaN(asUtcMs)) {
+    // The offset applies ONLY to a zone-less "YYYY-MM-DD HH:MM:SS"; a time that
+    // names its zone is already absolute.
+    const dateMs = naive ? asUtcMs - tzOffsetMs : asUtcMs;
     return Math.min(Math.max(Math.ceil((dateMs - Date.now()) / 1000), 1), 24 * 60 * 60);
   }
   const n = Number(trimmed);

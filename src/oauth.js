@@ -417,6 +417,13 @@ export async function fetchProviderUsage(account) {
     if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
     const data = await res.json();
     if (data?.code !== 200 || !data?.data) {
+      // HTTP 200 with a `success:false` body is a POSITIVE answer, not a transient
+      // probe failure: "当前用户不存在coding plan" (code 500 — the account has NO
+      // coding plan, measured 2026-11-08 on a cancelled plan) or an empty envelope.
+      // Returning it as `error` kept the TUI bars on "probing" forever while the
+      // row's real state — no plan to read — went unnamed.
+      const noPlan = data?.success === false || (data?.code != null && data.code !== 200 && !data?.data);
+      if (noPlan) return { noPlan: true, source: 'zai' };
       return { error: `bad_envelope${data?.code != null ? ' code=' + data.code : ''}` };
     }
     const now = Date.now();

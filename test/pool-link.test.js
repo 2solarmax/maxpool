@@ -324,6 +324,45 @@ test('per-account cloud rows: every remote account mirrored individually, no cre
   am.setPoolLinks([]);
 });
 
+test('request-shape refusal from the linked pool passes through: 429 + marker, mirror row NOT cooled', async () => {
+  // Chain: local proxy -> linked remote proxy -> Anthropic stub that refuses a
+  // non-Claude-Code Opus request (the 2026-11-08 shape refusal). The local side must
+  // hand the client the remote's answer and leave the mirror row available — cooling
+  // it would bench a healthy cloud account for real sessions.
+  const bare = JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Error' } });
+  const upstream = http.createServer((req, res) => { let b=''; req.on('data', c=>b+=c); req.on('end', () => {
+    const body = JSON.parse(b);
+    const cc = Array.isArray(body.system) && body.system.some(x => String(x?.text||'').startsWith('You are Claude Code'));
+    if (!/haiku/.test(body.model) && !cc) { res.writeHead(429, { 'content-type': 'application/json' }); res.end(bare); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  }); });
+  const upPort = await listen(upstream);
+  // A CLAUDE-type remote row so the remote's own shape check runs (provider rows skip it).
+  const remoteAm = new AccountManager([{ name: 'reports', type: 'apikey', apiKey: 'kr', accountUuid: 'R', upstream: `http://127.0.0.1:${upPort}` }], 0.9, { routingMode: 'balance' });
+  const remote = createProxyServer(remoteAm, { proxy: { clients: [{ name: 'max', key: 'mp-max' }] }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const rPort = await listen(remote);
+
+  const localAm = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1', upstream: 'http://127.0.0.1:1' }], 0.9, { routingMode: 'balance' });
+  const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${rPort}`, key: 'mp-max' });
+  link.lastOkAt = 1; link.lastError = null;
+  link.status = { accounts: [{ name: 'reports', type: 'oauth', accountUuid: 'R', enabled: true, status: 'active', inFlight: 0, quota: { unified7d: 0.1 } }] };
+  link.identities = remoteIdentities(link.status);
+  localAm.setPoolLinks([link]);
+  const local = createProxyServer(localAm, { proxy: { apiKey: 't' }, queue: { enabled: false } });
+  const lPort = await listen(local);
+  try {
+    const nonCC = JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 8, system: [{ type: 'text', text: 'You are a precise assistant.' }], messages: [{ role: 'user', content: 'hi' }] });
+    const res = await fetch(`http://127.0.0.1:${lPort}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't', 'x-maxpool-profile': 'claude', 'x-maxpool-pin-account': 'reports' }, body: nonCC });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('x-maxpool-request-shape-refused'), '1', 'the marker survived the link hop');
+    const mirror = localAm.accounts.find(a => a.remote && a.remote.remoteName === 'reports');
+    assert.ok(mirror, 'mirror row exists');
+    assert.ok(!mirror.cooldownUntil, 'mirror row was NOT cooled by the shape refusal');
+    assert.notEqual(mirror.status, 'throttled');
+  } finally { await close(local); await close(remote); await close(upstream); }
+});
+
 test('pin: remote serves a pinned request ONLY on the named account; pinned-unavailable is a fast 503 the caller fails over on', async () => {
   // Remote side: a real proxy with two GLM accounts, one rate-limited.
   const upstream = okUpstream();

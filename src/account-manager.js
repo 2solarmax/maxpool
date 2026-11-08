@@ -332,7 +332,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // drops until the next probe sweep re-learns it. The probe still rewrites it on
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
-  'providerQuotaSource', 'lastProbeOkAt',
+  'providerQuotaSource', 'lastProbeOkAt', 'noPlan',
 ];
 
 const PROVIDER_429_MIN_BENCH_SEC = 60;
@@ -3802,7 +3802,20 @@ export class AccountManager {
       if (usage.source === 'console-only') q.providerQuotaSource = 'console-only';
       return;
     }
+    if (usage.noPlan) {
+      // The key authenticates but the account HAS no plan (z.ai code 500 "no coding
+      // plan", e.g. cancelled/expired — measured 2026-11-08). That is a stable
+      // terminal state for the quota probe: show it in the row instead of "probing"
+      // forever, and stop treating the row as a quota unknown.
+      q.providerQuotaSource = 'zai';
+      q.noPlan = true;
+      q.providerSes = null; q.providerSesReset = null;
+      q.providerWk = null; q.providerWkReset = null;
+      q.lastProbeOkAt = Date.now();
+      return;
+    }
     q.providerQuotaSource = usage.source || 'zai';
+    q.noPlan = false; // a real reading means the plan exists (renewed / re-bought)
     if (usage.ses) {
       if (usage.ses.utilization != null) q.providerSes = clamp01(usage.ses.utilization);
       if (usage.ses.resetAt != null) {

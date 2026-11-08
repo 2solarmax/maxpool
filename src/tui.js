@@ -2631,6 +2631,12 @@ export class TUI {
       sesCell = emptyBar('n/a', bw);
       wkCell = emptyBar('n/a', bw);
       note = `  ${dim('console-only')}`;
+    } else if (q.noPlan) {
+      // z.ai answered: this key's account has no coding plan (cancelled/expired).
+      // Name it — "probing" here read as a pool fault for days (owner, 2026-11-08).
+      sesCell = emptyBar('no plan', bw);
+      wkCell = emptyBar('no plan', bw);
+      note = `  ${red('z.ai says no coding plan — check billing')}`;
     } else {
       sesCell = emptyBar('probing', bw);
       wkCell = emptyBar('probing', bw);
