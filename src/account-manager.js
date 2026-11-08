@@ -3183,9 +3183,9 @@ export class AccountManager {
     if (!requestInfo.sessionKey) return 0;
     if (this._sessionBinding(requestInfo.sessionKey)?.currentName !== account.name) return 0;
     const weeklyState = this._weeklyRawState(account);
-    // 'unknown' (weekly never probed yet) is neutral; every other non-normal tier
-    // (reserve/critical/exhausted/capped) releases the conversation.
-    if (weeklyState !== 'normal' && weeklyState !== 'unknown') return 0;
+    // Holds through 'soft' (≥65% weekly — most accounts by mid-week) and 'unknown'
+    // (never probed); reserve/critical/exhausted/capped release the conversation.
+    if (!['normal', 'soft', 'unknown'].includes(weeklyState)) return 0;
     // 5-hour window: Anthropic reports unified5h; GLM/Kimi report providerSes.
     const five = account.type === 'provider' ? account.quota?.providerSes : account.quota?.unified5h;
     if (five != null && five >= this.scheduler.weeklyReserveThreshold) return 0;

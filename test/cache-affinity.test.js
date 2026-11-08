@@ -123,3 +123,11 @@ test('prefer-claude mode: affinity applies too (scored mode)', () => {
   const first = acquire(m); release(first);
   assert.equal(m._cacheAffinity(first.account, { sessionKey: 'sess-x' }), 400);
 });
+
+test('affinity HOLDS in the soft weekly tier (65-85% — normal mid-week)', () => {
+  const m = am(2); am_ref = m;
+  const first = acquire(m); release(first);
+  first.account.quota.unified7d = 0.72; first.account.quota.unified7dReset = Date.now() + 3 * 86400_000;
+  assert.equal(m._weeklyRawState(first.account), 'soft', 'fixture is in the soft tier');
+  assert.equal(m._cacheAffinity(first.account, { sessionKey: 'sess-x' }), 400);
+});
