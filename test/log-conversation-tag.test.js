@@ -62,3 +62,21 @@ test('conversation hash is STABLE across turns (cache_control marker moves, cont
   assert.ok(turn1.conversationHash && turn1.conversationHash === turn2.conversationHash, `turn1==turn2 (${turn1.conversationHash} vs ${turn2.conversationHash})`);
   assert.equal(turn2.conversationHash, turn3.conversationHash, 'stable on every later turn');
 });
+
+test('conversation hash ignores the per-request billing header (live-traffic cause #2, 2026-11-08)', async () => {
+  const { __serverTest } = await import('../src/server.js');
+  const req = { method: 'POST', url: '/v1/messages' };
+  const body = (cch, prev) => Buffer.from(JSON.stringify({ model: 'claude-opus-5-5',
+    system: [
+      { type: 'text', text: `x-anthropic-billing-header: cc_version=2.1.314.3e7; cch=${cch}; cc_is_subagent=true; cc_prev_req=${prev}; cc_prompt_id=76a20dda;` },
+      { type: 'text', text: CC },
+    ],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'build X' }] }] }));
+  const t1 = __serverTest.describeRequest(req, body('e0527', 'req_011Cgqp9eavYPLre6M8Bighd'));
+  const t2 = __serverTest.describeRequest(req, body('39f9e', 'req_011DabcDEFghiJKLmnoPQRS'));
+  assert.equal(t1.conversationHash, t2.conversationHash, 'same conversation, different billing checksums → same id');
+  const other = __serverTest.describeRequest(req, Buffer.from(JSON.stringify({ model: 'claude-opus-5-5',
+    system: [{ type: 'text', text: `x-anthropic-billing-header: cch=39f9e;` }, { type: 'text', text: CC }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'DIFFERENT task' }] }] })));
+  assert.notEqual(t1.conversationHash, other.conversationHash, 'different first message still differs');
+});

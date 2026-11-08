@@ -3496,7 +3496,15 @@ function describeRequest(req, body) {
       // 1,360 tagged turns unique on 2026-11-08), which made the affinity inert and
       // the join useless. Strip cache_control (and any future positioning hints)
       // before hashing; identity = system text + first message CONTENT.
-      const stable = (v) => JSON.stringify(v, (k, val) => (k === 'cache_control' || k === '_pf') ? undefined : val);
+      // Positioning markers AND Claude Code's billing header both change per request:
+      // the first system block carries `x-anthropic-billing-header: … cch=<checksum>;
+      // cc_prev_req=<id>; …` whose values differ every turn (measured on live traffic
+      // 2026-11-08: identical 170,024-char systems differing only inside that header).
+      // Identity must come from CONTENT: drop cache_control/_pf keys and skip any
+      // system block that starts with x-anthropic-billing-header.
+      const stable = (v) => JSON.stringify(
+        Array.isArray(v) ? v.filter(b => !(b && typeof b === 'object' && String(b.text || '').startsWith('x-anthropic-billing-header'))) : v,
+        (k, val) => (k === 'cache_control' || k === '_pf') ? undefined : val);
       info.conversationHash = createHash('sha256')
         .update(stable(json.system ?? ''))
         .update('\u0000')
