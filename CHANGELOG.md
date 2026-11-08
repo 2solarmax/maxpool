@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.74] - 2026-11-08
+
+### Added
+
+- Size-scaled cache affinity (bigger conversations hold harder, 1x→3x by 450KB) + a per-move evidence log; flat 400 only cut re-writes 18.9%→14.8%
+
+### Changed
+
+- Pin the conversation-move evidence log
+
 ## [1.24.73] - 2026-11-08
 
 ### Added
