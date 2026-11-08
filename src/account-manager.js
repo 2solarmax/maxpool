@@ -179,6 +179,12 @@ const DEFAULT_SCHEDULER = {
   // accounts. So in-flight concurrency is the DOMINANT term, with a steep
   // per-account soft cap; burn-pace is only a soft de-preference (never a
   // bench); quota "use-it-or-lose-it" is intentionally a minor signal here.
+  // Cache-affinity discount (owner 2026-11-08, see _cacheAffinity): score points
+  // the last-used healthy Anthropic account sheds in balance mode. One weight unit
+  // in flight costs ~12 points past the per-account target and a typical Claude
+  // Code turn weighs 3-30 units, so 400 ≈ two large turns of extra depth tolerated
+  // before the conversation moves. 0 restores pure per-request balancing.
+  cacheAffinityBonus: 400,
   concurrencyWeight: 2,            // multiplies in-flight load (activeWeight+reqWeight) — dominant
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
@@ -3035,6 +3041,8 @@ export class AccountManager {
 
   _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
     const now = ctx?.now ?? Date.now();
+    // CACHE AFFINITY — see _cacheAffinity.
+    const affinity = this._cacheAffinity(account, requestInfo);
     const reqWeight = Math.max(1, requestInfo.weight || 1);
     // POOL LINK scores as the cloud's WORST-case load (owner 2026-10-29: "the team
     // pool will respect the accounts within it... included in the balancing act").
@@ -3146,7 +3154,37 @@ export class AccountManager {
     // default) learns the real number within a cycle. `probing`/requalify still
     // flags a never-seen account for learning — that path is unchanged.
 
-    return concurrency + capPenalty + paceCost + utilizationCost + scopedPace + spread + ramp + reserveCost + criticalCost + failurePenalty;
+    return Math.max(0, concurrency + capPenalty + paceCost + utilizationCost + scopedPace + spread + ramp + reserveCost + criticalCost + failurePenalty - affinity);
+  }
+
+  /**
+   * CACHE AFFINITY (owner 2026-11-08): Anthropic's prompt cache is PER ACCOUNT, so
+   * a conversation that hops accounts re-writes its whole prefix — 72% of all
+   * Anthropic cache writes over 24h were such re-writes (measured 2026-11-08). In
+   * balance mode the account this session used LAST sheds `cacheAffinityBonus`
+   * score points, so the conversation stays put unless there is a MAJOR reason to
+   * move ("stay unless a major preference or truly no other account" — owner):
+   *   - availability gates reject it (limit, exclusion, auth) → never rescued here;
+   *   - it is no longer healthy: weekly at/over the reserve tier, the 5h window at
+   *     or over the same mark, or a failure streak → affinity off, plain balancing;
+   *   - it carries roughly two more large requests than the best sibling (one
+   *     weight unit in flight costs ~12 points past the per-account target).
+   * Anthropic subscription rows only (local + cloud mirrors): GLM's cache already
+   * hits 98.6% under plain balancing and z.ai flags heavy single-key patterns.
+   * Sticky mode never reaches this (it returns the bound account before scoring).
+   */
+  _cacheAffinity(account, requestInfo = {}) {
+    const bonus = Number(this.scheduler.cacheAffinityBonus) || 0;
+    if (bonus <= 0 || this.scheduler.routingMode !== 'balance') return 0;
+    if (account.type !== 'oauth' || !requestInfo.sessionKey) return 0;
+    if (this._sessionBinding(requestInfo.sessionKey)?.currentName !== account.name) return 0;
+    const weeklyState = this._weeklyRawState(account);
+    if (weeklyState === 'unknown') return bonus; // never probed yet — plain balancing decides
+    if (weeklyState !== 'normal') return 0; // reserve/critical/exhausted/capped: no affinity
+    const five = account.quota?.unified5h;
+    if (five != null && five >= this.scheduler.weeklyReserveThreshold) return 0;
+    if ((account.consecutiveFailures || 0) > 0) return 0;
+    return bonus;
   }
 
   /**
