@@ -94,8 +94,12 @@ test('GLM rows get the same affinity, released by GLM\'s own 5-hour reading', ()
   const glm = m.accounts.find(a => a.type === 'provider');
   m._bindSession('sess-g', glm, 'claude-opus-5-5');
   assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 400, 'same rule as Anthropic');
-  glm.quota.providerSes = 0.87;
+  // The distinctive case: a GLM plan WITH a low weekly reading (used=weekly → 'normal')
+  // whose 5-HOUR window is near the wall — only the explicit providerSes gate releases.
+  glm.quota.providerWk = 0.2; glm.quota.providerSes = 0.87;
   assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 0, 'GLM near its 5h wall → released');
+  glm.quota.providerSes = 0.3;
+  assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 400, 'healthy again → holds');
 });
 
 test('affinity releases after a failure on the last-used account', () => {
