@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.76] - 2026-11-08
+
+### Fixed
+
+- Conversation hash was unstable across turns (cache_control marker moves per turn) — affinity was inert on ALL real traffic; 1,360/1,360 tagged turns had unique ids. Strip positioning markers before hashing.
+
 ## [1.24.75] - 2026-11-08
 
 ### Added
