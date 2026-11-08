@@ -918,12 +918,25 @@ async function forwardRequest(
         upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half', signal: linkCtl.signal });
       } finally { clearTimeout(linkTtfb); }
       ctx.status = upRes.status;
-      // The linked pool refused the request's SHAPE (not Claude Code) — the cloud
-      // account is healthy and every route would refuse it identically. Pass the
-      // answer through; cooling the mirror row would bench it for real sessions.
+      // The linked pool refused the request's SHAPE (not Claude Code). The cloud
+      // subscription accounts are healthy — exclude them (this mirror + every local
+      // oauth row) and fail over to routes that CAN serve the shape (apikey/provider);
+      // pass the refusal through only when none remains. (Red-team r2: answering
+      // outright starved the request of local routes when a mirror was picked first.)
       if (account.remote && upRes.status === 429 && upRes.headers.get(REQUEST_SHAPE_REFUSAL_HEADER) && !clientHasRealBytes(res, requestInfo)) {
         const errorText = await readErrorBody(upRes);
         finishLink({ status: 429, error: 'request_shape_refused', neutral: true });
+        excludedIndexes.add(account.index);
+        for (const a of accountManager.accounts) {
+          if (a.type === 'oauth') excludedIndexes.add(a.index);
+        }
+        if (
+          retryCount + 1 < maxAttempts
+          && !res.headersSent
+          && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
+        ) {
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+        }
         sendErrorBody(res, requestInfo, 429, errorText, upRes.headers);
         return;
       }
@@ -1138,12 +1151,12 @@ async function forwardRequest(
       // healthy, so benching it (60s) blocked every real session on it, and failing
       // over just collected the same refusal from every other account. Answer THIS
       // request and leave the account untouched.
-      if (account.type !== 'provider' && !/haiku/.test(String(requestInfo.model || '')) && isRequestShapeRefusal(rateLimitHeaders, errorBody, body)) {
-        // Anthropic ANSWERED (reachability proven) — this is not evidence the upstream
-        // is down, so it must confirm the shared-throttle recovery probe, not fail it
-        // (red-team 2026-11-08: a neutral release alone deferred the probe and could
-        // extend a fleet-wide pause while real traffic waited).
-        accountManager.confirmUpstreamProbe(lease);
+      if (account.type === 'oauth' && !/haiku/.test(String(requestInfo.model || '')) && isRequestShapeRefusal(rateLimitHeaders, errorBody, body)) {
+        // Anthropic answered, but a bare headerless "Error" 429 is also what a REAL
+        // fleet throttle looks like to this shape — evidence neither way. Hand the
+        // recovery probe back UNUSED: no deferral, no clearing; the very next request
+        // (often the apikey failover in this same chain) claims it (red-team r2).
+        accountManager.relinquishUpstreamProbe(lease);
         accountManager.releaseAccount(lease, { status: 429, error: 'request_shape_refused', neutral: true });
         console.log(`[Maxpool] 429 on "${account.name}" is a request-shape refusal (not Claude Code) — subscription accounts left active`);
         if (logDir) {
@@ -1167,7 +1180,7 @@ async function forwardRequest(
           if (logDir) writeRequestLog(logDir, reqId, logSections);
           return forwardRequest(
             req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-            retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, excludedIndexes,
+            retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
           );
         }
         if (logDir) writeRequestLog(logDir, reqId, logSections);

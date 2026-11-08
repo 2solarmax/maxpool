@@ -339,11 +339,19 @@ test('request-shape refusal from the linked pool passes through: 429 + marker, m
   }); });
   const upPort = await listen(upstream);
   // A CLAUDE-type remote row so the remote's own shape check runs (provider rows skip it).
-  const remoteAm = new AccountManager([{ name: 'reports', type: 'apikey', apiKey: 'kr', accountUuid: 'R', upstream: `http://127.0.0.1:${upPort}` }], 0.9, { routingMode: 'balance' });
+  const remoteAm = new AccountManager([{ name: 'reports', type: 'oauth', accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600_000, accountUuid: 'R', upstream: `http://127.0.0.1:${upPort}` }], 0.9, { routingMode: 'balance' });
   const remote = createProxyServer(remoteAm, { proxy: { clients: [{ name: 'max', key: 'mp-max' }] }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
   const rPort = await listen(remote);
 
-  const localAm = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1', upstream: 'http://127.0.0.1:1' }], 0.9, { routingMode: 'balance' });
+  // A local apikey route that CAN serve any shape (its own upstream) — after the mirror
+  // refuses the shape, the request must fail over HERE (red-team r2), not pass through.
+  const keyUp = http.createServer((req, res) => { req.resume(); req.on('end', () => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  }); });
+  const keyPort = await listen(keyUp);
+  const localAm = new AccountManager([{ name: 'local', type: 'apikey', apiKey: 'k1', upstream: `http://127.0.0.1:${keyPort}` }], 0.9, { routingMode: 'balance' });
+  localAm.accounts[0].enabled = false; // phase 1: no local route → the refusal passes through
   const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${rPort}`, key: 'mp-max' });
   link.lastOkAt = 1; link.lastError = null;
   link.status = { accounts: [{ name: 'reports', type: 'oauth', accountUuid: 'R', enabled: true, status: 'active', inFlight: 0, quota: { unified7d: 0.1 } }] };
@@ -360,7 +368,12 @@ test('request-shape refusal from the linked pool passes through: 429 + marker, m
     assert.ok(mirror, 'mirror row exists');
     assert.ok(!mirror.cooldownUntil, 'mirror row was NOT cooled by the shape refusal');
     assert.notEqual(mirror.status, 'throttled');
-  } finally { await close(local); await close(remote); await close(upstream); }
+    // Phase 2: a local apikey route exists → the same request is SERVED there.
+    localAm.accounts[0].enabled = true;
+    const res2 = await fetch(`http://127.0.0.1:${lPort}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't', 'x-maxpool-profile': 'claude', 'x-maxpool-pin-account': 'reports' }, body: nonCC });
+    assert.equal(res2.status, 200, 'failed over to the local apikey route');
+    assert.ok(!mirror.cooldownUntil, 'mirror still not cooled');
+  } finally { await close(local); await close(remote); await close(upstream); await close(keyUp); }
 });
 
 test('pin: remote serves a pinned request ONLY on the named account; pinned-unavailable is a fast 503 the caller fails over on', async () => {

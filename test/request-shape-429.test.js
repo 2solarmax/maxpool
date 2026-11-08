@@ -158,7 +158,9 @@ test('shape refusal confirms the shared-throttle recovery probe instead of faili
     body: JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 8, system: [{ type: 'text', text: 'You are a precise assistant.' }], messages: [{ role: 'user', content: 'hi' }] }) });
   assert.equal(res.status, 429);
   assert.equal(res.headers.get('x-maxpool-request-shape-refused'), '1');
-  assert.ok(!am.upstreamThrottle.until, 'reachability proven — the shared throttle must CLEAR, not defer');
+  assert.ok(am.upstreamThrottle.until, 'ambiguous evidence — the throttle stays armed');
+  assert.equal(am.upstreamThrottle.probeInFlight, false, 'but the probe is handed back, not deferred');
+  assert.ok(!am.upstreamThrottle.failedProbes, 'and no failed-probe strike was recorded');
   proxy.close(); up.close();
 });
 
