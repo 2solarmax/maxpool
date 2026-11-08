@@ -5,6 +5,23 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.72] - 2026-11-08
+
+### Added
+
+- Add Maxbar menu-bar app + whole-repo gitleaks secret scan
+
+### Changed
+
+- Fix 5 no-unused-vars in tests (pre-existing on main, blocking CI)
+- Close two mutation gaps (mirror-first failover, apikey never takes the shape path)
+
+### Fixed
+
+- Request-shape 429s no longer bench healthy accounts; z.ai reset parsing (UTC+8, bracketed id); 'no coding plan' named
+- Red-team round 1 — fail shape refusals over to non-subscription routes; confirm (not fail) the recovery probe; narrow noPlan; z.ai millis + bracket-tolerant next_flush_time; skip Haiku
+- Red-team r2 — mirror-entry shape refusals fail over to local routes; probe relinquished (ambiguous evidence); oauth-only + canQueueBufferedBody arg
+
 ## [1.24.71] - 2026-11-07
 
 ### Added
