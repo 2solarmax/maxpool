@@ -3171,16 +3171,19 @@ export class AccountManager {
    *     weight unit in flight costs ~12 points past the per-account target).
    * Anthropic subscription rows only (local + cloud mirrors): GLM's cache already
    * hits 98.6% under plain balancing and z.ai flags heavy single-key patterns.
-   * Sticky mode never reaches this (it returns the bound account before scoring).
+   * Applies in every scored mode (balance, prefer-*); never in sticky (see below).
    */
   _cacheAffinity(account, requestInfo = {}) {
     const bonus = Number(this.scheduler.cacheAffinityBonus) || 0;
-    if (bonus <= 0 || this.scheduler.routingMode !== 'balance') return 0;
+    // Sticky mode has its own binding; its score loop runs only once the session has
+    // decided to LEAVE a hot account — a discount there would pull it straight back.
+    if (bonus <= 0 || this.scheduler.routingMode === 'sticky') return 0;
     if (account.type !== 'oauth' || !requestInfo.sessionKey) return 0;
     if (this._sessionBinding(requestInfo.sessionKey)?.currentName !== account.name) return 0;
     const weeklyState = this._weeklyRawState(account);
-    if (weeklyState === 'unknown') return bonus; // never probed yet — plain balancing decides
-    if (weeklyState !== 'normal') return 0; // reserve/critical/exhausted/capped: no affinity
+    // 'unknown' (weekly never probed yet) is neutral; every other non-normal tier
+    // (reserve/critical/exhausted/capped) releases the conversation.
+    if (weeklyState !== 'normal' && weeklyState !== 'unknown') return 0;
     const five = account.quota?.unified5h;
     if (five != null && five >= this.scheduler.weeklyReserveThreshold) return 0;
     if ((account.consecutiveFailures || 0) > 0) return 0;

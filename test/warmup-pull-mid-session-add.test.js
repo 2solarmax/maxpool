@@ -73,7 +73,34 @@ test('W4.3 warmup-pull never lands a session on a provider, even under always po
   // DIRECTED non-provider warmup-pull keeps this off glm.
   const lease = am.acquireAccount(req({ sessionKey: 'sess1', requiresAnthropicThinkingIntegrity: true }));
   assert.notEqual(lease.account.type, 'provider', 'a signed-thinking session must never be shuttled onto a provider');
+  // 'always' maps to balance mode, where cache affinity (owner 2026-11-08) keeps a
+  // conversation on its healthy account: moving it would re-write its whole prompt
+  // cache. A freshly added account is onboarded by NEW conversations instead.
+  assert.equal(lease.account.name, 'a1', 'balance + cache affinity: the bound conversation stays put');
+});
+
+test('W4.3b with cache affinity off, balance mode still onboards the fresh NON-provider account', () => {
+  const am = manager(2);
+  am.scheduler.cacheAffinityBonus = 0;
+  makeCarrier(am, 0);
+  makeCarrier(am, 1);
+  am.setCrossProviderFallbackPolicy('always');
+  am.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
+  addFresh(am, 'fresh');
+  am._bindSession('sess1', am.accounts[0], 'claude-sonnet-5');
+  const lease = am.acquireAccount(req({ sessionKey: 'sess1', requiresAnthropicThinkingIntegrity: true }));
+  assert.notEqual(lease.account.type, 'provider');
   assert.equal(lease.account.name, 'fresh', 'it onboards the fresh NON-provider account');
+});
+
+test('W4.3c a NEW conversation (no binding) lands on the freshly added account under balance + affinity', () => {
+  const am = manager(2);
+  makeCarrier(am, 0);
+  makeCarrier(am, 1);
+  am.setCrossProviderFallbackPolicy('always');
+  addFresh(am, 'fresh');
+  const lease = am.acquireAccount(req({ sessionKey: 'brand-new' }));
+  assert.equal(lease.account.name, 'fresh', 'new work onboards the new account');
 });
 
 // ── Invariant 4 + 6: bounded / one-and-done — terminates, no flap ─────────────────

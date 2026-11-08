@@ -45,8 +45,19 @@ test('explicit routingMode wins over legacy policy', () => {
 
 // ── balance ───────────────────────────────────────────────────────────────────
 
-test('balance: one session spreads across multiple accounts', () => {
+test('balance: one session STAYS on its account by default (cache affinity, owner 2026-11-08)', () => {
   const am = makeFleet({ routingMode: 'balance' });
+  const c = {};
+  for (let i = 0; i < 9; i++) {
+    const l = am.acquireAccount({ profile: 'all', sessionKey: 'SAME' }, new Set());
+    c[l?.account?.name] = (c[l?.account?.name] || 0) + 1;
+    am.releaseAccount(l, { success: true });
+  }
+  assert.equal(Object.keys(c).length, 1, `one conversation must stay put: ${JSON.stringify(c)}`);
+});
+
+test('balance with cacheAffinityBonus 0: one session spreads across multiple accounts (pure balancing)', () => {
+  const am = makeFleet({ routingMode: 'balance', cacheAffinityBonus: 0 });
   const c = {};
   for (let i = 0; i < 9; i++) {
     const l = am.acquireAccount({ profile: 'all', sessionKey: 'SAME' }, new Set());

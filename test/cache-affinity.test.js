@@ -31,7 +31,7 @@ test('balance: a major load gap moves the session (two large turns of extra dept
   const sibling = m.accounts.find(a => a.name !== name1);
   sibling.activeWeight = 0; sibling.inFlight = 0;
   // ~3 large turns (weight 30 each ≈ 1080 score points) past the affinity bonus:
-  const next = acquire(m, 'sess-x', new Set(), { forceLoad: 100 });
+  const _next = acquire(m, "sess-x", new Set(), { forceLoad: 100 });
   first.account.activeWeight = 1200;
   const moved = acquire(m, 'sess-x');
   assert.notEqual(moved.account.name, name1, 'session moved off the heavily loaded account');
@@ -65,4 +65,55 @@ test('sticky mode: binding path unchanged (returns the bound account regardless 
   const second = acquire(m);
   assert.equal(second.account.name, name1);
   release(second);
+});
+
+test('affinity releases when the last-used account nears its 5-hour limit', () => {
+  const m = am(2); am_ref = m;
+  const first = acquire(m); const name1 = first.account.name; release(first);
+  first.account.quota.unified5h = 0.87; first.account.quota.unified5hReset = Date.now() + 3600_000;
+  first.account.activeWeight = 20; // modest extra load: affinity alone would have held it
+  const next = acquire(m);
+  assert.notEqual(next.account.name, name1, 'near the 5h wall → conversation moves');
+  release(next);
+});
+
+test('affinity releases when the last-used account is in its weekly reserve tier', () => {
+  const m = am(2); am_ref = m;
+  const first = acquire(m); const name1 = first.account.name; release(first);
+  first.account.quota.unified7d = 0.9; first.account.quota.unified7dReset = Date.now() + 3 * 86400_000;
+  m.accounts.find(a => a !== first.account).quota.unified7d = 0.1;
+  first.account.activeWeight = 20;
+  const next = acquire(m);
+  assert.notEqual(next.account.name, name1, 'weekly reserve → conversation moves');
+  release(next);
+});
+
+test('GLM/provider rows never get affinity', () => {
+  const m = am(1); am_ref = m;
+  m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
+  const glm = m.accounts.find(a => a.type === 'provider');
+  m._bindSession('sess-g', glm, 'claude-opus-5-5');
+  assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 0);
+});
+
+test('affinity releases after a failure on the last-used account', () => {
+  const m = am(2); am_ref = m;
+  const first = acquire(m); const name1 = first.account.name; release(first);
+  first.account.consecutiveFailures = 1; // failed recently, not cooling down
+  first.account.activeWeight = 20;
+  const next = acquire(m);
+  assert.notEqual(next.account.name, name1, 'a failing account loses its hold on the conversation');
+  release(next);
+});
+
+test('sticky mode: no affinity discount (its rebalance must be able to leave a hot account)', () => {
+  const m = am(2, { routingMode: 'sticky' }); am_ref = m;
+  const first = acquire(m); release(first);
+  assert.equal(m._cacheAffinity(first.account, { sessionKey: 'sess-x' }), 0);
+});
+
+test('prefer-claude mode: affinity applies too (scored mode)', () => {
+  const m = am(2, { routingMode: 'prefer-claude' }); am_ref = m;
+  const first = acquire(m); release(first);
+  assert.equal(m._cacheAffinity(first.account, { sessionKey: 'sess-x' }), 400);
 });
