@@ -190,3 +190,19 @@ test('fetchProviderUsage: only the no-coding-plan envelope is noPlan; other succ
     }
   } finally { globalThis.fetch = realFetch; }
 });
+
+test('an API-KEY account never takes the shape-refusal path (only subscription logins refuse on shape)', async () => {
+  const seen = [];
+  const up = anthropicStub(seen);
+  const upPort = await listen(up);
+  const mk = n => ({ name: n, type: 'apikey', apiKey: 'sk-x', accountUuid: `U-${n}`, upstream: `http://127.0.0.1:${upPort}` });
+  const am = new AccountManager([mk('k1')], 0.9, { routingMode: 'balance' });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 't' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const port = await listen(proxy);
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't' },
+    body: JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 8, system: [{ type: 'text', text: 'You are a precise assistant.' }], messages: [{ role: 'user', content: 'hi' }] }) });
+  await res.text();
+  assert.equal(res.headers.get('x-maxpool-request-shape-refused'), null, 'apikey 429 keeps the normal handling');
+  assert.equal(am.accounts[0].status, 'throttled', 'a real apikey 429 still benches as before');
+  proxy.close(); up.close();
+});

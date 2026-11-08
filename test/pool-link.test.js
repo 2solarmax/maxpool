@@ -330,10 +330,13 @@ test('request-shape refusal from the linked pool passes through: 429 + marker, m
   // hand the client the remote's answer and leave the mirror row available — cooling
   // it would bench a healthy cloud account for real sessions.
   const bare = JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Error' } });
+  let remoteHits = 0;
+  let enableLocalOnRefusal = null;
   const upstream = http.createServer((req, res) => { let b=''; req.on('data', c=>b+=c); req.on('end', () => {
+    remoteHits++;
     const body = JSON.parse(b);
     const cc = Array.isArray(body.system) && body.system.some(x => String(x?.text||'').startsWith('You are Claude Code'));
-    if (!/haiku/.test(body.model) && !cc) { res.writeHead(429, { 'content-type': 'application/json' }); res.end(bare); return; }
+    if (!/haiku/.test(body.model) && !cc) { enableLocalOnRefusal?.(); res.writeHead(429, { 'content-type': 'application/json' }); res.end(bare); return; }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
   }); });
@@ -368,10 +371,16 @@ test('request-shape refusal from the linked pool passes through: 429 + marker, m
     assert.ok(mirror, 'mirror row exists');
     assert.ok(!mirror.cooldownUntil, 'mirror row was NOT cooled by the shape refusal');
     assert.notEqual(mirror.status, 'throttled');
-    // Phase 2: a local apikey route exists → the same request is SERVED there.
-    localAm.accounts[0].enabled = true;
+    // Phase 2: a local apikey route exists → the same request is SERVED there. Load
+    // the local row so balancing picks the MIRROR first; the refusal must then fail
+    // over locally (the path under test), not reach the local row by first choice.
+    // Deterministic order: the local row stays OFF while routing picks the mirror and
+    // is switched ON by the cloud's upstream just before it answers with the refusal.
+    enableLocalOnRefusal = () => { localAm.accounts[0].enabled = true; };
+    const remoteHitsBefore = remoteHits;
     const res2 = await fetch(`http://127.0.0.1:${lPort}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't', 'x-maxpool-profile': 'claude', 'x-maxpool-pin-account': 'reports' }, body: nonCC });
     assert.equal(res2.status, 200, 'failed over to the local apikey route');
+    assert.ok(remoteHits > remoteHitsBefore, 'the mirror was tried first (the path under test ran)');
     assert.ok(!mirror.cooldownUntil, 'mirror still not cooled');
   } finally { await close(local); await close(remote); await close(upstream); await close(keyUp); }
 });
