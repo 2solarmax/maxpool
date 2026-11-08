@@ -5,6 +5,20 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.80] - 2026-11-08
+
+### Added
+
+- Hold a conversation on its account until it cannot serve; why= on move log
+
+### Changed
+
+- Hold-until-cannot-serve affinity + anti-dogpile cap (4fdc70b, 25f52f7)
+
+### Fixed
+
+- Cap the depth a cache-affinity hold can buy (anti-dogpile) + production-size spread tests
+
 ## [1.24.79] - 2026-11-08
 
 ### Fixed
