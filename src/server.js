@@ -3489,10 +3489,18 @@ function describeRequest(req, body) {
     // change within it (Claude Code relies on that for its own cache prefix), so a
     // short hash of those separates the main thread from each subagent.
     if (Array.isArray(json.messages) && json.messages.length) {
+      // CONVERSATION identity for cache affinity + the [cv] log tag. MUST be stable
+      // across turns of one conversation: Claude Code MOVES the cache_control marker
+      // every turn (turn 1: on messages[0]; later: stripped from [0], set on the
+      // newest message) — hashing it verbatim gave every turn a DIFFERENT id (all
+      // 1,360 tagged turns unique on 2026-11-08), which made the affinity inert and
+      // the join useless. Strip cache_control (and any future positioning hints)
+      // before hashing; identity = system text + first message CONTENT.
+      const stable = (v) => JSON.stringify(v, (k, val) => (k === 'cache_control' || k === '_pf') ? undefined : val);
       info.conversationHash = createHash('sha256')
-        .update(JSON.stringify(json.system ?? ''))
+        .update(stable(json.system ?? ''))
         .update('\u0000')
-        .update(JSON.stringify(json.messages[0] ?? ''))
+        .update(stable(json.messages[0] ?? ''))
         .digest('hex').slice(0, 16);
     }
     if (json.max_tokens && json.max_tokens > 16_000) weight += 1;

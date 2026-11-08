@@ -42,3 +42,23 @@ test('completion line names the account with [cv <hash> <sess>]', async () => {
     assert.match(line, /\[cv [0-9a-f]{8} term-abc\]/, 'short conversation hash + first 8 of session id');
   } finally { console.log = orig; proxy.close(); up.close(); }
 });
+
+test('conversation hash is STABLE across turns (cache_control marker moves, content identical)', async () => {
+  const { __serverTest } = await import('../src/server.js');
+  const req = { method: 'POST', url: '/v1/messages' };
+  const sys = [{ type: 'text', text: CC, cache_control: { type: 'ephemeral' } }];
+  const body = (msgs) => Buffer.from(JSON.stringify({ model: 'claude-opus-5-5', system: sys, messages: msgs }));
+  const turn1 = __serverTest.describeRequest(req, body([{ role: 'user', content: [{ type: 'text', text: 'build X', cache_control: { type: 'ephemeral' } }] }]));
+  const turn2 = __serverTest.describeRequest(req, body([
+    { role: 'user', content: [{ type: 'text', text: 'build X' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+    { role: 'user', content: [{ type: 'text', text: 'next', cache_control: { type: 'ephemeral' } }] }]));
+  const turn3 = __serverTest.describeRequest(req, body([
+    { role: 'user', content: [{ type: 'text', text: 'build X' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+    { role: 'user', content: [{ type: 'text', text: 'next' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+    { role: 'user', content: [{ type: 'text', text: 'again', cache_control: { type: 'ephemeral' } }] }]));
+  assert.ok(turn1.conversationHash && turn1.conversationHash === turn2.conversationHash, `turn1==turn2 (${turn1.conversationHash} vs ${turn2.conversationHash})`);
+  assert.equal(turn2.conversationHash, turn3.conversationHash, 'stable on every later turn');
+});
