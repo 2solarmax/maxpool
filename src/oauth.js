@@ -422,7 +422,7 @@ export async function fetchProviderUsage(account) {
       // coding plan, measured 2026-11-08 on a cancelled plan) or an empty envelope.
       // Returning it as `error` kept the TUI bars on "probing" forever while the
       // row's real state — no plan to read — went unnamed.
-      const noPlan = data?.success === false || (data?.code != null && data.code !== 200 && !data?.data);
+      const noPlan = data?.code === 500 && /coding plan/i.test(String(data?.msg || ''));
       if (noPlan) return { noPlan: true, source: 'zai' };
       return { error: `bad_envelope${data?.code != null ? ' code=' + data.code : ''}` };
     }

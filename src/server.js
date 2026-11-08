@@ -1138,14 +1138,39 @@ async function forwardRequest(
       // healthy, so benching it (60s) blocked every real session on it, and failing
       // over just collected the same refusal from every other account. Answer THIS
       // request and leave the account untouched.
-      if (account.type !== 'provider' && isRequestShapeRefusal(rateLimitHeaders, errorBody, body)) {
+      if (account.type !== 'provider' && !/haiku/.test(String(requestInfo.model || '')) && isRequestShapeRefusal(rateLimitHeaders, errorBody, body)) {
+        // Anthropic ANSWERED (reachability proven) — this is not evidence the upstream
+        // is down, so it must confirm the shared-throttle recovery probe, not fail it
+        // (red-team 2026-11-08: a neutral release alone deferred the probe and could
+        // extend a fleet-wide pause while real traffic waited).
+        accountManager.confirmUpstreamProbe(lease);
         accountManager.releaseAccount(lease, { status: 429, error: 'request_shape_refused', neutral: true });
-        console.log(`[Maxpool] 429 on "${account.name}" is a request-shape refusal (not Claude Code) — account left active, not failing over`);
+        console.log(`[Maxpool] 429 on "${account.name}" is a request-shape refusal (not Claude Code) — subscription accounts left active`);
         if (logDir) {
-          logSections.push(`=== RESPONSE 429 — "${account.name}" refused request shape (account untouched) ===\n${formatHeaders(upstreamRes.headers)}`);
+          logSections.push(`=== RESPONSE 429 — "${account.name}" refused request shape (subscription accounts untouched) ===\n${formatHeaders(upstreamRes.headers)}`);
           if (errorBody) logSections.push(`=== ERROR BODY ===\n${errorBody}`);
-          writeRequestLog(logDir, reqId, logSections);
         }
+        // Only SUBSCRIPTION logins refuse this shape. API-key and provider rows can
+        // still serve it — exclude every subscription-shaped account (local oauth rows
+        // and their cloud mirrors) and fail over if such a route remains (red-team
+        // 2026-11-08: answering outright starved a request GLM would have served).
+        excludedIndexes.add(account.index);
+        for (const a of accountManager.accounts) {
+          if (a.type === 'oauth') excludedIndexes.add(a.index); // local logins AND their cloud mirrors
+        }
+        if (
+          canRetryBufferedBody
+          && retryCount + 1 < maxAttempts
+          && !res.headersSent
+          && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
+        ) {
+          if (logDir) writeRequestLog(logDir, reqId, logSections);
+          return forwardRequest(
+            req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, excludedIndexes,
+          );
+        }
+        if (logDir) writeRequestLog(logDir, reqId, logSections);
         ctx.status = 429;
         sendErrorResponse(res, requestInfo, 429, {
           type: 'error',
@@ -2421,7 +2446,7 @@ function parseProviderRetryAfter(body, provider) {
     // an anchor to end-of-string never matches and the parsed time became garbage.
     // Capture the time inside ITS bracket and hand only that to the time parser.
     const resetMatch = message.match(/reset at\s+`?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)`?/i)
-      || message.match(/next_flush_time[:\s]+`?([^`\n]+?)`?$/i);
+      || message.match(/next_flush_time[:\s]+`?([^`\]\n]+?)`?(?:\]|$)/i);
     const resetSeconds = secondsUntilParsedTime(resetMatch?.[1], { tzOffsetMs: ZAI_TZ_OFFSET_MS });
     if (resetSeconds) return resetSeconds;
 
@@ -2588,7 +2613,7 @@ const ZAI_TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
 function secondsUntilParsedTime(value, { tzOffsetMs = 0 } = {}) {
   if (!value) return null;
   const trimmed = String(value).trim();
-  const naive = trimmed.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)$/);
+  const naive = trimmed.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)$/);
   const asUtcMs = naive
     ? Date.parse(`${naive[1]}T${naive[2]}Z`)
     : Date.parse(trimmed);

@@ -41,28 +41,36 @@ async function rig(mode) {
   const seen = [];
   const up = anthropicStub(seen, mode);
   const upPort = await listen(up);
-  const mk = n => ({ name: n, type: 'apikey', apiKey: 'sk-ant-x', accountUuid: `U-${n}`, upstream: `http://127.0.0.1:${upPort}` });
-  const am = new AccountManager([mk('a1'), mk('a2')], 0.9, { routingMode: 'balance' });
+  // oauth rows = subscription logins (refuse the shape). The apikey row sits on its
+  // OWN upstream that serves any shape — API keys are not subscription logins.
+  const keyUp = http.createServer((req, res) => { let b=''; req.on('data', c=>b+=c); req.on('end', () => {
+    seen.push(JSON.parse(b));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'msg_key', type: 'message', role: 'assistant', model: 'claude-opus-5-5',
+      content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }));
+  }); });
+  const keyPort = await listen(keyUp);
+  const mk = (n, port) => ({ name: n, type: n.startsWith('oauth') ? 'oauth' : 'apikey', apiKey: 'sk-ant-x', accountUuid: `U-${n}`, upstream: `http://127.0.0.1:${port}` });
+  const am = new AccountManager([mk('oauth-a1', upPort), mk('oauth-a2', upPort), mk('key-a3', keyPort)], 0.9, { routingMode: 'balance' });
   const proxy = createProxyServer(am, { proxy: { apiKey: 't' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
   const port = await listen(proxy);
   const post = (model, system) => fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't' },
     body: JSON.stringify({ model, max_tokens: 8, ...(system ? { system } : {}), messages: [{ role: 'user', content: 'hi' }] }),
   });
-  return { seen, am, post, close: () => { proxy.close(); up.close(); } };
+  return { seen, am, post, close: () => { proxy.close(); up.close(); keyUp.close(); } };
 }
 
 test('non-Claude-Code Opus request: answered with the refusal, ONE upstream call, accounts untouched', async () => {
   const r = await rig();
   const res = await r.post('claude-opus-5-5', [{ type: 'text', text: 'You are a precise assistant.' }]);
-  assert.equal(res.status, 429);
-  assert.equal(res.headers.get('x-maxpool-request-shape-refused'), '1');
-  assert.match((await res.json()).error.message, /only to Claude Code requests/);
-  assert.equal(r.seen.length, 1, 'no failover: every account would refuse the same shape');
-  for (const a of r.am.accounts) {
+  // The apikey row CAN serve this shape → served, not refused (red-team fix 1).
+  assert.equal(res.status, 200);
+  for (const a of r.am.accounts.filter(x => x.type === 'oauth')) {
     assert.notEqual(a.status, 'throttled', `${a.name} must not be benched`);
     assert.ok(!a.rateLimitedUntil, `${a.name} carries no rate-limit window`);
   }
+  assert.ok(r.seen.length >= 2, 'failover ran to the apikey route');
   // The very next real Claude Code request is served — nothing was benched.
   const ok = await r.post('claude-opus-5-5', [{ type: 'text', text: CC_ID }]);
   assert.equal(ok.status, 200);
@@ -89,6 +97,7 @@ test('refusal predicate needs all three: no quota headers, bare body, non-CC req
   assert.equal(isRequestShapeRefusal({}, BARE_429, cc), false, 'identity line in an early block counts');
   assert.equal(looksLikeClaudeCode(Buffer.from('not json')), true, 'unparseable → never a refusal');
   assert.equal(looksLikeClaudeCode(Buffer.from(JSON.stringify({ system: "You are a Claude agent, built on Anthropic's Claude Agent SDK." }))), true);
+  assert.equal(looksLikeClaudeCode(Buffer.from(JSON.stringify({ system: "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK." }))), true);
 });
 
 test('z.ai reset time: bracketed request id no longer breaks the parse; time is UTC+8', () => {
@@ -115,4 +124,67 @@ test('z.ai "no coding plan" is a named state, not an endless probe', async () =>
   // A real reading later (plan re-bought) clears it.
   am.applyProviderUsage(0, { ses: { utilization: 0.2, resetAt: Date.now() + 3600_000 }, source: 'zai' });
   assert.equal(am.accounts[0].quota.noPlan, false);
+});
+
+test('shape refusal with no apikey/provider route: answered once, no bench, no loop', async () => {
+  const seen = [];
+  const up = anthropicStub(seen);
+  const upPort = await listen(up);
+  const mk = n => ({ name: n, type: 'oauth', apiKey: 'sk-x', accountUuid: `U-${n}`, upstream: `http://127.0.0.1:${upPort}` });
+  const am = new AccountManager([mk('o1'), mk('o2')], 0.9, { routingMode: 'balance' });
+  const proxy = createProxyServer(am, { proxy: { apiKey: 't' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const port = await listen(proxy);
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't' },
+    body: JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 8, system: [{ type: 'text', text: 'You are a precise assistant.' }], messages: [{ role: 'user', content: 'hi' }] }) });
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get('x-maxpool-request-shape-refused'), '1');
+  assert.equal(seen.length, 1, 'ONE upstream call: both oauth accounts excluded after the first refusal');
+  assert.ok(am.accounts.every(a => a.status !== 'throttled' && !a.rateLimitedUntil));
+  proxy.close(); up.close();
+});
+
+test('shape refusal confirms the shared-throttle recovery probe instead of failing it', async () => {
+  const seen = [];
+  const up = anthropicStub(seen);
+  const upPort = await listen(up);
+  const mk = n => ({ name: n, type: 'oauth', apiKey: 'sk-x', accountUuid: `U-${n}`, upstream: `http://127.0.0.1:${upPort}` });
+  const am = new AccountManager([mk('o1'), mk('o2')], 0.9, { routingMode: 'balance' });
+  am.markUpstreamThrottled(300, 'test_throttle');
+  assert.ok(am.upstreamThrottle.until, 'throttle armed');
+  am.upstreamThrottle.until = Date.now() - 1; // window expired: the next request claims the recovery probe
+  const proxy = createProxyServer(am, { proxy: { apiKey: 't' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const port = await listen(proxy);
+  const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 't' },
+    body: JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 8, system: [{ type: 'text', text: 'You are a precise assistant.' }], messages: [{ role: 'user', content: 'hi' }] }) });
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get('x-maxpool-request-shape-refused'), '1');
+  assert.ok(!am.upstreamThrottle.until, 'reachability proven — the shared throttle must CLEAR, not defer');
+  proxy.close(); up.close();
+});
+
+test('z.ai noPlan matches ONLY the no-coding-plan envelope', async () => {
+  const am = new AccountManager([{ name: 'glm p', type: 'provider', provider: 'zai', authToken: 'k', upstream: 'http://glm' }], 0.9, {});
+  am.applyProviderUsage(0, { error: 'bad_envelope code=500' }); // transient — not noPlan
+  assert.equal(am.accounts[0].quota.noPlan, undefined);
+});
+
+/* global Response */
+test('fetchProviderUsage: only the no-coding-plan envelope is noPlan; other success:false envelopes stay transient errors', async () => {
+  const { fetchProviderUsage } = await import('../src/oauth.js');
+  const realFetch = globalThis.fetch;
+  const answer = body => async () => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  const acct = { provider: 'zai', credential: 'k' };
+  try {
+    globalThis.fetch = answer({ code: 500, msg: '当前用户不存在coding plan', success: false });
+    assert.deepEqual(await fetchProviderUsage(acct), { noPlan: true, source: 'zai' });
+    for (const other of [
+      { code: 401, msg: 'token expired', success: false },
+      { code: 500, msg: 'system busy, please retry', success: false },
+      { code: 1302, msg: 'rate limited', success: false },
+    ]) {
+      globalThis.fetch = answer(other);
+      const r = await fetchProviderUsage(acct);
+      assert.ok(r.error && !r.noPlan, `${other.msg} must stay a transient error`);
+    }
+  } finally { globalThis.fetch = realFetch; }
 });
