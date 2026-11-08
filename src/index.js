@@ -1005,7 +1005,7 @@ async function serverWorkerCommand() {
         // Headless (service / shared VM) pools have no TUI log buffer, so named-caller
         // attribution would otherwise reach no log at all. Only named callers are
         // logged here — a solo headless pool stays as quiet as before.
-        appendEventLog(`[Maxpool] ${info.caller} · ${info.method} ${info.path} → ${info.account || '?'} (${info.status})`);
+        appendEventLog(`[Maxpool] ${info.caller} · ${info.method} ${info.path} → ${info.account || '?'} (${info.status})${info.conversation ? `  [cv ${info.conversation.slice(0, 8)}]` : ''}`);
       }
     },
   };

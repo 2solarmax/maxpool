@@ -562,7 +562,7 @@ export class TUI {
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
-    this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null, caller: info.caller || null });
+    this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null, caller: info.caller || null, conversation: info.conversation || null });
     this.render();
   }
 
@@ -585,8 +585,15 @@ export class TUI {
     // then `ps eww -p <pid> | grep x-maxpool-session` to find the terminal. Truthiness
     // guard — a header-less request has sessionKey '' (server.js headerValue) → no tag.
     const isProvider = this.am.accounts.find(a => a.name === acct)?.type === 'provider';
-    const tag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
-    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${tag}`);
+    // Turn tags (2026-11-08): [sess <terminal>] on provider rows (unchanged), and
+    // [cv <conversation> <terminal>] on every row — the exact join a cache analysis
+    // needs between a transcript turn and the ACCOUNT that served it (previously
+    // only a timestamp window, too noisy to separate an account switch from cache
+    // expiry; peer audit 2026-11-08). Short: log stays scannable.
+    const provTag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
+    const cv = info.conversation || r?.conversation;
+    const cvTag = cv ? `  [cv ${cv.slice(0, 8)} ${String(info.sessionKey || r?.sessionKey || '').slice(0, 8)}]` : '';
+    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${provTag}${cvTag}`);
   }
 
   _addLog(msg) {

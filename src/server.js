@@ -544,6 +544,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           method: req.method, path: req.url,
           account: ctx.account, status: ctx.status,
           caller: req.callerName || null,
+          // Join keys for cache analysis (2026-11-08): which conversation each turn
+          // belonged to, so a turn's account is exact instead of a timestamp guess.
+          conversation: requestInfo?.conversationHash || null,
+          sessionKey: headerValue(req.headers, 'x-maxpool-session') || null,
         });
       }
     } catch (err) {
