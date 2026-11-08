@@ -112,7 +112,7 @@ test('HOLD: GLM weekly-less plan tiers on its 5h reading — held at 0.90, relea
   m._noteConversationAccount({ sessionKey: 'sess-g' }, glm);
   glm.quota.providerSes = 0.9;
   assert.equal(m._weeklyRawState(glm), 'reserve', 'the exact state the old 0.85 gate released');
-  assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 400, '0.90 → held');
+  assert.ok(m._cacheAffinity(glm, { sessionKey: 'sess-g' }) > 0, '0.90 → held (reserve tier: tighter-capped, 320)');
   glm.quota.providerSes = 0.96; // weekly ladder says critical (≥0.95), no unlock → cannot serve in pass 1
   assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 0, '0.96 → released');
   // Plan WITH a weekly window: only the 5h wall gate decides.
@@ -167,7 +167,7 @@ test('RELEASE: an unlocked critical account KEEPS the hold (unlock threads into 
   first.account.quota.unified7d = 0.96; first.account.quota.unified7dReset = FAR();
   const orig = m._criticalUnlock.bind(m);
   m._criticalUnlock = (a) => (a === first.account ? { reason: 'prereset', etaMs: 30 * 60_000 } : orig(a));
-  assert.equal(m._cacheAffinity(first.account, { sessionKey: 'sess-x' }, { reason: 'prereset' }), 400,
+  assert.ok(m._cacheAffinity(first.account, { sessionKey: 'sess-x' }, { reason: 'prereset' }) > 0,
     'with the situational unlock the account is servable, so the hold is live');
   const next = acquire(m);
   assert.equal(next.account.name, name1, 'unlocked critical holds the conversation (cheapest: criticalDrain cost)');
@@ -388,14 +388,138 @@ test('conversation hash: stable across turns, distinct per conversation (main vs
   assert.notEqual(t1.conversationHash, sub.conversationHash, 'a subagent is its own conversation');
 });
 
-test('bonus scales with conversation size: a 500K-token conversation holds harder than a small one', () => {
+test('bonus scales with conversation size but is CAPPED at cacheAffinityMaxExtraDepth units (anti-dogpile)', () => {
   const m = am(2); am_ref = m;
   const first = m.acquireAccount({ sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 20_000 });
-  const home = first.account.name; m.releaseAccount(first, { status: 200, success: true });
-  const small = m._cacheAffinity(m.accounts.find(a => a.name === home), { sessionKey: 's', affinityKey: 's:h', bodyBytes: 20_000 });
-  const big = m._cacheAffinity(m.accounts.find(a => a.name === home), { sessionKey: 's', affinityKey: 's:h', bodyBytes: 500_000 });
-  assert.equal(small, 400, 'small conversation: base bonus');
-  assert.equal(big, 1200, '500K conversation: 3x cap');
+  const a = first.account; m.releaseAccount(first, { status: 200, success: true });
+  const at = (bodyBytes) => m._cacheAffinity(a, { sessionKey: 's', affinityKey: 's:h', bodyBytes });
+  assert.equal(at(20_000), 400, 'small conversation: base bonus');
+  assert.equal(at(500_000), 480, '500K conversation: size would give 1200, cap = 40 units x 12 points = 480');
+  assert.equal(at(450_000), 480);
+  m.scheduler.cacheAffinityMaxExtraDepth = 100;
+  assert.equal(at(500_000), 1200, 'raising the cap restores the 3x size scaling (the cap, not the multiplier, is binding)');
+  m.scheduler.cacheAffinityMaxExtraDepth = 0;
+  assert.equal(at(20_000), 0, 'cap 0 = the hold buys no depth at all');
+});
+
+test('cap is priced per row: a discounted GLM row buys the same DEPTH (units), fewer points', () => {
+  const m = am(1); am_ref = m;
+  const a = m.accounts[0];
+  m._noteConversationAccount({ sessionKey: 's' }, a);
+  const orig = m._fastRefillMultiplier.bind(m);
+  m._fastRefillMultiplier = () => 0.4;
+  const unit = 2 * 0.4 + 10 * 0.4;
+  assert.ok(Math.abs(m._cacheAffinity(a, { sessionKey: 's', bodyBytes: 500_000 }) - 40 * unit) < 1e-9);
+  m._fastRefillMultiplier = orig;
+});
+
+test('cap is tighter for a reserve-tier account (reserve/perAccount concurrency-target ratio)', () => {
+  const m = am(2); am_ref = m;
+  const first = acquire(m); release(first);
+  const a = first.account;
+  const ri = { sessionKey: 'sess-x', bodyBytes: 500_000 };
+  assert.equal(m._cacheAffinity(a, ri), 480);
+  a.quota.unified7d = 0.9; a.quota.unified7dReset = FAR();
+  assert.equal(m._weeklyRawState(a), 'reserve');
+  assert.ok(Math.abs(m._cacheAffinity(a, ri) - 480 * (2 / 3)) < 1e-9, 'reserve: 40 x 2/3 units x 12');
+});
+
+test('cap is tighter for an UNLOCKED critical account too (lowest-headroom tier)', () => {
+  const m = am(2); am_ref = m;
+  const first = acquire(m); release(first);
+  const a = first.account;
+  a.quota.unified7d = 0.96; a.quota.unified7dReset = FAR();
+  const ri = { sessionKey: 'sess-x', bodyBytes: 500_000 };
+  assert.ok(Math.abs(m._cacheAffinity(a, ri, { reason: 'prereset' }) - 480 * (2 / 3)) < 1e-9);
+});
+
+// ── anti-dogpile: parallel conversations must SPREAD at production body sizes ──
+// The first red-team pass found the spread test only passed at bodyBytes ~0 (sizeMult 1);
+// at 450KB the unbounded 3x bonus stacked 11 conversations on one account at depth 110.
+const SIZES = [0, 20_000, 450_000, 500_000];
+const TURN = 10; // weight of a ~450-500KB Claude Code turn (ceil(bytes/64KB) + thinking/max_tokens)
+const fleet = (n, opts = {}) => new AccountManager(
+  Array.from({ length: n }, (_, i) => acct(`a${i + 1}`)), 0.9, { routingMode: 'balance', ...opts });
+const dist = (leases) => leases.reduce((o, l) => { o[l.account.name] = (o[l.account.name] || 0) + 1; return o; }, {});
+
+for (const bytes of SIZES) {
+  test(`SPREAD @${bytes}B: 20 conversations bound to one account fan out; its depth stays within cap of the shallowest sibling`, () => {
+    const m = fleet(8); am_ref = m;
+    const home = m.accounts[0];
+    const keys = Array.from({ length: 20 }, (_, i) => `term-1:C${i}`);
+    keys.forEach(k => m._noteConversationAccount({ affinityKey: k }, home));
+    const leases = keys.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes }));
+    const per = dist(leases);
+    const shallowest = Math.min(...m.accounts.slice(1).map(a => a.activeWeight));
+    const bound = m.scheduler.cacheAffinityMaxExtraDepth + TURN;
+    assert.ok(home.activeWeight - shallowest <= bound, `bound a1 depth ${home.activeWeight} vs shallowest sibling ${shallowest} (allowed gap ${bound}): ${JSON.stringify(per)}`);
+    assert.ok(per.a1 <= 7, `no stacking: ${JSON.stringify(per)}`);
+    assert.equal(Object.keys(per).length, 8, `every account takes load: ${JSON.stringify(per)}`);
+    // absolute ceiling: 7 turns even though 450K bonus used to allow 11+ at depth 110
+    assert.ok(home.activeWeight <= 70, `a1 depth ${home.activeWeight}`);
+    leases.forEach(release);
+  });
+
+  test(`SPREAD @${bytes}B: a RESERVE-tier home (weekly 0.90) is no deeper than the same bound`, () => {
+    const m = fleet(8); am_ref = m;
+    const home = m.accounts[0];
+    home.quota.unified7d = 0.9; home.quota.unified7dReset = FAR();
+    const keys = Array.from({ length: 20 }, (_, i) => `term-1:C${i}`);
+    keys.forEach(k => m._noteConversationAccount({ affinityKey: k }, home));
+    const leases = keys.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes }));
+    const shallowest = Math.min(...m.accounts.slice(1).map(a => a.activeWeight));
+    const reserveCap = m.scheduler.cacheAffinityMaxExtraDepth * (m.scheduler.reserveConcurrencyTarget / m.scheduler.perAccountConcurrencyTarget);
+    assert.ok(home.activeWeight - shallowest <= reserveCap + TURN, `reserve home ${home.activeWeight} vs shallowest ${shallowest}: ${JSON.stringify(dist(leases))}`);
+    assert.ok(dist(leases).a1 <= 6);
+    leases.forEach(release);
+  });
+
+  test(`SPREAD @${bytes}B: NEW parallel conversations never stack on a busy bound account`, () => {
+    const m = fleet(4); am_ref = m;
+    const home = m.accounts[0];
+    const bound = Array.from({ length: 6 }, (_, i) => `term-1:B${i}`);
+    bound.forEach(k => m._noteConversationAccount({ affinityKey: k }, home));
+    const held = bound.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes }));
+    const fresh = Array.from({ length: 12 }, (_, i) => m.acquireAccount({ sessionKey: 'term-1', affinityKey: `term-1:N${i}`, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes }));
+    const depths = m.accounts.map(a => a.activeWeight);
+    assert.ok(Math.max(...depths) - Math.min(...depths) <= m.scheduler.cacheAffinityMaxExtraDepth + TURN,
+      `fleet depth spread bounded: ${depths}`);
+    assert.ok(fresh.filter(l => l.account.name === 'a1').length <= 3, `new work avoids the busy bound account: ${JSON.stringify(dist(fresh))}`);
+    [...held, ...fresh].forEach(release);
+  });
+
+  test(`LOAD GAP @${bytes}B: depth from OTHER conversations still moves a bound conversation`, () => {
+    const m = fleet(3); am_ref = m;
+    const req = { sessionKey: 'sess-x', affinityKey: 'sess-x:H', model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes };
+    const first = m.acquireAccount(req); const name1 = first.account.name; release(first);
+    const others = [];
+    for (let i = 0; i < 8; i++) {
+      others.push(m.acquireAccount({ sessionKey: 'sess-x', affinityKey: `sess-x:O${i}`, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes },
+        new Set(m.accounts.filter(a => a.name !== name1).map(a => a.index))));
+    }
+    assert.ok(first.account.activeWeight >= 80);
+    const moved = m.acquireAccount(req);
+    assert.notEqual(moved.account.name, name1, 'cap-bounded hold lets go of a deep account');
+    release(moved); others.forEach(release);
+  });
+}
+
+// ── production settings (switchThreshold 0.90): the Claude 5h hold ──────────────
+test('PROD SETTINGS (switchThreshold 0.90): Claude 5h at 0.88 is still a candidate and HOLDS; at 0.91 it is benched and the conversation moves', () => {
+  const m = am(2); am_ref = m; // am() = 0.90, the production constant
+  assert.equal(m.switchThreshold, 0.9);
+  const first = acquire(m); const name1 = first.account.name; release(first);
+  first.account.quota.unified5hReset = Date.now() + 3600_000;
+  first.account.quota.unified5h = 0.88;
+  first.account.activeWeight = 20;
+  assert.equal(m._isAvailable(first.account, { allowWeeklyReserve: true, model: 'claude-opus-5-5' }), true);
+  const held = acquire(m);
+  assert.equal(held.account.name, name1, '0.85-0.90 range: bench does not fire, hold survives (old rule moved at 0.85)');
+  release(held);
+  first.account.quota.unified5h = 0.91;
+  assert.equal(m._isAvailable(first.account, { allowWeeklyReserve: true, model: 'claude-opus-5-5' }), false, 'benched at the real 0.90');
+  const logs = captureLogs(() => { const l = acquire(m); assert.notEqual(l.account.name, name1); release(l); });
+  assert.ok(logs.some(l => /why=released:unavailable\(5h-wall\)/.test(l)), logs.join(' | '));
 });
 
 test('conversation-move evidence log: fires once when a known conversation changes account', async () => {

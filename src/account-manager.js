@@ -183,9 +183,24 @@ const DEFAULT_SCHEDULER = {
   // a conversation's last-used healthy account sheds (every mode except sticky).
   // On an undiscounted row one in-flight weight unit costs ~12 points past the
   // per-account target (the bonus is rescaled per row so discounted rows match),
-  // and a Claude Code turn weighs 3-30 units: 400 ≈ 33 units, about two large
-  // turns of extra depth before the conversation moves. 0 = pure per-request.
+  // and a Claude Code turn weighs 3-30 units: 400 ≈ 33 units of extra depth before
+  // the conversation moves. It scales up with conversation size (to 3x) but is then
+  // CAPPED at cacheAffinityMaxExtraDepth below (40 units ≈ 480 points), so the
+  // effective bonus is 400-480 whatever the size. 0 = pure per-request.
   cacheAffinityBonus: 400,
+  // ANTI-DOGPILE CAP on what the hold may buy (owner hard rule 2026-11-08: many parallel
+  // sessions must SPREAD; a hold must never stack conversations on one account until it
+  // throttles). The size-scaled bonus above reaches 3x (1200 points ≈ 100 weight units ≈
+  // 11 big turns) for a 450KB+ conversation — measured: 11 bound 450KB conversations on
+  // one account, depth 110 (old code with the account in weekly reserve: 2, depth 30).
+  // This is the most EXTRA depth, in weight units past the account's concurrency target
+  // (perAccountConcurrencyTarget, or the tighter reserveConcurrencyTarget for reserve /
+  // unlocked-critical), that a hold can ever tolerate on ANY account: 40 ≈ 4 turns of a
+  // ~450KB conversation (weight ~10). Priced per row at that row's own unit cost, so a
+  // discounted GLM row gets the same DEPTH. Hard bound on a held account's in-flight depth
+  // = concTarget + this + one request's weight, whatever the body size or bonus. A reserve /
+  // unlocked-critical row's hold is scaled by reserveConcurrencyTarget/perAccountConcurrencyTarget.
+  cacheAffinityMaxExtraDepth: 40,
   // HOLD-UNTIL-CANNOT-SERVE (owner 2026-11-08): a bound conversation leaves its last
   // account only when that account truly cannot serve it. A re-store costs the same
   // whether the conversation leaves at 85% or at the wall, so leaving early buys
@@ -3327,7 +3342,19 @@ export class AccountManager {
       ? this._fastRefillMultiplier(account, { capFloor: true }) : refillMult;
     const unit = this.scheduler.concurrencyWeight * refillMult + this.scheduler.capPenaltyWeight * safetyMult;
     const fullUnit = this.scheduler.concurrencyWeight + this.scheduler.capPenaltyWeight;
-    return base * sizeMult * Math.min(1, unit / fullUnit);
+    const bonus = base * sizeMult * Math.min(1, unit / fullUnit);
+    // Anti-dogpile cap: never tolerate more than cacheAffinityMaxExtraDepth units of
+    // extra depth at THIS row's unit price, however large the conversation or bonus.
+    let maxExtra = Number(this.scheduler.cacheAffinityMaxExtraDepth);
+    if (!Number.isFinite(maxExtra) || maxExtra < 0) return bonus;
+    // A reserve (or unlocked-critical) account has the TIGHTER concurrency target; its
+    // hold gets the same tightening so the hold never stretches the lowest-headroom tier
+    // as far as a healthy one (reserveConcurrencyTarget / perAccountConcurrencyTarget).
+    const wk = this._weeklyRawState(account);
+    if (wk === 'reserve' || (wk === 'critical' && criticalUnlock)) {
+      maxExtra *= Math.min(1, this.scheduler.reserveConcurrencyTarget / Math.max(1, this.scheduler.perAccountConcurrencyTarget));
+    }
+    return Math.min(bonus, maxExtra * unit);
   }
 
   /**
