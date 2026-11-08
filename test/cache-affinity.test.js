@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
+import { __serverTest } from '../src/server.js';
 
 const acct = (n) => ({ name: n, type: 'oauth', accessToken: 't', refreshToken: 'r',
   expiresAt: Date.now() + 3600_000, accountUuid: `U-${n}`, upstream: 'http://127.0.0.1:1' });
@@ -14,7 +15,6 @@ const am = (n = 3, opts = {}) => new AccountManager(
 const release = (l) => am_ref.releaseAccount(l, { status: 200, success: true });
 let am_ref;
 const acquire = (mgr, sessionKey = 'sess-x', excluded) => mgr.acquireAccount({ sessionKey, model: 'claude-opus-5-5', weight: 10 }, excluded);
-// provider rows are plain-balance (no affinity)
 
 test('balance: consecutive turns stay on the same account at comparable load', () => {
   const m = am(); am_ref = m;
@@ -30,8 +30,7 @@ test('balance: a major load gap moves the session (two large turns of extra dept
   const first = acquire(m); const name1 = first.account.name; release(first);
   const sibling = m.accounts.find(a => a.name !== name1);
   sibling.activeWeight = 0; sibling.inFlight = 0;
-  // ~3 large turns (weight 30 each ≈ 1080 score points) past the affinity bonus:
-  const _next = acquire(m, "sess-x", new Set(), { forceLoad: 100 });
+  // ~100 weight units of extra depth on the bound account (≈1200 points) — far past the bonus:
   first.account.activeWeight = 1200;
   const moved = acquire(m, 'sess-x');
   assert.notEqual(moved.account.name, name1, 'session moved off the heavily loaded account');
@@ -92,7 +91,7 @@ test('GLM rows get the same affinity, released by GLM\'s own 5-hour reading', ()
   const m = am(1); am_ref = m;
   m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
   const glm = m.accounts.find(a => a.type === 'provider');
-  m._bindSession('sess-g', glm, 'claude-opus-5-5');
+  m._noteConversationAccount({ sessionKey: 'sess-g' }, glm);
   assert.equal(m._cacheAffinity(glm, { sessionKey: 'sess-g' }), 400, 'same rule as Anthropic');
   // The distinctive case: a GLM plan WITH a low weekly reading (used=weekly → 'normal')
   // whose 5-HOUR window is near the wall — only the explicit providerSes gate releases.
@@ -130,4 +129,59 @@ test('affinity HOLDS in the soft weekly tier (65-85% — normal mid-week)', () =
   first.account.quota.unified7d = 0.72; first.account.quota.unified7dReset = Date.now() + 3 * 86400_000;
   assert.equal(m._weeklyRawState(first.account), 'soft', 'fixture is in the soft tier');
   assert.equal(m._cacheAffinity(first.account, { sessionKey: 'sess-x' }), 400);
+});
+
+test('fan-out: subagents on other accounts do not drag the MAIN conversation off its account', () => {
+  const m = am(3); am_ref = m;
+  const main = { sessionKey: 'term-1', affinityKey: 'term-1:MAIN', model: 'claude-opus-5-5', weight: 10 };
+  const first = m.acquireAccount(main); const home = first.account.name;
+  m.releaseAccount(first, { status: 200, success: true });
+  // Same terminal, different conversations (subagents) forced onto the OTHER accounts.
+  for (const a of m.accounts.filter(x => x.name !== home)) {
+    const l = m.acquireAccount({ sessionKey: 'term-1', affinityKey: `term-1:SUB-${a.name}`, model: 'claude-opus-5-5', weight: 10 },
+      new Set(m.accounts.filter(x => x !== a).map(x => x.index)));
+    assert.equal(l.account.name, a.name); m.releaseAccount(l, { status: 200, success: true });
+  }
+  const again = m.acquireAccount(main);
+  assert.equal(again.account.name, home, 'main conversation returns to ITS account, not the last subagent\'s');
+  m.releaseAccount(again, { status: 200, success: true });
+});
+
+test('no readable quota (Kimi console-only) → no affinity', () => {
+  const m = am(1); am_ref = m;
+  m.addAccount({ name: 'kimi', type: 'provider', provider: 'kimi', apiKey: 'kk' });
+  const kimi = m.accounts.find(a => a.provider === 'kimi');
+  kimi.quota.providerQuotaSource = 'console-only';
+  m._noteConversationAccount({ sessionKey: 'k' }, kimi);
+  assert.equal(m._cacheAffinity(kimi, { sessionKey: 'k' }), 0);
+});
+
+test('bonus is scaled to the row\'s per-unit price (discounted rows tolerate the same depth)', () => {
+  const m = am(1); am_ref = m;
+  const a = m.accounts[0];
+  m._noteConversationAccount({ sessionKey: 's' }, a);
+  assert.equal(m._cacheAffinity(a, { sessionKey: 's' }), 400, 'undiscounted row: full bonus');
+  const orig = m._fastRefillMultiplier.bind(m);
+  m._fastRefillMultiplier = () => 0.4;
+  assert.ok(Math.abs(m._cacheAffinity(a, { sessionKey: 's' }) - 160) < 1e-9, 'unit at 0.4x → bonus at 0.4x');
+  m._fastRefillMultiplier = orig;
+});
+
+test('conversation map is bounded (LRU)', () => {
+  const m = am(1); am_ref = m;
+  for (let i = 0; i < 5005; i++) m._noteConversationAccount({ affinityKey: `k${i}` }, m.accounts[0]);
+  assert.equal(m.conversationLastAccount.size, 5000);
+  assert.equal(m.conversationLastAccount.has('k0'), false, 'oldest dropped');
+  assert.equal(m.conversationLastAccount.has('k5004'), true);
+});
+
+test('conversation hash: stable across turns, distinct per conversation (main vs subagent)', () => {
+  const req = { method: 'POST', url: '/v1/messages' };
+  const body = (sys, msgs) => Buffer.from(JSON.stringify({ model: 'claude-opus-5-5', system: sys, messages: msgs }));
+  const sys = [{ type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." }];
+  const t1 = __serverTest.describeRequest(req, body(sys, [{ role: 'user', content: 'build X' }]));
+  const t2 = __serverTest.describeRequest(req, body(sys, [{ role: 'user', content: 'build X' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'next' }]));
+  const sub = __serverTest.describeRequest(req, body([{ type: 'text', text: 'You are a search agent.' }], [{ role: 'user', content: 'find Y' }]));
+  assert.ok(t1.conversationHash && t1.conversationHash === t2.conversationHash, 'same conversation, later turn → same key');
+  assert.notEqual(t1.conversationHash, sub.conversationHash, 'a subagent is its own conversation');
 });

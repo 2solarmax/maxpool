@@ -68,6 +68,7 @@ test('W4.3 warmup-pull never lands a session on a provider, even under always po
   am.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' }); // also freshly added, but a provider
   addFresh(am, 'fresh');
   am._bindSession('sess1', am.accounts[0], 'claude-sonnet-5');
+  am._noteConversationAccount({ sessionKey: 'sess1' }, am.accounts[0]); // its last turn ran on a1
   // A signed-thinking request is migration-safe by default (crossAccountThinkingMigration),
   // and _isRequestCompatible does NOT bar providers in the compatible case — so only the
   // DIRECTED non-provider warmup-pull keeps this off glm.

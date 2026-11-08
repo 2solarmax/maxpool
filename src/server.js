@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import { normalizeClientHeaders, rewriteMetadataUserIdRaw } from './client-identity.js';
 import { appendEventLog } from './event-log.js';
@@ -496,6 +497,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         console.error('[Maxpool] x-maxpool-pin-account dropped: the link authenticated with the remote\'s legacy apiKey — mint a named client key (proxy.clients) so pins and per-person attribution work');
       }
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
+        // Affinity key = terminal + conversation. Works without the session header
+        // too (bare `claude`, teammates' launchers): the conversation hash alone.
+        requestInfo.affinityKey = requestInfo.conversationHash
+          ? `${requestInfo.sessionKey || ''}:${requestInfo.conversationHash}` : null;
         requestInfo.caller = req._caller || null;
         // Read per request (not captured at boot) so a config flip + seamless reload
         // takes effect on the next request with no restart.
@@ -3473,6 +3478,19 @@ function describeRequest(req, body) {
     const json = JSON.parse(body.toString());
     if (json.model) info.model = json.model;
     if (json.stream) info.stream = true;
+    // CONVERSATION identity for cache affinity (red-team 2026-11-08): the
+    // x-maxpool-session header names a TERMINAL, and a main thread plus its parallel
+    // subagents share it — so "last account used by this session" chased whichever
+    // request landed last. A conversation's system prompt + first message never
+    // change within it (Claude Code relies on that for its own cache prefix), so a
+    // short hash of those separates the main thread from each subagent.
+    if (Array.isArray(json.messages) && json.messages.length) {
+      info.conversationHash = createHash('sha256')
+        .update(JSON.stringify(json.system ?? ''))
+        .update('\u0000')
+        .update(JSON.stringify(json.messages[0] ?? ''))
+        .digest('hex').slice(0, 16);
+    }
     if (json.max_tokens && json.max_tokens > 16_000) weight += 1;
     if (json.thinking || json.effort) weight += 1;
     if (requiresAnthropicThinkingIntegrity(json)) {

@@ -180,10 +180,11 @@ const DEFAULT_SCHEDULER = {
   // per-account soft cap; burn-pace is only a soft de-preference (never a
   // bench); quota "use-it-or-lose-it" is intentionally a minor signal here.
   // Cache-affinity discount (owner 2026-11-08, see _cacheAffinity): score points
-  // the last-used healthy Anthropic account sheds in balance mode. One weight unit
-  // in flight costs ~12 points past the per-account target and a typical Claude
-  // Code turn weighs 3-30 units, so 400 ≈ two large turns of extra depth tolerated
-  // before the conversation moves. 0 restores pure per-request balancing.
+  // a conversation's last-used healthy account sheds (every mode except sticky).
+  // On an undiscounted row one in-flight weight unit costs ~12 points past the
+  // per-account target (the bonus is rescaled per row so discounted rows match),
+  // and a Claude Code turn weighs 3-30 units: 400 ≈ 33 units, about two large
+  // turns of extra depth before the conversation moves. 0 = pure per-request.
   cacheAffinityBonus: 400,
   concurrencyWeight: 2,            // multiplies in-flight load (activeWeight+reqWeight) — dominant
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
@@ -341,6 +342,7 @@ const PERSISTED_QUOTA_FIELDS = [
   'providerQuotaSource', 'lastProbeOkAt', 'noPlan',
 ];
 
+const CONVERSATION_AFFINITY_MAX = 5000;
 const PROVIDER_429_MIN_BENCH_SEC = 60;
 const PROVIDER_429_MAX_BENCH_SEC = 15 * 60;
 const PROVIDER_429_STREAK_FORGET_MS = 60 * 60 * 1000;
@@ -597,6 +599,10 @@ export class AccountManager {
     this.routingMode = 'automatic';
     this.preferredAccountName = null;
     this.sessionBindings = new Map();
+    // Cache affinity: conversation (terminal + prefix hash) → last account name.
+    // Bounded LRU — oldest conversations drop first; a dropped entry only means the
+    // next turn is balanced fresh.
+    this.conversationLastAccount = new Map();
     this._peakCache = null;   // per-UTC-minute peak-window memo (see _peakStateFor)
     // CAPACITY LEDGER (2026-08-22): observed tokens per completed window cycle, so
     // "true capacity" is comparable across providers. Restored from state on boot.
@@ -876,6 +882,7 @@ export class AccountManager {
       // disagree with the peak tier that caused the move (defaults to real time).
       this._bindSession(requestInfo.sessionKey, account, requestInfo.model, requestInfo.now);
     }
+    this._noteConversationAccount(requestInfo, account);
     account.inFlight++;
     account.activeWeight += weight;
     account.lastUsedAt = Date.now();
@@ -2238,9 +2245,9 @@ export class AccountManager {
       }
     }
     // Session binding only applies in 'sticky' mode. Every other mode scores each
-    // request independently — the whole point of 'balance' is that 20 sessions that
-    // happened to start on the same account do NOT keep hammering it while others
-    // idle. Warmup-pull still works under the non-sticky modes because it keys on
+    // request — so 20 sessions that started on one account do NOT keep hammering it
+    // while others idle — but with a bounded cache-affinity discount for the
+    // conversation's last account (_cacheAffinity, owner 2026-11-08). Warmup-pull still works under the non-sticky modes because it keys on
     // `_isWarming`, not on a binding.
     const isStickyMode = this.scheduler.routingMode === 'sticky';
     const bound = isStickyMode
@@ -3175,13 +3182,32 @@ export class AccountManager {
    * there but costs nothing either, and one rule is simpler to reason about.
    * Applies in every scored mode (balance, prefer-*); never in sticky (see below).
    */
+  _noteConversationAccount(requestInfo, account) {
+    const key = this._affinityKey(requestInfo);
+    if (!key) return;
+    const map = this.conversationLastAccount;
+    map.delete(key);                       // re-insert = most recent (LRU order)
+    map.set(key, account.name);
+    while (map.size > CONVERSATION_AFFINITY_MAX) map.delete(map.keys().next().value);
+  }
+
+  /** Conversation identity: terminal + prefix hash when the server computed one;
+   *  falls back to the terminal session key (callers that never set the hash,
+   *  e.g. tests and pre-hash call sites). */
+  _affinityKey(requestInfo = {}) {
+    return requestInfo.affinityKey || requestInfo.sessionKey || null;
+  }
+
   _cacheAffinity(account, requestInfo = {}) {
-    const bonus = Number(this.scheduler.cacheAffinityBonus) || 0;
+    const base = Number(this.scheduler.cacheAffinityBonus) || 0;
     // Sticky mode has its own binding; its score loop runs only once the session has
     // decided to LEAVE a hot account — a discount there would pull it straight back.
-    if (bonus <= 0 || this.scheduler.routingMode === 'sticky') return 0;
-    if (!requestInfo.sessionKey) return 0;
-    if (this._sessionBinding(requestInfo.sessionKey)?.currentName !== account.name) return 0;
+    if (base <= 0 || this.scheduler.routingMode === 'sticky') return 0;
+    const key = this._affinityKey(requestInfo);
+    if (!key || this.conversationLastAccount.get(key) !== account.name) return 0;
+    // No readable quota (Kimi's coding key is console-only) → nothing would ever
+    // release the hold before a 429; give such rows plain balancing (red-team r1).
+    if (account.type === 'provider' && account.quota?.providerQuotaSource === 'console-only') return 0;
     const weeklyState = this._weeklyRawState(account);
     // Holds through 'soft' (≥65% weekly — most accounts by mid-week) and 'unknown'
     // (never probed); reserve/critical/exhausted/capped release the conversation.
@@ -3190,7 +3216,15 @@ export class AccountManager {
     const five = account.type === 'provider' ? account.quota?.providerSes : account.quota?.unified5h;
     if (five != null && five >= this.scheduler.weeklyReserveThreshold) return 0;
     if ((account.consecutiveFailures || 0) > 0) return 0;
-    return bonus;
+    // Scale to THIS row's price of one in-flight unit, so every account tolerates the
+    // same extra DEPTH (~33 units) — a fast-refill/soak-discounted GLM row prices a
+    // unit at ~0.4x, and an unscaled bonus let it run ~2.5x deeper (red-team r1).
+    const refillMult = this._fastRefillMultiplier(account);
+    const safetyMult = this.scheduler.soakDiscount < 1
+      ? this._fastRefillMultiplier(account, { capFloor: true }) : refillMult;
+    const unit = this.scheduler.concurrencyWeight * refillMult + this.scheduler.capPenaltyWeight * safetyMult;
+    const fullUnit = this.scheduler.concurrencyWeight + this.scheduler.capPenaltyWeight;
+    return base * Math.min(1, unit / fullUnit);
   }
 
   /**
