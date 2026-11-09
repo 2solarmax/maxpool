@@ -85,7 +85,9 @@ test('shipped defaults: 0.6 ms/byte (direct only), 250KB retry-same threshold', 
 
 test('hint respects the anti-dogpile cap: an account loaded past it loses to an idle sibling', () => {
   const am = manager();
-  am.accounts[0].activeWeight = 120;   // far past target + cacheAffinityMaxExtraDepth
+  // 55: inside the band (45-65) where the CAP decides — the uncapped bonus would keep
+  // a1 here (review r2 C; 120 lost even uncapped, so the cap was unpinned).
+  am.accounts[0].activeWeight = 55;
   const lease = am.acquireAccount({ profile: 'claude', bodyBytes: 300_000, retrySameAccountName: 'a1' });
   assert.equal(lease.account.name, 'a2', 'moving off an account at its cap is the agreed shape');
 });

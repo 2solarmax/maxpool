@@ -1883,9 +1883,13 @@ test('bug A: resumed stream has NO heartbeat comment interleaved between real ev
     assert.equal(res.status, 200);
     const body = await res.text();
     assert.match(body, /message_stop/, 'the resumed stream completed');
-    // Heartbeat comments may appear BEFORE the first real event (while queued),
-    // but NEVER after — interleaving mid-stream is the corruption bug.
-    const after = body.slice(body.indexOf('data:'));
+    // Heartbeat pings may appear BEFORE the first real event (while queued, and —
+    // since review r2 D — until the first real byte is written), but NEVER after:
+    // interleaving mid-stream is the corruption bug. Cut at the first REAL event (a
+    // ping's own `data: {}` line is not one).
+    const firstReal = body.indexOf('data: {"type"');
+    assert.ok(firstReal >= 0, 'a real event arrived');
+    const after = body.slice(firstReal);
     assert.ok(!after.includes('event: ping'),
       'no heartbeat comment interleaved into the live SSE body after the first event');
   } finally {

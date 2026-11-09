@@ -33,6 +33,15 @@ function body(bytes, stream = false) {
   return JSON.stringify({ model: 'claude-opus-5-5', stream, messages: [{ role: 'user', content: pad }] });
 }
 
+// Review r2 G: record a1's failure streak at every acquire — the move path's release
+// must be streak-neutral (a streak releases every conversation held on a1).
+function streakAtAcquire(am) {
+  const seen = [];
+  const acquire = am.acquireAccount.bind(am);
+  am.acquireAccount = (ri, ex) => { seen.push(am.accounts[0].consecutiveFailures); return acquire(ri, ex); };
+  return seen;
+}
+
 function accounts(n = 2) {
   return new AccountManager(Array.from({ length: n }, (_, i) => ({
     name: `a${i + 1}`, type: 'oauth', accessToken: `t${i + 1}`, refreshToken: `r${i + 1}`, expiresAt: Date.now() + 3600_000,
@@ -167,8 +176,10 @@ test('T6: big prompt TTFBs once on a1 → retry-same on a1 (not excluded, normal
 
 test('T6: a second timeout after retry-same falls through to the move path (excluded)', async () => {
   const am = accounts(2);
+  const streaks = streakAtAcquire(am);
   const stub = upstreamStub(tok => (tok === 't1' ? 'hang' : 'ok'));
   const { lines, status } = await run(am, stub, body(BIG));
+  assert.deepEqual(streaks, [0, 0, 0], 'G: both a1 releases (retry-same and move) are streak-neutral');
   assert.equal(status, 200);
   assert.deepEqual(stub.hits, ['t1', 't1', 't2'], 'once on the same account, then moved');
   const a = attempts(lines);
@@ -178,8 +189,15 @@ test('T6: a second timeout after retry-same falls through to the move path (excl
 });
 
 test('T7: a small prompt that TTFBs moves immediately (no retry-same below the threshold)', async () => {
+  const am = accounts(2);
+  const streaks = streakAtAcquire(am);
   const stub = upstreamStub(tok => (tok === 't1' ? 'hang' : 'ok'));
-  const { lines, status } = await run(accounts(2), stub, body(SMALL));
+  const { lines, status } = await run(am, stub, body(SMALL));
+  assert.deepEqual(streaks, [0, 0], 'G: the move-path release is streak-neutral');
+  // Review r2 A wiring: a first-byte timeout is REQUEST-scoped — new placements are
+  // steered off a1, but a1 stays available to the conversations it holds.
+  assert.ok(am.accounts[0].softCooldownUntil > Date.now(), 'a1 deprioritised for new placements');
+  assert.ok(!(am.accounts[0].cooldownUntil > Date.now()), 'no account cooldown — held conversations keep a1');
   assert.equal(status, 200);
   assert.deepEqual(stub.hits, ['t1', 't2']);
   const a = attempts(lines);
@@ -235,6 +253,15 @@ test('T11 unit: a bare claude (240s) whose first wait ran 240s moves; a cc sessi
   const wait = scaledTtfbMs(k.UPSTREAM_TTFB_MS, k.TTFB_MS_PER_BYTE, 640_000, 100_000);
   assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: 640_000, startedAt: Date.now() - (100_000 - wait) + 500 }, res, { streamClientToleranceMs: 100_000 }), true);
   assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: 640_000, startedAt: Date.now() - (100_000 - wait) - 1000 }, res, { streamClientToleranceMs: 100_000 }), false);
+  // exact boundary on a frozen clock (review r2 H): elapsed + wait == ceiling is
+  // allowed, +1ms is refused
+  const realNow = Date.now; const T = realNow();
+  Date.now = () => T;
+  try {
+    const at = extra => ({ stream: true, bodyBytes: 640_000, startedAt: T - (100_000 - wait) - extra });
+    assert.equal(retrySameEligible(ok, at(0), res, { streamClientToleranceMs: 100_000 }), true, 'exactly equal is allowed');
+    assert.equal(retrySameEligible(ok, at(1), res, { streamClientToleranceMs: 100_000 }), false, '+1ms is refused');
+  } finally { Date.now = realNow; }
   // non-streaming: no ceiling, no patience rule
   assert.equal(retrySameEligible(ok, { stream: false, bodyBytes: 640_000, startedAt: Date.now() - 3_600_000 }, res, {}), true);
 });

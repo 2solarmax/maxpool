@@ -496,8 +496,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         const queueConfig = { ...DEFAULT_QUEUE, ...(config.queue || {}) };
         const canRetryBufferedBody = body.length <= retryConfig.maxRetryBufferBytes;
         requestInfo = describeRequest(req, body);
-        // Request clock for elapsed-time log lines ("Client left after Xs"); read back
-        // by the direct and link client-gone paths. Was never set, so every direct-path
+        // Request clock: the direct client-gone line ("Client left after Xs" — request
+        // age) and the retry-same patience rule read it. (The link path reports time on
+        // THIS account, from lease.startedAt.) Was never set, so every direct-path
         // client-gone line read 0.0s.
         requestInfo.startedAt = Date.now();
         const maxQueuedBodyBytes = queueConfig.maxQueuedBodyBytes == null
@@ -833,7 +834,7 @@ async function forwardRequest(
   // first events would be pure latency. See streamResponse + classifyHeldStreamPrefix.
   requestInfo._refusalRerouteEligible = account.type !== 'provider'
     && canRetryBufferedBody
-    && !res.headersSent;
+    && !clientHasRealBytes(res, requestInfo);
 
   // Refresh OAuth token if needed
   const tokenReady = await accountManager.ensureTokenFresh(account.index);
@@ -950,6 +951,10 @@ async function forwardRequest(
     // ctx.status: an earlier hop's 429 would otherwise leak into this hop's catch.
     let linkStatus = null;
     let linkGraceTimer = null;
+    // One 'close' listener per link hop, detached at every exit (review r2 F) — like the
+    // direct path's onClientClose, so a failover / queue-resume chain never stacks them.
+    let onLinkClose = null;
+    const detachLinkClose = () => { if (onLinkClose) res.off('close', onLinkClose); onLinkClose = null; };
     const finishLink = (outcome) => {
       if (linkDone) return; linkDone = true;
       accountManager.releaseAccount(lease, outcome);
@@ -974,7 +979,8 @@ async function forwardRequest(
       // headers, commit the SSE stream + heartbeat. The post-headers branch below
       // (queueHeartbeatActive) already clears it and frames a remote error correctly.
       linkGraceTimer = armStreamForwardGrace(res, requestInfo, queueConfig, accountManager);
-      res.once('close', () => { if (!res.writableEnded) linkClientGone = true; linkCtl.abort(); });
+      onLinkClose = () => { if (!res.writableEnded) linkClientGone = true; linkCtl.abort(); };
+      res.once('close', onLinkClose);
       let upRes;
       try {
         upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half', signal: linkCtl.signal });
@@ -1001,6 +1007,7 @@ async function forwardRequest(
           && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
         ) {
           logFailedAttempt(account.name, 'request_shape_refused', 'linked pool refused the request shape (not Claude Code)', 'moved');
+          detachLinkClose();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
         }
         logFailedAttempt(account.name, 'request_shape_refused', 'linked pool refused the request shape; no route serves it', 'surfaced');
@@ -1019,10 +1026,12 @@ async function forwardRequest(
         excludedIndexes.add(account.index);
         if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
           logFailedAttempt(account.name, `remote-${upRes.status}`, `linked pool refused before any byte`, 'moved');
+          detachLinkClose();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
         }
         // Every route refused: that is capacity, so it waits here. The body was cancelled
         // above, so falling through handed the client a 503 with no body.
+        detachLinkClose();
         const queued = await queueAndRetry(
           `all routes failed after ${upRes.status} from "${account.name}"`,
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
@@ -1035,15 +1044,15 @@ async function forwardRequest(
         return;
       }
       // A request released from the queue already holds a committed keep-alive stream.
-      if (requestInfo.queueHeartbeatActive) {
+      // An error on it is framed as an SSE error; a 2xx keeps the heartbeat until the
+      // first real chunk (below).
+      if (requestInfo.queueHeartbeatActive && upRes.status >= 400) {
         clearQueueHeartbeat(requestInfo);
-        if (upRes.status >= 400) {
-          const errorText = await readErrorBody(upRes);
-          logFailedAttempt(account.name, `remote-${upRes.status}`, 'linked pool answered an error on a held stream', 'surfaced');
-          sendErrorBody(res, requestInfo, upRes.status, errorText, upRes.headers);
-          finishLink({ success: upRes.status < 500, status: upRes.status });
-          return;
-        }
+        const errorText = await readErrorBody(upRes);
+        logFailedAttempt(account.name, `remote-${upRes.status}`, 'linked pool answered an error on a held stream', 'surfaced');
+        sendErrorBody(res, requestInfo, upRes.status, errorText, upRes.headers);
+        finishLink({ success: upRes.status < 500, status: upRes.status });
+        return;
       }
       const outHeaders = {};
       upRes.headers.forEach((v, k) => { if (!HOP_BY_HOP_HEADERS.has(k) && k !== 'content-length' && k !== 'transfer-encoding') outHeaders[k] = v; });
@@ -1055,11 +1064,14 @@ async function forwardRequest(
             const { done, value } = await reader.read();
             if (done) break;
             if (res.destroyed) { try { await reader.cancel(); } catch { } break; }
+            // First REAL byte stops the keep-alive (review r2 D) — until then a link that
+            // dies after its headers can still fail over.
+            if (requestInfo.queueHeartbeatActive) clearQueueHeartbeat(requestInfo);
             res.write(Buffer.from(value));
           }
         } finally { try { await reader.cancel(); } catch { /* already done */ } }
       }
-      res.end();
+      res.end();   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded
       finishLink({ success: ctx.status < 500, status: ctx.status });
       // SC22 no-double-count: this request was counted at auth; the serving pool
       // counted it too. Undo the local one.
@@ -1069,7 +1081,7 @@ async function forwardRequest(
       }
       hooks.onRequestRouted?.(reqId, { account: account.name });
     } catch (err) {
-      const heldS = ((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1);
+      const heldS = heldSeconds(lease);
       // D1: the client left before anything reached it. The account did nothing wrong
       // and the turn is abandoned — release neutral, do not exclude, never re-send.
       // (A cancel AFTER bytes flowed keeps the path below: a mid-response failure.)
@@ -1093,8 +1105,10 @@ async function forwardRequest(
       if (!clientHasRealBytes(res, requestInfo)) {
         if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
           logFailedAttempt(account.name, linkKind, linkDetail, 'moved');
+          detachLinkClose();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
         }
+        detachLinkClose();
         const queued = await queueAndRetry(
           `all routes failed after a link error on "${account.name}"`,
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
@@ -1107,6 +1121,8 @@ async function forwardRequest(
       }
       ctx.status = 502;
       sendErrorResponse(res, requestInfo, 502, { type: 'error', error: { type: 'api_error', message: `Team pool "${account.name}" unreachable: ${err?.message || err}` } });
+    } finally {
+      detachLinkClose();
     }
     return;
   }
@@ -2203,7 +2219,9 @@ async function forwardRequest(
     // provider. If no provider is available,
     // fall through to the normal error path — the client sees the same message it
     // would have seen before this feature existed.
-    if (err.code === 'REFUSAL_RETRY' && canRetryBufferedBody && !res.headersSent) {
+    // !clientHasRealBytes, not !headersSent: a slow turn whose keep-alive committed
+    // (pings only) is just as reroutable as a fast one (review r2 B).
+    if (err.code === 'REFUSAL_RETRY' && canRetryBufferedBody && !clientHasRealBytes(res, requestInfo)) {
       const category = err.refusalCategory || 'unknown';
       const anthropicIndexes = accountManager.accounts
         .filter(a => a.type !== 'provider')
@@ -2215,6 +2233,7 @@ async function forwardRequest(
       // 2026-09-14: removing a latch changed nothing on any constructible path.
       if (providerAvailable && retryCount + 1 <= maxAttempts) {
         console.log(`[Maxpool] Anthropic safeguard refusal (${category}) on "${account.name}" — rerouting turn to a provider account`);
+        logFailedAttempt(account.name, 'safeguard_refusal', `${category}; rerouting to a provider`, 'moved');
         accountManager.releaseAccount(lease, { success: true, status: 200, refusal: category });
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
@@ -2256,7 +2275,7 @@ async function forwardRequest(
         requestInfo.retrySameAccountName = account.name;
         accountManager.releaseAccount(lease, { error: 'upstream_ttfb', scope: 'request' });
         requestInfo.pendingRetrySame = { account: account.name, kind: transientKind,
-          detail: `no first byte after ${((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1)}s on a ${Math.round((requestInfo.bodyBytes || 0) / 1000)}KB prompt` };
+          detail: `no first byte after ${heldSeconds(lease)}s on a ${Math.round((requestInfo.bodyBytes || 0) / 1000)}KB prompt` };
         // retryCount NOT bumped: maxAttempts is sized by ACCOUNT COUNT (failover budget);
         // a same-account retry is not a failover and must not eat the move it may still
         // need (2 accounts: retry-same + move = 2 hops). sameAccountRetried bounds it.
@@ -2265,10 +2284,14 @@ async function forwardRequest(
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
-      // The release carries no error/status, so it moves no counter (no streak, no
-      // held-conversation release); markTransientFailure(network) is the short fixed
-      // cooldown, and it never bumps the streak either.
-      accountManager.markTransientFailure(account.index, err.code || err.message || 'network_error', { network: true });
+      // A first-byte / idle timeout is REQUEST-scoped (D4, review r2 A): it soft-cools the
+      // account for NEW placements only — conversations held on it keep it — and only 3
+      // in a row escalate to an account fault. Every other network class (reset, DNS,
+      // fetch failed) is fleet-wide connectivity: the short fixed account cooldown. The
+      // release carries no error/status, so it moves no counter itself.
+      const requestScoped = err.code === 'UPSTREAM_TTFB' || err.code === 'UPSTREAM_IDLE';
+      accountManager.markTransientFailure(account.index, err.code || err.message || 'network_error',
+        { network: true, scope: requestScoped ? 'request' : 'account' });
       accountManager.releaseAccount(lease);
       excludedIndexes.add(account.index);
       // hasEligibleRoute like every sibling gate: with no route left the network-cause
@@ -2276,7 +2299,7 @@ async function forwardRequest(
       // answer with a misleading quota message).
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
         && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
-        logFailedAttempt(account.name, transientKind, `transient after ${((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1)}s`, 'moved');
+        logFailedAttempt(account.name, transientKind, `transient after ${heldSeconds(lease)}s`, 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
@@ -2398,14 +2421,15 @@ function retrySameEligible(account, requestInfo, res, queueConfig = {}) {
  * D5: one line per FAILED attempt, naming the account, the error class and what the
  * pool did next — so "why did this move" is answerable from the log without a forensic
  * dig (the Mac pool logged failed attempts not at all before this). nextAction tokens:
- * released-cancel | retry-same (batch 2) | moved | queued | surfaced.
+ * released-cancel | retry-same | moved | repaired | queued | surfaced.
  */
-function formatAttemptFailure(account, kind, detail, nextAction) {
-  return `[Maxpool] attempt failed (${kind}) on "${account}" — ${detail} → ${nextAction}`;
+function logFailedAttempt(account, kind, detail, nextAction) {
+  console.log(`[Maxpool] attempt failed (${kind}) on "${account}" — ${detail} → ${nextAction}`);
 }
 
-function logFailedAttempt(account, kind, detail, nextAction) {
-  console.log(formatAttemptFailure(account, kind, detail, nextAction));
+/** Seconds this lease has been held on its account, one decimal ("12.3"). */
+function heldSeconds(lease) {
+  return ((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1);
 }
 
 function parseRetryAfter(value) {
@@ -2632,7 +2656,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, formatAttemptFailure, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -3564,17 +3588,10 @@ async function queueAndRetryInner(
   ).then(() => true);
 }
 
-// The stream-forward grace-timer callback (extracted so its logic is unit-testable
-// in isolation). Fires when a STREAMING request's upstream is slow to first byte:
-// commits the SSE stream + heartbeat so the client never idle-times-out. Client-
-// abort-safe — an async timer has NO synchronous liveness precondition (unlike the
-// queue caller), so if the client vanished during the forward window (or the stream
-// is already committed) it reaps the queue slot and bails WITHOUT touching the dead
-// socket. ensureQueueHeartbeat is itself hardened against a throwing write, but this
-// guard is the cheaper first line of defense against the worker-bounce race.
-// Shared by the direct and link paths. The deadline is anchored ONCE per request (??=)
-// so it bounds CUMULATIVE pre-headers time across re-forwards; returns the timer (or
-// null) for the caller to clear the moment headers arrive.
+// Arms the stream-forward grace timer. Shared by the direct and link paths. The
+// deadline is anchored ONCE per request (??=) so it bounds CUMULATIVE pre-headers time
+// across re-forwards; returns the timer (or null) for the caller to clear the moment
+// headers arrive.
 function armStreamForwardGrace(res, requestInfo, queueConfig, accountManager) {
   if (!requestInfo.stream || res.headersSent) return null;
   const streamForwardGraceMs = queueConfig?.streamForwardGraceMs == null
@@ -3590,6 +3607,14 @@ function armStreamForwardGrace(res, requestInfo, queueConfig, accountManager) {
   return t;
 }
 
+// The stream-forward grace-timer callback (extracted so its logic is unit-testable
+// in isolation). Fires when a STREAMING request's upstream is slow to first byte:
+// commits the SSE stream + heartbeat so the client never idle-times-out. Client-
+// abort-safe — an async timer has NO synchronous liveness precondition (unlike the
+// queue caller), so if the client vanished during the forward window (or the stream
+// is already committed) it reaps the queue slot and bails WITHOUT touching the dead
+// socket. ensureQueueHeartbeat is itself hardened against a throwing write, but this
+// guard is the cheaper first line of defense against the worker-bounce race.
 function commitStreamGraceHeartbeat(res, requestInfo, queueConfig, accountManager) {
   if (res.destroyed || res.writableEnded || res.headersSent) {
     clearQueueHeartbeat(requestInfo);
@@ -4215,13 +4240,15 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   let readFailed = false;
 
 
-  // We're now committed to streaming a real upstream response body onto this
-  // response — there is no more failover for this forward. Stop the queue
-  // heartbeat (if this was a resumed held stream) BEFORE the first real byte, so
-  // the setInterval can't inject queue keepalive pings between live SSE
-  // events (Bug A). It is deliberately NOT cleared earlier (on resume), so a
-  // pre-byte failover can still re-hold the session via queueAndRetry.
-  clearQueueHeartbeat(requestInfo);
+  // The queue/keep-alive heartbeat keeps running until the FIRST REAL BYTE goes to the
+  // client (review r2 D): until then the client has only pings, so a failure between
+  // upstream headers and the first body chunk can still fail over (clientHasRealBytes
+  // stays false) and the client's idle watchdog stays fed. realWrite stops it right
+  // before the first real write, so no ping can land between live SSE events (Bug A).
+  const realWrite = (chunk) => {
+    if (requestInfo.queueHeartbeatActive) clearQueueHeartbeat(requestInfo);
+    return res.write(chunk);
+  };
 
   // Client left mid-stream: the caller drops its disconnect-abort once headers
   // arrive, and the loop below only checks res.destroyed AFTER a read resolves — so
@@ -4359,7 +4386,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       // single decoded text feeds the scrubber (client lane) and the accounting lane.
       const chunkText = decoder.decode(out, { stream: true });
       const writeText = scrubber ? scrubber.push(chunkText) : null;
-      const ok = scrubber ? (writeText ? res.write(writeText) : true) : res.write(out);
+      const ok = scrubber ? (writeText ? realWrite(writeText) : true) : realWrite(out);
 
       const text = chunkText;
 
@@ -4444,7 +4471,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         if (!readFailed && !res.destroyed) {
           try {
             if (!committed && !res.headersSent) { res.writeHead(status, responseHeaders); committed = true; }
-            res.write(held);
+            realWrite(held);
           } catch { /* client already gone */ }
         }
       }
@@ -4458,7 +4485,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       const held = Buffer.from(concatUint8(modelEchoBuffer));
       modelEchoBuffer = null;
       try {
-        if (!readFailed && !res.destroyed) res.write(held);
+        if (!readFailed && !res.destroyed) realWrite(held);
       } catch { /* client already gone */ }
       const heldText = held.toString('utf8');
       if (streamLog) streamLog.push(heldText);
@@ -4472,6 +4499,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
     if (!readFailed) {
+      clearQueueHeartbeat(requestInfo);   // finishing: no pings after this point
       if (!committed && !res.headersSent) res.writeHead(status, responseHeaders);
       // Truncation sentinel FIRST (before end()) — a write after end() throws and
       // would be swallowed, silently producing the truncated stream this guards.
@@ -4487,11 +4515,11 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       // client a corrupt frame ahead of the error.
       if (scrubber && !truncatedMidEvent && !res.destroyed && !res.writableEnded) {
         const tail = scrubber.flush();
-        if (tail) { try { res.write(tail); } catch { /* client gone */ } }
+        if (tail) { try { realWrite(tail); } catch { /* client gone */ } }
       }
       if ((committed || res.headersSent) && truncatedMidEvent && !res.destroyed && !res.writableEnded) {
         try {
-          res.write(`event: error\ndata: ${JSON.stringify({
+          realWrite(`event: error\ndata: ${JSON.stringify({
             type: 'error',
             error: { type: 'api_error', message: 'Upstream closed the stream before the response completed. Retry the message.' },
           })}\n\n`);

@@ -1,0 +1,410 @@
+// Red-team round 2 pins (task-2026-11-09-maxpool-retry-before-move): request-scoped
+// faults never evict held conversations (A), refusal reroute after the keep-alive (B),
+// "real bytes" means a real body byte (D), the once-only give-up line (E), and the link
+// close-listener hygiene (F).
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer } from '../src/server.js';
+import { PoolLink } from '../src/pool-link.js';
+import { ReadableStream } from 'node:stream/web';
+
+const listen = s => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
+const close = s => { s.closeAllConnections?.(); return new Promise(r => s.close(r)); };
+const attempts = lines => lines.filter(l => l.startsWith('[Maxpool] attempt failed ('));
+const tok = req => String(req.headers.authorization || '').replace('Bearer ', '');
+const json = (res, status, obj, h = {}) => { res.writeHead(status, { 'content-type': 'application/json', ...h }); res.end(JSON.stringify(obj)); };
+
+async function captureLog(fn) {
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => { lines.push(a.join(' ')); };
+  try { await fn(); } finally { console.log = orig; }
+  return lines;
+}
+
+const mgr = (n = 2, extra = {}) => new AccountManager(Array.from({ length: n }, (_, i) => ({
+  name: `a${i + 1}`, type: 'oauth', accessToken: `t${i + 1}`, refreshToken: `r${i + 1}`, expiresAt: Date.now() + 3600_000,
+})), 0.9, extra);
+
+const TTFB = (am, i = 0) => am.markTransientFailure(i, 'UPSTREAM_TTFB', { network: true, scope: 'request' });
+const pick = (am, info) => { const l = am.acquireAccount({ profile: 'claude', ...info }); const name = l?.account?.name ?? null; if (l) am.releaseAccount(l); return name; };
+
+// ---------------------------------------------------------------- A: request-scoped faults
+
+for (const mode of ['sticky', 'balance']) {
+  const held = mode === 'sticky' ? { sessionKey: 'H' } : { affinityKey: 'H' };
+  const cold = mode === 'sticky' ? { sessionKey: 'N' } : { affinityKey: 'N' };
+
+  test(`A (${mode}): one request-scoped TTFB by ANOTHER request keeps held H on a1; only new placements skip a1`, () => {
+    const am = mgr(2, { routingMode: mode });
+    am.accounts[1].activeWeight = 30;   // a1 is the natural pick for ANY request
+    assert.equal(pick(am, held), 'a1', 'control: H is placed on a1');
+    assert.equal(pick(am, mode === 'sticky' ? { sessionKey: 'N0' } : { affinityKey: 'N0' }), 'a1', 'control: a cold pick lands on a1 too');
+    TTFB(am);
+    assert.equal(pick(am, held), 'a1', 'H stays on its account');
+    assert.equal(pick(am, cold), 'a2', 'a cold pick is deprioritised off a1');
+    assert.equal(am.accounts[0].consecutiveFailures, 0, 'no streak');
+    assert.ok(!am.accounts[0].cooldownUntil || am.accounts[0].cooldownUntil <= Date.now(), 'no account cooldown');
+    // The reviewer's probe: the account-scoped shape (old behaviour) evicts H.
+    const am2 = mgr(2, { routingMode: mode });
+    am2.accounts[1].activeWeight = 30;
+    assert.equal(pick(am2, held), 'a1');
+    am2.markTransientFailure(0, 'UPSTREAM_TTFB', { network: true });
+    assert.equal(pick(am2, held), 'a2', 'control: an account-scoped fault releases H');
+  });
+
+  test(`A (${mode}): 3 consecutive request-scoped faults escalate to an account fault (H released), logged once`, async () => {
+    const am = mgr(2, { routingMode: mode });
+    assert.equal(pick(am, held), 'a1');
+    const lines = await captureLog(() => { TTFB(am); TTFB(am); });
+    assert.equal(pick(am, held), 'a1', 'two in a row: still request-scoped');
+    assert.equal(lines.filter(l => l.includes('treating as an ACCOUNT fault')).length, 0);
+    const more = await captureLog(() => { TTFB(am); TTFB(am); });
+    assert.equal(pick(am, held), 'a2', 'third in a row: held conversation released');
+    assert.equal(more.filter(l => l.includes('request-scoped faults in a row') && l.includes('"a1"')).length, 1, more.join('\n'));
+    assert.ok(am.accounts[0].consecutiveFailures >= 1, 'escalation feeds the failures gate');
+  });
+
+  test(`A (${mode}): a success between request-scoped faults resets the count`, () => {
+    const am = mgr(2, { routingMode: mode });
+    assert.equal(pick(am, held), 'a1');
+    TTFB(am); TTFB(am);
+    const l = am.acquireAccount({ profile: 'claude', ...held });
+    assert.equal(l.account.name, 'a1');
+    am.releaseAccount(l, { success: true, status: 200 });
+    assert.equal(am.accounts[0].requestFaultStreak, 0, 'reset on success');
+    assert.equal(am.accounts[0].softCooldownUntil, null, 'success also ends the soft cooldown for new placements');
+    TTFB(am); TTFB(am);
+    assert.equal(pick(am, held), 'a1', 'the count restarted: 2 in a row, not 4');
+  });
+}
+
+test('A: a soft-cooled account is deprioritised, never benched — the only route still serves a cold pick', () => {
+  const am = mgr(1);
+  TTFB(am);
+  assert.equal(pick(am, { sessionKey: 'N' }), 'a1');
+});
+
+test('A: the retry-same hint is a held conversation — it keeps a soft-cooled a1 even with no affinity key', () => {
+  const am = mgr(2, { routingMode: 'balance' });
+  am.accounts[1].activeWeight = 30;
+  TTFB(am);
+  assert.equal(pick(am, {}), 'a2', 'control: a keyless cold pick skips a1');
+  assert.equal(pick(am, { retrySameAccountName: 'a1' }), 'a1');
+});
+
+test('A: the escalation line is logged once per RUN — a success re-arms it', async () => {
+  const am = mgr(2);
+  const l = am.acquireAccount({ profile: 'claude', sessionKey: 'S' }, new Set([1]));
+  assert.equal(l.account.name, 'a1');
+  const lines = await captureLog(() => {
+    TTFB(am); TTFB(am); TTFB(am); TTFB(am);
+    am.releaseAccount(l, { success: true, status: 200 });   // a1 answers a request in flight
+    TTFB(am); TTFB(am); TTFB(am);
+  });
+  assert.equal(lines.filter(l => l.includes('request-scoped faults in a row')).length, 2, lines.join('\n'));
+});
+
+test('A: the soft cooldown expires', () => {
+  const am = mgr(2, { routingMode: 'balance' });
+  TTFB(am);
+  am.accounts[0].softCooldownUntil = Date.now() - 1;
+  assert.equal(pick(am, { affinityKey: 'N' }), 'a1');
+});
+
+// ---------------------------------------------------------------- B: refusal reroute after the keep-alive
+
+const REFUSAL_SSE = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_r","model":"claude-opus-5","usage":{"input_tokens":0,"output_tokens":0}}}\n\n'
+  + 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"reasoning_extraction"}},"usage":{"output_tokens":0}}\n\n'
+  + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+const PROVIDER_SSE = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_p","model":"glm-5.3","usage":{"input_tokens":10,"output_tokens":0}}}\n\n'
+  + 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"provider answered"}}\n\n'
+  + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+
+for (const delay of [0, 1000]) {
+  test(`B: a refused streaming turn reroutes to the provider at upstream delay ${delay}ms (grace 300ms)`, async () => {
+    let call = 0;
+    const up = http.createServer((req, res) => {
+      req.resume();
+      call += 1;
+      const n = call;
+      const t = setTimeout(() => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(n === 1 ? REFUSAL_SSE : PROVIDER_SSE); }, n === 1 ? delay : 0);
+      res.on('close', () => clearTimeout(t));
+    });
+    const upPort = await listen(up);
+    const am = new AccountManager([
+      { name: 'anth1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
+      { name: 'glm1', type: 'provider', provider: 'zai', profiles: ['all'], accessToken: 'k', refreshToken: null, expiresAt: null, model: 'glm-5.3' },
+    ], 0.9, { routingMode: 'balance' });
+    am.accounts[1].activeWeight = 50;   // anth1 is the first pick
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false, streamForwardGraceMs: 300 } });
+    const port = await listen(proxy);
+    try {
+      let text = '';
+      const lines = await captureLog(async () => {
+        const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+          method: 'POST', headers: { 'content-type': 'application/json', 'x-maxpool-profile': 'all' },
+          body: JSON.stringify({ model: 'claude-opus-5', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+        });
+        text = await r.text();
+      });
+      assert.equal(call, 2, `rerouted once:\n${lines.join('\n')}`);
+      assert.ok(text.includes('provider answered'), text.slice(0, 300));
+      assert.ok(!text.includes('"refusal"'), 'the refusal never reaches the client');
+      if (delay > 0) assert.ok(text.indexOf('event: ping') >= 0 && text.indexOf('event: ping') < text.indexOf('msg_p'), 'the keep-alive had committed first');
+      assert.deepEqual(attempts(lines), ['[Maxpool] attempt failed (safeguard_refusal) on "anth1" — reasoning_extraction; rerouting to a provider → moved']);
+    } finally { await close(proxy); await close(up); }
+  });
+}
+
+// B (eligibility): a re-forward AFTER the keep-alive committed (529 on anth1 at 1s) must
+// still arm the refusal hold on anth2 — the eligibility latch reads real bytes, not headers.
+test('B: a refusal on the account a slow 529 moved to (keep-alive committed) still reroutes', async () => {
+  const hits = [];
+  const up = http.createServer((req, res) => {
+    req.resume();
+    const t = tok(req); hits.push(t);
+    if (t === 't1') {
+      const h = setTimeout(() => json(res, 529, { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }), 1000);
+      res.on('close', () => clearTimeout(h));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(t === 't2' ? REFUSAL_SSE : PROVIDER_SSE);
+  });
+  const upPort = await listen(up);
+  const am = new AccountManager([
+    { name: 'anth1', type: 'oauth', accessToken: 't1', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
+    { name: 'anth2', type: 'oauth', accessToken: 't2', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
+    { name: 'glm1', type: 'provider', provider: 'zai', profiles: ['all'], accessToken: 'k', refreshToken: null, expiresAt: null, model: 'glm-5.3' },
+  ], 0.9, { routingMode: 'balance' });
+  am.accounts[1].activeWeight = 20; am.accounts[2].activeWeight = 60;   // anth1 → anth2 → glm1
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false, streamForwardGraceMs: 300 } });
+  const port = await listen(proxy);
+  try {
+    let text = '';
+    const lines = await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-maxpool-profile': 'all' },
+        body: JSON.stringify({ model: 'claude-opus-5', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      text = await r.text();
+    });
+    assert.deepEqual(hits, ['t1', 't2', 'k'], lines.join('\n'));
+    assert.ok(text.includes('provider answered'), text.slice(0, 300));
+    assert.ok(!text.includes('"refusal"'));
+  } finally { await close(proxy); await close(up); }
+});
+
+// ---------------------------------------------------------------- D: first REAL body byte
+
+test('D: streamResponse never leaves the keep-alive running — an empty 2xx body stops it', async () => {
+  const { __serverTest } = await import('../src/server.js');
+  const { EventEmitter } = await import('node:events');
+  const sink = Object.assign(new EventEmitter(), { headersSent: true, destroyed: false, writableEnded: false,
+    writeHead() {}, write: () => true, end() { this.writableEnded = true; } });
+  const requestInfo = { stream: true, queueHeartbeatActive: true, queueHeartbeatTimer: setInterval(() => {}, 60_000).unref() };
+  const empty = new ReadableStream({ start(c) { c.close(); } });
+  await __serverTest.streamResponse(empty, sink, 200, {}, 0, mgr(1), null, requestInfo);
+  assert.equal(requestInfo.queueHeartbeatActive, false);
+  assert.equal(requestInfo.queueHeartbeatTimer, null);
+});
+
+for (const grace of [300, 20_000]) {
+  test(`D: upstream sends headers then dies before any body byte → moved to a2 (grace ${grace}ms)`, async () => {
+    const hits = [];
+    const up = http.createServer((req, res) => {
+      req.resume();
+      hits.push(tok(req));
+      if (tok(req) === 't1') {
+        const t = setTimeout(() => {
+          res.writeHead(200, { 'content-type': 'text/event-stream' });
+          res.flushHeaders();
+          setTimeout(() => req.socket.destroy(), 100);
+        }, 500);
+        res.on('close', () => clearTimeout(t));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_a2"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n');
+    });
+    const upPort = await listen(up);
+    const am = mgr(2);
+    const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false, streamForwardGraceMs: grace, heartbeatMs: 1000 } });
+    const port = await listen(proxy);
+    try {
+      let text = '';
+      const lines = await captureLog(async () => {
+        const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'claude-opus-5-5', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+        });
+        text = await r.text();
+      });
+      assert.deepEqual(hits, ['t1', 't2'], lines.join('\n'));
+      assert.ok(text.includes('msg_a2'), `${text.slice(0, 300)}\n${lines.join('\n')}`);
+      assert.ok(!text.includes('event: error'), text.slice(0, 300));
+      const a = attempts(lines);
+      assert.equal(a.length, 1, a.join('\n'));
+      assert.match(a[0], /on "a1" — transient after [\d.]+s → moved$/);
+    } finally { await close(proxy); await close(up); }
+  });
+}
+
+test('D (link): a held link stream keeps its keep-alive until the first real chunk, never after', async () => {
+  const STATUS = { accounts: [
+    { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
+    { name: 'personal', type: 'oauth', accountUuid: 'U2', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
+  ] };
+  let n = 0;
+  const remote = http.createServer((req, res) => {
+    if (req.url === '/maxpool/status') return json(res, 200, STATUS);
+    req.resume();
+    n += 1;
+    if (n <= 2) return json(res, 503, {}, { 'retry-after': '1' });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"type":"message_start"}\n\n');
+    const t = setTimeout(() => res.end('data: {"type":"message_stop"}\n\n'), 1500);
+    res.on('close', () => clearTimeout(t));
+  });
+  const remotePort = await listen(remote);
+  const upstream = http.createServer((req, res) => { res.writeHead(500); res.end('{}'); });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([], 0.9);
+  const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${remotePort}`, key: 'mp-max' });
+  await link.poll();
+  am.setPoolLinks([link]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: true, capacityMaxWaitMs: 8000, pollMs: 50, heartbeatMs: 1000 } });
+  const port = await listen(proxy);
+  try {
+    let text = '';
+    await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-opus-5-5', stream: true, messages: [] }) });
+      text = await r.text();
+    });
+    const firstReal = text.indexOf('data: {"type"');
+    assert.ok(firstReal > 0 && text.slice(0, firstReal).includes('event: ping'), `held first:\n${text.slice(0, 300)}`);
+    assert.ok(text.includes('message_stop'), text.slice(0, 300));
+    assert.ok(!text.slice(firstReal).includes('event: ping'), `no ping after the first real chunk:\n${text}`);
+  } finally { am.setPoolLinks([]); await close(proxy); await close(remote); await close(upstream); }
+});
+
+// ---------------------------------------------------------------- E: once-only give-up line
+
+test('E: a queue-ENABLED decline (window 0) prints exactly one surfaced line for the attempt', async () => {
+  const up = http.createServer((req, res) => { req.resume(); json(res, 429, { type: 'error', error: { type: 'rate_limit_error', message: 'limit' } }, { 'retry-after': '30' }); });
+  const upPort = await listen(up);
+  const proxy = createProxyServer(mgr(1), { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: true, nonStreamMaxWaitMs: 0, capacityMaxWaitMs: 0, maxWaitMs: 0, pollMs: 20 } });
+  const port = await listen(proxy);
+  try {
+    let status = 0;
+    const lines = await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-opus-5-5', messages: [] }) });
+      status = r.status; await r.text();
+    });
+    assert.equal(status, 429);
+    const final = lines.filter(l => /→ surfaced$/.test(l) && (l.startsWith('[Maxpool] attempt failed (') || l.startsWith('[Maxpool] hold gave up')));
+    assert.equal(final.length, 1, lines.join('\n'));
+  } finally { await close(proxy); await close(up); }
+});
+
+test('E: a non-streaming hold that commits then expires prints exactly one hold-gave-up line', async () => {
+  const up = http.createServer((req, res) => { req.resume(); json(res, 429, { type: 'error', error: { type: 'rate_limit_error', message: 'limit' } }, { 'retry-after': '30' }); });
+  const upPort = await listen(up);
+  const proxy = createProxyServer(mgr(1), { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: true, nonStreamMaxWaitMs: 600, capacityMaxWaitMs: 600, pollMs: 50 } });
+  const port = await listen(proxy);
+  try {
+    const lines = await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-opus-5-5', messages: [] }) });
+      await r.text();
+    });
+    assert.equal(lines.filter(l => l.startsWith('[Maxpool] hold gave up')).length, 1, lines.join('\n'));
+    assert.equal(lines.filter(l => /→ surfaced$/.test(l)).length, 1, lines.join('\n'));
+  } finally { await close(proxy); await close(up); }
+});
+
+// ---------------------------------------------------------------- F: link close listeners
+
+test('F: link hops detach their close listener — a 3-hop link chain leaves none behind', async () => {
+  const STATUS = { accounts: [
+    { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
+    { name: 'personal', type: 'oauth', accountUuid: 'U2', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
+  ] };
+  let n = 0;
+  const remote = http.createServer((req, res) => {
+    if (req.url === '/maxpool/status') return json(res, 200, STATUS);
+    req.resume();
+    n += 1;
+    if (n <= 2) { req.socket.destroy(); return; }
+    json(res, 200, { id: 'msg_link_ok' });
+  });
+  const remotePort = await listen(remote);
+  const upstream = http.createServer((req, res) => { res.writeHead(500); res.end('{}'); });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([], 0.9);
+  const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${remotePort}`, key: 'mp-max' });
+  await link.poll();
+  am.setPoolLinks([link]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: true, capacityMaxWaitMs: 8000, networkMaxWaitMs: 60_000, pollMs: 50 } });
+  let atStart = -1; let atFinish = -1;
+  proxy.on('request', (_req, res) => {
+    atStart = res.listenerCount('close');
+    res.on('finish', () => { atFinish = res.listenerCount('close'); });
+  });
+  const port = await listen(proxy);
+  try {
+    let text = '';
+    await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-opus-5-5', stream: true, messages: [] }) });
+      text = await r.text();
+    });
+    assert.ok(text.includes('msg_link_ok'), text.slice(0, 200));
+    assert.equal(n, 3, 'three link hops');
+    // Only the serving hop's own listener may still be attached when the body finishes.
+    assert.ok(atFinish <= atStart + 1, `close listeners: start=${atStart} finish=${atFinish}`);
+  } finally { am.setPoolLinks([]); await close(proxy); await close(remote); await close(upstream); }
+});
+
+// ---------------------------------------------------------------- repaired branch (B10)
+
+test('repaired: an mcp_tool_use id colliding with a client tool_use (GLM call_N counters) reaches the transcript repair', async () => {
+  // collectForeignServerToolIds drops the colliding id, so the up-front strip never
+  // runs; Anthropic rejects the mcp tag with the plain-API wording → the repair branch.
+  const bodies = [];
+  const up = http.createServer((req, res) => {
+    let b = ''; req.on('data', c => { b += c; });
+    req.on('end', () => {
+      bodies.push(b);
+      if (b.includes('mcp_tool_use')) {
+        return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: "messages.1.content.2: Input tag 'mcp_tool_use' found using 'type' does not match any of the expected tags: 'text', 'tool_use', 'server_tool_use', 'thinking'" } });
+      }
+      json(res, 200, { id: 'msg_ok', type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } });
+    });
+  });
+  const upPort = await listen(up);
+  const proxy = createProxyServer(mgr(1), { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const port = await listen(proxy);
+  const reqBody = { model: 'claude-opus-5-5', max_tokens: 16, messages: [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: [
+      { type: 'thinking', thinking: 'plan', signature: 'c2ln' },
+      { type: 'tool_use', id: 'call_0', name: 'Read', input: {} },
+      { type: 'mcp_tool_use', id: 'call_0', name: 'search', server_name: 'docs', input: {} },
+    ] },
+    { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'call_0', content: 'ok' },
+      { type: 'mcp_tool_result', tool_use_id: 'call_0', content: [] },
+    ] },
+  ] };
+  try {
+    const lines = await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(reqBody) });
+      await r.text();
+    });
+    const a = attempts(lines);
+    assert.ok(a.includes('[Maxpool] attempt failed (transcript_rejected) on "a1" — removed 1 thinking / converted 0 tool block(s) → repaired'), lines.join('\n'));
+    assert.ok(bodies.length >= 2 && !bodies[1].includes('"thinking"'), 'the retry carried the repaired body');
+  } finally { await close(proxy); await close(up); }
+});

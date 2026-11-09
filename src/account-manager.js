@@ -4,6 +4,9 @@ import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 
+// Review r2 A: consecutive request-scoped faults before they count against the account.
+const REQUEST_FAULT_ESCALATE = 3;
+
 // Nominal window length per kind — mirrors capacity-ledger's WINDOW_MS (kept here as a
 // local table so account-manager does not import a private constant).
 const WINDOW_MS_BY_KIND = { ses: 5 * 3600_000, wk: 7 * 86400_000 };
@@ -1102,6 +1105,10 @@ export class AccountManager {
     if (outcome.success) {
       account.completedRequests++;
       account.consecutiveFailures = 0;
+      // Review r2 A: any success ends a request-scoped fault run.
+      account.requestFaultStreak = 0;
+      account.requestFaultEscalated = false;
+      account.softCooldownUntil = null;
       account.providerRateLimitStreak = 0;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
@@ -1190,6 +1197,21 @@ export class AccountManager {
     // `maxed` tag, so "maxed" renders iff the model is actually benched.
     const exhausted = e.utilization != null && e.utilization >= this.scheduler.weeklyExhaustedThreshold;
     return exhausted ? { resetAt: e.resetAt || null, family: fam } : null;
+  }
+
+  /** Review r2 A: inside a request-scoped soft cooldown (new placements only). */
+  _softCooling(account, now = Date.now()) {
+    return Boolean(account.softCooldownUntil && now < account.softCooldownUntil);
+  }
+
+  /** Does `account` already hold this request's conversation (so a soft cooldown must
+   *  not move it)? The one-shot retry-same hint, or the last account for the affinity
+   *  key (which falls back to the sessionKey, so a sticky binding is covered). A
+   *  return-home target needs no clause: homeCand is captured before the skip. */
+  _holdsRequest(account, requestInfo = {}) {
+    if (requestInfo.retrySameAccountName === account.name) return true;
+    const key = this._affinityKey(requestInfo);
+    return Boolean(key && this.conversationLastAccount.get(key) === account.name);
   }
 
   _isAvailable(account, options = {}) {
@@ -2378,6 +2400,7 @@ export class AccountManager {
       bestScore = Infinity;
       bestPriority = Infinity;
       let homeCand = null;   // the home account as a candidate THIS pass, scored as holder
+      let coolBest = null;   // best soft-cooled account (review r2 A): used only if nothing else fits
 
       for (let i = 0; i < this.accounts.length; i++) {
         const idx = (this.nextIndex + i) % this.accounts.length;
@@ -2397,12 +2420,30 @@ export class AccountManager {
           homeCand = { account, priority, critUnlock,
             score: this._scoreAccount(account, requestInfo, scoringCtx, critUnlock, home.name) };
         }
+        // REQUEST-SCOPED SOFT COOLDOWN (review r2 A): after a request-scoped first-byte
+        // timeout the account is deprioritised for NEW placements only — a cold pick
+        // takes it last. A conversation it HOLDS (_holdsRequest) is not touched:
+        // evicting those is exactly what a request-scoped fault must never do.
+        if (this._softCooling(account, now) && !this._holdsRequest(account, requestInfo)) {
+          if (!coolBest || priority < coolBest.priority || (priority === coolBest.priority && score < coolBest.score)) {
+            coolBest = { account, priority, score, critUnlock };
+          }
+          continue;
+        }
         if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
           bestPriority = priority;
           bestScore = score;
           best = account;
           if (critUnlock) bestUnlockMap.set(account.name, critUnlock); else bestUnlockMap.delete(account.name);
         }
+      }
+
+      // Deprioritised, never benched: with no other candidate, the soft-cooled one serves.
+      if (!best && coolBest) {
+        best = coolBest.account;
+        bestPriority = coolBest.priority;
+        bestScore = coolBest.score;
+        if (coolBest.critUnlock) bestUnlockMap.set(best.name, coolBest.critUnlock); else bestUnlockMap.delete(best.name);
       }
 
       // RETURN HOME: only once this pass already picked a Claude account — a provider
@@ -2417,7 +2458,7 @@ export class AccountManager {
           homeNote = `home=${home.name}:returned`;
         } else if (home.stale) {
           homeNote = `home=${home.name}:skipped(stale-${Math.round(home.ageMs / 60_000)}m)`;
-        } else if (homeCand && homeCand.priority <= bestPriority && homeCand.score < bestScore) {
+        } else if (homeCand && homeCand.priority === bestPriority && homeCand.score < bestScore) {   // home is in the same loop: its priority is never below the pick's
           best = homeCand.account;
           homeSwitched = true;
           if (homeCand.critUnlock) bestUnlockMap.set(best.name, homeCand.critUnlock); else bestUnlockMap.delete(best.name);
@@ -3339,7 +3380,7 @@ export class AccountManager {
     if (!home || home.name === this.conversationLastAccount.get(key)) return null;
     const ageMs = now - home.at;
     let windowMs = Number(this.scheduler.cacheAffinityReturnWindowMs);
-    if (!Number.isFinite(windowMs) || windowMs < 0) windowMs = 3_600_000;
+    if (!Number.isFinite(windowMs) || windowMs < 0) windowMs = DEFAULT_SCHEDULER.cacheAffinityReturnWindowMs;
     return { name: home.name, stale: ageMs > windowMs, ageMs };
   }
 
@@ -4731,9 +4772,34 @@ export class AccountManager {
     console.log(`[Maxpool] Account "${account.name}" disabled after HTTP ${status} (${reason})`);
   }
 
-  markTransientFailure(accountIndex, reason = 'transient_error', { network = false } = {}) {
+  markTransientFailure(accountIndex, reason = 'transient_error', { network = false, scope = 'account' } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+
+    // REQUEST-SCOPED (review r2 A): a first-byte/idle timeout on ONE request says nothing
+    // about the account's other conversations. Deprioritise it for new placements only
+    // (softCooldownUntil — held conversations keep it), and count consecutive request-
+    // scoped faults. REQUEST_FAULT_ESCALATE in a row (no success between) is no longer
+    // "one slow request": escalate to the account-scoped shape below (real cooldown +
+    // failure streak → held conversations released), logged once per run.
+    if (network && scope === 'request') {
+      account.failedRequests++;
+      account.lastError = reason;
+      account.lastErrorAt = Date.now();
+      account.requestFaultStreak = (account.requestFaultStreak || 0) + 1;
+      if (account.requestFaultStreak < REQUEST_FAULT_ESCALATE) {
+        account.softCooldownUntil = Date.now() + this.scheduler.networkCooldownMs;
+        console.log(`[Maxpool] Account "${account.name}" deprioritised for new placements for ${Math.ceil(this.scheduler.networkCooldownMs / 1000)}s after ${reason} (request-scoped ${account.requestFaultStreak}/${REQUEST_FAULT_ESCALATE}; held conversations stay)`);
+        return;
+      }
+      account.consecutiveFailures++;
+      account.cooldownUntil = Date.now() + this.scheduler.networkCooldownMs;
+      if (!account.requestFaultEscalated) {
+        account.requestFaultEscalated = true;
+        console.log(`[Maxpool] Account "${account.name}": ${account.requestFaultStreak} request-scoped faults in a row (${reason}) — treating as an ACCOUNT fault: cooling down ${Math.ceil(this.scheduler.networkCooldownMs / 1000)}s, held conversations released`);
+      }
+      return;
+    }
 
     if (network) {
       // A network-class failure (lost connectivity / token-refresh `fetch failed`)
