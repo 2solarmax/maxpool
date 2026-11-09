@@ -367,26 +367,40 @@ test('F: link hops detach their close listener — a 3-hop link chain leaves non
   } finally { am.setPoolLinks([]); await close(proxy); await close(remote); await close(upstream); }
 });
 
-// ---------------------------------------------------------------- repaired branch (B10)
+// ---------------------------------------------------------------- post-rejection repair (coordinator 2026-11-09)
 
-test('repaired: an mcp_tool_use id colliding with a client tool_use (GLM call_N counters) reaches the transcript repair', async () => {
-  // collectForeignServerToolIds drops the colliding id, so the up-front strip never
-  // runs; Anthropic rejects the mcp tag with the plain-API wording → the repair branch.
+const MCP_WORDING = "messages.1.content.2: Input tag 'mcp_tool_use' found using 'type' does not match any of the expected tags: 'text', 'tool_use', 'server_tool_use', 'thinking'";
+
+async function mcpRig(messages, session) {
   const bodies = [];
   const up = http.createServer((req, res) => {
     let b = ''; req.on('data', c => { b += c; });
     req.on('end', () => {
       bodies.push(b);
-      if (b.includes('mcp_tool_use')) {
-        return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: "messages.1.content.2: Input tag 'mcp_tool_use' found using 'type' does not match any of the expected tags: 'text', 'tool_use', 'server_tool_use', 'thinking'" } });
-      }
+      if (b.includes('mcp_tool_use')) return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: MCP_WORDING } });
       json(res, 200, { id: 'msg_ok', type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } });
     });
   });
   const upPort = await listen(up);
-  const proxy = createProxyServer(mgr(1), { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const am = mgr(1);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
   const port = await listen(proxy);
-  const reqBody = { model: 'claude-opus-5-5', max_tokens: 16, messages: [
+  try {
+    let status = 0; let text = '';
+    const lines = await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-maxpool-session': session }, body: JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 16, messages }) });
+      status = r.status; text = await r.text();
+    });
+    return { am, bodies, lines, status, text };
+  } finally { await close(proxy); await close(up); }
+}
+
+test('repair: nothing convertible (GLM call_N id collides with a client tool_use; valid Claude thinking) → no retry, no session mark, the original 400 surfaced', async () => {
+  // collectForeignServerToolIds drops the colliding id, so neither the up-front strip
+  // nor the post-rejection repair can convert it; stripping the thinking cannot cure an
+  // mcp-tag 400. Before this fix: removed the thinking, retried into the same 400 and
+  // latched the session to strip thinking on every later turn.
+  const { am, bodies, lines, status, text } = await mcpRig([
     { role: 'user', content: 'hi' },
     { role: 'assistant', content: [
       { type: 'thinking', thinking: 'plan', signature: 'c2ln' },
@@ -397,14 +411,27 @@ test('repaired: an mcp_tool_use id colliding with a client tool_use (GLM call_N 
       { type: 'tool_result', tool_use_id: 'call_0', content: 'ok' },
       { type: 'mcp_tool_result', tool_use_id: 'call_0', content: [] },
     ] },
-  ] };
-  try {
-    const lines = await captureLog(async () => {
-      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(reqBody) });
-      await r.text();
-    });
-    const a = attempts(lines);
-    assert.ok(a.includes('[Maxpool] attempt failed (transcript_rejected) on "a1" — removed 1 thinking / converted 0 tool block(s) → repaired'), lines.join('\n'));
-    assert.ok(bodies.length >= 2 && !bodies[1].includes('"thinking"'), 'the retry carried the repaired body');
-  } finally { await close(proxy); await close(up); }
+  ], 'sess-collide');
+  assert.equal(bodies.length, 1, `one upstream call, no identical retry:\n${lines.join('\n')}`);
+  assert.equal(status, 400);
+  assert.ok(text.includes("Input tag 'mcp_tool_use'"), 'the original upstream 400 body');
+  assert.equal(am.isSessionThinkingContaminated('sess-collide'), false, 'session left unmarked');
+  assert.deepEqual(attempts(lines), ['[Maxpool] attempt failed (transcript_rejected) on "a1" — Anthropic rejected the transcript; nothing convertible to repair → surfaced']);
+});
+
+test('repair: a convertible foreign mcp pair is converted (thinking + tools) and served on Claude in ONE call — never a rejected round-trip', async () => {
+  // The converted>0 case: detectTranscriptOrigin flags exactly the converter's id set,
+  // so the up-front strip converts it before the first send.
+  const { bodies, status, lines } = await mcpRig([
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: [
+      { type: 'thinking', thinking: 'glm plan', signature: 'glmhex' },
+      { type: 'mcp_tool_use', id: 'call_7', name: 'search', server_name: 'docs', input: {} },
+    ] },
+    { role: 'user', content: [{ type: 'mcp_tool_result', tool_use_id: 'call_7', content: [{ type: 'text', text: 'r' }] }, { type: 'text', text: 'next' }] },
+  ], 'sess-conv');
+  assert.equal(status, 200, lines.join('\n'));
+  assert.equal(bodies.length, 1);
+  assert.ok(!bodies[0].includes('mcp_tool_use'), 'converted before the first send');
+  assert.deepEqual(attempts(lines), []);
 });

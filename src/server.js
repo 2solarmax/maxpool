@@ -1910,7 +1910,11 @@ async function forwardRequest(
           && /(does not match any of the expected tags|without a corresponding)/i.test(errorBody);
       if (anthropicIncompat && incompatRepairable && !requestInfo.incompatRepairTried && canRepairBody) {
         const repaired = stripForeignThinkingBlocks(body);
-        if (repaired.body) {
+        // Retry ONLY when a foreign tool block was converted (review r2, coordinator
+        // 2026-11-09). These 400s are about mcp/server-tool tags, never thinking: with
+        // nothing converted the retry is a guaranteed identical 400, and the latch below
+        // would strip the session's valid Claude thinking on every later turn for nothing.
+        if (repaired.body && repaired.converted > 0) {
           // Latch the pre-strip sticky so the NEXT turn repairs up front instead of
           // re-paying this rejected round-trip every turn (the client resends the whole
           // poisoned history each turn — same cache-churn the audit is about).
@@ -2031,6 +2035,11 @@ async function forwardRequest(
         return;
       }
 
+      if (anthropicIncompat && incompatRepairable) {
+        logFailedAttempt(account.name, 'transcript_rejected', requestInfo.incompatRepairTried
+          ? 'Anthropic still rejected the repaired transcript'
+          : 'Anthropic rejected the transcript; nothing convertible to repair', 'surfaced');
+      }
       ctx.status = upstreamRes.status;
       sendErrorBody(res, requestInfo, upstreamRes.status, errorBody, upstreamRes.headers);
       return;

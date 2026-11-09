@@ -59,12 +59,15 @@ test('F2: mcp-contaminated session never sends a poisoned body — turn 1 pre-st
   } finally { await close(proxy); await close(upstream); }
 });
 
-test('F2 backstop: an UNPREDICTED mcp 400 (e.g. nested shape) is repaired before pinning and latched — turn 2 one call', async () => {
+test('F2 backstop: an UNPREDICTED mcp 400 with nothing convertible is NOT retried or latched — the 400 surfaces once per turn', async () => {
   // Hide the mcp block from detectTranscriptOrigin's walk by nesting it under a key the
   // walker never visits — a stand-in for any future shape the forecast misses. The
   // upstream still rejects it, so this exercises the REACTIVE repair-before-pin branch.
-  // Here the reactive repair can't convert the hidden block either, so this test pins
-  // the OTHER half: the latch + the "pin only when the repair finds nothing" fallthrough.
+  // Here the reactive repair can't convert the hidden block either. Since review r2
+  // (coordinator 2026-11-09) that means NO retry and NO latch: stripping thinking cannot
+  // cure an mcp-tag 400, so the retry was a guaranteed identical 400 and the latch only
+  // degraded every later turn. (This fixture's upstream also rejects on "thinking" — a
+  // mock convenience; the real mcp 400 is about the tag, not the thinking.)
   let calls = 0;
   const upstream = http.createServer((req, res) => {
     let b = ''; req.on('data', c => b += c); req.on('end', () => {
@@ -93,12 +96,12 @@ test('F2 backstop: an UNPREDICTED mcp 400 (e.g. nested shape) is repaired before
   });
   try {
     const c0 = calls; const r1 = await post(msgs);
-    assert.equal(r1.status, 200, 'turn 1 healed on Claude, not pinned');
-    assert.equal(calls - c0, 2, 'turn 1: one 400, one repaired retry');
-    assert.ok(am.isSessionThinkingContaminated('f2b'), 'repair-before-pin latched the up-front pre-strip');
+    assert.equal(r1.status, 400, 'turn 1: the original 400 surfaces');
+    assert.equal(calls - c0, 1, 'turn 1: one call — no identical retry');
+    assert.equal(am.isSessionThinkingContaminated('f2b'), false, 'no latch: later turns keep their thinking');
     assert.equal(am._effectiveIncompatible({ sessionKey: 'f2b' }).incompatible, false, 'session was NOT pinned provider-only');
     const c1 = calls; const r2 = await post([...msgs, { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, { role: 'user', content: [{ type: 'text', text: 'more' }] }]);
-    assert.equal(r2.status, 200);
-    assert.equal(calls - c1, 1, 'turn 2: repaired up front — exactly ONE upstream call');
+    assert.equal(r2.status, 400);
+    assert.equal(calls - c1, 1, 'turn 2: one call, body untouched (nothing latched)');
   } finally { await close(proxy); await close(upstream); }
 });
