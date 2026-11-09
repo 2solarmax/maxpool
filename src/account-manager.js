@@ -926,6 +926,9 @@ export class AccountManager {
       : null;
     requestInfo.returnedHome = null;   // set by the selection loop when it sends the turn home
     const account = this.getActiveAccount(requestInfo, excludedIndexes);
+    // The D3 retry-same hint is good for exactly ONE acquire, honored or not — a stale
+    // hint would pull a later failover hop back onto the account it just left.
+    requestInfo.retrySameAccountName = null;
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
@@ -2309,6 +2312,22 @@ export class AccountManager {
         && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
         this.currentIndex = pinned.index;
         return pinned;
+      }
+    }
+
+    // D3 retry-same hint (one hop, set by server.js after a first-byte timeout on a big
+    // prompt): re-pick the account that just timed out — its stored copy of the prompt
+    // is warm there. A HINT, not a lease bypass (P1): it passes the same fairness gate
+    // (_matchesRequest: queue waiters ahead → refused) and availability check (in-flight
+    // cap, cooldown, rate limit) as any pick, and falls through to normal selection when
+    // either refuses. The caller clears it after this acquire.
+    if (requestInfo.retrySameAccountName) {
+      const same = this.accounts.find(a => a.name === requestInfo.retrySameAccountName);
+      if (same && !excludedIndexes.has(same.index)
+        && this._matchesRequest(same, profile, requestInfo)
+        && this._isAvailable(same, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
+        this.currentIndex = same.index;
+        return same;
       }
     }
 
