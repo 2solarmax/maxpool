@@ -677,11 +677,29 @@ test('RETURN HOME spread: 20 detoured conversations sharing one home stay within
   const shallowest = Math.min(...claude.slice(1).map(a => a.activeWeight));
   const bound = m.scheduler.cacheAffinityMaxExtraDepth + TURN;
   assert.ok(home.activeWeight - shallowest <= bound, `home depth ${home.activeWeight} vs shallowest ${shallowest}: ${JSON.stringify(dist(leases))}`);
-  assert.ok(leases.filter(l => l.returnedHome).length >= 2, `some went home: ${JSON.stringify(dist(leases))}`);
+  // Natural rotation over 8 equal accounts lands on home by itself, so count only the
+  // turns the return-home SWITCH put there — the cap must hold against those.
+  assert.ok(leases.filter(l => l.returnedHomeSwitched).length >= 1, `switch moved some home: ${JSON.stringify(dist(leases))}`);
   const homeLease = leases.find(l => l.returnedHome);
   const logs = captureLogs(() => m.releaseAccount(homeLease, { status: 429, error: 'rate_limited' }));
   assert.ok(logs.some(l => new RegExp(`^\\[Maxpool\\] return-home lease throttled \\(429 rate_limited, (switched|natural)\\): ${home.name} depth=\\d+$`).test(l)), logs.join(' | '));
   leases.filter(l => l !== homeLease).forEach(release);
+});
+
+test('RETURN HOME throttle line tags a pool-wide throttle so it is not blamed on home depth', () => {
+  const m = detourMgr();
+  const line = (outcome) => {
+    detour(m); // each return needs a fresh GLM detour — the previous return made a2 the last account
+    const { lease } = returnTurn(m);
+    assert.ok(lease.returnedHome, 'went home');
+    return captureLogs(() => m.releaseAccount(lease, outcome)).find(l => l.includes('return-home lease throttled')) || '';
+  };
+  // Pool-wide throttle (server markUpstreamThrottled path): tagged.
+  assert.match(line({ status: 429, error: 'upstream_throttled', upstreamThrottled: true, neutral: true }),
+    /^\[Maxpool\] return-home lease throttled \(429 upstream_throttled pool-wide, (switched|natural)\): a2 depth=\d+$/);
+  // Per-account throttle (markProvisionalUpstreamFailure path): NOT tagged — it counts against home.
+  assert.match(line({ status: 429, error: 'upstream_throttled', neutral: true }),
+    /^\[Maxpool\] return-home lease throttled \(429 upstream_throttled, (switched|natural)\): a2 depth=\d+$/);
 });
 
 test('RETURN HOME with degraded conversation identity (per-terminal key) still goes home, capped', () => {

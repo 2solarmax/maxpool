@@ -1067,7 +1067,10 @@ export class AccountManager {
     // Owner's throttling constraint: make any throttle on a return-home turn countable,
     // and say whether the switch (vs the loop's own pick) put the turn on home.
     if (lease.returnedHome && (outcome.status === 429 || (outcome.status === 503 && account.remote)) && outcome.error !== 'request_shape_refused') {
-      console.log(`[Maxpool] return-home lease throttled (${outcome.status} ${outcome.error || '-'}, ${lease.returnedHomeSwitched ? 'switched' : 'natural'}): ${account.name} depth=${depthBefore}`);
+      // A pool-wide throttle (markUpstreamThrottled) is not about home's depth — tag it so
+      // the post-release count can leave it out.
+      const scope = outcome.upstreamThrottled ? ' pool-wide' : '';
+      console.log(`[Maxpool] return-home lease throttled (${outcome.status} ${outcome.error || '-'}${scope}, ${lease.returnedHomeSwitched ? 'switched' : 'natural'}): ${account.name} depth=${depthBefore}`);
     }
 
     if (lease.upstreamThrottleProbe) {
