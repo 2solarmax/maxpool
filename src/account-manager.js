@@ -2458,11 +2458,19 @@ export class AccountManager {
           homeNote = `home=${home.name}:returned`;
         } else if (home.stale) {
           homeNote = `home=${home.name}:skipped(stale-${Math.round(home.ageMs / 60_000)}m)`;
-        } else if (homeCand && homeCand.priority === bestPriority && homeCand.score < bestScore) {   // home is in the same loop: its priority is never below the pick's
+        } else if (homeCand && homeCand.priority <= bestPriority && homeCand.score < bestScore) {
+          // `<=`, not `===`: a soft-cooled HOME is skipped from the best-pick above but
+          // still recorded in homeCand — home at equal-or-better priority wins even then
+          // (review r3 R3-5: soft-cooldown must never override return-home).
           best = homeCand.account;
           homeSwitched = true;
           if (homeCand.critUnlock) bestUnlockMap.set(best.name, homeCand.critUnlock); else bestUnlockMap.delete(best.name);
           homeNote = `home=${home.name}:returned`;
+        } else if (homeCand && this._softCooling(homeCand.account, now)) {
+          // R3-5: a soft-cooled home that did NOT win as holder: name the soft cooldown
+          // (it kept home out of the best-pick) instead of an `outscored:` line computed
+          // as if home had competed there.
+          homeNote = `home=${home.name}:skipped(soft-cooled;${homeCand.priority > bestPriority ? 'priority-tier' : `holder-score ${homeCand.score.toFixed(1)}>=pick ${bestScore.toFixed(1)}`})`;
         } else {
           let why = 'unknown';
           try { why = this._moveReason(home.name, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(best.name) || null, now, true); } catch (e) { why = `error:${e.message}`; }

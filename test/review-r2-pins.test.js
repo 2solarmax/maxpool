@@ -435,3 +435,131 @@ test('repair: a convertible foreign mcp pair is converted (thinking + tools) and
   assert.ok(!bodies[0].includes('mcp_tool_use'), 'converted before the first send');
   assert.deepEqual(attempts(lines), []);
 });
+
+// ================================================================ review round 3
+
+test('R3-1: a stalled non-streaming body is request-scoped like TTFB/IDLE; resets/DNS stay account-scoped', async () => {
+  const { __serverTest } = await import('../src/server.js');
+  const f = __serverTest.isRequestScopedTimeout;
+  for (const code of ['UPSTREAM_TTFB', 'UPSTREAM_IDLE', 'UPSTREAM_BODY']) assert.equal(f({ code }), true, code);
+  for (const code of ['ECONNRESET', 'ENOTFOUND', 'UND_ERR_SOCKET', undefined]) assert.equal(f({ code }), false, String(code));
+});
+
+test('R3-2: direct path — no ping after the first real chunk, none inside a partial event (heartbeat-committed, late first chunk)', async () => {
+  const MS = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_x","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+    + 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n';
+  const up = http.createServer((req, res) => {
+    req.resume();
+    const timers = [];
+    timers.push(setTimeout(() => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders(); }, 600));
+    timers.push(setTimeout(() => res.write(MS), 1800));                                                  // late first real chunk
+    timers.push(setTimeout(() => res.write('event: content_block_delta\ndata: {"type":"content_block_d'), 2000));  // partial event
+    timers.push(setTimeout(() => res.write('elta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'), 4500));
+    timers.push(setTimeout(() => res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n'), 7000));
+    res.on('close', () => timers.forEach(clearTimeout));
+  });
+  const upPort = await listen(up);
+  const proxy = createProxyServer(mgr(1), { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false, streamForwardGraceMs: 200, heartbeatMs: 1000 } });
+  const port = await listen(proxy);
+  try {
+    let text = '';
+    await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-opus-5-5', stream: true, messages: [{ role: 'user', content: 'hi' }] }) });
+      text = await r.text();
+    });
+    const firstReal = text.indexOf('event: message_start');
+    assert.ok(firstReal > 0 && text.slice(0, firstReal).includes('event: ping'), `keep-alive committed first:\n${text.slice(0, 200)}`);
+    assert.ok(text.includes('message_stop'), text);
+    assert.equal((text.slice(firstReal).match(/event: ping/g) || []).length, 0, `no ping after the first real chunk:\n${text}`);
+    assert.ok(text.includes('{"type":"content_block_delta","index":0'), 'the split event arrives whole');
+    // E07: a stray stream-forward grace timer must not survive the body loop — it would
+    // fire after the stream ended, see headersSent and tear down bookkeeping. Wait out
+    // the grace window: no late ping may arrive.
+    await new Promise(r => setTimeout(r, 2500));
+    assert.equal((text.slice(firstReal).match(/event: ping/g) || []).length, 0, `no late grace-timer ping:\n${text}`);
+  } finally { await close(proxy); await close(up); }
+});
+
+test('R3-3: a link that answers headers then goes silent is cut at the link idle bound and the conversation moves', async () => {
+  const STATUS = { accounts: [
+    { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
+    { name: 'personal', type: 'oauth', accountUuid: 'U2', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
+  ] };
+  let n = 0;
+  const remote = http.createServer((req, res) => {
+    if (req.url === '/maxpool/status') return json(res, 200, STATUS);
+    req.resume();
+    n += 1;
+    if (n === 1) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders(); return; }   // headers, then silence
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_row2"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n');
+  });
+  const remotePort = await listen(remote);
+  const upstream = http.createServer((req, res) => { res.writeHead(500); res.end('{}'); });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([], 0.9);
+  const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${remotePort}`, key: 'mp-max' });
+  await link.poll();
+  am.setPoolLinks([link]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false, streamForwardGraceMs: 200, heartbeatMs: 1000 } });
+  const port = await listen(proxy);
+  const prev = process.env.MAXPOOL_LINK_IDLE_MS;
+  process.env.MAXPOOL_LINK_IDLE_MS = '2500';
+  try {
+    let text = ''; const t0 = Date.now(); let elapsed = 0;
+    const lines = await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-opus-5-5', stream: true, messages: [] }) });
+      text = await r.text(); elapsed = Date.now() - t0;
+    });
+    assert.equal(n, 2, lines.join('\n'));
+    assert.ok(text.includes('msg_row2'), `${text.slice(0, 300)}\n${lines.join('\n')}`);
+    assert.ok(elapsed >= 2300 && elapsed < 8000, `cut at the bound, not undici's 300s: ${elapsed}ms`);
+    const firstReal = text.indexOf('event: message_start');
+    assert.ok(text.slice(0, firstReal).includes('event: ping'), 'pings while waiting');
+    assert.ok(!text.slice(firstReal).includes('event: ping'), 'no ping after the real body');
+    const a = attempts(lines);
+    assert.equal(a.length, 1, a.join('\n'));
+    assert.match(a[0], /\(link_idle\) on ".* ☁" — HTTP 200 after [\d.]+s \(link body idle timeout\) → moved$/);
+    assert.deepEqual(am.accounts.map(x => x.inFlight), am.accounts.map(() => 0), 'every lease released');
+  } finally {
+    if (prev === undefined) delete process.env.MAXPOOL_LINK_IDLE_MS; else process.env.MAXPOOL_LINK_IDLE_MS = prev;
+    am.setPoolLinks([]); await close(proxy); await close(remote); await close(upstream);
+  }
+});
+
+// R3-5: a soft-cooled HOME at better priority still wins return-home.
+function homeRig(prio) {
+  const m = new AccountManager(['a1', 'a2'].map(n => ({ name: n, type: 'oauth', accessToken: n, refreshToken: n, expiresAt: Date.now() + 3600_000 })), 0.9,
+    { routingMode: 'balance', crossProviderFallbackPolicy: 'always' });
+  m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
+  const ri = { sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 10_000, profile: 'all' };
+  const by = n => m.accounts.find(a => a.name === n);
+  m._noteConversationAccount(ri, by('a1'));
+  m._noteConversationAccount(ri, by('glm'));          // a GLM detour: home is a1
+  const base = m._effectivePriority.bind(m);
+  m._effectivePriority = (acc, r, now) => (acc.name === 'a1' ? prio.a1 : acc.name === 'a2' ? prio.a2 : base(acc, r, now));
+  m.markTransientFailure(by('a1').index, 'UPSTREAM_TTFB', { network: true, scope: 'request' });   // home soft-cooled
+  return { m, ri, glm: by('glm') };
+}
+
+test('R3-5: home a1 (priority 0, soft-cooled) vs a2 (priority 1) → the turn returns home, switched', () => {
+  const { m, ri, glm } = homeRig({ a1: 0, a2: 1 });
+  let lease;
+  const logs = []; const orig = console.log; console.log = (...a) => logs.push(a.join(' '));
+  try { lease = m.acquireAccount(ri, new Set([glm.index])); } finally { console.log = orig; }
+  assert.equal(lease.account.name, 'a1', logs.join('\n'));
+  assert.equal(lease.returnedHome, true);
+  assert.equal(lease.returnedHomeSwitched, true);
+});
+
+test('R3-5: a soft-cooled home that cannot win names the soft cooldown — never an outscored line', () => {
+  const { m, ri, glm } = homeRig({ a1: 2, a2: 1 });
+  let lease;
+  const logs = []; const orig = console.log; console.log = (...a) => logs.push(a.join(' '));
+  try { lease = m.acquireAccount(ri, new Set([glm.index])); } finally { console.log = orig; }
+  assert.equal(lease.account.name, 'a2');
+  const line = logs.find(l => l.includes('home=a1:')) || '';
+  assert.match(line, /home=a1:skipped\(soft-cooled;priority-tier\)/, logs.join('\n'));
+  assert.ok(!line.includes('outscored'), line);
+});

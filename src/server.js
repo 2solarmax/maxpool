@@ -1056,21 +1056,58 @@ async function forwardRequest(
       }
       const outHeaders = {};
       upRes.headers.forEach((v, k) => { if (!HOP_BY_HOP_HEADERS.has(k) && k !== 'content-length' && k !== 'transfer-encoding') outHeaders[k] = v; });
-      if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
+      // A streaming 2xx defers its headers to the FIRST REAL CHUNK (review r3 R3-3, same
+      // rule as D on the direct path): until then the client holds no real bytes, so a
+      // link that answers headers and then stalls can still fail over; the grace timer
+      // re-arms (deadline anchored once per request) so a slow body still gets pings.
+      const deferHead = requestInfo.stream && upRes.status < 300 && upRes.body
+        && /event-stream/i.test(upRes.headers.get('content-type') || '');
+      let bodyGraceTimer = null;
+      if (deferHead) bodyGraceTimer = armStreamForwardGrace(res, requestInfo, queueConfig, accountManager);
+      else if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
       if (upRes.body) {
         const reader = upRes.body.getReader();
+        // R3-3: bound the link body like the direct path bounds its stream (STREAM_IDLE_MS
+        // default 240s). Without this, a link that answers headers then stalls is masked
+        // by our own keep-alive pings until undici's ~300s bodyTimeout — longer than the
+        // direct path's bound, and the reaper exempts the link lease. Cut at the same
+        // bound: the catch below fails over with the row excluded and the lease released
+        // request-scoped.
+        const linkIdleMs = Math.max(1_000, Number(process.env.MAXPOOL_LINK_IDLE_MS) || STREAM_IDLE_MS);
         try {
           for (;;) {
-            const { done, value } = await reader.read();
+            const readP = reader.read();
+            readP.catch(() => {});
+            let idleTimer;
+            const idle = new Promise((_, reject) => {
+              idleTimer = setTimeout(
+                () => reject(Object.assign(new Error('link body idle timeout'), { code: 'UPSTREAM_IDLE', linkBody: true })),
+                linkIdleMs,
+              );
+              idleTimer.unref?.();
+            });
+            let r;
+            try {
+              r = await Promise.race([readP, idle]);
+            } finally {
+              clearTimeout(idleTimer);
+            }
+            const { done, value } = r;
             if (done) break;
             if (res.destroyed) { try { await reader.cancel(); } catch { } break; }
-            // First REAL byte stops the keep-alive (review r2 D) — until then a link that
-            // dies after its headers can still fail over.
-            if (requestInfo.queueHeartbeatActive) clearQueueHeartbeat(requestInfo);
+            // First REAL byte stops the grace timer AND the keep-alive (review r2 D /
+            // r3 R3-3) — until then a link that dies after its headers can still fail over.
+            if (bodyGraceTimer) { clearTimeout(bodyGraceTimer); bodyGraceTimer = null; }
+            else if (requestInfo.queueHeartbeatActive) clearQueueHeartbeat(requestInfo);
+            if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
             res.write(Buffer.from(value));
           }
-        } finally { try { await reader.cancel(); } catch { /* already done */ } }
+        } finally {
+          if (bodyGraceTimer) clearTimeout(bodyGraceTimer);
+          try { await reader.cancel(); } catch { /* already done */ }
+        }
       }
+      if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
       res.end();   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded
       finishLink({ success: ctx.status < 500, status: ctx.status });
       // SC22 no-double-count: this request was counted at auth; the serving pool
@@ -1097,6 +1134,7 @@ async function forwardRequest(
       // only a TTFB abort, a mid-stream cancel or an unknown link error lands here. It
       // must not release every other conversation held on this row.
       const linkKind = linkClientGone ? 'client_cancelled'
+        : err?.linkBody ? 'link_idle'
         : err?.name === 'AbortError' ? 'link_ttfb'
           : 'pool_link_unreachable';
       finishLink({ status: 502, error: 'pool_link_unreachable', scope: 'request' });
@@ -2270,12 +2308,12 @@ async function forwardRequest(
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
-      // A first-byte / idle timeout is REQUEST-scoped (D4, review r2 A): it soft-cools the
+      // A first-byte / idle / stalled-body timeout is REQUEST-scoped (D4, review r2 A): it soft-cools the
       // account for NEW placements only — conversations held on it keep it — and only 3
       // in a row escalate to an account fault. Every other network class (reset, DNS,
       // fetch failed) is fleet-wide connectivity: the short fixed account cooldown. The
       // release carries no error/status, so it moves no counter itself.
-      const requestScoped = err.code === 'UPSTREAM_TTFB' || err.code === 'UPSTREAM_IDLE';
+      const requestScoped = isRequestScopedTimeout(err);
       accountManager.markTransientFailure(account.index, err.code || err.message || 'network_error',
         { network: true, scope: requestScoped ? 'request' : 'account' });
       accountManager.releaseAccount(lease);
@@ -2411,6 +2449,12 @@ function retrySameEligible(account, requestInfo, res, queueConfig = {}) {
  */
 function logFailedAttempt(account, kind, detail, nextAction) {
   console.log(`[Maxpool] attempt failed (${kind}) on "${account}" — ${detail} → ${nextAction}`);
+}
+
+/** A first-byte, mid-stream idle or stalled non-streaming body timeout concerns ONE
+ *  request, not the account (review r2 A / r3 R3-1). Resets, DNS, fetch failures do not. */
+function isRequestScopedTimeout(err) {
+  return err?.code === 'UPSTREAM_TTFB' || err?.code === 'UPSTREAM_IDLE' || err?.code === 'UPSTREAM_BODY';
 }
 
 /** Seconds this lease has been held on its account, one decimal ("12.3"). */
@@ -2642,7 +2686,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -4358,6 +4402,14 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         } else if (totalLen(modelEchoBuffer) > 64 * 1024) {
           // Pathological upstream: 64KB with no complete model-bearing event. Flush
           // verbatim — the warning is the worst outcome of a missed rewrite.
+          out = Buffer.from(concatUint8(modelEchoBuffer));
+          modelEchoBuffer = null;
+          modelEchoPending = false;
+        } else if (Date.now() - refusalHoldStart > REFUSAL_HOLD_MAX_MS) {
+          // Same fail-open cap as the refusal hold (review r3 R3-4): an upstream that
+          // trickles events without ever emitting a model-bearing one must not hold the
+          // stream forever — release the held bytes verbatim (a missed rewrite warning
+          // beats a dead session) so the idle guard and abort paths can act.
           out = Buffer.from(concatUint8(modelEchoBuffer));
           modelEchoBuffer = null;
           modelEchoPending = false;
