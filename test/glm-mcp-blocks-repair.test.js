@@ -71,16 +71,6 @@ test('an mcp_tool_use id a client tool_use also owns is not converted (orphan gu
   assert.equal(out, null);
 });
 
-test('repair-before-pin: the incompatibility path retries a repaired body instead of pinning', () => {
-  // The wiring is behavioral in forwardRequest (needs a live upstream); here we pin the
-  // CONTRACT the branch depends on: the repair that branch runs is the same function the
-  // broad strip uses, and it converts this incident shape. If stripForeignThinkingBlocks
-  // ever stops converting mcp pairs, the before-pin retry would send an unrepaired body.
-  const { body: out, converted } = stripForeignThinkingBlocks(incidentBody());
-  assert.equal(converted, 2);
-  assert.notEqual(out?.toString(), incidentBody(), 'the body actually changed');
-});
-
 // F1/F3 fixtures: the two verbatim 400 shapes captured live on 2026-11-06.
 const PLAIN_400 = `messages.1.content.1: Input tag 'mcp_tool_use' found using 'type' does not match any of the expected tags: 'bash_code_execution_tool_result', 'code_execution_tool_result', 'connector_text', 'server_tool_use', 'text', 'thinking', 'tool_result', 'tool_use'`;
 const BETA_400 = 'messages.1: `mcp_tool_use` with id `call_76647c` was found without a corresponding `mcp_tool_result` block';

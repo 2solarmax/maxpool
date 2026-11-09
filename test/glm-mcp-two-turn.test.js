@@ -62,12 +62,11 @@ test('F2: mcp-contaminated session never sends a poisoned body — turn 1 pre-st
 test('F2 backstop: an UNPREDICTED mcp 400 with nothing convertible is NOT retried or latched — the 400 surfaces once per turn', async () => {
   // Hide the mcp block from detectTranscriptOrigin's walk by nesting it under a key the
   // walker never visits — a stand-in for any future shape the forecast misses. The
-  // upstream still rejects it, so this exercises the REACTIVE repair-before-pin branch.
-  // Here the reactive repair can't convert the hidden block either. Since review r2
-  // (coordinator 2026-11-09) that means NO retry and NO latch: stripping thinking cannot
-  // cure an mcp-tag 400, so the retry was a guaranteed identical 400 and the latch only
-  // degraded every later turn. (This fixture's upstream also rejects on "thinking" — a
-  // mock convenience; the real mcp 400 is about the tag, not the thinking.)
+  // upstream still rejects it. Since review r2 (2026-11-09) there is no post-rejection
+  // repair: whatever the forecast misses the converter misses too (same id collector),
+  // so the 400 surfaces once — no identical retry, no latch stripping later turns'
+  // thinking. (This fixture's upstream also rejects on "thinking" — a mock convenience;
+  // the real mcp 400 is about the tag, not the thinking.)
   let calls = 0;
   const upstream = http.createServer((req, res) => {
     let b = ''; req.on('data', c => b += c); req.on('end', () => {
@@ -85,7 +84,7 @@ test('F2 backstop: an UNPREDICTED mcp 400 with nothing convertible is NOT retrie
   const proxyPort = await listen(proxy);
   // Foreign thinking (unsigned-by-Anthropic) the forecast does NOT flag; the upstream
   // answers with the mcp-wording 400 so ONLY the incompat branch (not the signature
-  // branch) can catch it — the before-pin repair strips the thinking and retries.
+  // branch) sees it — and with nothing convertible, it surfaces.
   const msgs = [
     { role: 'user', content: [{ type: 'text', text: 'q' }] },
     { role: 'assistant', content: [{ type: 'thinking', thinking: 'glm plan', signature: 'glmhex' }, { type: 'text', text: 'a' }] },

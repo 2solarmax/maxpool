@@ -1892,42 +1892,21 @@ async function forwardRequest(
       // session) and retry PROVIDER-only, rather than surfacing the 400. Only worth
       // it when a provider can actually serve it (profile=all with a GLM/Kimi token).
       //
-      // REPAIR FIRST (2026-11-06, "customer fups"): the broad strip + coordinate repair
-      // above may both have found nothing while the transcript is still curable — the
-      // measured case is a GLM-authored `mcp_tool_use`/`mcp_tool_result` pair, which
-      // both repairs predate. Try the conversion once here; if it changes the body,
-      // retry THAT on Claude instead of pinning. Pin only when the conversion finds
-      // nothing (a genuinely unrepairable transcript). This kills the pin loop: pin →
-      // provider exhausts → "can only run on GLM" with ~59h Retry — while a text-
-      // converted body replays 200 (verified live, count_tokens, 2026-11-06).
+      // NO post-rejection conversion retry (review r2, 2026-11-09): detectTranscriptOrigin
+      // flags exactly the ids the converter can convert, so the up-front strip has
+      // already converted every curable block before the first send (pinned by
+      // glm-mcp-two-turn F2). A rejection that reaches here has nothing convertible —
+      // re-sending it was a guaranteed identical 400, and its latch stripped valid Claude
+      // thinking from every later turn. Move to GLM/Kimi when one is available; else
+      // the original 400 surfaces (below).
       const providerAvailable = accountManager.accounts?.some(a => a.type === 'provider' && a.enabled !== false);
-      // Exact-shape gate (red-team M2): the loose isAnthropicIncompatBody matcher also
-      // fires on unrelated unknown-tag 400s (its expected-tags list mentions
-      // server_tool_use); a rewrite must key on the two MCP wordings or the
-      // deterministic server-tool-id wording, never the fuzzy predicate.
-      const incompatRepairable = /server_tool_use\.id: String should match pattern/i.test(errorBody)
+      // Exact-shape gate (red-team M2) for the surfaced attempt line: the loose
+      // isAnthropicIncompatBody matcher also fires on unrelated unknown-tag 400s (its
+      // expected-tags list mentions server_tool_use), so key on the two MCP wordings or
+      // the deterministic server-tool-id wording, never the fuzzy predicate.
+      const incompatTagRejection = /server_tool_use\.id: String should match pattern/i.test(errorBody)
         || /mcp_tool_(use|result)/.test(errorBody)
           && /(does not match any of the expected tags|without a corresponding)/i.test(errorBody);
-      if (anthropicIncompat && incompatRepairable && !requestInfo.incompatRepairTried && canRepairBody) {
-        const repaired = stripForeignThinkingBlocks(body);
-        // Retry ONLY when a foreign tool block was converted (review r2, coordinator
-        // 2026-11-09). These 400s are about mcp/server-tool tags, never thinking: with
-        // nothing converted the retry is a guaranteed identical 400, and the latch below
-        // would strip the session's valid Claude thinking on every later turn for nothing.
-        if (repaired.body && repaired.converted > 0) {
-          // Latch the pre-strip sticky so the NEXT turn repairs up front instead of
-          // re-paying this rejected round-trip every turn (the client resends the whole
-          // poisoned history each turn — same cache-churn the audit is about).
-          accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
-          logFailedAttempt(account.name, 'transcript_rejected', `removed ${repaired.removed} thinking / converted ${repaired.converted} tool block(s)`, 'repaired');
-          console.log(`[Maxpool] Recovering session on Claude: incompatibility repair removed ${repaired.removed} thinking block(s), converted ${repaired.converted} provider tool block(s) — retrying on Claude before pinning`);
-          return forwardRequest(
-            req, res, repaired.body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
-            retryConfig, queueConfig, { ...requestInfo, incompatRepairTried: true, anthropicIncompatible: false, repairCount: repairCount + 1 },
-            repaired.body.length <= retryConfig.maxRetryBufferBytes, canQueueBufferedBody, excludedIndexes,
-          );
-        }
-      }
       if (anthropicIncompat && requestInfo.sessionKey && providerAvailable
         && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
         accountManager.markSessionIncompatible?.(requestInfo.sessionKey, requestInfo.homeProvider);
@@ -2035,10 +2014,8 @@ async function forwardRequest(
         return;
       }
 
-      if (anthropicIncompat && incompatRepairable) {
-        logFailedAttempt(account.name, 'transcript_rejected', requestInfo.incompatRepairTried
-          ? 'Anthropic still rejected the repaired transcript'
-          : 'Anthropic rejected the transcript; nothing convertible to repair', 'surfaced');
+      if (anthropicIncompat && incompatTagRejection) {
+        logFailedAttempt(account.name, 'transcript_rejected', 'Anthropic rejected the transcript; nothing convertible to repair', 'surfaced');
       }
       ctx.status = upstreamRes.status;
       sendErrorBody(res, requestInfo, upstreamRes.status, errorBody, upstreamRes.headers);
@@ -2430,7 +2407,7 @@ function retrySameEligible(account, requestInfo, res, queueConfig = {}) {
  * D5: one line per FAILED attempt, naming the account, the error class and what the
  * pool did next — so "why did this move" is answerable from the log without a forensic
  * dig (the Mac pool logged failed attempts not at all before this). nextAction tokens:
- * released-cancel | retry-same | moved | repaired | queued | surfaced.
+ * released-cancel | retry-same | moved | queued | surfaced.
  */
 function logFailedAttempt(account, kind, detail, nextAction) {
   console.log(`[Maxpool] attempt failed (${kind}) on "${account}" — ${detail} → ${nextAction}`);
