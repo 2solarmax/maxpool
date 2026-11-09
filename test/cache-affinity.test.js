@@ -689,3 +689,36 @@ test('RETURN HOME with degraded conversation identity (per-terminal key) still g
   assert.equal(lease.account.name, 'a2', line);
   release(lease);
 });
+
+test('RETURN HOME never overrides a GLM pick, even one whose hold was released (pick stays GLM)', () => {
+  const m = detourMgr(); const { glm } = detour(m);
+  glm.consecutiveFailures = 1;   // GLM hold released, but GLM is still the lightest candidate
+  byName(m, 'a1').activeWeight = 20; byName(m, 'a3').activeWeight = 20;
+  let lease;
+  const logs = captureLogs(() => { lease = m.acquireAccount(RI()); });
+  assert.equal(lease.account.name, 'glm', logs.join(' | '));
+  assert.equal(lease.returnedHome, false);
+  release(lease);
+});
+
+test('RETURN HOME: why= explains why the conversation LEFT GLM (against the pre-return pick)', () => {
+  const m = detourMgr(); const { glm } = detour(m);
+  glm.activeWeight = 1200;       // GLM held but outscored by load; loop picks a1 (depth 0), home a2 wins
+  let lease;
+  const logs = captureLogs(() => { lease = m.acquireAccount(RI()); });
+  const line = logs.find(l => l.includes('conversation moved:')) || '';
+  assert.equal(lease.account.name, 'a2', line);
+  assert.match(line, /glm → a2 .* why=outscored:[\d.]+\(.*depth=1200\/0\) home=a2:returned$/, line);
+  release(lease);
+});
+
+test('RETURN HOME onto an UNLOCKED critical home: unlock bookkeeping follows the switch', () => {
+  const m = detourMgr(); const { a2 } = detour(m);
+  a2.quota.unified7d = 0.96; a2.quota.unified7dReset = FAR();
+  const orig = m._criticalUnlock.bind(m);
+  m._criticalUnlock = (a, ...rest) => (a === a2 ? { reason: 'prereset', etaMs: 30 * 60_000 } : orig(a, ...rest));
+  const { lease, logs } = returnTurn(m);
+  assert.equal(lease.account.name, 'a2', logs.join(' | '));
+  assert.ok(logs.some(l => l.startsWith('[Maxpool] Critical unlock "prereset": routing to "a2"')), logs.join(' | '));
+  release(lease);
+});
