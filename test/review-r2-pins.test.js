@@ -481,7 +481,7 @@ test('R3-2: direct path — no ping after the first real chunk, none inside a pa
   } finally { await close(proxy); await close(up); }
 });
 
-test('R3-3: a link that answers headers then goes silent is cut at the link idle bound and the conversation moves', async () => {
+test('R3-3: a link that answers headers then goes silent is cut at the link idle bound (no real byte → failover)', async () => {
   const STATUS = { accounts: [
     { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
     { name: 'personal', type: 'oauth', accountUuid: 'U2', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
@@ -516,7 +516,6 @@ test('R3-3: a link that answers headers then goes silent is cut at the link idle
     assert.ok(text.includes('msg_row2'), `${text.slice(0, 300)}\n${lines.join('\n')}`);
     assert.ok(elapsed >= 2300 && elapsed < 8000, `cut at the bound, not undici's 300s: ${elapsed}ms`);
     const firstReal = text.indexOf('event: message_start');
-    assert.ok(text.slice(0, firstReal).includes('event: ping'), 'pings while waiting');
     assert.ok(!text.slice(firstReal).includes('event: ping'), 'no ping after the real body');
     const a = attempts(lines);
     assert.equal(a.length, 1, a.join('\n'));
@@ -526,6 +525,82 @@ test('R3-3: a link that answers headers then goes silent is cut at the link idle
     if (prev === undefined) delete process.env.MAXPOOL_LINK_IDLE_MS; else process.env.MAXPOOL_LINK_IDLE_MS = prev;
     am.setPoolLinks([]); await close(proxy); await close(remote); await close(upstream);
   }
+});
+
+// M2/E07: a link that dies INSIDE the grace window, failing over to a slow direct hop.
+test('M2: link body dies inside the grace window → failover hop keeps its pings, no ERR_HTTP_HEADERS_SENT', async () => {
+  const remote = http.createServer((req, res) => {
+    if (req.url === '/maxpool/status') return json(res, 200, { accounts: [
+      { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } }] });
+    req.resume();
+    res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders();
+    setTimeout(() => res.socket.destroy(), 300);
+  });
+  const remotePort = await listen(remote);
+  const up = http.createServer((req, res) => {   // the DIRECT hop-2 upstream: headers now, body at 4.5s
+    req.resume();
+    res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders();
+    const t = setTimeout(() => res.end('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_direct"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'), 4500);
+    res.on('close', () => clearTimeout(t));
+  });
+  const upPort = await listen(up);
+  const am = mgr(1);
+  const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${remotePort}`, key: 'mp-max' });
+  await link.poll();
+  am.setPoolLinks([link]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false, streamForwardGraceMs: 1500, heartbeatMs: 500 } });
+  const port = await listen(proxy);
+  try {
+    let text = '';
+    const lines = await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-opus-5-5', stream: true, messages: [] }) });
+      text = await r.text();
+    });
+    assert.ok(text.includes('msg_direct'), `${text.slice(0, 300)}\n${lines.join('\n')}`);   // lines: ${lines.join(' | ')}
+    assert.ok(!lines.some(l => l.includes('ERR_HTTP_HEADERS_SENT')), lines.join('\n'));
+    const firstReal = text.indexOf('event: message_start');
+    assert.ok(firstReal >= 0, text.slice(0, 200));
+    assert.ok(!text.slice(firstReal).includes('event: ping'), 'no ping after the first real byte');
+  } finally { am.setPoolLinks([]); await close(proxy); await close(remote); await close(up); }
+});
+
+// M1: pings must never land inside the real stream, even when the grace timer already
+// fired before the first real chunk.
+test('M1: link silent past the grace window, then a real chunk → zero pings after it', async () => {
+  const STATUS = { accounts: [
+    { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } }] };
+  const remote = http.createServer((req, res) => {
+    if (req.url === '/maxpool/status') return json(res, 200, STATUS);
+    req.resume();
+    res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders();
+    const timers = [];
+    timers.push(setTimeout(() => res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_x"}}\n\n'), 1900));   // past the 200ms grace
+    timers.push(setTimeout(() => res.write('event: content_block_delta\ndata: {"type":"content_block_d'), 2100));
+    timers.push(setTimeout(() => res.write('elta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'), 3300));
+    timers.push(setTimeout(() => res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n'), 4200));
+    res.on('close', () => timers.forEach(clearTimeout));
+  });
+  const remotePort = await listen(remote);
+  const upstream = http.createServer((req, res) => { res.writeHead(500); res.end('{}'); });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([], 0.9);
+  const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${remotePort}`, key: 'mp-max' });
+  await link.poll();
+  am.setPoolLinks([link]);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false, streamForwardGraceMs: 200, heartbeatMs: 500 } });
+  const port = await listen(proxy);
+  try {
+    let text = '';
+    await captureLog(async () => {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'claude-opus-5-5', stream: true, messages: [] }) });
+      text = await r.text();
+    });
+    const firstReal = text.indexOf('event: message_start');
+    assert.ok(firstReal > 0, text.slice(0, 200));
+    assert.ok(text.slice(0, firstReal).includes('event: ping'), 'the grace timer committed the keep-alive first');
+    assert.equal((text.slice(firstReal).match(/event: ping/g) || []).length, 0, `no ping after the first real chunk:\n${text}`);
+    assert.ok(text.includes('message_stop'), text);
+  } finally { am.setPoolLinks([]); await close(proxy); await close(remote); await close(upstream); }
 });
 
 // R3-5: a soft-cooled HOME at better priority still wins return-home.

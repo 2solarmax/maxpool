@@ -1056,23 +1056,29 @@ async function forwardRequest(
       }
       const outHeaders = {};
       upRes.headers.forEach((v, k) => { if (!HOP_BY_HOP_HEADERS.has(k) && k !== 'content-length' && k !== 'transfer-encoding') outHeaders[k] = v; });
-      // A streaming 2xx defers its headers to the FIRST REAL CHUNK (review r3 R3-3, same
-      // rule as D on the direct path): until then the client holds no real bytes, so a
-      // link that answers headers and then stalls can still fail over; the grace timer
-      // re-arms (deadline anchored once per request) so a slow body still gets pings.
-      const deferHead = requestInfo.stream && upRes.status < 300 && upRes.body
-        && /event-stream/i.test(upRes.headers.get('content-type') || '');
-      let bodyGraceTimer = null;
-      if (deferHead) bodyGraceTimer = armStreamForwardGrace(res, requestInfo, queueConfig, accountManager);
-      else if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
+      // Headers committed exactly as before (review r4: the batch-7 deferral is REVERTED
+      // — it let a stale grace timer commit keep-alive mid-failover, ERR_HTTP_HEADERS_SENT
+      // on the next hop, and leaked pings into the real stream). Consequence, accepted:
+      // once the link's own headers are written, a later stall can only SURFACE — the
+      // idle guard below bounds the wait instead of undici's ~300s bodyTimeout. Failover
+      // stays possible while only OUR keep-alive pings have been sent (no real chunk yet).
+      if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
+      // r4: headers are committed but NO real byte has been written — keep the keep-alive
+      // heartbeating through the link body wait and any failover hop (grace arm refuses
+      // an already-committed response). clientHasRealBytes stays false until the first
+      // real chunk, so a silent/stalled link can still fail over.
+      if (requestInfo.stream && upRes.status < 300 && !res.destroyed && !res.writableEnded
+        && !requestInfo.queueHeartbeatActive) {
+        ensureQueueHeartbeatInterval(res, requestInfo, Math.max(1000, Number(queueConfig?.heartbeatMs) || 10_000));
+      }
       if (upRes.body) {
         const reader = upRes.body.getReader();
-        // R3-3: bound the link body like the direct path bounds its stream (STREAM_IDLE_MS
-        // default 240s). Without this, a link that answers headers then stalls is masked
-        // by our own keep-alive pings until undici's ~300s bodyTimeout — longer than the
-        // direct path's bound, and the reaper exempts the link lease. Cut at the same
-        // bound: the catch below fails over with the row excluded and the lease released
-        // request-scoped.
+        // R3-3/r4: bound the link body like the direct path bounds its stream
+        // (MAXPOOL_LINK_IDLE_MS, default STREAM_IDLE_MS). Without this, a link that
+        // answers headers then stalls is masked until undici's ~300s bodyTimeout — longer
+        // than the direct path's bound, and the reaper exempts the link lease. The catch
+        // below fails over while no real byte reached the client; after that it surfaces
+        // honestly and releases the lease request-scoped.
         const linkIdleMs = Math.max(1_000, Number(process.env.MAXPOOL_LINK_IDLE_MS) || STREAM_IDLE_MS);
         try {
           for (;;) {
@@ -1095,20 +1101,15 @@ async function forwardRequest(
             const { done, value } = r;
             if (done) break;
             if (res.destroyed) { try { await reader.cancel(); } catch { } break; }
-            // First REAL byte stops the grace timer AND the keep-alive (review r2 D /
-            // r3 R3-3) — until then a link that dies after its headers can still fail over.
-            if (bodyGraceTimer) { clearTimeout(bodyGraceTimer); bodyGraceTimer = null; }
-            else if (requestInfo.queueHeartbeatActive) clearQueueHeartbeat(requestInfo);
-            if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
+            // First REAL byte stops the keep-alive (review r2 D — UNCONDITIONAL, r4 M1:
+            // a conditional clear let pings land inside the real stream when the grace
+            // timer had already fired).
+            if (requestInfo.queueHeartbeatActive) clearQueueHeartbeat(requestInfo);
             res.write(Buffer.from(value));
           }
-        } finally {
-          if (bodyGraceTimer) clearTimeout(bodyGraceTimer);
-          try { await reader.cancel(); } catch { /* already done */ }
-        }
+        } finally { try { await reader.cancel(); } catch { /* already done */ } }
       }
-      if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
-      res.end();   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded
+      res.end();   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded
       finishLink({ success: ctx.status < 500, status: ctx.status });
       // SC22 no-double-count: this request was counted at auth; the serving pool
       // counted it too. Undo the local one.
@@ -2686,7 +2687,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -3686,16 +3687,25 @@ function ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager) {
     reapDead();
     return;
   }
-  requestInfo.queueHeartbeatActive = true;
-  requestInfo.queueHeartbeatTimer = setInterval(() => {
-    if (res.destroyed || res.writableEnded) { reapDead(); return; }
+  ensureQueueHeartbeatInterval(res, requestInfo, heartbeatMs, () => reapDead());
+}
+
+/** The keep-alive interval half of the queue heartbeat, for a response whose headers
+ *  are ALREADY committed (the link pass-through writes the link's own headers, r4):
+ *  pings every heartbeatMs until clearQueueHeartbeat, so the client stays alive across
+ *  the link body wait and any failover hop while clientHasRealBytes stays false. */
+function ensureQueueHeartbeatInterval(res, requestInfo, heartbeatMs, onDead = null) {
+  const timer = setInterval(() => {
+    if (res.destroyed || res.writableEnded) { clearQueueHeartbeat(requestInfo); onDead?.(); return; }
     try {
       res.write(QUEUE_KEEPALIVE);
     } catch {
-      reapDead();
+      clearQueueHeartbeat(requestInfo); onDead?.();
     }
   }, heartbeatMs);
-  requestInfo.queueHeartbeatTimer.unref?.();
+  timer.unref?.();
+  requestInfo.queueHeartbeatActive = true;
+  requestInfo.queueHeartbeatTimer = timer;
 }
 
 function clearQueueHeartbeat(requestInfo) {
@@ -4291,6 +4301,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   // MODEL ECHO NORMALIZATION state (rationale at the write site).
   let modelEchoPending = true;
   let modelEchoBuffer = null;
+  let modelEchoHoldStart = null;   // r4: the echo cap counts from the FIRST held byte, not stream start
 
   // SAFEGUARD-REFUSAL REROUTE (2026-09-14). Anthropic's server-side classifier can
   // terminate a turn with HTTP 200 + `stop_reason:"refusal"` + stop_details.category
@@ -4310,6 +4321,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   const refusalWatch = requestInfo?._refusalRerouteEligible === true;
   let refusalHoldBuffer = refusalWatch ? [] : null;
   const refusalHoldStart = Date.now();
+  let holdByteAt = null;   // r4: when the FIRST byte entered the (refusal or echo) hold
 
   try {
     while (true) {
@@ -4346,6 +4358,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       // rerouted turn leaves the client socket completely untouched — the caller can
       // then re-dispatch onto a provider as if the Anthropic attempt never happened.
       if (refusalHoldBuffer) {
+        holdByteAt ??= Date.now();
         refusalHoldBuffer.push(value);
         const held = decoder.decode(concatUint8(refusalHoldBuffer));
         const verdict = classifyHeldStreamPrefix(held);
@@ -4361,9 +4374,11 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
           continue; // nothing decisive yet — keep holding, write nothing
         }
         // Decisive content, or either cap hit → fail open: release the held bytes as
-        // this chunk and never hold again on this stream.
+        // this chunk and never hold again on this stream. The echo hold (below) inherits
+        // when the FIRST byte was held, so the two stacked holds share ONE 30s budget.
         value = concatUint8(refusalHoldBuffer);
         refusalHoldBuffer = null;
+        modelEchoHoldStart = holdByteAt;
       }
 
       if (!committed) {
@@ -4384,6 +4399,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       // concat with decoder-safe helpers.
       let out = value;
       if (requestInfo?.model && modelEchoPending) {
+        modelEchoHoldStart ??= Date.now();
         modelEchoBuffer = modelEchoBuffer ? [...modelEchoBuffer, value] : [value];
         const s = decoder.decode(concatUint8(modelEchoBuffer));
         if (s.includes('"model"') && s.includes('\n\n')) {
@@ -4405,8 +4421,10 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
           out = Buffer.from(concatUint8(modelEchoBuffer));
           modelEchoBuffer = null;
           modelEchoPending = false;
-        } else if (Date.now() - refusalHoldStart > REFUSAL_HOLD_MAX_MS) {
-          // Same fail-open cap as the refusal hold (review r3 R3-4): an upstream that
+        } else if (modelEchoHoldStart != null && Date.now() - modelEchoHoldStart > REFUSAL_HOLD_MAX_MS) {
+          // Same fail-open cap as the refusal hold (review r3 R3-4), anchored at the
+          // first held byte (r4): a split model-bearing event arriving >30s after stream
+          // START must still be rewritten, not released verbatim to leak the provider id.
           // trickles events without ever emitting a model-bearing one must not hold the
           // stream forever — release the held bytes verbatim (a missed rewrite warning
           // beats a dead session) so the idle guard and abort paths can act.
