@@ -208,7 +208,13 @@ const DEFAULT_SCHEDULER = {
   // This is the 5-hour-window level at which the hold lets go (providers; Claude
   // benches at switchThreshold anyway). Weekly reserve/soft tiers do NOT release.
   cacheAffinityFiveHourWall: 0.97,
-  concurrencyWeight: 2,            // multiplies in-flight load (activeWeight+reqWeight) — dominant
+  // RETURN HOME after a provider detour (owner 2026-11-09): when a conversation's turn
+  // went to GLM/Kimi and a later turn is routed back to Claude, it prefers the Claude
+  // account it used last — that account still holds its stored copy. Only while the copy
+  // is alive: Claude Code writes 1-hour copies (measured 2026-11-09: 272 of 272 cache
+  // writes `ephemeral_1h`; 55 of 64 detours came back within the hour, median 533 s).
+  cacheAffinityReturnWindowMs: 3_600_000,
+  concurrencyWeight: 2,           // multiplies in-flight load (activeWeight+reqWeight) — dominant
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
   paceCostWeight: 1.5,            // soft de-preference of accounts burning ahead of pace (was the ×6 term)
@@ -365,6 +371,15 @@ const PERSISTED_QUOTA_FIELDS = [
 ];
 
 const CONVERSATION_AFFINITY_MAX = 5000;
+/** Bounded LRU insert: re-insert = most recent; the oldest key drops past the cap. */
+function lruSet(map, key, value) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > CONVERSATION_AFFINITY_MAX) map.delete(map.keys().next().value);
+}
+/** An Anthropic account with its own prompt cache (allow-list: a provider or legacy
+ *  pool row can forward to GLM, so "not a provider" is not proof of a Claude cache). */
+const isClaudeAccount = (a) => a?.type === 'oauth' || a?.type === 'apikey';
 const IDENTITY_WINDOW_MS = 15 * 60_000;
 const IDENTITY_MAX_SAMPLES = 4000;
 const IDENTITY_MIN_PER_SESSION = 8;
@@ -631,6 +646,9 @@ export class AccountManager {
     // Bounded LRU — oldest conversations drop first; a dropped entry only means the
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
+    // Same key → { name, at } of the last CLAUDE account only (a GLM/Kimi turn never
+    // overwrites it), so a conversation returning from a provider detour can go home.
+    this.conversationLastClaudeAccount = new Map();
     // Conversation-identity HEALTH (owner 2026-11-08: "make sure this cannot degrade
     // silently"). Twice in one day a Claude Code request-shape detail (a moving
     // cache_control marker, then a per-request billing checksum) made every turn hash
@@ -906,6 +924,7 @@ export class AccountManager {
     const prevCurrentName = requestInfo.sessionKey
       ? this._sessionBinding(requestInfo.sessionKey)?.currentName
       : null;
+    requestInfo.returnedHome = null;   // set by the selection loop when it sends the turn home
     const account = this.getActiveAccount(requestInfo, excludedIndexes);
     if (!account) return null;
 
@@ -924,7 +943,8 @@ export class AccountManager {
     this.notePoolSend(account);
     // Non-null only when this acquire moved the session off its prior account.
     const migratedFromName = (prevCurrentName && account.name !== prevCurrentName) ? prevCurrentName : null;
-    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName };
+    const returnedHome = requestInfo.returnedHome === account.name;
+    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName, returnedHome };
   }
 
   /** Fail-safe: snap a session's binding back to the pre-migration issuing account
@@ -1041,6 +1061,11 @@ export class AccountManager {
 
     account.inFlight = Math.max(0, account.inFlight - 1);
     account.activeWeight = Math.max(0, account.activeWeight - lease.weight);
+
+    // Owner's throttling constraint: make any 429 on a return-home turn countable.
+    if (lease.returnedHome && outcome.status === 429 && outcome.error !== 'request_shape_refused') {
+      console.log(`[Maxpool] return-home lease throttled (429): ${account.name}`);
+    }
 
     if (lease.upstreamThrottleProbe) {
       if (outcome.success) {
@@ -2325,10 +2350,12 @@ export class AccountManager {
     ];
 
     const bestUnlockMap = new Map();
+    const home = this._returnHome(requestInfo, now);
     for (const weeklyOptions of weeklyPasses) {
       best = null;
       bestScore = Infinity;
       bestPriority = Infinity;
+      let homeCand = null;   // the home account as a candidate THIS pass, scored as holder
 
       for (let i = 0; i < this.accounts.length; i++) {
         const idx = (this.nextIndex + i) % this.accounts.length;
@@ -2344,12 +2371,41 @@ export class AccountManager {
 
         const priority = this._effectivePriority(account, requestInfo, now);
         const score = this._scoreAccount(account, requestInfo, scoringCtx, critUnlock);
+        if (home && !home.stale && account.name === home.name) {
+          homeCand = { account, priority, critUnlock,
+            score: this._scoreAccount(account, requestInfo, scoringCtx, critUnlock, home.name) };
+        }
         if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
           bestPriority = priority;
           bestScore = score;
           best = account;
           if (critUnlock) bestUnlockMap.set(account.name, critUnlock); else bestUnlockMap.delete(account.name);
         }
+      }
+
+      // RETURN HOME: only once this pass already picked a Claude account — a provider
+      // pick is never touched, so this never pulls a conversation off GLM sooner. Home
+      // wins when it is a candidate here, in the same priority tier, and its score AS
+      // HOLDER (release gates, zeroed steering, anti-dogpile cap) beats the pick.
+      let homeNote = null;
+      const pickedBeforeHome = best;
+      if (best && home && isClaudeAccount(best)) {
+        if (best.name === home.name) {
+          homeNote = `home=${home.name}:returned`;
+        } else if (home.stale) {
+          homeNote = `home=${home.name}:skipped(stale-${Math.round(home.ageMs / 60_000)}m)`;
+        } else if (homeCand && homeCand.priority <= bestPriority && homeCand.score < bestScore) {
+          best = homeCand.account;
+          bestPriority = homeCand.priority;
+          bestScore = homeCand.score;
+          if (homeCand.critUnlock) bestUnlockMap.set(best.name, homeCand.critUnlock); else bestUnlockMap.delete(best.name);
+          homeNote = `home=${home.name}:returned`;
+        } else {
+          let why = 'unknown';
+          try { why = this._moveReason(home.name, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(best.name) || null, now, true); } catch (e) { why = `error:${e.message}`; }
+          homeNote = `home=${home.name}:skipped(${why})`;
+        }
+        if (best.name === home.name) requestInfo.returnedHome = home.name;
       }
 
       if (best) {
@@ -2380,9 +2436,11 @@ export class AccountManager {
         const ckey = this._affinityKey(requestInfo);
         const lastName = ckey ? this.conversationLastAccount.get(ckey) : null;
         if (lastName && lastName !== best.name) {
+          // why= explains why the conversation LEFT its last account — measured against
+          // the loop's own pick, before any return-home switch.
           let why = 'unknown';
-          try { why = this._moveReason(lastName, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(best.name) || null, now); } catch (e) { why = `error:${e.message}`; }
-          console.log(`[Maxpool] conversation moved: ${lastName} → ${best.name} (${requestInfo.bodyBytes ?? '?'}B) why=${why}`);
+          try { why = this._moveReason(lastName, pickedBeforeHome, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(pickedBeforeHome.name) || null, now); } catch (e) { why = `error:${e.message}`; }
+          console.log(`[Maxpool] conversation moved: ${lastName} → ${best.name} (${requestInfo.bodyBytes ?? '?'}B) why=${why}${homeNote ? ` ${homeNote}` : ''}`);
         }
         return best;
       }
@@ -3090,10 +3148,10 @@ export class AccountManager {
     return this._holdsUsableReset(account, now) ? 1 - Math.min(d, 0.9) : 1;
   }
 
-  _scoreTerms(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
+  _scoreTerms(account, requestInfo = {}, ctx = null, criticalUnlock = null, holderName = undefined) {
     const now = ctx?.now ?? Date.now();
     // CACHE AFFINITY — see _cacheAffinity.
-    const affinity = this._cacheAffinity(account, requestInfo, criticalUnlock);
+    const affinity = this._cacheAffinity(account, requestInfo, criticalUnlock, holderName);
     const reqWeight = Math.max(1, requestInfo.weight || 1);
     // POOL LINK scores as the cloud's WORST-case load (owner 2026-10-29: "the team
     // pool will respect the accounts within it... included in the balancing act").
@@ -3212,8 +3270,8 @@ export class AccountManager {
   }
 
   /** Routing cost — lower is preferred. Sum of the named terms minus the affinity bonus. */
-  _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null) {
-    const t = this._scoreTerms(account, requestInfo, ctx, criticalUnlock);
+  _scoreAccount(account, requestInfo = {}, ctx = null, criticalUnlock = null, holderName = undefined) {
+    const t = this._scoreTerms(account, requestInfo, ctx, criticalUnlock, holderName);
     return Math.max(0, t.concurrency + t.capPenalty + t.paceCost + t.utilizationCost + t.scopedPace + t.spread + t.ramp + t.reserveCost + t.criticalCost + t.failurePenalty - t.affinity);
   }
 
@@ -3238,10 +3296,25 @@ export class AccountManager {
   _noteConversationAccount(requestInfo, account) {
     const key = this._affinityKey(requestInfo);
     if (!key) return;
-    const map = this.conversationLastAccount;
-    map.delete(key);                       // re-insert = most recent (LRU order)
-    map.set(key, account.name);
-    while (map.size > CONVERSATION_AFFINITY_MAX) map.delete(map.keys().next().value);
+    lruSet(this.conversationLastAccount, key, account.name);
+    if (isClaudeAccount(account)) {
+      lruSet(this.conversationLastClaudeAccount, key, { name: account.name, at: requestInfo.now ?? Date.now() });
+    }
+  }
+
+  /**
+   * RETURN HOME (owner 2026-11-09): the Claude account a conversation should go back to
+   * after a provider detour, or null. A detour = the last account differs from the last
+   * CLAUDE account (the Claude memory only ever holds Claude names). `stale` when the
+   * stored copy has outlived cacheAffinityReturnWindowMs — going home then buys nothing.
+   */
+  _returnHome(requestInfo, now = Date.now()) {
+    const key = this._affinityKey(requestInfo);
+    if (!key) return null;
+    const home = this.conversationLastClaudeAccount.get(key);
+    if (!home || home.name === this.conversationLastAccount.get(key)) return null;
+    const ageMs = now - home.at;
+    return { name: home.name, stale: ageMs > Number(this.scheduler.cacheAffinityReturnWindowMs), ageMs };
   }
 
   /** Conversation identity: terminal + prefix hash when the server computed one;
@@ -3320,13 +3393,15 @@ export class AccountManager {
     return null;
   }
 
-  _cacheAffinity(account, requestInfo = {}, criticalUnlock = null) {
+  /** `holderName` scores `account` as if it held the conversation (return-home after a
+   *  provider detour); omitted = the conversation's real last account. */
+  _cacheAffinity(account, requestInfo = {}, criticalUnlock = null, holderName = undefined) {
     const base = Number(this.scheduler.cacheAffinityBonus) || 0;
     // Sticky mode has its own binding; its score loop runs only once the session has
     // decided to LEAVE a hot account — a discount there would pull it straight back.
     if (base <= 0 || this.scheduler.routingMode === 'sticky') return 0;
     const key = this._affinityKey(requestInfo);
-    if (!key || this.conversationLastAccount.get(key) !== account.name) return 0;
+    if (!key || (holderName ?? this.conversationLastAccount.get(key)) !== account.name) return 0;
     // Scale with the CONVERSATION'S SIZE too: losing the cache costs the prefix a
     // hop re-writes, and requestInfo.bodyBytes ≈ prefix + this turn. Checkpoint
     // 2026-11-08 11:07Z: a flat 400 cut full re-writes only 18.9%→14.8% of turns —
@@ -3363,7 +3438,9 @@ export class AccountManager {
    * names the reason, incl. availability causes); `outscored:` = the hold was live and
    * the sibling still won, with the dominant score terms that beat the bonus.
    */
-  _moveReason(lastName, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlock, now) {
+  _moveReason(lastName, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlock, now, asHolder = false) {
+    // asHolder: explain why `lastName` lost while scored AS the holder (return-home).
+    const holder = asHolder ? lastName : undefined;
     const last = this.accounts.find(a => a.name === lastName);
     if (!last) return 'released:account-gone';
     if (excludedIndexes.has(last.index)) return 'released:excluded';
@@ -3374,8 +3451,8 @@ export class AccountManager {
     const gate = this._affinityRelease(last, unlock);
     if (gate) return `released:${gate}`;
     if (this._effectivePriority(last, requestInfo, now) > this._effectivePriority(best, requestInfo, now)) return 'released:priority-tier';
-    if (this._cacheAffinity(last, requestInfo, unlock) <= 0) return 'released:no-hold';
-    const lt = this._scoreTerms(last, requestInfo, scoringCtx, unlock);
+    if (this._cacheAffinity(last, requestInfo, unlock, holder) <= 0) return 'released:no-hold';
+    const lt = this._scoreTerms(last, requestInfo, scoringCtx, unlock, holder);
     const bt = this._scoreTerms(best, requestInfo, scoringCtx, bestUnlock);
     const sum = t => t.concurrency + t.capPenalty + t.paceCost + t.utilizationCost + t.scopedPace + t.spread + t.ramp + t.reserveCost + t.criticalCost + t.failurePenalty - t.affinity;
     const delta = sum(lt) - sum(bt);

@@ -537,3 +537,155 @@ test('conversation-move evidence log: fires once when a known conversation chang
     assert.ok(logs.some(l => l.includes('conversation moved:') && l.includes('→')), `log line present: ${logs.filter(Boolean).join(' | ')}`);
   } finally { console.log = origLog; }
 });
+
+// ── RETURN HOME after a provider detour (owner 2026-11-09) ─────────────────────────
+// A turn went to GLM; the next turn routed back to Claude must go to the Claude account
+// that still holds the conversation's stored copy — unless that account cannot serve.
+// Measured before the change: 42 of 64 returns landed on a different Claude account.
+const detourMgr = (threshold = 0.9, opts = {}) => {
+  const m = new AccountManager(Array.from({ length: 3 }, (_, i) => acct(`a${i + 1}`)), threshold,
+    { routingMode: 'balance', crossProviderFallbackPolicy: 'always', ...opts });
+  m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
+  am_ref = m;
+  return m;
+};
+const RI = (extra = {}) => ({ sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 10_000, profile: 'all', ...extra });
+const byName = (m, n) => m.accounts.find(a => a.name === n);
+// Conversation used a2, then a GLM turn; a2 is a little busier than its siblings.
+const detour = (m, ri = RI()) => {
+  const a2 = byName(m, 'a2'); const glm = byName(m, 'glm');
+  m._noteConversationAccount(ri, a2);
+  m._noteConversationAccount(ri, glm);
+  a2.activeWeight = 6;
+  return { a2, glm };
+};
+// The retry after a failed GLM attempt: GLM excluded, so the pick is Claude.
+const returnTurn = (m, ri = RI()) => {
+  let lease;
+  const logs = captureLogs(() => { lease = m.acquireAccount(ri, new Set([byName(m, 'glm').index])); });
+  return { lease, logs, line: logs.find(l => l.includes('conversation moved:')) || '' };
+};
+
+test('RETURN HOME: after a GLM turn the next Claude turn goes back to the last Claude account', () => {
+  const m = detourMgr(); detour(m);
+  const { lease, line } = returnTurn(m);
+  assert.equal(lease.account.name, 'a2', `went home despite a2 being busier: ${line}`);
+  assert.match(line, /glm → a2 .* why=released:excluded home=a2:returned$/, line);
+  assert.equal(lease.returnedHome, true);
+  release(lease);
+});
+
+test('RETURN HOME is never forced: home rate-limited → normal pick, reason logged', () => {
+  const m = detourMgr(); const { a2 } = detour(m);
+  m.markRateLimited(a2.index, 30);
+  const { lease, line } = returnTurn(m);
+  assert.notEqual(lease.account.name, 'a2');
+  assert.match(line, /home=a2:skipped\(released:unavailable\(rate-limited\)\)$/, line);
+  assert.equal(lease.returnedHome, false);
+  release(lease);
+});
+
+test('RETURN HOME is never forced: home at the 5h wall → normal pick', () => {
+  const m = detourMgr(0.99); const { a2 } = detour(m);
+  a2.quota.unified5h = 0.98; a2.quota.unified5hReset = Date.now() + 3600_000;
+  const { lease, line } = returnTurn(m);
+  assert.notEqual(lease.account.name, 'a2');
+  assert.match(line, /home=a2:skipped\(released:5h-0\.98\)$/, line);
+  release(lease);
+});
+
+test('RETURN HOME is never forced: home past the anti-dogpile cap → normal pick, outscored named', () => {
+  const m = detourMgr(); const { a2 } = detour(m);
+  a2.activeWeight = 1200;
+  const { lease, line } = returnTurn(m);
+  assert.notEqual(lease.account.name, 'a2');
+  assert.match(line, /home=a2:skipped\(outscored:[\d.]+\(.*bonus=400;depth=1200\/0\)\)$/, line);
+  release(lease);
+});
+
+test('RETURN HOME is never forced: home in a worse priority tier → normal pick', () => {
+  const m = detourMgr(); detour(m);
+  m._peakTier = (a) => (a.name === 'a2' ? 1 : 0);
+  const { lease, line } = returnTurn(m);
+  assert.notEqual(lease.account.name, 'a2');
+  assert.match(line, /home=a2:skipped\(released:priority-tier\)$/, line);
+  release(lease);
+});
+
+test('RETURN HOME only while the stored copy lives: older than the window → normal pick; inside → home', () => {
+  const m = detourMgr(); detour(m);
+  m.conversationLastClaudeAccount.get('s:h').at = Date.now() - 2 * 3600_000;
+  const stale = returnTurn(m);
+  assert.notEqual(stale.lease.account.name, 'a2');
+  assert.match(stale.line, /home=a2:skipped\(stale-120m\)$/, stale.line);
+  release(stale.lease);
+
+  const m2 = detourMgr(); detour(m2);
+  m2.conversationLastClaudeAccount.get('s:h').at = Date.now() - 59 * 60_000;
+  const fresh = returnTurn(m2);
+  assert.equal(fresh.lease.account.name, 'a2', fresh.line);
+  am_ref = m2; release(fresh.lease);
+});
+
+test('RETURN HOME never pulls a conversation off GLM: a held GLM pick stays GLM', () => {
+  const m = detourMgr(); const { a2, glm } = detour(m);
+  a2.activeWeight = 0; glm.activeWeight = 4;
+  let lease;
+  const logs = captureLogs(() => { lease = m.acquireAccount(RI()); });
+  assert.equal(lease.account.name, 'glm', logs.join(' | '));
+  assert.equal(logs.some(l => l.includes('home=')), false, 'no return-home on a GLM pick');
+  release(lease);
+});
+
+test('RETURN HOME memory holds only Claude accounts (allow-list): GLM, pool rows never become home', () => {
+  const m = detourMgr();
+  const ri = RI();
+  m._noteConversationAccount(ri, byName(m, 'a3'));
+  m._noteConversationAccount(ri, byName(m, 'glm'));
+  m._noteConversationAccount(ri, { name: 'legacy-pool', type: 'pool' });
+  assert.equal(m.conversationLastClaudeAccount.get('s:h').name, 'a3');
+  m._noteConversationAccount(ri, { name: 'key-acct', type: 'apikey' });
+  assert.equal(m.conversationLastClaudeAccount.get('s:h').name, 'key-acct', 'API-key accounts carry their own cache too');
+});
+
+test('RETURN HOME: sticky mode is untouched (no hold bonus → home never wins on score)', () => {
+  const m = detourMgr(0.9, { routingMode: 'sticky' }); detour(m);
+  const { lease, line } = returnTurn(m);
+  assert.notEqual(lease.account.name, 'a2', line);
+  release(lease);
+});
+
+test('RETURN HOME bookkeeping names home: Switched-to line and lease flag', () => {
+  const m = detourMgr(); detour(m);
+  m.currentIndex = byName(m, 'a1').index;
+  const { lease, logs } = returnTurn(m);
+  assert.ok(logs.includes('[Maxpool] Switched to account "a2"'), logs.join(' | '));
+  assert.equal(m.currentIndex, lease.account.index);
+  release(lease);
+});
+
+test('RETURN HOME spread: 20 detoured conversations sharing one home stay within the hold cap', () => {
+  const m = fleet(8, { crossProviderFallbackPolicy: 'always' }); am_ref = m;
+  m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
+  const home = m.accounts[0]; const glm = byName(m, 'glm');
+  const keys = Array.from({ length: 20 }, (_, i) => `term-1:D${i}`);
+  keys.forEach(k => { m._noteConversationAccount({ affinityKey: k }, home); m._noteConversationAccount({ affinityKey: k }, glm); });
+  const leases = keys.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: TURN, bodyBytes: 450_000, profile: 'all' }, new Set([glm.index])));
+  const claude = m.accounts.filter(a => a.type === 'oauth');
+  const shallowest = Math.min(...claude.slice(1).map(a => a.activeWeight));
+  const bound = m.scheduler.cacheAffinityMaxExtraDepth + TURN;
+  assert.ok(home.activeWeight - shallowest <= bound, `home depth ${home.activeWeight} vs shallowest ${shallowest}: ${JSON.stringify(dist(leases))}`);
+  assert.ok(leases.filter(l => l.returnedHome).length >= 2, `some went home: ${JSON.stringify(dist(leases))}`);
+  const homeLease = leases.find(l => l.returnedHome);
+  const logs = captureLogs(() => m.releaseAccount(homeLease, { status: 429, error: 'rate_limited' }));
+  assert.ok(logs.includes(`[Maxpool] return-home lease throttled (429): ${home.name}`), logs.join(' | '));
+  leases.filter(l => l !== homeLease).forEach(release);
+});
+
+test('RETURN HOME with degraded conversation identity (per-terminal key) still goes home, capped', () => {
+  const m = detourMgr(); m.identityHealth.degraded = true;
+  detour(m, RI({ affinityKey: undefined }));
+  const { lease, line } = returnTurn(m, RI({ affinityKey: undefined }));
+  assert.equal(lease.account.name, 'a2', line);
+  release(lease);
+});
