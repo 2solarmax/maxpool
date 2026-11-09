@@ -1056,6 +1056,14 @@ export class AccountManager {
     return out;
   }
 
+  /**
+   * outcome.neutral  — the attempt says nothing about the account (client cancel,
+   *                    request-shape refusal): no counters move at all.
+   * outcome.scope    — 'account' (default) | 'request'. A request-scoped failure is
+   *                    recorded (failedRequests, lastError) but never extends the
+   *                    consecutiveFailures streak, so it cannot trip the hold-release
+   *                    gate for the account's other conversations.
+   */
   releaseAccount(lease, outcome = {}) {
     if (!lease?.account) return;
     const account = lease.account;
@@ -1109,7 +1117,12 @@ export class AccountManager {
 
     if (outcome.error || outcome.status) {
       account.failedRequests++;
-      account.consecutiveFailures++;
+      // scope:'request' (cancel-adjacent / first-byte timeout / link blip): the fault
+      // belongs to THIS request, not the account. It must not bump the streak that
+      // the hold-release gate (_affinityRelease `failures-N`) reads — one such fault
+      // used to evict every conversation held on the account (4 in 1s, 2026-11-09
+      // 08:13Z). Account-level faults (429 / caps / auth) keep the default 'account'.
+      if (outcome.scope !== 'request') account.consecutiveFailures++;
       account.lastStatus = outcome.status || account.lastStatus;
       account.lastResponseMs = Date.now() - lease.startedAt;
       this._recordLoadEvent(account, lease, outcome);

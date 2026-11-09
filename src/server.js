@@ -908,6 +908,13 @@ async function forwardRequest(
     // listener (calling releaseOnClientGone would release the lease itself).
     res.off('close', onClientClose);
     let linkDone = false;
+    // Set by the res 'close' handler BEFORE it aborts the link fetch, so the catch can
+    // tell "the client left" apart from the TTFB timer or a real link error. Mirrors
+    // the direct path's clientGone handling (catch below, "Client left after").
+    let linkClientGone = false;
+    // The linked pool's status once headers arrived (null = no answer yet). Local, not
+    // ctx.status: an earlier hop's 429 would otherwise leak into this hop's catch.
+    let linkStatus = null;
     const finishLink = (outcome) => {
       if (linkDone) return; linkDone = true;
       accountManager.releaseAccount(lease, outcome);
@@ -921,11 +928,12 @@ async function forwardRequest(
       const linkTtfbMs = Math.max(15_000, Number(process.env.MAXPOOL_LINK_TTFB_MS) || UPSTREAM_TTFB_MS);
       const linkCtl = new AbortController();
       const linkTtfb = setTimeout(() => linkCtl.abort(), linkTtfbMs);
-      res.once('close', () => linkCtl.abort());
+      res.once('close', () => { if (!res.writableEnded) linkClientGone = true; linkCtl.abort(); });
       let upRes;
       try {
         upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half', signal: linkCtl.signal });
       } finally { clearTimeout(linkTtfb); }
+      linkStatus = upRes.status;
       ctx.status = upRes.status;
       // The linked pool refused the request's SHAPE (not Claude Code). The cloud
       // subscription accounts are healthy — exclude them (this mirror + every local
@@ -960,14 +968,17 @@ async function forwardRequest(
         finishLink({ status: upRes.status, error: 'remote_pinned_unavailable' });
         excludedIndexes.add(account.index);
         if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+          logFailedAttempt(account.name, `remote-${upRes.status}`, `linked pool refused before any byte`, 'moved');
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
         }
         // Every route refused: that is capacity, so it waits here. The body was cancelled
         // above, so falling through handed the client a 503 with no body.
+        logFailedAttempt(account.name, `remote-${upRes.status}`, 'linked pool refused before any byte; no other route', 'queued');
         const queued = await queueAndRetry(
           `all routes failed after ${upRes.status} from "${account.name}"`,
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'capacity',
+          formatAttemptFailure(account.name, `remote-${upRes.status}`, 'queue gave up — surfaced', 'surfaced'),
         );
         if (queued) return;
         ctx.status = upRes.status;
@@ -1008,18 +1019,42 @@ async function forwardRequest(
       }
       hooks.onRequestRouted?.(reqId, { account: account.name });
     } catch (err) {
-      finishLink({ status: 502, error: 'pool_link_unreachable' });
+      const heldS = ((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1);
+      // D1: the client left before anything reached it. The account did nothing wrong
+      // and the turn is abandoned — release neutral, do not exclude, never re-send.
+      // (A cancel AFTER bytes flowed keeps the path below: a mid-response failure.)
+      if (linkClientGone && !clientHasRealBytes(res, requestInfo)) {
+        finishLink({ success: false, neutral: true, error: 'client_cancelled' });
+        clearQueueHeartbeat(requestInfo);
+        console.log(`[Maxpool] Client left after ${heldS}s on "${account.name}" (link, still waiting) — released, not retried`);
+        logFailedAttempt(account.name, 'client_cancelled', `client left after ${heldS}s, nothing sent`, 'released-cancel');
+        return;
+      }
+      // P4: a known remote 429/503 is an account-level fault (keep it account-scoped);
+      // a TTFB abort, a cancel mid-stream or an unknown link error is request-scoped
+      // (D4) — it must not release every other conversation held on this row.
+      const accountLevel = linkStatus === 429 || linkStatus === 503;
+      const linkKind = linkClientGone ? 'client_cancelled'
+        : (err?.name === 'AbortError' && linkStatus == null) ? 'link_ttfb'
+          : 'pool_link_unreachable';
+      finishLink({ status: 502, error: 'pool_link_unreachable', ...(accountLevel ? {} : { scope: 'request' }) });
       excludedIndexes.add(account.index);   // P4b: never re-pick a row that just failed
+      const linkDetail = `${linkStatus == null ? 'no answer' : `HTTP ${linkStatus}`} after ${heldS}s (${err?.message || err})`;
       if (!clientHasRealBytes(res, requestInfo)) {
         if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+          logFailedAttempt(account.name, linkKind, linkDetail, 'moved');
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
         }
+        logFailedAttempt(account.name, linkKind, linkDetail, 'queued');
         const queued = await queueAndRetry(
           `all routes failed after a link error on "${account.name}"`,
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'network',
+          formatAttemptFailure(account.name, linkKind, 'queue gave up — surfaced', 'surfaced'),
         );
         if (queued) return;
+      } else {
+        logFailedAttempt(account.name, linkKind, `${linkDetail}, output already sent`, 'surfaced');
       }
       ctx.status = 502;
       sendErrorResponse(res, requestInfo, 502, { type: 'error', error: { type: 'api_error', message: `Team pool "${account.name}" unreachable: ${err?.message || err}` } });
@@ -2084,6 +2119,7 @@ async function forwardRequest(
       const heldMs = Date.now() - (requestInfo.startedAt || Date.now());
       console.log(`[Maxpool] Client left after ${(heldMs / 1000).toFixed(1)}s on "${account.name}" `
         + `(${res.headersSent ? 'mid-response — output already sent' : 'still waiting, nothing sent'})`);
+      logFailedAttempt(account.name, 'client_cancelled', `client left after ${(heldMs / 1000).toFixed(1)}s (${res.headersSent ? 'mid-response' : 'still waiting'})`, 'released-cancel');
       releaseOnClientGone();
       return;
     }
@@ -2146,19 +2182,27 @@ async function forwardRequest(
       // Network-class (ECONNRESET / fetch failed / timeout / terminated): short fixed
       // cooldown, no exponential escalation — the fleet auto-recovers seconds after
       // connectivity returns instead of being benched for up to 15 min.
+      const transientKind = err.code || (err.message || 'network_error').slice(0, 40);
       accountManager.markTransientFailure(account.index, err.code || err.message || 'network_error', { network: true });
-      accountManager.releaseAccount(lease);
+      // TTFB on the direct path is request-scoped (D4): the account itself is healthy,
+      // a big prompt is just slow — this must not release the account's OTHER held
+      // conversations. Every other network class keeps today's account-level shape.
+      const transientScope = (err.code === 'UPSTREAM_TTFB' || err.code === 'UPSTREAM_IDLE') ? { scope: 'request' } : {};
+      accountManager.releaseAccount(lease, Object.keys(transientScope).length ? { ...transientScope } : undefined);
       excludedIndexes.add(account.index);
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+        logFailedAttempt(account.name, transientKind, `transient after ${((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1)}s`, 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
+      logFailedAttempt(account.name, transientKind, 'transient; no other route', 'queued');
       const queued = await queueAndRetry(
         `all routes failed after network error from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
         retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'network',
+        formatAttemptFailure(account.name, transientKind, 'queue gave up — surfaced', 'surfaced'),
       );
       if (queued) return;
       ctx.status = 503;
@@ -2188,15 +2232,18 @@ async function forwardRequest(
     if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
       account.status = 'error';
       excludedIndexes.add(account.index);
+      logFailedAttempt(account.name, (err.code || err.message || 'error').toString().slice(0, 40), err.message, 'moved');
       return forwardRequest(
         req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
         retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
       );
     }
+    logFailedAttempt(account.name, (err.code || err.message || 'error').toString().slice(0, 40), `no other route after ${err.message}`, 'queued');
     const queued = await queueAndRetry(
       `all routes failed after proxy error from "${account.name}"`,
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
       retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'proxy',
+      formatAttemptFailure(account.name, (err.code || err.message || 'error').toString().slice(0, 40), 'no route took the queue — surfaced', 'surfaced'),
     );
     if (queued) return;
     ctx.status = 502;
@@ -2206,6 +2253,20 @@ async function forwardRequest(
       error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
     });
   }
+}
+
+/**
+ * D5: one line per FAILED attempt, naming the account, the error class and what the
+ * pool did next — so "why did this move" is answerable from the log without a forensic
+ * dig (the Mac pool logged failed attempts not at all before this). nextAction tokens:
+ * released-cancel | retry-same (batch 2) | moved | queued | surfaced.
+ */
+function formatAttemptFailure(account, kind, detail, nextAction) {
+  return `[Maxpool] attempt failed (${kind}) on "${account}" — ${detail} → ${nextAction}`;
+}
+
+function logFailedAttempt(account, kind, detail, nextAction) {
+  console.log(formatAttemptFailure(account, kind, detail, nextAction));
 }
 
 function parseRetryAfter(value) {
@@ -2432,7 +2493,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, formatAttemptFailure, streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -3142,10 +3203,29 @@ function clientHasRealBytes(res, requestInfo) {
   return res.headersSent && !requestInfo.queueHeartbeatActive;
 }
 
-async function queueAndRetry(
+// `giveUpLog` (optional, last arg): a pre-rendered `attempt failed (...) → surfaced`
+// line, logged exactly once by the wrapper below when this attempt's hold ENDS in a
+// give-up (queue disabled/not-eligible, window exhausted, no recovery in the window) —
+// never when the request is re-dispatched.
+async function queueAndRetry(...args) {
+  // A call WITHOUT a give-up log is exactly 16 args (through `cause`, itself a
+  // string) — never strip that. Only a 17th string arg is a give-up log line.
+  const maybeLog = args.length > 16 ? args[args.length - 1] : null;
+  if (typeof maybeLog !== 'string') return queueAndRetryInner(...args, null);
+  const inner = args.slice(0, -1);
+  let fired = false;
+  const onGiveUp = () => { if (!fired) { fired = true; console.log(maybeLog); } };
+  const result = await queueAndRetryInner(...inner, onGiveUp);
+  if (!result && !fired) onGiveUp();
+  return result;
+}
+
+async function queueAndRetryInner(
   reason, req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
   retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody = canRetryBufferedBody, cause = 'quota',
+  onGiveUp = null,
 ) {
+  const giveUp = (msg) => { onGiveUp?.(); return finishQueuedStreamIfNeeded(res, requestInfo, msg); };
   if (!queueConfig.enabled || !canQueueBufferedBody || (res.headersSent && !requestInfo.queueHeartbeatActive) || res.destroyed) {
     if (queueConfig.enabled && !canQueueBufferedBody && requestInfo.queueBlockedReason) {
       console.log(`[Maxpool] Not queueing request: ${requestInfo.queueBlockedReason}`);
@@ -3231,7 +3311,7 @@ async function queueAndRetry(
   // Weekly-capped but the reset time is unknown (cold start / probe failure):
   // we can't estimate a wait, so don't pretend to — error honestly now.
   if (retryPlan.cause === 'weekly_reset_unknown') {
-    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
+    return giveUp(honestMessage);
   }
 
   const streamHoldMaxMs = queueConfig.streamHoldMaxMs == null
@@ -3254,7 +3334,7 @@ async function queueAndRetry(
     countTokensMaxWaitMs,
   });
 
-  if (queueWindowMs <= 0) return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
+  if (queueWindowMs <= 0) return giveUp(honestMessage);
 
   // HOLD-vs-ERROR oracle (from nextRetryForRequest): HOLD only when a TEMPORARY
   // cause has a finite real reset within the ceiling. ERROR FAST for permanent /
@@ -3294,14 +3374,13 @@ async function queueAndRetry(
   if (ticket === null) {
     // Backpressure: too many requests already waiting / too many bytes buffered.
     // Reject honestly instead of growing the heap unbounded.
-    return finishQueuedStreamIfNeeded(res, requestInfo,
-      'Maxpool queue is full — too many requests are already waiting for capacity. Try again shortly.');
+    return giveUp('Maxpool queue is full — too many requests are already waiting for capacity. Try again shortly.');
   }
   const elapsed = Date.now() - requestInfo.queueStartedAt;
   const remaining = queueWindowMs - elapsed;
   if (remaining <= 0) {
     accountManager.removeQueuedRequest?.(requestInfo);
-    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
+    return giveUp(honestMessage);
   }
 
   ctx.account = '(queued)';
@@ -3315,7 +3394,7 @@ async function queueAndRetry(
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
   if (!available) {
     accountManager.removeQueuedRequest?.(requestInfo);
-    return finishQueuedStreamIfNeeded(res, requestInfo, honestMessage);
+    return giveUp(honestMessage);
   }
 
   // NOTE: the heartbeat is deliberately NOT cleared here. It must stay alive
