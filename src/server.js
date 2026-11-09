@@ -1075,10 +1075,10 @@ async function forwardRequest(
         logFailedAttempt(account.name, 'client_cancelled', `client left after ${heldS}s, nothing sent`, 'released-cancel');
         return;
       }
-      // P4: a known remote 429/503 is an account-level fault (keep it account-scoped);
-      // a TTFB abort, a cancel mid-stream or an unknown link error is request-scoped
-      // (D4) — it must not release every other conversation held on this row.
-      const accountLevel = linkStatus === 429 || linkStatus === 503;
+      // Everything that reaches this catch is request-scoped (D4): a remote 429/503 is
+      // handled — account-scoped — by its own branch above before anything can throw, so
+      // only a TTFB abort, a mid-stream cancel or an unknown link error lands here. It
+      // must not release every other conversation held on this row.
       const linkKind = linkClientGone ? 'client_cancelled'
         : (err?.name === 'AbortError' && linkStatus == null) ? 'link_ttfb'
           : 'pool_link_unreachable';
@@ -1091,7 +1091,7 @@ async function forwardRequest(
         // retryCount NOT bumped — see the direct path: not a failover hop.
         return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
       }
-      finishLink({ status: 502, error: 'pool_link_unreachable', ...(accountLevel ? {} : { scope: 'request' }) });
+      finishLink({ status: 502, error: 'pool_link_unreachable', scope: 'request' });
       excludedIndexes.add(account.index);   // P4b: never re-pick a row that just failed
       const linkDetail = `${linkStatus == null ? 'no answer' : `HTTP ${linkStatus}`} after ${heldS}s (${err?.message || err})`;
       if (!clientHasRealBytes(res, requestInfo)) {
