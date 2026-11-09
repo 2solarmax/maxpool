@@ -943,8 +943,9 @@ export class AccountManager {
     this.notePoolSend(account);
     // Non-null only when this acquire moved the session off its prior account.
     const migratedFromName = (prevCurrentName && account.name !== prevCurrentName) ? prevCurrentName : null;
-    const returnedHome = requestInfo.returnedHome === account.name;
-    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName, returnedHome };
+    const returnedHome = requestInfo.returnedHome?.name === account.name;
+    const returnedHomeSwitched = returnedHome && requestInfo.returnedHome.switched === true;
+    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName, returnedHome, returnedHomeSwitched };
   }
 
   /** Fail-safe: snap a session's binding back to the pre-migration issuing account
@@ -1059,12 +1060,14 @@ export class AccountManager {
     if (!lease?.account) return;
     const account = lease.account;
 
+    const depthBefore = account.activeWeight;
     account.inFlight = Math.max(0, account.inFlight - 1);
     account.activeWeight = Math.max(0, account.activeWeight - lease.weight);
 
-    // Owner's throttling constraint: make any 429 on a return-home turn countable.
-    if (lease.returnedHome && outcome.status === 429 && outcome.error !== 'request_shape_refused') {
-      console.log(`[Maxpool] return-home lease throttled (429): ${account.name}`);
+    // Owner's throttling constraint: make any throttle on a return-home turn countable,
+    // and say whether the switch (vs the loop's own pick) put the turn on home.
+    if (lease.returnedHome && (outcome.status === 429 || (outcome.status === 503 && account.remote)) && outcome.error !== 'request_shape_refused') {
+      console.log(`[Maxpool] return-home lease throttled (${outcome.status} ${outcome.error || '-'}, ${lease.returnedHomeSwitched ? 'switched' : 'natural'}): ${account.name} depth=${depthBefore}`);
     }
 
     if (lease.upstreamThrottleProbe) {
@@ -2371,7 +2374,7 @@ export class AccountManager {
 
         const priority = this._effectivePriority(account, requestInfo, now);
         const score = this._scoreAccount(account, requestInfo, scoringCtx, critUnlock);
-        if (home && !home.stale && account.name === home.name) {
+        if (home && account.name === home.name) {
           homeCand = { account, priority, critUnlock,
             score: this._scoreAccount(account, requestInfo, scoringCtx, critUnlock, home.name) };
         }
@@ -2388,6 +2391,7 @@ export class AccountManager {
       // wins when it is a candidate here, in the same priority tier, and its score AS
       // HOLDER (release gates, zeroed steering, anti-dogpile cap) beats the pick.
       let homeNote = null;
+      let homeSwitched = false;
       const pickedBeforeHome = best;
       if (best && home && isClaudeAccount(best)) {
         if (best.name === home.name) {
@@ -2396,8 +2400,7 @@ export class AccountManager {
           homeNote = `home=${home.name}:skipped(stale-${Math.round(home.ageMs / 60_000)}m)`;
         } else if (homeCand && homeCand.priority <= bestPriority && homeCand.score < bestScore) {
           best = homeCand.account;
-          bestPriority = homeCand.priority;
-          bestScore = homeCand.score;
+          homeSwitched = true;
           if (homeCand.critUnlock) bestUnlockMap.set(best.name, homeCand.critUnlock); else bestUnlockMap.delete(best.name);
           homeNote = `home=${home.name}:returned`;
         } else {
@@ -2405,7 +2408,7 @@ export class AccountManager {
           try { why = this._moveReason(home.name, best, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(best.name) || null, now, true); } catch (e) { why = `error:${e.message}`; }
           homeNote = `home=${home.name}:skipped(${why})`;
         }
-        if (best.name === home.name) requestInfo.returnedHome = home.name;
+        if (best.name === home.name) requestInfo.returnedHome = { name: home.name, switched: homeSwitched };
       }
 
       if (best) {
@@ -3305,8 +3308,10 @@ export class AccountManager {
   /**
    * RETURN HOME (owner 2026-11-09): the Claude account a conversation should go back to
    * after a provider detour, or null. A detour = the last account differs from the last
-   * CLAUDE account (the Claude memory only ever holds Claude names). `stale` when the
-   * stored copy has outlived cacheAffinityReturnWindowMs — going home then buys nothing.
+   * CLAUDE account (the Claude memory only ever holds Claude names). That includes the
+   * case where the last-account entry was evicted but the Claude entry survived: going
+   * home then restores the evicted hold, which is harmless. `stale` when the stored copy
+   * has outlived cacheAffinityReturnWindowMs — going home then buys nothing.
    */
   _returnHome(requestInfo, now = Date.now()) {
     const key = this._affinityKey(requestInfo);
@@ -3314,7 +3319,9 @@ export class AccountManager {
     const home = this.conversationLastClaudeAccount.get(key);
     if (!home || home.name === this.conversationLastAccount.get(key)) return null;
     const ageMs = now - home.at;
-    return { name: home.name, stale: ageMs > Number(this.scheduler.cacheAffinityReturnWindowMs), ageMs };
+    let windowMs = Number(this.scheduler.cacheAffinityReturnWindowMs);
+    if (!Number.isFinite(windowMs) || windowMs < 0) windowMs = 3_600_000;
+    return { name: home.name, stale: ageMs > windowMs, ageMs };
   }
 
   /** Conversation identity: terminal + prefix hash when the server computed one;

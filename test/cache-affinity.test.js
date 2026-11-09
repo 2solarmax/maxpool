@@ -572,7 +572,19 @@ test('RETURN HOME: after a GLM turn the next Claude turn goes back to the last C
   assert.equal(lease.account.name, 'a2', `went home despite a2 being busier: ${line}`);
   assert.match(line, /glm → a2 .* why=released:excluded home=a2:returned$/, line);
   assert.equal(lease.returnedHome, true);
+  assert.equal(lease.returnedHomeSwitched, true, 'a1 was lighter; the switch put the turn on a2');
   release(lease);
+});
+
+test('RETURN HOME natural: the loop already picked home → not switched, line says natural', () => {
+  const m = detourMgr(); const { a2 } = detour(m);
+  a2.activeWeight = 0; byName(m, 'a1').activeWeight = 20; byName(m, 'a3').activeWeight = 20;
+  const { lease, line } = returnTurn(m);
+  assert.equal(lease.account.name, 'a2', line);
+  assert.equal(lease.returnedHome, true);
+  assert.equal(lease.returnedHomeSwitched, false);
+  const logs = captureLogs(() => m.releaseAccount(lease, { status: 429, error: 'rate_limited' }));
+  assert.ok(logs.some(l => /\(429 rate_limited, natural\): a2 depth=10$/.test(l)), logs.join(' | '));
 });
 
 test('RETURN HOME is never forced: home rate-limited → normal pick, reason logged', () => {
@@ -627,16 +639,6 @@ test('RETURN HOME only while the stored copy lives: older than the window → no
   am_ref = m2; release(fresh.lease);
 });
 
-test('RETURN HOME never pulls a conversation off GLM: a held GLM pick stays GLM', () => {
-  const m = detourMgr(); const { a2, glm } = detour(m);
-  a2.activeWeight = 0; glm.activeWeight = 4;
-  let lease;
-  const logs = captureLogs(() => { lease = m.acquireAccount(RI()); });
-  assert.equal(lease.account.name, 'glm', logs.join(' | '));
-  assert.equal(logs.some(l => l.includes('home=')), false, 'no return-home on a GLM pick');
-  release(lease);
-});
-
 test('RETURN HOME memory holds only Claude accounts (allow-list): GLM, pool rows never become home', () => {
   const m = detourMgr();
   const ri = RI();
@@ -678,16 +680,79 @@ test('RETURN HOME spread: 20 detoured conversations sharing one home stay within
   assert.ok(leases.filter(l => l.returnedHome).length >= 2, `some went home: ${JSON.stringify(dist(leases))}`);
   const homeLease = leases.find(l => l.returnedHome);
   const logs = captureLogs(() => m.releaseAccount(homeLease, { status: 429, error: 'rate_limited' }));
-  assert.ok(logs.includes(`[Maxpool] return-home lease throttled (429): ${home.name}`), logs.join(' | '));
+  assert.ok(logs.some(l => new RegExp(`^\\[Maxpool\\] return-home lease throttled \\(429 rate_limited, (switched|natural)\\): ${home.name} depth=\\d+$`).test(l)), logs.join(' | '));
   leases.filter(l => l !== homeLease).forEach(release);
 });
 
 test('RETURN HOME with degraded conversation identity (per-terminal key) still goes home, capped', () => {
-  const m = detourMgr(); m.identityHealth.degraded = true;
-  detour(m, RI({ affinityKey: undefined }));
-  const { lease, line } = returnTurn(m, RI({ affinityKey: undefined }));
+  // Degraded: the per-request key churns, so only sessionKey ('s') can join the turns.
+  const setup = () => {
+    const m = detourMgr(); m.identityHealth.degraded = true;
+    const a2 = byName(m, 'a2'); const glm = byName(m, 'glm');
+    m._noteConversationAccount(RI({ affinityKey: 's:h1' }), a2);
+    m._noteConversationAccount(RI({ affinityKey: 's:h1' }), glm);
+    return { m, a2 };
+  };
+  const { m, a2 } = setup();
+  a2.activeWeight = 6;
+  const { lease, line } = returnTurn(m, RI({ affinityKey: 's:h2' }));
   assert.equal(lease.account.name, 'a2', line);
   release(lease);
+
+  // Cap half: a fresh manager, home past the anti-dogpile cap → does NOT go home.
+  const c = setup();
+  c.a2.activeWeight = 1200;
+  const capped = returnTurn(c.m, RI({ affinityKey: 's:h2' }));
+  assert.notEqual(capped.lease.account.name, 'a2', capped.line);
+  am_ref = c.m; release(capped.lease);
+});
+
+test('RETURN HOME stale window: a non-finite or negative config falls back to one hour', () => {
+  for (const bad of ['abc', -5]) {
+    const m = detourMgr(0.9, { cacheAffinityReturnWindowMs: bad }); detour(m);
+    m.conversationLastClaudeAccount.get('s:h').at = Date.now() - 2 * 3600_000;
+    const stale = returnTurn(m);
+    assert.notEqual(stale.lease.account.name, 'a2', `${bad}: ${stale.line}`);
+    assert.match(stale.line, /home=a2:skipped\(stale-120m\)$/, stale.line);
+    release(stale.lease);
+  }
+  // Negative: without the fallback every age is "stale"; a 59-minute-old home must still go home.
+  const m = detourMgr(0.9, { cacheAffinityReturnWindowMs: -5 }); detour(m);
+  m.conversationLastClaudeAccount.get('s:h').at = Date.now() - 59 * 60_000;
+  const fresh = returnTurn(m);
+  assert.equal(fresh.lease.account.name, 'a2', fresh.line);
+  release(fresh.lease);
+});
+
+test('RETURN HOME a reused requestInfo does not carry returnedHome into a later acquire', () => {
+  const m = detourMgr(); const { a2 } = detour(m);
+  const ri = RI();
+  const first = m.acquireAccount(ri, new Set([byName(m, 'glm').index]));
+  assert.equal(first.account.name, 'a2');
+  assert.equal(first.returnedHome, true);
+  release(first);
+  // Second turn: hold on home through the normal path, no detour.
+  m._noteConversationAccount(ri, a2);
+  a2.activeWeight = 0;
+  const second = m.acquireAccount(ri, new Set([byName(m, 'glm').index]));
+  assert.equal(second.account.name, 'a2');
+  assert.equal(second.returnedHome, false, 'normal hold is not a return-home');
+  release(second);
+});
+
+test('RETURN HOME throttle line: request_shape_refused is excluded; a remote 503 is counted', () => {
+  const m = detourMgr(); detour(m);
+  const l1 = returnTurn(m).lease;
+  assert.equal(l1.returnedHome, true);
+  const refused = captureLogs(() => m.releaseAccount(l1, { status: 429, error: 'request_shape_refused' }));
+  assert.equal(refused.some(l => l.includes('return-home lease throttled')), false, refused.join(' | '));
+
+  const m2 = detourMgr(); detour(m2);
+  const l2 = returnTurn(m2).lease;
+  assert.equal(l2.returnedHome, true);
+  l2.account.remote = true;
+  const logs = captureLogs(() => m2.releaseAccount(l2, { status: 503, error: 'remote_pinned_unavailable' }));
+  assert.ok(logs.some(l => /^\[Maxpool\] return-home lease throttled \(503 remote_pinned_unavailable, (switched|natural)\): a2 depth=\d+$/.test(l)), logs.join(' | '));
 });
 
 test('RETURN HOME never overrides a GLM pick, even one whose hold was released (pick stays GLM)', () => {
