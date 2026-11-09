@@ -2315,22 +2315,6 @@ export class AccountManager {
       }
     }
 
-    // D3 retry-same hint (one hop, set by server.js after a first-byte timeout on a big
-    // prompt): re-pick the account that just timed out — its stored copy of the prompt
-    // is warm there. A HINT, not a lease bypass (P1): it passes the same fairness gate
-    // (_matchesRequest: queue waiters ahead → refused) and availability check (in-flight
-    // cap, cooldown, rate limit) as any pick, and falls through to normal selection when
-    // either refuses. The caller clears it after this acquire.
-    if (requestInfo.retrySameAccountName) {
-      const same = this.accounts.find(a => a.name === requestInfo.retrySameAccountName);
-      if (same && !excludedIndexes.has(same.index)
-        && this._matchesRequest(same, profile, requestInfo)
-        && this._isAvailable(same, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
-        this.currentIndex = same.index;
-        return same;
-      }
-    }
-
     const preferred = this._preferredAccount(profile, excludedIndexes, requestInfo);
     if (preferred) {
       const preferredPasses = [
@@ -3441,9 +3425,19 @@ export class AccountManager {
     const base = Number(this.scheduler.cacheAffinityBonus) || 0;
     // Sticky mode has its own binding; its score loop runs only once the session has
     // decided to LEAVE a hot account — a discount there would pull it straight back.
-    if (base <= 0 || this.scheduler.routingMode === 'sticky') return 0;
-    const key = this._affinityKey(requestInfo);
-    if (!key || (holderName ?? this.conversationLastAccount.get(key)) !== account.name) return 0;
+    // D3 retry-same (one acquire, set by server.js after a first-byte timeout on a big
+    // prompt): the account that just timed out holds this prompt's warm copy, so it is
+    // scored AS THE HOLDER — the same bonus, release gates, priority tiers, weekly
+    // passes, fairness and anti-dogpile cap as any held conversation (red-team r1: no
+    // bypass). Only the cooldown is skipped, upstream (server.js never cools it). It
+    // applies in sticky mode too: pulling the turn back to that account IS the intent,
+    // for exactly one acquire.
+    const retrySame = requestInfo.retrySameAccountName != null && requestInfo.retrySameAccountName === account.name;
+    if (base <= 0 || (this.scheduler.routingMode === 'sticky' && !retrySame)) return 0;
+    if (!retrySame) {
+      const key = this._affinityKey(requestInfo);
+      if (!key || (holderName ?? this.conversationLastAccount.get(key)) !== account.name) return 0;
+    }
     // Scale with the CONVERSATION'S SIZE too: losing the cache costs the prefix a
     // hop re-writes, and requestInfo.bodyBytes ≈ prefix + this turn. Checkpoint
     // 2026-11-08 11:07Z: a flat 400 cut full re-writes only 18.9%→14.8% of turns —

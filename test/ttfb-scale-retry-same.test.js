@@ -1,9 +1,10 @@
 // D2 size-scaled first-byte wait + D3 retry-same on the DIRECT path.
 // Module constants are read at import, and node --test runs each file in its own
 // process — so the knobs are set here, BEFORE the dynamic import:
-//   floor 5s (the minimum the code allows), 300KB × per-byte ≈ 7s on streaming turns.
+//   floor 5s (the minimum the code allows), 300KB × per-byte = 12s on streaming turns
+//   (margins ≥3.5s either side of every timing assertion — red-team r1 #10).
 process.env.MAXPOOL_TTFB_MS = '5000';
-process.env.MAXPOOL_TTFB_MS_PER_BYTE = String(7000 / 300_000);
+process.env.MAXPOOL_TTFB_MS_PER_BYTE = String(12_000 / 300_000);
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -125,15 +126,15 @@ test('T7/T8 unit: retry-same eligibility — size threshold, once, account healt
 
 // ---------------------------------------------------------------- T3 (wiring)
 
-test('T3 wiring: a streaming 300KB turn waits the SCALED ~7s, not the 5s floor', async () => {
-  // Answers at 6s: inside the scaled wait, past the floor. A timer still on the floor
-  // would TTFB at 5s and retry.
-  const stub = upstreamStub(() => 6000);
+test('T3 wiring: a streaming 300KB turn waits the SCALED 12s, not the 5s floor', async () => {
+  // Answers at 8.5s: 3.5s inside the scaled wait, 3.5s past the floor. A timer still on
+  // the floor would TTFB at 5s and retry.
+  const stub = upstreamStub(() => 8500);
   const { lines, status, text } = await run(accounts(1), stub, body(BIG, true), { enabled: true, streamForwardGraceMs: 1000 });
   assert.equal(status, 200);
   assert.ok(text.includes('msg_scaled_ok'), `the upstream answer reached the client:\n${text.slice(0, 300)}`);
   assert.equal(stub.hits.length, 1, `served on the first attempt; attempts:\n${attempts(lines).join('\n')}`);
-  assert.ok(lines.some(l => /first-byte wait 7s for 300KB prompt on "a1" \(direct; floor 5s\)/.test(l)), `chosen wait logged once:\n${lines.join('\n')}`);
+  assert.ok(lines.some(l => /first-byte wait 12s for 300KB prompt on "a1" \(direct; floor 5s\)/.test(l)), `chosen wait logged once:\n${lines.join('\n')}`);
   assert.equal(lines.filter(l => l.includes('first-byte wait')).length, 1);
 });
 
@@ -141,8 +142,19 @@ test('T3 wiring: a streaming 300KB turn waits the SCALED ~7s, not the 5s floor',
 
 test('T6: big prompt TTFBs once on a1 → retry-same on a1 (not excluded, normal acquire) → answers', async () => {
   const am = accounts(2);
+  // Pin the RELEASE itself (red-team r1 #1): read a1's counters at the retry's acquire,
+  // i.e. after the TTFB release and before the retry's success resets the streak.
+  const atRetry = [];
+  const acquire = am.acquireAccount.bind(am);
+  am.acquireAccount = (ri, ex) => {
+    atRetry.push({ streak: am.accounts[0].consecutiveFailures, failed: am.accounts[0].failedRequests, inFlight: am.accounts[0].inFlight });
+    return acquire(ri, ex);
+  };
   const stub = upstreamStub((tok, n) => (tok === 't1' && n === 1 ? 'hang' : 'ok'));
   const { lines, status } = await run(am, stub, body(BIG));
+  assert.equal(atRetry.length, 2);
+  assert.deepEqual(atRetry[1], { streak: 0, failed: 1, inFlight: 0 },
+    'released request-scoped: counted as a failed request, no streak (a streak would release every held conversation), lease returned');
   assert.equal(status, 200);
   assert.deepEqual(stub.hits, ['t1', 't1'], 'the retry went to the SAME account');
   const a = attempts(lines);
@@ -197,7 +209,7 @@ test('T7: a connection DROP (not a timeout) on a big prompt moves — retry-same
 });
 
 test('T6 (streaming): retry-same works on a heartbeat-committed stream; the wait is logged once', async () => {
-  // grace 1s commits the SSE heartbeat before the scaled 7s TTFB fires — the retry
+  // grace 1s commits the SSE heartbeat before the scaled 12s TTFB fires — the retry
   // must still go to the same account and the client must get the real answer.
   const stub = upstreamStub((tok, n) => (n === 1 ? 'hang' : 'sse'));
   const { lines, status, text } = await run(accounts(2), stub, body(BIG, true), { enabled: true, streamForwardGraceMs: 1000 });
@@ -207,4 +219,73 @@ test('T6 (streaming): retry-same works on a heartbeat-committed stream; the wait
   assert.ok(text.includes('msg_scaled_ok'), 'the retry\'s answer reached the client');
   assert.ok(attempts(lines)[0].endsWith('→ retry-same'), attempts(lines).join('\n'));
   assert.equal(lines.filter(l => l.includes('first-byte wait')).length, 1, 'chosen wait logged once per request, not per attempt');
+});
+
+// ---- red-team r1 #11: retry-same only when the second wait can end inside client patience.
+
+test('T11 unit: a bare claude (240s) whose first wait ran 240s moves; a cc session retries', () => {
+  const ok = { status: 'active' };
+  const res = { headersSent: false };
+  const k = ttfbKnobs();
+  const bare = { stream: true, bodyBytes: 640_000, startedAt: Date.now() - 240_000 };
+  assert.equal(retrySameEligible(ok, bare, res, {}), false, '240s + 240s > 240s ceiling');
+  const cc = { stream: true, bodyBytes: 640_000, startedAt: Date.now() - 384_000, clientToleranceMs: 4_320_000 };
+  assert.equal(retrySameEligible(ok, cc, res, {}), true, `elapsed + next wait inside ${k.CLI_STREAM_CEILING_MS}ms`);
+  // boundary: exactly at the ceiling is allowed, 1s over is not
+  const wait = scaledTtfbMs(k.UPSTREAM_TTFB_MS, k.TTFB_MS_PER_BYTE, 640_000, 100_000);
+  assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: 640_000, startedAt: Date.now() - (100_000 - wait) + 500 }, res, { streamClientToleranceMs: 100_000 }), true);
+  assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: 640_000, startedAt: Date.now() - (100_000 - wait) - 1000 }, res, { streamClientToleranceMs: 100_000 }), false);
+  // non-streaming: no ceiling, no patience rule
+  assert.equal(retrySameEligible(ok, { stream: false, bodyBytes: 640_000, startedAt: Date.now() - 3_600_000 }, res, {}), true);
+});
+
+test('T11 wiring: low client patience (16s) → a 12s first wait cannot be repeated → moved, not retry-same', async () => {
+  const stub = upstreamStub((tok, n) => (tok === 't1' && n === 1 ? 'hang' : 'sse'));
+  const { lines, status, text } = await run(accounts(2), stub, body(BIG, true),
+    { enabled: true, streamForwardGraceMs: 1000, streamClientToleranceMs: 16_000 });
+  assert.equal(status, 200);
+  assert.ok(text.includes('msg_scaled_ok'), text.slice(0, 200));
+  assert.deepEqual(stub.hits, ['t1', 't2'], 'moved — the retry could not finish inside 16s');
+  const a = attempts(lines);
+  assert.equal(a.length, 1, a.join('\n'));
+  assert.ok(a[0].includes('(UPSTREAM_TTFB) on "a1"') && a[0].endsWith('→ moved'), a[0]);
+});
+
+test('#5: retry-same refused by selection prints ONE moved line naming who served — never retry-same', async () => {
+  // At the retry's acquire a1 sits at the in-flight cap, so selection refuses the hint.
+  const am = accounts(2);
+  const acquire = am.acquireAccount.bind(am);
+  let n = 0;
+  am.acquireAccount = (ri, ex) => {
+    n++;
+    if (n === 2) am.accounts[0].inFlight = am.scheduler.safetyMaxActivePerAccount;
+    const l = acquire(ri, ex);
+    if (n === 2) am.accounts[0].inFlight = 0;
+    return l;
+  };
+  const stub = upstreamStub(tok => (tok === 't1' ? 'hang' : 'ok'));
+  const { lines, status } = await run(am, stub, body(BIG));
+  assert.equal(status, 200);
+  assert.deepEqual(stub.hits, ['t1', 't2']);
+  const a = attempts(lines);
+  assert.equal(a.length, 1, a.join('\n'));
+  assert.match(a[0], /\(UPSTREAM_TTFB\) on "a1" — no first byte after .*; same account refused by selection, served by "a2" → moved$/);
+});
+
+test('#5: retry-same refused with NO route free → one surfaced line naming the refusal', async () => {
+  const am = accounts(1);
+  const acquire = am.acquireAccount.bind(am);
+  let n = 0;
+  am.acquireAccount = (ri, ex) => {
+    n++;
+    if (n === 2) am.accounts[0].inFlight = am.scheduler.safetyMaxActivePerAccount;
+    const l = acquire(ri, ex);
+    if (n === 2) am.accounts[0].inFlight = 0;
+    return l;
+  };
+  const stub = upstreamStub(() => 'hang');
+  const { lines } = await run(am, stub, body(BIG));
+  const a = attempts(lines);
+  assert.equal(a.length, 1, a.join('\n'));
+  assert.match(a[0], /\(UPSTREAM_TTFB\) on "a1" — no first byte after .*; same account refused by selection, no route free; not held → surfaced$/);
 });

@@ -44,7 +44,6 @@ const msPerByteFromEnv = (name, dflt) => {
   return Number.isFinite(n) && n >= 0 ? n : dflt;
 };
 const TTFB_MS_PER_BYTE = msPerByteFromEnv('MAXPOOL_TTFB_MS_PER_BYTE', 0.6);
-const LINK_TTFB_MS_PER_BYTE = msPerByteFromEnv('MAXPOOL_LINK_TTFB_MS_PER_BYTE', 0.6);
 // D3: at/over this size a first-byte timeout retries the SAME account once (its stored
 // copy is warm there) before the request is allowed to move.
 const BIG_PROMPT_BYTES = (() => {
@@ -736,20 +735,22 @@ async function forwardRequest(
   }
 
   // Select account
-  const retrySameName = requestInfo.retrySameAccountName || null;
+  // D3/D5: a retry-same attempt's line waits for THIS acquire — the token is what
+  // actually happened (acquireAccount consumes the one-shot hint either way).
+  const pendingSame = requestInfo.pendingRetrySame || null;
+  requestInfo.pendingRetrySame = null;
   const lease = accountManager.acquireAccount(requestInfo, excludedIndexes);
   const account = lease?.account;
-  // (acquireAccount consumed the one-shot hint.) Say so when selection refused it.
-  if (retrySameName) {
-    if (account && account.name !== retrySameName) {
-      console.log(`[Maxpool] retry-same on "${retrySameName}" refused by selection (busy/gated) — served by "${account.name}" instead`);
-    }
+  if (pendingSame && account) {
+    if (account.name === pendingSame.account) logFailedAttempt(pendingSame.account, pendingSame.kind, pendingSame.detail, 'retry-same');
+    else logFailedAttempt(pendingSame.account, pendingSame.kind, `${pendingSame.detail}; same account refused by selection, served by "${account.name}"`, 'moved');
   }
   if (!account) {
     const queued = await queueAndRetry(
       'no eligible account/provider currently available',
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
       retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'quota',
+      ...(pendingSame ? [{ attempt: [pendingSame.account, pendingSame.kind, `${pendingSame.detail}; same account refused by selection, no route free`] }] : []),
     );
     if (queued) return;
 
@@ -860,12 +861,11 @@ async function forwardRequest(
       );
     }
 
-    logFailedAttempt(account.name, 'token_refresh', 'OAuth token refresh unavailable; no other route', 'queued');
     const queued = await queueAndRetry(
       `OAuth token refresh unavailable for "${account.name}"`,
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
       retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'quota',
-      formatAttemptFailure(account.name, 'token_refresh', 'queue gave up — surfaced', 'surfaced'),
+      { attempt: [account.name, 'token_refresh', 'OAuth token refresh unavailable; no other route'] },
     );
     if (queued) return;
 
@@ -960,15 +960,16 @@ async function forwardRequest(
       // thinking turns regularly sit silent 20-60s before headers, so the link
       // TTFB must match the direct path's UPSTREAM_TTFB_MS (120s default), not a
       // flat 15s (owner report 2026-10-30: every pinned GLM turn 502-aborted).
-      const linkTtfbFloorMs = Math.max(15_000, Number(process.env.MAXPOOL_LINK_TTFB_MS) || UPSTREAM_TTFB_MS);
-      // D2: scaled like the direct path (own knob: MAXPOOL_LINK_TTFB_MS_PER_BYTE).
-      const linkCeilingMs = clientWaitCeilingMs(requestInfo, queueConfig);
-      const linkTtfbMs = scaledTtfbMs(linkTtfbFloorMs, LINK_TTFB_MS_PER_BYTE, requestInfo.bodyBytes, linkCeilingMs);
-      noteScaledTtfb(requestInfo, account.name, 'link', linkTtfbMs, linkTtfbFloorMs, linkCeilingMs);
+      // FLAT on purpose — no D2 size scaling and no D3 retry-same here (red-team r1,
+      // 2026-11-09): the linked pool commits its own keep-alive headers ~1s in, which
+      // clears this timer for every HEALTHY link, so a scaled wait only ever ran against
+      // a dead/blackholed tunnel — stretching its detection from 120s to minutes. The
+      // big-prompt first-byte timeouts measured were all on the direct path.
+      const linkTtfbMs = Math.max(15_000, Number(process.env.MAXPOOL_LINK_TTFB_MS) || UPSTREAM_TTFB_MS);
       const linkCtl = new AbortController();
       const linkTtfb = setTimeout(() => linkCtl.abort(), linkTtfbMs);
       // P2: the link path had NO pre-headers keep-alive — a streaming client sat on a
-      // silent socket for the whole link wait (now up to minutes). Arm the same
+      // silent socket for the whole link wait (up to the 120s floor). Arm the same
       // stream-forward grace the direct path uses: after streamForwardGraceMs with no
       // headers, commit the SSE stream + heartbeat. The post-headers branch below
       // (queueHeartbeatActive) already clears it and frames a remote error correctly.
@@ -992,13 +993,17 @@ async function forwardRequest(
         for (const a of accountManager.accounts) {
           if (a.type === 'oauth') excludedIndexes.add(a.index);
         }
+        // !clientHasRealBytes, not !headersSent: after the P2 keep-alive commits, headers
+        // are out with only pings behind them — a slow-then-refused turn must still fail over.
         if (
           retryCount + 1 < maxAttempts
-          && !res.headersSent
+          && !clientHasRealBytes(res, requestInfo)
           && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
         ) {
+          logFailedAttempt(account.name, 'request_shape_refused', 'linked pool refused the request shape (not Claude Code)', 'moved');
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
         }
+        logFailedAttempt(account.name, 'request_shape_refused', 'linked pool refused the request shape; no route serves it', 'surfaced');
         sendErrorBody(res, requestInfo, 429, errorText, upRes.headers);
         return;
       }
@@ -1018,12 +1023,11 @@ async function forwardRequest(
         }
         // Every route refused: that is capacity, so it waits here. The body was cancelled
         // above, so falling through handed the client a 503 with no body.
-        logFailedAttempt(account.name, `remote-${upRes.status}`, 'linked pool refused before any byte; no other route', 'queued');
         const queued = await queueAndRetry(
           `all routes failed after ${upRes.status} from "${account.name}"`,
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'capacity',
-          formatAttemptFailure(account.name, `remote-${upRes.status}`, 'queue gave up — surfaced', 'surfaced'),
+          { attempt: [account.name, `remote-${upRes.status}`, 'linked pool refused before any byte; no other route'] },
         );
         if (queued) return;
         ctx.status = upRes.status;
@@ -1035,6 +1039,7 @@ async function forwardRequest(
         clearQueueHeartbeat(requestInfo);
         if (upRes.status >= 400) {
           const errorText = await readErrorBody(upRes);
+          logFailedAttempt(account.name, `remote-${upRes.status}`, 'linked pool answered an error on a held stream', 'surfaced');
           sendErrorBody(res, requestInfo, upRes.status, errorText, upRes.headers);
           finishLink({ success: upRes.status < 500, status: upRes.status });
           return;
@@ -1080,17 +1085,8 @@ async function forwardRequest(
       // only a TTFB abort, a mid-stream cancel or an unknown link error lands here. It
       // must not release every other conversation held on this row.
       const linkKind = linkClientGone ? 'client_cancelled'
-        : (err?.name === 'AbortError' && linkStatus == null) ? 'link_ttfb'
+        : err?.name === 'AbortError' ? 'link_ttfb'
           : 'pool_link_unreachable';
-      // D3 retry-same on the link path: same rule as the direct path's UPSTREAM_TTFB.
-      if (linkKind === 'link_ttfb' && canRetryBufferedBody && retrySameEligible(account, requestInfo, res)) {
-        finishLink({ status: 504, error: 'link_ttfb', scope: 'request' });
-        requestInfo.sameAccountRetried = true;
-        requestInfo.retrySameAccountName = account.name;
-        logFailedAttempt(account.name, linkKind, `no first byte after ${heldS}s on a ${Math.round((requestInfo.bodyBytes || 0) / 1000)}KB prompt`, 'retry-same');
-        // retryCount NOT bumped — see the direct path: not a failover hop.
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
-      }
       finishLink({ status: 502, error: 'pool_link_unreachable', scope: 'request' });
       excludedIndexes.add(account.index);   // P4b: never re-pick a row that just failed
       const linkDetail = `${linkStatus == null ? 'no answer' : `HTTP ${linkStatus}`} after ${heldS}s (${err?.message || err})`;
@@ -1099,12 +1095,11 @@ async function forwardRequest(
           logFailedAttempt(account.name, linkKind, linkDetail, 'moved');
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
         }
-        logFailedAttempt(account.name, linkKind, linkDetail, 'queued');
         const queued = await queueAndRetry(
           `all routes failed after a link error on "${account.name}"`,
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'network',
-          formatAttemptFailure(account.name, linkKind, 'queue gave up — surfaced', 'surfaced'),
+          { attempt: [account.name, linkKind, linkDetail] },
         );
         if (queued) return;
       } else {
@@ -1263,16 +1258,18 @@ async function forwardRequest(
         if (
           canRetryBufferedBody
           && retryCount + 1 < maxAttempts
-          && !res.headersSent
+          && !clientHasRealBytes(res, requestInfo)
           && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
         ) {
           if (logDir) writeRequestLog(logDir, reqId, logSections);
+          logFailedAttempt(account.name, 'request_shape_refused', 'subscription refused the request shape (not Claude Code)', 'moved');
           return forwardRequest(
             req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
           );
         }
         if (logDir) writeRequestLog(logDir, reqId, logSections);
+        logFailedAttempt(account.name, 'request_shape_refused', 'subscription refused the request shape; no route serves it', 'surfaced');
         ctx.status = 429;
         sendErrorResponse(res, requestInfo, 429, {
           type: 'error',
@@ -1302,7 +1299,7 @@ async function forwardRequest(
         if (
           canRetryBufferedBody
           && retryCount + 1 < maxAttempts
-          && !res.headersSent
+          && !clientHasRealBytes(res, requestInfo)
           && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
         ) {
           logFailedAttempt(account.name, 'upstream_429', `server-side throttle, retry-after ${retryAfter}s`, 'moved');
@@ -1320,12 +1317,11 @@ async function forwardRequest(
           );
           console.log('[Maxpool] Every eligible Claude account returned the same server-side 429; opening shared Anthropic throttle');
 
-          logFailedAttempt(account.name, 'upstream_429', 'request-wide server-side throttle', 'queued');
           const queued = await queueAndRetry(
             'Anthropic upstream is temporarily limiting requests',
             req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'upstream_throttle',
-            formatAttemptFailure(account.name, 'upstream_429', 'queue gave up — surfaced', 'surfaced'),
+            { attempt: [account.name, 'upstream_429', 'request-wide server-side throttle'] },
           );
           if (queued) return;
 
@@ -1340,12 +1336,11 @@ async function forwardRequest(
           return;
         }
 
-        logFailedAttempt(account.name, 'upstream_429', 'server-side throttle; no other route', 'queued');
         const queued = await queueAndRetry(
           `all routes failed after server-side 429 from "${account.name}"`,
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'capacity',
-          formatAttemptFailure(account.name, 'upstream_429', 'queue gave up — surfaced', 'surfaced'),
+          { attempt: [account.name, 'upstream_429', 'server-side throttle; no other route'] },
         );
         if (queued) return;
 
@@ -1369,12 +1364,11 @@ async function forwardRequest(
           neutral: true,
         });
 
-        logFailedAttempt(account.name, 'upstream_429', 'matching ambiguous 429s — shared throttle opened', 'queued');
         const queued = await queueAndRetry(
           'Anthropic upstream is temporarily limiting requests',
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'upstream_throttle',
-          formatAttemptFailure(account.name, 'upstream_429', 'queue gave up — surfaced', 'surfaced'),
+          { attempt: [account.name, 'upstream_429', 'matching ambiguous 429s — shared throttle opened'] },
         );
         if (queued) return;
 
@@ -1402,7 +1396,7 @@ async function forwardRequest(
       if (
         canRetryBufferedBody &&
         retryCount + 1 < maxAttempts &&
-        !res.headersSent &&
+        !clientHasRealBytes(res, requestInfo) &&
         hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
       ) {
         logFailedAttempt(account.name, rlKind, `HTTP 429, benched ${retryAfter}s`, 'moved');
@@ -1412,12 +1406,11 @@ async function forwardRequest(
         );
       }
 
-      logFailedAttempt(account.name, rlKind, `HTTP 429, benched ${retryAfter}s; no other route`, 'queued');
       const queued = await queueAndRetry(
         `all routes failed after 429 from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
         retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'quota',
-        formatAttemptFailure(account.name, rlKind, 'queue gave up — surfaced', 'surfaced'),
+        { attempt: [account.name, rlKind, `HTTP 429, benched ${retryAfter}s; no other route`] },
       );
       if (queued) return;
 
@@ -1465,7 +1458,7 @@ async function forwardRequest(
       if (
         canRetryBufferedBody &&
         retryCount + 1 < maxAttempts &&
-        !res.headersSent &&
+        !clientHasRealBytes(res, requestInfo) &&
         hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
       ) {
         logFailedAttempt(account.name, authKind, `HTTP ${upstreamRes.status}`, 'moved');
@@ -1510,7 +1503,7 @@ async function forwardRequest(
       if (
         canRetryBufferedBody
         && retryCount + 1 < maxAttempts
-        && !res.headersSent
+        && !clientHasRealBytes(res, requestInfo)
         && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
       ) {
         logFailedAttempt(account.name, 'upstream_529', `overloaded, retry-after ${retryAfter}s`, 'moved');
@@ -1525,12 +1518,11 @@ async function forwardRequest(
         accountManager.markUpstreamThrottled(incident.retryAfter, 'matching_request_wide_529s');
         console.log('[Maxpool] Every eligible Claude account returned the same 529; opening shared Anthropic throttle');
 
-        logFailedAttempt(account.name, 'upstream_529', 'request-wide overload — shared throttle opened', 'queued');
         const queued = await queueAndRetry(
           'Anthropic upstream is overloaded',
           req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'upstream_throttle',
-          formatAttemptFailure(account.name, 'upstream_529', 'queue gave up — surfaced', 'surfaced'),
+          { attempt: [account.name, 'upstream_529', 'request-wide overload — shared throttle opened'] },
         );
         if (queued) return;
 
@@ -1545,12 +1537,11 @@ async function forwardRequest(
         return;
       }
 
-      logFailedAttempt(account.name, 'upstream_529', 'overloaded; no other route', 'queued');
       const queued = await queueAndRetry(
         `all routes failed after HTTP 529 from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
         retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, 'capacity',
-        formatAttemptFailure(account.name, 'upstream_529', 'queue gave up — surfaced', 'surfaced'),
+        { attempt: [account.name, 'upstream_529', 'overloaded; no other route'] },
       );
       if (queued) return;
 
@@ -1577,12 +1568,11 @@ async function forwardRequest(
         );
       }
 
-      logFailedAttempt(account.name, `upstream_${upstreamRes.status}`, 'retriable upstream status; no other route', 'queued');
       const queued = await queueAndRetry(
         `all routes failed after ${upstreamRes.status} from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
         retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'capacity',
-        formatAttemptFailure(account.name, `upstream_${upstreamRes.status}`, 'queue gave up — surfaced', 'surfaced'),
+        { attempt: [account.name, `upstream_${upstreamRes.status}`, 'retriable upstream status; no other route'] },
       );
       if (queued) return;
 
@@ -1733,6 +1723,7 @@ async function forwardRequest(
           accountManager.revertSessionBinding(requestInfo.sessionKey, lease.migratedFromName);
           excludedIndexes.add(account.index);
           console.log(`[Maxpool] Thinking-signature fail-safe: reverting session to issuer "${lease.migratedFromName}" and retrying`);
+          logFailedAttempt(account.name, 'invalid_thinking_signature', `migrated replay rejected; back to issuer "${lease.migratedFromName}"`, 'moved');
           return forwardRequest(
             req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
             retryConfig, queueConfig, { ...requestInfo, pinnedAccountName: lease.migratedFromName },
@@ -1908,6 +1899,7 @@ async function forwardRequest(
           // re-paying this rejected round-trip every turn (the client resends the whole
           // poisoned history each turn — same cache-churn the audit is about).
           accountManager.markSessionThinkingContaminated?.(requestInfo.sessionKey);
+          logFailedAttempt(account.name, 'transcript_rejected', `removed ${repaired.removed} thinking / converted ${repaired.converted} tool block(s)`, 'repaired');
           console.log(`[Maxpool] Recovering session on Claude: incompatibility repair removed ${repaired.removed} thinking block(s), converted ${repaired.converted} provider tool block(s) — retrying on Claude before pinning`);
           return forwardRequest(
             req, res, repaired.body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
@@ -1921,6 +1913,7 @@ async function forwardRequest(
         accountManager.markSessionIncompatible?.(requestInfo.sessionKey, requestInfo.homeProvider);
         excludedIndexes.add(account.index);
         console.log(`[Maxpool] Anthropic rejected this transcript (server_tool_use/thinking); pinning session to GLM/Kimi and retrying`);
+        logFailedAttempt(account.name, 'transcript_rejected', 'Anthropic rejected the transcript; pinning to GLM/Kimi', 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, { ...requestInfo, anthropicIncompatible: true },
@@ -1948,6 +1941,7 @@ async function forwardRequest(
           if (a.type === 'provider') excludedIndexes.add(a.index);
         }
         console.log(`[Maxpool] Provider "${account.name}" context too small for this request; pinning session to Claude and retrying`);
+        logFailedAttempt(account.name, 'provider_context_too_small', 'request exceeds the provider context; pinning to Claude', 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, { ...requestInfo, largeContext: true },
@@ -1965,6 +1959,7 @@ async function forwardRequest(
           if (a.type === 'provider') excludedIndexes.add(a.index);
         }
         console.log(`[Maxpool] Provider "${account.name}" rejected this request's shape (${String(errorBody).slice(0, 120)}); retrying on Claude`);
+        logFailedAttempt(account.name, 'provider_shape_rejected', 'provider will not take this body; retrying on Claude', 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo,
@@ -2184,9 +2179,11 @@ async function forwardRequest(
       // was still waiting" — and the elapsed time is what exposes a client watchdog firing
       // at its floor while maxpool was still happily holding the request.
       const heldMs = Date.now() - (requestInfo.startedAt || Date.now());
+      // clientHasRealBytes, not headersSent: the keep-alive commits headers with only pings.
+      const gotOutput = clientHasRealBytes(res, requestInfo);
       console.log(`[Maxpool] Client left after ${(heldMs / 1000).toFixed(1)}s on "${account.name}" `
-        + `(${res.headersSent ? 'mid-response — output already sent' : 'still waiting, nothing sent'})`);
-      logFailedAttempt(account.name, 'client_cancelled', `client left after ${(heldMs / 1000).toFixed(1)}s (${res.headersSent ? 'mid-response' : 'still waiting'})`, 'released-cancel');
+        + `(${gotOutput ? 'mid-response — output already sent' : 'still waiting, nothing sent'})`);
+      logFailedAttempt(account.name, 'client_cancelled', `client left after ${(heldMs / 1000).toFixed(1)}s (${gotOutput ? 'mid-response' : 'still waiting'})`, 'released-cancel');
       releaseOnClientGone();
       return;
     }
@@ -2254,11 +2251,12 @@ async function forwardRequest(
       // account once — no cooldown (it would make the account unavailable to its own
       // retry), no exclusion, through the normal acquire path via a one-hop hint (P1).
       // The second timeout falls through to the move path below.
-      if (err.code === 'UPSTREAM_TTFB' && canRetryBufferedBody && retrySameEligible(account, requestInfo, res)) {
+      if (err.code === 'UPSTREAM_TTFB' && canRetryBufferedBody && retrySameEligible(account, requestInfo, res, queueConfig)) {
         requestInfo.sameAccountRetried = true;
         requestInfo.retrySameAccountName = account.name;
         accountManager.releaseAccount(lease, { error: 'upstream_ttfb', scope: 'request' });
-        logFailedAttempt(account.name, transientKind, `no first byte after ${((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1)}s on a ${Math.round((requestInfo.bodyBytes || 0) / 1000)}KB prompt`, 'retry-same');
+        requestInfo.pendingRetrySame = { account: account.name, kind: transientKind,
+          detail: `no first byte after ${((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1)}s on a ${Math.round((requestInfo.bodyBytes || 0) / 1000)}KB prompt` };
         // retryCount NOT bumped: maxAttempts is sized by ACCOUNT COUNT (failover budget);
         // a same-account retry is not a failover and must not eat the move it may still
         // need (2 accounts: retry-same + move = 2 hops). sameAccountRetried bounds it.
@@ -2267,26 +2265,28 @@ async function forwardRequest(
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
+      // The release carries no error/status, so it moves no counter (no streak, no
+      // held-conversation release); markTransientFailure(network) is the short fixed
+      // cooldown, and it never bumps the streak either.
       accountManager.markTransientFailure(account.index, err.code || err.message || 'network_error', { network: true });
-      // TTFB on the direct path is request-scoped (D4): the account itself is healthy,
-      // a big prompt is just slow — this must not release the account's OTHER held
-      // conversations. Every other network class keeps today's account-level shape.
-      const transientScope = (err.code === 'UPSTREAM_TTFB' || err.code === 'UPSTREAM_IDLE') ? { scope: 'request' } : {};
-      accountManager.releaseAccount(lease, Object.keys(transientScope).length ? { ...transientScope } : undefined);
+      accountManager.releaseAccount(lease);
       excludedIndexes.add(account.index);
-      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !res.headersSent) {
+      // hasEligibleRoute like every sibling gate: with no route left the network-cause
+      // hold below is the honest path (a move would land in the no-account queue and
+      // answer with a misleading quota message).
+      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
+        && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
         logFailedAttempt(account.name, transientKind, `transient after ${((Date.now() - (lease.startedAt || Date.now())) / 1000).toFixed(1)}s`, 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
           retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
         );
       }
-      logFailedAttempt(account.name, transientKind, 'transient; no other route', 'queued');
       const queued = await queueAndRetry(
         `all routes failed after network error from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
         retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'network',
-        formatAttemptFailure(account.name, transientKind, 'queue gave up — surfaced', 'surfaced'),
+        { attempt: [account.name, transientKind, 'transient; no other route'] },
       );
       if (queued) return;
       ctx.status = 503;
@@ -2322,12 +2322,11 @@ async function forwardRequest(
         retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
       );
     }
-    logFailedAttempt(account.name, (err.code || err.message || 'error').toString().slice(0, 40), `no other route after ${err.message}`, 'queued');
     const queued = await queueAndRetry(
       `all routes failed after proxy error from "${account.name}"`,
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
       retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canRetryBufferedBody, 'proxy',
-      formatAttemptFailure(account.name, (err.code || err.message || 'error').toString().slice(0, 40), 'no route took the queue — surfaced', 'surfaced'),
+      { attempt: [account.name, (err.code || err.message || 'error').toString().slice(0, 40), `no other route after ${err.message}`] },
     );
     if (queued) return;
     ctx.status = 502;
@@ -2373,15 +2372,25 @@ function noteScaledTtfb(requestInfo, accountName, path, waitMs, floorMs, ceiling
 /**
  * D3: may this first-byte timeout retry the SAME account instead of moving?
  * Only for a big prompt, once per request, on an account that is not throttled /
- * auth-dead / cooling, while nothing real has reached the client. (No "patience left"
- * gate: the alternative — a move — waits the same scaled time on a COLD account.)
+ * auth-dead / cooling, while nothing real has reached the client, and only when the
+ * second wait can still end inside the client's patience. Direct path only.
  */
-function retrySameEligible(account, requestInfo, res) {
+function retrySameEligible(account, requestInfo, res, queueConfig = {}) {
   if (requestInfo.sameAccountRetried) return false;
   if ((requestInfo.bodyBytes || 0) < BIG_PROMPT_BYTES) return false;
   if (!account || account.status === 'throttled' || account.status === 'error'
     || account.subscriptionGone || account.refreshDead) return false;
   if (account.cooldownUntil && Date.now() < account.cooldownUntil) return false;
+  // The second attempt must be able to FINISH inside the client's patience: a bare
+  // `claude` (240s ceiling, hard 300s death) whose first wait already ran 240s cannot
+  // get a first byte from a 240s retry — that is guaranteed-wasted load; move instead.
+  // Non-streaming has no ceiling (null): its wait is the flat floor either way.
+  const ceilingMs = clientWaitCeilingMs(requestInfo, queueConfig);
+  if (ceilingMs != null) {
+    const nextWaitMs = scaledTtfbMs(UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, requestInfo.bodyBytes, ceilingMs);
+    const elapsedMs = Date.now() - (requestInfo.startedAt || Date.now());
+    if (elapsedMs + nextWaitMs > ceilingMs) return false;
+  }
   return !clientHasRealBytes(res, requestInfo);
 }
 
@@ -2623,7 +2632,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, formatAttemptFailure, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, LINK_TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, formatAttemptFailure, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -3333,27 +3342,38 @@ function clientHasRealBytes(res, requestInfo) {
   return res.headersSent && !requestInfo.queueHeartbeatActive;
 }
 
-// `giveUpLog` (optional, last arg): a pre-rendered `attempt failed (...) → surfaced`
-// line, logged exactly once by the wrapper below when this attempt's hold ENDS in a
-// give-up (queue disabled/not-eligible, window exhausted, no recovery in the window) —
-// never when the request is re-dispatched.
 async function queueAndRetry(...args) {
-  // A call WITHOUT a give-up log is exactly 16 args (through `cause`, itself a
-  // string) — never strip that. Only a 17th string arg is a give-up log line.
-  const maybeLog = args.length > 16 ? args[args.length - 1] : null;
-  if (typeof maybeLog !== 'string') return queueAndRetryInner(...args, null);
+  // A call WITHOUT an attempt descriptor is exactly 16 args (through `cause`) — never
+  // strip that. A 17th `{ attempt: [account, kind, detail] }` arg makes the queue print
+  // the failed attempt's ONE line once its outcome is known (D5): `→ queued` when the
+  // hold commits, `→ surfaced` when the queue declines without holding. A hold that
+  // later gives up prints a separate `hold gave up` line — the attempt was queued.
+  const desc = args.length > 16 ? args[args.length - 1] : null;
+  if (!desc || !Array.isArray(desc.attempt)) return queueAndRetryInner(...args, null, null);
   const inner = args.slice(0, -1);
-  let fired = false;
-  const onGiveUp = () => { if (!fired) { fired = true; console.log(maybeLog); } };
-  const result = await queueAndRetryInner(...inner, onGiveUp);
-  if (!result && !fired) onGiveUp();
+  const [acct, kind, detail] = desc.attempt;
+  let held = false;
+  let finalized = false;
+  const onHold = () => {
+    if (held) return;
+    held = true;
+    logFailedAttempt(acct, kind, detail, 'queued');
+  };
+  const onGiveUp = () => {
+    if (finalized) return;
+    finalized = true;
+    if (held) console.log(`[Maxpool] hold gave up for the (${kind}) attempt on "${acct}" → surfaced`);
+    else logFailedAttempt(acct, kind, `${detail}; not held`, 'surfaced');
+  };
+  const result = await queueAndRetryInner(...inner, onGiveUp, onHold);
+  if (!result) onGiveUp();
   return result;
 }
 
 async function queueAndRetryInner(
   reason, req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
   retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody = canRetryBufferedBody, cause = 'quota',
-  onGiveUp = null,
+  onGiveUp = null, onHold = null,
 ) {
   const giveUp = (msg) => { onGiveUp?.(); return finishQueuedStreamIfNeeded(res, requestInfo, msg); };
   if (!queueConfig.enabled || !canQueueBufferedBody || (res.headersSent && !requestInfo.queueHeartbeatActive) || res.destroyed) {
@@ -3513,6 +3533,7 @@ async function queueAndRetryInner(
     return giveUp(honestMessage);
   }
 
+  onHold?.();   // the hold is committed: the attempt that led here is `→ queued`
   ctx.account = '(queued)';
   hooks.onRequestRouted?.(reqId, { account: '(queued)' });
   // Hold-chain note: when this hold expires still-full (queueHoldChain), the

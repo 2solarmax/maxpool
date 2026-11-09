@@ -69,7 +69,7 @@ const post = (port, body = { model: 'claude-opus-5-5', messages: [] }) => fetch(
 // DIRECT-path sites: no pool link at all — one local account whose upstream port is
 // dead. One refused TCP connection is a network-class fetch failure → the transient
 // branch (markTransientFailure network + release) → moved when a route remains.
-test('direct path: transient failure emits exactly one attempt line per attempt with moved, then queued/surfaced', async () => {
+test('direct path: transient failure on the last route emits ONE line → surfaced (queue declined, never queued)', async () => {
   const deadPort = 1; // nothing listens here; connection refused instantly
   const am = new AccountManager([{
     name: 'local@gomokka.com', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000,
@@ -78,11 +78,11 @@ test('direct path: transient failure emits exactly one attempt line per attempt 
   const port = await listen(proxy);
   try {
     const lines = await captureLog(() => post(port));
-    // Single account, no route left: the attempt is queued (queue disabled in this
-    // fixture → declines immediately) and then surfaced — one line each.
-    one(lines, 'fetch failed', 'queued');
-    one(lines, 'fetch failed', 'surfaced');
-    assert.equal(attempts(lines).length, 2, `no duplicate attempt lines:\n${attempts(lines).join('\n')}`);
+    // Single account, no route left, queue disabled → declines without holding: the
+    // token is decided AFTER the queue answers (red-team r1 #5) — one line, surfaced.
+    const line = one(lines, 'fetch failed', 'surfaced');
+    assert.match(line, /transient; no other route; not held → surfaced$/);
+    assert.equal(attempts(lines).length, 1, `one line per attempt:\n${attempts(lines).join('\n')}`);
   } finally { await close(proxy); }
 });
 
@@ -99,17 +99,14 @@ test('link path: remote 429 emits exactly one attempt line with moved', async ()
 
 // Wire: remote 503 with only ONE remote account route available — the queue refuses
 // (pinned requests never hold) and the error is surfaced: queued + surfaced pair.
-test('link path: remote 503 with no other route emits queued then surfaced, one each', async () => {
+test('link path: remote 503 — moved off row 1, row 2 (last route, queue off) is ONE surfaced line', async () => {
   const r = remote(503, 0, (req, res) => { res.writeHead(503); res.end('{}'); });
   const { proxyPort, cleanup } = await boot(r.server);
   try {
     const lines = await captureLog(() => post(proxyPort));
-    // Row 1 (a successor exists) logs moved; row 2 (last route) logs queued, the
-    // queue declines (disabled here) and the SAME attempt logs its surfaced verdict.
     one(lines, 'remote-503', 'moved');
-    one(lines, 'remote-503', 'queued');
     one(lines, 'remote-503', 'surfaced');
-    assert.equal(attempts(lines).length, 3, `exactly one line per verdict:\n${attempts(lines).join('\n')}`);
+    assert.equal(attempts(lines).length, 2, `exactly one line per attempt:\n${attempts(lines).join('\n')}`);
   } finally { await cleanup(); }
 });
 
@@ -228,23 +225,22 @@ test('direct path: client cancel logs a NON-ZERO elapsed and exactly one release
 
 // Direct non-transient: a fetch that fails for a reason that is NOT network-class (an
 // unparseable upstream URL) → moved off the first account, then surfaced.
-test('direct path: non-transient proxy error emits moved, then queued + surfaced on the last route', async () => {
+test('direct path: non-transient proxy error emits moved, then ONE surfaced line on the last route', async () => {
   const am = oauth(2);
   const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: 'http://bad host:1', queue: { enabled: false } });
   const port = await listen(proxy);
   try {
     const lines = await captureLog(() => post(port));
     const a = attempts(lines);
-    assert.equal(a.length, 3, a.join('\n'));
+    assert.equal(a.length, 2, a.join('\n'));
     assert.ok(a[0].includes('on "a1"') && a[0].endsWith('→ moved'), a[0]);
-    assert.ok(a[1].includes('on "a2"') && a[1].endsWith('→ queued'), a[1]);
-    assert.ok(a[2].includes('on "a2"') && a[2].endsWith('→ surfaced'), a[2]);
+    assert.ok(a[1].includes('on "a2"') && a[1].endsWith('→ surfaced'), a[1]);
     assert.ok(!a.some(l => l.includes('fetch failed')), 'classified non-transient');
   } finally { await close(proxy); }
 });
 
 // Local 429 on the only account: queued, then (queue disabled) surfaced — one each.
-test('direct path: local 429 with no other route emits queued then surfaced', async () => {
+test('direct path: local 429 with no other route (queue off) emits ONE surfaced line', async () => {
   const upstream = http.createServer((req, res) => {
     req.resume();
     res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '30' });
@@ -255,9 +251,8 @@ test('direct path: local 429 with no other route emits queued then surfaced', as
   const port = await listen(proxy);
   try {
     const lines = await captureLog(() => post(port));
-    one(lines, 'rate_limited', 'queued');
     one(lines, 'rate_limited', 'surfaced');
-    assert.equal(attempts(lines).length, 2, attempts(lines).join('\n'));
+    assert.equal(attempts(lines).length, 1, attempts(lines).join('\n'));
   } finally { await close(proxy); await close(upstream); }
 });
 
