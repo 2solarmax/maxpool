@@ -2503,13 +2503,17 @@ export class TUI {
             if (!g || g.usableNow === false || g.paused || g.expired) continue;
             if (g.endsAt != null && g.endsAt <= now) continue;            // live expiry
             // The ONE shared scope answer (A1) — display reads the same
-            // classification as claim and lift.
+            // classification as claim and lift. DISPLAY nuance (owner 2026-11-10
+            // "distinguish model-specific vs general"): a grant that refills a
+            // MODEL limit (scoped) shows under its model tag even when it ALSO
+            // gives back to the weekly — the give-back is a side effect, not the
+            // grant's identity. Only an unscoped general refiller counts general.
             const scopes = appliesTo(g);
-            const hasGeneral = scopes.includes('general');
             const hasScoped = scopes.some(x => x !== 'general' && x !== 'session');
+            const hasGeneral = scopes.includes('general');
             const left = Math.max(0, Math.floor(g.resetsLeft ?? 1));
-            if (hasGeneral) general += left;
-            else if (hasScoped) scoped += left;
+            if (hasScoped) scoped += left;
+            else if (hasGeneral) general += left;
             else unknown += left;
             if (g.endsAt != null && g.endsAt < soonest) soonest = g.endsAt;
           }

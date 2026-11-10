@@ -835,6 +835,24 @@ test('B3: scoped grant renders nF~Xd; mixed renders g+sF', () => {
   assert.match(rstCellOf(tui, 2), /^3F\s*$/, 'overflow drops the suffix first');
 });
 
+// B3.1 (owner 2026-11-10 "distinguish model-specific vs general"): a grant that is
+// model-scoped AND gives back to the weekly (the live launch-2610-fable shape:
+// clears:["seven_day_overage_included"], gives_back_weekly:true) displays under its
+// MODEL tag — it IS a Fable reset; the give-back is a side effect, not its identity.
+test('B3.1: scoped+gives-back grant displays as F, not general', () => {
+  const am = oauthAM(3);
+  am.accounts[0].resetGrants = grantRow({ n: 2, clears: ['seven_day_overage_included'], givesBack: true, endsIn: 119 * DAY });
+  am.accounts[1].resetGrants = { ...grantRow({ n: 1 }), grants: [
+    ...grantRow({ n: 1 }).grants,
+    ...grantRow({ n: 1, clears: ['seven_day_overage_included'], givesBack: true }).grants,
+  ] };
+  am.accounts[2].resetGrants = grantRow({ n: 1, givesBack: true });   // general + give-back: stays general
+  const tui = new TUI({ accountManager: am });
+  assert.match(rstCellOf(tui, 0), /^2F\s*$/, 'scoped+giveback grants tagged F (2F~119d is 7 wide → 2F)');
+  assert.match(rstCellOf(tui, 1), /^1\+1F\s*$/, 'one true general + one scoped+giveback renders 1+1F');
+  assert.match(rstCellOf(tui, 2), /^1~119d\s*$/, 'general grant with give-back stays general (no F)');
+});
+
 test('B3: unknown-scope grants render n? (shown, never claimed)', () => {
   const am = oauthAM(2);
   am.accounts[0].resetGrants = grantRow({ n: 2, clears: [] });
