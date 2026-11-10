@@ -4,7 +4,12 @@ import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 // A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
-import { appliesTo } from './claude-reset-grants.js';
+import { appliesTo, forgetClaimOrg } from './claude-reset-grants.js';
+import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt } from './reset-policy.js';
+import {
+  LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
+  CLAIM_BACKOFF_CAP_MS, REACTIVE_CLAIM_TIMEOUT_MS,
+} from './reset-timing.js';
 
 // Review r2 A: consecutive request-scoped faults before they count against the account.
 const REQUEST_FAULT_ESCALATE = 3;
@@ -97,6 +102,7 @@ function emptyQuota() {
     // marker — a swallowed failing probe no longer silently freezes a stale tag.
     // Header-driven updates do NOT stamp this (headers can't refresh scoped/provider).
     lastProbeOkAt: null,        // ms
+    lastProbeOkSentAt: null,    // ms — SEND time of that probe (claim ordering, C1)
     // Last background probe FAILURE — surfaced in the TUI/status so a persistently
     // failing probe (e.g. the usage endpoint rate-limiting us) is VISIBLE instead of
     // silently swallowed (which let a stale weekly keep looking fresh). Cleared on
@@ -571,7 +577,10 @@ export function normalizeRemoteResets(ra) {
     };
   }
   if (ra.capLift && typeof ra.capLift === 'object') {
-    out.capLift = { active: ra.capLift.active === true, since: ra.capLift.since ?? null, mode: ra.capLift.mode ?? null };
+    // `ceiling` is the holder's computed lifted cap (null = full lift). A give-back
+    // lift MUST carry it — without it the mirror would read a full lift.
+    const ceiling = Number.isFinite(ra.capLift.ceiling) ? ra.capLift.ceiling : null;
+    out.capLift = { active: ra.capLift.active === true, since: ra.capLift.since ?? null, mode: ra.capLift.mode ?? null, ceiling };
   }
   return out;
 }
@@ -1857,8 +1866,17 @@ export class AccountManager {
   // ceilingOverride? } — evaluated live by capLiftActive() from the CURRENT
   // listing, so a grant missing from a fresh listing ends the lift at once.
 
-  /** Freshness bound for the listing that may START a lift: 3x the grants cadence. */
-  _capLiftListingFreshMs() { return 3 * (this._grantsEveryMs ?? 5 * 60_000); }
+  /** D4 (finding 3): the free weekly refill of the limit the lift lets the account
+   *  burn is < 24h away — the lift would spend a scarce reset for a few hours of
+   *  capacity the free refill brings anyway. Held unless the lifting reset itself
+   *  dies inside the same 24h (its value is lost either way). Unknown refill = no hold. */
+  _liftRefillHeld(account, sourceEndsAt, now = Date.now()) {
+    const q = account.quota || {};
+    const refillAt = account.type === 'provider' ? q.providerWkReset : q.unified7dReset;
+    if (refillAt == null || refillAt - now >= POLICY.dyingWindowMs) return false;
+    const sourceDying = sourceEndsAt != null && sourceEndsAt - now < POLICY.dyingWindowMs;
+    return !sourceDying;
+  }
 
   /** True while the account's usage cap is suspended by a held full-refill reset. */
   capLiftActive(account, now = Date.now()) {
@@ -1879,24 +1897,27 @@ export class AccountManager {
       this.endCapLift(account.index, 'grace expired', now);
       return false;
     }
+    // The free refill moved inside 24h while lifted: the cap returns now.
+    if (this._liftRefillHeld(account, st.sourceEndsAt ?? null, now)) {
+      this.endCapLift(account.index, 'free refill <24h away', now);
+      return false;
+    }
     return true;
   }
 
   /** The lifted ceiling for a window, or null for "no cap at all".
    *  A give-back grant with a measured drop lifts only to cap + drop (per window,
-   *  the weekly is where the give-back lands); a full seven_day grant lifts fully. */
+   *  the weekly is where the give-back lands); a full seven_day grant lifts fully.
+   *  A MIRROR reads the holder's exported ceiling (it carries no giveBack); a
+   *  give-back lift whose ceiling is unknown fails CLOSED to the cap itself. */
   _capLiftCeiling(account, window, now) {
     const st = account.capLift;
     if (!st) return null;
-    if (st.mode === 'giveback') {
-      const drop = Number(account.giveBack?.drop);
-      if (Number.isFinite(drop) && drop > 0) {
-        const cap = Number(account.capUtilization) || 0;
-        return Math.min(1, cap + drop);
-      }
-      return null;
-    }
-    return null;   // full lift
+    if (st.mode !== 'giveback') return null;   // full lift
+    const cap = Number(account.capUtilization) || 0;
+    if (account.remote) return Number.isFinite(st.ceiling) ? st.ceiling : cap;
+    const drop = Number(account.giveBack?.drop);
+    return Number.isFinite(drop) && drop > 0 ? Math.min(1, cap + drop) : cap;
   }
 
   /** Re-evaluate the lift from the CURRENT listing (holder pool only). Called by
@@ -1910,6 +1931,7 @@ export class AccountManager {
     // START conditions (all must hold).
     let active = false;
     let mode = null;
+    let sources = [];      // the resets that carry the lift (their expiry decides the refill hold)
     // No cap configured → nothing to lift (starting a lift on an uncapped account
     // would remap its ordinary weekly tiers and log noise for no benefit).
     const capFloor = account.capUtilization;
@@ -1917,7 +1939,7 @@ export class AccountManager {
       const rg = account.resetGrants;
       const cards = account.resetCards;
       const listingOk = rg && rg.stale !== true && rg.eligible !== false
-        && rg.checkedAt != null && (now - rg.checkedAt) <= this._capLiftListingFreshMs()
+        && rg.checkedAt != null && (now - rg.checkedAt) <= LISTING_FRESH_MS
         // No cooldown, no claim backoff for the grant that would lift (C3).
         && !(rg.cooldownUntil != null && rg.cooldownUntil > now);
       if (listingOk) {
@@ -1930,39 +1952,46 @@ export class AccountManager {
           && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0 && !inBackoff(g));
         // appliesTo is the ONE scope answer: full = clears seven_day; give-back =
         // gives_back_weekly on a grant that does NOT clear seven_day.
-        const full = fresh.some(g => Array.isArray(g.clears) && g.clears.includes('seven_day'));
-        const giveback = fresh.some(g => g.givesBackWeekly === true
+        const fullGrants = fresh.filter(g => Array.isArray(g.clears) && g.clears.includes('seven_day'));
+        const givebackGrants = fresh.filter(g => g.givesBackWeekly === true
           && !(Array.isArray(g.clears) && g.clears.includes('seven_day')));
-        if (full) { active = true; mode = 'full'; }
-        else if (giveback) {
+        if (fullGrants.length) { active = true; mode = 'full'; sources = fullGrants.map(g => g.endsAt); }
+        else if (givebackGrants.length) {
           // Give-back lifts ONLY once a measured claim recorded the drop (pre-mortem #7:
           // a give-back grant returns what the MODEL used, not the whole weekly).
           const drop = Number(account.giveBack?.drop);
-          if (Number.isFinite(drop) && drop > 0) { active = true; mode = 'giveback'; }
+          if (Number.isFinite(drop) && drop > 0) { active = true; mode = 'giveback'; sources = givebackGrants.map(g => g.endsAt); }
         }
       }
       // z.ai weekly card: a full refill by the same rule (pre-mortem #9: a GLM
       // capped below 0.90 never reaches the z.ai wall otherwise).
       if (!active && account.type === 'provider' && account.provider === 'zai' && cards && cards.stale !== true
-        && cards.checkedAt != null && (now - cards.checkedAt) <= this._capLiftListingFreshMs()) {
+        && cards.checkedAt != null && (now - cards.checkedAt) <= LISTING_FRESH_MS) {
         const hasWeeklyLimit = account.quota?.providerWk != null || account.quota?.providerWkReset != null;
-        const liveWeekly = (cards.weekly || []).some(c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now));
-        if (hasWeeklyLimit && liveWeekly) { active = true; mode = 'full'; }
+        const liveWeekly = (cards.weekly || []).filter(c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now));
+        if (hasWeeklyLimit && liveWeekly.length) { active = true; mode = 'full'; sources = liveWeekly.map(c => c.expiresAt); }
       }
     }
+    // The soonest-expiring source is the one a claim would spend first.
+    const known = sources.filter(t => t != null);
+    const sourceEndsAt = known.length ? Math.min(...known) : null;
+    // D4 (finding 3): never start or keep the lift inside 24h of the free refill.
+    let endWhy = 'grant missing from fresh listing';
+    if (active && this._liftRefillHeld(account, sourceEndsAt, now)) { active = false; endWhy = 'free refill <24h away'; }
 
     if (active) {
       const prev = account.capLift;
       account.capLift = {
         active: true,
         since: prev?.active ? prev.since : now,
-        graceUntil: now + (this._liftGraceMs ?? 10 * 60_000),
+        graceUntil: now + LIFT_GRACE_MS,
         mode: mode || 'full',
+        sourceEndsAt,
         reason,
       };
       if (!was) this._logCapLift(account, 'cap lifted', reason);
     } else if (was) {
-      this.endCapLift(accountIndex, 'grant missing from fresh listing', now);
+      this.endCapLift(accountIndex, endWhy, now);
     }
   }
 
@@ -3388,9 +3417,12 @@ export class AccountManager {
     // A spent/unknown listing holds nothing (C4: only a reset C1/C3 could spend).
     const grants = account.resetGrants?.grants || [];
     const listingFresh = account.resetGrants && account.resetGrants.stale !== true;
+    // appliesTo is the ONE scope answer (C4): only a grant that can refill a WEEKLY
+    // limit counts — session-only and unmapped-scope grants are never claimed, so
+    // they earn no routing discount.
     if (grants.some(g => g && g.usableNow !== false && !g.paused && !g.blocking && !g.unavailableReason
       && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0
-      && Array.isArray(g.clears) && g.clears.length > 0)) return listingFresh;
+      && appliesTo(g).some(s => s !== 'session'))) return listingFresh;
     const cards = account.resetCards;
     if (!cards || cards.stale === true) return false;
     const live = c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now);
@@ -4169,7 +4201,7 @@ export class AccountManager {
    * Update an account's quota from a background usage probe (fetchUsage result).
    * Same effect as learning quota from a live response, but for idle accounts.
    */
-  applyUsageData(accountIndex, usage) {
+  applyUsageData(accountIndex, usage, { sentAt = null } = {}) {
     // A successful probe ends any escalation streak.
     if (this.accounts[accountIndex]?.quota) this.accounts[accountIndex].quota.consecutiveProbeFailures = 0;
     const account = this.accounts[accountIndex];
@@ -4246,11 +4278,15 @@ export class AccountManager {
     }
 
     q.lastProbeOkAt = Date.now();
+    // C1 (finding 1): the SEND time orders this reading against a claim — a probe
+    // sent before a claim and applied after it carries the pre-claim reading.
+    q.lastProbeOkSentAt = Number.isFinite(sentAt) ? sentAt : q.lastProbeOkAt;
     // C3 give-back measurement: the FIRST successful probe after a give-back claim
     // records how far unified7d DROPPED — the value a give-back grant actually
     // returns (it only returns what the model used, never the whole weekly;
     // pre-mortem #7). Later lifts for this account use cap + drop as the ceiling.
-    if (account.giveBack?.pendingAt != null && usage.sevenDay?.utilization != null) {
+    if (account.giveBack?.pendingAt != null && q.lastProbeOkSentAt > account.giveBack.pendingAt
+      && usage.sevenDay?.utilization != null) {
       const utilBefore = account.giveBack.utilBefore;
       account.giveBack = { drop: Math.max(0, utilBefore - clamp01(usage.sevenDay.utilization)), at: Date.now() };
     }
@@ -4425,15 +4461,23 @@ export class AccountManager {
       return;
     }
     // DRIFT = a 200 the parser can't have meant (pre-mortem #17): expected arrays
-    // missing, or raw entries present but none kept — treat exactly like an error
-    // so a z.ai schema change never reads as "all cards gone".
+    // missing, or raw entries present but none kept — treated EXACTLY like an
+    // error: keep the last good cards (marked stale) and leave the cap lift on
+    // its grace window (finding 11: re-evaluating the lift on a drifted listing
+    // ended it at once instead of after the grace).
     const drift = !Array.isArray(cards.fiveHour) || !Array.isArray(cards.weekly);
+    if (drift) {
+      if (account.resetCards) {
+        account.resetCards = { ...account.resetCards, stale: true, lastError: 'listing drift (unexpected payload shape)', lastErrorAt: Date.now() };
+      }
+      return;
+    }
     account.resetCards = {
-      fiveHour: cards.fiveHour || [],
-      weekly: cards.weekly || [],
+      fiveHour: cards.fiveHour,
+      weekly: cards.weekly,
       checkedAt: Date.now(),
-      stale: Boolean(drift),
-      lastError: drift ? 'listing drift (unexpected payload shape)' : null,
+      stale: false,
+      lastError: null,
     };
     // C3: a z.ai weekly card can start the lift too.
     this.refreshCapLift(accountIndex, Date.now(), 'cards refreshed');
@@ -5294,6 +5338,9 @@ export class AccountManager {
     account.refreshDead = false;  // fresh tokens from re-auth revive a dead-refresh account
     account.subscriptionGone = false;  // a working re-auth means the org accepts OAuth again
     if (account.status === 'error') account.status = 'active';
+    // A re-login may be a DIFFERENT org under the same name: forget the cached
+    // claim org and the claim backoff (finding 10).
+    this._forgetClaimState(account.name);
     console.log(`[Maxpool] Updated tokens for account "${account.name}"`);
     this._onTokenRefresh?.(accountIndex, {
       accessToken,
@@ -5558,6 +5605,9 @@ export class AccountManager {
     const removed = this.accounts[index];
     if (removed.inFlight > 0) return false;
     const removedName = removed.name;
+    // A later account under the same name must start clean (finding 10). Mirrors
+    // never claimed, so only local rows carry claim state.
+    if (!removed.remote) this._forgetClaimState(removedName);
     this.accounts.splice(index, 1);
     this.accounts.forEach((a, i) => a.index = i);
     if (this.currentIndex >= this.accounts.length) {
@@ -5827,16 +5877,45 @@ export class AccountManager {
   _reactiveClaimGrant(account, kind, now = Date.now()) {
     if (!account?.resetGrants || account.resetGrants.eligible === false) return null;
     const checkedAt = account.resetGrants.checkedAt;
-    if (checkedAt == null || now - checkedAt > 6 * 3600_000) return null;   // stored listing ≤ 6h
+    if (checkedAt == null || now - checkedAt > CLAIM_STALE_LISTING_MAX_MS) return null;   // stored listing ≤ 6h
     const grants = (account.resetGrants.grants || [])
       .filter(g => g && g.usableNow !== false && !g.paused && !g.expired && !g.blocking && !g.unavailableReason
-        && (g.endsAt == null || g.endsAt > now));
+        && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0)
+      .sort((a, b) => (a.endsAt ?? Infinity) - (b.endsAt ?? Infinity));
     if (!grants.length) return null;
     if (kind === 'weekly') return grants.find(g => appliesTo(g).includes('general')) || null;
     // Model-scoped: the probe must have MEASURED that family's bucket at the wall.
     const e = account.quota?.scopedWeekly?.[kind];
-    const measured = e && e.reactive !== true && e.utilization != null && e.utilization >= 0.99;
+    const measured = e && e.reactive !== true && e.utilization != null && e.utilization >= CLAUDE_WALL_WEEKLY;
     return measured ? (grants.find(g => appliesTo(g).includes(kind)) || null) : null;
+  }
+
+  /** A claim SUCCEEDED: spend it in the stored listing at once (finding 1). Until
+   *  the next listing (≤ 5 min, or hours when the endpoint 429s) the stored copy
+   *  otherwise still offers the spent reset to the reactive path, the lift and
+   *  the routing discount. resetsLeft drops by one; at 0 the grant leaves. */
+  noteGrantClaimed(account, grantId) {
+    const rg = account?.resetGrants;
+    if (!rg || !Array.isArray(rg.grants)) return;
+    const grants = [];
+    for (const g of rg.grants) {
+      if (g?.id !== grantId) { grants.push(g); continue; }
+      const left = Math.floor(g.resetsLeft ?? 1) - 1;
+      if (left >= 1) grants.push({ ...g, resetsLeft: left });
+    }
+    account.resetGrants = { ...rg, grants };
+  }
+
+  /** Forget everything claim-related keyed by this account name: the cached org
+   *  and the per-grant backoff (finding 10 — a same-name re-login to another org
+   *  must not POST to the old org or inherit its backoff). */
+  _forgetClaimState(accountName) {
+    forgetClaimOrg(accountName);
+    const prefix = `${accountName}:`;
+    for (const m of [this._claimTries, this._claimRetryUntil]) {
+      if (!m) continue;
+      for (const k of [...m.keys()]) if (k.startsWith(prefix)) m.delete(k);
+    }
   }
 
   /** C6: the ONE claim lock per account, shared by the prober and the reactive
@@ -5860,8 +5939,8 @@ export class AccountManager {
     if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
     const tries = (this._claimTries.get(key) || 0) + 1;
     this._claimTries.set(key, tries);
-    const steps = [15 * 60_000, 30 * 60_000, 60 * 60_000];
-    const waitMs = Math.min(6 * 3600_000, steps[Math.min(tries - 1, steps.length - 1)]);
+    const steps = CLAIM_BACKOFF_STEPS_MS;
+    const waitMs = Math.min(CLAIM_BACKOFF_CAP_MS, steps[Math.min(tries - 1, steps.length - 1)]);
     this._claimRetryUntil.set(key, now + waitMs);
     return { tries, waitMs };
   }
@@ -5875,18 +5954,22 @@ export class AccountManager {
   /** Try the reactive claim for a weekly-class 429 (7d header ≥ 0.999) or a scoped
    *  429 (model family). Returns true when a claim was attempted. NEVER called for
    *  a mirror row or a benched/disabled account. Shares the C6 lock and backoff
-   *  state with the prober path. */
+   *  state with the prober path. The server calls it fire-and-forget; the claim
+   *  itself gives up after REACTIVE_CLAIM_TIMEOUT_MS so the lock is never held for
+   *  minutes. A 401 (token rejected) defers to the next sweep — it refreshes the
+   *  token first — and is NOT counted as a failed claim (no backoff). */
   async tryReactiveClaim(account, { kind, weeklyUtil = null }, now = Date.now()) {
     if (!account) return false;
     if (account.remote || account.poolBenchedBy || account.enabled === false) return false;
     if (!account.credential || account.type !== 'oauth') return false;
+    // C6 (finding 1): ONE claim per wall — after a claim, only a probe SENT after
+    // it may show the wall again. Repeated 429s on the same wall never re-claim.
+    const lastClaimAt = account.lastClaimAt ?? null;
+    if (lastClaimAt != null && !((probeSentAt(account.quota) ?? -Infinity) > lastClaimAt)) return false;
+    // No grant (or a scoped 429 without a probe-measured bucket) → the next sweep
+    // decides on its own fresh reading.
     const grant = this._reactiveClaimGrant(account, kind, now);
-    if (!grant) {
-      // C2: mark the candidate so the next sweep decides (a scoped 429 without a
-      // measured bucket must not claim on the header alone).
-      account.claimCandidate = kind;
-      return false;
-    }
+    if (!grant) return false;
     // C6: shared backoff per (account, grantId).
     const key = `${account.name}:${grant.id}`;
     const until = this._claimRetryUntil?.get(key);
@@ -5894,10 +5977,17 @@ export class AccountManager {
     if (!this.acquireClaimLock(account.name)) return false;
     try {
       const { claimResetGrant } = await import('./claude-reset-grants.js');
-      const r = await claimResetGrant(account.credential, grant.id, { accountKey: account.name });
+      const r = await claimResetGrant(account.credential, grant.id, {
+        accountKey: account.name, signal: AbortSignal.timeout(REACTIVE_CLAIM_TIMEOUT_MS),
+      });
+      if (!r?.ok && r?.status === 401) {
+        console.log(`[reset-grant] ${account.name}: reactive claim deferred to the next sweep (token rejected)`);
+        return true;   // attempted; no backoff, no lift change
+      }
       if (r?.ok) {
         this.noteClaimSuccess(account.name, grant.id);
         account.lastClaimAt = Date.now();
+        this.noteGrantClaimed(account, grant.id);
         // Clear the wall this claim refills.
         if (kind !== 'weekly' && account.quota?.scopedWeekly?.[kind]) delete account.quota.scopedWeekly[kind];
         if (account.status === 'throttled') {
@@ -5971,8 +6061,13 @@ export class AccountManager {
         },
         // C3: the holder pool's cap-lift verdict. Mirrors honour this as-is;
         // missing = no lift. Never recomputed on the mirror side.
-        capLift: a.capLift?.active === true
-          ? { active: true, since: a.capLift.since ?? null, mode: a.capLift.mode ?? null }
+        // `ceiling` = the holder's lifted cap (null = full lift): a give-back lift
+        // exported without it read as a FULL lift on every mirror (finding 2).
+        // The EVALUATED verdict (grace, refill proximity, dead/benched), never the
+        // raw stored flag — a lift that capLiftActive would end must not reach mirrors.
+        capLift: (a.remote ? a.capLift?.active === true : this.capLiftActive(a, now))
+          ? { active: true, since: a.capLift.since ?? null, mode: a.capLift.mode ?? null,
+              ceiling: a.remote ? (a.capLift.ceiling ?? null) : this._capLiftCeiling(a, 'wk', now) }
           : { active: false },
         giveBack: a.giveBack ?? null,
         // Capacity-page inputs for linked pools (a mirror has no credential and no

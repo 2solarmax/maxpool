@@ -6,10 +6,25 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { decideClaude } from '../src/reset-policy.js';
+import { Prober } from '../src/prober.js';
 
 const DAY = 86400_000;
 const H = 3600_000;
 const now = () => Date.now();
+
+// The prober's claim goes through claimResetGrant → fetch: stub it (never the network).
+function stubClaimFetch({ ok = true } = {}) {
+  const realFetch = globalThis.fetch;
+  const realLog = console.log;
+  console.log = () => {};
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/api/oauth/profile')) return { ok: true, status: 200, json: async () => ({ organization: { uuid: 'org-lift' } }) };
+    return ok ? { ok: true, status: 200, json: async () => ({ success: true }) }
+      : { ok: false, status: 400, json: async () => ({ error: { type: 'invalid_request_error', message: 'nope' } }) };
+  };
+  return () => { globalThis.fetch = realFetch; console.log = realLog; };
+}
+const quietProber = am => new Prober(am, { intervalMs: 0, log: () => {} });
 
 function cappedAm({ cap = 0.75, type = 'oauth', provider = undefined } = {}) {
   const acct = type === 'provider'
@@ -36,7 +51,7 @@ function setUsage(a, { wk, ses, wkReset = 3 * DAY, sesReset = 3 * H, scoped = nu
 }
 
 // ── TEST 21: the lift suspends the cap; the claim fires at 0.99; cap returns ──
-test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal, claim at 0.99, capped returns after the claim', () => {
+test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal, claim at 0.99, capped returns after the claim', async () => {
   const am = cappedAm({ cap: 0.75 });
   const a = am.accounts[0];
   setUsage(a, { wk: 0.93 });
@@ -48,14 +63,20 @@ test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal,
   assert.notEqual(am._weeklyRawState(a), 'capped', 'not capped while lifted');
   assert.equal(am._weeklyRawState(a), 'normal', 'routable at normal share (0.93 < 0.999 wall)');
   assert.equal(am._isSessionQuotaUnavailable(a), false, 'the session bench reads no cap either');
-  // Climb to the claim point.
+  // Climb to the claim point; the PROBER claims (the real end-of-lift path —
+  // judge #12: ending it via an empty listing never exercised the claim).
   setUsage(a, { wk: 0.995 });
   const act = decideClaude(a, a.resetGrants);
   assert.ok(act, 'the claim fires at 0.99');
-  // Grant gone from a fresh listing after the claim → capped returns at 0.80.
-  am.applyResetGrants(0, { grants: [], eligible: true });
+  const restore = stubClaimFetch({ ok: true });
+  try { assert.equal(await quietProber(am)._claimClaudeGrant(a, act), true, 'claimed'); }
+  finally { restore(); }
+  assert.equal(am.capLiftActive(a), false, 'the CLAIM ended the lift (no new listing yet)');
+  assert.equal(a.resetGrants.grants.length, 0, 'the spent grant left the stored listing');
+  // The next refresh of the stored listing cannot re-lift on the spent grant.
+  am.refreshCapLift(0);
   setUsage(a, { wk: 0.80 });
-  assert.equal(am.capLiftActive(a), false, 'the lift ended (grant gone)');
+  assert.equal(am.capLiftActive(a), false, 'still ended after a re-evaluation');
   assert.equal(am._weeklyRawState(a), 'capped', 'capped returns at 0.80 over the 0.75 cap');
 });
 
@@ -136,8 +157,17 @@ test('SC10: a claim failure while lifted applies the cap again on the next evalu
   setUsage(a, { wk: 0.995 });
   am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
   assert.equal(am.capLiftActive(a), true);
-  am.endCapLift(0, 'claim failed');   // what _claimClaudeGrant does on a failed claim
+  // Drive the REAL claim path with a failing claim (judge #12: calling endCapLift
+  // directly let a mutant that drops the end-of-lift in _claimClaudeGrant survive).
+  const act = decideClaude(a, a.resetGrants);
+  assert.ok(act, 'precondition: the policy decides to claim');
+  const restore = stubClaimFetch({ ok: false });
+  try { assert.equal(await quietProber(am)._claimClaudeGrant(a, act), false, 'the claim failed'); }
+  finally { restore(); }
   assert.equal(am.capLiftActive(a), false, 'the lift ended on the failed claim');
+  // The grant is in claim backoff now: a fresh listing still holding it does not re-lift.
+  am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
+  assert.equal(am.capLiftActive(a), false, 'no re-lift on a grant in claim backoff');
   setUsage(a, { wk: 0.80 });
   assert.equal(am._weeklyRawState(a), 'capped', 'the cap applies again');
 });
@@ -219,4 +249,88 @@ test('an uncapped account with a grant stays ordinary (no lift state, no log)', 
   finally { console.log = realLog; }
   assert.equal(am.capLiftActive(b), false);
   assert.equal(logs.filter(l => /cap lifted/.test(l)).length, 0, 'no lift log for an uncapped account');
+});
+
+// ── judge #3 (D4): no lift inside 24h of the free weekly refill ───────────────
+test('SC10 (judge #3): Claude lift refused at refill-18h, granted at refill-3d; a DYING grant still lifts at refill-18h', () => {
+  const near = cappedAm({ cap: 0.75 });
+  setUsage(near.accounts[0], { wk: 0.80, wkReset: 18 * H });
+  near.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
+  assert.equal(near.capLiftActive(near.accounts[0]), false, 'refill 18h away → no lift (the free refill covers it)');
+  assert.equal(near._weeklyRawState(near.accounts[0]), 'capped', 'the cap holds');
+
+  const far = cappedAm({ cap: 0.75 });
+  setUsage(far.accounts[0], { wk: 0.80, wkReset: 3 * DAY });
+  far.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
+  assert.equal(far.capLiftActive(far.accounts[0]), true, 'refill 3 days away → lifted');
+
+  const dying = cappedAm({ cap: 0.75 });
+  setUsage(dying.accounts[0], { wk: 0.80, wkReset: 18 * H });
+  dying.applyResetGrants(0, { grants: [{ ...GEN_GRANT(), endsAt: Date.now() + 10 * H }], eligible: true });
+  assert.equal(dying.capLiftActive(dying.accounts[0]), true, 'the grant itself dies within 24h → its value is lost anyway: lift');
+});
+
+test('SC10 (judge #3): a lift in force ends when the free refill moves inside 24h (no new listing needed)', () => {
+  const am = cappedAm({ cap: 0.75 });
+  const a = am.accounts[0];
+  setUsage(a, { wk: 0.80, wkReset: 3 * DAY });
+  am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
+  assert.equal(am.capLiftActive(a), true, 'precondition: lifted');
+  const logs = [];
+  const realLog = console.log;
+  console.log = m => logs.push(m);
+  try {
+    a.quota.unified7dReset = Date.now() + 18 * H;     // the window advanced toward its refill
+    assert.equal(am.capLiftActive(a), false, 'the lift ends inside 24h of the refill');
+  } finally { console.log = realLog; }
+  assert.ok(logs.some(l => /cap restored \(free refill <24h away\)/.test(l)), logs.join(' | '));
+  assert.equal(am._weeklyRawState(a), 'capped');
+});
+
+test('SC10 (judge #3): GLM capped account with a weekly card — refused at refill-18h, granted at refill-3d', () => {
+  const card = () => ({ weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 20 * DAY, expired: false }], fiveHour: [] });
+  const setup = (refillIn) => {
+    const glm = cappedAm({ cap: 0.60, type: 'provider', provider: 'zai' });
+    const g = glm.accounts[0];
+    g.quota.providerSes = 0.30; g.quota.providerSesReset = Date.now() + 3 * H;
+    g.quota.providerWk = 0.62; g.quota.providerWkReset = Date.now() + refillIn;
+    g.quota.weeklyAbsent = false;
+    glm.applyResetCards(0, card());
+    return { glm, g };
+  };
+  const near = setup(18 * H);
+  assert.equal(near.glm.capLiftActive(near.g), false, 'z.ai refill 18h away → the card is not burned via a lift');
+  assert.equal(near.glm._weeklyRawState(near.g), 'capped');
+  const far = setup(3 * DAY);
+  assert.equal(far.glm.capLiftActive(far.g), true, 'z.ai refill 3 days away → lifted');
+});
+
+// ── judge #11: a drifted z.ai listing keeps the lift on its grace window ───────
+test('SC10 (judge #11): a drifted card listing holds the lift for the grace window (never ends it at once)', () => {
+  const glm = cappedAm({ cap: 0.60, type: 'provider', provider: 'zai' });
+  const g = glm.accounts[0];
+  g.quota.providerSes = 0.30; g.quota.providerSesReset = Date.now() + 3 * H;
+  g.quota.providerWk = 0.62; g.quota.providerWkReset = Date.now() + 5 * DAY;
+  g.quota.weeklyAbsent = false;
+  glm.applyResetCards(0, { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 20 * DAY, expired: false }], fiveHour: [] });
+  assert.equal(glm.capLiftActive(g), true, 'precondition: lifted');
+  glm.applyResetCards(0, { fiveHour: [] });   // 200 with the weekly array missing = drift
+  assert.equal(g.resetCards.stale, true, 'drift marks the listing stale');
+  assert.equal(g.resetCards.weekly.length, 1, 'the last good cards are kept');
+  assert.equal(glm.capLiftActive(g), true, 'the lift rides its grace window through the drift');
+});
+
+test('SC10 (judge #3): at refill-18h a lift never STARTS — no lift log, and the export tells mirrors "no lift"', () => {
+  const am = cappedAm({ cap: 0.75 });
+  const a = am.accounts[0];
+  setUsage(a, { wk: 0.80, wkReset: 18 * H });
+  const logs = [];
+  const realLog = console.log;
+  console.log = m => logs.push(String(m));
+  try {
+    for (let i = 0; i < 3; i++) am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });   // three listings
+  } finally { console.log = realLog; }
+  assert.equal(logs.filter(l => /cap lifted|cap restored/.test(l)).length, 0, `no lift flapping per listing (got: ${logs.join(' | ')})`);
+  assert.notEqual(a.capLift?.active, true, 'no lift state was stored');
+  assert.equal(am.getStatus().accounts[0].capLift.active, false, 'mirrors are told: no lift');
 });

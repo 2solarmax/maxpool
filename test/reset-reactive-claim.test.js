@@ -4,7 +4,11 @@
 // probe-MEASURED bucket; one claim lock per account; failure backoff.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
+import { decideClaude } from '../src/reset-policy.js';
+import { claimResetGrant } from '../src/claude-reset-grants.js';
+import { createProxyServer } from '../src/server.js';
 
 const DAY = 86400_000;
 const H = 3600_000;
@@ -57,8 +61,12 @@ test('SC5: scoped 429 + measured fable bucket → exactly 1 claim POST, bench cl
     assert.equal(a.quota.scopedWeekly.fable, undefined, 'the reactive Fable bench is cleared');
     assert.equal(a.status, 'active', 'unbenched');
     assert.ok(a.lastClaimAt > 0, 'lastClaimAt stamped');
-    // "the next probe reads 0.05" — a second reactive attempt is suppressed (one claim per wall).
-    await manager.tryReactiveClaim(a, { kind: 'fable' });
+    assert.deepEqual(a.resetGrants.grants.map(g => g.id), ['f1'], 'the spent grant left the stored listing');
+    // A second Fable 429 on the SAME wall, with the measured bucket still in place
+    // (judge #12: the old test passed only because the entry was deleted) and an
+    // unspent Fable grant still held — no probe has landed since the claim.
+    a.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 2 * DAY, isActive: true } };
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'fable' }), false, 'suppressed by the one-claim-per-wall guard');
     assert.equal(calls.filter(u => /reset_rate_limits/.test(u)).length, 1, 'no second claim');
   } finally { restore(); }
 });
@@ -83,8 +91,8 @@ test('SC5/8: stale stored listing (20 min) + 7d-class 429 → claim POST same ti
   } finally { restore(); }
 });
 
-// ── TEST 17: a scoped 429 without a measured bucket → claimCandidate, no claim ─
-test('SC8: scoped Fable 429 with bucket 0.2 → 0 claims + claimCandidate; measured 0.995 → ONLY the Fable grant', async () => {
+// ── TEST 17: a scoped 429 without a measured bucket → no claim (the sweep decides) ─
+test('SC8: scoped Fable 429 with an unmeasured bucket → 0 claims; measured 0.995 → ONLY the Fable grant', async () => {
   const calls = [];
   const restore = stubClaim({ calls });
   try {
@@ -95,7 +103,6 @@ test('SC8: scoped Fable 429 with bucket 0.2 → 0 claims + claimCandidate; measu
     const att = await mgrA.tryReactiveClaim(aA, { kind: 'fable' });
     assert.equal(att, false, 'no claim attempted');
     assert.equal(calls.filter(u => /reset_rate_limits/.test(u)).length, 0, '0 claims on an unmeasured bucket');
-    assert.equal(aA.claimCandidate, 'fable', 'claimCandidate set for the next sweep');
 
     // (b) measured at 0.995: only the Fable grant is claimed (not the general one).
     const mgrB = am({ grants: { grants: [...GEN().grants, ...FABLE(1).grants], nextGrantId: null, cooldownUntil: null, eligible: true, checkedAt: Date.now(), stale: false },
@@ -207,4 +214,185 @@ test('SC8: the claim lock covers BOTH paths (prober suppressed while reactive ho
     const claimed2 = await prober._claimClaudeGrant(a, { grant: GEN().grants[0], scope: 'general', reason: 'weekly at wall' });
     assert.equal(claimed2, true, 'the prober claims once the lock is free');
   } finally { restore(); }
+});
+
+// ── judge #1: ONE claim per wall across SEQUENTIAL 429s, with resetsLeft 2 ─────
+const usageAt = (wk) => ({ fiveHour: { utilization: 0.1, resetAt: Date.now() + H },
+  sevenDay: { utilization: wk, resetAt: Date.now() + 3 * DAY }, weeklyAbsent: false });
+
+test('SC8 (judge #1): sequential weekly 429s after a claim → ONE POST; resetsLeft 2→1; a pre-claim probe landing late never re-licenses; a post-claim probe at the wall does', async () => {
+  const calls = [];
+  const restore = stubClaim({ calls });
+  try {
+    const listing = GEN();
+    listing.grants[0].resetsLeft = 2; listing.grants[0].resetsTotal = 2;
+    const manager = am({ grants: listing, wk: 0.999 });
+    const a = manager.accounts[0];
+    const posts = () => calls.filter(u => /reset_rate_limits/.test(u)).length;
+
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 }), true);
+    assert.equal(posts(), 1);
+    assert.equal(a.resetGrants.grants[0].resetsLeft, 1, 'the stored count dropped 2 → 1 at once');
+
+    // Second weekly 429 on the same wall: no probe since the claim.
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 }), false);
+    assert.equal(posts(), 1, 'no second claim for the same wall');
+
+    // The prober race: a probe SENT before the claim lands after it, still carrying
+    // the pre-claim 0.999 reading. Neither path may treat it as a new wall.
+    const claimAt = a.lastClaimAt;
+    await new Promise(r => setTimeout(r, 5));
+    manager.applyUsageData(0, usageAt(0.999), { sentAt: claimAt - 1000 });
+    assert.ok(a.quota.lastProbeOkAt > claimAt, 'precondition: the reading was APPLIED after the claim');
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 }), false);
+    assert.equal(decideClaude(a, a.resetGrants), null, 'the prober path refuses the same late reading');
+    assert.equal(posts(), 1);
+
+    // Negative control: a probe SENT after the claim still at the wall is a NEW wall.
+    await new Promise(r => setTimeout(r, 5));
+    manager.applyUsageData(0, usageAt(0.999), { sentAt: Date.now() });
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 }), true);
+    assert.equal(posts(), 2, 'a probe sent after the claim licenses the remaining reset');
+    assert.equal(a.resetGrants.grants.length, 0, 'resetsLeft 1 → 0: the grant left the stored listing');
+  } finally { restore(); }
+});
+
+// ── judge #4: a 401 defers to the sweep — never a failed claim, never a backoff ──
+test('SC8 (judge #4): a 401 on the reactive claim sets NO backoff and leaves the next attempt free', async () => {
+  const realFetch = globalThis.fetch;
+  const posts = [];
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith('/api/oauth/profile')) return { ok: true, status: 200, json: async () => ({ organization: { uuid: 'org-401' } }) };
+    posts.push(String(url));
+    return { ok: false, status: 401, json: async () => ({ error: { type: 'authentication_error', message: 'token rejected' } }) };
+  };
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    const manager = new AccountManager([{ name: 'claude 401-UNIQUE', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
+    const a = manager.accounts[0];
+    a.quota.unified7d = 0.999; a.quota.unified7dReset = Date.now() + 3 * DAY; a.quota.lastProbeOkAt = Date.now();
+    manager.applyResetGrants(0, GEN());
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 }), true, 'attempted');
+    const key = `${a.name}:g1`;
+    assert.ok(!(manager._claimRetryUntil?.get(key) > Date.now()), 'NO backoff window after a 401');
+    assert.ok(!(manager._claimTries?.get(key) > 0), 'the 401 is not counted as a failed try');
+    assert.equal(a.lastClaimAt ?? null, null, 'a 401 is not a claim');
+    await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 });
+    assert.equal(posts.length, 2, 'the next 429 may try again at once');
+  } finally { globalThis.fetch = realFetch; console.log = realLog; }
+});
+
+test('SC8 (judge #4): the reactive claim carries an abort signal (bounded; never holds the lock for minutes)', async () => {
+  const realFetch = globalThis.fetch;
+  const signals = [];
+  globalThis.fetch = async (url, opts) => {
+    signals.push(opts?.signal);
+    if (String(url).endsWith('/api/oauth/profile')) return { ok: true, status: 200, json: async () => ({ organization: { uuid: 'org-sig' } }) };
+    return { ok: true, status: 200, json: async () => ({ success: true }) };
+  };
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    const manager = new AccountManager([{ name: 'claude SIGNAL-UNIQUE', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
+    const a = manager.accounts[0];
+    a.quota.unified7d = 0.999; a.quota.unified7dReset = Date.now() + 3 * DAY; a.quota.lastProbeOkAt = Date.now();
+    manager.applyResetGrants(0, GEN());
+    await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 });
+    assert.ok(signals.length >= 1);
+    for (const s of signals) assert.ok(s instanceof AbortSignal, 'every claim call is abortable');
+  } finally { globalThis.fetch = realFetch; console.log = realLog; }
+});
+
+test('SC8 (judge #4): the user request fails over at once while the reactive claim is still in flight', async () => {
+  const seen = [];
+  const up = http.createServer((req, res) => { req.resume(); req.on('end', () => {
+    seen.push(req.headers.authorization);
+    if (req.headers.authorization === 'Bearer t1') {
+      res.writeHead(429, { 'retry-after': '60', 'content-type': 'application/json',
+        'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '1.0' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'weekly limit reached' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+  }); });
+  await new Promise(r => up.listen(0, '127.0.0.1', r));
+  const manager = new AccountManager([
+    { name: 'a1', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
+    { name: 'a2', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 },
+  ], 0.9);
+  const claimCalls = [];
+  // A claim that NEVER settles (a hung profile GET / POST).
+  manager.tryReactiveClaim = (acct, opts) => { claimCalls.push(opts.kind); return new Promise(() => {}); };
+  const proxy = createProxyServer(manager, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${up.address().port}`,
+    retry: { maxRetryBufferBytes: 1024 * 1024 } });
+  await new Promise(r => proxy.listen(0, '127.0.0.1', r));
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    const req = fetch(`http://127.0.0.1:${proxy.address().port}/v1/messages`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'test', messages: [] }) })
+      .then(r => r.status);
+    const status = await Promise.race([req, new Promise(r => setTimeout(() => r('STALLED'), 3000))]);
+    assert.equal(status, 200, 'the request failed over without waiting for the claim');
+    assert.deepEqual(claimCalls, ['weekly'], 'the weekly-class 429 started the reactive claim');
+    assert.deepEqual(seen, ['Bearer t1', 'Bearer t2']);
+  } finally { console.log = realLog; proxy.closeAllConnections?.(); proxy.close(); up.close(); }
+});
+
+// ── judge #10: claim state is per LOGIN, not per name ─────────────────────────
+function profileClaimFetch(log, { claimStatus = 200 } = {}) {
+  return async (url) => {
+    log.push(String(url));
+    if (String(url).endsWith('/api/oauth/profile')) return { ok: true, status: 200, json: async () => ({ organization: { uuid: 'org-x' } }) };
+    if (claimStatus === 200) return { ok: true, status: 200, json: async () => ({ success: true }) };
+    return { ok: false, status: claimStatus, json: async () => ({ error: { type: 'not_found_error', message: 'no such org' } }) };
+  };
+}
+const profiles = log => log.filter(u => u.endsWith('/api/oauth/profile')).length;
+
+test('SC8 (judge #10): a re-login (updateAccountTokens) forgets the cached org AND the claim backoff', async () => {
+  const name = 'claude RELOGIN-UNIQUE';
+  const manager = new AccountManager([{ name, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
+  const log = [];
+  const f = profileClaimFetch(log);
+  await claimResetGrant('t', 'g1', { accountKey: name, fetchImpl: f });
+  await claimResetGrant('t', 'g1', { accountKey: name, fetchImpl: f });
+  assert.equal(profiles(log), 1, 'control: the org is cached per account');
+  manager.noteClaimFailure(name, 'g1');
+  const realLog = console.log;
+  console.log = () => {};
+  try { manager.updateAccountTokens(0, { accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 }); }
+  finally { console.log = realLog; }
+  assert.equal(manager._claimRetryUntil.get(`${name}:g1`), undefined, 'backoff cleared on re-login');
+  assert.equal(manager._claimTries.get(`${name}:g1`), undefined, 'try count cleared on re-login');
+  await claimResetGrant('t2', 'g1', { accountKey: name, fetchImpl: f });
+  assert.equal(profiles(log), 2, 'the re-login re-reads the profile (it may be a different org)');
+});
+
+test('SC8 (judge #10): removeAccount forgets the claim state; a 403/404 claim drops the cached org', async () => {
+  const name = 'claude REMOVE-UNIQUE';
+  const manager = new AccountManager([
+    { name, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'claude other', type: 'oauth', accessToken: 'u', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.9);
+  const log = [];
+  await claimResetGrant('t', 'g1', { accountKey: name, fetchImpl: profileClaimFetch(log) });
+  manager.noteClaimFailure(name, 'g1');
+  manager.noteClaimFailure('claude other', 'g1');
+  assert.equal(manager.removeAccount(0), true);
+  assert.equal(manager._claimRetryUntil.get(`${name}:g1`), undefined, 'removed account: backoff gone');
+  assert.ok(manager._claimRetryUntil.get('claude other:g1') > 0, 'a sibling keeps its own backoff');
+  await claimResetGrant('t', 'g1', { accountKey: name, fetchImpl: profileClaimFetch(log) });
+  assert.equal(profiles(log), 2, 'removed account: the org cache was dropped');
+
+  // 404 on the org path: the cached org is wrong now — the next claim re-reads it.
+  const log2 = [];
+  const k = 'claude 404-UNIQUE';
+  const r = await claimResetGrant('t', 'g1', { accountKey: k, fetchImpl: profileClaimFetch(log2, { claimStatus: 404 }) });
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 404, 'the failing status is reported');
+  await claimResetGrant('t', 'g1', { accountKey: k, fetchImpl: profileClaimFetch(log2) });
+  assert.equal(profiles(log2), 2, 'a 404 claim dropped the cached org');
 });

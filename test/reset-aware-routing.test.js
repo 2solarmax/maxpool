@@ -153,3 +153,19 @@ test('lifted holder at 0.96 weekly is routable normal (capped/critical remapped)
   am.applyResetCards(0, { weekly: [{ recordId: 1, expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] });
   assert.equal(am._weeklyRawState(a), 'normal', 'with the card (lifted) the tier remaps to normal below the wall');
 });
+
+// ── judge #7: the routing discount reads the ONE shared scope answer ─────────
+test('holdsUsableReset (judge #7): session-only and unmapped-scope grants earn NO discount; weekly-refilling ones do', () => {
+  const mk = (name) => ({ name, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + H });
+  const am = new AccountManager([mk('c1')], 0.9);
+  const a = am.accounts[0];
+  const grant = (o) => ({ id: 'g', usableNow: true, paused: false, resetsLeft: 1, endsAt: soon(30 * DAY), givesBackWeekly: false, ...o });
+  am.applyResetGrants(0, { grants: [grant({ clears: ['five_hour'] })], eligible: true });
+  assert.equal(am._holdsUsableReset(a), false, 'session-only grant: never claimed → no discount');
+  am.applyResetGrants(0, { grants: [grant({ clears: ['mystery_limit'] })], eligible: true });
+  assert.equal(am._holdsUsableReset(a), false, 'unmapped scope: never claimed → no discount');
+  am.applyResetGrants(0, { grants: [grant({ clears: ['seven_day'] })], eligible: true });
+  assert.equal(am._holdsUsableReset(a), true, 'general weekly grant counts');
+  am.applyResetGrants(0, { grants: [grant({ clears: ['seven_day_overage_included'] })], eligible: true });
+  assert.equal(am._holdsUsableReset(a), true, 'model-scoped weekly grant counts');
+});

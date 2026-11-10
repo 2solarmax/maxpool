@@ -74,7 +74,9 @@ export function appliesTo(grant) {
     const scope = GRANT_SCOPE_BY_KEY[key];
     if (scope) out.add(scope);
   }
-  if (grant.gives_back_weekly === true) out.add('general');
+  // Both shapes: the raw API key AND the normalized field every STORED grant
+  // carries (reading only the raw key made the OR rule dead for stored grants).
+  if (grant.gives_back_weekly === true || grant.givesBackWeekly === true) out.add('general');
   return [...out];
 }
 
@@ -137,6 +139,19 @@ function _logRawGrantKeysOnce(ce, log = console.log) {
   try { log(`[reset-grant] cedar_ember grant keys: [${[...keys].sort().join(', ')}]`); } catch { /* log-only */ }
 }
 
+// A `clears` value we have no scope for: the grant is shown, never claimed, never
+// lifts a cap. Logged ONCE per key per process so a new limit name is visible.
+const _loggedUnmappedClears = new Set();
+function _logUnmappedClearsOnce(ce, log = console.log) {
+  for (const g of (Array.isArray(ce.grants) ? ce.grants : [])) {
+    for (const k of (Array.isArray(g?.clears) ? g.clears : [])) {
+      if (typeof k !== 'string' || k in GRANT_SCOPE_BY_KEY || _loggedUnmappedClears.has(k)) continue;
+      _loggedUnmappedClears.add(k);
+      try { log(`[reset-grant] unmapped clears key "${k}" — grant shown, never claimed`); } catch { /* log-only */ }
+    }
+  }
+}
+
 /** List this account's banked resets. Zero-spend read (skip_spend=1).
  *  Returns { grants: [], nextGrantId, cooldownUntil, eligible, reason } | { error }.
  *  `fetchImpl` is the test seam (never hits api.anthropic.com from tests). */
@@ -159,7 +174,7 @@ export async function listResetGrants(accessToken, { signal, fetchImpl = (u, o) 
                eligible: false, reason: ce.ineligible_reason || 'ineligible' };
     }
     const now = Date.now();
-    if (Array.isArray(ce.grants) && ce.grants.length) _logRawGrantKeysOnce(ce);
+    if (Array.isArray(ce.grants) && ce.grants.length) { _logRawGrantKeysOnce(ce); _logUnmappedClearsOnce(ce); }
     const grants = (Array.isArray(ce.grants) ? ce.grants : []).map(g => normalizeGrant(g, now)).filter(Boolean);
     return {
       grants,
@@ -175,15 +190,22 @@ export async function listResetGrants(accessToken, { signal, fetchImpl = (u, o) 
 
 // C6: org uuid cache — one profile GET per account per process (pre-mortem #6: a
 // failing claim retried a profile GET + POST per sweep per account). Keyed by the
-// account's credential fingerprint-free identity: the CALLER passes accountKey
-// (the account name); the cache holds { key, org } so a caller with a different
-// account name but same cache slot still refetches.
+// account name the CALLER passes as accountKey. Cleared by forgetClaimOrg when
+// the account is removed or re-logged-in (a same-name re-login may be a
+// different org), and dropped on a 403/404 claim (the org no longer matches).
 const _orgCache = new Map();   // accountKey -> org uuid
+
+/** Forget the cached org for one account (removeAccount / token replacement). */
+export function forgetClaimOrg(accountKey) {
+  if (accountKey != null) _orgCache.delete(accountKey);
+}
 
 /** Claim one grant. The CLI never retries a claim on the wire; our request_id is
  *  random per CALL (server treats already_used as success), so a caller retry is
  *  safe but the id is not reused across distinct decisions. Returns
- *  { ok:true } | { ok:false, error, code }.
+ *  { ok:true } | { ok:false, error, code, status }  (`status` = the HTTP status
+ *  of the failing call when there was one — a 401 means "token rejected", which
+ *  callers treat as defer-to-the-sweep, not as a failed claim).
  *  `accountKey` (account name) caches the org uuid per account (C6): one profile
  *  GET per account per process. */
 export async function claimResetGrant(accessToken, grantId, { signal, requestId, fetchImpl, accountKey } = {}) {
@@ -193,7 +215,7 @@ export async function claimResetGrant(accessToken, grantId, { signal, requestId,
     let org = accountKey != null ? _orgCache.get(accountKey) : undefined;
     if (org == null) {
       const prof = await doFetch(PROFILE_URL, { headers: headers(accessToken), signal });
-      if (!prof.ok) return { ok: false, error: `profile HTTP ${prof.status}` };
+      if (!prof.ok) return { ok: false, error: `profile HTTP ${prof.status}`, status: prof.status };
       const body = await prof.json();
       // The profile returns `organization` (SINGULAR object) — measured live on
       // maxim.krasnykh@gmail.com 2026-10-09: {account, organization, application}.
@@ -219,11 +241,15 @@ export async function claimResetGrant(accessToken, grantId, { signal, requestId,
     // Success shapes observed: {success:true} or result:"already_used" (idempotent).
     const okFlag = data?.success === true || data?.result === 'already_used';
     if (okFlag) return { ok: true, grantId, alreadyUsed: data?.result === 'already_used' };
-    return { ok: false, error: data?.error?.message || JSON.stringify(data).slice(0, 200), code: data?.error?.type };
+    // 403/404 on the org path: the cached org no longer belongs to this login —
+    // drop it so the next claim re-reads the profile.
+    if ((res.status === 403 || res.status === 404) && accountKey != null) _orgCache.delete(accountKey);
+    return { ok: false, error: data?.error?.message || JSON.stringify(data).slice(0, 200), code: data?.error?.type,
+      status: Number.isFinite(res.status) ? res.status : null };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
   }
 }
 
 /** Test seam: reset the once-per-process raw-key-set logger. */
-export function _resetGrantKeyLogForTest() { _loggedRawGrantKeys = false; }
+export function _resetGrantKeyLogForTest() { _loggedRawGrantKeys = false; _loggedUnmappedClears.clear(); }

@@ -140,3 +140,36 @@ test('SC8: getStatus exports null resets for an enabled===false account', () => 
   on.applyResetGrants(0, GOOD());
   assert.ok(on.getStatus().accounts[0].resetGrants);
 });
+
+// ── judge #2: a give-back lift reaches the mirror WITH its ceiling ───────────
+test('SC10 (judge #2): a cloud give-back lift (ceiling cap+drop) stays a give-back lift on the Mac mirror', () => {
+  const cloud = cloudAm();
+  const c = cloud.accounts[0];
+  c.capUtilization = 0.75; c.capMode = 'fixed';
+  c.quota.unified7dReset = Date.now() + 3 * DAY;
+  c.giveBack = { drop: 0.10, at: Date.now() };              // measured: cap + drop = 0.85
+  cloud.applyResetGrants(0, { grants: [{ ...GOOD().grants[0], id: 'gb1', clears: ['seven_day_overage_included'], givesBackWeekly: true }],
+    nextGrantId: null, cooldownUntil: null, eligible: true });
+  c.quota.unified7d = 0.97;
+  assert.equal(cloud.capLiftActive(c), true, 'precondition: the holder is lifted (give-back)');
+  assert.equal(cloud._weeklyRawState(c), 'capped', 'control: the holder reads capped at 0.97 over its 0.85 ceiling');
+
+  const row = cloud.getStatus().accounts[0];
+  assert.equal(row.capLift.mode, 'giveback');
+  assert.ok(Math.abs(row.capLift.ceiling - 0.85) < 1e-9, `the export carries the ceiling (got ${row.capLift.ceiling})`);
+
+  const mac = macAm();
+  mac.syncRemoteMirrors(linkWith(row));
+  const mirror = mac.accounts.find(a => a.remote);
+  mirror.quota.unified7d = 0.97; mirror.quota.unified7dReset = Date.now() + 3 * DAY;
+  assert.equal(mac._weeklyRawState(mirror), 'capped', 'the mirror honours the 0.85 ceiling — never a FULL lift');
+  mirror.quota.unified7d = 0.80;
+  assert.equal(mac._weeklyRawState(mirror), 'normal', 'below the ceiling the mirror is lifted like the holder');
+
+  // An export missing the ceiling (fail closed): the give-back lift reads as the cap itself.
+  const mac2 = macAm();
+  mac2.syncRemoteMirrors(linkWith({ ...row, capLift: { active: true, since: row.capLift.since, mode: 'giveback' } }));
+  const m2 = mac2.accounts.find(a => a.remote);
+  m2.quota.unified7d = 0.80; m2.quota.unified7dReset = Date.now() + 3 * DAY;
+  assert.equal(mac2._weeklyRawState(m2), 'capped', 'unknown ceiling → no lift above the cap');
+});

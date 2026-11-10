@@ -163,3 +163,54 @@ test('usage probe still fires every sweep (calls per sweep never exceed the old 
   assert.equal(grantsCalls, 1, 'grants at the 5-min cadence only');
   assert.ok(usageCalls + grantsCalls <= 5 * 2, 'total /api/oauth/usage calls never exceed the pre-change per-sweep count (2/account)');
 });
+
+// ── found in the judge-fix pass: the OR rule must hold for STORED (normalized) grants ──
+test('gives-back-weekly counts as general on a NORMALIZED grant too (every stored grant is normalized)', async () => {
+  const { decideClaude } = await import('../src/reset-policy.js');
+  const raw = { id: 'gb', resets_total: 1, resets_left: 1, usable_now: true, use_requires_limit: true,
+    clears: ['seven_day_overage_included'], gives_back_weekly: true, ends_at: new Date(Date.now() + 30 * DAY).toISOString() };
+  const g = normalizeGrant(raw, Date.now());
+  assert.deepEqual(appliesTo(g).sort(), ['fable', 'general'], 'normalized give-back grant applies to the general weekly');
+  // And the policy claims it at the GENERAL weekly wall, as a give-back claim.
+  const a = { name: 'a', enabled: true, lastClaimAt: null,
+    quota: { unified7d: 0.995, unified7dReset: Date.now() + 3 * DAY, lastProbeOkAt: Date.now() } };
+  const act = decideClaude(a, { grants: [g], eligible: true, stale: false, cooldownUntil: null });
+  assert.ok(act, 'claimed at the general weekly wall');
+  assert.equal(act.scope, 'general');
+  assert.equal(act.giveBack, true, 'snapshotted as a give-back claim (measures the drop)');
+});
+
+// ── judge #11: an unmapped clears key is logged ONCE per process ──────────────
+test('an unmapped clears key logs once per key per process (keys only, never values)', async () => {
+  _resetGrantKeyLogForTest();
+  const body = { cedar_ember: { eligible: true, grants: [
+    { id: 'u1', resets_total: 1, resets_left: 1, usable_now: true, clears: ['seven_day', 'mystery_limit'], ends_at: new Date(Date.now() + 9 * DAY).toISOString() },
+  ] } };
+  const fetchImpl = async () => ({ ok: true, status: 200, json: async () => body });
+  const logs = [];
+  const realLog = console.log;
+  console.log = m => logs.push(String(m));
+  try {
+    await listResetGrants('tok', { fetchImpl });
+    await listResetGrants('tok', { fetchImpl });
+  } finally { console.log = realLog; }
+  const unmapped = logs.filter(l => /unmapped clears key/.test(l));
+  assert.equal(unmapped.length, 1, `exactly one line across two listings (got ${unmapped.length})`);
+  assert.match(unmapped[0], /"mystery_limit"/);
+  assert.ok(!logs.some(l => /unmapped clears key "seven_day"/.test(l)), 'a mapped key never logs');
+});
+
+// ── judge #9 (A3): the token is refreshed BEFORE the grants listing ───────────
+test('A3: probeOne refreshes the token before listing grants (the listing uses the fresh token)', async () => {
+  const am = new AccountManager([{ name: 'a1', type: 'oauth', accessToken: 'old-tok', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
+  const a = am.accounts[0];
+  const order = [];
+  am.ensureTokenFresh = async () => { order.push('refresh'); a.credential = 'new-tok'; };
+  const seen = [];
+  const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+    probeFn: async () => ({ fiveHour: { utilization: 0.1 }, sevenDay: { utilization: 0.2 }, weeklyAbsent: false }),
+    grantsFn: async (cred) => { order.push('list'); seen.push(cred === 'new-tok' ? 'fresh' : 'stale'); return { grants: [], eligible: true }; } });
+  await prober.probeOne(a);
+  assert.deepEqual(order.slice(0, 2), ['refresh', 'list'], `refresh first (got ${order.join(',')})`);
+  assert.deepEqual(seen, ['fresh'], 'the listing carried the refreshed token');
+});

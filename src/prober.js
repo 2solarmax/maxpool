@@ -10,26 +10,17 @@
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
 import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
 import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
-import { listResetGrants, claimResetGrant, appliesTo } from './claude-reset-grants.js';
-import { decideZai, decideClaude } from './reset-policy.js';
+import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
+import { decideZai, decideClaudeWithReason, CLAUDE_WALL_WEEKLY } from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
+// Reset-machinery timing lives in ONE leaf module (re-exported for callers that
+// imported these from the prober).
+import { GRANTS_EVERY_MS, GRANTS_RETRY_MS, CLAIM_BACKOFF_STEPS_MS, CLAIM_BACKOFF_CAP_MS, LIFT_GRACE_MS } from './reset-timing.js';
+export { GRANTS_EVERY_MS, GRANTS_RETRY_MS, CLAIM_BACKOFF_STEPS_MS, CLAIM_BACKOFF_CAP_MS, LIFT_GRACE_MS };
 
 // How often a subscription-latched account is rechecked (one probe + at most one
 // token refresh per window — cheap, and bounded so a truly canceled plan isn't hammered).
 export const SUB_RECHECK_MS = 30 * 60_000;
-
-// A2 (2026-11-10): grants are listed at most once per 5 min per account (the call
-// hits the same per-IP rate-limited /api/oauth/usage as the usage probe). A
-// stale/errored listing retries sooner (30s) so a transient blank recovers fast.
-export const GRANTS_EVERY_MS = 5 * 60_000;
-export const GRANTS_RETRY_MS = 30_000;
-
-// C6 (pre-mortem #6): a FAILED Claude claim backs off per (account, grantId).
-export const CLAIM_BACKOFF_STEPS_MS = [15 * 60_000, 30 * 60_000, 60 * 60_000];
-export const CLAIM_BACKOFF_CAP_MS = 6 * 60 * 60_000;
-
-// C3: the cap lift survives listing failures for this long before ending.
-export const LIFT_GRACE_MS = 10 * 60_000;
 
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null, zaiUsageFn = fetchZaiModelUsage, cardsFn = listResetCards, now = Date.now } = {}) {
@@ -369,6 +360,9 @@ export class Prober {
       if (r?.ok) {
         this.am.noteClaimSuccess?.(account.name, act.grant.id);
         account.lastClaimAt = Date.now();
+        // Spend it in the STORED listing too: until the next listing (≤5 min) the
+        // held count, the lift and the reactive path must not see it as unspent.
+        this.am.noteGrantClaimed?.(account, act.grant.id);
         // C3 give-back: snapshot unified7d BEFORE the claim so the next probe can
         // measure the drop a give-back grant actually returned (cap+drop ceiling).
         if (act.giveBack) {
@@ -427,6 +421,9 @@ export class Prober {
       account._subRecheck = true;
     }
     try {
+      // A3: refresh the token BEFORE the grants listing — a near-expired token
+      // otherwise 401s the listing and blanks the count every refresh cycle.
+      await this.am.ensureTokenFresh(account.index);
       // Claude banked resets (cedar_ember) piggyback on the oauth poll — same
       // OWNER GATE as z.ai cards: a DISABLED account is never listed or claimed.
       try {
@@ -463,7 +460,11 @@ export class Prober {
           // lastProbeOkAt.
         }
       } catch { /* grants are best-effort; never break the quota probe */ }
-      await this.am.ensureTokenFresh(account.index);
+      // C1/finding 1: the SEND time of the probe whose reading a claim decides on.
+      // A probe sent before a claim and applied after it carries the PRE-claim
+      // reading; comparing the send time (not the apply time) with lastClaimAt
+      // keeps it from licensing a second claim for the same wall.
+      let probeSentAt = Date.now();
       let usage = await this._withTimeout(this.probeFn(account.credential));
       if (usage?.status === 401) {
         // Token rejected — force a refresh and retry once. NOT for a DISABLED account:
@@ -476,6 +477,7 @@ export class Prober {
         // account refreshes normally the moment it is re-enabled.
         if (account.enabled !== false) {
           await this.am.ensureTokenFresh(account.index, true);
+          probeSentAt = Date.now();
           usage = await this._withTimeout(this.probeFn(account.credential));
         }
       }
@@ -487,7 +489,7 @@ export class Prober {
         this.am.recordProbeError?.(account.index, usage.error, usage.status ?? null);
         return { ok: false, status: usage.status ?? null };
       }
-      this.am.applyUsageData(account.index, usage); // clears the error + stamps freshness
+      this.am.applyUsageData(account.index, usage, { sentAt: probeSentAt }); // clears the error + stamps freshness
       // C1: decide the claim on the reading JUST stored (this sweep's probe), on
       // the listing stored this same sweep — never on a pre-probe reading.
       await this._decideClaimAfterProbe(account);
@@ -507,45 +509,30 @@ export class Prober {
     if (!this.am.applyResetGrants) return;
     const listing = account.resetGrants;
     if (!listing) return;
-    const act = decideClaude(account, listing);
-    if (act) {
-      await this._claimClaudeGrant(account, act);
+    const { action, reason } = decideClaudeWithReason(account, listing);
+    if (action) {
+      account._claimSkipKey = null;
+      await this._claimClaudeGrant(account, action);
       return;
     }
-    // C5: at a reached limit with a held-but-unspendable grant, say WHY once per
+    // C5: at a reached limit with a held-but-unspent grant, say WHY once per
     // (account, reason) change — the owner's live check reads exactly these lines.
+    // The reason is the POLICY's own rejection (stale listing, cooldown, already
+    // claimed, window elapsed, …), never a guess reconstructed here.
     const q = account.quota || {};
-    const anyGrant = (listing.grants || []).filter(g => g && !g.paused && !g.expired);
-    if (!anyGrant.length) return;
-    const grants = anyGrant.filter(g => g.usableNow !== false && !g.blocking && !g.unavailableReason);
-    const applies = (g) => appliesTo(g);   // the ONE shared scope answer (A1)
     const wk = q.unified7d ?? null;
-    const atWall = wk != null && wk >= 0.99;
-    const scopedAtWall = (fam) => {
-      const e = q.scopedWeekly?.[fam];
-      return e && e.reactive !== true && e.utilization != null && e.utilization >= 0.99;
-    };
-    let reason = null;
-    if (atWall) {
-      const generalHeld = grants.some(g => applies(g).includes('general'));
-      if (generalHeld) reason = 'probe not fresh';
-      else if (anyGrant.some(g => g.usableNow === false || g.blocking || g.unavailableReason)) reason = 'grant not usable';
-      else reason = 'general not held';
-    } else {
-      for (const fam of ['fable', 'opus', 'sonnet', 'haiku']) {
-        if (scopedAtWall(fam)) {
-          const scopedHeld = grants.some(g => applies(g).includes(fam));
-          if (scopedHeld) reason = 'probe not fresh';
-          else if (anyGrant.some(g => g.usableNow === false || g.blocking || g.unavailableReason)) reason = 'grant not usable';
-          else reason = `${fam} not held`;
-          break;
-        }
-      }
+    const scopedAtWall = Object.values(q.scopedWeekly || {}).some(e =>
+      e && e.reactive !== true && e.utilization != null && e.utilization >= CLAUDE_WALL_WEEKLY);
+    const atWall = (wk != null && wk >= CLAUDE_WALL_WEEKLY) || scopedAtWall;
+    const held = (listing.grants || []).some(g => g && !g.paused && !g.expired);
+    if (!atWall || !held) {
+      // Left the wall (or holds nothing): the next wall logs its reason afresh.
+      account._claimSkipKey = null;
+      return;
     }
     if (reason == null) return;
-    const logKey = `${reason}`;
-    if (account._claimSkipKey !== logKey) {
-      account._claimSkipKey = logKey;
+    if (account._claimSkipKey !== reason) {
+      account._claimSkipKey = reason;
       this.log(`[reset-grant] ${account.name}: at wall, claim held (${reason})`);
     }
   }

@@ -43,6 +43,7 @@
  *     value cannot survive a wait.
  */
 import { appliesTo as defaultAppliesTo } from './claude-reset-grants.js';
+import { CLAIM_FRESH_MS } from './reset-timing.js';
 
 export const POLICY = {
   wallWeekly: 0.90,       // weekly at 90% = at the wall (z.ai cards; UNCHANGED — pre-mortem #22)
@@ -63,7 +64,8 @@ export const CLAUDE_WALL_WEEKLY = 0.99;
 // Claim freshness bound (C1, pre-mortem #5): the usage reading the claim decides on
 // must be THIS fresh (≤ 5 min) — a reading taken before this sweep's probe (up to
 // ~36 min stale after failed probes) would spend a reset right after a free refill.
-export const CLAIM_FRESH_MS = 5 * 60_000;
+// The value lives in the shared timing leaf; re-exported for existing callers.
+export { CLAIM_FRESH_MS };
 
 function msLeft(t, now) { return t == null ? Infinity : t - now; }
 
@@ -111,80 +113,123 @@ export function decideZai(account, cards, now = Date.now()) {
 }
 
 /** Decide the Claude action. Returns {kind:'grant', grant, scope, reason} | null.
+ *  Thin wrapper over decideClaudeWithReason for callers that only need the action. */
+export function decideClaude(account, listing, now = Date.now(), opts = {}) {
+  return decideClaudeWithReason(account, listing, now, opts).action;
+}
+
+/** The ONE probe-send-time used to order a reading against a claim (finding 1):
+ *  the SEND time of the last successful probe when the prober recorded it,
+ *  else its apply time. A probe sent before a claim carries the pre-claim
+ *  reading even when it lands after the claim. */
+export function probeSentAt(q) {
+  return q?.lastProbeOkSentAt ?? q?.lastProbeOkAt ?? null;
+}
+
+/** Decide the Claude action AND say why when there is none.
+ *  Returns { action: {kind:'grant', grant, scope, giveBack?, reason} | null,
+ *            reason: string | null }  — `reason` names the rejection when action
+ *  is null (C5: the skip log prints exactly this), or the claim reason.
  *
  *  C1 (amended, 2026-11-10): the claim is decided per grant by appliesTo (D1),
  *  NEVER by the server's nextGrantId order alone (pre-mortem #8: a Fable 429 could
  *  pick the general grant through that order). Freshness gates (pre-mortem #5):
  *  lastProbeOkAt within CLAIM_FRESH_MS, unified7dReset in the future (a window
- *  that just rolled means 0% used — don't spend on it), and lastProbeOkAt newer
- *  than any claim we already made (no second claim for one wall).
+ *  that just rolled means 0% used — don't spend on it), and a probe SENT after
+ *  any claim we already made (no second claim for one wall).
+ *  D4: a dying-value claim (not at the wall) waits when the free refill of the
+ *  limit it clears is < 24h away; a wall claim never waits (limit effectively full).
  *  Session-only grants are NEVER claimed (owner 2026-10-30). */
-export function decideClaude(account, listing, now = Date.now(), opts = {}) {
-  if (account?.enabled === false) return null;               // R0
-  if (!listing || listing.error || listing.stale || listing.eligible === false) return null; // only a FRESH listing may claim
-  if (listing.cooldownUntil != null && listing.cooldownUntil > now) return null;
+export function decideClaudeWithReason(account, listing, now = Date.now(), opts = {}) {
+  const skip = reason => ({ action: null, reason });
+  if (account?.enabled === false) return skip('account disabled');   // R0
+  if (!listing) return skip('no listing');
+  // Only a FRESH listing may claim.
+  if (listing.error) return skip('listing failed');
+  if (listing.stale) return skip('listing stale');
+  if (listing.eligible === false) return skip('not eligible');
+  if (listing.cooldownUntil != null && listing.cooldownUntil > now) return skip('cooldown');
   const q = account.quota || {};
 
   // FRESHNESS (pre-mortem #5): decide on THIS sweep's probe, never an aging one.
   // `freshNow` defaults to the real clock; tests may inject a frozen one.
   const freshNow = opts.now ?? now;
   const lastProbeOkAt = q.lastProbeOkAt ?? null;
-  if (lastProbeOkAt == null || freshNow - lastProbeOkAt > CLAIM_FRESH_MS) return null;
+  if (lastProbeOkAt == null || freshNow - lastProbeOkAt > CLAIM_FRESH_MS) return skip('probe not fresh');
   // A weekly window that already rolled over is empty — a claim right now buys
   // nothing (spent right after the free refill, at 0% used).
-  if (q.unified7dReset != null && q.unified7dReset <= freshNow) return null;
-  // No second claim for one wall: a probe newer than the last claim must land first.
+  if (q.unified7dReset != null && q.unified7dReset <= freshNow) return skip('weekly window elapsed');
+  // No second claim for one wall: a probe SENT after the last claim must land first.
   const lastClaimAt = account.lastClaimAt ?? null;
-  if (lastClaimAt != null && lastProbeOkAt <= lastClaimAt) return null;
+  if (lastClaimAt != null && probeSentAt(q) <= lastClaimAt) return skip('already claimed for this wall');
 
   // Per-grant applicability (D1 via appliesTo), soonest-expiring first among
   // SAME-scope grants. Grants with unknown scope (appliesTo []) are never chosen.
-  const grants = (listing.grants || [])
-    .filter(g => g && g.usableNow !== false && !g.paused && !g.expired
-      && !g.blocking && !g.unavailableReason && (g.endsAt == null || g.endsAt > now))
+  const held = (listing.grants || []).filter(g => g && !g.paused && !g.expired
+    && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0);
+  if (!held.length) return skip('no grant held');
+  const grants = held
+    .filter(g => g.usableNow !== false && !g.blocking && !g.unavailableReason)
     .sort((a, b) => (a.endsAt ?? Infinity) - (b.endsAt ?? Infinity));
-  if (!grants.length) return null;
+  if (!grants.length) return skip('grant not usable');
 
   const appliesTo = opts.appliesTo || defaultAppliesTo;
   const wkUtil = q.unified7d ?? null;
   const weeklyWall = wkUtil != null && wkUtil >= CLAUDE_WALL_WEEKLY;
+  // D4: the free refill of a limit < 24h away makes a not-at-the-wall spend redundant.
+  const refillSoon = resetAt => resetAt != null && msLeft(resetAt, now) < POLICY.freeRefillWaitMs;
+  let reason = null;
+  const note = r => { if (reason == null) reason = r; };
 
   // GENERAL (clears the general weekly, or gives_back_weekly): claim at the wall.
   // "Weekly reached" is the fresh unified7d reading ONLY — never the generic
   // `rejected` status (that conflates the 5h window and per-model caps; pre-mortem #8).
   const general = grants.filter(g => appliesTo(g).includes('general'));
   for (const g of general) {
-    const atWall = weeklyWall;
-    const dying = msLeft(g.endsAt, now) < POLICY.dyingWindowMs
-      && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;  // weekly window only (owner 2026-10-30)
-    if (atWall || (dying && !g.requiresLimit)) {
+    const giveBack = g.givesBackWeekly === true && !(Array.isArray(g.clears) && g.clears.includes('seven_day'));
+    if (weeklyWall) {
       // A give-back-only grant (no seven_day in clears) returns only what the model
       // used — the claim snapshots unified7d so the next probe measures the drop.
-      const giveBack = g.givesBackWeekly === true && !(Array.isArray(g.clears) && g.clears.includes('seven_day'));
-      return { kind: 'grant', grant: g, scope: 'general', giveBack, reason: atWall ? 'weekly at wall' : 'dying value' };
+      return { action: { kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'weekly at wall' }, reason: 'weekly at wall' };
     }
+    const dying = msLeft(g.endsAt, now) < POLICY.dyingWindowMs
+      && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;  // weekly window only (owner 2026-10-30)
+    if (!dying) continue;
+    if (g.requiresLimit) { note('requires limit'); continue; }
+    if (refillSoon(q.unified7dReset)) { note('free refill <24h away'); continue; }
+    return { action: { kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'dying value' }, reason: 'dying value' };
   }
+  if (weeklyWall && !general.length) note('general not held');
 
   // MODEL-SCOPED (D3): claim when THAT model's probe-measured weekly bucket is at
   // its wall. `reactive` entries (a 429's authoritative-high mark) do NOT count —
   // only the probe's own measurement (pre-mortem #3/#8: a scoped 429 classified by
-  // guesswork must not spend a reset).
+  // guesswork must not spend a reset). D4 dying-value is evaluated per bucket
+  // BEFORE the below-the-wall skip (it applies exactly there).
   const scopedFams = new Set();
   for (const g of grants) for (const s of appliesTo(g)) if (s !== 'general' && s !== 'session') scopedFams.add(s);
   for (const fam of scopedFams) {
     const e = q.scopedWeekly?.[fam];
     const measured = e && e.reactive !== true && e.utilization != null;
-    if (!measured || e.utilization < CLAUDE_WALL_WEEKLY) continue;
+    if (!measured) continue;
     const cand = grants.find(g => appliesTo(g).includes(fam));
     if (!cand) continue;
+    if (e.utilization >= CLAUDE_WALL_WEEKLY) {
+      return { action: { kind: 'grant', grant: cand, scope: fam, reason: `${fam} weekly at wall` }, reason: `${fam} weekly at wall` };
+    }
     const dying = msLeft(cand.endsAt, now) < POLICY.dyingWindowMs
       && e.utilization >= POLICY.dyingMinUtilWeekly;
-    if (dying && !cand.requiresLimit && e.utilization < CLAUDE_WALL_WEEKLY) {
-      return { kind: 'grant', grant: cand, scope: fam, reason: 'dying value' };
-    }
-    return { kind: 'grant', grant: cand, scope: fam, reason: `${fam} weekly at wall` };
+    if (!dying) continue;
+    if (cand.requiresLimit) { note('requires limit'); continue; }
+    if (refillSoon(e.resetAt)) { note('free refill <24h away'); continue; }
+    return { action: { kind: 'grant', grant: cand, scope: fam, reason: 'dying value' }, reason: 'dying value' };
+  }
+  // A scoped bucket measured at the wall with no grant for it.
+  for (const [fam, e] of Object.entries(q.scopedWeekly || {})) {
+    if (e && e.reactive !== true && e.utilization != null && e.utilization >= CLAUDE_WALL_WEEKLY
+      && !grants.some(g => appliesTo(g).includes(fam))) note(`${fam} not held`);
   }
 
-  // Session-only grants: NEVER claimed (owner 2026-10-30) — falls through to null.
-  return null;
+  // Session-only grants: NEVER claimed (owner 2026-10-30) — falls through.
+  return skip(reason ?? 'below wall');
 }
