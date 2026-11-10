@@ -574,6 +574,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           // belonged to, so a turn's account is exact instead of a timestamp guess.
           conversation: requestInfo?.conversationHash || null,
           sessionKey: headerValue(req.headers, 'x-maxpool-session') || null,
+          // D (2026-11-10): the first REAL upstream byte (the fetch resolve), for
+          // the TUI's ttfb= tag. Prefer this over the client-write stamp: a queued
+          // request's heartbeat commits writes LONG before upstream answers.
+          firstUpstreamByteAt: requestInfo?._firstUpstreamByteAt ?? null,
         });
       }
     } catch (err) {
@@ -1252,6 +1256,13 @@ async function forwardRequest(
       });
     } finally {
       clearTimeout(ttfbTimer);
+      // D (2026-11-10): the FIRST REAL UPSTREAM BYTE anchor. The fetch resolving IS
+      // the moment upstream answered — stamp it once per request (??= so a
+      // failover's later attempt cannot move it). The queue heartbeat NEVER stamps
+      // this (it is our own keep-alive, not upstream data); the TUI's ttfb= tag
+      // prefers this stamp when present, so a queued request's ttfb measures the
+      // upstream wait, not the queue wait. Log-only: no setting reads it.
+      requestInfo._firstUpstreamByteAt ??= Date.now();
       // Stop the grace timer for THIS attempt — but LEAVE streamGraceDeadline set so
       // a re-forward (failover) re-arms for the REMAINING time to the shared deadline.
       if (streamGraceTimer) clearTimeout(streamGraceTimer);
@@ -1440,6 +1451,24 @@ async function forwardRequest(
         fingerprint: rateLimit.scope === 'unknown' ? rateLimit.fingerprint : null,
         modelScope: rateLimit.modelScope || null,
       });
+      // C2 REACTIVE CLAIM (2026-11-10): a 429 on the serving lease claims a held
+      // reset AT ONCE, not after a full prober sweep. Only on the lease's LOCAL
+      // account holding the credential (never a mirror row — its 429 is the
+      // cloud's, and the cloud claims on its own side). A weekly-CLASS 429 (the
+      // 7d header itself ≥ the wall) claims a general grant; a scoped 429 claims
+      // only if the probe MEASURED that model's bucket at the wall. Uses the
+      // current token; a 401 defers to the sweep.
+      if (accountManager.tryReactiveClaim && !account.remote) {
+        const weeklyHdr = Number(rateLimitHeaders['anthropic-ratelimit-unified-7d-utilization']);
+        const weeklyWall = Number.isFinite(weeklyHdr) && weeklyHdr >= 0.999;
+        try {
+          if (weeklyWall) {
+            await accountManager.tryReactiveClaim(account, { kind: 'weekly', weeklyUtil: weeklyHdr });
+          } else if (rateLimit.modelScope) {
+            await accountManager.tryReactiveClaim(account, { kind: rateLimit.modelScope, weeklyUtil: weeklyHdr });
+          }
+        } catch { /* the claim is best-effort; the failover below proceeds */ }
+      }
       accountManager.releaseAccount(lease, { status: 429, error: rateLimit.modelScope ? 'model_rate_limited' : 'rate_limited' });
 
       if (logDir) {

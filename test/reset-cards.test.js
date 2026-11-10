@@ -375,3 +375,95 @@ test('owner 2026-10-30: a dying weekly card/grant is never spent because of the 
   const clWk = { enabled: true, quota: { ...freshQ, unified5h: 0.10, unified7d: 0.40 } };
   assert.equal(decideClaude(clWk, listing, now, { now })?.reason, 'dying value', 'weekly-driven dying grant still allowed');
 });
+
+// ── TEST 8 (A4, 2026-11-10): z.ai card listings keep the last good on error/timeout/drift ──
+test('A4: error, timeout, all-unavailable, and renamed-field listings all HOLD the stored cards (stale), one log line', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { Prober } = await import('../src/prober.js');
+  const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', credential: 'k', apiKey: 'k' }], 0.9);
+  const GOOD_CARDS = () => ({ weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: soon(20 * DAY), expired: false }], fiveHour: [], source: 'zai' });
+  am.applyResetCards(0, GOOD_CARDS());
+  const logs = [];
+  let mode = 'error';
+  const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m),
+    providerProbeFn: async () => ({ ses: { utilization: 0.2, resetAt: soon(3 * H) }, wk: { utilization: 0.3, resetAt: soon(3 * DAY) }, source: 'zai' }),
+    cardsFn: async () => {
+    if (mode === 'error') return { error: 'HTTP 500' };
+    if (mode === 'timeout') return null;                     // _withTimeout resolves null
+    if (mode === 'unavailable') return { weekly: [], fiveHour: [] };   // raw parse of all-unavailable is legitimately empty — NOT drift
+    if (mode === 'renamed') return { error: 'drift: 2 raw entries, 0 kept' };  // listResetCards-level drift
+    return GOOD_CARDS();
+  } });
+  const cardLogs = () => logs.filter(l => /^\[reset-card\] glm t:/.test(l));
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].resetCards.weekly.length, 1, 'error: the stored cards are held');
+  assert.equal(am.accounts[0].resetCards.stale, true, 'marked stale');
+  mode = 'timeout';
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].resetCards.weekly.length, 1, 'timeout: held');
+  mode = 'renamed';
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(am.accounts[0].resetCards.weekly.length, 1, 'renamed field (drift): held, never a good empty');
+  assert.equal(cardLogs().length, 1, 'ONE failure line across the failed sweeps');
+  mode = 'ok';
+  await prober.probeProvider(am.accounts[0]);
+  assert.equal(cardLogs().length, 2, 'recovery logs once');
+  assert.match(cardLogs()[1], /listing recovered/);
+  assert.equal(am.accounts[0].resetCards.stale, false);
+});
+
+test('A4: a 200 with every entry available:false is a legitimate empty list (not drift)', async () => {
+  const { listResetCards } = await import('../src/zai-reset-cards.js');
+  const fetchImpl = async () => ({ status: 200, json: async () => ({ code: 200, data: {
+    fiveHourResets: [{ recordId: 5, expireTime: '2099-12-22 23:59:59', available: false }],
+    weekResets: [],
+  } }) });
+  const r = await listResetCards('tok', { fetchImpl });
+  assert.deepEqual(r, { fiveHour: [], weekly: [], source: 'zai' }, 'all-unavailable parses to an honest empty, no error');
+});
+
+test('A4: listResetCards treats a 200 with a RENAMED field as drift (raw>0 kept 0)', async () => {
+  const { listResetCards } = await import('../src/zai-reset-cards.js');
+  const fetchImpl = async () => ({ status: 200, json: async () => ({ code: 200, data: {
+    fiveHourResets: [{ recordIdx: 5, expireTime: '2099-12-22 23:59:59', available: true }],   // recordId renamed
+    weekResets: [],
+  } }) });
+  const r = await listResetCards('tok', { fetchImpl });
+  assert.ok(r.error && /drift/.test(r.error), 'drift reads as an error, never a good empty list');
+});
+
+test('A4: expected arrays MISSING from a 200 is drift', async () => {
+  const { listResetCards } = await import('../src/zai-reset-cards.js');
+  const fetchImpl = async () => ({ status: 200, json: async () => ({ code: 200, data: { fiveHourResets2: [], weekResets: [] } }) });
+  const r = await listResetCards('tok', { fetchImpl });
+  assert.ok(r.error && /drift/.test(r.error));
+});
+
+// ── TEST 9 (A4/SC5): a redeem removes the card from the stored list even when the follow-up read fails ──
+test('A4/SC5: a successful redeem removes the recordId locally; a FAILED follow-up listing keeps the removal', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { Prober } = await import('../src/prober.js');
+  const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', credential: 'k', apiKey: 'k' }], 0.9);
+  am.applyResetCards(0, { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] });
+  const realFetch = globalThis.fetch;
+  let listFails = false;
+  globalThis.fetch = async (_u, init) => {
+    if (init?.method === 'POST') return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) };
+    if (listFails) return { status: 500 };
+    return { status: 200, json: async () => ({ code: 200, data: { fiveHourResets: [], weekResets: [] } }) };
+  };
+  const logs = [];
+  const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
+    cardsFn: async () => ({ weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] }) });
+  try {
+    await Prober.prototype._redeemZaiCard.call({ ...prober, log: m => logs.push(m), am, _withTimeout: p => p },
+      am.accounts[0], { card: { recordId: 9, grantType: 'GLOBAL' }, resetType: 'WEEK', reason: 'weekly at wall' });
+    // The follow-up read FAILS — the removal must still hold.
+    listFails = true;
+    assert.ok(logs.some(l => /card 9 redeemed/.test(l)));
+    const weekly = am.accounts[0].resetCards.weekly || [];
+    assert.ok(!weekly.some(c => c.recordId === 9), 'the redeemed card is GONE from the stored list');
+    // And the routing discount no longer sees a usable reset.
+    assert.equal(am._holdsUsableReset(am.accounts[0]), false, 'no stale discount for a spent card');
+  } finally { globalThis.fetch = realFetch; }
+});

@@ -524,8 +524,9 @@ export class Prober {
     // C5: at a reached limit with a held-but-unspendable grant, say WHY once per
     // (account, reason) change — the owner's live check reads exactly these lines.
     const q = account.quota || {};
-    const grants = (listing.grants || []).filter(g => g && g.usableNow !== false && !g.paused && !g.expired && !g.blocking && !g.unavailableReason);
-    if (!grants.length) return;
+    const anyGrant = (listing.grants || []).filter(g => g && !g.paused && !g.expired);
+    if (!anyGrant.length) return;
+    const grants = anyGrant.filter(g => g.usableNow !== false && !g.blocking && !g.unavailableReason);
     const applies = (g) => {
       const out = new Set();
       for (const key of (Array.isArray(g.clears) ? g.clears : [])) {
@@ -545,12 +546,16 @@ export class Prober {
     let reason = null;
     if (atWall) {
       const generalHeld = grants.some(g => applies(g).includes('general'));
-      reason = generalHeld ? 'probe not fresh' : 'general not held';
+      if (generalHeld) reason = 'probe not fresh';
+      else if (anyGrant.some(g => g.usableNow === false || g.blocking || g.unavailableReason)) reason = 'grant not usable';
+      else reason = 'general not held';
     } else {
       for (const fam of ['fable', 'opus', 'sonnet', 'haiku']) {
         if (scopedAtWall(fam)) {
           const scopedHeld = grants.some(g => applies(g).includes(fam));
-          reason = scopedHeld ? 'probe not fresh' : `${fam} not held`;
+          if (scopedHeld) reason = 'probe not fresh';
+          else if (anyGrant.some(g => g.usableNow === false || g.blocking || g.unavailableReason)) reason = 'grant not usable';
+          else reason = `${fam} not held`;
           break;
         }
       }

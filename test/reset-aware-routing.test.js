@@ -118,3 +118,38 @@ test('latch self-clear: a healthy probe un-benches a latched account', () => {
   am.applyUsageData(0, { limits: [] });   // a passing probe
   assert.equal(a.subscriptionGone, false, 'org accepts OAuth again — un-benched');
 });
+
+// ── TEST 27 (C3/C4, 2026-11-10): a LIFTED reset-holder routes at ordinary share ─
+test('lifted holder: no C4 discount while lifted (the score equals the discount-off score)', () => {
+  const am = makeAm();
+  const a = am.accounts[0];
+  a.capUtilization = 0.75; a.capMode = 'fixed';
+  a.quota.providerWk = 0.80; a.quota.providerWkReset = soon(3 * DAY);
+  am.applyResetCards(0, { weekly: [{ recordId: 1, expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] });
+  assert.equal(am.capLiftActive(a), true, 'control: lifted');
+  const ctx = { now: Date.now(), fleetRecentWeight: 0 };
+  const liftedScore = am._scoreAccount(a, {}, ctx);
+  const noDiscScore = (() => { const saved = am.scheduler.resetBoostDiscount; am.scheduler.resetBoostDiscount = 0;
+    const s = am._scoreAccount(a, {}, ctx); am.scheduler.resetBoostDiscount = saved; return s; })();
+  assert.ok(Math.abs(liftedScore - noDiscScore) < 1e-9,
+    `no discount while lifted: ${liftedScore.toFixed(3)} == discount-off ${noDiscScore.toFixed(3)}`);
+  // Control: the SAME account NOT lifted (cap null → no lift) still gets the discount.
+  const c = am.accounts[1];
+  c.quota.providerWk = 0.30;
+  am.applyResetCards(1, { fiveHour: [{ recordId: 2, expiresAt: soon(20 * DAY), expired: false }], weekly: [] });
+  const withDisc = am._scoreAccount(c, {}, ctx);
+  const noDisc = (() => { const saved = am.scheduler.resetBoostDiscount; am.scheduler.resetBoostDiscount = 0;
+    const s = am._scoreAccount(c, {}, ctx); am.scheduler.resetBoostDiscount = saved; return s; })();
+  assert.ok(withDisc < noDisc, 'control: the discount applies when NOT lifted');
+});
+
+test('lifted holder at 0.96 weekly is routable normal (capped/critical remapped)', () => {
+  const am = makeAm();
+  const a = am.accounts[0];
+  a.quota.providerWk = 0.96; a.quota.providerWkReset = soon(3 * DAY);
+  assert.equal(am._weeklyRawState(a), 'critical', 'control: without a cap the tier is critical');
+  a.capUtilization = 0.75; a.capMode = 'fixed';
+  assert.equal(am._weeklyRawState(a), 'capped', 'control: with the cap the tier is capped');
+  am.applyResetCards(0, { weekly: [{ recordId: 1, expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] });
+  assert.equal(am._weeklyRawState(a), 'normal', 'with the card (lifted) the tier remaps to normal below the wall');
+});

@@ -600,11 +600,14 @@ export class TUI {
     const provTag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
     const cv = info.conversation || r?.conversation;
     const cvTag = cv ? `  [cv ${cv.slice(0, 8)} ${String(info.sessionKey || r?.sessionKey || '').slice(0, 8)}]` : '';
-    // ttfb LAST: time until the first response byte reached the client (the stall Claude
-    // Code reports as "Waiting for API response"). Appended after every existing token so
-    // parsers of `\((\w+), ([0-9.]+)s\)` and the bracket tags are unaffected; omitted
-    // when no byte was ever sent.
-    const ttfbTag = r?.firstByteAt != null ? ` ttfb=${((r.firstByteAt - r.started) / 1000).toFixed(1)}s` : '';
+    // ttfb LAST: time until the first REAL upstream byte (the fetch resolve —
+    // D, 2026-11-10), falling back to the client-write stamp when the upstream
+    // anchor is absent (a request that never reached upstream, the link path).
+    // The queue heartbeat never stamps the upstream anchor, so a queued request's
+    // ttfb measures the upstream wait, not the queue wait. Omitted when no byte
+    // was ever sent.
+    const ttfbAt = info.firstUpstreamByteAt ?? r?.firstByteAt;
+    const ttfbTag = ttfbAt != null ? ` ttfb=${((ttfbAt - r.started) / 1000).toFixed(1)}s` : '';
     this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${provTag}${cvTag}${ttfbTag}`);
   }
 

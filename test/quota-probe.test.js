@@ -157,3 +157,22 @@ test('normalizeUsageBucket tolerates percentage and epoch/iso reset formats', ()
   assert.equal(normalizeUsageBucket(null), null);
   assert.equal(normalizeUsageBucket({}).utilization, null);
 });
+
+// ── TEST 11 (A2, 2026-11-10): no merged call — the two /api/oauth/usage requests
+// carry their DISTINCT headers (the grants call the CLI User-Agent, the usage call
+// the beta header). Merging them would drop one of the two and blind a reader.
+test('A2: the grants call and the usage call keep their distinct header sets (no merge)', async () => {
+  const { listResetGrants } = await import('../src/claude-reset-grants.js');
+  const { fetchUsage } = await import('../src/oauth.js');
+  const grantHeaders = [], usageHeaders = [];
+  const grantFetch = async (_u, opts) => { grantHeaders.push(opts.headers); return { ok: true, status: 200, json: async () => ({ cedar_ember: { eligible: true, grants: [] } }) }; };
+  await listResetGrants('tok', { fetchImpl: grantFetch });
+  assert.ok(String(grantHeaders[0]['User-Agent'] || '').startsWith('claude-cli/'), 'the grants call sends the CLI User-Agent (else eligible:false "surface")');
+  assert.equal(grantHeaders[0]['anthropic-beta'], undefined, 'the grants call does NOT send the beta header');
+  const usageFetch = async (_u, opts) => { usageHeaders.push(opts.headers); return { ok: true, status: 200, json: async () => ({ limits: [] }) }; };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = usageFetch;
+  try { await fetchUsage('tok'); } finally { globalThis.fetch = realFetch; }
+  assert.equal(usageHeaders[0]['anthropic-beta'], 'oauth-2025-04-20', 'the usage call sends the beta header (limits[])');
+  assert.equal(usageHeaders[0]['User-Agent'], undefined, 'the usage call keeps its own header set');
+});

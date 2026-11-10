@@ -242,3 +242,59 @@ test('index.js forwards the first-byte hook to the TUI (production wiring pin)',
   const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
   assert.match(src, /onRequestFirstByte:\s*\(id\)\s*=>\s*\{\s*tui\?\.onRequestFirstByte\(id\);?\s*\}/);
 });
+
+// ── TEST 31 (D): a QUEUED request's ttfb measures the UPSTREAM wait, not the queue wait ──
+test('queued request: ttfb reflects the upstream fetch resolve, never the heartbeat commit', async () => {
+  const lines = [];
+  const orig = console.log;
+  const tui = Object.create(TUI.prototype);
+  tui.am = { accounts: [] }; tui.log = []; tui.running = false; tui.render = () => {}; tui.active = new Map();
+  tui._addLog = m => lines.push(m);
+  let upstreamDelayMs = 800;
+  const up = http.createServer((req, res) => { req.resume(); req.on('end', () => {
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'msg_01Q', type: 'message', role: 'assistant', model: 'claude-3-5-haiku',
+        content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }));
+    }, upstreamDelayMs);
+  }); });
+  await new Promise(r => up.listen(0, '127.0.0.1', r));
+  const upPort = up.address().port;
+  // An apikey account capped so the FIRST selection queues, then un-caps fast so
+  // the wait is short — the queue heartbeat commits SSE writes BEFORE upstream
+  // answers, and those writes must NOT anchor ttfb.
+  const am = new AccountManager([{ name: 'acct-q', type: 'apikey', apiKey: 'sk', upstream: `http://127.0.0.1:${upPort}` }], 0.9, {});
+  const proxy = createProxyServer(am, { proxy: { apiKey: 't' }, upstream: `http://127.0.0.1:${upPort}` }, {
+    onRequestStart: (id, i) => tui.onRequestStart(id, i),
+    onRequestRouted: (id, i) => tui.onRequestRouted(id, i),
+    onRequestFirstByte: id => tui.onRequestFirstByte(id),
+    onRequestEnd: (id, i) => tui.onRequestEnd(id, i),
+  });
+  await new Promise(r => proxy.listen(0, '127.0.0.1', r));
+  try {
+    console.log = () => {};
+    await fetch(`http://127.0.0.1:${proxy.address().port}/v1/messages`, { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 't', 'x-maxpool-session': 'term-queued-0001' },
+      body: JSON.stringify({ model: 'claude-3-5-haiku', max_tokens: 8,
+        system: [{ type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." }],
+        messages: [{ role: 'user', content: 'build X' }] }) });
+    const line = lines.find(l => l.includes('→ acct-q'));
+    assert.ok(line, lines.join(' | '));
+    assert.match(line, /ttfb=[0-9.]+s$/);
+    const total = Number(/, ([0-9.]+)s\)/.exec(line)[1]);
+    const ttfb = Number(/ttfb=([0-9.]+)s$/.exec(line)[1]);
+    assert.ok(ttfb >= 0.7, `ttfb ${ttfb}s reflects the ~800ms upstream wait (not the instant heartbeat commit)`);
+    assert.ok(ttfb <= total, 'ttfb <= total');
+  } finally { console.log = orig; proxy.close(); up.close(); }
+});
+
+test('D pin: the upstream anchor is stamped at the fetch resolve (clearTimeout site), once per request', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
+  // The stamp sits in the ttfbTimer finally block, immediately after clearTimeout.
+  const m = /clearTimeout\(ttfbTimer\);\s*\n\s*\/\/ D \(2026-11-10\)[\s\S]*?requestInfo\._firstUpstreamByteAt \?\?= Date\.now\(\);/.exec(src);
+  assert.ok(m, 'the upstream-byte stamp lives at the clearTimeout(ttfbTimer) site');
+  // And the heartbeat functions never touch the anchor.
+  const heartbeatRegion = src.slice(src.indexOf('function ensureQueueHeartbeat'), src.indexOf('function finishQueuedStreamIfNeeded'));
+  assert.ok(!/_firstUpstreamByteAt/.test(heartbeatRegion), 'the queue heartbeat never stamps the upstream anchor');
+});

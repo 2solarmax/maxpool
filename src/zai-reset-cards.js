@@ -80,15 +80,17 @@ export async function listResetCards(token, { signal, fetchImpl = fetch } = {}) 
     const fiveHour = normalizeCards(data.data.fiveHourResets, now);
     const weekly = normalizeCards(data.data.weekResets, now);
     // Drift guard: the raw arrays are the expected shape; if either is missing, or
-    // raw entries exist but none survived normalization, the schema moved.
+    // raw entries exist but none survived normalization, the schema moved. An
+    // `available:false` entry is LEGITIMATELY dropped by normalizeCards — only
+    // entries that claim to be available count toward the drift check.
     const rawFive = Array.isArray(data.data.fiveHourResets) ? data.data.fiveHourResets : null;
     const rawWeek = Array.isArray(data.data.weekResets) ? data.data.weekResets : null;
     if (rawFive == null || rawWeek == null) {
       return { error: 'drift: expected arrays missing' };
     }
-    const rawCount = rawFive.length + rawWeek.length;
-    if (rawCount > 0 && fiveHour.length + weekly.length === 0) {
-      return { error: `drift: ${rawCount} raw entr${rawCount === 1 ? 'y' : 'ies'}, 0 kept` };
+    const availableRaw = [...rawFive, ...rawWeek].filter(c => c && c.available !== false).length;
+    if (availableRaw > 0 && fiveHour.length + weekly.length === 0) {
+      return { error: `drift: ${availableRaw} raw entr${availableRaw === 1 ? 'y' : 'ies'}, 0 kept` };
     }
     return { fiveHour, weekly, source: 'zai' };
   } catch (err) {

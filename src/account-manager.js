@@ -4075,7 +4075,10 @@ export class AccountManager {
       // C3 CAP LIFT (provider twin): a lifted z.ai account tiers `normal` below
       // the wall so it can climb to the 0.90 card wall instead of being stranded
       // in reserve/critical by its own cap.
-      if (this.capLiftActive(account, now) && used < this.scheduler.weeklyExhaustedThreshold) return 'normal';
+      if (this.capLiftActive(account, now)) {
+        const ceil = this._capLiftCeiling(account, 'wk', now);
+        if ((ceil == null && used < this.scheduler.weeklyExhaustedThreshold) || (ceil != null && used < ceil)) return 'normal';
+      }
       // USAGE CAP — checked FIRST, before every tier: a reservation is owner intent
       // and outranks both the tier ladder and the upstream verdict. There is no
       // upstreamAllows carve-out for providers anyway, but the ordering documents
@@ -4097,9 +4100,13 @@ export class AccountManager {
     // C3 CAP LIFT (pre-mortem #10): while a general reset can be spent, the
     // soft/reserve/critical tiers would strand it — above 0.95 an account is
     // last-resort-only, so it never reaches the 0.99 claim point. Below the wall
-    // (0.999) a lifted account tiers as `normal`, at ordinary share; at the wall
-    // the ordinary exhausted logic applies (the claim then fires on it).
-    if (this.capLiftActive(account, now) && used < this.scheduler.weeklyExhaustedThreshold) return 'normal';
+    // (0.999, or the give-back ceiling cap+drop) a lifted account tiers as
+    // `normal`, at ordinary share; above the ceiling the ordinary logic applies.
+    if (this.capLiftActive(account, now)) {
+      const ceil = this._capLiftCeiling(account, 'wk', now);
+      if (ceil == null && used < this.scheduler.weeklyExhaustedThreshold) return 'normal';
+      if (ceil != null && used < ceil) return 'normal';
+    }
     // NEVER bench on utilization alone while the upstream explicitly says the account is
     // ALLOWED. Anthropic reports both a percentage and a verdict; the verdict is the
     // authority, and it keeps saying "allowed"/"allowed_warning" at 100% used. This mirrors
@@ -5792,6 +5799,100 @@ export class AccountManager {
   /** True when account is benched by the duplicate guard. */
   isPoolBenched(account) {
     return Boolean(account && account.poolBenchedBy);
+  }
+
+  // ── C2: the reactive claim (a 429 on the serving lease claims AT ONCE) ──────
+  // Runs only on the serving lease's LOCAL account holding the credential — never
+  // a mirror row (its 429 is the CLOUD's; the cloud claims on its own side) and
+  // never a relayed 429 (pre-mortem #21: the wrong pool would double-spend).
+  // The grant comes from the STORED listing: stale is allowed up to 6h with
+  // endsAt>now (a fresh listing is exactly what's missing at the wall — the usage
+  // endpoint 429s). The claim uses the CURRENT access token; a 401 defers to the
+  // sweep (no refresh on this path).
+
+  /** Pick the grant for a reactive claim. weekly=true → a general grant; a family
+   *  name → that model's grant, only if the probe MEASURED the bucket at the wall
+   *  (a reactive 429's own 1.0 mark is not measurement). Returns the grant or null. */
+  _reactiveClaimGrant(account, kind, now = Date.now()) {
+    if (!account?.resetGrants || account.resetGrants.eligible === false) return null;
+    const checkedAt = account.resetGrants.checkedAt;
+    if (checkedAt == null || now - checkedAt > 6 * 3600_000) return null;   // stored listing ≤ 6h
+    const grants = (account.resetGrants.grants || [])
+      .filter(g => g && g.usableNow !== false && !g.paused && !g.expired && !g.blocking && !g.unavailableReason
+        && (g.endsAt == null || g.endsAt > now));
+    if (!grants.length) return null;
+    const scopes = g => {
+      const out = new Set();
+      for (const key of (Array.isArray(g.clears) ? g.clears : [])) {
+        if (key === 'seven_day') out.add('general');
+        else if (key === 'five_hour') out.add('session');
+        else if (key === 'seven_day_overage_included') out.add('fable');
+      }
+      if (g.givesBackWeekly === true) out.add('general');
+      return out;
+    };
+    if (kind === 'weekly') return grants.find(g => scopes(g).has('general')) || null;
+    // Model-scoped: the probe must have MEASURED that family's bucket at the wall.
+    const e = account.quota?.scopedWeekly?.[kind];
+    const measured = e && e.reactive !== true && e.utilization != null && e.utilization >= 0.99;
+    return measured ? (grants.find(g => scopes(g).has(kind)) || null) : null;
+  }
+
+  /** Try the reactive claim for a weekly-class 429 (7d header ≥ 0.999) or a scoped
+   *  429 (model family). Returns true when a claim was attempted. NEVER called for
+   *  a mirror row or a benched/disabled account. Shares the C6 backoff state with
+   *  the prober path (keyed account:grantId). */
+  async tryReactiveClaim(account, { kind, weeklyUtil = null }, now = Date.now()) {
+    if (!account) return false;
+    if (account.remote || account.poolBenchedBy || account.enabled === false) return false;
+    if (!account.credential || account.type !== 'oauth') return false;
+    if (this._reactiveClaimInFlight?.has(account.name)) return false;
+    const grant = this._reactiveClaimGrant(account, kind, now);
+    if (!grant) {
+      // C2: mark the candidate so the next sweep decides (a scoped 429 without a
+      // measured bucket must not claim on the header alone).
+      account.claimCandidate = kind;
+      return false;
+    }
+    // C6: shared backoff per (account, grantId) — the prober's _claimRetryUntil.
+    const key = `${account.name}:${grant.id}`;
+    const until = this._claimRetryUntil?.get(key);
+    if (until && until > now) return false;
+    if (!this._reactiveClaimInFlight) this._reactiveClaimInFlight = new Set();
+    this._reactiveClaimInFlight.add(account.name);
+    try {
+      const { claimResetGrant } = await import('./claude-reset-grants.js');
+      const r = await claimResetGrant(account.credential, grant.id, { accountKey: account.name });
+      if (r?.ok) {
+        if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
+        this._claimRetryUntil.set(key, 0);
+        account.lastClaimAt = Date.now();
+        // Clear the wall this claim refills.
+        if (kind !== 'weekly' && account.quota?.scopedWeekly?.[kind]) delete account.quota.scopedWeekly[kind];
+        if (account.status === 'throttled') {
+          account.status = 'active'; account.rateLimitedUntil = null;
+          if (account.lastError === 'rate_limited') { account.lastError = null; account.lastErrorAt = null; }
+        }
+        this.endCapLift(account.index, 'reactive claim succeeded');
+        console.log(`[reset-grant] ${account.name}: grant ${grant.id} claimed reactively (${kind === 'weekly' ? 'weekly 429 at the wall' : `${kind} scoped 429`})`);
+        return true;
+      }
+      // Backoff 15m/30m/1h cap 6h — same steps as the prober path.
+      const tries = (this._claimTries?.get(key) || 0) + 1;
+      if (!this._claimTries) this._claimTries = new Map();
+      this._claimTries.set(key, tries);
+      const waitMs = Math.min(6 * 3600_000, [15 * 60_000, 30 * 60_000, 60 * 60_000][Math.min(tries - 1, 2)]);
+      if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
+      this._claimRetryUntil.set(key, now + waitMs);
+      console.log(`[reset-grant] ${account.name}: reactive claim FAILED ${grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
+      this.endCapLift(account.index, 'reactive claim failed');
+      return true;   // attempted
+    } catch (e) {
+      console.log(`[reset-grant] ${account.name}: reactive claim error ${e.message}`);
+      return true;
+    } finally {
+      this._reactiveClaimInFlight?.delete(account.name);
+    }
   }
 
   getStatus() {
