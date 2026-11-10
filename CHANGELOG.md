@@ -5,6 +5,31 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.81] - 2026-11-10
+
+### Added
+
+- Return a conversation to its last Claude account after a GLM/Kimi detour
+
+### Changed
+
+- Pin GLM-pick guard, pre-return why=, unlock bookkeeping on return-home
+- Delete dead accountLevel branch in the link catch — remote 429/503 never reach it (equivalent mutant M49)
+
+### Fixed
+
+- Return-home review round 1 — attributable throttle line, reset/refusal/503 pins, dead stores, degraded-identity test, window guard
+- Return-home review round 2 — spread test counts switched turns only; pool-wide throttles tagged on the throttle line
+- Client cancel is neutral, request-level faults stop evicting held conversations, every failed attempt logged
+- Size-scaled first-byte wait, retry-same for big prompts, remaining attempt-log sites
+- Red-team r1 — outcome-decided attempt tokens, direct-only retry-same with a patience rule, gates after keep-alive
+- Red-team r2 — request-scoped faults keep held conversations, refusal reroute after keep-alive, first-real-byte heartbeat
+- Retry a rejected transcript only when a foreign tool block was converted
+- Delete the unreachable post-rejection repair branch
+- Red-team r3 — request-scoped body stall, link idle bound, echo-hold cap, soft-cooled home
+- Red-team r4 — revert link header deferral, honest post-headers link stall, echo-hold anchor
+- Red-team r5 — refusal cap shares the first-held-byte anchor; dedupe comment
+
 ## [1.24.80] - 2026-11-08
 
 ### Added
