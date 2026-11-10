@@ -243,58 +243,118 @@ test('index.js forwards the first-byte hook to the TUI (production wiring pin)',
   assert.match(src, /onRequestFirstByte:\s*\(id\)\s*=>\s*\{\s*tui\?\.onRequestFirstByte\(id\);?\s*\}/);
 });
 
-// ── TEST 31 (D): a QUEUED request's ttfb measures the UPSTREAM wait, not the queue wait ──
-test('queued request: ttfb reflects the upstream fetch resolve, never the heartbeat commit', async () => {
+// ── TEST 31 (D): ttfb measures the UPSTREAM wait of the attempt that served ────
+// Shared harness: a TUI capturing the request log line, a proxy over oauth
+// accounts pointed at `up`, and the line's (total, ttfb) parsed.
+function ttfbHarness() {
   const lines = [];
-  const orig = console.log;
   const tui = Object.create(TUI.prototype);
   tui.am = { accounts: [] }; tui.log = []; tui.running = false; tui.render = () => {}; tui.active = new Map();
   tui._addLog = m => lines.push(m);
-  let upstreamDelayMs = 800;
-  const up = http.createServer((req, res) => { req.resume(); req.on('end', () => {
-    setTimeout(() => {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ id: 'msg_01Q', type: 'message', role: 'assistant', model: 'claude-3-5-haiku',
-        content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }));
-    }, upstreamDelayMs);
-  }); });
-  await new Promise(r => up.listen(0, '127.0.0.1', r));
-  const upPort = up.address().port;
-  // An apikey account capped so the FIRST selection queues, then un-caps fast so
-  // the wait is short — the queue heartbeat commits SSE writes BEFORE upstream
-  // answers, and those writes must NOT anchor ttfb.
-  const am = new AccountManager([{ name: 'acct-q', type: 'apikey', apiKey: 'sk', upstream: `http://127.0.0.1:${upPort}` }], 0.9, {});
-  const proxy = createProxyServer(am, { proxy: { apiKey: 't' }, upstream: `http://127.0.0.1:${upPort}` }, {
+  const hooks = {
     onRequestStart: (id, i) => tui.onRequestStart(id, i),
     onRequestRouted: (id, i) => tui.onRequestRouted(id, i),
     onRequestFirstByte: id => tui.onRequestFirstByte(id),
     onRequestEnd: (id, i) => tui.onRequestEnd(id, i),
-  });
-  await new Promise(r => proxy.listen(0, '127.0.0.1', r));
-  try {
-    console.log = () => {};
-    await fetch(`http://127.0.0.1:${proxy.address().port}/v1/messages`, { method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': 't', 'x-maxpool-session': 'term-queued-0001' },
-      body: JSON.stringify({ model: 'claude-3-5-haiku', max_tokens: 8,
-        system: [{ type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." }],
-        messages: [{ role: 'user', content: 'build X' }] }) });
-    const line = lines.find(l => l.includes('→ acct-q'));
+  };
+  const parse = (acct) => {
+    const line = lines.find(l => l.includes(`→ ${acct}`));
     assert.ok(line, lines.join(' | '));
     assert.match(line, /ttfb=[0-9.]+s$/);
-    const total = Number(/, ([0-9.]+)s\)/.exec(line)[1]);
-    const ttfb = Number(/ttfb=([0-9.]+)s$/.exec(line)[1]);
-    assert.ok(ttfb >= 0.7, `ttfb ${ttfb}s reflects the ~800ms upstream wait (not the instant heartbeat commit)`);
-    assert.ok(ttfb <= total, 'ttfb <= total');
-  } finally { console.log = orig; proxy.close(); up.close(); }
+    return { line, total: Number(/, ([0-9.]+)s\)/.exec(line)[1]), ttfb: Number(/ttfb=([0-9.]+)s$/.exec(line)[1]) };
+  };
+  return { lines, hooks, parse };
+}
+const oauthAccts = (n) => Array.from({ length: n }, (_, i) =>
+  ({ name: `a${i + 1}`, type: 'oauth', accessToken: `t${i + 1}`, refreshToken: `r${i + 1}`, expiresAt: Date.now() + 3600_000 }));
+
+test('queued request: ttfb = the upstream wait only — the queue wait (heartbeats included) is excluded', async () => {
+  const { hooks, parse } = ttfbHarness();
+  // Upstream answers 800ms after the request reaches it.
+  const up = http.createServer((req, res) => { req.resume(); req.on('end', () => {
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n');
+    }, 800);
+  }); });
+  await new Promise(r => up.listen(0, '127.0.0.1', r));
+  // The only account is benched for ~600ms: the request QUEUES (heartbeat pings
+  // reach the client during the wait) before it is forwarded.
+  const am = new AccountManager(oauthAccts(1), 0.9);
+  am.accounts[0].status = 'throttled';
+  am.accounts[0].rateLimitedUntil = Date.now() + 600;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${up.address().port}`,
+    queue: { enabled: true, maxWaitMs: 5000, pollMs: 20, heartbeatMs: 50 },
+  }, hooks);
+  await new Promise(r => proxy.listen(0, '127.0.0.1', r));
+  const orig = console.log;
+  try {
+    console.log = () => {};
+    const res = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/messages`, { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', stream: true, messages: [] }) });
+    const text = await res.text();
+    assert.match(text, /event: ping/, 'precondition: the request really QUEUED (heartbeat pings were sent)');
+    const { total, ttfb } = parse('a1');
+    assert.ok(total >= 1.3, `precondition: total ${total}s covers queue (~0.6s) + upstream (~0.8s)`);
+    assert.ok(ttfb >= 0.7, `ttfb ${ttfb}s reflects the ~800ms upstream wait`);
+    assert.ok(ttfb <= total - 0.4, `ttfb ${ttfb}s excludes the ~600ms queue wait (total ${total}s)`);
+  } finally { console.log = orig; proxy.closeAllConnections?.(); proxy.close(); up.close(); }
 });
 
-test('D pin: the upstream anchor is stamped at the fetch resolve (clearTimeout site), once per request', async () => {
-  const { readFileSync } = await import('node:fs');
-  const src = readFileSync(new URL('../src/server.js', import.meta.url), 'utf8');
-  // The stamp sits in the ttfbTimer finally block, immediately after clearTimeout.
-  const m = /clearTimeout\(ttfbTimer\);\s*\n\s*\/\/ D \(2026-11-10\)[\s\S]*?requestInfo\._firstUpstreamByteAt \?\?= Date\.now\(\);/.exec(src);
-  assert.ok(m, 'the upstream-byte stamp lives at the clearTimeout(ttfbTimer) site');
-  // And the heartbeat functions never touch the anchor.
-  const heartbeatRegion = src.slice(src.indexOf('function ensureQueueHeartbeat'), src.indexOf('function finishQueuedStreamIfNeeded'));
-  assert.ok(!/_firstUpstreamByteAt/.test(heartbeatRegion), 'the queue heartbeat never stamps the upstream anchor');
+test('failover: ttfb is the SERVING attempt\'s upstream wait — a quick 429 on the first account never anchors it', async () => {
+  const { hooks, parse } = ttfbHarness();
+  const up = http.createServer((req, res) => { req.resume(); req.on('end', () => {
+    if (req.headers.authorization === 'Bearer t1') {          // first attempt: instant 429
+      res.writeHead(429, { 'retry-after': '60', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    setTimeout(() => {                                         // failover attempt: 800ms upstream wait
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+    }, 800);
+  }); });
+  await new Promise(r => up.listen(0, '127.0.0.1', r));
+  const am = new AccountManager(oauthAccts(2), 0.9);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${up.address().port}`,
+    retry: { maxRetryBufferBytes: 1024 * 1024 },
+  }, hooks);
+  await new Promise(r => proxy.listen(0, '127.0.0.1', r));
+  const orig = console.log;
+  try {
+    console.log = () => {};
+    const res = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/messages`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'test', messages: [] }) });
+    assert.equal(res.status, 200);
+    await res.text();
+    const { ttfb } = parse('a2');
+    assert.ok(ttfb >= 0.7, `ttfb ${ttfb}s is the serving attempt's ~800ms wait, not the first attempt's instant 429`);
+  } finally { console.log = orig; proxy.closeAllConnections?.(); proxy.close(); up.close(); }
+});
+
+test('an upstream that never answers stamps no upstream ttfb (a failed fetch is not a first byte)', async () => {
+  const { lines, hooks } = ttfbHarness();
+  // Nothing listens on this port: every fetch fails before any upstream byte.
+  const dead = http.createServer();
+  await new Promise(r => dead.listen(0, '127.0.0.1', r));
+  const deadPort = dead.address().port;
+  await new Promise(r => dead.close(r));
+  const am = new AccountManager(oauthAccts(1), 0.9);
+  const ends = [];
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${deadPort}` },
+    { ...hooks, onRequestEnd: (id, i) => { ends.push(i); hooks.onRequestEnd(id, i); } });
+  await new Promise(r => proxy.listen(0, '127.0.0.1', r));
+  const orig = console.log;
+  try {
+    console.log = () => {};
+    const res = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/messages`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'test', messages: [] }) });
+    await res.text();
+    assert.ok(ends.length >= 1, lines.join(' | '));
+    assert.equal(ends.at(-1).firstUpstreamByteAt, null, 'no upstream-byte stamp on a failed fetch');
+    assert.equal(ends.at(-1).upstreamForwardStartAt, null, 'and no forward-start pair either');
+  } finally { console.log = orig; proxy.closeAllConnections?.(); proxy.close(); }
 });

@@ -7,6 +7,7 @@ import { sendLoginToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
 import { normalizeRemoteResets } from './account-manager.js';
 import { appliesTo } from './claude-reset-grants.js';
+import { LISTING_FRESH_MS } from './reset-timing.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -601,14 +602,18 @@ export class TUI {
     const provTag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
     const cv = info.conversation || r?.conversation;
     const cvTag = cv ? `  [cv ${cv.slice(0, 8)} ${String(info.sessionKey || r?.sessionKey || '').slice(0, 8)}]` : '';
-    // ttfb LAST: time until the first REAL upstream byte (the fetch resolve —
-    // D, 2026-11-10), falling back to the client-write stamp when the upstream
-    // anchor is absent (a request that never reached upstream, the link path).
-    // The queue heartbeat never stamps the upstream anchor, so a queued request's
-    // ttfb measures the upstream wait, not the queue wait. Omitted when no byte
-    // was ever sent.
-    const ttfbAt = info.firstUpstreamByteAt ?? r?.firstByteAt;
-    const ttfbTag = ttfbAt != null ? ` ttfb=${((ttfbAt - r.started) / 1000).toFixed(1)}s` : '';
+    // ttfb LAST: the UPSTREAM wait of the attempt that served — its fetch resolve
+    // minus its own forward start (D, 2026-11-10). Never measured from arrival:
+    // that would add queue wait and earlier failover attempts. Falls back to the
+    // client-write stamp from arrival when no upstream pair exists (a request that
+    // never reached upstream, the link path). Omitted when no byte was ever sent.
+    let ttfbMs = null;
+    if (info.firstUpstreamByteAt != null && info.upstreamForwardStartAt != null) {
+      ttfbMs = info.firstUpstreamByteAt - info.upstreamForwardStartAt;
+    } else if (r?.firstByteAt != null) {
+      ttfbMs = r.firstByteAt - r.started;
+    }
+    const ttfbTag = ttfbMs != null ? ` ttfb=${(Math.max(0, ttfbMs) / 1000).toFixed(1)}s` : '';
     this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${provTag}${cvTag}${ttfbTag}`);
   }
 
@@ -2480,7 +2485,6 @@ export class TUI {
     let resetsCell;
     {
       const now = Date.now();
-      const GRANTS_EVERY_MS = 5 * 60_000;
       let general = 0;       // resetsLeft of general-weekly grants + live cards
       let scoped = 0;        // resetsLeft of model-scoped grants (tagged F)
       let unknown = 0;       // resetsLeft of scope-unknown grants
@@ -2516,9 +2520,9 @@ export class TUI {
       // than 3x the grants cadence. An account that stopped being probed never gets
       // re-listed, so checkedAt alone would show a green count forever.
       const freshGrants = a.resetGrants && a.resetGrants.stale !== true
-        && (a.resetGrants.checkedAt == null || now - a.resetGrants.checkedAt <= 3 * GRANTS_EVERY_MS);
+        && (a.resetGrants.checkedAt == null || now - a.resetGrants.checkedAt <= LISTING_FRESH_MS);
       const freshCards = !a.resetCards || (a.resetCards.stale !== true
-        && (a.resetCards.checkedAt == null || now - a.resetCards.checkedAt <= 3 * GRANTS_EVERY_MS));
+        && (a.resetCards.checkedAt == null || now - a.resetCards.checkedAt <= LISTING_FRESH_MS));
       const notFresh = total > 0 && (!freshGrants || !freshCards || a.refreshDead || a.subscriptionGone);
 
       // Core text per the grammar.

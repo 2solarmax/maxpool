@@ -578,6 +578,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           // the TUI's ttfb= tag. Prefer this over the client-write stamp: a queued
           // request's heartbeat commits writes LONG before upstream answers.
           firstUpstreamByteAt: requestInfo?._firstUpstreamByteAt ?? null,
+          upstreamForwardStartAt: requestInfo?._upstreamForwardStartAt ?? null,
         });
       }
     } catch (err) {
@@ -1246,6 +1247,10 @@ async function forwardRequest(
   const streamGraceTimer = armStreamForwardGrace(res, requestInfo, queueConfig, accountManager);
   try {
     let upstreamRes;
+    // D (finding 5): THIS attempt's upstream forward start. ttfb is measured from
+    // here — never from the request's arrival, which includes queue wait and the
+    // earlier attempts of a failover.
+    const upstreamForwardStartAt = Date.now();
     try {
       upstreamRes = await fetch(upstreamUrl, {
         method,
@@ -1256,17 +1261,18 @@ async function forwardRequest(
       });
     } finally {
       clearTimeout(ttfbTimer);
-      // D (2026-11-10): the FIRST REAL UPSTREAM BYTE anchor. The fetch resolving IS
-      // the moment upstream answered — stamp it once per request (??= so a
-      // failover's later attempt cannot move it). The queue heartbeat NEVER stamps
-      // this (it is our own keep-alive, not upstream data); the TUI's ttfb= tag
-      // prefers this stamp when present, so a queued request's ttfb measures the
-      // upstream wait, not the queue wait. Log-only: no setting reads it.
-      requestInfo._firstUpstreamByteAt ??= Date.now();
       // Stop the grace timer for THIS attempt — but LEAVE streamGraceDeadline set so
       // a re-forward (failover) re-arms for the REMAINING time to the shared deadline.
       if (streamGraceTimer) clearTimeout(streamGraceTimer);
     }
+    // D (2026-11-10, finding 5): the upstream ANSWERED (fetch resolved — a failed
+    // or timed-out fetch threw above and never reaches here). Stamped on EVERY
+    // attempt together with that attempt's forward start, so after a failover the
+    // pair describes the attempt that actually served (a quick 429 then a slow
+    // second account reports the slow one). The queue heartbeat never stamps it.
+    // Log-only: no setting reads it.
+    requestInfo._upstreamForwardStartAt = upstreamForwardStartAt;
+    requestInfo._firstUpstreamByteAt = Date.now();
     // Response arrived — the pre-response leak window is over. Stop guarding for
     // client-disconnect via abort (streamResponse handles mid-stream disconnects).
     res.off('close', onClientClose);
@@ -1458,16 +1464,19 @@ async function forwardRequest(
       // 7d header itself ≥ the wall) claims a general grant; a scoped 429 claims
       // only if the probe MEASURED that model's bucket at the wall. Uses the
       // current token; a 401 defers to the sweep.
+      // FIRE-AND-FORGET (finding 4): the claim (profile GET + POST) runs OFF the
+      // user's request — this request fails over at once; the claim unbenches the
+      // account for the NEXT request when it lands. Never awaited here.
       if (accountManager.tryReactiveClaim && !account.remote) {
         const weeklyHdr = Number(rateLimitHeaders['anthropic-ratelimit-unified-7d-utilization']);
         const weeklyWall = Number.isFinite(weeklyHdr) && weeklyHdr >= 0.999;
-        try {
-          if (weeklyWall) {
-            await accountManager.tryReactiveClaim(account, { kind: 'weekly', weeklyUtil: weeklyHdr });
-          } else if (rateLimit.modelScope) {
-            await accountManager.tryReactiveClaim(account, { kind: rateLimit.modelScope, weeklyUtil: weeklyHdr });
-          }
-        } catch { /* the claim is best-effort; the failover below proceeds */ }
+        const kind = weeklyWall ? 'weekly' : (rateLimit.modelScope || null);
+        if (kind) {
+          try {
+            Promise.resolve(accountManager.tryReactiveClaim(account, { kind, weeklyUtil: weeklyHdr }))
+              .catch(() => { /* best-effort; the sweep retries */ });
+          } catch { /* a synchronous throw must not break the failover below */ }
+        }
       }
       accountManager.releaseAccount(lease, { status: 429, error: rateLimit.modelScope ? 'model_rate_limited' : 'rate_limited' });
 
