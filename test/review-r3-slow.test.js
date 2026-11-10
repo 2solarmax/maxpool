@@ -139,3 +139,44 @@ test('r4: a provider stream trickling pings with no model event releases 30s aft
     assert.ok(firstPingAt >= 30_000 && firstPingAt < 38_000, `released ~30s after the hold began (first ping ~1.5s): ${firstPingAt}ms`);
   } finally { ac.abort(); await close(proxy); await close(up); }
 });
+
+// r5: the REFUSAL hold's 30s cap shares the same anchor (first held byte) — case A:
+// a bare message_start arriving 31s after headers is NOT past the cap, so a refusal in
+// the next chunk still reroutes with nothing written to the client.
+test('r5 case A: message_start at +31s, refusal 1s later → still rerouted (cap counts from the first held byte)', async () => {
+  const START = 'event: message_start\ndata: {"type":"message_start","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":0,"output_tokens":0}}}\n\n';
+  const REFUSAL = 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"reasoning_extraction"}},"usage":{"output_tokens":0}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const PROVIDER = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_p","model":"glm-5.3"}}\n\nevent: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"provider answered"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+  let call = 0;
+  const up = http.createServer((req, res) => {
+    req.resume(); call += 1;
+    if (call === 1) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders();
+      const t1 = setTimeout(() => res.write(START), 31_000);
+      const t2 = setTimeout(() => res.end(REFUSAL), 32_000);
+      res.on('close', () => { clearTimeout(t1); clearTimeout(t2); });
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(PROVIDER);
+  });
+  const upPort = await listen(up);
+  const am = new AccountManager([
+    { name: 'anth1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
+    { name: 'glm1', type: 'provider', provider: 'zai', profiles: ['all'], accessToken: 'k', refreshToken: null, expiresAt: null, model: 'glm-5.3' },
+  ], 0.9, { routingMode: 'balance' });
+  am.accounts[1].activeWeight = 50;
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const port = await listen(proxy);
+  try {
+    let text = '';
+    const lines = []; const orig = console.log; console.log = (...a) => lines.push(a.join(' '));
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-maxpool-profile': 'all' },
+        body: JSON.stringify({ model: 'claude-opus-5', stream: true, messages: [{ role: 'user', content: 'hi' }] }) });
+      text = await r.text();
+    } finally { console.log = orig; }
+    assert.equal(call, 2, `rerouted once: ${lines.join(' | ')}`);
+    assert.ok(text.includes('provider answered'), text.slice(0, 300));
+    assert.ok(!text.includes('"refusal"'), 'the refusal never reaches the client');
+  } finally { await close(proxy); await close(up); }
+});

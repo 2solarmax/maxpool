@@ -1109,7 +1109,7 @@ async function forwardRequest(
           }
         } finally { try { await reader.cancel(); } catch { /* already done */ } }
       }
-      res.end();   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded
+      res.end();   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded
       finishLink({ success: ctx.status < 500, status: ctx.status });
       // SC22 no-double-count: this request was counted at auth; the serving pool
       // counted it too. Undo the local one.
@@ -4320,8 +4320,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   let refusalRerouting = false;
   const refusalWatch = requestInfo?._refusalRerouteEligible === true;
   let refusalHoldBuffer = refusalWatch ? [] : null;
-  const refusalHoldStart = Date.now();
-  let holdByteAt = null;   // r4: when the FIRST byte entered the (refusal or echo) hold
+  let holdByteAt = null;   // r4/r5: when the FIRST byte entered the (refusal or echo) hold — ONE 30s budget from there
 
   try {
     while (true) {
@@ -4370,7 +4369,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         }
         if (verdict.decision === 'hold'
             && totalLen(refusalHoldBuffer) <= REFUSAL_HOLD_MAX_BYTES
-            && Date.now() - refusalHoldStart <= REFUSAL_HOLD_MAX_MS) {
+            && holdByteAt != null && Date.now() - holdByteAt <= REFUSAL_HOLD_MAX_MS) {   // r5: ONE 30s budget from the first held byte
           continue; // nothing decisive yet — keep holding, write nothing
         }
         // Decisive content, or either cap hit → fail open: release the held bytes as
