@@ -1,0 +1,44 @@
+{
+  "_comment": "Redacted cedar_ember listing shape. Built 2026-11-10 from the field names the pool's normalizer (src/claude-reset-grants.js normalizeGrant) and the Claude Code 2.1.322 client rule read — grant ids, labels and org ids are placeholders, never live values. Field names match the observed server payload (research Q2/Q5, 2026-11-10): every measured grant clears seven_day_overage_included (model-scoped Fable); one also five_hour.",
+  "cedar_ember": {
+    "eligible": true,
+    "ineligible_reason": null,
+    "next_grant_id": "grant-placeholder-1",
+    "cooldown_until": null,
+    "weekly_resets_at": "2026-11-13T15:59:00Z",
+    "grants": [
+      {
+        "id": "grant-placeholder-1",
+        "label": "New model launch: one model reset (placeholder label)",
+        "resets_total": 1,
+        "resets_left": 1,
+        "starts_at": "2026-11-09T18:00:00Z",
+        "ends_at": "2027-03-09T07:59:00Z",
+        "usable_now": true,
+        "paused": false,
+        "use_requires_limit": false,
+        "clears": ["seven_day_overage_included"],
+        "gives_back_weekly": false,
+        "blocking": false,
+        "unavailable_reason": null,
+        "percent_used": 0
+      },
+      {
+        "id": "grant-placeholder-2",
+        "label": "Tenure variant (placeholder label)",
+        "resets_total": 1,
+        "resets_left": 1,
+        "starts_at": "2026-11-09T18:00:00Z",
+        "ends_at": "2027-03-09T07:59:00Z",
+        "usable_now": true,
+        "paused": false,
+        "use_requires_limit": false,
+        "clears": ["five_hour", "seven_day_overage_included"],
+        "gives_back_weekly": false,
+        "blocking": false,
+        "unavailable_reason": null,
+        "percent_used": 0
+      }
+    ]
+  }
+}

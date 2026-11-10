@@ -50,9 +50,48 @@ function toMs(v) {
   return Number.isFinite(t) ? t : null;
 }
 
+// Scope map (D1 + research Q5, from the Claude Code 2.1.322 client rule
+// `clears.includes(L) || (L==='seven_day' && givesBackWeekly)`): which limit a
+// `clears` key refills. An UNMAPPED key means "we don't know what this refills" —
+// the grant is shown, never claimed, and never lifts a cap (fail closed; the
+// October z.ai drift class — never invent scope from a name).
+export const GRANT_SCOPE_BY_KEY = {
+  seven_day: 'general',                 // refills the general weekly
+  five_hour: 'session',                 // refills the session window only
+  seven_day_overage_included: 'fable',  // model-scoped: refills the Fable weekly
+};
+
+/** One shared applicability answer (per D1): the limits this grant refills.
+ *  Returns an array of scopes from {general, session, fable}; unknown/unmapped
+ *  keys contribute NOTHING (fail closed), and `unknown` is never returned as a
+ *  scope — a grant with only unmapped keys has appliesTo() = [] (display-only).
+ *  A `gives_back_weekly` grant ALSO returns 'general' (its model reset returns
+ *  that model's usage to the general weekly) — the client's own OR rule. */
+export function appliesTo(grant) {
+  if (!grant) return [];
+  const out = new Set();
+  for (const key of (Array.isArray(grant.clears) ? grant.clears : [])) {
+    const scope = GRANT_SCOPE_BY_KEY[key];
+    if (scope) out.add(scope);
+  }
+  if (grant.gives_back_weekly === true) out.add('general');
+  return [...out];
+}
+
+// Process-wide: the first listing logs the raw grant KEY SET (keys only, never
+// values) once, so a schema drift is visible without per-sweep spam. Set by
+// listResetGrants on the first grants-bearing response.
+let _loggedRawGrantKeys = false;
+
 /** Normalize a cedar_ember grant. Drops malformed entries (the CLI does the same:
  *  "ignoring a malformed grant"). Keeps expired ones OUT unless resets remain and
- *  ends_at is still ahead — expired grants are display-only noise. */
+ *  ends_at is still ahead — expired grants are display-only noise.
+ *
+ *  FAIL-CLOSED defaults (pre-mortem #11, 2026-11-10): the old normalizer INVENTED
+ *  scope and usability from missing fields (clears → ['five_hour','seven_day'],
+ *  usable_now → true). A missing `clears` is scope UNKNOWN: [] — shown, never
+ *  claimed, never lifts a cap. Missing `gives_back_weekly` is false. Missing
+ *  `usable_now` is false (a usable grant's listing always says so). */
 export function normalizeGrant(raw, now = Date.now()) {
   if (!raw || typeof raw !== 'object') return null;
   const g = raw.id != null ? raw : { ...raw, id: raw };   // tolerate id-less shapes
@@ -71,14 +110,31 @@ export function normalizeGrant(raw, now = Date.now()) {
     label: g.label || null,
     resetsLeft, resetsTotal, startsAt, endsAt,
     // clears is the money field: [five_hour, seven_day, seven_day_overage_included]
-    // means a grant clears BOTH windows (measured live). Default to assuming both
-    // when absent rather than none — the observed server always sends it.
-    clears: Array.isArray(g.clears) ? g.clears : ['five_hour', 'seven_day'],
-    usableNow: g.usable_now !== false && (resetsLeft >= 1),
+    // (measured live, 2026-11-10). Missing → [] = scope unknown: display-only,
+    // never claimed, never lifts a cap. Never assume both.
+    clears: Array.isArray(g.clears) ? g.clears : [],
+    givesBackWeekly: g.gives_back_weekly === true,
+    blocking: g.blocking === true,
+    unavailableReason: typeof g.unavailable_reason === 'string' ? g.unavailable_reason : null,
+    percentUsed: Number.isFinite(Number(g.percent_used)) ? Number(g.percent_used) : null,
+    // Fail closed: a grant the listing does not explicitly mark usable is NOT
+    // claimable (pre-mortem #11). usable_now:false also fails here.
+    usableNow: g.usable_now === true && (resetsLeft >= 1),
     paused: g.paused === true,
     requiresLimit: g.use_requires_limit !== false, // most grants only fire at the wall
     expired: endsAt != null && endsAt <= now,
   };
+}
+
+/** Log the raw grant key set once per process (drift visibility). Keys only. */
+function _logRawGrantKeysOnce(ce, log = console.log) {
+  if (_loggedRawGrantKeys) return;
+  _loggedRawGrantKeys = true;
+  const keys = new Set();
+  for (const g of (Array.isArray(ce.grants) ? ce.grants : [])) {
+    if (g && typeof g === 'object') for (const k of Object.keys(g)) keys.add(k);
+  }
+  try { log(`[reset-grant] cedar_ember grant keys: [${[...keys].sort().join(', ')}]`); } catch { /* log-only */ }
 }
 
 /** List this account's banked resets. Zero-spend read (skip_spend=1).
@@ -102,6 +158,7 @@ export async function listResetGrants(accessToken, { signal } = {}) {
                eligible: false, reason: ce.ineligible_reason || 'ineligible' };
     }
     const now = Date.now();
+    if (Array.isArray(ce.grants) && ce.grants.length) _logRawGrantKeysOnce(ce);
     const grants = (Array.isArray(ce.grants) ? ce.grants : []).map(g => normalizeGrant(g, now)).filter(Boolean);
     return {
       grants,
@@ -115,27 +172,40 @@ export async function listResetGrants(accessToken, { signal } = {}) {
   }
 }
 
+// C6: org uuid cache — one profile GET per account per process (pre-mortem #6: a
+// failing claim retried a profile GET + POST per sweep per account). Keyed by the
+// account's credential fingerprint-free identity: the CALLER passes accountKey
+// (the account name); the cache holds { key, org } so a caller with a different
+// account name but same cache slot still refetches.
+const _orgCache = new Map();   // accountKey -> org uuid
+
 /** Claim one grant. The CLI never retries a claim on the wire; our request_id is
  *  random per CALL (server treats already_used as success), so a caller retry is
  *  safe but the id is not reused across distinct decisions. Returns
- *  { ok:true } | { ok:false, error, code }. */
-export async function claimResetGrant(accessToken, grantId, { signal, requestId, fetchImpl } = {}) {
+ *  { ok:true } | { ok:false, error, code }.
+ *  `accountKey` (account name) caches the org uuid per account (C6): one profile
+ *  GET per account per process. */
+export async function claimResetGrant(accessToken, grantId, { signal, requestId, fetchImpl, accountKey } = {}) {
   if (!accessToken || !grantId) return { ok: false, error: 'missing args' };
   const doFetch = fetchImpl || ((u, o) => fetch(u, o));
   try {
-    const prof = await doFetch(PROFILE_URL, { headers: headers(accessToken), signal });
-    if (!prof.ok) return { ok: false, error: `profile HTTP ${prof.status}` };
-    const body = await prof.json();
-    // The profile returns `organization` (SINGULAR object) — measured live on
-    // maxim.krasnykh@gmail.com 2026-10-09: {account, organization, application}.
-    // v1.24.0-12 read only the plural `organizations` array (null for personal
-    // accounts), so EVERY cedar_ember claim on a personal account failed with
-    // 'no oauth organization' while the account sat exhausted with a usable reset
-    // (owner report: 'this account is exhausted but the reset is not being used').
-    // Accept both shapes; singular wins when present.
-    const org = body?.organization?.uuid
-      ?? (Array.isArray(body?.organizations) && body.organizations.length ? body.organizations[0].uuid : null);
-    if (!org) return { ok: false, error: 'no oauth organization' };
+    let org = accountKey != null ? _orgCache.get(accountKey) : undefined;
+    if (org == null) {
+      const prof = await doFetch(PROFILE_URL, { headers: headers(accessToken), signal });
+      if (!prof.ok) return { ok: false, error: `profile HTTP ${prof.status}` };
+      const body = await prof.json();
+      // The profile returns `organization` (SINGULAR object) — measured live on
+      // maxim.krasnykh@gmail.com 2026-10-09: {account, organization, application}.
+      // v1.24.0-12 read only the plural `organizations` array (null for personal
+      // accounts), so EVERY cedar_ember claim on a personal account failed with
+      // 'no oauth organization' while the account sat exhausted with a usable reset
+      // (owner report: 'this account is exhausted but the reset is not being used').
+      // Accept both shapes; singular wins when present.
+      org = body?.organization?.uuid
+        ?? (Array.isArray(body?.organizations) && body.organizations.length ? body.organizations[0].uuid : null);
+      if (!org) return { ok: false, error: 'no oauth organization' };
+      if (accountKey != null) _orgCache.set(accountKey, org);
+    }
 
     const rid = requestId || randomUUID();
     const res = await doFetch(`https://api.anthropic.com${CLAIM_PATH}/${org}/reset_rate_limits`, {
@@ -153,3 +223,6 @@ export async function claimResetGrant(accessToken, grantId, { signal, requestId,
     return { ok: false, error: err.message || String(err) };
   }
 }
+
+/** Test seam: reset the once-per-process raw-key-set logger. */
+export function _resetGrantKeyLogForTest() { _loggedRawGrantKeys = false; }

@@ -8,7 +8,10 @@ const DAY = 24 * H;
 const soon = (ms) => Date.now() + ms;
 
 function acct({ ses, wk, weeklyAbsent = false, enabled = true } = {}) {
-  return { name: 't', enabled, quota: { providerSes: ses, providerWk: wk, weeklyAbsent, unified5h: ses, unified7d: wk } };
+  // C1 freshness prerequisites: a claim only fires on a probe-fresh reading whose
+  // weekly window has not rolled (CLAIM_FRESH_MS / unified7dReset gates, 2026-11-10).
+  return { name: 't', enabled, quota: { providerSes: ses, providerWk: wk, weeklyAbsent,
+    unified5h: ses, unified7d: wk, unified7dReset: Date.now() + 3 * DAY, lastProbeOkAt: Date.now() } };
 }
 
 // ── expiry parsing ────────────────────────────────────────────────────────────
@@ -66,14 +69,18 @@ test('R3: expired cards are never chosen', () => {
 });
 
 // ── Claude grants ─────────────────────────────────────────────────────────────
-function grant({ endsAt = soon(20 * DAY), resetsLeft = 1, usableNow = true, paused = false, requiresLimit = false, clears = ['five_hour', 'seven_day'] } = {}) {
-  return { id: 'g1', resetsLeft, resetsTotal: resetsLeft, endsAt, startsAt: null, usableNow: usableNow, paused, requiresLimit, clears, label: null, expired: endsAt <= Date.now() };
+function grant({ endsAt = soon(20 * DAY), resetsLeft = 1, usableNow = true, paused = false, requiresLimit = false, clears = ['five_hour', 'seven_day'], ...rest } = {}) {
+  return { id: 'g1', resetsLeft, resetsTotal: resetsLeft, endsAt, startsAt: null, usableNow: usableNow, paused, requiresLimit, clears,
+    givesBackWeekly: false, blocking: false, unavailableReason: null, label: null, expired: endsAt <= Date.now(), ...rest };
 }
 
-test('claude: weekly-clearing grant fires at weekly wall', () => {
+test('claude: general grant fires at the Claude weekly wall (0.99, NOT the z.ai 0.90)', () => {
   const g = grant();
-  const act = decideClaude(acct({ wk: 0.92 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
+  assert.equal(decideClaude(acct({ wk: 0.98 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null }), null,
+    'below CLAUDE_WALL_WEEKLY: no claim (z.ai 0.90 wall must NOT move)');
+  const act = decideClaude(acct({ wk: 0.995 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
   assert.equal(act?.grant?.id, 'g1');
+  assert.equal(act?.scope, 'general');
 });
 
 test('claude: requiresLimit grant is NOT spent on dying value pre-wall', () => {
@@ -90,13 +97,20 @@ test('claude: no-requirement grant IS spent on dying value', () => {
 test('claude: cooldown blocks; spent grants (resets_left 0) dropped upstream', () => {
   const g = grant();
   const cooled = { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: soon(H) };
-  assert.equal(decideClaude(acct({ wk: 0.95 }), cooled), null);
+  assert.equal(decideClaude(acct({ wk: 0.995 }), cooled), null);
 });
 
-test('claude: honors nextGrantId when server names one', () => {
-  const a = grant(); const b = { ...grant(), id: 'g2' };
-  const act = decideClaude(acct({ wk: 0.95 }), { grants: [a, b], eligible: true, nextGrantId: 'g2', cooldownUntil: null });
-  assert.equal(act.grant.id, 'g2');
+test('claude: per-grant scope beats the server-named order (pre-mortem #8)', () => {
+  // A general grant and a Fable grant; the server names the GENERAL one next, but
+  // only the Fable bucket is at its wall — the Fable grant must be chosen, never
+  // the general grant through nextGrantId order.
+  const general = grant({ id: 'gen', clears: ['seven_day'] });
+  const fable = grant({ id: 'fab', clears: ['seven_day_overage_included'] });
+  const a = acct({ wk: 0.50 });
+  a.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: soon(3 * DAY), isActive: true } };
+  const act = decideClaude(a, { grants: [general, fable], eligible: true, nextGrantId: 'gen', cooldownUntil: null });
+  assert.equal(act?.grant?.id, 'fab', 'the scoped-wall grant is chosen, not nextGrantId');
+  assert.equal(act?.scope, 'fable');
 });
 
 // ── idempotency of the redeem wire format ─────────────────────────────────────
@@ -354,9 +368,10 @@ test('owner 2026-10-30: a dying weekly card/grant is never spent because of the 
   const zaiWk = { enabled: true, quota: { providerSes: 0.10, providerWk: 0.40 } };
   assert.equal(decideZai(zaiWk, cards, now)?.reason, 'dying value', 'weekly-driven dying spend still allowed');
   // Claude: weekly-clearing grant, weekly 10%, session 96%, dying
-  const cl = { enabled: true, quota: { unified5h: 0.96, unified7d: 0.10 } };
-  const listing = { eligible: true, grants: [{ id: 'g1', usableNow: true, endsAt: soon, clears: ['five_hour', 'seven_day'] }] };
-  assert.equal(decideClaude(cl, listing, now), null, 'session-driven dying grant refused');
-  const clWk = { enabled: true, quota: { unified5h: 0.10, unified7d: 0.40 } };
-  assert.equal(decideClaude(clWk, listing, now)?.reason, 'dying value', 'weekly-driven dying grant still allowed');
+  const freshQ = { unified5h: 0.96, unified7d: 0.10, unified7dReset: now + 3 * DAY, lastProbeOkAt: now };
+  const cl = { enabled: true, quota: freshQ };
+  const listing = { eligible: true, grants: [{ id: 'g1', usableNow: true, endsAt: soon, clears: ['five_hour', 'seven_day'], givesBackWeekly: false }] };
+  assert.equal(decideClaude(cl, listing, now, { now }), null, 'session-driven dying grant refused');
+  const clWk = { enabled: true, quota: { ...freshQ, unified5h: 0.10, unified7d: 0.40 } };
+  assert.equal(decideClaude(clWk, listing, now, { now })?.reason, 'dying value', 'weekly-driven dying grant still allowed');
 });
