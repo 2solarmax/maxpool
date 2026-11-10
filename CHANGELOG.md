@@ -5,6 +5,34 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.82] - 2026-11-10
+
+### Changed
+
+- One shared appliesTo() across display, routing, claim and lift
+- Pin the sibling-pull regression against a terminal-keyed home; fix home-map field comment
+- Return-home routing fix (repro/home-note-missing) into reset-machinery release
+- Prefix intentionally-unused params (window, now, weeklyUtil) per no-unused-vars
+
+### Documentation
+
+- CONTEXT entry for the 2026-11-10 reset-machinery decisions
+- Record the reset-machinery judge-round decisions
+
+### Fixed
+
+- Fall back to the 'origin' remote when 'private' is absent; fail before the test stage on a missing remote
+- Keep last good reset count (mark stale) on failed grant check; log ttfb
+- Per-grant scope from Anthropic's own clears field; fail-closed normalizer
+- Cap lift while a full-refill reset is held; z.ai cards keep last good; claim pacing + backoff
+- Every row shows its resets with scope; mirrors display and honour the holder's verdict
+- Reactive claim on the serving lease's 429; ttfb anchors the real upstream byte
+- One shared claim lock + backoff for prober and reactive paths; lift start-gates read cooldown and backoff
+- Request path — reactive claim off the request, ttfb per serving attempt, one timing module
+- Judge round 1 — one claim per wall, refill-aware lift, exported ceiling, exact skip reasons
+- Keep return-home memory across identity-key flips and LRU eviction
+- Key the return-home memory by conversation with its own detour flag
+
 ## [1.24.81] - 2026-11-10
 
 ### Added
