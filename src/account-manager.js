@@ -649,8 +649,9 @@ export class AccountManager {
     // Bounded LRU — oldest conversations drop first; a dropped entry only means the
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
-    // Same key → { name, at } of the last CLAUDE account only (a GLM/Kimi turn never
-    // overwrites it), so a conversation returning from a provider detour can go home.
+    // _homeKey (affinityKey, else sessionKey) → { name, at, detoured } of the last CLAUDE
+    // account only (a GLM/Kimi turn never overwrites the name; it sets `detoured`), so a
+    // conversation returning from a provider detour can go home.
     this.conversationLastClaudeAccount = new Map();
     // Conversation-identity HEALTH (owner 2026-11-08: "make sure this cannot degrade
     // silently"). Twice in one day a Claude Code request-shape detail (a moving

@@ -127,12 +127,11 @@ test('sibling conversation that never detoured is not pulled home when health de
   step(m, A({ pinAccount: 'other' }));
   step(m, B({ pinAccount: 'personal' }));
   m.identityHealth.degraded = true;
-  step(m, B({ pinAccount: 'personal' }));          // lastAccount for the bare key = personal
-  const sA = step(m, A({ pinAccount: 'other' }));
-  assert.equal(sA.lease.account.name, 'other');
-  assert.match(sA.line, /personal → other/, `moved line present: ${sA.line}`);
+  step(m, B({ pinAccount: 'glm' }));               // B detours; a terminal-keyed home would now be marked
+  const sA = step(m, A(), new Set([2]));           // A unpinned, GLM excluded
+  assert.match(sA.line, /glm → /, `moved line present: ${sA.line}`);
   assert.doesNotMatch(sA.line, /home=/, sA.line);
-  assert.ok(!sA.lease.returnedHome, 'A was not sent to personal');
+  assert.ok(!sA.lease.returnedHome, 'A was not sent home');
 });
 
 test('a conversation that never left Claude gets no home note', () => {
