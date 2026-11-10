@@ -10,7 +10,7 @@
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
 import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
 import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
-import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
+import { listResetGrants, claimResetGrant, appliesTo } from './claude-reset-grants.js';
 import { decideZai, decideClaude } from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
 
@@ -518,16 +518,7 @@ export class Prober {
     const anyGrant = (listing.grants || []).filter(g => g && !g.paused && !g.expired);
     if (!anyGrant.length) return;
     const grants = anyGrant.filter(g => g.usableNow !== false && !g.blocking && !g.unavailableReason);
-    const applies = (g) => {
-      const out = new Set();
-      for (const key of (Array.isArray(g.clears) ? g.clears : [])) {
-        if (key === 'seven_day') out.add('general');
-        else if (key === 'five_hour') out.add('session');
-        else if (key === 'seven_day_overage_included') out.add('fable');
-      }
-      if (g.givesBackWeekly === true) out.add('general');
-      return [...out];
-    };
+    const applies = (g) => appliesTo(g);   // the ONE shared scope answer (A1)
     const wk = q.unified7d ?? null;
     const atWall = wk != null && wk >= 0.99;
     const scopedAtWall = (fam) => {

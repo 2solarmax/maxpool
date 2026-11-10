@@ -3,6 +3,8 @@ import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity
 import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
+// A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
+import { appliesTo } from './claude-reset-grants.js';
 
 // Review r2 A: consecutive request-scoped faults before they count against the account.
 const REQUEST_FAULT_ESCALATE = 3;
@@ -1926,8 +1928,11 @@ export class AccountManager {
         const fresh = (rg.grants || []).filter(g =>
           g && g.usableNow !== false && !g.paused && !g.expired && !g.blocking && !g.unavailableReason
           && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0 && !inBackoff(g));
+        // appliesTo is the ONE scope answer: full = clears seven_day; give-back =
+        // gives_back_weekly on a grant that does NOT clear seven_day.
         const full = fresh.some(g => Array.isArray(g.clears) && g.clears.includes('seven_day'));
-        const giveback = fresh.some(g => g.givesBackWeekly === true && !(Array.isArray(g.clears) && g.clears.includes('seven_day')));
+        const giveback = fresh.some(g => g.givesBackWeekly === true
+          && !(Array.isArray(g.clears) && g.clears.includes('seven_day')));
         if (full) { active = true; mode = 'full'; }
         else if (giveback) {
           // Give-back lifts ONLY once a measured claim recorded the drop (pre-mortem #7:
@@ -5827,21 +5832,11 @@ export class AccountManager {
       .filter(g => g && g.usableNow !== false && !g.paused && !g.expired && !g.blocking && !g.unavailableReason
         && (g.endsAt == null || g.endsAt > now));
     if (!grants.length) return null;
-    const scopes = g => {
-      const out = new Set();
-      for (const key of (Array.isArray(g.clears) ? g.clears : [])) {
-        if (key === 'seven_day') out.add('general');
-        else if (key === 'five_hour') out.add('session');
-        else if (key === 'seven_day_overage_included') out.add('fable');
-      }
-      if (g.givesBackWeekly === true) out.add('general');
-      return out;
-    };
-    if (kind === 'weekly') return grants.find(g => scopes(g).has('general')) || null;
+    if (kind === 'weekly') return grants.find(g => appliesTo(g).includes('general')) || null;
     // Model-scoped: the probe must have MEASURED that family's bucket at the wall.
     const e = account.quota?.scopedWeekly?.[kind];
     const measured = e && e.reactive !== true && e.utilization != null && e.utilization >= 0.99;
-    return measured ? (grants.find(g => scopes(g).has(kind)) || null) : null;
+    return measured ? (grants.find(g => appliesTo(g).includes(kind)) || null) : null;
   }
 
   /** C6: the ONE claim lock per account, shared by the prober and the reactive

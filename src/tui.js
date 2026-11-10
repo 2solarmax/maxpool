@@ -6,6 +6,7 @@ import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
 import { normalizeRemoteResets } from './account-manager.js';
+import { appliesTo } from './claude-reset-grants.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -2497,10 +2498,11 @@ export class TUI {
           for (const g of (rg.grants || [])) {
             if (!g || g.usableNow === false || g.paused || g.expired) continue;
             if (g.endsAt != null && g.endsAt <= now) continue;            // live expiry
-            const clears = Array.isArray(g.clears) ? g.clears : [];
-            const hasGeneral = clears.includes('seven_day') || g.givesBackWeekly === true;
-            const hasScoped = clears.some(k => k === 'seven_day_overage_included'
-              || k === 'seven_day_opus' || k === 'seven_day_sonnet');
+            // The ONE shared scope answer (A1) — display reads the same
+            // classification as claim and lift.
+            const scopes = appliesTo(g);
+            const hasGeneral = scopes.includes('general');
+            const hasScoped = scopes.some(x => x !== 'general' && x !== 'session');
             const left = Math.max(0, Math.floor(g.resetsLeft ?? 1));
             if (hasGeneral) general += left;
             else if (hasScoped) scoped += left;
