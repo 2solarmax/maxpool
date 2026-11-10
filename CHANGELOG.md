@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Rst column: a grant that refills a model limit (e.g. Fable) now shows under its model tag (`2F~119d`) even when it also gives usage back to the weekly limit — the give-back is a side effect, not the grant's identity (owner 2026-11-10: "distinguish model-specific vs general resets in the terminal UI")
+- Rst column — model-scoped grants display under their model tag even when they also give back to the weekly
 
 ## [1.24.83] - 2026-11-10
 
