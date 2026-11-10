@@ -49,6 +49,47 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-11-10 · reset machinery — scope from `clears`, cap lift (D2), reactive claim
+
+**Context:** resets were invisible on cloud rows (the export omitted `eligible`),
+the count flickered on transient listing failures (null-on-error), every measured
+grant was model-scoped (`seven_day_overage_included` = Fable) while the claim gate
+required a literal `seven_day` (so NO grant could ever be claimed), and capped
+accounts could never reach their claim wall. Task:
+`mokka-workspace/work/tooling/1-discovery/bug-2026-11-10-maxpool-reset-machinery-all-accounts/`.
+
+**Decisions (owner D1-D4 + pre-mortem amendments):**
+- Scope is Anthropic's own `clears` field via one shared `appliesTo()`
+  (`seven_day`=general, `five_hour`=session, `seven_day_overage_included`=fable);
+  missing `clears` → `[]` = unknown: shown, never claimed, never lifts. Missing
+  `usable_now` → false (fail closed).
+- Claude claims read their OWN wall `CLAUDE_WALL_WEEKLY=0.99`; z.ai's
+  `POLICY.wallWeekly` stays 0.90 (shared constant would move GLM redeems).
+- The claim decision runs AFTER this sweep's usage probe (freshness: lastProbeOkAt
+  ≤5 min, unified7dReset future, lastProbeOkAt > lastClaimAt) and picks the grant
+  by scope, never by the server's nextGrantId order.
+- Cap lift (D2): a held full-refill reset (seven_day grant or z.ai weekly card)
+  suspends the cap on BOTH windows + the provider max(ses,wk) cap, remaps
+  soft/reserve/critical → normal below the wall, and ends on claim / grant-gone /
+  10-min listing-failure grace expiry. Give-back grants lift only to cap + the
+  MEASURED unified7d drop (never a full lift on an unmeasured one).
+- capLift is computed ONLY by the holder pool and exported; mirrors honour it.
+- Reactive claim: a weekly-class 429 (7d header ≥ wall) claims on the serving
+  lease's local account at once; a scoped 429 only with a probe-MEASURED bucket;
+  stored listing allowed stale ≤6h; current token only (a 401 defers to the sweep);
+  one claim lock per account shared with the prober; failure backoff 15m/30m/1h
+  cap 6h per (account, grantId).
+- Grants listed ≤1 per 5 min per account (the call shares the rate-limited
+  /api/oauth/usage endpoint); two calls kept (distinct header sets, no merge).
+- TUI Rst column: fixed grammar at width 6 (`n~Xd` general, `nF~Xd` scoped,
+  `g+sF` mixed, `n?` unknown, gray+`?` not-fresh); count = SUM of resetsLeft +
+  live cards; expiry checked live in the render.
+- ttfb anchors at the upstream fetch resolve; the queue heartbeat never stamps it.
+
+**Consequences:** every row (cloud included) shows its resets with scope; capped
+accounts spend their general resets; a 429 at the wall claims within the same
+request; z.ai schema drift reads as a failed listing, never a silent 0.
+
 ### 2026-08-10 · #8 — Five named routing modes replace crossProviderFallbackPolicy
 
 **Context:** `crossProviderFallbackPolicy: 'always'` read as "load balance across
