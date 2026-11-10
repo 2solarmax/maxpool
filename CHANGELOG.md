@@ -9,8 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Rst column: model-scoped counts spell the model name (`2Fable`), not a bare `F` tag (owner 2026-11-10: "What does the letter F mean?")
-- Reset counts survive a pool self-update: grants/cards snapshots ride the persisted quota state and restore marked stale — local rows no longer blank for 5–10 min after every seamless reload (measured live during the 1.24.84 rollout, 17:18–17:22Z)
+- Spell the model name (2Fable) and survive self-updates
 
 ## [1.24.84] - 2026-11-10
 
