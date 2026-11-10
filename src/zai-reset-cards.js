@@ -60,7 +60,10 @@ function normalizeCards(arr, now = Date.now()) {
 }
 
 /** List this account's available reset cards. Zero-spend read.
- *  Returns { fiveHour: [], weekly: [] } | { error }. */
+ *  Returns { fiveHour: [], weekly: [] } | { error }.
+ *  DRIFT (A4, 2026-11-10): a 200 whose expected arrays are missing, or whose raw
+ *  entries all vanish in normalization (renamed field), is reported as an ERROR —
+ *  never as an empty "good" list that overwrites the last known cards. */
 export async function listResetCards(token, { signal, fetchImpl = fetch } = {}) {
   if (!token) return { error: 'no token' };
   try {
@@ -74,11 +77,20 @@ export async function listResetCards(token, { signal, fetchImpl = fetch } = {}) 
       return { error: `bad_envelope${data?.code != null ? ' code=' + data.code : ''}` };
     }
     const now = Date.now();
-    return {
-      fiveHour: normalizeCards(data.data.fiveHourResets, now),
-      weekly: normalizeCards(data.data.weekResets, now),
-      source: 'zai',
-    };
+    const fiveHour = normalizeCards(data.data.fiveHourResets, now);
+    const weekly = normalizeCards(data.data.weekResets, now);
+    // Drift guard: the raw arrays are the expected shape; if either is missing, or
+    // raw entries exist but none survived normalization, the schema moved.
+    const rawFive = Array.isArray(data.data.fiveHourResets) ? data.data.fiveHourResets : null;
+    const rawWeek = Array.isArray(data.data.weekResets) ? data.data.weekResets : null;
+    if (rawFive == null || rawWeek == null) {
+      return { error: 'drift: expected arrays missing' };
+    }
+    const rawCount = rawFive.length + rawWeek.length;
+    if (rawCount > 0 && fiveHour.length + weekly.length === 0) {
+      return { error: `drift: ${rawCount} raw entr${rawCount === 1 ? 'y' : 'ies'}, 0 kept` };
+    }
+    return { fiveHour, weekly, source: 'zai' };
   } catch (err) {
     return { error: err.message || String(err) };
   }

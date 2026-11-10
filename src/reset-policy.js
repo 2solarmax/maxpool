@@ -158,7 +158,10 @@ export function decideClaude(account, listing, now = Date.now(), opts = {}) {
     const dying = msLeft(g.endsAt, now) < POLICY.dyingWindowMs
       && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;  // weekly window only (owner 2026-10-30)
     if (atWall || (dying && !g.requiresLimit)) {
-      return { kind: 'grant', grant: g, scope: 'general', reason: atWall ? 'weekly at wall' : 'dying value' };
+      // A give-back-only grant (no seven_day in clears) returns only what the model
+      // used — the claim snapshots unified7d so the next probe measures the drop.
+      const giveBack = g.givesBackWeekly === true && !(Array.isArray(g.clears) && g.clears.includes('seven_day'));
+      return { kind: 'grant', grant: g, scope: 'general', giveBack, reason: atWall ? 'weekly at wall' : 'dying value' };
     }
   }
 

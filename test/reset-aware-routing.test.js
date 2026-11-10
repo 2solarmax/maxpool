@@ -36,10 +36,14 @@ test('holdsUsableReset: expired card, spent grant, paused grant, disabled accoun
   assert.equal(am._holdsUsableReset(a), false, 'expired card');
   am.applyResetGrants(0, { grants: [{ id: 'g', usableNow: false, resetsLeft: 0 }], eligible: true });
   assert.equal(am._holdsUsableReset(a), false, 'spent grant');
-  am.applyResetGrants(0, { grants: [{ id: 'g', usableNow: true, paused: true, resetsLeft: 1, endsAt: soon(DAY) }], eligible: true });
+  am.applyResetGrants(0, { grants: [{ id: 'g', usableNow: true, paused: true, resetsLeft: 1, endsAt: soon(DAY), clears: ['seven_day'] }], eligible: true });
   assert.equal(am._holdsUsableReset(a), false, 'paused grant');
-  am.applyResetGrants(0, { grants: [{ id: 'g', usableNow: true, resetsLeft: 1, endsAt: soon(DAY) }], eligible: true });
-  assert.equal(am._holdsUsableReset(a), true, 'live grant');
+  // C4/A1 (2026-11-10): a grant with NO clears is scope-unknown — it can never be
+  // spent, so it holds nothing for routing either.
+  am.applyResetGrants(0, { grants: [{ id: 'g', usableNow: true, resetsLeft: 1, endsAt: soon(DAY), clears: [] }], eligible: true });
+  assert.equal(am._holdsUsableReset(a), false, 'unknown-scope grant holds nothing');
+  am.applyResetGrants(0, { grants: [{ id: 'g', usableNow: true, resetsLeft: 1, endsAt: soon(DAY), clears: ['seven_day'] }], eligible: true });
+  assert.equal(am._holdsUsableReset(a), true, 'live grant with known scope');
   a.enabled = false;
   assert.equal(am._holdsUsableReset(a), false, 'R0 owner gate: disabled never counts');
 });

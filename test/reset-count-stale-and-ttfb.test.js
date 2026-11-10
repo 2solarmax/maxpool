@@ -80,20 +80,25 @@ test('prober logs once per transition: ok→failing, failing→ok (no per-poll s
   const am = am1();
   const logs = [];
   let mode = 'ok';
+  // A2: grants are listed at most once per GRANTS_EVERY_MS (5 min) — the test's
+  // back-to-back probeOne calls must each land in a NEW listing window, so the
+  // injected clock advances a full window per sweep.
+  let clock = 1_700_000_000_000;
   const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
-    probeFn: async () => ({ status: 500, error: 'x' }),
+    probeFn: async () => ({ status: 500, error: 'x' }), now: () => clock,
     grantsFn: async () => (mode === 'ok' ? GOOD() : mode === 'throw' ? (() => { throw new Error('boom'); })() : { error: 'HTTP 502' }) });
   prober._claimClaudeGrant = async () => {};
   const rg = () => logs.filter(l => l.startsWith('[reset-grant] a1:'));
-  await prober.probeOne(am.accounts[0]);
+  const sweep = () => { clock += 6 * 60_000; return prober.probeOne(am.accounts[0]); };
+  await sweep();
   assert.equal(rg().length, 0, 'healthy: silent');
   mode = 'fail';
-  await prober.probeOne(am.accounts[0]); await prober.probeOne(am.accounts[0]); mode = 'throw'; await prober.probeOne(am.accounts[0]);
+  await sweep(); await sweep(); mode = 'throw'; await sweep();
   assert.equal(rg().length, 1, 'three failures in a row log ONE line');
   assert.match(rg()[0], /listing FAILED \(HTTP 502\)/);
   assert.equal(am.accounts[0].resetGrants.stale, true, 'a throw is a failed listing too');
   mode = 'ok';
-  await prober.probeOne(am.accounts[0]); await prober.probeOne(am.accounts[0]);
+  await sweep(); await sweep();
   assert.equal(rg().length, 2, 'recovery logs ONE line');
   assert.match(rg()[1], /listing recovered/);
   assert.equal(am.accounts[0].resetGrants.stale, false);
