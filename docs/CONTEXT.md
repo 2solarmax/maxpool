@@ -84,11 +84,25 @@ accounts could never reach their claim wall. Task:
 - TUI Rst column: fixed grammar at width 6 (`n~Xd` general, `nF~Xd` scoped,
   `g+sF` mixed, `n?` unknown, gray+`?` not-fresh); count = SUM of resetsLeft +
   live cards; expiry checked live in the render.
-- ttfb anchors at the upstream fetch resolve; the queue heartbeat never stamps it.
+- ttfb = the serving attempt's upstream wait (its fetch resolve minus its own
+  forward start), stamped only on a successful fetch; the queue heartbeat never
+  stamps it.
+
+**Review round (judge @2c4da59, same day):** one claim per wall is ordered by the
+probe's SEND time (a probe sent before a claim cannot license another); a
+successful claim spends the reset in the stored listing at once; the reactive
+claim runs off the request (fire-and-forget, 10s abort) and a 401 defers to the
+sweep without backoff; no lift — and no dying-value claim — within 24h of the
+limit's free refill unless the reset itself dies first (D4); mirrors read the
+holder's exported lift ceiling; the skip log prints the policy's own reason;
+claim state (cached org, backoff) is per login and cleared on re-login/removal;
+the give-back OR rule also holds for stored (normalized) grants. Timing constants
+live in one leaf module, `src/reset-timing.js`.
 
 **Consequences:** every row (cloud included) shows its resets with scope; capped
-accounts spend their general resets; a 429 at the wall claims within the same
-request; z.ai schema drift reads as a failed listing, never a silent 0.
+accounts spend their general resets; a 429 at the wall claims for the NEXT request
+without slowing this one; z.ai schema drift reads as a failed listing, never a
+silent 0.
 
 ### 2026-08-10 · #8 — Five named routing modes replace crossProviderFallbackPolicy
 
