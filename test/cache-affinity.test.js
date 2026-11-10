@@ -702,27 +702,19 @@ test('RETURN HOME throttle line tags a pool-wide throttle so it is not blamed on
     /^\[Maxpool\] return-home lease throttled \(429 upstream_throttled, (switched|natural)\): a2 depth=\d+$/);
 });
 
-test('RETURN HOME with degraded conversation identity (per-terminal key) still goes home, capped', () => {
-  // Degraded: the per-request key churns, so only sessionKey ('s') can join the turns.
-  const setup = () => {
-    const m = detourMgr(); m.identityHealth.degraded = true;
-    const a2 = byName(m, 'a2'); const glm = byName(m, 'glm');
-    m._noteConversationAccount(RI({ affinityKey: 's:h1' }), a2);
-    m._noteConversationAccount(RI({ affinityKey: 's:h1' }), glm);
-    return { m, a2 };
-  };
-  const { m, a2 } = setup();
+test('RETURN HOME with genuinely broken identity (churning hash): home is never found, normal pick stands', () => {
+  // The home is keyed by the conversation id, not the terminal key, so when every request
+  // carries a fresh hash there is no home to find — never a forced or wrong return.
+  const m = detourMgr(); m.identityHealth.degraded = true;
+  const a2 = byName(m, 'a2'); const glm = byName(m, 'glm');
+  m._noteConversationAccount(RI({ affinityKey: 's:h1' }), a2);
+  m._noteConversationAccount(RI({ affinityKey: 's:h1' }), glm);
   a2.activeWeight = 6;
   const { lease, line } = returnTurn(m, RI({ affinityKey: 's:h2' }));
-  assert.equal(lease.account.name, 'a2', line);
+  assert.notEqual(lease.account.name, 'a2', line);
+  assert.ok(!lease.returnedHome, 'no return-home attempted');
+  assert.doesNotMatch(line, /home=/, line);
   release(lease);
-
-  // Cap half: a fresh manager, home past the anti-dogpile cap → does NOT go home.
-  const c = setup();
-  c.a2.activeWeight = 1200;
-  const capped = returnTurn(c.m, RI({ affinityKey: 's:h2' }));
-  assert.notEqual(capped.lease.account.name, 'a2', capped.line);
-  am_ref = c.m; release(capped.lease);
 });
 
 test('RETURN HOME stale window: a non-finite or negative config falls back to one hour', () => {

@@ -697,8 +697,9 @@ export class AccountManager {
     // Bounded LRU — oldest conversations drop first; a dropped entry only means the
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
-    // Same key → { name, at } of the last CLAUDE account only (a GLM/Kimi turn never
-    // overwrites it), so a conversation returning from a provider detour can go home.
+    // _homeKey (affinityKey, else sessionKey) → { name, at, detoured } of the last CLAUDE
+    // account only (a GLM/Kimi turn never overwrites the name; it sets `detoured`), so a
+    // conversation returning from a provider detour can go home.
     this.conversationLastClaudeAccount = new Map();
     // Conversation-identity HEALTH (owner 2026-11-08: "make sure this cannot degrade
     // silently"). Twice in one day a Claude Code request-shape detail (a moving
@@ -3588,26 +3589,43 @@ export class AccountManager {
    */
   _noteConversationAccount(requestInfo, account) {
     const key = this._affinityKey(requestInfo);
-    if (!key) return;
-    lruSet(this.conversationLastAccount, key, account.name);
+    if (key) lruSet(this.conversationLastAccount, key, account.name);
+    // Home memory: ONE key per conversation, independent of identity health, so the
+    // degraded <-> ok flip of _affinityKey can neither hide a home nor lend it to the
+    // sibling conversations that share the terminal key. The entry carries its own
+    // detour state: a Claude turn clears it, a provider turn sets it (same name and
+    // `at`, only the LRU position moves so other traffic cannot evict a long detour).
+    const homeKey = this._homeKey(requestInfo);
+    if (!homeKey) return;
     if (isClaudeAccount(account)) {
-      lruSet(this.conversationLastClaudeAccount, key, { name: account.name, at: requestInfo.now ?? Date.now() });
+      lruSet(this.conversationLastClaudeAccount, homeKey,
+        { name: account.name, at: requestInfo.now ?? Date.now(), detoured: false });
+    } else {
+      const home = this.conversationLastClaudeAccount.get(homeKey);
+      if (home) lruSet(this.conversationLastClaudeAccount, homeKey, { ...home, detoured: true });
     }
+  }
+
+  /** Key of the conversation's home entry: the conversation itself, never the shared
+   *  terminal key when a conversation id exists. When identity is genuinely broken
+   *  (a fresh hash every request) the home is simply never found, so the normal pick
+   *  stands — never a forced or wrong return. */
+  _homeKey(requestInfo = {}) {
+    return requestInfo.affinityKey || requestInfo.sessionKey || null;
   }
 
   /**
    * RETURN HOME (owner 2026-11-09): the Claude account a conversation should go back to
-   * after a provider detour, or null. A detour = the last account differs from the last
-   * CLAUDE account (the Claude memory only ever holds Claude names). That includes the
-   * case where the last-account entry was evicted but the Claude entry survived: going
-   * home then restores the evicted hold, which is harmless. `stale` when the stored copy
-   * has outlived cacheAffinityReturnWindowMs — going home then buys nothing.
+   * after a provider detour, or null. A detour = a provider turn was served after the
+   * last Claude turn (the entry's own `detoured` flag), so a conversation that never
+   * left Claude has no home to return to. `stale` when the stored copy has outlived
+   * cacheAffinityReturnWindowMs — going home then buys nothing.
    */
   _returnHome(requestInfo, now = Date.now()) {
-    const key = this._affinityKey(requestInfo);
-    if (!key) return null;
-    const home = this.conversationLastClaudeAccount.get(key);
-    if (!home || home.name === this.conversationLastAccount.get(key)) return null;
+    const homeKey = this._homeKey(requestInfo);
+    if (!homeKey) return null;
+    const home = this.conversationLastClaudeAccount.get(homeKey);
+    if (!home || !home.detoured) return null;
     const ageMs = now - home.at;
     let windowMs = Number(this.scheduler.cacheAffinityReturnWindowMs);
     if (!Number.isFinite(windowMs) || windowMs < 0) windowMs = DEFAULT_SCHEDULER.cacheAffinityReturnWindowMs;
