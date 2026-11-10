@@ -3368,8 +3368,20 @@ export class AccountManager {
     const key = this._affinityKey(requestInfo);
     if (!key) return;
     lruSet(this.conversationLastAccount, key, account.name);
+    // The key flips between "term:hash" and "term" when identity health flips
+    // (_affinityKey), so the Claude memory is kept under both: a home recorded under
+    // only the old key is invisible to the return after a detour.
+    const keys = new Set([key, requestInfo.affinityKey, requestInfo.sessionKey]);
     if (isClaudeAccount(account)) {
-      lruSet(this.conversationLastClaudeAccount, key, { name: account.name, at: requestInfo.now ?? Date.now() });
+      const entry = { name: account.name, at: requestInfo.now ?? Date.now() };
+      for (const k of keys) if (k) lruSet(this.conversationLastClaudeAccount, k, entry);
+    } else {
+      // A provider turn: refresh the home's LRU position only (same value, same `at`),
+      // so other conversations' Claude traffic cannot evict it during a long detour.
+      for (const k of keys) {
+        const home = k && this.conversationLastClaudeAccount.get(k);
+        if (home) lruSet(this.conversationLastClaudeAccount, k, home);
+      }
     }
   }
 
