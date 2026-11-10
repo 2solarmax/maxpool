@@ -43,8 +43,16 @@ run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — prints output, fa
   fi
 }
 BUMP="${1:-patch}"
-REMOTE="${RELEASE_REMOTE:-private}"
+# Clones name the GitHub remote differently ('private' on some, 'origin' on others):
+# prefer 'private' when it exists, else 'origin'. Checked BEFORE the test stage so a
+# missing remote fails in seconds, not after the suite and a local version bump.
+if git remote get-url private >/dev/null 2>&1; then DEFAULT_REMOTE=private; else DEFAULT_REMOTE=origin; fi
+REMOTE="${RELEASE_REMOTE:-$DEFAULT_REMOTE}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
+  echo "✗ Git remote '$REMOTE' does not exist in this clone (remotes: $(git remote | tr '\n' ' ')). Set RELEASE_REMOTE." >&2
+  exit 1
+fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "✗ Working tree is dirty. Commit your changes first, then release." >&2
