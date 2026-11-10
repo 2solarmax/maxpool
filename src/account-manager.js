@@ -1915,11 +1915,17 @@ export class AccountManager {
       const rg = account.resetGrants;
       const cards = account.resetCards;
       const listingOk = rg && rg.stale !== true && rg.eligible !== false
-        && rg.checkedAt != null && (now - rg.checkedAt) <= this._capLiftListingFreshMs();
+        && rg.checkedAt != null && (now - rg.checkedAt) <= this._capLiftListingFreshMs()
+        // No cooldown, no claim backoff for the grant that would lift (C3).
+        && !(rg.cooldownUntil != null && rg.cooldownUntil > now);
       if (listingOk) {
+        const inBackoff = g => {
+          const until = this._claimRetryUntil?.get(`${account.name}:${g.id}`);
+          return until != null && until > now;
+        };
         const fresh = (rg.grants || []).filter(g =>
           g && g.usableNow !== false && !g.paused && !g.expired && !g.blocking && !g.unavailableReason
-          && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0);
+          && (g.endsAt == null || g.endsAt > now) && (g.resetsLeft ?? 1) > 0 && !inBackoff(g));
         const full = fresh.some(g => Array.isArray(g.clears) && g.clears.includes('seven_day'));
         const giveback = fresh.some(g => g.givesBackWeekly === true && !(Array.isArray(g.clears) && g.clears.includes('seven_day')));
         if (full) { active = true; mode = 'full'; }
@@ -5838,15 +5844,47 @@ export class AccountManager {
     return measured ? (grants.find(g => scopes(g).has(kind)) || null) : null;
   }
 
+  /** C6: the ONE claim lock per account, shared by the prober and the reactive
+   *  path. Returns true when the lock was ACQUIRED (caller must release). */
+  acquireClaimLock(accountName) {
+    if (!this._claimLocks) this._claimLocks = new Set();
+    if (this._claimLocks.has(accountName)) return false;
+    this._claimLocks.add(accountName);
+    return true;
+  }
+
+  releaseClaimLock(accountName) {
+    this._claimLocks?.delete(accountName);
+  }
+
+  /** C6: record a claim FAILURE — backoff per (account, grantId) 15m/30m/1h, cap 6h.
+   *  Shared state with the prober path (same maps). Returns the wait ms. */
+  noteClaimFailure(accountName, grantId, now = Date.now()) {
+    const key = `${accountName}:${grantId}`;
+    if (!this._claimTries) this._claimTries = new Map();
+    if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
+    const tries = (this._claimTries.get(key) || 0) + 1;
+    this._claimTries.set(key, tries);
+    const steps = [15 * 60_000, 30 * 60_000, 60 * 60_000];
+    const waitMs = Math.min(6 * 3600_000, steps[Math.min(tries - 1, steps.length - 1)]);
+    this._claimRetryUntil.set(key, now + waitMs);
+    return { tries, waitMs };
+  }
+
+  /** C6: a SUCCESSFUL claim clears the backoff for that grant. */
+  noteClaimSuccess(accountName, grantId) {
+    this._claimRetryUntil?.set(`${accountName}:${grantId}`, 0);
+    this._claimTries?.set(`${accountName}:${grantId}`, 0);
+  }
+
   /** Try the reactive claim for a weekly-class 429 (7d header ≥ 0.999) or a scoped
    *  429 (model family). Returns true when a claim was attempted. NEVER called for
-   *  a mirror row or a benched/disabled account. Shares the C6 backoff state with
-   *  the prober path (keyed account:grantId). */
+   *  a mirror row or a benched/disabled account. Shares the C6 lock and backoff
+   *  state with the prober path. */
   async tryReactiveClaim(account, { kind, weeklyUtil = null }, now = Date.now()) {
     if (!account) return false;
     if (account.remote || account.poolBenchedBy || account.enabled === false) return false;
     if (!account.credential || account.type !== 'oauth') return false;
-    if (this._reactiveClaimInFlight?.has(account.name)) return false;
     const grant = this._reactiveClaimGrant(account, kind, now);
     if (!grant) {
       // C2: mark the candidate so the next sweep decides (a scoped 429 without a
@@ -5854,18 +5892,16 @@ export class AccountManager {
       account.claimCandidate = kind;
       return false;
     }
-    // C6: shared backoff per (account, grantId) — the prober's _claimRetryUntil.
+    // C6: shared backoff per (account, grantId).
     const key = `${account.name}:${grant.id}`;
     const until = this._claimRetryUntil?.get(key);
     if (until && until > now) return false;
-    if (!this._reactiveClaimInFlight) this._reactiveClaimInFlight = new Set();
-    this._reactiveClaimInFlight.add(account.name);
+    if (!this.acquireClaimLock(account.name)) return false;
     try {
       const { claimResetGrant } = await import('./claude-reset-grants.js');
       const r = await claimResetGrant(account.credential, grant.id, { accountKey: account.name });
       if (r?.ok) {
-        if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
-        this._claimRetryUntil.set(key, 0);
+        this.noteClaimSuccess(account.name, grant.id);
         account.lastClaimAt = Date.now();
         // Clear the wall this claim refills.
         if (kind !== 'weekly' && account.quota?.scopedWeekly?.[kind]) delete account.quota.scopedWeekly[kind];
@@ -5877,13 +5913,7 @@ export class AccountManager {
         console.log(`[reset-grant] ${account.name}: grant ${grant.id} claimed reactively (${kind === 'weekly' ? 'weekly 429 at the wall' : `${kind} scoped 429`})`);
         return true;
       }
-      // Backoff 15m/30m/1h cap 6h — same steps as the prober path.
-      const tries = (this._claimTries?.get(key) || 0) + 1;
-      if (!this._claimTries) this._claimTries = new Map();
-      this._claimTries.set(key, tries);
-      const waitMs = Math.min(6 * 3600_000, [15 * 60_000, 30 * 60_000, 60 * 60_000][Math.min(tries - 1, 2)]);
-      if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
-      this._claimRetryUntil.set(key, now + waitMs);
+      const { tries, waitMs } = this.noteClaimFailure(account.name, grant.id, now);
       console.log(`[reset-grant] ${account.name}: reactive claim FAILED ${grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       this.endCapLift(account.index, 'reactive claim failed');
       return true;   // attempted
@@ -5891,7 +5921,7 @@ export class AccountManager {
       console.log(`[reset-grant] ${account.name}: reactive claim error ${e.message}`);
       return true;
     } finally {
-      this._reactiveClaimInFlight?.delete(account.name);
+      this.releaseClaimLock(account.name);
     }
   }
 

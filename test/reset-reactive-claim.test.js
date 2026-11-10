@@ -184,3 +184,27 @@ test('SC8: a failing claim attempts at 0, +15m, +45m only; one profile GET per a
     assert.equal(profiles.length, 1, `ONE profile GET per account per process (got ${profiles.length})`);
   } finally { Date.now = realNow; restore(); }
 });
+
+// ── TEST 18 pin: the lock is SHARED — the prober's claim is suppressed while the
+// reactive claim holds it (and vice versa).
+test('SC8: the claim lock covers BOTH paths (prober suppressed while reactive holds it)', async () => {
+  const { Prober } = await import('../src/prober.js');
+  const calls = [];
+  const restore = stubClaim({ calls });
+  try {
+    const manager = am({ grants: GEN(), wk: 0.995 });
+    const a = manager.accounts[0];
+    const prober = new Prober(manager, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+      probeFn: async () => ({ fiveHour: { utilization: 0.2 }, sevenDay: { utilization: 0.995 }, weeklyAbsent: false }),
+      grantsFn: async () => a.resetGrants });
+    // The reactive path holds the lock (a claim in flight): the prober's own claim
+    // must be suppressed for the same account.
+    assert.equal(manager.acquireClaimLock(a.name), true);
+    const claimed = await prober._claimClaudeGrant(a, { grant: GEN().grants[0], scope: 'general', reason: 'weekly at wall' });
+    assert.equal(claimed, false, 'the prober claim is suppressed while the reactive path holds the lock');
+    assert.equal(calls.filter(u => /reset_rate_limits/.test(u)).length, 0, 'no POST while locked');
+    manager.releaseClaimLock(a.name);
+    const claimed2 = await prober._claimClaudeGrant(a, { grant: GEN().grants[0], scope: 'general', reason: 'weekly at wall' });
+    assert.equal(claimed2, true, 'the prober claims once the lock is free');
+  } finally { restore(); }
+});

@@ -350,29 +350,24 @@ export class Prober {
   }
 
   /** Execute a Claude cedar_ember claim decided by the policy.
-   *  C6: one claim lock per account shared with the reactive path; a FAILED claim
-   *  backs off per (account, grantId) 15m/30m/1h cap 6h; a SUCCESSFUL claim sets
-   *  lastClaimAt (decideClaude then waits for a newer probe before claiming again)
-   *  and clears any reactive scoped entry / weekly throttle so the account can
-   *  serve again immediately. */
+   *  C6: the ONE claim lock per account lives on the account-manager (shared with
+   *  the reactive path); a FAILED claim backs off per (account, grantId)
+   *  15m/30m/1h cap 6h; a SUCCESSFUL claim sets lastClaimAt (decideClaude then
+   *  waits for a newer probe before claiming again) and clears any reactive
+   *  scoped entry / weekly throttle so the account can serve again immediately. */
   async _claimClaudeGrant(account, act) {
     if (!act?.grant) return false;
-    const lock = this._claimLocks?.get(account.name);
-    if (lock) return false;                         // one claim in flight per account
-    if (!this._claimLocks) this._claimLocks = new Map();
-    this._claimLocks.set(account.name, true);
-    const key = `${account.name}:${act.grant.id}`;
     const now = Date.now();
-    const until = this._claimRetryUntil?.get(key);
-    if (until && until > now) { this._claimLocks.delete(account.name); return false; }
+    const key = `${account.name}:${act.grant.id}`;
+    const until = this.am._claimRetryUntil?.get?.(key);
+    if (until && until > now) return false;
+    if (!this.am.acquireClaimLock?.(account.name)) return false;
     try {
       const q = account.quota || {};
       this.log(`[reset-grant] ${account.name}: claiming grant ${act.grant.id} (${act.reason}; ses=${q.unified5h ?? '?'} wk=${q.unified7d ?? '?'})`);
       const r = await this._withTimeout(claimResetGrant(account.credential, act.grant.id, { accountKey: account.name }));
       if (r?.ok) {
-        if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
-        this._claimRetryUntil.set(key, 0);
-        this._claimTries?.set(key, 0);
+        this.am.noteClaimSuccess?.(account.name, act.grant.id);
         account.lastClaimAt = Date.now();
         // C3 give-back: snapshot unified7d BEFORE the claim so the next probe can
         // measure the drop a give-back grant actually returned (cap+drop ceiling).
@@ -395,12 +390,8 @@ export class Prober {
         this.log(`[reset-grant] ${account.name}: grant ${act.grant.id} claimed${r.alreadyUsed ? ' (already used — idempotent)' : ''}`);
         return true;
       }
-      const tries = (this._claimTries?.get(key) || 0) + 1;
-      if (!this._claimTries) this._claimTries = new Map();
-      this._claimTries.set(key, tries);
-      const waitMs = Math.min(CLAIM_BACKOFF_CAP_MS, CLAIM_BACKOFF_STEPS_MS[Math.min(tries - 1, CLAIM_BACKOFF_STEPS_MS.length - 1)]);
-      if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
-      this._claimRetryUntil.set(key, now + waitMs);
+      const { tries, waitMs } = this.am.noteClaimFailure?.(account.name, act.grant.id, now)
+        || { tries: 1, waitMs: CLAIM_BACKOFF_STEPS_MS[0] };
       this.log(`[reset-grant] ${account.name}: claim FAILED ${act.grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       // A failed claim ENDS any cap lift (C3: "ends at once on a claim (success or failure)").
       this.am.endCapLift?.(account.index, 'claim failed');
@@ -409,7 +400,7 @@ export class Prober {
       this.log(`[reset-grant] ${account.name}: claim error ${e.message}`);
       return false;
     } finally {
-      this._claimLocks.delete(account.name);
+      this.am.releaseClaimLock?.(account.name);
     }
   }
 
