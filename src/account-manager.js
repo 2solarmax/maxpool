@@ -1911,7 +1911,7 @@ export class AccountManager {
    *  the weekly is where the give-back lands); a full seven_day grant lifts fully.
    *  A MIRROR reads the holder's exported ceiling (it carries no giveBack); a
    *  give-back lift whose ceiling is unknown fails CLOSED to the cap itself. */
-  _capLiftCeiling(account, window, now) {
+  _capLiftCeiling(account, _window, _now) {
     const st = account.capLift;
     if (!st) return null;
     if (st.mode !== 'giveback') return null;   // full lift
@@ -5976,7 +5976,7 @@ export class AccountManager {
    *  itself gives up after REACTIVE_CLAIM_TIMEOUT_MS so the lock is never held for
    *  minutes. A 401 (token rejected) defers to the next sweep — it refreshes the
    *  token first — and is NOT counted as a failed claim (no backoff). */
-  async tryReactiveClaim(account, { kind, weeklyUtil = null }, now = Date.now()) {
+  async tryReactiveClaim(account, { kind, weeklyUtil: _weeklyUtil = null }, now = Date.now()) {
     if (!account) return false;
     if (account.remote || account.poolBenchedBy || account.enabled === false) return false;
     if (!account.credential || account.type !== 'oauth') return false;
