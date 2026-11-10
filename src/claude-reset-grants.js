@@ -138,11 +138,12 @@ function _logRawGrantKeysOnce(ce, log = console.log) {
 }
 
 /** List this account's banked resets. Zero-spend read (skip_spend=1).
- *  Returns { grants: [], nextGrantId, cooldownUntil, eligible, reason } | { error }. */
-export async function listResetGrants(accessToken, { signal } = {}) {
+ *  Returns { grants: [], nextGrantId, cooldownUntil, eligible, reason } | { error }.
+ *  `fetchImpl` is the test seam (never hits api.anthropic.com from tests). */
+export async function listResetGrants(accessToken, { signal, fetchImpl = (u, o) => fetch(u, o) } = {}) {
   if (!accessToken) return { error: 'no token' };
   try {
-    const res = await fetch(`${USAGE_BASE}?cedar_ember=1&skip_spend=1`, {
+    const res = await fetchImpl(`${USAGE_BASE}?cedar_ember=1&skip_spend=1`, {
       headers: headers(accessToken), signal,
     });
     if (res.status === 401) return { error: 'unauthorized' };

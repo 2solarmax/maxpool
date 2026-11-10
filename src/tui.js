@@ -5,6 +5,7 @@ import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
+import { normalizeRemoteResets } from './account-manager.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -2298,12 +2299,33 @@ export class TUI {
     const live = a?.poolBenchedBy ? this.am.remoteRowFor?.(a) : null;
     if (live) {
       const r = live.row;
+      // B2 (2026-11-10): the overlay also carries the cloud twin's RESETS via the
+      // same normalizeRemoteResets the mirror rows use. When the twin's snapshot is
+      // MISSING the reset fields (one failed link poll — the "2 → gone → back"
+      // flicker through a new path), keep the PREVIOUS overlay marked not-fresh,
+      // never 0.
+      let resetsOverlay;
+      if (r.resetGrants != null || r.resetCards != null || r.capLift != null) {
+        const nr = normalizeRemoteResets(r);
+        resetsOverlay = { resetGrants: nr.resetGrants, resetCards: nr.resetCards, capLift: nr.capLift };
+      } else {
+        const prev = a._twinResetsOverlay || {};
+        resetsOverlay = {
+          resetGrants: prev.resetGrants ? { ...prev.resetGrants, stale: true } : null,
+          resetCards: prev.resetCards ? { ...prev.resetCards, stale: true } : null,
+          capLift: prev.capLift ?? null,
+        };
+      }
+      a._twinResetsOverlay = resetsOverlay;   // remember for the next frame's fallback
       a = Object.assign(Object.create(Object.getPrototypeOf(a)), a, {
         quota: { ...a.quota, ...(r.quota || {}) },
         inFlight: r.inFlight ?? 0,
         completedRequests: r.completedRequests ?? a.completedRequests,
         refreshDead: Boolean(r.refreshDead),
         rateLimitedUntil: r.rateLimitedUntil ? Date.parse(r.rateLimitedUntil) : null,
+        resetGrants: resetsOverlay.resetGrants,
+        resetCards: resetsOverlay.resetCards,
+        capLift: resetsOverlay.capLift,
       });
     }
 
@@ -2439,50 +2461,82 @@ export class TUI {
     // column showing 0 or the count). z.ai cards + Claude cedar_ember grants,
     // not-yet-expired, on ENABLED accounts only: a disabled account's resets are
     // not ours to spend, and showing a count there would imply otherwise.
+    //
+    // B3 grammar (2026-11-10), rendered width EXACTLY RESETS_W (6):
+    //   general  n~Xd       e.g. 2~119d
+    //   scoped   nF~Xd      e.g. 2F~4d   (model-scoped, e.g. Fable)
+    //   mixed    g+sF       e.g. 1+2F
+    //   unknown  n?         scope unknown — count shown, never claimed
+    //   not-fresh = gray + trailing '?' (stale listing, dead account, old check)
+    // Count = SUM of resetsLeft over spendable grants + live cards (not entries).
+    // Overflow order: drop the suffix first, then collapse to total+'*'.
+    // Expiry is checked LIVE here: grants endsAt>now, cards !expired &&
+    // (expiresAt==null || expiresAt>now) — a frozen `expired` flag never keeps a
+    // dead reset on screen (pre-mortem #18).
     let resetsCell;
     {
-      let n = 0;
-      let grantN = 0;
+      const now = Date.now();
+      const GRANTS_EVERY_MS = 5 * 60_000;
+      let general = 0;       // resetsLeft of general-weekly grants + live cards
+      let scoped = 0;        // resetsLeft of model-scoped grants (tagged F)
+      let unknown = 0;       // resetsLeft of scope-unknown grants
+      let soonest = Infinity;
       if (a.enabled !== false) {
+        const liveCard = c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now);
         const rc = a.resetCards;
-        if (rc) n += (rc.fiveHour || []).filter(c => !c.expired).length
-                 + (rc.weekly || []).filter(c => !c.expired).length;
+        if (rc) {
+          for (const c of [...(rc.fiveHour || []), ...(rc.weekly || [])]) {
+            if (liveCard(c)) { general += 1; if (c.expiresAt != null && c.expiresAt < soonest) soonest = c.expiresAt; }
+          }
+        }
         const rg = a.resetGrants;
-        if (rg?.eligible) { grantN = (rg.grants || []).filter(g => g.usableNow && !g.expired).length; n += grantN; }
+        if (rg?.eligible !== false && rg) {
+          for (const g of (rg.grants || [])) {
+            if (!g || g.usableNow === false || g.paused || g.expired) continue;
+            if (g.endsAt != null && g.endsAt <= now) continue;            // live expiry
+            const clears = Array.isArray(g.clears) ? g.clears : [];
+            const hasGeneral = clears.includes('seven_day') || g.givesBackWeekly === true;
+            const hasScoped = clears.some(k => k === 'seven_day_overage_included'
+              || k === 'seven_day_opus' || k === 'seven_day_sonnet');
+            const left = Math.max(0, Math.floor(g.resetsLeft ?? 1));
+            if (hasGeneral) general += left;
+            else if (hasScoped) scoped += left;
+            else unknown += left;
+            if (g.endsAt != null && g.endsAt < soonest) soonest = g.endsAt;
+          }
+        }
       }
-      // Expiry rides with the count when it's tight: "1~2d" = 1 reset, expires in ~2 days.
-      // Claude grants end mid-Oct (weeks out) — a day-count would be noise; only the
-      // SOONEST-expiring card under 7 days gets a suffix, so the column stays narrow
-      // and the number it carries still answers "use it or lose it?".
+      const total = general + scoped + unknown;
+      // Not-fresh (pre-mortem #15): stale listing, a dead account, or a check older
+      // than 3x the grants cadence. An account that stopped being probed never gets
+      // re-listed, so checkedAt alone would show a green count forever.
+      const freshGrants = a.resetGrants && a.resetGrants.stale !== true
+        && (a.resetGrants.checkedAt == null || now - a.resetGrants.checkedAt <= 3 * GRANTS_EVERY_MS);
+      const freshCards = !a.resetCards || (a.resetCards.stale !== true
+        && (a.resetCards.checkedAt == null || now - a.resetCards.checkedAt <= 3 * GRANTS_EVERY_MS));
+      const notFresh = total > 0 && (!freshGrants || !freshCards || a.refreshDead || a.subscriptionGone);
+
+      // Core text per the grammar.
+      let core;
+      if (total === 0) core = '0';
+      else if (unknown > 0 && general === 0 && scoped === 0) core = `${unknown}?`;
+      else if (general > 0 && scoped > 0) core = `${general}+${scoped}F`;
+      else if (scoped > 0) core = `${scoped}F`;
+      else core = `${general}`;
+
+      // Expiry suffix (owner 2026-10-01: always show when a reset exists).
       let suffix = '';
-      if (n > 0) {
-        let soonest = Infinity;
-        const rc = a.resetCards;
-        if (rc) for (const c of [...(rc.fiveHour || []), ...(rc.weekly || [])]) {
-          if (!c.expired && c.expiresAt != null && c.expiresAt < soonest) soonest = c.expiresAt;
-        }
-        const rg = a.resetGrants;
-        if (rg?.eligible) for (const g of (rg.grants || [])) {
-          if (g.usableNow && !g.expired && g.endsAt != null && g.endsAt < soonest) soonest = g.endsAt;
-        }
-        // Expiry is ALWAYS shown when a reset exists (owner 2026-10-01: "what is the
-        // proper way to communicate if we have a reset, and when does it expire" —
-        // both facts, always). Hours under 24h, days at or above.
-        const days = soonest === Infinity ? null : (soonest - Date.now()) / 86400_000;
-        if (days != null) {
-          suffix = days < 1 ? '~' + Math.max(1, Math.round(days * 24)) + 'h'
-                            : '~' + Math.max(1, Math.round(days)) + 'd';
-        }
+      if (total > 0 && soonest !== Infinity) {
+        const days = (soonest - now) / 86400_000;
+        suffix = days < 1 ? `~${Math.max(1, Math.round(days * 24))}h` : `~${Math.max(1, Math.round(days))}d`;
       }
-      // STALE (the last grant check failed; the count is the last good read): gray with a
-      // trailing '?'. The expiry suffix is dropped when '?' would overflow the fixed column.
-      const stale = n > 0 && grantN > 0 && a.resetGrants?.stale === true;
-      if (stale) {
-        const txt = String(n) + suffix;
-        resetsCell = rpad(gray(txt.length + 1 <= RESETS_W ? txt + '?' : String(n) + '?'), RESETS_W);
-      } else {
-        resetsCell = rpad(n > 0 ? green(String(n) + suffix) : gray('0'), RESETS_W);
-      }
+
+      // Fit to EXACTLY RESETS_W: full form, then drop the suffix, then total+'*'.
+      let text = core + suffix;
+      if (text.length > RESETS_W) text = core;
+      if (text.length > RESETS_W) text = `${total}*`.slice(0, RESETS_W);
+      if (notFresh) text = (text + '?').length <= RESETS_W ? text + '?' : `${total}?`.slice(0, RESETS_W);
+      resetsCell = rpad(total > 0 && !notFresh ? green(text) : gray(text), RESETS_W);
     }
 
     if (a.type === 'provider') {

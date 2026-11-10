@@ -1908,7 +1908,10 @@ export class AccountManager {
     // START conditions (all must hold).
     let active = false;
     let mode = null;
-    if (account.enabled !== false && !account.poolBenchedBy && !account.refreshDead && !account.subscriptionGone) {
+    // No cap configured → nothing to lift (starting a lift on an uncapped account
+    // would remap its ordinary weekly tiers and log noise for no benefit).
+    const capFloor = account.capUtilization;
+    if (capFloor != null && account.enabled !== false && !account.poolBenchedBy && !account.refreshDead && !account.subscriptionGone) {
       const rg = account.resetGrants;
       const cards = account.resetCards;
       const listingOk = rg && rg.stale !== true && rg.eligible !== false

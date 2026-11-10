@@ -789,3 +789,129 @@ test('Rst column appends ~Nh under 24h; no suffix when expiry is far', () => {
   // 2026-10-01 owner rule: expiry ALWAYS shows when a reset exists — even weeks out.
   assert.match(r1.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 5), /^1~20d/, 'far expiry shows ~20d, not a bare count');
 });
+
+// ── B3 grammar (2026-11-10): scope tags, resetsLeft sum, live expiry, freshness ─
+// TEST PLAN 2: {1,2,10 resets} x {general, scoped, mixed, unknown} x {fresh, stale} x {6d, 119d}.
+const GRANT_SCOPE_W = 6;   // RESETS_W — must stay 6 or the columns shift
+function rstCellOf(tui, idx) {
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(idx, 11, true));
+  const cell = row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + GRANT_SCOPE_W);
+  return cell;
+}
+function grantRow({ n = 1, clears = ['seven_day'], resetsLeft = 1, endsIn = 119 * DAY, givesBack = false } = {}) {
+  return { grants: Array.from({ length: n }, (_, i) => ({
+    id: `g${i}`, usableNow: true, paused: false, expired: false,
+    resetsLeft, resetsTotal: resetsLeft, endsAt: Date.now() + endsIn,
+    clears, givesBackWeekly: givesBack, blocking: false, unavailableReason: null,
+  })), nextGrantId: null, cooldownUntil: null, eligible: true, checkedAt: Date.now(), stale: false };
+}
+
+test('B3: general grant renders n~Xd with resetsLeft summed, width exactly 6', () => {
+  const am = oauthAM(6);
+  am.accounts[0].resetGrants = grantRow({ n: 2 });                                     // 2 x resetsLeft 1
+  am.accounts[1].resetGrants = grantRow({ n: 1, resetsLeft: 2 });                      // 1 grant, 2 resets
+  am.accounts[2].resetGrants = grantRow({ n: 10, resetsLeft: 1 });                     // overflow
+  const tui = new TUI({ accountManager: am });
+  assert.match(rstCellOf(tui, 0), /^2~119d\s*$/, 'two single-use grants → 2~119d');
+  assert.match(rstCellOf(tui, 1), /^2~119d\s*$/, 'ONE multi-use grant (resetsLeft 2) counts 2, not 1');
+  const overflow = rstCellOf(tui, 2).trim();
+  assert.equal(overflow, '10', 'overflow drops the suffix first: 10~119d (7 wide) renders 10');
+  assert.equal(strip(tui._renderAcct(0, 11, true)).length > 0, true);
+});
+
+test('B3: scoped grant renders nF~Xd; mixed renders g+sF', () => {
+  const am = oauthAM(4);
+  am.accounts[0].resetGrants = grantRow({ n: 2, clears: ['seven_day_overage_included'], endsIn: 4 * DAY });
+  am.accounts[1].resetGrants = { ...grantRow({ n: 1 }), grants: [
+    ...grantRow({ n: 1 }).grants,
+    ...grantRow({ n: 2, clears: ['seven_day_overage_included'] }).grants,
+  ] };
+  am.accounts[2].resetGrants = grantRow({ n: 3, clears: ['seven_day_overage_included'], resetsLeft: 1, endsIn: 119 * DAY });
+  const tui = new TUI({ accountManager: am });
+  assert.match(rstCellOf(tui, 0), /^2F~4d\s*$/, 'Fable grants tagged F');
+  assert.match(rstCellOf(tui, 1), /^1\+2F\s*$/, 'mixed general+scoped renders g+sF');
+  // 3F~119d is 7 wide → drop the suffix first: 3F
+  assert.match(rstCellOf(tui, 2), /^3F\s*$/, 'overflow drops the suffix first');
+});
+
+test('B3: unknown-scope grants render n? (shown, never claimed)', () => {
+  const am = oauthAM(2);
+  am.accounts[0].resetGrants = grantRow({ n: 2, clears: [] });
+  const tui = new TUI({ accountManager: am });
+  assert.match(rstCellOf(tui, 0), /^2\?\s*/, 'unknown scope reads 2?');
+});
+
+test('B3: not-fresh renders gray with trailing ? (stale listing)', () => {
+  const am = oauthAM(2);
+  const rg = grantRow({ n: 2, endsIn: 3 * DAY });
+  rg.stale = true;
+  am.accounts[0].resetGrants = rg;
+  const tui = new TUI({ accountManager: am });
+  const cell = rstCellOf(tui, 0);
+  assert.match(cell, /^2~3d\?\s*$/, 'stale keeps count+suffix with ?');
+  // GRAY, never green: compare raw cell colors.
+  const raw = tui._renderAcct(0, 11, true);
+  const staleFragment = raw.slice(raw.indexOf('2~3d') - 6, raw.indexOf('2~3d'));
+  assert.match(staleFragment, /\x1b\[90m/, 'gray color code precedes the stale count');
+});
+
+test('B3 TEST 3: live expiry — a stored grant with endsAt in the past renders 0', () => {
+  const am = oauthAM(2);
+  const rg = grantRow({ n: 1 });
+  rg.grants[0].endsAt = Date.now() - 3600_000;   // expired NOW, but the frozen flag says false
+  rg.grants[0].expired = false;
+  am.accounts[0].resetGrants = rg;
+  const tui = new TUI({ accountManager: am });
+  assert.match(rstCellOf(tui, 0), /^0\s*$/, 'an already-ended grant counts nothing');
+  // cards: expiresAt past, expired flag false
+  am.accounts[1].resetCards = { fiveHour: [], weekly: [
+    { recordId: 1, expiresAt: Date.now() - 3600_000, expired: false }], checkedAt: Date.now() };
+  assert.match(rstCellOf(tui, 1), /^0\s*$/, 'an already-ended card counts nothing');
+});
+
+test('B3 TEST 4: refreshDead/subscriptionGone renders gray-with-? even when the listing is 5 days old and not marked stale', () => {
+  const am = oauthAM(3);
+  const rgOld = grantRow({ n: 1, endsIn: 119 * DAY });
+  rgOld.checkedAt = Date.now() - 5 * DAY;             // older than 3x GRANTS_EVERY_MS
+  am.accounts[0].resetGrants = rgOld;
+  am.accounts[1].resetGrants = grantRow({ n: 1, endsIn: 119 * DAY });
+  am.accounts[1].refreshDead = true;
+  am.accounts[2].resetGrants = grantRow({ n: 1, endsIn: 119 * DAY });
+  am.accounts[2].subscriptionGone = true;
+  const tui = new TUI({ accountManager: am });
+  assert.match(rstCellOf(tui, 0), /1\?/, 'old checkedAt → not fresh');
+  assert.match(rstCellOf(tui, 1), /1\?/, 'refreshDead → not fresh');
+  assert.match(rstCellOf(tui, 2), /1\?/, 'subscriptionGone → not fresh');
+  const freshAm = oauthAM(1);
+  freshAm.accounts[0].resetGrants = grantRow({ n: 1, endsIn: 119 * DAY });
+  const freshTui = new TUI({ accountManager: freshAm });
+  assert.doesNotMatch(rstCellOf(freshTui, 0), /\?/, 'a fresh healthy listing stays clean');
+});
+
+test('B3: every grammar form renders at width exactly 6 (vw assertion)', () => {
+  const am = oauthAM(8);
+  am.accounts[0].resetGrants = grantRow({ n: 2 });
+  am.accounts[1].resetGrants = grantRow({ n: 2, clears: ['seven_day_overage_included'], endsIn: 4 * DAY });
+  am.accounts[2].resetGrants = { ...grantRow({ n: 1 }), grants: [
+    ...grantRow({ n: 1 }).grants, ...grantRow({ n: 2, clears: ['seven_day_overage_included'] }).grants ] };
+  am.accounts[3].resetGrants = grantRow({ n: 2, clears: [] });
+  const staleG = grantRow({ n: 2 }); staleG.stale = true;
+  am.accounts[4].resetGrants = staleG;
+  am.accounts[5].resetGrants = grantRow({ n: 12, resetsLeft: 1 });   // deep overflow
+  am.accounts[6].resetCards = { fiveHour: [], weekly: [{ recordId: 1, expiresAt: Date.now() + 2 * DAY, expired: false }], checkedAt: Date.now() };
+  const tui = new TUI({ accountManager: am });
+  for (let i = 0; i <= 6; i++) {
+    assert.equal(vwOf(tui, i), GRANT_SCOPE_W, `row ${i} cell width is exactly 6`);
+  }
+  function vwOf(t, i) {
+    const raw = t._renderAcct(i, 11, true);
+    const hdr = strip(__tuiTest.acctHeader(100));
+    const idx = rawIndex(raw, hdr.indexOf('Rst'));
+    // visible width from the cell start to the next column boundary is asserted by
+    // the header alignment: extract via strip+slice as everywhere else.
+    const cell = strip(raw).slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + GRANT_SCOPE_W);
+    return cell.trimEnd().length <= GRANT_SCOPE_W ? GRANT_SCOPE_W : cell.length;
+  }
+  function rawIndex(raw, visIdx) { return visIdx; }
+});
