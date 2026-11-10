@@ -238,8 +238,11 @@ export async function claimResetGrant(accessToken, grantId, { signal, requestId,
       signal,
     });
     const data = await res.json().catch(() => null);
-    // Success shapes observed: {success:true} or result:"already_used" (idempotent).
-    const okFlag = data?.success === true || data?.result === 'already_used';
+    // Success shapes observed: {success:true}, result:"already_used" (idempotent),
+    // or result:"reset" with reset:true (measured live 2026-11-10: the claim POST
+    // returns the consumed grant — resets_left:0, cleared:[...], cooldown_until).
+    const okFlag = data?.success === true || data?.result === 'already_used'
+      || (data?.result === 'reset' && data?.reset === true);
     if (okFlag) return { ok: true, grantId, alreadyUsed: data?.result === 'already_used' };
     // 403/404 on the org path: the cached org no longer belongs to this login —
     // drop it so the next claim re-reads the profile.

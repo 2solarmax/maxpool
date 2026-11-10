@@ -214,3 +214,23 @@ test('A3: probeOne refreshes the token before listing grants (the listing uses t
   assert.deepEqual(order.slice(0, 2), ['refresh', 'list'], `refresh first (got ${order.join(',')})`);
   assert.deepEqual(seen, ['fresh'], 'the listing carried the refreshed token');
 });
+
+// 2026-11-10 live shape: Anthropic answers a SUCCESSFUL claim with
+// {"result":"reset","reset":true,"grant_id":...,"resets_left":0,"cleared":[...]}
+// (observed on 3 accounts at 15:39–15:41Z, v1.24.82). The parser must accept it,
+// not back off — the old okFlag only knew {success:true} / {result:"already_used"}.
+test('claim accepts the live "result":"reset" success shape', async () => {
+  const { claimResetGrant } = await import('../src/claude-reset-grants.js');
+  const live = { result: 'reset', reason: null, reset: true, grant_id: 'launch-2610-fable',
+    resets_left: 0, cleared: ['seven_day_overage_included'],
+    weekly_resets_at: '2026-11-11T16:00:00+00:00', cooldown_until: '2026-11-11T04:00:00+00:00' };
+  const fetchImpl = async (url, _opts) => {
+    if (url.includes('/api/oauth/profile')) {
+      return { ok: true, status: 200, json: async () => ({ organization: { uuid: 'org-1' } }) };
+    }
+    return { ok: true, status: 200, json: async () => live };
+  };
+  const out = await claimResetGrant('tok', 'launch-2610-fable', { fetchImpl, accountKey: 'acct' });
+  assert.equal(out.ok, true, `live reset shape must be a success (got ${JSON.stringify(out).slice(0, 120)})`);
+  assert.equal(out.alreadyUsed, false);
+});
