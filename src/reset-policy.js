@@ -100,7 +100,7 @@ export function decideZai(account, cards, now = Date.now()) {
 /** Decide the Claude action. Returns {kind:'grant', grant} | null. */
 export function decideClaude(account, listing, now = Date.now()) {
   if (account?.enabled === false) return null;               // R0
-  if (!listing || listing.error || listing.eligible === false) return null;
+  if (!listing || listing.error || listing.stale || listing.eligible === false) return null; // only a FRESH listing may claim
   if (listing.cooldownUntil != null && listing.cooldownUntil > now) return null;
   const grants = (listing.grants || [])
     .filter(g => g.usableNow && !g.paused && !g.expired)

@@ -307,6 +307,18 @@ export class Prober {
     } catch (e) { this.log(`[reset-card] ${account.name}: redeem error ${e.message}`); }
   }
 
+  /** One log line per ok<->failing transition of the grant listing (no per-poll spam). */
+  _logGrantListingTransition(account, listing) {
+    const failing = Boolean(listing.error);
+    if (failing && !account._grantListFailing) {
+      account._grantListFailing = true;
+      this.log(`[reset-grant] ${account.name}: listing FAILED (${listing.error}) — keeping last known reset count, marked stale`);
+    } else if (!failing && account._grantListFailing) {
+      account._grantListFailing = false;
+      this.log(`[reset-grant] ${account.name}: listing recovered`);
+    }
+  }
+
   /** Execute a Claude cedar_ember claim decided by the policy. */
   async _claimClaudeGrant(account, act) {
     try {
@@ -347,9 +359,14 @@ export class Prober {
         // A pool-benched duplicate never claims a grant: the cloud owns this account
         // (mirror of the z.ai card guard above; red-team 2026-10-31).
         if (account.enabled !== false && account.credential && !account.poolBenchedBy && this.am.applyResetGrants) {
-          const listing = await this._withTimeout(this.grantsFn(account.credential));
+          // A timeout or throw is a failed listing too (stale, logged once), not silence.
+          let listing;
+          try { listing = await this._withTimeout(this.grantsFn(account.credential)); }
+          catch (e) { listing = { error: e?.message || String(e) }; }
+          if (listing == null) listing = { error: 'timed out' };
           if (listing) {
             this.am.applyResetGrants(account.index, listing);
+            this._logGrantListingTransition(account, listing);
             const act = decideClaude(account, listing);
             if (act) await this._claimClaudeGrant(account, act);
           }

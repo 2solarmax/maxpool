@@ -571,6 +571,12 @@ export class TUI {
     if (r) r.account = info.account;
   }
 
+  /** First response byte reached the client (server.js markFirstByte). */
+  onRequestFirstByte(id) {
+    const r = this.active.get(id);
+    if (r && r.firstByteAt == null) r.firstByteAt = Date.now();
+  }
+
   onRequestEnd(id, info) {
     const r = this.active.get(id);
     this.active.delete(id);
@@ -593,7 +599,12 @@ export class TUI {
     const provTag = (isProvider && r?.sessionKey) ? `  [sess ${String(r.sessionKey).slice(0, 8)}]` : '';
     const cv = info.conversation || r?.conversation;
     const cvTag = cv ? `  [cv ${cv.slice(0, 8)} ${String(info.sessionKey || r?.sessionKey || '').slice(0, 8)}]` : '';
-    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${provTag}${cvTag}`);
+    // ttfb LAST: time until the first response byte reached the client (the stall Claude
+    // Code reports as "Waiting for API response"). Appended after every existing token so
+    // parsers of `\((\w+), ([0-9.]+)s\)` and the bracket tags are unaffected; omitted
+    // when no byte was ever sent.
+    const ttfbTag = r?.firstByteAt != null ? ` ttfb=${((r.firstByteAt - r.started) / 1000).toFixed(1)}s` : '';
+    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${provTag}${cvTag}${ttfbTag}`);
   }
 
   _addLog(msg) {
@@ -2431,12 +2442,13 @@ export class TUI {
     let resetsCell;
     {
       let n = 0;
+      let grantN = 0;
       if (a.enabled !== false) {
         const rc = a.resetCards;
         if (rc) n += (rc.fiveHour || []).filter(c => !c.expired).length
                  + (rc.weekly || []).filter(c => !c.expired).length;
         const rg = a.resetGrants;
-        if (rg?.eligible) n += (rg.grants || []).filter(g => g.usableNow && !g.expired).length;
+        if (rg?.eligible) { grantN = (rg.grants || []).filter(g => g.usableNow && !g.expired).length; n += grantN; }
       }
       // Expiry rides with the count when it's tight: "1~2d" = 1 reset, expires in ~2 days.
       // Claude grants end mid-Oct (weeks out) — a day-count would be noise; only the
@@ -2462,7 +2474,15 @@ export class TUI {
                             : '~' + Math.max(1, Math.round(days)) + 'd';
         }
       }
-      resetsCell = rpad(n > 0 ? green(String(n) + suffix) : gray('0'), RESETS_W);
+      // STALE (the last grant check failed; the count is the last good read): gray with a
+      // trailing '?'. The expiry suffix is dropped when '?' would overflow the fixed column.
+      const stale = n > 0 && grantN > 0 && a.resetGrants?.stale === true;
+      if (stale) {
+        const txt = String(n) + suffix;
+        resetsCell = rpad(gray(txt.length + 1 <= RESETS_W ? txt + '?' : String(n) + '?'), RESETS_W);
+      } else {
+        resetsCell = rpad(n > 0 ? green(String(n) + suffix) : gray('0'), RESETS_W);
+      }
     }
 
     if (a.type === 'provider') {

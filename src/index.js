@@ -1021,6 +1021,7 @@ async function serverWorkerCommand() {
       restartController.requestRouted(id, info.account);
       tui?.onRequestRouted(id, info);
     },
+    onRequestFirstByte: (id) => { tui?.onRequestFirstByte(id); },
     onRequestEnd: (id, info) => {
       restartController.requestEnded(id);
       if (tui) {

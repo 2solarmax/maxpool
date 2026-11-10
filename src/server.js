@@ -473,6 +473,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      markFirstByte(res, () => hooks.onRequestFirstByte?.(reqId));
+
       // The request is now TRACKED (onRequestStart accepted → tui.active +
       // restartController.activeRequests both hold it). EVERYTHING that can throw —
       // including body buffering — must run inside the try whose finally fires
@@ -4042,6 +4044,28 @@ function prepareRuntimeProviders(accountManager, headers) {
       model,
       stripBetaHeaders: true,
     });
+  }
+}
+
+/**
+ * Call `onFirst` once, the first time anything is flushed to the client (headers or
+ * body). This is the moment a waiting client first sees life: Claude Code reports
+ * "Waiting for API response" when nothing arrives for ~20s, so the request log carries
+ * time-to-first-byte separately from the total duration. Pure observer: the wrapped
+ * methods behave identically, and a throwing callback never affects the response.
+ */
+export function markFirstByte(res, onFirst) {
+  let fired = false;
+  const fire = () => { if (fired) return; fired = true; try { onFirst(); } catch { /* observer only */ } };
+  for (const m of ['write', 'end', 'flushHeaders']) {
+    const orig = res[m];
+    if (typeof orig !== 'function') continue;
+    res[m] = function (...args) {
+      // end() with no body and write('') send no bytes of their own, but end() still
+      // flushes the headers, so any call to these three means bytes are on the way.
+      fire();
+      return orig.apply(this, args);
+    };
   }
 }
 

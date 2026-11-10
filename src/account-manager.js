@@ -4138,16 +4138,26 @@ export class AccountManager {
    * the OAuth quota gates.
    */
   /** Store the latest Claude reset-grant listing (prober piggyback). */
-  applyResetGrants(accountIndex, listing) {
+  applyResetGrants(accountIndex, listing, now = Date.now()) {
     const account = this.accounts[accountIndex];
     if (!account || !listing) return;
-    if (listing.error) { account.resetGrants = null; return; }
+    if (listing.error) {
+      // A failed check must not erase the last good count (2026-11-10: "2~119d" went
+      // blank after one transient non-2xx, with no reset claimed). Keep the previous
+      // listing, mark it stale, and keep checkedAt = the last GOOD read. Never good
+      // before → stay null (nothing to show).
+      if (account.resetGrants) {
+        account.resetGrants = { ...account.resetGrants, stale: true, lastError: String(listing.error), lastErrorAt: now };
+      }
+      return;
+    }
     account.resetGrants = {
       grants: listing.grants || [],
       nextGrantId: listing.nextGrantId ?? null,
       cooldownUntil: listing.cooldownUntil ?? null,
       eligible: listing.eligible !== false,
-      checkedAt: Date.now(),
+      checkedAt: now,
+      stale: false,
     };
   }
 
@@ -5584,7 +5594,7 @@ export class AccountManager {
         // Reset cards / grants (display + cross-pool routing preference). Card ids,
         // counts and expiry only — no credentials; the redeem stays with the holder.
         resetCards: a.resetCards ? { fiveHour: a.resetCards.fiveHour, weekly: a.resetCards.weekly, checkedAt: a.resetCards.checkedAt } : null,
-        resetGrants: a.resetGrants ? { grants: a.resetGrants.grants, cooldownUntil: a.resetGrants.cooldownUntil, checkedAt: a.resetGrants.checkedAt } : null,
+        resetGrants: a.resetGrants ? { grants: a.resetGrants.grants, cooldownUntil: a.resetGrants.cooldownUntil, checkedAt: a.resetGrants.checkedAt, stale: Boolean(a.resetGrants.stale) } : null,
         // Capacity-page inputs for linked pools (a mirror has no credential and no
         // local cycles): this pool's plan price and measured tanks, per window.
         monthlyPriceUSD: a.remote ? null : this.monthlyPriceFor(a),
