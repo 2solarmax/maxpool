@@ -5659,6 +5659,13 @@ export class AccountManager {
       // when a leak's cards are most at risk — remediation rotates keys and
       // restarts the pool, and the in-memory flag would vanish mid-remediation.
       if (a.outsideUsage?.outside) out.outsideUsage = { ...a.outsideUsage };
+      // RESETS survive restart (2026-11-10, live during the 1.24.84 rollout:
+      // every local row blanked ~5-10 min after each seamless reload because the
+      // serialized grants sweep takes minutes to re-list all accounts). Persist a
+      // grants/cards SNAPSHOT so the post-reload screen shows the last known
+      // count instead of nothing; restoreQuotaState marks it stale.
+      if (a.resetGrants) out.resetGrants = { ...a.resetGrants, grants: (a.resetGrants.grants || []).map(g => ({ ...g })) };
+      if (a.resetCards) out.resetCards = { ...a.resetCards, fiveHour: (a.resetCards.fiveHour || []).map(c => ({ ...c })), weekly: (a.resetCards.weekly || []).map(c => ({ ...c })) };
       return out;
     });
   }
@@ -5693,6 +5700,18 @@ export class AccountManager {
       }
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
+      // RESTORED RESETS (2026-11-10): a pre-reload snapshot is a proof, not a
+      // live listing — restore it marked STALE so the screen shows the count
+      // with the not-fresh marker (never blank) and the first live listing
+      // (≤ GRANTS_EVERY_MS) overwrites it. Never claim off a restored listing:
+      // usability is re-derived by the next live check (C5 gates on usableNow
+      // from the LIVE response; a restored entry may be hours old).
+      if (match.resetGrants && !account.resetGrants) {
+        account.resetGrants = { ...match.resetGrants, stale: true };
+      }
+      if (match.resetCards && !account.resetCards) {
+        account.resetCards = { ...match.resetCards, stale: true };
+      }
       // OUTSIDE-USAGE restored: keep holding R7 and force the next sweep to
       // re-verify immediately (fresh poolHourly can only re-prove the leak).
       if (match.outsideUsage?.outside) {

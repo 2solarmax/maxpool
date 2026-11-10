@@ -129,8 +129,7 @@ test('TUI: fresh count renders "2~119d" (no ?), stale renders a trailing "?"', (
   assert.match(rstCell(am), /2~119d(?!\?)/);
   am.applyResetGrants(0, { error: 'HTTP 503' });
   const line = rstCell(am);
-  assert.match(line, /2\?/, 'stale count still shown, marked');
-  assert.doesNotMatch(line, /2~119d/, 'long expiry suffix is trimmed to keep the column width');
+  assert.match(line, /2~119d\?/, 'stale count keeps suffix + ? at width 8');
 });
 
 test('TUI: stale with a short suffix keeps the suffix and appends "?"', () => {
@@ -148,7 +147,7 @@ test('TUI: stale marker uses gray, fresh uses green', () => {
   am.applyResetGrants(0, { error: 'HTTP 503' });
   const stale = tui._renderAcct(0, 11, true);
   assert.ok(/\x1b\[[0-9;]*m2~119d/.test(fresh));
-  assert.ok(!/2\?/.test(fresh) && /2\?/.test(strip(stale)));
+  assert.ok(!/2~119d\?/.test(strip(fresh)) && /2~119d\?/.test(strip(stale)));
   assert.notEqual(fresh, stale);
 });
 
@@ -357,4 +356,40 @@ test('an upstream that never answers stamps no upstream ttfb (a failed fetch is 
     assert.equal(ends.at(-1).firstUpstreamByteAt, null, 'no upstream-byte stamp on a failed fetch');
     assert.equal(ends.at(-1).upstreamForwardStartAt, null, 'and no forward-start pair either');
   } finally { console.log = orig; proxy.closeAllConnections?.(); proxy.close(); }
+});
+
+// ── Restart persistence (2026-11-10, live during the 1.24.84 rollout: local rows
+// blanked 17:18–17:22Z because the serialized grants sweep takes minutes to re-list
+// all accounts after every seamless reload). A grants snapshot rides the quota state
+// file; restore marks it STALE (count shown, never claimed off a restored listing).
+test('resetGrants snapshot survives export → restore across a restart (marked stale)', () => {
+  const am = am1();
+  am.applyResetGrants(0, GOOD(), 1000);
+  const saved = am.exportQuotaState();
+  assert.equal(saved[0].resetGrants.grants.length, 2, 'snapshot carries the grants');
+
+  const am2 = new AccountManager([{ name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
+  am2.restoreQuotaState(saved);
+  const rg = am2.accounts[0].resetGrants;
+  assert.ok(rg, 'restored account has grants');
+  assert.equal(rg.grants.length, 2, 'count survives the restart');
+  assert.equal(rg.stale, true, 'restored listing is STALE — proof, not a live read');
+});
+
+test('restore never overwrites a live listing the new process already made', () => {
+  const am = am1();
+  am.applyResetGrants(0, GOOD(), 1000);
+  const saved = am.exportQuotaState();
+
+  const am2 = new AccountManager([{ name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
+  am2.applyResetGrants(0, GOOD(), 5000);          // live listing BEFORE restore
+  am2.restoreQuotaState(saved);
+  assert.equal(am2.accounts[0].resetGrants.checkedAt, 5000, 'live listing wins over the restored snapshot');
+  assert.notEqual(am2.accounts[0].resetGrants.stale, true);
+});
+
+test('no grants → no resetGrants key in the snapshot (null stays null)', () => {
+  const am = am1();
+  const saved = am.exportQuotaState();
+  assert.equal(saved[0].resetGrants, undefined, 'never-good account persists no grants');
 });

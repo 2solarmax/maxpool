@@ -472,9 +472,9 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   assert.equal(narrow.indexOf('Account'), 4);
   assert.equal(narrow.indexOf('Status'), 41);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  // +7 for the fixed-width Rst column (Status 13 + 'Rst' 6 + space) before Quota —
-  // width 6 fits '2~21d' so a suffixed row never pushes its quota bars right.
-  assert.equal(narrow.indexOf('Quota'), 62);
+  // +9 for the fixed-width Rst column (Status 13 + 'Rst' 8 + space) before Quota —
+  // width 8 fits '2Fable' so a model-named row never pushes its quota bars right.
+  assert.equal(narrow.indexOf('Quota'), 64);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
@@ -792,7 +792,7 @@ test('Rst column appends ~Nh under 24h; no suffix when expiry is far', () => {
 
 // ── B3 grammar (2026-11-10): scope tags, resetsLeft sum, live expiry, freshness ─
 // TEST PLAN 2: {1,2,10 resets} x {general, scoped, mixed, unknown} x {fresh, stale} x {6d, 119d}.
-const GRANT_SCOPE_W = 6;   // RESETS_W — must stay 6 or the columns shift
+const GRANT_SCOPE_W = 8;   // RESETS_W — must stay 8 or the columns shift
 function rstCellOf(tui, idx) {
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(idx, 11, true));
@@ -816,7 +816,7 @@ test('B3: general grant renders n~Xd with resetsLeft summed, width exactly 6', (
   assert.match(rstCellOf(tui, 0), /^2~119d\s*$/, 'two single-use grants → 2~119d');
   assert.match(rstCellOf(tui, 1), /^2~119d\s*$/, 'ONE multi-use grant (resetsLeft 2) counts 2, not 1');
   const overflow = rstCellOf(tui, 2).trim();
-  assert.equal(overflow, '10', 'overflow drops the suffix first: 10~119d (7 wide) renders 10');
+  assert.equal(overflow, '10~119d'.slice(0,8).trim(), '10 grants keep the compact form at width 8');
   assert.equal(strip(tui._renderAcct(0, 11, true)).length > 0, true);
 });
 
@@ -829,10 +829,10 @@ test('B3: scoped grant renders nF~Xd; mixed renders g+sF', () => {
   ] };
   am.accounts[2].resetGrants = grantRow({ n: 3, clears: ['seven_day_overage_included'], resetsLeft: 1, endsIn: 119 * DAY });
   const tui = new TUI({ accountManager: am });
-  assert.match(rstCellOf(tui, 0), /^2F~4d\s*$/, 'Fable grants tagged F');
-  assert.match(rstCellOf(tui, 1), /^1\+2F\s*$/, 'mixed general+scoped renders g+sF');
+  assert.match(rstCellOf(tui, 0), /^2Fable\s*$/, 'Fable grants tagged by model name (2Fable~4d is 10 wide → drops suffix)');
+  assert.match(rstCellOf(tui, 1), /^1\+2Fable\s*$/, 'mixed general+scoped spells the model');
   // 3F~119d is 7 wide → drop the suffix first: 3F
-  assert.match(rstCellOf(tui, 2), /^3F\s*$/, 'overflow drops the suffix first');
+  assert.match(rstCellOf(tui, 2), /^3Fable\s*$/, '3Fable fits width 8 exactly');
 });
 
 // B3.1 (owner 2026-11-10 "distinguish model-specific vs general"): a grant that is
@@ -848,8 +848,8 @@ test('B3.1: scoped+gives-back grant displays as F, not general', () => {
   ] };
   am.accounts[2].resetGrants = grantRow({ n: 1, givesBack: true });   // general + give-back: stays general
   const tui = new TUI({ accountManager: am });
-  assert.match(rstCellOf(tui, 0), /^2F\s*$/, 'scoped+giveback grants tagged F (2F~119d is 7 wide → 2F)');
-  assert.match(rstCellOf(tui, 1), /^1\+1F\s*$/, 'one true general + one scoped+giveback renders 1+1F');
+  assert.match(rstCellOf(tui, 0), /^2Fable\s*$/, 'scoped+giveback grants spell the model (2Fable)');
+  assert.match(rstCellOf(tui, 1), /^1\+1Fable\s*$/, 'one true general + one scoped+giveback spells the model');
   assert.match(rstCellOf(tui, 2), /^1~119d\s*$/, 'general grant with give-back stays general (no F)');
 });
 
@@ -898,9 +898,9 @@ test('B3 TEST 4: refreshDead/subscriptionGone renders gray-with-? even when the 
   am.accounts[2].resetGrants = grantRow({ n: 1, endsIn: 119 * DAY });
   am.accounts[2].subscriptionGone = true;
   const tui = new TUI({ accountManager: am });
-  assert.match(rstCellOf(tui, 0), /1\?/, 'old checkedAt → not fresh');
-  assert.match(rstCellOf(tui, 1), /1\?/, 'refreshDead → not fresh');
-  assert.match(rstCellOf(tui, 2), /1\?/, 'subscriptionGone → not fresh');
+  assert.match(rstCellOf(tui, 0), /1~119d\?/, 'old checkedAt → not fresh (suffix fits width 8)');
+  assert.match(rstCellOf(tui, 1), /1~119d\?/, 'refreshDead → not fresh');
+  assert.match(rstCellOf(tui, 2), /1~119d\?/, 'subscriptionGone → not fresh');
   const freshAm = oauthAM(1);
   freshAm.accounts[0].resetGrants = grantRow({ n: 1, endsIn: 119 * DAY });
   const freshTui = new TUI({ accountManager: freshAm });

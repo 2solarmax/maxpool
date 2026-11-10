@@ -40,7 +40,7 @@ const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a 
 const WHERE_W = 5;         // 'Local' / 'Cloud' — where the account is provisioned
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
-const RESETS_W = 6;        // 'Rst' column — FIXED width (fits '2~21d'); a variable
+const RESETS_W = 8;        // 'Rst' column — FIXED width (fits '2Fable' / '1~119d'); a variable
                            // width ('0' vs '1~21d') shifted every quota bar per row.
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
 
@@ -2545,8 +2545,15 @@ export class TUI {
       }
 
       // Fit to EXACTLY RESETS_W: full form, then drop the suffix, then total+'*'.
-      let text = core + suffix;
-      if (text.length > RESETS_W) text = core;
+      // OWNER READABILITY (2026-11-10: "What does the letter F mean? I have no
+      // idea"): a bare F is undecodable shorthand — the 2026-08-27 no-glossary
+      // rule says the cell says what it means in words. Model-scoped resets spell
+      // the model: '2Fable' / '1Opus'. RESETS_W grows to fit '99Fable' (8) so the
+      // word is never truncated into a mystery tag again; plain counts keep the
+      // compact n~Xd form.
+      const coreFable = core.replace(/F\b/, 'Fable');
+      let text = coreFable + suffix;
+      if (text.length > RESETS_W) text = coreFable;
       if (text.length > RESETS_W) text = `${total}*`.slice(0, RESETS_W);
       if (notFresh) text = (text + '?').length <= RESETS_W ? text + '?' : `${total}?`.slice(0, RESETS_W);
       resetsCell = rpad(total > 0 && !notFresh ? green(text) : gray(text), RESETS_W);

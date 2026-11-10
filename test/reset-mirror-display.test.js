@@ -76,7 +76,7 @@ test('SC2: overlay keeps the twin resets when one link status omits them (marked
   mac.poolLinks = [linkStale];
   const tui2 = new TUI({ accountManager: mac });
   const frame2 = strip(tui2._renderAcct(0, 11, true));
-  assert.match(frame2, /1\?/, 'frame 2 KEEPS the count with ? — never 0');
+  assert.match(frame2, /1~119d\?/, 'frame 2 KEEPS the count with ? — never 0');
   assert.doesNotMatch(frame2, / 0 /, 'never drops to 0');
 });
 
