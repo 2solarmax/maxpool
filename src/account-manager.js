@@ -5924,7 +5924,17 @@ export class AccountManager {
     // Model-scoped: the probe must have MEASURED that family's bucket at the wall.
     const e = account.quota?.scopedWeekly?.[kind];
     const measured = e && e.reactive !== true && e.utilization != null && e.utilization >= CLAUDE_WALL_WEEKLY;
-    return measured ? (grants.find(g => appliesTo(g).includes(kind)) || null) : null;
+    if (!measured) return null;
+    // NARROWEST FIRST (2026-11-11, owner report): a grant that directly CLEARS the
+    // general weekly (full-reset shape: clears includes 'seven_day') is the
+    // account's most powerful card — never spend it at a model-only wall while a
+    // model-only grant remains. gives_back_weekly does NOT make a grant broad
+    // (the give-back is a side effect of the model reset, not a weekly refill —
+    // the client's own rule treats it as an OR). Within one breadth, the
+    // soonest-expiry sort above still wins so nothing rots.
+    const clearsWeekly = g => (Array.isArray(g.clears) ? g.clears : []).includes('seven_day');
+    const narrow = grants.find(g => !clearsWeekly(g) && appliesTo(g).includes(kind));
+    return narrow || grants.find(g => appliesTo(g).includes(kind)) || null;
   }
 
   /** A claim SUCCEEDED: spend it in the stored listing at once (finding 1). Until

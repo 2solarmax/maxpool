@@ -848,8 +848,10 @@ test('B3.1: scoped+gives-back grant displays as F, not general', () => {
   ] };
   am.accounts[2].resetGrants = grantRow({ n: 1, givesBack: true });   // general + give-back: stays general
   const tui = new TUI({ accountManager: am });
-  assert.match(rstCellOf(tui, 0), /^2Fable\s*$/, 'scoped+giveback grants spell the model (2Fable)');
-  assert.match(rstCellOf(tui, 1), /^1\+1Fable\s*$/, 'one true general + one scoped+giveback spells the model');
+  // Identity counting (2026-11-11): give-back adds no display count — 2 scoped+
+  // giveback grants are 2 Fable resets, matching Anthropic's own screen.
+  assert.match(rstCellOf(tui, 0), /^2Fable\s*$/, 'scoped+giveback grants stay 2Fable (give-back adds no count)');
+  assert.match(rstCellOf(tui, 1), /^1\+1Fable\s*$/, 'one true general + one scoped+giveback = 1+1Fable');
   assert.match(rstCellOf(tui, 2), /^1~119d\s*$/, 'general grant with give-back stays general (no F)');
 });
 
@@ -932,4 +934,25 @@ test('B3: every grammar form renders at width exactly 6 (vw assertion)', () => {
     return cell.trimEnd().length <= GRANT_SCOPE_W ? GRANT_SCOPE_W : cell.length;
   }
   function rawIndex(raw, visIdx) { return visIdx; }
+});
+
+// ---------------------------------------------------------------------------
+// RED (2026-11-11, owner report): max@gomokka.com holds a FULL reset (clears
+// ['seven_day','seven_day_overage_included']) + two Fable-only grants. The
+// screen said "3Fable" — hiding the general half of the full reset. A grant
+// that refills BOTH must count in BOTH buckets: 1+2Fable (g+sFable grammar).
+// ---------------------------------------------------------------------------
+test('B3.2: a full reset (weekly+model clears) counts in BOTH buckets — 1+2Fable', () => {
+  const am = oauthAM(1);
+  am.accounts[0].resetGrants = { eligible: true, checkedAt: Date.now(), stale: false, grants: [
+    { id: 'full-reset', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 29 * DAY, clears: ['seven_day', 'seven_day_overage_included'], givesBackWeekly: false },
+    { id: 'fable-a', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 120 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
+    { id: 'fable-b', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 120 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
+  ] };
+  const tui = new TUI({ accountManager: am });
+  // The owner's literal account (2026-11-11): full reset (clears weekly+fable) +
+  // 2 fable-only give-back grants = "two fable and one regular weekly" on
+  // Anthropic's screen. Identity counting renders 1+2Fable — grant-for-grant
+  // equal to what the owner sees there.
+  assert.match(rstCellOf(tui, 0), /1\+2Fable/, 'full reset = 1 general; 2 fable-only = 1+2Fable (owner math)');
 });

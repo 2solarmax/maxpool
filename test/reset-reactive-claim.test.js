@@ -396,3 +396,34 @@ test('SC8 (judge #10): removeAccount forgets the claim state; a 403/404 claim dr
   await claimResetGrant('t', 'g1', { accountKey: k, fetchImpl: profileClaimFetch(log2) });
   assert.equal(profiles(log2), 2, 'a 404 claim dropped the cached org');
 });
+
+// ---------------------------------------------------------------------------
+// RED (2026-11-11, owner report): a grant that clears BOTH the general weekly
+// AND a model bucket (full-reset-2611 shape: clears ['seven_day',
+// 'seven_day_overage_included']) is the MOST POWERFUL reset an account holds.
+// Spending it at a Fable-only wall burns the general-weekly refill for nothing.
+// Pick order at a scoped wall must be: narrowest grant first; the broad one is
+// reserved for the weekly wall. (Mirror: at the weekly wall only general-
+// refilling grants qualify, unchanged.)
+// ---------------------------------------------------------------------------
+{
+  const DAY = 86400_000;
+  const now = Date.now();
+  const acct = {
+    name: 'max@gomokka.com', type: 'oauth', credential: 'tok',
+    resetGrants: {
+      eligible: true, checkedAt: now, stale: false, grants: [
+        // Full reset: clears weekly + Fable; expires SOONEST (Dec 10) — the sort
+        // that currently wins and must NOT at a fable wall.
+        { id: 'full-reset-2611', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: now - DAY, endsAt: now + 29 * DAY, clears: ['seven_day', 'seven_day_overage_included'], givesBackWeekly: false },
+        // Fable-only launch grant.
+        { id: 'launch-2610-fable', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: now - 2 * DAY, endsAt: now + 120 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
+      ],
+    },
+    quota: { scopedWeekly: { fable: { utilization: 1.0, resetAt: now + 5 * DAY, reactive: false } } },
+  };
+  const am = new AccountManager([acct], 0.9);
+  const pick = am._reactiveClaimGrant(acct, 'fable', now);
+  assert.equal(pick?.id, 'launch-2610-fable',
+    'at a fable wall the NARROW fable-only grant is claimed, not the full reset');
+}

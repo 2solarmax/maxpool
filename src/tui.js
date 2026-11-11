@@ -2502,18 +2502,23 @@ export class TUI {
           for (const g of (rg.grants || [])) {
             if (!g || g.usableNow === false || g.paused || g.expired) continue;
             if (g.endsAt != null && g.endsAt <= now) continue;            // live expiry
-            // The ONE shared scope answer (A1) — display reads the same
-            // classification as claim and lift. DISPLAY nuance (owner 2026-11-10
-            // "distinguish model-specific vs general"): a grant that refills a
-            // MODEL limit (scoped) shows under its model tag even when it ALSO
-            // gives back to the weekly — the give-back is a side effect, not the
-            // grant's identity. Only an unscoped general refiller counts general.
+            // Display counts GRANTS by identity, not capabilities (owner
+            // 2026-11-11: the screen showed "3Fable" while Anthropic's own screen
+            // says "two fable and one regular weekly"). A grant that directly
+            // clears the general weekly (full-reset shape: clears includes
+            // 'seven_day') IS a weekly reset however much else it also clears —
+            // count it general, once. Model-only grants count scoped; the
+            // give-back side effect adds no display count (B3.1 nuance, 2026-11-10).
+            // Claim and lift still read appliesTo() — the full reset stays eligible
+            // at a model wall, and narrow-first spending (2026-11-11) keeps it for
+            // the weekly wall.
             const scopes = appliesTo(g);
+            const clearsWeekly = (Array.isArray(g.clears) ? g.clears : []).includes('seven_day');
             const hasScoped = scopes.some(x => x !== 'general' && x !== 'session');
-            const hasGeneral = scopes.includes('general');
             const left = Math.max(0, Math.floor(g.resetsLeft ?? 1));
-            if (hasScoped) scoped += left;
-            else if (hasGeneral) general += left;
+            if (clearsWeekly) general += left;
+            else if (hasScoped) scoped += left;
+            else if (scopes.includes('general')) general += left;
             else unknown += left;
             if (g.endsAt != null && g.endsAt < soonest) soonest = g.endsAt;
           }
