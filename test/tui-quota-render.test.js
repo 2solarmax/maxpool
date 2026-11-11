@@ -954,3 +954,17 @@ test('B3.2: a full reset (weekly+model clears) counts in BOTH buckets — 1+2Fab
   // equal to what the owner sees there.
   assert.match(rstCellOf(tui, 0), /1\+2Fable/, 'full reset = 1 general; 2 fable-only = 1+2Fable (owner math)');
 });
+
+// RED (2026-11-11, live after the 1.24.86 self-update): a stale mixed cell
+// collapsed '1+2Fable' → '3?' (the '?' did not fit), so the count flipped on
+// every restart. Stale keeps the breakdown; gray carries the staleness.
+test('B3.3: a stale mixed cell keeps its breakdown (no collapse to total?)', () => {
+  const am = oauthAM(1);
+  am.accounts[0].resetGrants = { eligible: true, checkedAt: Date.now(), stale: true, grants: [
+    { id: 'full-reset', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 29 * DAY, clears: ['seven_day', 'seven_day_overage_included'], givesBackWeekly: false },
+    { id: 'fable-a', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 120 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
+    { id: 'fable-b', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 120 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
+  ] };
+  const tui = new TUI({ accountManager: am });
+  assert.match(rstCellOf(tui, 0), /^1\+2Fable\s*$/, 'stale mixed cell stays 1+2Fable (gray), never 3?');
+});

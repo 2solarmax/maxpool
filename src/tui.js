@@ -2560,7 +2560,11 @@ export class TUI {
       let text = coreFable + suffix;
       if (text.length > RESETS_W) text = coreFable;
       if (text.length > RESETS_W) text = `${total}*`.slice(0, RESETS_W);
-      if (notFresh) text = (text + '?').length <= RESETS_W ? text + '?' : `${total}?`.slice(0, RESETS_W);
+      // Not-fresh: append '?' only when it fits. When it does not ('1+2Fable' is
+      // already 8), keep the breakdown and let the gray colour carry staleness —
+      // collapsing to '3?' made the cell flip 1+2Fable → 3? → 1+2Fable across every
+      // self-update (owner 2026-11-10: "the number of resets keeps changing").
+      if (notFresh && (text + '?').length <= RESETS_W) text += '?';
       resetsCell = rpad(total > 0 && !notFresh ? green(text) : gray(text), RESETS_W);
     }
 
