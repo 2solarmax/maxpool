@@ -1879,6 +1879,17 @@ export class AccountManager {
     return !sourceDying;
   }
 
+  /** C3: a listing failure holds an active lift LIFT_GRACE_MS from the FIRST failure
+   *  of the streak — measured from the last good read, a failure late in the 5-min
+   *  cycle left ~3 min of hold (live 2026-11-11). A good listing rewrites capLift,
+   *  which ends the streak. */
+  _holdLiftThroughFailure(account, now = Date.now()) {
+    const st = account.capLift;
+    if (!st?.active || st.failingSince != null) return;
+    st.failingSince = now;
+    st.graceUntil = Math.max(st.graceUntil ?? 0, now + LIFT_GRACE_MS);
+  }
+
   /** True while the account's usage cap is suspended by a held full-refill reset. */
   capLiftActive(account, now = Date.now()) {
     if (!account || account.enabled === false) return false;
@@ -4420,6 +4431,7 @@ export class AccountManager {
       if (account.resetGrants) {
         account.resetGrants = { ...account.resetGrants, stale: true, lastError: String(listing.error), lastErrorAt: now };
       }
+      this._holdLiftThroughFailure(account, now);
       return;
     }
     account.resetGrants = {
@@ -4478,6 +4490,7 @@ export class AccountManager {
       if (account.resetCards) {
         account.resetCards = { ...account.resetCards, stale: true, lastError: String(cards.error), lastErrorAt: Date.now() };
       }
+      this._holdLiftThroughFailure(account);
       return;
     }
     // DRIFT = a 200 the parser can't have meant (pre-mortem #17): expected arrays
@@ -4490,6 +4503,7 @@ export class AccountManager {
       if (account.resetCards) {
         account.resetCards = { ...account.resetCards, stale: true, lastError: 'listing drift (unexpected payload shape)', lastErrorAt: Date.now() };
       }
+      this._holdLiftThroughFailure(account);
       return;
     }
     account.resetCards = {

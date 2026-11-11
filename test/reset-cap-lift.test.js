@@ -353,3 +353,23 @@ test('SC10 (judge #3): at refill-18h a lift never STARTS — no lift log, and th
   assert.notEqual(a.capLift?.active, true, 'no lift state was stored');
   assert.equal(am.getStatus().accounts[0].capLift.active, false, 'mirrors are told: no lift');
 });
+
+// RED (live 2026-11-11, mk@dubner.io 21:36→21:39 and privacy 22:59→23:02): the grace
+// ran from the LAST GOOD listing, so a 429 arriving 7 min into a 5-min listing cycle
+// left only ~3 min of hold and the lift dropped mid-climb. The 10-min hold through
+// failures starts at the FIRST failure.
+test('C3: the 10-min hold through listing failures starts at the first failure, not the last good listing', () => {
+  const am = cappedAm({ cap: null });
+  const a = am.accounts[0];
+  a.capUtilization = null;
+  setUsage(a, { wk: 0.97 });
+  const t0 = Date.now();
+  am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true }, t0);
+  assert.equal(am.capLiftActive(a, t0), true);
+  const failAt = t0 + 7 * 60_000;                    // listing 429s 7 min after the last good read
+  am.applyResetGrants(0, { error: 'HTTP 429' }, failAt);
+  am.applyResetGrants(0, { error: 'HTTP 429' }, failAt + 60_000);   // a retry also fails: streak, not a re-arm
+  assert.equal(am.capLiftActive(a, failAt + 4 * 60_000), true, '4 min into the failures: still held');
+  assert.equal(am.capLiftActive(a, failAt + 9 * 60_000), true, '9 min into the failures: still held');
+  assert.equal(am.capLiftActive(a, failAt + 11 * 60_000), false, 'after 10 min of failures: ends');
+});
