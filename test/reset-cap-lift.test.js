@@ -236,18 +236,38 @@ test('SC8: refreshDead / poolBenchedBy / disabled accounts never start the lift'
 });
 
 // ── an uncapped account holding a grant does not "lift" (nothing to lift) ─────
-test('an uncapped account with a grant stays ordinary (no lift state, no log)', () => {
+// RED (owner 2026-11-11, live): uncapped cloud accounts at 0.92-0.98 weekly, each
+// holding a full weekly reset, sat in the last-resort tier and never reached the
+// 0.99 claim point while GLM took the load. The D2 rule ("use them up to 100%, then
+// the reset") applies to EVERY account holding a full reset, capped or not.
+test('D2: an UNCAPPED account at 0.97 holding a full weekly reset is routable normal, not last-resort', () => {
   const am = cappedAm({ cap: 0.75 });
   const b = am.accounts[1];
-  b.capUtilization = null;   // uncapped
-  setUsage(b, { wk: 0.5 });
-  const logs = [];
-  const realLog = console.log;
-  console.log = m => logs.push(m);
-  try { am.applyResetGrants(1, { grants: [GEN_GRANT()], eligible: true }); }
-  finally { console.log = realLog; }
-  assert.equal(am.capLiftActive(b), false);
-  assert.equal(logs.filter(l => /cap lifted/.test(l)).length, 0, 'no lift log for an uncapped account');
+  b.capUtilization = null;   // uncapped (every cloud account today)
+  setUsage(b, { wk: 0.97 });
+  assert.equal(am._weeklyRawState(b), 'critical', 'control: without a reset, 0.97 is last-resort');
+  am.applyResetGrants(1, { grants: [GEN_GRANT()], eligible: true });
+  assert.equal(am.capLiftActive(b), true, 'the full reset lifts an uncapped account too');
+  assert.equal(am._weeklyRawState(b), 'normal', 'runs to its weekly limit so the reset gets spent there');
+  // A Fable-only reset never lifts — it refills only Fable, not the general week.
+  const am2 = cappedAm({ cap: 0.75 }); const d = am2.accounts[1]; d.capUtilization = null;
+  setUsage(d, { wk: 0.97 });
+  am2.applyResetGrants(1, { grants: [FABLE_GRANT()], eligible: true });
+  assert.equal(am2._weeklyRawState(d), 'critical', 'Fable-only reset: unchanged');
+});
+
+test('D2: an uncapped give-back lift is bounded by last-resort line + measured drop, never the full wall', () => {
+  const am = cappedAm({ cap: 0.75 });
+  const b = am.accounts[1];
+  b.capUtilization = null;
+  setUsage(b, { wk: 0.97 });
+  b.giveBack = { drop: 0.03, at: Date.now() };
+  am.applyResetGrants(1, { grants: [GIVEBACK_GRANT()], eligible: true });
+  assert.equal(am.capLiftActive(b), true);
+  assert.equal(am._capLiftCeiling(b, 'wk'), am.scheduler.weeklyCriticalThreshold + 0.03);
+  assert.equal(am._weeklyRawState(b), 'normal', '0.97 < 0.95 + 0.03');
+  setUsage(b, { wk: 0.985 });
+  assert.notEqual(am._weeklyRawState(b), 'normal', 'above the measured ceiling the ordinary tiers apply');
 });
 
 // ── judge #3 (D4): no lift inside 24h of the free weekly refill ───────────────

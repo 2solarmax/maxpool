@@ -40,7 +40,7 @@ const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a 
 const WHERE_W = 5;         // 'Local' / 'Cloud' — where the account is provisioned
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
-const RESETS_W = 8;        // 'Rst' column — FIXED width (fits '2Fable' / '1~119d'); a variable
+const RESETS_W = 13;       // 'Rst' column — FIXED width (fits '1+3Fable~118d': count AND expiry, owner 2026-11-11); a variable
                            // width ('0' vs '1~21d') shifted every quota bar per row.
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
 

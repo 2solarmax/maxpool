@@ -472,9 +472,9 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   assert.equal(narrow.indexOf('Account'), 4);
   assert.equal(narrow.indexOf('Status'), 41);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  // +9 for the fixed-width Rst column (Status 13 + 'Rst' 8 + space) before Quota —
-  // width 8 fits '2Fable' so a model-named row never pushes its quota bars right.
-  assert.equal(narrow.indexOf('Quota'), 64);
+  // Fixed-width Rst column (13 + space) before Quota — width 13 fits '1+3Fable~118d'
+  // so a row with resets never pushes its quota bars right.
+  assert.equal(narrow.indexOf('Quota'), 69);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
@@ -792,7 +792,7 @@ test('Rst column appends ~Nh under 24h; no suffix when expiry is far', () => {
 
 // ── B3 grammar (2026-11-10): scope tags, resetsLeft sum, live expiry, freshness ─
 // TEST PLAN 2: {1,2,10 resets} x {general, scoped, mixed, unknown} x {fresh, stale} x {6d, 119d}.
-const GRANT_SCOPE_W = 8;   // RESETS_W — must stay 8 or the columns shift
+const GRANT_SCOPE_W = 13;  // RESETS_W — count AND expiry always fit (owner 2026-11-11)
 function rstCellOf(tui, idx) {
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(idx, 11, true));
@@ -829,10 +829,9 @@ test('B3: scoped grant renders nF~Xd; mixed renders g+sF', () => {
   ] };
   am.accounts[2].resetGrants = grantRow({ n: 3, clears: ['seven_day_overage_included'], resetsLeft: 1, endsIn: 119 * DAY });
   const tui = new TUI({ accountManager: am });
-  assert.match(rstCellOf(tui, 0), /^2Fable\s*$/, 'Fable grants tagged by model name (2Fable~4d is 10 wide → drops suffix)');
-  assert.match(rstCellOf(tui, 1), /^1\+2Fable\s*$/, 'mixed general+scoped spells the model');
-  // 3F~119d is 7 wide → drop the suffix first: 3F
-  assert.match(rstCellOf(tui, 2), /^3Fable\s*$/, '3Fable fits width 8 exactly');
+  assert.match(rstCellOf(tui, 0), /^2Fable~\d+d\s*$/, 'Fable grants tagged by model name, expiry kept');
+  assert.match(rstCellOf(tui, 1), /^1\+2Fable~\d+d\s*$/, 'mixed general+scoped spells the model, expiry kept');
+  assert.match(rstCellOf(tui, 2), /^3Fable~119d\s*$/, 'count and expiry both shown');
 });
 
 // B3.1 (owner 2026-11-10 "distinguish model-specific vs general"): a grant that is
@@ -850,8 +849,8 @@ test('B3.1: scoped+gives-back grant displays as F, not general', () => {
   const tui = new TUI({ accountManager: am });
   // Identity counting (2026-11-11): give-back adds no display count — 2 scoped+
   // giveback grants are 2 Fable resets, matching Anthropic's own screen.
-  assert.match(rstCellOf(tui, 0), /^2Fable\s*$/, 'scoped+giveback grants stay 2Fable (give-back adds no count)');
-  assert.match(rstCellOf(tui, 1), /^1\+1Fable\s*$/, 'one true general + one scoped+giveback = 1+1Fable');
+  assert.match(rstCellOf(tui, 0), /^2Fable~\d+d\s*$/, 'scoped+giveback grants stay 2Fable (give-back adds no count)');
+  assert.match(rstCellOf(tui, 1), /^1\+1Fable~\d+d\s*$/, 'one true general + one scoped+giveback = 1+1Fable');
   assert.match(rstCellOf(tui, 2), /^1~119d\s*$/, 'general grant with give-back stays general (no F)');
 });
 
@@ -966,5 +965,16 @@ test('B3.3: a stale mixed cell keeps its breakdown (no collapse to total?)', () 
     { id: 'fable-b', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 120 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
   ] };
   const tui = new TUI({ accountManager: am });
-  assert.match(rstCellOf(tui, 0), /^1\+2Fable\s*$/, 'stale mixed cell stays 1+2Fable (gray), never 3?');
+  assert.match(rstCellOf(tui, 0), /^1\+2Fable~\d+d\?\s*$/, 'stale mixed cell keeps breakdown + expiry, marked ?; never 3?');
+});
+
+// RED (owner 2026-11-11): "No date of expiration is shown in the reset column when
+// there is multiple" — '1+2Fable' filled the 8-wide column, so the expiry was dropped.
+test('B3.4: a mixed cell shows the count AND the expiry date', () => {
+  const am = oauthAM(1);
+  am.accounts[0].resetGrants = { eligible: true, checkedAt: Date.now(), stale: false, grants: [
+    { id: 'full-reset', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 29 * DAY + 3600_000, clears: ['seven_day', 'seven_day_overage_included'], givesBackWeekly: false },
+    { id: 'fable-a', resetsLeft: 2, resetsTotal: 2, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 118 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
+  ] };
+  assert.match(rstCellOf(new TUI({ accountManager: am }), 0), /^1\+2Fable~29d\s*$/);
 });

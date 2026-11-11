@@ -1915,7 +1915,9 @@ export class AccountManager {
     const st = account.capLift;
     if (!st) return null;
     if (st.mode !== 'giveback') return null;   // full lift
-    const cap = Number(account.capUtilization) || 0;
+    // Uncapped: the line it would otherwise stop at is the last-resort tier.
+    const cap = account.capUtilization != null ? Number(account.capUtilization) || 0
+      : this.scheduler.weeklyCriticalThreshold;
     if (account.remote) return Number.isFinite(st.ceiling) ? st.ceiling : cap;
     const drop = Number(account.giveBack?.drop);
     return Number.isFinite(drop) && drop > 0 ? Math.min(1, cap + drop) : cap;
@@ -1933,10 +1935,10 @@ export class AccountManager {
     let active = false;
     let mode = null;
     let sources = [];      // the resets that carry the lift (their expiry decides the refill hold)
-    // No cap configured → nothing to lift (starting a lift on an uncapped account
-    // would remap its ordinary weekly tiers and log noise for no benefit).
-    const capFloor = account.capUtilization;
-    if (capFloor != null && account.enabled !== false && !account.poolBenchedBy && !account.refreshDead && !account.subscriptionGone) {
+    // Capped OR uncapped (owner 2026-11-11): an uncapped account above 0.95 weekly
+    // tiers last-resort and never reaches the 0.99 claim point, so its full reset
+    // sat unspent while GLM took the load. The lift applies to every holder.
+    if (account.enabled !== false && !account.poolBenchedBy && !account.refreshDead && !account.subscriptionGone) {
       const rg = account.resetGrants;
       const cards = account.resetCards;
       const listingOk = rg && rg.stale !== true && rg.eligible !== false
