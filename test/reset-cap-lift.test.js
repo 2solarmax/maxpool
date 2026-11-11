@@ -10,7 +10,6 @@ import { Prober } from '../src/prober.js';
 
 const DAY = 86400_000;
 const H = 3600_000;
-const now = () => Date.now();
 
 // The prober's claim goes through claimResetGrant → fetch: stub it (never the network).
 function stubClaimFetch({ ok = true } = {}) {

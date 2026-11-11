@@ -927,13 +927,11 @@ test('B3: every grammar form renders at width exactly 6 (vw assertion)', () => {
   function vwOf(t, i) {
     const raw = t._renderAcct(i, 11, true);
     const hdr = strip(__tuiTest.acctHeader(100));
-    const idx = rawIndex(raw, hdr.indexOf('Rst'));
     // visible width from the cell start to the next column boundary is asserted by
     // the header alignment: extract via strip+slice as everywhere else.
     const cell = strip(raw).slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + GRANT_SCOPE_W);
     return cell.trimEnd().length <= GRANT_SCOPE_W ? GRANT_SCOPE_W : cell.length;
   }
-  function rawIndex(raw, visIdx) { return visIdx; }
 });
 
 // ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ const FABLE = (n = 2) => ({ grants: Array.from({ length: n }, (_, i) => ({ id: `
 // the default impl when no fetchImpl is passed).
 function stubClaim({ ok = true, calls = [] } = {}) {
   const realFetch = globalThis.fetch;
-  globalThis.fetch = async (url, opts) => {
+  globalThis.fetch = async (url, _opts) => {
     calls.push(String(url));
     if (String(url).endsWith('/api/oauth/profile')) {
       return { ok: true, json: async () => ({ organization: { uuid: 'org-1' } }) };
