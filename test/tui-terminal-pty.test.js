@@ -7,15 +7,18 @@
 //
 //   (a) terminal stops reading → the HTTP listener still answers within 1s
 //   (b) quit while the terminal is behind → the exit sequence still arrives
-//   (c) self-update hand-off with a slow terminal → the old worker's exit sequence lands
-//       before the new worker paints, and nothing from the old worker after it
+//   (c) self-update hand-off with the terminal behind across the old worker's stop() →
+//       its exit sequence lands before the new worker paints, and nothing after it
+//   (d) a crash that exits with the TUI up → the exit sequence still arrives
+//   (e) a crash that does NOT exit (reload worker) → the worker never blocks on the
+//       terminal afterwards (red-team S-1, 2026-11-12)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,10 +40,22 @@ function getFreePort() {
   });
 }
 
+// Answers 200, except a rejected effort level (400) for `output_config.effort: 'xhigh'`:
+// the pool heals that with a retry and prints a plain console line — traffic that
+// writes to the terminal even with the dashboard gone.
 function startUpstream() {
   const server = http.createServer((req, res) => {
-    req.resume();
+    let raw = '';
+    req.on('data', c => { raw += c; });
     req.on('end', () => {
+      let body = {};
+      try { body = JSON.parse(raw || '{}'); } catch { /* not JSON */ }
+      if (body?.output_config?.effort === 'xhigh') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',
+          message: "output_config.effort 'xhigh' is not supported when thinking is disabled on this model. Use effort 'high' or below, or enable thinking." } }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end('{"id":"msg_ok","type":"message","content":[]}');
     });
@@ -50,7 +65,7 @@ function startUpstream() {
 
 // One proxied request (it logs a line and renders on the TUI). Resolves {status, ms}
 // or {error, ms} — never rejects, so a frozen pool reads as a timeout, not a crash.
-function proxyRequest(port, timeoutMs) {
+function proxyRequest(port, timeoutMs, body = { model: 'claude-x', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }) {
   const t0 = Date.now();
   return new Promise(resolve => {
     const req = http.request(
@@ -59,7 +74,7 @@ function proxyRequest(port, timeoutMs) {
       res => { res.resume(); res.on('end', () => resolve({ status: res.statusCode, ms: Date.now() - t0 })); });
     req.on('timeout', () => req.destroy(new Error('timeout')));
     req.on('error', e => resolve({ error: e.message, ms: Date.now() - t0 }));
-    req.end(JSON.stringify({ model: 'claude-x', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }));
+    req.end(JSON.stringify(body));
   });
 }
 
@@ -114,7 +129,7 @@ class Terminal {
   }
 }
 
-async function bootPool({ supervised = false } = {}) {
+async function bootPool({ supervised = false, env: extraEnv = {} } = {}) {
   const port = await getFreePort();
   const upstream = await startUpstream();
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-pty-'));
@@ -124,6 +139,7 @@ async function bootPool({ supervised = false } = {}) {
     upstream: `http://127.0.0.1:${upstream.port}`,
     updateCheck: false,
     restartDrainTimeoutMs: 500,
+    retry: { maxAttemptsPerRequest: 3 },   // room for the effort-repair retry with one account
     accounts: [{ name: 'a1', type: 'oauth', accountUuid: 'u1', accessToken: 'at1', refreshToken: 'rt1', expiresAt: Date.now() + 3600_000 }],
   }) + '\n');
   const env = {
@@ -135,13 +151,37 @@ async function bootPool({ supervised = false } = {}) {
     // Unsupervised = the worker itself owns the pty (no IPC parent) — the exact
     // process that froze live. Supervised = the TTY supervisor + its worker.
     ...(supervised ? {} : { MAXPOOL_SERVER_WORKER: '1' }),
+    ...extraEnv,
   };
   const term = new Terminal(['server'], env);
-  await term.next('PID ');
+  const pid = Number((await term.next('PID ')).slice(4));
   term.cmd('read');
   await waitFor(async () => (await proxyRequest(port, 1000)).status === 200, 20_000, 'the pool to serve');
-  return { port, term, cleanup: () => { term.close(); upstream.server.close(); } };
+  // The pool's event log sits next to its config (config.js getLogPath).
+  const logPath = configPath.replace(/\.json$/, '.log');
+  const log = () => readFile(logPath, 'utf8').catch(() => '');
+  return { port, term, pid, log, cleanup: () => { term.close(); upstream.server.close(); } };
 }
+
+// The supervisor's live worker children (newest last).
+function childPids(pid) {
+  const r = spawnSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' });
+  return (r.stdout || '').split('\n').filter(Boolean).map(Number).sort((a, b) => a - b);
+}
+
+// r = restart (the same hand-off a self-update runs), then y = confirm. Separate
+// keystrokes: the TUI reads a multi-char chunk as a paste and ignores it.
+async function pressRestart(term) {
+  term.cmd(`keys ${Buffer.from('r').toString('hex')}`);
+  await sleep(700);
+  term.cmd(`keys ${Buffer.from('y').toString('hex')}`);
+}
+
+const indexesOf = (out, needle) => {
+  const at = [];
+  for (let i = out.indexOf(needle); i >= 0; i = out.indexOf(needle, i + 1)) at.push(i);
+  return at;
+};
 
 test('(a) a terminal that stops reading never stops the pool answering', { skip, timeout: 60_000 }, async () => {
   const { port, term, cleanup } = await bootPool();
@@ -176,31 +216,84 @@ test('(b) quitting while the terminal is behind still delivers the exit sequence
 });
 
 test('(c) self-update hand-off: the old worker is done writing before the new one paints', { skip, timeout: 120_000 }, async () => {
-  const { port, term, cleanup } = await bootPool({ supervised: true });
+  const { port, term, log, cleanup } = await bootPool({ supervised: true });
   try {
-    // A terminal falling behind: ~50 KB/s against ~20 KB frames.
-    term.cmd('read-slow 1024 20');
+    // The terminal stops reading and frames back up in the old worker's queue.
+    term.cmd('pause');
     for (let i = 0; i < 10; i++) { await proxyRequest(port, 2000); await sleep(30); }
-    // r = restart (the same hand-off a self-update runs), then y = confirm. Separate
-    // keystrokes: the TUI reads a multi-char chunk as a paste and ignores it.
-    term.cmd(`keys ${Buffer.from('r').toString('hex')}`);
-    await sleep(700);
-    term.cmd(`keys ${Buffer.from('y').toString('hex')}`);
-    // The new worker's start() is the 2nd alt-screen enter. Then let the old worker
-    // finish its drain and exit while the terminal is still slow.
-    await waitFor(async () => (await term.screen()).split(ENTER_ALT).length - 1 >= 2, 60_000, 'the new worker to take over');
+    await pressRestart(term);
+    // Still paused when the old worker gives up the screen: its exit sequence itself
+    // queues behind frames the terminal has not taken (the old worker logs this just
+    // before its stop()). Only then does the terminal catch up — slowly.
+    const HANDING = /Reload: handing the terminal to the new worker \((\d+) bytes not yet shown\)/;
+    let handing = null;
+    const deadline = Date.now() + 60_000;
+    while (!(handing = (await log()).match(HANDING)) && Date.now() < deadline) await sleep(20);
+    // The line is queued just before the old worker's stop(); it reaches the file only
+    // if that stop() does not freeze the worker while the terminal is not reading.
+    assert.ok(handing, `the old worker never reached the terminal hand-off, or froze in it (log tail: ${(await log()).slice(-1500)})`);
+    assert.ok(Number(handing[1]) > 0, 'precondition: the terminal was behind when the old worker stopped');
+    term.cmd('read-slow 2048 20');
+    await waitFor(async () => indexesOf(await term.screen(), ENTER_ALT).length >= 2, 60_000, 'the new worker to take over');
     await sleep(3000);
     term.cmd('read');
     await sleep(1500);
     const out = await term.screen();
-    const enters = [];
-    for (let i = out.indexOf(ENTER_ALT); i >= 0; i = out.indexOf(ENTER_ALT, i + 1)) enters.push(i);
-    const newWorkerStart = enters[1];
-    const leaves = [];
-    for (let i = out.indexOf(LEAVE_ALT); i >= 0; i = out.indexOf(LEAVE_ALT, i + 1)) leaves.push(i);
+    const newWorkerStart = indexesOf(out, ENTER_ALT)[1];
+    const leaves = indexesOf(out, LEAVE_ALT);
     assert.ok(leaves.some(i => i < newWorkerStart), 'the old worker left the screen before the new worker painted');
     const late = leaves.filter(i => i > newWorkerStart);
     assert.deepEqual(late, [], `the old worker wrote its exit sequence AFTER the new worker took the screen (at ${late}, new worker at ${newWorkerStart})`);
     assert.equal((await proxyRequest(port, 3000)).status, 200, 'the new worker serves');
+  } finally { cleanup(); }
+});
+
+test('(d) a crash that exits while the terminal is behind still delivers the exit sequence', { skip, timeout: 60_000 }, async () => {
+  const { port, term, pid, cleanup } = await bootPool({ env: { MAXPOOL_TEST_CRASH_SIGNAL: '1' } });
+  try {
+    term.cmd('pause');
+    for (let i = 0; i < 10; i++) { await proxyRequest(port, 500); await sleep(30); }   // frames back up
+    process.kill(pid, 'SIGUSR2');   // an uncaught exception in the (non-reload) worker → exit 75
+    await sleep(1500);
+    term.cmd('read');
+    assert.equal(await term.waitExit(15), '75', 'the crashed worker exits for a restart');
+    const out = await term.screen();
+    const lastFrame = out.lastIndexOf('\x1b[?25l');
+    const lastExit = out.lastIndexOf(EXIT_SEQ);
+    assert.ok(lastExit >= 0, `the exit sequence never reached the terminal (tail: ${JSON.stringify(out.slice(-200))})`);
+    assert.ok(lastExit > lastFrame, `the terminal was left in the dashboard screen: last frame at ${lastFrame}, exit sequence at ${lastExit}`);
+  } finally { cleanup(); }
+});
+
+test('(e) a crash that does not exit leaves the worker answering with the terminal stopped', { skip, timeout: 120_000 }, async () => {
+  const { port, term, pid, cleanup } = await bootPool({ supervised: true, env: { MAXPOOL_TEST_CRASH_SIGNAL: '1' } });
+  try {
+    // Hand the pool to a RELOAD worker: a reload worker never exits on a crash.
+    const [first] = childPids(pid);
+    await pressRestart(term);
+    await waitFor(async () => { const c = childPids(pid); return c.length === 1 && c[0] !== first; }, 90_000, 'the reload worker to be the only worker');
+    assert.equal((await proxyRequest(port, 3000)).status, 200, 'the reload worker serves');
+    const [worker] = childPids(pid);
+    // 1st crash: the dashboard is up → it is stopped (plain logs from here on).
+    // 2nd crash: no dashboard → the plain restore path. Neither may block the worker.
+    for (const n of [1, 2]) {
+      process.kill(worker, 'SIGUSR2');
+      await sleep(1000);
+      assert.deepEqual(childPids(pid), [worker], `the reload worker stayed up after crash ${n}`);
+    }
+    term.cmd('pause');   // now the terminal stops reading (it holds only ~1 KB)
+    // Each request prints one plain line (a healed effort level; a new model name per
+    // request, so the fix is never remembered) — far more than the terminal holds.
+    const slow = [];
+    for (let i = 0; i < 60; i++) {
+      const r = await proxyRequest(port, 1000, { model: `claude-e-${i}`, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }], output_config: { effort: 'xhigh' } });
+      if (r.status !== 200) slow.push(`#${i}: ${r.error || r.status} after ${r.ms}ms`);
+      await sleep(20);
+    }
+    term.cmd('read');
+    await sleep(1500);
+    const printed = (await term.screen()).split('rejected effort').length - 1;
+    assert.ok(printed >= 20, `precondition: the crashed worker printed to the terminal (saw ${printed} lines)`);
+    assert.deepEqual(slow, [], `after a crash that did not exit, requests stalled behind the terminal:\n${slow.join('\n')}`);
   } finally { cleanup(); }
 });

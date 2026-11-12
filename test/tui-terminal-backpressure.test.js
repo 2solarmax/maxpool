@@ -110,3 +110,31 @@ test('flushOutput resolves once the terminal has taken everything, or at its tim
     assert.equal(out.listenerCount('drain'), 0, 'flushOutput leaves no drain listener behind');
   });
 });
+
+// Red-team S-4 (2026-11-12): once a hand-off starts (self-update / login), the old TUI
+// must not act on keys — a 'q' or 'r' typed during the wait would quit or restart a
+// process that is already handing the terminal over.
+test('a key typed after the hand-off starts does nothing', async () => {
+  const out = fakeStdout();
+  const stdin = new EventEmitter();
+  Object.assign(stdin, { isTTY: true, setRawMode() {}, resume() {}, pause() {}, setEncoding() {} });
+  const inDesc = Object.getOwnPropertyDescriptor(process, 'stdin');
+  Object.defineProperty(process, 'stdin', { value: stdin, configurable: true, writable: true });
+  try {
+    await withStdout(out, async (tui) => {
+      tui.running = false;   // start for real (against the stand-in terminal)
+      const seen = [];
+      tui._onData = d => seen.push(d);
+      assert.equal(tui.start(), true);
+      try {
+        stdin.emit('data', 'x');
+        assert.deepEqual(seen, ['x'], 'keys reach the TUI while it runs');
+        const flushing = tui.beginHandOff({ timeoutMs: 100 });
+        stdin.emit('data', 'q');
+        assert.deepEqual(seen, ['x'], `a key typed during the hand-off wait was acted on: ${JSON.stringify(seen)}`);
+        assert.equal(stdin.listenerCount('data'), 0, 'the TUI still listens to the keyboard during the hand-off');
+        await flushing;
+      } finally { tui.stop(); }
+    });
+  } finally { Object.defineProperty(process, 'stdin', inDesc); }
+});

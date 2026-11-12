@@ -49,6 +49,26 @@ export function writeTerminalSync(s) {
   try { writeSync(1, s); } catch { /* terminal gone */ }
 }
 
+/**
+ * Re-enter raw mode after another process reset the terminal (post-update reassert).
+ * setRawMode is tcsetattr(TCSADRAIN): it blocks the WHOLE process until the terminal
+ * has read everything already sent (2026-11-12, measured 2.8s on a paused pty). So the
+ * toggle waits until our own queued output has drained — the remaining wait is the
+ * kernel's ~1 KB — and a terminal that is not reading at all gets it on 'drain'.
+ * Resolves true when reclaimed now, false when deferred to 'drain'.
+ */
+export async function reclaimRawMode({ stdin = process.stdin, stdout = process.stdout, flush, timeoutMs = 1500 } = {}) {
+  if (!stdin.isTTY) return true;
+  // OFF then ON: Node short-circuits setRawMode(true) while it believes isRaw is already
+  // true, and the reset happened in ANOTHER process (verified on a real pty 2026-08-07).
+  const reclaim = () => {
+    try { stdin.setRawMode(false); stdin.setRawMode(true); stdin.resume(); } catch { /* terminal gone */ }
+  };
+  if (!flush || await flush({ timeoutMs })) { reclaim(); return true; }
+  stdout.once('drain', reclaim);
+  return false;
+}
+
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
 const vw = s => strip(s).length;
@@ -598,24 +618,31 @@ export class TUI {
     return true;
   }
 
-  /** Stop drawing frames (no more renders, no drain wake-up); the screen stays as is. */
+  /** Stop drawing frames (no more renders, no drain wake-up) and stop taking keys, so
+   *  nothing typed during a hand-off wait acts; the screen stays as is. */
   _haltRendering() {
     this.running = false;
+    if (this._dataHandler) process.stdin.removeListener('data', this._dataHandler);
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
     if (this._drainArmed) { process.stdout.removeListener('drain', this._onDrain); this._drainArmed = false; }
   }
 
   /** `exiting`: called from the process-exit path — the exit sequence must be written
-   *  synchronously or it is lost with the non-blocking stream's queue (r2 B1). */
-  stop({ exiting = false } = {}) {
+   *  synchronously or it is lost with the non-blocking stream's queue (r2 B1).
+   *  `keepRaw`: leave the terminal's raw mode as is. Node switches it with
+   *  tcsetattr(TCSADRAIN), which BLOCKS the whole process until the terminal has read
+   *  everything already sent (measured: 2.8s for a terminal that read nothing for 3s) —
+   *  so a process that keeps serving after stop() must not switch it while the
+   *  terminal may be behind. */
+  stop({ exiting = false, keepRaw = false } = {}) {
     this._haltRendering();
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
     process.stdin.removeListener('data', this._dataHandler);
     process.stdout.removeListener('resize', this._resizeHandler);
     if (exiting) writeTerminalSync(EXIT_SEQ);
     else process.stdout.write(EXIT_SEQ);
-    try { process.stdin.setRawMode(false); } catch {}
+    if (!keepRaw) { try { process.stdin.setRawMode(false); } catch {} }
     process.stdin.pause();
   }
 
@@ -623,11 +650,18 @@ export class TUI {
    *  while this process keeps running (r2 B2): let the frames a slow terminal is still
    *  taking land, then the exit sequence, each bounded by timeoutMs — so the next
    *  writer never interleaves with our queue, and blocking is never turned back on. */
-  async handOff({ timeoutMs = 1500 } = {}) {
+  async handOff({ timeoutMs = 1500, flushing = null, keepRaw = false } = {}) {
+    await (flushing || this.beginHandOff({ timeoutMs }));
+    this.stop({ keepRaw });
+    await this.flushOutput({ timeoutMs });
+  }
+
+  /** First half of handOff, started early so the terminal catches up while the caller
+   *  does other work: stop drawing and taking keys, and return the flush (pass it to
+   *  handOff as `flushing`). Gate on that promise — `running` is already false. */
+  beginHandOff({ timeoutMs = 1500 } = {}) {
     this._haltRendering();
-    await this.flushOutput({ timeoutMs });
-    this.stop();
-    await this.flushOutput({ timeoutMs });
+    return this.flushOutput({ timeoutMs });
   }
 
   /** Resolve once the terminal has taken everything queued for it: true when drained,
@@ -1592,14 +1626,16 @@ export class TUI {
   // it's a RE-AUTH in place (revives a dead-refresh/reauth account), not a duplicate.
   async _doLogin() {
     const wasRunning = this.running;
-    if (wasRunning) await this.handOff();   // r2 B2: bounded flush + exit sequence before the prompt
     // Mute the console-log MIRROR to stdout during the interactive prompt so routing
     // logs (console.log, e.g. the glm-fallback 429 churn) don't flood over the readline
     // "Name this account" prompt. The prompts + errors use process.stdout.write, which
     // BYPASSES the mirror, so they stay visible. Login runs only on the terminal-owning
-    // primary (mirror baseline false), so the finally restores it to false.
+    // primary (mirror baseline false), so the finally restores it to false. Muted BEFORE
+    // the hand-off: its stop() hands console.log back to the mirror while the second
+    // flush still waits, and those lines would print onto the user's normal screen.
     setConsoleStdoutSuppressed(true);
     try {
+      if (wasRunning) await this.handOff();   // r2 B2: bounded flush + exit sequence before the prompt
       process.stdout.write('\nOpening browser to log into Claude…\n');
       const creds = await loginOAuth();
       const profile = await fetchProfile(creds.accessToken);

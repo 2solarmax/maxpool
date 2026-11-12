@@ -42,7 +42,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled } from './oauth.js';
-import { TUI, writeTerminalSync } from './tui.js';
+import { TUI, writeTerminalSync, reclaimRawMode } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
@@ -982,29 +982,39 @@ async function serverWorkerCommand() {
   // Best-effort terminal restore on ANY abnormal exit path (uncaughtException,
   // a bare process.exit, a crash) so the user's shell is never left in raw mode
   // or the alt-screen. Idempotent and safe even when no TUI was running.
-  const restoreTerminal = () => {
+  // `exiting`: only the process-exit path may turn blocking writes back on (r2 B1,
+  // 2026-11-12) — a TUI-owned stdout is NON-BLOCKING and its queued bytes are dropped
+  // at exit, so there the exit sequence goes out synchronously or the shell stays in
+  // the dashboard. A process that keeps running (a crash that does not exit) must
+  // stay non-blocking, or a terminal that stops reading freezes it again (red-team S-1).
+  const restoreTerminal = ({ exiting }) => {
     // Handed the TTY to a new worker (seamless TUI reload) → the new worker owns
     // it now; restoring here would clobber its live TUI. No-op.
     if (terminalHandedOff) return;
     try {
-      // 'exit' context: a TUI-owned stdout is NON-BLOCKING, and its queued bytes are
-      // dropped at exit — the exit sequence must go out synchronously (r2 B1,
-      // 2026-11-12) or the shell stays in the dashboard.
-      if (tui?.running) { tui.stop({ exiting: true }); return; }
-      if (process.stdout.isTTY) writeTerminalSync('\x1b[?25h\x1b[?1049l');
+      if (tui?.running) { tui.stop({ exiting }); return; }
+      if (process.stdout.isTTY) {
+        if (exiting) writeTerminalSync('\x1b[?25h\x1b[?1049l');
+        else process.stdout.write('\x1b[?25h\x1b[?1049l');
+      }
       if (process.stdin.isTTY) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
     } catch { /* never throw from a restore */ }
   };
-  process.on('exit', restoreTerminal);
+  process.on('exit', () => restoreTerminal({ exiting: true }));
+  // Test seam: SIGUSR2 throws from a timer, so a pty test can crash a worker for real.
+  if (process.env.MAXPOOL_TEST_CRASH_SIGNAL === '1') {
+    process.on('SIGUSR2', () => setImmediate(() => { throw new Error('maxpool test crash (MAXPOOL_TEST_CRASH_SIGNAL)'); }));
+  }
   process.on('uncaughtException', err => {
     console.error(`[Maxpool] Worker uncaughtException: ${err?.stack || err}`);
-    restoreTerminal();
     // A reload worker must NEVER exit(1) (escapes the supervisor exit-75 loop).
     // Stay alive so the supervisor's baton timeouts roll us back cleanly. Also
     // skip the exit-75 restart while DRAINING: a shutdown-time write to a dead
     // terminal can throw here, and restarting then would respawn the very orphan
     // a terminal-close shutdown is trying to avoid — let the drain finish instead.
+    // Exiting → the 'exit' listener restores the terminal (synchronously, once).
     if (!isReloadWorker && !draining) process.exit(SERVER_RESTART_EXIT_CODE);
+    restoreTerminal({ exiting: false });
   });
   // Swallow EPIPE/EIO from writes to a hung-up terminal so they can't crash us.
   process.stdout.on('error', () => {});
@@ -1509,6 +1519,10 @@ async function serverWorkerCommand() {
     const releaseBatonAndDrain = async () => {
       if (draining) { try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ } return; }
       draining = true;
+      // Terminal hand-off, part 1 (red-team S-2): stop drawing and taking keys NOW and
+      // let a slow terminal catch up WHILE steps 1-4 run — they can take many seconds,
+      // and the supervisor waits only so long for MSG_RELEASED.
+      const terminalCatchUp = tui?.running ? tui.beginHandOff({ timeoutMs: 1500 }) : null;
       // MSG_RELEASE arrived → the new worker booted OK and this reload is really
       // proceeding (not a rollback). Disarm the rollback self-heal.
       if (reloadWatchdog) { clearTimeout(reloadWatchdog); reloadWatchdog = null; }
@@ -1540,18 +1554,27 @@ async function serverWorkerCommand() {
       await flushConfigWrites();
       await flushStateWrites();
 
-      // Terminal hand-off (r2 B2, 2026-11-12): bound the wait for a slow terminal to
-      // take our last frames + exit sequence (1.5s each) BEFORE releasing — the new
-      // worker paints right after MSG_RELEASED, and its first frame must not interleave
-      // with ours. Never turns blocking back on; keeps serving in-flight requests.
-      if (tui?.running) await tui.handOff({ timeoutMs: 1500 });
+      // Muzzle our own remaining logs (in-flight requests completing) BEFORE the
+      // hand-off's stop() gives console.log back to plain stdout, so none of them
+      // print on the user's screen or paint the new worker's alt-screen.
+      setConsoleStdoutSuppressed(true);
+      // Terminal hand-off, part 2 (r2 B2, 2026-11-12): finish the catch-up started at
+      // the top, then the exit sequence, each bounded (1.5s) — BEFORE releasing: the
+      // new worker paints right after MSG_RELEASED, and its first frame must not
+      // interleave with ours. Never turns blocking back on; keeps serving in-flight.
+      if (terminalCatchUp) {
+        await terminalCatchUp;
+        appendEventLog(`[Maxpool] Reload: handing the terminal to the new worker (${process.stdout.writableLength || 0} bytes not yet shown)`);
+        // keepRaw: the incoming worker puts the terminal in raw mode itself, and
+        // switching it here would freeze this worker — still streaming in-flight
+        // responses — for as long as the terminal is behind (TCSADRAIN; see TUI.stop).
+        await tui.handOff({ timeoutMs: 1500, flushing: terminalCatchUp, keepRaw: true });
+      }
       // The terminal is now HANDED OFF: the incoming worker will take the TTY at
       // MSG_TAKEOVER. Arm the guard UNCONDITIONALLY (even if the TUI was already
       // stopped) so this worker's later exit(0) restoreTerminal can't clobber the
-      // new worker's TUI. Also muzzle our own remaining drain-time logs (in-flight
-      // requests completing) so they don't paint the new worker's alt-screen.
+      // new worker's TUI.
       terminalHandedOff = true;
-      setConsoleStdoutSuppressed(true);
       try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ }
 
       // (macOS) releaseLease() above dropped the wake-lock, but we still stream our
@@ -1623,19 +1646,9 @@ async function serverWorkerCommand() {
           await becomePrimary({ viaTakeover: true });
         } else if (msg?.type === MSG_TTY_REASSERT) {
           // The old worker has now EXITED, and its exit reset the shared terminal out
-          // of raw mode (libuv's uv_tty_reset_mode on process exit). Reclaim it.
-          //
-          // The toggle OFF then ON is load-bearing: Node short-circuits setRawMode(true)
-          // when it believes isRaw is already true — and it does believe that, because
-          // the clobber happened in ANOTHER process and left our flag untouched. A bare
-          // setRawMode(true) here is a silent no-op (verified on a real pty 2026-08-07).
-          if (process.stdin.isTTY) {
-            try {
-              process.stdin.setRawMode(false);
-              process.stdin.setRawMode(true);
-              process.stdin.resume();
-            } catch { /* terminal gone — nothing to reclaim */ }
-          }
+          // of raw mode (libuv's uv_tty_reset_mode on process exit). Reclaim it —
+          // without blocking on a terminal that is behind (reclaimRawMode).
+          await reclaimRawMode({ flush: tui?._nb ? o => tui.flushOutput(o) : null });
           // Re-assert the screen state too: the dying worker's alt-screen exit and
           // cursor-show can land after ours.
           if (tui?.running && process.stdout.isTTY) {
