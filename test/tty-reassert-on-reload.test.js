@@ -93,11 +93,37 @@ test('WIRING: reapOldWorker calls onExited which sends MSG_TTY_REASSERT', async 
   assert.match(src, /msg\?\.type\s*===\s*MSG_TTY_REASSERT/,
     'the worker message handler must handle MSG_TTY_REASSERT');
 
-  // The handler does the off→on toggle (not just on)
-  // Match the HANDLER (msg?.type ===), not the import at the top of the file.
+  // The handler reclaims raw mode through reclaimRawMode (its off→on toggle is
+  // pinned by behaviour below). Match the HANDLER (msg?.type ===), not the import.
   const handlerMatch = src.match(/msg\?\.type\s*===\s*MSG_TTY_REASSERT[\s\S]{0,800}/);
   assert.ok(handlerMatch, 'handler block found');
-  assert.match(handlerMatch[0], /setRawMode\(false\)/, 'handler toggles OFF');
-  assert.match(handlerMatch[0], /setRawMode\(true\)/, 'handler toggles ON');
-  assert.match(handlerMatch[0], /resume\(\)/, 'handler resumes stdin');
+  assert.match(handlerMatch[0], /await reclaimRawMode\(/, 'handler reclaims raw mode');
+});
+
+// reclaimRawMode (2026-11-12): setRawMode is tcsetattr(TCSADRAIN) and blocks the whole
+// process while the terminal is behind, so the toggle waits for our output to drain.
+function rawStdin() {
+  const calls = [];
+  return { calls, isTTY: true, _isRaw: true,
+    setRawMode(v) { this._isRaw = v; calls.push(v); }, resume() { calls.push('resume'); } };
+}
+
+test('reclaimRawMode toggles off→on and resumes once our output has drained', async () => {
+  const { reclaimRawMode } = await import('../src/tui.js');
+  const stdin = rawStdin();
+  const done = await reclaimRawMode({ stdin, stdout: new (await import('node:events')).EventEmitter(), flush: async () => true });
+  assert.equal(done, true);
+  assert.deepEqual(stdin.calls, [false, true, 'resume']);
+});
+
+test('reclaimRawMode does NOT touch the terminal mode while the terminal is behind; it does on drain', async () => {
+  const { reclaimRawMode } = await import('../src/tui.js');
+  const { EventEmitter } = await import('node:events');
+  const stdin = rawStdin();
+  const stdout = new EventEmitter();
+  const done = await reclaimRawMode({ stdin, stdout, flush: async () => false });
+  assert.equal(done, false);
+  assert.deepEqual(stdin.calls, [], 'no blocking tcsetattr while the terminal has not read our output');
+  stdout.emit('drain');
+  assert.deepEqual(stdin.calls, [false, true, 'resume']);
 });
