@@ -102,16 +102,16 @@ test('a mid-width terminal (showBoth, no showFable) shows Ses and Wk but not Fbl
 
 test('barLayout: one bar under 70 columns, two from 70, three from 112, three bars capped at 11', () => {
   const { barLayout } = __tuiTest;
-  assert.deepEqual(barLayout(69), { showBoth: false, showFable: false, bw: 5 });
-  assert.deepEqual(barLayout(70), { showBoth: true, showFable: false, bw: 5 });
-  assert.deepEqual(barLayout(93), { showBoth: true, showFable: false, bw: 7 });
-  assert.deepEqual(barLayout(99), { showBoth: true, showFable: false, bw: 10 });
-  assert.deepEqual(barLayout(111), { showBoth: true, showFable: false, bw: 16 });
-  assert.deepEqual(barLayout(112), { showBoth: true, showFable: true, bw: 9 });
-  assert.deepEqual(barLayout(117), { showBoth: true, showFable: true, bw: 10 });
-  assert.deepEqual(barLayout(118), { showBoth: true, showFable: true, bw: 11 });
-  assert.deepEqual(barLayout(120), { showBoth: true, showFable: true, bw: 11 });
-  assert.deepEqual(barLayout(140), { showBoth: true, showFable: true, bw: 11 });
+  assert.deepEqual(barLayout(69), { showSession: true, showBoth: false, showFable: false, bw: 5 });
+  assert.deepEqual(barLayout(70), { showSession: true, showBoth: true, showFable: false, bw: 5 });
+  assert.deepEqual(barLayout(93), { showSession: true, showBoth: true, showFable: false, bw: 7 });
+  assert.deepEqual(barLayout(99), { showSession: true, showBoth: true, showFable: false, bw: 10 });
+  assert.deepEqual(barLayout(111), { showSession: true, showBoth: true, showFable: false, bw: 16 });
+  assert.deepEqual(barLayout(112), { showSession: true, showBoth: true, showFable: true, bw: 9 });
+  assert.deepEqual(barLayout(117), { showSession: true, showBoth: true, showFable: true, bw: 10 });
+  assert.deepEqual(barLayout(118), { showSession: true, showBoth: true, showFable: true, bw: 11 });
+  assert.deepEqual(barLayout(120), { showSession: true, showBoth: true, showFable: true, bw: 11 });
+  assert.deepEqual(barLayout(140), { showSession: true, showBoth: true, showFable: true, bw: 11 });
 });
 
 test('barLayout: a two-bar row fills the terminal exactly at 95 columns and never overflows it', () => {
