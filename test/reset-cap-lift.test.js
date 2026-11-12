@@ -373,3 +373,41 @@ test('C3: the 10-min hold through listing failures starts at the first failure, 
   assert.equal(am.capLiftActive(a, failAt + 9 * 60_000), true, '9 min into the failures: still held');
   assert.equal(am.capLiftActive(a, failAt + 11 * 60_000), false, 'after 10 min of failures: ends');
 });
+
+// RED (live 2026-11-12 00:20Z, reports@gomokka.com): lifted at 0.97 with its free
+// refill 4 days out, it still paid the weekly pace + utilization costs — the pool
+// picks the cheapest account, so it scored worst of every Claude account (4.27 vs a
+// fresh 2.00) and got ZERO requests for an hour. A full reset refills the week, so a
+// fully-lifted account's weekly window is not scarce: it prices like a fresh one.
+// The 5h session window and the load terms still apply (no dogpile).
+test('D2: a fully-lifted account is priced like a fresh one on the WEEKLY window, not worst-of-pool', () => {
+  const am = cappedAm({ cap: null });
+  const [a, b] = am.accounts;
+  for (const x of [a, b]) x.capUtilization = null;
+  setUsage(a, { wk: 0.97, wkReset: 4 * DAY, ses: 0.1 });
+  setUsage(b, { wk: 0.30, wkReset: 4 * DAY, ses: 0.1 });
+  const req = { model: 'claude-opus-5-5', weight: 1, profile: 'claude' };
+  am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
+  assert.equal(am.capLiftActive(a), true);
+  assert.ok(am._scoreAccount(a, req) <= am._scoreAccount(b, req),
+    `lifted 0.97 (${am._scoreAccount(a, req).toFixed(2)}) must not score worse than a fresh 0.30 (${am._scoreAccount(b, req).toFixed(2)})`);
+  assert.ok(!['reserve', 'critical', 'exhausted'].includes(am._weeklyPaceState(a)), 'a lifted account is not "hot" on weekly pace');
+  assert.ok(!['reserve', 'critical', 'exhausted'].includes(am._weeklyState(a)), 'nor on weekly pressure');
+  // The SESSION window still prices it — a lifted account at 90% of its 5h window is dearer.
+  const cool = am._scoreAccount(a, req);
+  setUsage(a, { wk: 0.97, wkReset: 4 * DAY, ses: 0.9 });
+  assert.ok(am._scoreAccount(a, req) > cool, 'session pressure still counts while lifted');
+});
+
+test('D2: a GIVE-BACK lift keeps weekly pricing (it refills only what the model used)', () => {
+  const am = cappedAm({ cap: null });
+  const [a, b] = am.accounts;
+  for (const x of [a, b]) x.capUtilization = null;
+  setUsage(a, { wk: 0.97, wkReset: 4 * DAY, ses: 0.1 });
+  setUsage(b, { wk: 0.30, wkReset: 4 * DAY, ses: 0.1 });
+  a.giveBack = { drop: 0.03, at: Date.now() };
+  am.applyResetGrants(0, { grants: [GIVEBACK_GRANT()], eligible: true });
+  assert.equal(am.capLiftActive(a), true);
+  const req = { model: 'claude-opus-5-5', weight: 1, profile: 'claude' };
+  assert.ok(am._scoreAccount(a, req) > am._scoreAccount(b, req), 'give-back lift: still priced on its weekly usage');
+});

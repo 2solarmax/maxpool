@@ -1890,6 +1890,16 @@ export class AccountManager {
     st.graceUntil = Math.max(st.graceUntil ?? 0, now + LIFT_GRACE_MS);
   }
 
+  /** A FULL lift (a held reset that refills the whole week) makes the weekly window
+   *  not scarce: the pool picks the cheapest account, so pricing a lifted 0.97 on
+   *  its weekly usage made it worst-of-pool and starved it (reports, live
+   *  2026-11-12). Weekly pace/utilization/pressure ignore it; the 5h window and the
+   *  load terms still apply. A give-back lift refills only what the model used, so
+   *  it keeps weekly pricing. */
+  _weeklyRefilledByLift(account, now = Date.now()) {
+    return this.capLiftActive(account, now) && account.capLift?.mode !== 'giveback';
+  }
+
   /** True while the account's usage cap is suspended by a held full-refill reset. */
   capLiftActive(account, now = Date.now()) {
     if (!account || account.enabled === false) return false;
@@ -3844,7 +3854,8 @@ export class AccountManager {
     if (q.unified5h != null) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.unified5h, q.unified5hReset, FIVE_HOUR_MS, now));
     }
-    if (q.unified7d != null) {
+    const weeklyFree = this._weeklyRefilledByLift(account, now);
+    if (q.unified7d != null && !weeklyFree) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now));
     }
     if (q.tokensLimit != null && q.tokensRemaining != null && q.tokensLimit > 0) {
@@ -3859,7 +3870,7 @@ export class AccountManager {
     if (q.providerSes != null) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.providerSes, q.providerSesReset, FIVE_HOUR_MS, now));
     }
-    if (q.providerWk != null) {
+    if (q.providerWk != null && !weeklyFree) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.providerWk, q.providerWkReset, WEEK_MS, now));
     }
     return scarcity;
@@ -3895,7 +3906,7 @@ export class AccountManager {
     // signal (the actual fix) while capacity dying at reset stays free (the
     // invariant the older tests pin). Unknown/absent reset → face value, same as
     // _accountScarcity. Turn the flag off to restore session-only exactly.
-    if (this.scheduler.weeklyAwareScoring !== false) {
+    if (this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)) {
       if (q.unified7d != null) {
         util = Math.max(util, this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now));
       }
@@ -4100,6 +4111,7 @@ export class AccountManager {
   _weeklyState(account) {
     const rawState = this._weeklyRawState(account);
     if (rawState === 'unknown' || rawState === 'exhausted' || rawState === 'capped') return rawState;
+    if (this._weeklyRefilledByLift(account)) return rawState;
 
     const pressure = Math.max(clamp01(account.quota.unified7d ?? 0), this._effectiveWeeklyUsage(account));
     if (pressure >= this.scheduler.weeklyCriticalThreshold) return 'critical';
@@ -4209,6 +4221,7 @@ export class AccountManager {
     // Provider quota lives in separate fields — see _weeklyRawState.
     if (account.type === 'provider') return this._weeklyRawState(account, now);
     if (account.quota.unified7d == null) return 'unknown';
+    if (this._weeklyRefilledByLift(account, now)) return this._weeklyRawState(account, now);
     const effective = this._effectiveWeeklyUsage(account);
     if (effective >= this.scheduler.weeklyExhaustedThreshold) return 'exhausted';
     if (effective >= this.scheduler.weeklyCriticalThreshold) return 'critical';
