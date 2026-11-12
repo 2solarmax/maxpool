@@ -42,7 +42,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled } from './oauth.js';
-import { TUI } from './tui.js';
+import { TUI, writeTerminalSync } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
@@ -314,7 +314,7 @@ async function supervisorCommand() {
   // (exit alt-screen + show cursor + raw off) so the user's shell is clean.
   const restoreTerminalFromSupervisor = () => {
     try {
-      if (process.stdout.isTTY) process.stdout.write('\x1b[?25h\x1b[?1049l');
+      if (process.stdout.isTTY) writeTerminalSync('\x1b[?25h\x1b[?1049l');
       if (process.stdin.isTTY) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
     } catch { /* never throw */ }
   };
@@ -829,7 +829,10 @@ async function serverWorkerCommand() {
   // by spawned integration tests so a startup probe can't race their refresh/rotation
   // assertions (mirrors MAXPOOL_DISABLE_SLEEP_GUARD).
   const probeSeconds = process.env.MAXPOOL_DISABLE_QUOTA_PROBE === '1' ? 0 : (config.quotaProbeSeconds || 0);
-  const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000 });
+  // Late-bound: routes probe lines through the TUI once it owns the console (a TUI
+  // render must be the only writer to the terminal, 2026-11-12).
+  const uiLog = (...a) => console.log(...a);
+  const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000, log: uiLog });
   // Tell the AM the probe cadence so the TUI can flag a scoped/provider tag whose
   // background probe has gone stale (> 3× interval since last success).
   accountManager.quotaProbeIntervalMs = probeSeconds * 1000;
@@ -984,8 +987,11 @@ async function serverWorkerCommand() {
     // it now; restoring here would clobber its live TUI. No-op.
     if (terminalHandedOff) return;
     try {
-      if (tui?.running) { tui.stop(); return; }
-      if (process.stdout.isTTY) process.stdout.write('\x1b[?25h\x1b[?1049l');
+      // 'exit' context: a TUI-owned stdout is NON-BLOCKING, and its queued bytes are
+      // dropped at exit — the exit sequence must go out synchronously (r2 B1,
+      // 2026-11-12) or the shell stays in the dashboard.
+      if (tui?.running) { tui.stop({ exiting: true }); return; }
+      if (process.stdout.isTTY) writeTerminalSync('\x1b[?25h\x1b[?1049l');
       if (process.stdin.isTTY) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
     } catch { /* never throw from a restore */ }
   };
@@ -1077,7 +1083,7 @@ async function serverWorkerCommand() {
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
     if (updateTimer) clearInterval(updateTimer);
-    if (tui?.running) { tui.stop(); }
+    if (tui?.running) { tui.stop(); }   // plain-log mode resumes for the drain messages
     console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
     // Best-effort: flush quota + settle in-flight refreshes/prober before exit so
@@ -1162,6 +1168,7 @@ async function serverWorkerCommand() {
     pauseAdmission: () => accountManager.setAdmissionPaused(true),
     resumeAdmission: () => accountManager.setAdmissionPaused(false),
     restartNow: requestReload,
+    log: uiLog,   // via the TUI's console, not straight to the terminal (T6)
     // The pre-drain only earns its cost on the COLD path (the socket closes, so an
     // in-flight request would be severed). Seamless keeps serving them post-baton.
     isSeamless: () => {
@@ -1533,7 +1540,11 @@ async function serverWorkerCommand() {
       await flushConfigWrites();
       await flushStateWrites();
 
-      if (tui?.running) tui.stop(); // restore terminal before the new worker takes it
+      // Terminal hand-off (r2 B2, 2026-11-12): bound the wait for a slow terminal to
+      // take our last frames + exit sequence (1.5s each) BEFORE releasing — the new
+      // worker paints right after MSG_RELEASED, and its first frame must not interleave
+      // with ours. Never turns blocking back on; keeps serving in-flight requests.
+      if (tui?.running) await tui.handOff({ timeoutMs: 1500 });
       // The terminal is now HANDED OFF: the incoming worker will take the TTY at
       // MSG_TAKEOVER. Arm the guard UNCONDITIONALLY (even if the TUI was already
       // stopped) so this worker's later exit(0) restoreTerminal can't clobber the
@@ -1630,7 +1641,7 @@ async function serverWorkerCommand() {
           if (tui?.running && process.stdout.isTTY) {
             try {
               process.stdout.write('\x1b[?1049h\x1b[?25l');
-              tui.render();
+              tui.forceRender();
             } catch { /* ignore */ }
           }
         } else if (msg?.type === MSG_ROLLED_BACK) {
@@ -2550,5 +2561,6 @@ function formatDurationMs(ms) {
 function formatLoadWindow(load = {}) {
   const avg = load.avgMs != null ? ` avg ${formatDurationMs(load.avgMs)}` : '';
   const failed = load.failed ? `, ${load.failed} failed` : '';
-  return `${load.requests || 0} req${avg}${failed}`;
+  const linkFailed = load.linkFailed ? `, ${load.linkFailed} link drop${load.linkFailed === 1 ? '' : 's'}` : '';
+  return `${load.requests || 0} req${avg}${failed}${linkFailed}`;
 }

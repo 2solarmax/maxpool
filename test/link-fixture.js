@@ -1,5 +1,6 @@
 // Shared fixture for the link-path TTFB / retry-same tests: a fake cloud pool with two
-// Claude rows. `plan(pinAccount, nthHitForThatRow, req)` → 'hang' | 'ok' | 'sse' | {delay, sse}.
+// Claude rows. `plan(pinAccount, nthHitForThatRow, req)` → 'hang' | 'reset' | 'partial'
+// | 'ok' | 'sse' | {delay, sse}.
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
@@ -30,6 +31,14 @@ export function remotePool(plan) {
     hits.push(pin);
     const what = plan(pin, n, req);
     if (what === 'hang') return;
+    // 'reset': the link drops the connection (a transport fault, nothing answered).
+    if (what === 'reset') { req.socket.destroy(); return; }
+    // 'partial': the first SSE event, then silence (lets a client leave mid-body).
+    if (what === 'partial') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_link_partial"}}\n\n');
+      return;
+    }
     const answer = (sse) => {
       if (sse) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(SSE_OK); }
       else { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"id":"msg_link_ok"}'); }

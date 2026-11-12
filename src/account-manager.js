@@ -1118,6 +1118,11 @@ export class AccountManager {
    *                    recorded (failedRequests, lastError) but never extends the
    *                    consecutiveFailures streak, so it cannot trip the hold-release
    *                    gate for the account's other conversations.
+   * outcome.linkFault — a LINK-transport fault (link_ttfb / link_idle /
+   *                    pool_link_unreachable): the Mac↔cloud link gave up, not the
+   *                    account (2026-11-12: cloud rows showed 10-26 "failed" while the
+   *                    cloud itself failed ≈6 of ~2,100). Records a link drop load
+   *                    event and returns — no failedRequests, no streak, no error text.
    */
   releaseAccount(lease, outcome = {}) {
     if (!lease?.account) return;
@@ -1145,6 +1150,14 @@ export class AccountManager {
     }
 
     if (outcome.neutral) return;
+
+    // A link fault is not the account failing: tally it as a link drop (kept out of
+    // avgMs too — a 120s give-up is not the account's latency) and stop here, before
+    // every failure counter / error field.
+    if (outcome.linkFault) {
+      this._recordLoadEvent(account, lease, { success: false, linkFault: true });
+      return;
+    }
 
     // A per-model weekly cap is NOT an account failure — the account is healthy for
     // every other model. Don't poison its failure counters / scoring penalty (mirror
@@ -1198,6 +1211,7 @@ export class AccountManager {
       durationMs: Math.max(0, now - lease.startedAt),
       weight: Math.max(1, lease.weight || 1),
       success: Boolean(outcome.success),
+      linkFault: Boolean(outcome.linkFault),
       status: outcome.status || null,
     });
     this._pruneLoadEvents(account, now);
@@ -1216,14 +1230,21 @@ export class AccountManager {
     const since = now - windowMs;
     const events = (account.loadEvents || []).filter(e => e.at >= since);
     const requests = events.length;
-    const failed = events.filter(e => !e.success).length;
+    // "failed" is what the operator reads as the ACCOUNT misbehaving; a link fault is
+    // the pool's own tunnel to the team pool and gets its own field (2026-11-12).
+    const failed = events.filter(e => !e.success && !e.linkFault).length;
+    const linkFailed = events.filter(e => !e.success && e.linkFault).length;
+    // avgMs excludes link faults (N1, pre-mortem r2): a 120s give-up on the link is not
+    // this account's response time.
+    const timed = events.filter(e => !e.linkFault);
     const weight = events.reduce((sum, e) => sum + (e.weight || 1), 0);
-    const durationMs = events.reduce((sum, e) => sum + (e.durationMs || 0), 0);
+    const durationMs = timed.reduce((sum, e) => sum + (e.durationMs || 0), 0);
     return {
       requests,
       failed,
+      linkFailed,
       weight,
-      avgMs: requests ? Math.round(durationMs / requests) : null,
+      avgMs: timed.length ? Math.round(durationMs / timed.length) : null,
     };
   }
 

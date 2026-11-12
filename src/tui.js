@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeSync } from 'node:fs';
+import { isatty } from 'node:tty';
 import { homedir } from 'node:os';
 import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
@@ -26,6 +27,27 @@ const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
 const dimUnderline = s => `${ESC}2;4m${s}${RESET}`;
+
+// Terminal output budget (2026-11-12: the pool froze for up to 60s inside a synchronous
+// TTY write() — a full-screen redraw per log line, 4.9 GB in 12h49m). Frames are
+// coalesced to one per RENDER_MIN_INTERVAL_MS (≤10/s), an unchanged frame is re-sent
+// only after REPAINT_MS, and nothing is written while the terminal has not drained.
+const RENDER_MIN_INTERVAL_MS = 100;
+const REPAINT_MS = 5000;
+const EXIT_SEQ = `${ESC}?25h${ESC}?1049l`;   // show cursor + leave the alt screen
+
+/**
+ * Write to the terminal synchronously at PROCESS EXIT. The TUI turns its output
+ * non-blocking, and Node drops a non-blocking stream's queued bytes on exit — the exit
+ * sequence written through the stream never arrives and the shell is left in the
+ * dashboard (pre-mortem r2 B1, real-pty probe). Blocking back on + a direct fd write
+ * delivers it. Exit paths only: a blocking write is exactly what froze the pool.
+ */
+export function writeTerminalSync(s) {
+  if (!isatty(1)) return;
+  try { process.stdout._handle?.setBlocking?.(true); } catch { /* not a libuv tty */ }
+  try { writeSync(1, s); } catch { /* terminal gone */ }
+}
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
@@ -204,19 +226,24 @@ function countdown(ts) {
  *  "how long each request takes" is not something the owner acts on. An idle
  *  account renders NOTHING.
  *
- *    2 live · 17 req/hr · 1 failed
+ *    2 live · 17 req/hr · 1 failed · 3 link drops
  *    17 req/hr                 working, idle this second
  *    (blank)                   resting — nothing to say
+ *
+ *  "link drops" (2026-11-12): the link to a team pool gave up, not the account —
+ *  yellow, never folded into "failed".
  */
 function loadText(load) {
   const inflight = load?.current?.inFlight || 0;
   const hourReq = load?.last1h?.requests || 0;
   const failed = load?.last15m?.failed || 0;
-  if (!inflight && !hourReq && !failed) return '';
+  const linkFailed = load?.last15m?.linkFailed || 0;
+  if (!inflight && !hourReq && !failed && !linkFailed) return '';
   const parts = [];
   if (inflight) parts.push(`${inflight} live`);
   if (hourReq) parts.push(`${hourReq} req/hr`);
   if (failed) parts.push(red(`${failed} failed`));
+  if (linkFailed) parts.push(yellow(`${linkFailed} link drop${linkFailed === 1 ? '' : 's'}`));
   return parts.join(' · ');
 }
 
@@ -516,6 +543,18 @@ export class TUI {
     this.timer = null;
     this._origLog = null;
     this._origErr = null;
+    // Terminal output state (2026-11-12 freeze fix): _nb = stdout made non-blocking by
+    // start(); _renderTimer = the one scheduled coalesced render; _lastFrame /
+    // _lastFullWriteAt = what the terminal last got and when; _forceNext = the next
+    // frame must be sent even if unchanged; _drainArmed = one 'drain' listener pending.
+    this._nb = false;
+    this._renderTimer = null;
+    this._lastRenderAt = 0;
+    this._lastFrame = null;
+    this._lastFullWriteAt = 0;
+    this._forceNext = false;
+    this._drainArmed = false;
+    this._onDrain = () => { this._drainArmed = false; if (this.running) this.render(); };
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -529,11 +568,19 @@ export class TUI {
     }
 
     this.running = true;
+    // Never block the pool on its own terminal (2026-11-12): Node writes a TTY
+    // synchronously, so a terminal that fell behind stopped EVERY request for up to 60s.
+    // Real TTYs only (r2 S3); a later stop() leaves it non-blocking (the exit path alone
+    // turns blocking back on — writeTerminalSync).
+    if (!this._nb && isatty(process.stdout.fd) && typeof process.stdout._handle?.setBlocking === 'function') {
+      process.stdout._handle.setBlocking(false);
+      this._nb = true;
+    }
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     this._dataHandler = d => this._onData(d);
-    this._resizeHandler = () => this.render();
+    this._resizeHandler = () => this.forceRender();
     process.stdin.on('data', this._dataHandler);
     process.stdout.on('resize', this._resizeHandler);
 
@@ -543,30 +590,70 @@ export class TUI {
     console.log = (...a) => this._addLog(a.join(' '));
     console.error = (...a) => this._addLog(a.join(' '));
 
-    this.render();
+    this.forceRender();
     this.timer = setInterval(() => {
       this.frame = (this.frame + 1) % SPINNER.length;
-      this.render();
+      this.requestRender();
     }, 500);
     return true;
   }
 
-  stop() {
+  /** Stop drawing frames (no more renders, no drain wake-up); the screen stays as is. */
+  _haltRendering() {
     this.running = false;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
+    if (this._drainArmed) { process.stdout.removeListener('drain', this._onDrain); this._drainArmed = false; }
+  }
+
+  /** `exiting`: called from the process-exit path — the exit sequence must be written
+   *  synchronously or it is lost with the non-blocking stream's queue (r2 B1). */
+  stop({ exiting = false } = {}) {
+    this._haltRendering();
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
     process.stdin.removeListener('data', this._dataHandler);
     process.stdout.removeListener('resize', this._resizeHandler);
-    process.stdout.write(`${ESC}?25h${ESC}?1049l`);
+    if (exiting) writeTerminalSync(EXIT_SEQ);
+    else process.stdout.write(EXIT_SEQ);
     try { process.stdin.setRawMode(false); } catch {}
     process.stdin.pause();
+  }
+
+  /** Give the terminal up to someone else (a self-update's new worker, a login prompt)
+   *  while this process keeps running (r2 B2): let the frames a slow terminal is still
+   *  taking land, then the exit sequence, each bounded by timeoutMs — so the next
+   *  writer never interleaves with our queue, and blocking is never turned back on. */
+  async handOff({ timeoutMs = 1500 } = {}) {
+    this._haltRendering();
+    await this.flushOutput({ timeoutMs });
+    this.stop();
+    await this.flushOutput({ timeoutMs });
+  }
+
+  /** Resolve once the terminal has taken everything queued for it: true when drained,
+   *  false at timeoutMs. 'drain' fires only after a write hit the high-water mark, so
+   *  the queue length is polled too. */
+  flushOutput({ timeoutMs = 1500 } = {}) {
+    const out = process.stdout;
+    if (!out.writableLength) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const finish = drained => {
+        clearTimeout(deadline); clearInterval(poll);
+        out.removeListener('drain', onDrain);
+        resolve(drained);
+      };
+      const onDrain = () => { if (!out.writableLength) finish(true); };
+      const deadline = setTimeout(() => finish(false), timeoutMs);
+      const poll = setInterval(onDrain, 25);
+      out.on('drain', onDrain);
+    });
   }
 
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
     this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null, caller: info.caller || null, conversation: info.conversation || null });
-    this.render();
+    this.requestRender();
   }
 
   onRequestRouted(id, info) {
@@ -624,7 +711,8 @@ export class TUI {
     appendEventLog(msg);
     this.log.unshift({ t: timestamp(), msg });
     if (this.log.length > 200) this.log.length = 200;
-    if (this.running) this.render();
+    // Scheduled, not drawn: a burst of N lines is ONE frame (was N full screens).
+    this.requestRender();
   }
 
   // ── input handling ─────────────────────────────────
@@ -660,7 +748,7 @@ export class TUI {
         .split('')
         .filter(c => c >= ' ' && c !== '\x7f')
         .join('');
-      if (typed) { this.inputBuf += typed; this.render(); }
+      if (typed) { this.inputBuf += typed; this.forceRender(); }
       if (nlIdx !== -1) { this._pendingPaste = ''; return this._key('enter'); }
       return;
     }
@@ -684,7 +772,7 @@ export class TUI {
       case 'input':  this._keyInput(k); break;
       case 'confirm': this._keyConfirm(k); break;
     }
-    this.render();
+    this.forceRender();
   }
 
   _keyNormal(k) {
@@ -756,14 +844,14 @@ export class TUI {
       if (!this.checkNow) { this._addLog('Update check unavailable on this worker'); return; }
       if (this.updateBusy) return;                       // already running
       this.updateBusy = 'Checking npm…';
-      this.render();
+      this.forceRender();
       Promise.resolve(this.checkNow())
         .catch(() => {})
         .finally(() => {
           // If an update was found+applied, the seamless reload replaces this worker and
           // this never renders. Otherwise report the outcome in place.
           this.updateBusy = null;
-          if (this.mode === 'updates') this.render();
+          if (this.mode === 'updates') this.forceRender();
         });
     } else if (k === 't') {
       this._toggleAutoUpdate();
@@ -1000,7 +1088,7 @@ export class TUI {
     const looksLikeSecretName = /^[A-Z][A-Z0-9_-]{2,60}$/.test(input) && !input.includes('.');
     if (!looksLikeSecretName) return input;   // a pasted key
     this._addLog(`Resolving GCP secret "${input}"…`);
-    this.render();
+    this.forceRender();
     try {
       const { resolveSecret } = await import('../secret-resolver.js');
       const v = await resolveSecret(input);
@@ -1102,7 +1190,7 @@ export class TUI {
     this.mode = 'accounts';
     if (secretName) this._addLog(`Resolving secret "${secretName}" from GCP…`);
     else this._addLog(`Adding "${name}" with direct API key…`);
-    this.render();
+    this.forceRender();
     try {
       let token = null;
       if (secretName) {
@@ -1504,7 +1592,7 @@ export class TUI {
   // it's a RE-AUTH in place (revives a dead-refresh/reauth account), not a duplicate.
   async _doLogin() {
     const wasRunning = this.running;
-    if (wasRunning) this.stop();
+    if (wasRunning) await this.handOff();   // r2 B2: bounded flush + exit sequence before the prompt
     // Mute the console-log MIRROR to stdout during the interactive prompt so routing
     // logs (console.log, e.g. the glm-fallback 429 churn) don't flood over the readline
     // "Name this account" prompt. The prompts + errors use process.stdout.write, which
@@ -1997,9 +2085,30 @@ export class TUI {
 
   // ── rendering ──────────────────────────────────────
 
+  /** Draw on the next tick at the latest — N calls inside one tick draw ONE frame
+   *  (2026-11-12: every log line used to redraw the full screen synchronously and the
+   *  pool froze on a terminal that fell behind). */
+  requestRender() {
+    if (!this.running || this._renderTimer) return;
+    const wait = Math.max(0, RENDER_MIN_INTERVAL_MS - (Date.now() - this._lastRenderAt));
+    this._renderTimer = setTimeout(() => {
+      this._renderTimer = null;
+      this.render();
+    }, wait);
+    this._renderTimer.unref?.();
+  }
+
+  /** Draw NOW (keystroke, resize, takeover): the user is waiting on this frame. */
+  forceRender() {
+    if (!this.running) return;
+    if (this._renderTimer) { clearTimeout(this._renderTimer); this._renderTimer = null; }
+    this._forceNext = true;
+    this.render();
+  }
+
   render() {
     if (!this.running) return;
-    // Guard against re-entry: clearing an expired quota logs, and _addLog calls
+    // Guard against re-entry: clearing an expired quota logs, and _addLog schedules
     // render() again — without this the nested call would render twice.
     if (this._rendering) return;
     this._rendering = true;
@@ -2018,7 +2127,7 @@ export class TUI {
     const H = process.stdout.rows || 24;
 
     if (W < 40 || H < 8) {
-      process.stdout.write(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
+      this._writeScreen(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
       return;
     }
 
@@ -2288,15 +2397,33 @@ export class TUI {
   }
 
   /** Full-screen buffer write: cursor home, H rows fitted to W, then hide the cursor
-   *  (shown only in input mode). */
+   *  (shown only in input mode). The ONLY frame writer: it coalesces (an unchanged
+   *  frame is skipped unless forced / REPAINT_MS-old) and never writes into a terminal
+   *  that has not drained the last frame — it owes one render on 'drain' instead
+   *  (2026-11-12 freeze fix). Memory stays bounded: the stream's own high-water mark
+   *  stops us, and at most one frame is owed. */
   _writeScreen(lines, W, H) {
-    let buf = `${ESC}H`;
-    for (let i = 0; i < H; i++) {
-      buf += fitLine(lines[i] || '', W);
-      if (i < H - 1) buf += '\r\n';
+    let buf;
+    if (typeof lines === 'string') {
+      buf = lines;   // pre-built screen (e.g. "Terminal too small")
+    } else {
+      buf = `${ESC}H`;
+      for (let i = 0; i < H; i++) {
+        buf += fitLine(lines[i] || '', W);
+        if (i < H - 1) buf += '\r\n';
+      }
+      // Show cursor only in input mode
+      buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
     }
-    // Show cursor only in input mode
-    buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
+    this._lastRenderAt = Date.now();
+    if (!this._forceNext && this._lastFrame === buf && Date.now() - this._lastFullWriteAt < REPAINT_MS) return;
+    if (this._nb && process.stdout.writableNeedDrain) {
+      if (!this._drainArmed) { this._drainArmed = true; process.stdout.once('drain', this._onDrain); }
+      return;   // frame owed: written once, on 'drain'
+    }
+    this._forceNext = false;
+    this._lastFrame = buf;
+    this._lastFullWriteAt = Date.now();
     process.stdout.write(buf);
   }
 

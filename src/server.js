@@ -1145,9 +1145,20 @@ async function forwardRequest(
         : err?.linkBody ? 'link_idle'
         : err?.name === 'AbortError' ? 'link_ttfb'
           : 'pool_link_unreachable';
-      finishLink({ status: 502, error: 'pool_link_unreachable', scope: 'request' });
+      // D4 split (2026-11-12): a client leaving after output started says nothing about
+      // the link either — neutral. A LINK-transport fault is booked as a link drop, not
+      // a failure of the cloud row behind it.
+      if (linkClientGone) {
+        finishLink({ success: false, neutral: true, error: linkKind });
+      } else {
+        finishLink({ status: 502, error: linkKind, scope: 'request', linkFault: true });
+      }
       excludedIndexes.add(account.index);   // P4b: never re-pick a row that just failed
-      const linkDetail = `${linkStatus == null ? 'no answer' : `HTTP ${linkStatus}`} after ${heldS}s (${err?.message || err})`;
+      const streamTag = requestInfo.stream ? 'streaming' : 'non-streaming';
+      // A string code (UND_ERR_SOCKET, ECONNRESET) names the fault; DOMException
+      // codes are numbers (AbortError = 20), so fall back to the cause, then the name.
+      const errCode = (typeof err?.code === 'string' && err.code) || err?.cause?.code || err?.name || 'unknown';
+      const linkDetail = `${linkStatus == null ? 'no answer' : `HTTP ${linkStatus}`} after ${heldS}s (${err?.message || err}) [${errCode}, ${streamTag}]`;
       if (!clientHasRealBytes(res, requestInfo)) {
         if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
           logFailedAttempt(account.name, linkKind, linkDetail, 'moved');

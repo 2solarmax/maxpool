@@ -519,7 +519,8 @@ test('R3-3: a link that answers headers then goes silent is cut at the link idle
     assert.ok(!text.slice(firstReal).includes('event: ping'), 'no ping after the real body');
     const a = attempts(lines);
     assert.equal(a.length, 1, a.join('\n'));
-    assert.match(a[0], /\(link_idle\) on ".* ☁" — HTTP 200 after [\d.]+s \(link body idle timeout\) → moved$/);
+    // D6 (2026-11-12): the line also names the error code and the stream flag.
+    assert.match(a[0], /\(link_idle\) on ".* ☁" — HTTP 200 after [\d.]+s \(link body idle timeout\) \[UPSTREAM_IDLE, streaming\] → moved$/);
     assert.deepEqual(am.accounts.map(x => x.inFlight), am.accounts.map(() => 0), 'every lease released');
   } finally {
     if (prev === undefined) delete process.env.MAXPOOL_LINK_IDLE_MS; else process.env.MAXPOOL_LINK_IDLE_MS = prev;
