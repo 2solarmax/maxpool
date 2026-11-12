@@ -69,6 +69,23 @@ export async function reclaimRawMode({ stdin = process.stdin, stdout = process.s
   return false;
 }
 
+/**
+ * reclaimRawMode + the update-window measurement (release B, B11): says how long the new
+ * worker took to take the terminal back, or that it was deferred to the terminal's drain
+ * (and how long that took when it finally happened). `now`/`log` are injectable for tests.
+ */
+export async function reclaimRawModeLogged({ stdout = process.stdout, log = m => console.log(`[Maxpool] ${m}`), now = Date.now, ...rest } = {}) {
+  const t0 = now();
+  const done = await reclaimRawMode({ stdout, ...rest });
+  if (done) {
+    log(`reload: terminal reclaimed in ${now() - t0}ms`);
+  } else {
+    log('reload: terminal reclaim deferred to drain');
+    stdout.once('drain', () => log(`reload: terminal reclaimed after drain in ${now() - t0}ms`));
+  }
+  return done;
+}
+
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
 const vw = s => strip(s).length;
@@ -735,7 +752,9 @@ export class TUI {
       ttfbMs = r.firstByteAt - r.started;
     }
     const ttfbTag = ttfbMs != null ? ` ttfb=${(Math.max(0, ttfbMs) / 1000).toFixed(1)}s` : '';
-    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${provTag}${cvTag}${ttfbTag}`);
+    // B8: ' ns' = a non-streaming request (strict false: the oauth relay carries no shape, so no tag).
+    const nsTag = info.stream === false ? ' ns' : '';
+    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${nsTag}${provTag}${cvTag}${ttfbTag}`);
   }
 
   _addLog(msg) {

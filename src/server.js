@@ -66,6 +66,113 @@ const isNetworkCode = c => Boolean(c) && NETWORK_ERROR_CODES.has(c);
 const NETWORK_SOAK_NONSTREAM_MS = Math.max(5_000,
   Number(process.env.MAXPOOL_NETWORK_SOAK_NONSTREAM_MS) || 45_000);
 const QUEUE_KEEPALIVE = 'event: ping\ndata: {}\n\n';
+
+// PER-REQUEST DEADLINE, NON-STREAMING (release B, 2026-11-13). A non-streaming request has
+// no keep-alive, so the CLIENT's own timer decides when it is abandoned. maxpool used to
+// wait a flat 120s per hop and chain hops without limit, serving into sockets the client had
+// already closed. When the client tells us how long it will wait (X-Stainless-Timeout, or the
+// pool header from the Mac), every wait is bounded by ONE deadline anchored at arrival.
+// A request with no usable patience header gets NO deadline: today's behaviour, never a new cut-off.
+const NONSTREAM_HOP_CAP_MS = 290_000;      // undici's own headers/body timeout is 300s: nothing waits past this
+const NONSTREAM_FLOOR_PATIENCE_MS = 15_000; // usable patience is never below 15s once the margin is taken
+const MAX_PATIENCE_MS = 3_600_000;
+const posMsFromEnv = (name, dflt) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : dflt;
+};
+/** Live knob values (env read per call so a two-pool test can inject a small cap). */
+function deadlineKnobs() {
+  return {
+    NONSTREAM_MARGIN_MS: posMsFromEnv('MAXPOOL_NONSTREAM_MARGIN_MS', 15_000),       // client header: leave this much before its timer
+    POOL_TRANSIT_MARGIN_MS: 3_000,                                                  // pool header: the Mac already took its margin
+    NONSTREAM_MIN_MOVE_MS: posMsFromEnv('MAXPOOL_NONSTREAM_MIN_MOVE_MS', 60_000),   // below this, never re-send to another account
+    LINK_RETURN_MARGIN_MS: posMsFromEnv('MAXPOOL_LINK_RETURN_MARGIN_MS', 10_000),   // G: the cloud's answer must travel back inside the Mac's wait
+    LINK_HOP_CAP_MS: Math.min(posMsFromEnv('MAXPOOL_LINK_HOP_CAP_MS', NONSTREAM_HOP_CAP_MS), NONSTREAM_HOP_CAP_MS),
+    UPSTREAM_BODY_MS,
+  };
+}
+// A plain positive decimal. `Number('')` is 0, `Number('abc')` is NaN, `Number('Infinity')`
+// is Infinity and `setTimeout(NaN)` fires in 1ms: every one of them must mean "no header".
+const PLAIN_POSITIVE_NUMBER = /^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+function parsePositiveHeader(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!PLAIN_POSITIVE_NUMBER.test(s)) return null;
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+/** The client's patience: first VALID of the pool header (ms) → X-Stainless-Timeout (s) →
+ *  x-stainless-read-timeout (s). null = unknown, i.e. no deadline. */
+function parsePatience(headers = {}) {
+  const k = deadlineKnobs();
+  const pool = parsePositiveHeader(headerValue(headers, 'x-maxpool-deadline-ms'));
+  if (pool != null) return { ms: Math.min(pool, MAX_PATIENCE_MS), source: 'pool', poolSupplied: true };
+  for (const [name, source] of [['x-stainless-timeout', 'stainless-timeout'], ['x-stainless-read-timeout', 'stainless-read-timeout']]) {
+    const secs = parsePositiveHeader(headerValue(headers, name));
+    if (secs == null) continue;
+    const floor = k.NONSTREAM_MARGIN_MS + NONSTREAM_FLOOR_PATIENCE_MS;
+    return { ms: Math.min(Math.max(secs * 1000, floor), MAX_PATIENCE_MS), source, poolSupplied: false };
+  }
+  return null;
+}
+/** deadlineAt for a request that arrived at `arrivedAt`; null when the client gave no usable patience. */
+function computeDeadline(headers, arrivedAt) {
+  const p = parsePatience(headers);
+  if (!p) return null;
+  const k = deadlineKnobs();
+  const usableMs = p.poolSupplied
+    ? Math.max(p.ms - k.POOL_TRANSIT_MARGIN_MS, 1_000)
+    : p.ms - k.NONSTREAM_MARGIN_MS;
+  return { deadlineAt: arrivedAt + usableMs, patienceMs: p.ms, source: p.source, poolSupplied: p.poolSupplied };
+}
+/** Time left on a non-streaming request's deadline. Infinity = no deadline (streaming, or a header-less client). */
+function nonStreamRemainingMs(requestInfo = {}) {
+  if (requestInfo.stream || requestInfo.deadlineAt == null) return Infinity;
+  return requestInfo.deadlineAt - Date.now();
+}
+/** First-byte wait for one DIRECT hop: min(the scaled/flat wait, remaining, 290s) — the outer
+ *  min explicit here because scaledTtfbMs floors at 120s and clientWaitCeilingMs is null for non-streaming. */
+function nonStreamFirstByteWait(requestInfo, waitMs) {
+  const remaining = nonStreamRemainingMs(requestInfo);
+  if (remaining === Infinity) return { ms: waitMs, deadlineBound: false };
+  const other = Math.min(waitMs, NONSTREAM_HOP_CAP_MS);
+  return remaining <= other ? { ms: Math.max(1, Math.floor(remaining)), deadlineBound: true } : { ms: other, deadlineBound: false };
+}
+/** Non-streaming body-read wait: min(UPSTREAM_BODY_MS, remaining). */
+function nonStreamBodyWait(requestInfo, bodyMs) {
+  const remaining = nonStreamRemainingMs(requestInfo);
+  if (remaining === Infinity) return { ms: bodyMs, deadlineBound: false };
+  return remaining <= bodyMs ? { ms: Math.max(1, Math.floor(remaining)), deadlineBound: true } : { ms: bodyMs, deadlineBound: false };
+}
+/** ONE NUMBER for a link hop: linkWait = min(remaining − G, cap) (never below min(15s, remaining)),
+ *  header = linkWait − G. So header + G ≤ linkWait always: the cloud's whole hop chain ends
+ *  inside this ONE Mac link wait. null = no usable time left (never arm a 0ms timer). */
+function computeLinkHop(remainingMs, { capMs, marginMs } = {}) {
+  const k = deadlineKnobs();
+  const G = marginMs ?? k.LINK_RETURN_MARGIN_MS;
+  const cap = capMs ?? k.LINK_HOP_CAP_MS;
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return null;
+  const linkWaitMs = Math.floor(Math.min(cap, Math.max(remainingMs - G, Math.min(15_000, remainingMs))));
+  const headerMs = linkWaitMs - G;
+  if (headerMs < 1_000) return null;
+  return { linkWaitMs, headerMs, deadlineBound: remainingMs - G <= cap };
+}
+/** The answer for a request whose client patience ran out: retryable by every SDK (5xx). */
+function deadlineErrorPayload() {
+  return {
+    type: 'error',
+    error: {
+      type: 'timeout_error',
+      message: 'This request ran out of time before Claude answered. Sending the message again normally works.',
+    },
+  };
+}
+/** 504 for a deadline expiry. The pool-only marker rides ONLY when the request itself carried the pool
+ *  deadline header (an old Mac / header-less request keeps today's answer and never sees it). */
+function sendDeadlineResponse(res, requestInfo) {
+  const headers = requestInfo.deadlinePoolSupplied ? { 'x-maxpool-request-scoped': '1' } : {};
+  sendErrorResponse(res, requestInfo, 504, deadlineErrorPayload(), headers);
+}
 // Account screen shell (served keyless at /maxpool/screen; the page itself prompts
 // for a pool key and reads the key-gated /maxpool/status). Read once at boot.
 const SCREEN_HTML = (() => {
@@ -250,6 +357,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     requestTimeout: Math.max(1_000, Number(process.env.MAXPOOL_REQUEST_TIMEOUT_MS) || 300_000),
     connectionsCheckingInterval: Math.max(100, Number(process.env.MAXPOOL_CONNECTIONS_CHECK_MS) || 30_000),
   }, async (req, res) => {
+    // B1: the deadline is anchored HERE, at the request event, before auth and body buffering.
+    const arrivedAt = Date.now();
     try {
       // Disable Nagle on the client socket: flush each SSE event immediately instead
       // of coalescing small writes into bursts. Smooths streaming cadence toward the
@@ -503,6 +612,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // THIS account, from lease.startedAt.) Was never set, so every direct-path
         // client-gone line read 0.0s.
         requestInfo.startedAt = Date.now();
+        // B1: non-streaming only; a request with no usable patience header gets NO deadline.
+        if (!requestInfo.stream) {
+          const dl = computeDeadline(req.headers, arrivedAt);
+          if (dl) {
+            requestInfo.deadlineAt = dl.deadlineAt;
+            requestInfo.deadlineSource = dl.source;
+            requestInfo.deadlinePoolSupplied = dl.poolSupplied;
+          }
+        }
         const maxQueuedBodyBytes = queueConfig.maxQueuedBodyBytes == null
           ? Infinity
           : Math.max(0, Number(queueConfig.maxQueuedBodyBytes) || 0);
@@ -579,6 +697,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           // request's heartbeat commits writes LONG before upstream answers.
           firstUpstreamByteAt: requestInfo?._firstUpstreamByteAt ?? null,
           upstreamForwardStartAt: requestInfo?._upstreamForwardStartAt ?? null,
+          // B8: makes the non-streaming share measurable. null = no request shape was ever parsed.
+          stream: requestInfo?.method != null ? Boolean(requestInfo.stream) : null,
         });
       }
     } catch (err) {
@@ -808,6 +928,7 @@ async function forwardRequest(
   // waiter instead of preferentially jumping ahead of the FIFO for the rest of
   // this request's failover chain.
   requestInfo.queueAdmitted = false;
+  requestInfo._clientRes = res;   // B10: lets the shared chokepoints see the client socket
 
   // Abort the upstream fetch and release the lease if the CLIENT disconnects during
   // the pre-response window (token refresh + connect + waiting for the upstream's
@@ -935,6 +1056,7 @@ async function forwardRequest(
       // locally went live remotely). The remote pool owns its own accounts.
       if (/^x-maxpool-(zai|kimi)-/.test(lk)) continue;
       if (lk === 'x-maxpool-pin-account') continue;   // M4: only this pool sets a pin
+      if (lk === 'x-maxpool-deadline-ms') continue;   // B4: ONE number — this hop computes its own below
       linkHeaders[k] = v;
     }
     linkHeaders[HOP_HEADER] = String(hop);
@@ -966,6 +1088,21 @@ async function forwardRequest(
       if (linkDone) return; linkDone = true;
       accountManager.releaseAccount(lease, outcome);
     };
+    // B4 (non-streaming with a deadline): linkWait = min(remaining − G, 290s); the cloud is told
+    // linkWait − G, so its whole hop chain ends inside this ONE wait. No time left → 504, no call.
+    let linkHop = null;
+    if (!requestInfo.stream && requestInfo.deadlineAt != null) {
+      linkHop = computeLinkHop(nonStreamRemainingMs(requestInfo));
+      if (!linkHop) {
+        finishLink({ neutral: true, error: 'deadline', kind: 'deadline' });
+        detachLinkClose();
+        ctx.status = 504;
+        logFailedAttempt(account.name, 'deadline', 'no time left before the client gives up', 'surfaced');
+        sendDeadlineResponse(res, requestInfo);
+        return;
+      }
+      linkHeaders['x-maxpool-deadline-ms'] = String(linkHop.headerMs);
+    }
     try {
       // P4a: a blackholed link must not hang the request (and hold a lease) for
       // minutes — bound time-to-headers like the direct path's TTFB guard. GLM
@@ -977,7 +1114,7 @@ async function forwardRequest(
       // clears this timer for every HEALTHY link, so a scaled wait only ever ran against
       // a dead/blackholed tunnel — stretching its detection from 120s to minutes. The
       // big-prompt first-byte timeouts measured were all on the direct path.
-      const linkTtfbMs = Math.max(15_000, Number(process.env.MAXPOOL_LINK_TTFB_MS) || UPSTREAM_TTFB_MS);
+      const linkTtfbMs = linkHop ? linkHop.linkWaitMs : Math.max(15_000, Number(process.env.MAXPOOL_LINK_TTFB_MS) || UPSTREAM_TTFB_MS);
       const linkCtl = new AbortController();
       const linkTtfb = setTimeout(() => linkCtl.abort(), linkTtfbMs);
       // P2: the link path had NO pre-headers keep-alive — a streaming client sat on a
@@ -1048,6 +1185,22 @@ async function forwardRequest(
         if (queued) return;
         ctx.status = upRes.status;
         sendErrorResponse(res, requestInfo, upRes.status, { type: 'error', error: { type: 'overloaded_error', message: `Team pool account "${account.name}" is at capacity` } });
+        return;
+      }
+      // B7: the cloud ran out of the deadline THIS request gave it (504 + request-scoped). It says
+      // nothing about the cloud row or the link: release NEUTRAL (no cooldownUntil, no failed count,
+      // no streak) and treat it like any other request-scoped miss — try another route only if time remains.
+      if (account.remote && upRes.status === 504 && upRes.headers.get('x-maxpool-request-scoped') === '1' && !clientHasRealBytes(res, requestInfo)) {
+        const errorText = await readErrorBody(upRes);
+        finishLink({ neutral: true, error: 'deadline', kind: 'deadline' });
+        excludedIndexes.add(account.index);
+        if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+          logFailedAttempt(account.name, 'remote-504', 'linked pool ran out of the request deadline', 'moved');
+          detachLinkClose();
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+        }
+        logFailedAttempt(account.name, 'remote-504', 'linked pool ran out of the request deadline; no time to move', 'surfaced');
+        sendErrorBody(res, requestInfo, 504, errorText, upRes.headers);
         return;
       }
       // A request released from the queue already holds a committed keep-alive stream.
@@ -1135,6 +1288,17 @@ async function forwardRequest(
         clearQueueHeartbeat(requestInfo);
         console.log(`[Maxpool] Client left after ${heldS}s on "${account.name}" (link, still waiting) — released, not retried`);
         logFailedAttempt(account.name, 'client_cancelled', `client left after ${heldS}s, nothing sent`, 'released-cancel');
+        return;
+      }
+      // B12: the wait was cut by the CLIENT'S deadline (not the per-hop cap, not a dead link): neither an
+      // account fault nor a link fault — release neutral, and answer a retryable 504 (nothing left to move on).
+      // (A no-headers AbortError that is not a client leaving can only be this hop's timer.)
+      if (linkHop?.deadlineBound && err?.name === 'AbortError' && !linkClientGone && linkStatus == null && !clientHasRealBytes(res, requestInfo)) {
+        finishLink({ neutral: true, error: 'deadline', kind: 'deadline' });
+        detachLinkClose();
+        ctx.status = 504;
+        logFailedAttempt(account.name, 'deadline', `no answer after ${heldS}s (client patience), non-streaming`, 'surfaced');
+        sendDeadlineResponse(res, requestInfo);
         return;
       }
       // Everything that reaches this catch is request-scoped (D4): a remote 429/503 is
@@ -1239,10 +1403,27 @@ async function forwardRequest(
   // this fixed clock, so a long healthy stream is never cut.
   const ttfbController = new AbortController();
   const ttfbCeilingMs = clientWaitCeilingMs(requestInfo, queueConfig);
-  const ttfbMs = scaledTtfbMs(UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, requestInfo.bodyBytes, ttfbCeilingMs);
+  let ttfbMs = scaledTtfbMs(UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, requestInfo.bodyBytes, ttfbCeilingMs);
+  // B2/N-3: a non-streaming request with a deadline never waits past it (nor past 290s, undici's own
+  // bound), and with no time left never reaches upstream at all (never arm a 0ms timer).
+  let ttfbDeadlineBound = false;
+  if (!requestInfo.stream && requestInfo.deadlineAt != null) {
+    if (nonStreamRemainingMs(requestInfo) <= 0) {
+      res.off('close', onClientClose);
+      accountManager.relinquishUpstreamProbe?.(lease);
+      accountManager.releaseAccount(lease, { neutral: true, error: 'deadline', kind: 'deadline' });
+      ctx.status = 504;
+      logFailedAttempt(account.name, 'deadline', 'no time left before the client gives up', 'surfaced');
+      sendDeadlineResponse(res, requestInfo);
+      return;
+    }
+    const w = nonStreamFirstByteWait(requestInfo, ttfbMs);
+    ttfbMs = w.ms;
+    ttfbDeadlineBound = w.deadlineBound;
+  }
   noteScaledTtfb(requestInfo, account.name, 'direct', ttfbMs, UPSTREAM_TTFB_MS, ttfbCeilingMs);
   const ttfbTimer = setTimeout(
-    () => ttfbController.abort(Object.assign(new Error('upstream TTFB timeout'), { code: 'UPSTREAM_TTFB' })),
+    () => ttfbController.abort(Object.assign(new Error('upstream TTFB timeout'), { code: ttfbDeadlineBound ? 'UPSTREAM_DEADLINE' : 'UPSTREAM_TTFB' })),
     ttfbMs,
   );
   ttfbTimer.unref?.();
@@ -2188,18 +2369,35 @@ async function forwardRequest(
       const bodyP = upstreamRes.arrayBuffer();
       bodyP.catch(() => {});
       let bodyTimer;
+      // B3: bounded by min(UPSTREAM_BODY_MS, remaining) when the request carries a deadline.
+      const bodyWait = nonStreamBodyWait(requestInfo, UPSTREAM_BODY_MS);
       const bodyTimeout = new Promise((_, reject) => {
         bodyTimer = setTimeout(
-          () => reject(Object.assign(new Error('upstream body timeout'), { code: 'UPSTREAM_BODY' })),
-          UPSTREAM_BODY_MS,
+          () => reject(Object.assign(new Error('upstream body timeout'), { code: bodyWait.deadlineBound ? 'UPSTREAM_DEADLINE' : 'UPSTREAM_BODY' })),
+          bodyWait.ms,
         );
         bodyTimer.unref?.();
       });
+      // B10: the pre-response close listener was dropped when the headers arrived, so during this
+      // body read nobody watches the client. Without this, a client that left mid-read still gets
+      // a second upstream call when the read fails (the move path re-sends for a dead socket).
+      let onBodyClientClose;
+      const clientLeft = new Promise((_, reject) => {
+        const gone = () => reject(Object.assign(new Error('client closed during body read'), { code: 'CLIENT_GONE_BODY' }));
+        if (res.destroyed || res.closed) { gone(); return; }
+        onBodyClientClose = gone;
+        res.once('close', onBodyClientClose);
+      });
+      clientLeft.catch(() => {});
       let arr;
       try {
-        arr = await Promise.race([bodyP, bodyTimeout]);
+        arr = await Promise.race([bodyP, bodyTimeout, clientLeft]);
+      } catch (e) {
+        if (e?.code === 'CLIENT_GONE_BODY') { try { await upstreamRes.body?.cancel(); } catch { /* already closed */ } }
+        throw e;
       } finally {
         clearTimeout(bodyTimer);
+        if (onBodyClientClose) res.off('close', onBodyClientClose);
       }
       const buf = Buffer.from(arr);
       extractUsageFromBody(buf, account.index, accountManager, requestInfo);
@@ -2277,6 +2475,32 @@ async function forwardRequest(
         + `(${gotOutput ? 'mid-response — output already sent' : 'still waiting, nothing sent'})`);
       logFailedAttempt(account.name, 'client_cancelled', `client left after ${(heldMs / 1000).toFixed(1)}s (${gotOutput ? 'mid-response' : 'still waiting'})`, 'released-cancel');
       releaseOnClientGone();
+      return;
+    }
+    // B10: the client left during the non-streaming BODY read. Not an account fault, nothing to move,
+    // nothing to write to: release neutral and stop (the move path below would fetch on a dead socket).
+    if (err?.code === 'CLIENT_GONE_BODY') {
+      const heldMs = Date.now() - (requestInfo.startedAt || Date.now());
+      console.log(`[Maxpool] Client left after ${(heldMs / 1000).toFixed(1)}s on "${account.name}" (during the response body read) — released, not retried`);
+      logFailedAttempt(account.name, 'client_cancelled', `client left after ${(heldMs / 1000).toFixed(1)}s (body read)`, 'released-cancel');
+      accountManager.relinquishUpstreamProbe?.(lease);
+      accountManager.releaseAccount(lease, { neutral: true, error: 'client_cancelled', kind: 'client_cancelled' });
+      clearQueueHeartbeat(requestInfo);
+      accountManager.removeQueuedRequest?.(requestInfo);
+      return;
+    }
+    // B12: the wait was cut by the CLIENT'S deadline — neither an account fault (no markTransientFailure
+    // streak) nor a link fault. Release neutral and answer a retryable 504; nothing is moved or re-sent.
+    if (err.code === 'UPSTREAM_DEADLINE') {
+      accountManager.relinquishUpstreamProbe?.(lease);
+      accountManager.releaseAccount(lease, { neutral: true, error: 'deadline', kind: 'deadline' });
+      ctx.status = 504;
+      logFailedAttempt(account.name, 'deadline', `no answer after ${heldSeconds(lease)}s (client patience), non-streaming`, 'surfaced');
+      if (logDir) {
+        logSections.push(`=== DEADLINE ===\n${err.message}`);
+        writeRequestLog(logDir, reqId, logSections);
+      }
+      sendDeadlineResponse(res, requestInfo);
       return;
     }
     // undici reports every socket/DNS/TLS failure as the bare string "fetch failed" and
@@ -2475,6 +2699,9 @@ function noteScaledTtfb(requestInfo, accountName, path, waitMs, floorMs, ceiling
  * second wait can still end inside the client's patience. Direct path only.
  */
 function retrySameEligible(account, requestInfo, res, queueConfig = {}) {
+  // B5: a non-streaming request is never retried on the same account — the second wait is a second
+  // full hop of silence behind a client that cannot be told we are still working.
+  if (!requestInfo.stream) return false;
   if (requestInfo.sameAccountRetried) return false;
   if ((requestInfo.bodyBytes || 0) < BIG_PROMPT_BYTES) return false;
   if (!account || account.status === 'throttled' || account.status === 'error'
@@ -2526,7 +2753,25 @@ function isProviderAuthStatus(status) {
 }
 
 function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = new Set()) {
+  // B10: ONE client-gone check in the same chokepoint — never pick a route to re-send for a client that left.
+  if (clientAlreadyGone(requestInfo)) {
+    if (!requestInfo._clientGoneLogged) {
+      requestInfo._clientGoneLogged = true;
+      console.log('[Maxpool] Client already left — not re-sending to another account');
+      logFailedAttempt('-', 'client_cancelled', 'client left before a re-send', 'released-cancel');
+    }
+    return false;
+  }
+  // B6: ONE check in the chokepoint every re-send site falls through — a non-streaming request with
+  // under the minimum time left is not moved to another account (a fresh hop cannot finish).
+  if (nonStreamRemainingMs(requestInfo) < deadlineKnobs().NONSTREAM_MIN_MOVE_MS) return false;
   return accountManager.hasAvailableRoute?.(requestInfo, excludedIndexes) || false;
+}
+
+/** B10: has the client socket of this request closed? (requestInfo carries its res; set at forwardRequest entry.) */
+function clientAlreadyGone(requestInfo = {}) {
+  const r = requestInfo._clientRes;
+  return Boolean(r && (r.destroyed || r.closed));
 }
 
 function formatRetryDuration(seconds) {
@@ -2738,7 +2983,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { hasEligibleRoute, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -3482,7 +3727,7 @@ async function queueAndRetryInner(
   onGiveUp = null, onHold = null,
 ) {
   const giveUp = (msg) => { onGiveUp?.(); return finishQueuedStreamIfNeeded(res, requestInfo, msg); };
-  if (!queueConfig.enabled || !canQueueBufferedBody || (res.headersSent && !requestInfo.queueHeartbeatActive) || res.destroyed) {
+  if (!queueConfig.enabled || !canQueueBufferedBody || (res.headersSent && !requestInfo.queueHeartbeatActive) || res.destroyed || res.closed) {
     if (queueConfig.enabled && !canQueueBufferedBody && requestInfo.queueBlockedReason) {
       console.log(`[Maxpool] Not queueing request: ${requestInfo.queueBlockedReason}`);
     }
@@ -3577,7 +3822,7 @@ async function queueAndRetryInner(
   const streamClientToleranceMs = Number.isFinite(requestInfo.clientToleranceMs)
     ? requestInfo.clientToleranceMs
     : Math.max(0, Number(queueConfig.streamClientToleranceMs) || 0);
-  const queueWindowMs = computeQueueWindowMs({
+  let queueWindowMs = computeQueueWindowMs({
     cause,
     stream: Boolean(requestInfo.stream),
     retryPlanCause: retryPlan.cause,
@@ -3589,6 +3834,13 @@ async function queueAndRetryInner(
     isCountTokens: Boolean(requestInfo.isCountTokens),
     countTokensMaxWaitMs,
   });
+
+  // B6: a non-streaming hold is capped at the time the client still has; none left = give up now.
+  const deadlineRemainingMs = nonStreamRemainingMs(requestInfo);
+  if (deadlineRemainingMs !== Infinity) {
+    if (deadlineRemainingMs <= 0) return giveUp(honestMessage);
+    queueWindowMs = Math.min(queueWindowMs, deadlineRemainingMs);
+  }
 
   if (queueWindowMs <= 0) return giveUp(honestMessage);
 
@@ -4358,9 +4610,29 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   // upstream headers and the first body chunk can still fail over (clientHasRealBytes
   // stays false) and the client's idle watchdog stays fed. realWrite stops it right
   // before the first real write, so no ping can land between live SSE events (Bug A).
+  // B9: a SCRUBBED provider stream drops every thinking event, so a long GLM think leaves the client
+  // (and a linked Mac's idle timer) with nothing for tens of seconds — Claude Code reads that as a
+  // dead stream. Once the first real byte is out, and only while a scrubber is active, keep a
+  // keep-alive ping flowing. Safe mid-stream: the scrubber hands realWrite WHOLE events only
+  // (provider-thinking-scrub.js push/event), so a ping can only land between events. Never armed
+  // before the first real write (the model-echo/refusal holds `continue` ahead of realWrite, and a
+  // ping before writeHead would commit default headers).
+  let scrubPingTimer = null;
+  let scrubPingStopped = false;
+  const armScrubPing = () => {
+    if (!scrubber || scrubPingTimer || scrubPingStopped || res.destroyed) return;
+    const ms = Math.max(100, Number(process.env.MAXPOOL_SCRUB_PING_MS) || 3000);
+    scrubPingTimer = setInterval(() => {
+      if (res.destroyed || res.writableEnded) return;
+      try { res.write('event: ping\ndata: {"type":"ping"}\n\n'); } catch { /* client gone */ }
+    }, ms);
+    scrubPingTimer.unref?.();
+  };
   const realWrite = (chunk) => {
     if (requestInfo.queueHeartbeatActive) clearQueueHeartbeat(requestInfo);
-    return res.write(chunk);
+    const ok = res.write(chunk);
+    armScrubPing();
+    return ok;
   };
 
   // Client left mid-stream: the caller drops its disconnect-abort once headers
@@ -4573,6 +4845,9 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
     if (err?.code === 'REFUSAL_RETRY') refusalRerouting = true;
     throw err;
   } finally {
+    // B9: stop the keep-alive before anything else in the teardown, and never re-arm it.
+    scrubPingStopped = true;
+    if (scrubPingTimer) { clearInterval(scrubPingTimer); scrubPingTimer = null; }
     // SAFEGUARD-REFUSAL HOLD last-resort flush. A stream can end while the hold is
     // still undecided — a `usage`-only stream (message_delta with no content blocks
     // and no message_stop) reaches `done` having never produced a decisive event, and

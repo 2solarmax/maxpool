@@ -119,18 +119,18 @@ test('T5: the scaled wait clamps at the client patience ceiling', () => {
   assert.equal(scaledTtfbMs(120_000, 0.6, 640_000, null), 120_000);
 });
 
-test('T7/T8 unit: retry-same eligibility — size threshold, once, account health, real bytes', () => {
+test('T7/T8 unit: retry-same eligibility — size threshold, once, account health, real bytes (streaming; B5 makes non-streaming never eligible)', () => {
   const res = { headersSent: false };
   const ok = { status: 'active' };
   assert.equal(ttfbKnobs().BIG_PROMPT_BYTES, 250_000);
-  assert.equal(retrySameEligible(ok, { bodyBytes: 250_000 }, res), true, 'at the threshold');
-  assert.equal(retrySameEligible(ok, { bodyBytes: 249_999 }, res), false, 'below the threshold');
-  assert.equal(retrySameEligible(ok, { bodyBytes: BIG, sameAccountRetried: true }, res), false, 'once per request');
-  assert.equal(retrySameEligible({ status: 'throttled' }, { bodyBytes: BIG }, res), false, 'throttled');
-  assert.equal(retrySameEligible({ status: 'error' }, { bodyBytes: BIG }, res), false, 'auth-dead');
-  assert.equal(retrySameEligible({ status: 'active', cooldownUntil: Date.now() + 5000 }, { bodyBytes: BIG }, res), false, 'cooling');
-  assert.equal(retrySameEligible(ok, { bodyBytes: BIG }, { headersSent: true }), false, 'real bytes already sent');
-  assert.equal(retrySameEligible(ok, { bodyBytes: BIG, queueHeartbeatActive: true }, { headersSent: true }), true, 'heartbeat-only stream is still retryable');
+  assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: 250_000 }, res), true, 'at the threshold');
+  assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: 249_999 }, res), false, 'below the threshold');
+  assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: BIG, sameAccountRetried: true }, res), false, 'once per request');
+  assert.equal(retrySameEligible({ status: 'throttled' }, { stream: true, bodyBytes: BIG }, res), false, 'throttled');
+  assert.equal(retrySameEligible({ status: 'error' }, { stream: true, bodyBytes: BIG }, res), false, 'auth-dead');
+  assert.equal(retrySameEligible({ status: 'active', cooldownUntil: Date.now() + 5000 }, { stream: true, bodyBytes: BIG }, res), false, 'cooling');
+  assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: BIG }, { headersSent: true }), false, 'real bytes already sent');
+  assert.equal(retrySameEligible(ok, { stream: true, bodyBytes: BIG, queueHeartbeatActive: true }, { headersSent: true }), true, 'heartbeat-only stream is still retryable');
 });
 
 // ---------------------------------------------------------------- T3 (wiring)
@@ -159,8 +159,8 @@ test('T6: big prompt TTFBs once on a1 → retry-same on a1 (not excluded, normal
     atRetry.push({ streak: am.accounts[0].consecutiveFailures, failed: am.accounts[0].failedRequests, inFlight: am.accounts[0].inFlight });
     return acquire(ri, ex);
   };
-  const stub = upstreamStub((tok, n) => (tok === 't1' && n === 1 ? 'hang' : 'ok'));
-  const { lines, status } = await run(am, stub, body(BIG));
+  const stub = upstreamStub((tok, n) => (tok === 't1' && n === 1 ? 'hang' : 'sse'));
+  const { lines, status } = await run(am, stub, body(BIG, true));
   assert.equal(atRetry.length, 2);
   assert.deepEqual(atRetry[1], { streak: 0, failed: 1, inFlight: 0 },
     'released request-scoped: counted as a failed request, no streak (a streak would release every held conversation), lease returned');
@@ -177,8 +177,8 @@ test('T6: big prompt TTFBs once on a1 → retry-same on a1 (not excluded, normal
 test('T6: a second timeout after retry-same falls through to the move path (excluded)', async () => {
   const am = accounts(2);
   const streaks = streakAtAcquire(am);
-  const stub = upstreamStub(tok => (tok === 't1' ? 'hang' : 'ok'));
-  const { lines, status } = await run(am, stub, body(BIG));
+  const stub = upstreamStub(tok => (tok === 't1' ? 'hang' : 'sse'));
+  const { lines, status } = await run(am, stub, body(BIG, true));
   assert.deepEqual(streaks, [0, 0, 0], 'G: both a1 releases (retry-same and move) are streak-neutral');
   assert.equal(status, 200);
   assert.deepEqual(stub.hits, ['t1', 't1', 't2'], 'once on the same account, then moved');
@@ -262,8 +262,8 @@ test('T11 unit: a bare claude (240s) whose first wait ran 240s moves; a cc sessi
     assert.equal(retrySameEligible(ok, at(0), res, { streamClientToleranceMs: 100_000 }), true, 'exactly equal is allowed');
     assert.equal(retrySameEligible(ok, at(1), res, { streamClientToleranceMs: 100_000 }), false, '+1ms is refused');
   } finally { Date.now = realNow; }
-  // non-streaming: no ceiling, no patience rule
-  assert.equal(retrySameEligible(ok, { stream: false, bodyBytes: 640_000, startedAt: Date.now() - 3_600_000 }, res, {}), true);
+  // non-streaming: never retry-same (release B / B5) — whatever the elapsed time
+  assert.equal(retrySameEligible(ok, { stream: false, bodyBytes: 640_000, startedAt: Date.now() }, res, {}), false);
 });
 
 test('T11 wiring: low client patience (16s) → a 12s first wait cannot be repeated → moved, not retry-same', async () => {
@@ -290,8 +290,8 @@ test('#5: retry-same refused by selection prints ONE moved line naming who serve
     if (n === 2) am.accounts[0].inFlight = 0;
     return l;
   };
-  const stub = upstreamStub(tok => (tok === 't1' ? 'hang' : 'ok'));
-  const { lines, status } = await run(am, stub, body(BIG));
+  const stub = upstreamStub(tok => (tok === 't1' ? 'hang' : 'sse'));
+  const { lines, status } = await run(am, stub, body(BIG, true));
   assert.equal(status, 200);
   assert.deepEqual(stub.hits, ['t1', 't2']);
   const a = attempts(lines);
@@ -311,7 +311,7 @@ test('#5: retry-same refused with NO route free → one surfaced line naming the
     return l;
   };
   const stub = upstreamStub(() => 'hang');
-  const { lines } = await run(am, stub, body(BIG));
+  const { lines } = await run(am, stub, body(BIG, true));
   const a = attempts(lines);
   assert.equal(a.length, 1, a.join('\n'));
   assert.match(a[0], /\(UPSTREAM_TTFB\) on "a1" — no first byte after .*; same account refused by selection, no route free; not held → surfaced$/);

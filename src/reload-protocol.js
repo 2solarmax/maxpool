@@ -135,3 +135,9 @@ export async function runReloadBaton({
 // in-process can detect it; the TUI keeps rendering while the kernel line-buffers, so
 // every keystroke (r / q / p) is swallowed. Measured on a real pty 2026-08-07.
 export const MSG_TTY_REASSERT = 'tty-reassert';
+
+/** One log line for the update-window record (release B, B11): when the old worker exited and how. */
+export function describeOldWorkerExit({ swappedAt, exitedAt, killed = false }) {
+  const after = ((exitedAt - swappedAt) / 1000).toFixed(1);
+  return `reload: old worker exited at ${new Date(exitedAt).toISOString()} (${after}s after swap, ${killed ? 'SIGKILL after the drain cap' : 'clean exit'})`;
+}

@@ -42,7 +42,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled } from './oauth.js';
-import { TUI, writeTerminalSync, reclaimRawMode } from './tui.js';
+import { TUI, writeTerminalSync, reclaimRawModeLogged } from './tui.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
@@ -51,7 +51,7 @@ import {
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
   MSG_LISTEN, MSG_RELEASE, MSG_TAKEOVER, MSG_PROBE_READY,
   MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
-  MSG_TTY_REASSERT, MSG_CONN,
+  MSG_TTY_REASSERT, MSG_CONN, describeOldWorkerExit,
 } from './reload-protocol.js';
 
 const args = process.argv.slice(2);
@@ -521,18 +521,23 @@ function reapOldWorker(worker, onExited = () => {}) {
   // SIGKILL only ever reaps a genuinely wedged worker, never cuts a live stream.
   const cap = RELOAD_DRAIN_MS + 30_000;
   let reaped = false;
+  let killed = false;
+  const swappedAt = Date.now();
   // `onExited` fires on BOTH paths (clean exit and SIGKILL): the terminal is clobbered
   // by the exit itself, however that exit came about.
   const finish = () => {
     if (reaped) return;
     reaped = true;
     clearTimeout(timer);
+    // B11: the update-window record — when the old worker actually exited (its exit resets the shared terminal).
+    console.log(`[Maxpool] ${describeOldWorkerExit({ swappedAt, exitedAt: Date.now(), killed })}`);
     try { onExited(); } catch { /* never let the callback break reaping */ }
   };
   const timer = setTimeout(() => {
     if (reaped) return;
     console.error(`[Maxpool] Old worker outlived ${Math.ceil(cap / 1000)}s reload-drain cap; SIGKILL.`);
     try { worker.child.kill('SIGKILL'); } catch { /* ignore */ }
+    killed = true;
     finish();
   }, cap);
   timer.unref?.();
@@ -1648,7 +1653,7 @@ async function serverWorkerCommand() {
           // The old worker has now EXITED, and its exit reset the shared terminal out
           // of raw mode (libuv's uv_tty_reset_mode on process exit). Reclaim it —
           // without blocking on a terminal that is behind (reclaimRawMode).
-          await reclaimRawMode({ flush: tui?._nb ? o => tui.flushOutput(o) : null });
+          await reclaimRawModeLogged({ flush: tui?._nb ? o => tui.flushOutput(o) : null });
           // Re-assert the screen state too: the dying worker's alt-screen exit and
           // cursor-show can land after ours.
           if (tui?.running && process.stdout.isTTY) {

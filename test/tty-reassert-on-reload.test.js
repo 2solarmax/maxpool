@@ -97,7 +97,7 @@ test('WIRING: reapOldWorker calls onExited which sends MSG_TTY_REASSERT', async 
   // pinned by behaviour below). Match the HANDLER (msg?.type ===), not the import.
   const handlerMatch = src.match(/msg\?\.type\s*===\s*MSG_TTY_REASSERT[\s\S]{0,800}/);
   assert.ok(handlerMatch, 'handler block found');
-  assert.match(handlerMatch[0], /await reclaimRawMode\(/, 'handler reclaims raw mode');
+  assert.match(handlerMatch[0], /await reclaimRawMode(Logged)?\(/, 'handler reclaims raw mode');
 });
 
 // reclaimRawMode (2026-11-12): setRawMode is tcsetattr(TCSADRAIN) and blocks the whole
