@@ -80,8 +80,10 @@ export { CLAIM_FRESH_MS };
 
 function msLeft(t, now) { return t == null ? Infinity : t - now; }
 
-/** R7 (owner, 2026-11-13): should a WALL claim of `grant` wait for the free refill at
- *  `refillAt`? The ONE hold rule, shared by the sweep (decideClaudeWithReason) and the
+/** R7 (owner, 2026-11-13): should a GENERAL weekly WALL claim of `grant` wait for the
+ *  free refill at `refillAt`? GENERAL ONLY (red-team r3, orchestrator decision): a
+ *  per-model (Fable) wall and a dying-value grant claim exactly as before R7. The ONE
+ *  hold rule, shared by the sweep (decideClaudeWithReason) and the
  *  reactive 429 path (account-manager tryReactiveClaim) so neither can spend what the
  *  other holds. Reads only the refill stamp, the grant's end and a LIVE peer count —
  *  never the walled account's own usage reading, which is routinely stale at the wall.
@@ -89,14 +91,14 @@ function msLeft(t, now) { return t == null ? Infinity : t - now; }
  *  within dyingWindowMs after) the refill — it would sit unspent at ~0% used — no
  *  counter, or a count that isn't an integer ≥ the pool-wide budget ⇒ false (claim).
  *  BUDGET (red-team r2 #2): roomy peers must cover EVERY wall currently held in this
- *  pool — holdMinPeers × holdersInPool(scope), where holdersInPool counts the walls
+ *  pool — holdMinPeers × holdersInPool(), where holdersInPool counts the walls
  *  holding now INCLUDING this one. Without a holders counter, this wall alone (1). */
-export function wallClaimHeld(refillAt, grant, now, { peersWithRoom, holdersInPool } = {}, scope = 'general') {
+export function wallClaimHeld(refillAt, grant, now, { peersWithRoom, holdersInPool } = {}) {
   if (!(refillAt > now) || refillAt - now >= POLICY.freeRefillWaitMs) return false;
   if (grant?.endsAt != null && grant.endsAt - refillAt < POLICY.dyingWindowMs) return false;
-  const holders = holdersInPool ? holdersInPool(scope) : 1;
+  const holders = holdersInPool ? holdersInPool() : 1;
   if (!Number.isInteger(holders) || holders < 1) return false;
-  const count = peersWithRoom?.(scope);
+  const count = peersWithRoom?.();
   return Number.isInteger(count) && count >= POLICY.holdMinPeers * holders;
 }
 
@@ -161,7 +163,9 @@ export function probeSentAt(q) {
  *  Returns { action: {kind:'grant', grant, scope, giveBack?, reason} | null,
  *            reason: string | null, heldScope?: string | null }  — `reason` names
  *  the rejection when action is null (C5: the skip log prints exactly this), or the
- *  claim reason; `heldScope` names the limit an R7 hold kept unclaimed (null: none).
+ *  claim reason; `heldScope` is 'general' whenever the R7 hold kept the general
+ *  weekly wall unclaimed on this decision — on EVERY return after that point, a claim
+ *  of a dying model grant included, so the caller always registers the hold (null: none).
  *
  *  C1 (amended, 2026-11-10): the claim is decided per grant by appliesTo (D1),
  *  NEVER by the server's nextGrantId order alone (pre-mortem #8: a Fable 429 could
@@ -173,9 +177,12 @@ export function probeSentAt(q) {
  *  limit it clears is < 24h away; a wall claim never waits (limit effectively full).
  *  Session-only grants are NEVER claimed (owner 2026-10-30).
  *  R7 (owner, 2026-11-13, task-2026-11-13-maxpool-hold-resets-when-pool-has-room):
- *  a WALL claim is HELD when the free refill of the limit it clears is < 24h away
- *  (freeRefillWaitMs) AND opts.peersWithRoom(scope) answers at least
- *  POLICY.holdMinPeers — other accounts in THIS pool can absorb the load. The hold
+ *  the GENERAL weekly WALL claim is HELD when its free refill is < 24h away
+ *  (freeRefillWaitMs) AND opts.peersWithRoom() answers at least POLICY.holdMinPeers
+ *  × opts.holdersInPool() — other accounts in THIS pool can absorb the load. Model
+ *  (Fable) walls are never held (red-team r3) — but while the general wall is held the
+ *  model WALL claim is skipped too: the account is benched by its general wall, so a
+ *  Fable reset would buy nothing until the general refill lands. The hold
  *  re-evaluates every decision tick (the caller supplies a live count), and fails
  *  CLAIM-side: capacity unknown (no counter, non-number answer) or a grant that
  *  would expire before the refill (or within a day after it — it would sit unspent
@@ -219,18 +226,14 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
   const weeklyWall = wkUtil != null && wkUtil >= CLAUDE_WALL_WEEKLY;
   // D4: the free refill of a limit < 24h away makes a not-at-the-wall spend redundant.
   const refillSoon = resetAt => resetAt != null && msLeft(resetAt, now) < POLICY.freeRefillWaitMs;
-  // R7: hold a WALL claim for the imminent free refill while other accounts in this
-  // pool can absorb the load (wallClaimHeld). A hold NOTES its reason and moves on
-  // (red-team #2): the model-scoped loop below must still run, so a dying model
-  // grant is spent and a model wall with no room elsewhere is claimed.
-  // heldScope reports WHICH limit was held so the caller can register the hold
-  // (it feeds the pool-wide budget and the held-wall rescue — red-team r2 #1/#2).
-  let heldScope = null;
-  const holdsWall = (refillAt, grant, scope) => {
-    const held = wallClaimHeld(refillAt, grant, now, { peersWithRoom: opts.peersWithRoom, holdersInPool: opts.holdersInPool }, scope);
-    if (held && heldScope == null) heldScope = scope;
-    return held;
-  };
+  // R7: hold the GENERAL wall claim for the imminent free refill while other accounts
+  // in this pool can absorb the load (wallClaimHeld). A hold NOTES its reason and
+  // moves on (red-team #2): the model-scoped loop below must still run, so a dying
+  // model grant is spent. `generalHeld` rides on every return after it (red-team r3
+  // #2) so the caller registers the hold even when this decision claims a dying model
+  // grant — it feeds the pool-wide budget and the held-wall rescue (r2 #1/#2).
+  let generalHeld = false;
+  const out = (action, why) => ({ action, reason: why, heldScope: generalHeld ? 'general' : null });
   let reason = null;
   const note = r => { if (reason == null) reason = r; };
 
@@ -242,17 +245,19 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
     const giveBack = g.givesBackWeekly === true && !(Array.isArray(g.clears) && g.clears.includes('seven_day'));
     if (weeklyWall) {
       // R7: the free refill is imminent and the pool has room — hold the claim.
-      if (holdsWall(q.unified7dReset, g, 'general')) { note(HOLD_POOL_HAS_ROOM); continue; }
+      if (wallClaimHeld(q.unified7dReset, g, now, { peersWithRoom: opts.peersWithRoom, holdersInPool: opts.holdersInPool })) {
+        generalHeld = true; note(HOLD_POOL_HAS_ROOM); continue;
+      }
       // A give-back-only grant (no seven_day in clears) returns only what the model
       // used — the claim snapshots unified7d so the next probe measures the drop.
-      return { action: { kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'weekly at wall' }, reason: 'weekly at wall' };
+      return out({ kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'weekly at wall' }, 'weekly at wall');
     }
     const dying = msLeft(g.endsAt, now) < POLICY.dyingWindowMs
       && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;  // weekly window only (owner 2026-10-30)
     if (!dying) continue;
     if (g.requiresLimit) { note('requires limit'); continue; }
     if (refillSoon(q.unified7dReset)) { note('free refill <24h away'); continue; }
-    return { action: { kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'dying value' }, reason: 'dying value' };
+    return out({ kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'dying value' }, 'dying value');
   }
   if (weeklyWall && !general.length) note('general not held');
 
@@ -270,16 +275,19 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
     const cand = grants.find(g => appliesTo(g).includes(fam));
     if (!cand) continue;
     if (e.utilization >= CLAUDE_WALL_WEEKLY) {
-      // R7 twin for a model-scoped wall: ask the counter for THAT model's bucket.
-      if (holdsWall(e.resetAt, cand, fam)) { note(HOLD_POOL_HAS_ROOM); continue; }
-      return { action: { kind: 'grant', grant: cand, scope: fam, reason: `${fam} weekly at wall` }, reason: `${fam} weekly at wall` };
+      // Never held on its own (red-team r3) — but skipped while the GENERAL wall is
+      // held: the account is benched by its general wall, so a model reset buys
+      // nothing now; the hold re-evaluates every tick and, once the general refill
+      // lands (or the hold lets go), this wall claims as before R7.
+      if (generalHeld) continue;
+      return out({ kind: 'grant', grant: cand, scope: fam, reason: `${fam} weekly at wall` }, `${fam} weekly at wall`);
     }
     const dying = msLeft(cand.endsAt, now) < POLICY.dyingWindowMs
       && e.utilization >= POLICY.dyingMinUtilWeekly;
     if (!dying) continue;
     if (cand.requiresLimit) { note('requires limit'); continue; }
     if (refillSoon(e.resetAt)) { note('free refill <24h away'); continue; }
-    return { action: { kind: 'grant', grant: cand, scope: fam, reason: 'dying value' }, reason: 'dying value' };
+    return out({ kind: 'grant', grant: cand, scope: fam, reason: 'dying value' }, 'dying value');
   }
   // A scoped bucket measured at the wall with no grant for it.
   for (const [fam, e] of Object.entries(q.scopedWeekly || {})) {
@@ -288,5 +296,5 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
   }
 
   // Session-only grants: NEVER claimed (owner 2026-10-30) — falls through.
-  return { action: null, reason: reason ?? 'below wall', heldScope };
+  return out(null, reason ?? 'below wall');
 }

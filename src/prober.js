@@ -364,6 +364,9 @@ export class Prober {
       if (r?.ok) {
         this.am.noteClaimSuccess?.(account.name, act.grant.id);
         account.lastClaimAt = Date.now();
+        // Only a claim that clears the general weekly retires a general hold (r3 #3);
+        // a Fable claim refills nothing the hold is waiting on.
+        if (act.scope === 'general') account.lastGeneralClaimAt = account.lastClaimAt;
         // Spend it in the STORED listing too: until the next listing (≤5 min) the
         // held count, the lift and the reactive path must not see it as unspent.
         this.am.noteGrantClaimed?.(account, act.grant.id);
@@ -512,15 +515,18 @@ export class Prober {
     if (!this.am.applyResetGrants) return;
     const listing = account.resetGrants;
     if (!listing) return;
-    // R7 (2026-11-13): the wall claim waits for an imminent free refill only while
+    // R7 (2026-11-13): the GENERAL weekly wall claim (the only one R7 holds — red-team
+    // r3) waits for an imminent free refill only while
     // other accounts in THIS pool have room. Counted LIVE per sweep, so the hold
     // ends the moment capacity disappears; unknown capacity claims (never hold).
     // holdersInPool budgets one hold per holdMinPeers roomy peers across the pool
     // (r2 #2); a hold is registered so a later failed probe can still rescue it (r2 #1).
-    const peersWithRoom = this.am.countPeersWithRoom ? scope => this.am.countPeersWithRoom(account, scope) : null;
+    const peersWithRoom = this.am.countPeersWithRoom ? () => this.am.countPeersWithRoom(account) : null;
     const holdersInPool = this.am.countHoldingWalls ? () => this.am.countHoldingWalls(account) : null;
     const { action, reason, heldScope } = decideClaudeWithReason(account, listing, Date.now(), { peersWithRoom, holdersInPool });
-    if (heldScope != null) this.am.noteWallHold?.(account, heldScope);
+    // heldScope rides on every return once the general wall is held — a dying model
+    // grant claimed in the same decision included (r3 #2) — so the hold is always registered.
+    if (heldScope === 'general') this.am.noteWallHold?.(account);
     if (action) {
       account._claimSkipKey = null;
       await this._claimClaudeGrant(account, action);
@@ -560,14 +566,14 @@ export class Prober {
    *  peers' LIVE probe freshness) and claim through the reactive route — the same
    *  one the 429 fast path uses, whose pick tolerates a stale listing on purpose.
    *  A still-roomy pool keeps holding; a refill that moved past 24h (or a dying
-   *  grant) makes wallClaimHeld itself release. Never claims a wall nobody held. */
+   *  grant) makes wallClaimHeld itself release. Never claims a wall nobody held.
+   *  General weekly wall only (red-team r3): no model wall is ever held. */
   async _rescueHeldWall(account) {
     if (!this.am.isHoldingWall?.(account)) return;   // never a wall nobody held
     // A listing-side cooldown is a server instruction the reactive route doesn't read.
     const cd = account.resetGrants?.cooldownUntil;
     if (cd != null && cd > Date.now()) return;
-    const scope = account._wallHold.scope;
-    await this.am.tryReactiveClaim(account, { kind: scope === 'general' ? 'weekly' : scope });
+    await this.am.tryReactiveClaim(account, { kind: 'weekly' });
   }
 
   _withTimeout(promise) {

@@ -125,7 +125,7 @@ function pool(n = 3, now = Date.now()) {
   self.quota.unified7d = 0.995; self.quota.unified7dReset = now + 18 * H;
   return am;
 }
-const count = (am, scope = 'general', now = Date.now()) => am.countPeersWithRoom(am.accounts[0], scope, now);
+const count = (am, now = Date.now()) => am.countPeersWithRoom(am.accounts[0], now);
 
 test('ROOM: two healthy fresh peers count; self never counts — even when self itself is roomy', () => {
   const am = pool(3);
@@ -147,7 +147,7 @@ test('RT2-4 (minor): a peer whose identity cannot be resolved is not counted (un
   const am = pool(3, now);
   am.accounts[1].accountUuid = null;
   assert.equal(am.capacityIdentity(am.accounts[1]), null, 'precondition: no identity');
-  assert.equal(count(am, 'general', now), 1);
+  assert.equal(count(am, now), 1);
 });
 
 test('ROOM: each disqualifier drops exactly one peer', () => {
@@ -199,10 +199,10 @@ test('BOUNDARIES: a peer probe exactly 5 min old still counts; weekly/5h exactly
   const am = pool(3, now);
   am.accounts[1].quota.lastProbeOkAt = now - 5 * 60_000;          // exactly CLAIM_FRESH_MS
   am.accounts[2].quota.unified7d = 0.65;                          // exactly 1 - holdPeerWeeklyRoom
-  assert.equal(count(am, 'general', now), 2);
+  assert.equal(count(am, now), 2);
   const am2 = pool(3, now);
   am2.accounts[1].quota.unified5h = 0.65;                         // exactly switchThreshold - holdPeerSessionRoom
-  assert.equal(count(am2, 'general', now), 2);
+  assert.equal(count(am2, now), 2);
 });
 
 // ── red-team round 1 (2026-11-13) ────────────────────────────────────────────
@@ -212,7 +212,7 @@ test('RT1 (blocker): a GENERAL hold never leans on peers whose model limit is ex
   const am = pool(3, now);
   am.accounts[1].quota.scopedWeekly = structuredClone(exhausted);
   am.accounts[2].quota.scopedWeekly = structuredClone(exhausted);
-  assert.equal(count(am, 'general', now), 0, 'Fable-exhausted peers cannot carry the walled account');
+  assert.equal(count(am, now), 0, 'Fable-exhausted peers cannot carry the walled account');
   const cases = {
     'fable measured full (0.80, no room)': { fable: { utilization: 0.80, resetAt: now + DAY } },
     'fable reactive 429 mark': { fable: { utilization: 1.0, resetAt: now + DAY, reactive: true } },
@@ -221,16 +221,16 @@ test('RT1 (blocker): a GENERAL hold never leans on peers whose model limit is ex
   for (const [name, sw] of Object.entries(cases)) {
     const a = pool(3, now);
     a.accounts[1].quota.scopedWeekly = sw;
-    assert.equal(count(a, 'general', now), 1, name);
+    assert.equal(count(a, now), 1, name);
   }
   // A peer with a roomy model bucket (or none reported) still counts for the general hold.
   const ok = pool(3, now);
   ok.accounts[1].quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: now + DAY } };
-  assert.equal(count(ok, 'general', now), 2);
+  assert.equal(count(ok, now), 2);
   // An INACTIVE model limit binds nothing (same rule as the router's _scopedExhausted).
   const inactive = pool(3, now);
   inactive.accounts[1].quota.scopedWeekly = { fable: { utilization: 1.0, resetAt: now + DAY, isActive: false } };
-  assert.equal(count(inactive, 'general', now), 2);
+  assert.equal(count(inactive, now), 2);
 });
 
 test('RT1 (blocker, e2e): a general wall with Fable-exhausted peers → the prober CLAIMS', async () => {
@@ -547,13 +547,13 @@ test('RT4 (major): room is measured to the peer\'s CAP on both windows', () => {
   const now = Date.now();
   const wk = pool(3, now);
   wk.accounts[1].capUtilization = 0.70; wk.accounts[1].quota.unified7d = 0.64;   // 0.06 to the cap
-  assert.equal(count(wk, 'general', now), 1, 'weekly: cap 0.70 at 0.64 → not counted');
+  assert.equal(count(wk, now), 1, 'weekly: cap 0.70 at 0.64 → not counted');
   const ses = pool(3, now);
   ses.accounts[1].capUtilization = 0.70; ses.accounts[1].quota.unified7d = 0.30; ses.accounts[1].quota.unified5h = 0.50;
-  assert.equal(count(ses, 'general', now), 1, '5h: cap 0.70 at 0.50 → 0.20 to the cap < 0.25');
+  assert.equal(count(ses, now), 1, '5h: cap 0.70 at 0.50 → 0.20 to the cap < 0.25');
   const ok = pool(3, now);
   ok.accounts[1].capUtilization = 0.80; ok.accounts[1].quota.unified7d = 0.40; ok.accounts[1].quota.unified5h = 0.50;
-  assert.equal(count(ok, 'general', now), 2, 'cap 0.80: 0.40 weekly / 0.30 5h room → counts');
+  assert.equal(count(ok, now), 2, 'cap 0.80: 0.40 weekly / 0.30 5h room → counts');
 });
 
 test('RT6 (minor): two local names for ONE account count once', () => {
@@ -561,7 +561,7 @@ test('RT6 (minor): two local names for ONE account count once', () => {
   const am = pool(4, now);
   am.accounts[1].accountUuid = 'u-dup';
   am.accounts[2].accountUuid = 'u-dup';
-  assert.equal(count(am, 'general', now), 2, 'u-dup once + the fourth account');
+  assert.equal(count(am, now), 2, 'u-dup once + the fourth account');
 });
 
 test('ROOM: a provider (GLM/Kimi) is not a Claude peer', () => {
@@ -659,7 +659,9 @@ test('R3-1 (fast path): a 429 over a probe-measured Fable wall claims as at cb96
   try {
     const am = pool(3);
     const self = am.accounts[0];
-    self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
+    // general weekly below the wall but its refill 18h out: only "general only" keeps
+    // this Fable 429 out of the hold (the general refill stamp would otherwise hold it)
+    self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 18 * H;
     self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
     fableRoomOn(am.accounts.slice(1));
     am.applyResetGrants(0, listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }));
@@ -753,16 +755,49 @@ test('R3-4: a peer counts only if it shares a routable profile with the walled a
   const now = Date.now();
   const am = pool(3, now);
   am.accounts[1].profiles = ['team-b'];
-  assert.equal(count(am, 'general', now), 1, 'a peer on another profile cannot take this account\'s traffic');
+  assert.equal(count(am, now), 1, 'a peer on another profile cannot take this account\'s traffic');
   am.accounts[1].profiles = ['all'];
-  assert.equal(count(am, 'general', now), 2, 'sharing "all" is enough');
+  assert.equal(count(am, now), 2, 'sharing "all" is enough');
   const t = pool(3, now);
   t.accounts[0].profiles = ['team-a'];
-  assert.equal(count(t, 'general', now), 0, 'self on a private profile: default peers share nothing');
+  assert.equal(count(t, now), 0, 'self on a private profile: default peers share nothing');
   t.accounts[2].profiles = ['claude', 'team-a'];
-  assert.equal(count(t, 'general', now), 1);
+  assert.equal(count(t, now), 1);
   // the router's own predicate decides (one definition of "can serve this traffic")
   const r = pool(3, now);
   r._matchesProfile = () => false;
-  assert.equal(count(r, 'general', now), 0);
+  assert.equal(count(r, now), 0);
+  // a self with no profiles set routes as the router's default (claude + all)
+  const d = pool(3, now);
+  delete d.accounts[0].profiles;
+  assert.equal(count(d, now), 2);
+});
+
+test('R3-3 (boundary): a general claim stamped at the very millisecond of the hold retires it', () => {
+  const now = Date.now();
+  const am = pool(3, now);
+  const self = am.accounts[0];
+  am.noteWallHold(self, now - 1000);
+  assert.equal(am.isHoldingWall(self, now), true, 'precondition: live');
+  self.lastGeneralClaimAt = now - 1000;
+  assert.equal(am.isHoldingWall(self, now), false);
+  self.lastGeneralClaimAt = now - 1001;
+  assert.equal(am.isHoldingWall(self, now), true, 'a general claim BEFORE the hold does not retire it');
+  self.lastClaimAt = now;                                              // a later Fable claim
+  assert.equal(am.isHoldingWall(self, now), true);
+});
+
+test('R3-3 (fast path): a Fable 429 claim on an account holding its general wall leaves the general hold live', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G(), G({ id: 'f1', clears: ['seven_day_overage_included'] })] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'general wall held');
+    self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'precondition: the Fable 429 claims (as at cb969da)');
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
+    assert.equal(am.isHoldingWall(self), true, 'the Fable claim refilled nothing the general hold waits on');
+  } finally { restore(); }
 });
