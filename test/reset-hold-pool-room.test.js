@@ -509,6 +509,106 @@ test('RT2-2 (major): the same pool-wide budget on the 429 fast path', async () =
   } finally { restore(); }
 });
 
+// The hold register: only a LIVE hold consumes another wall's budget.
+// 4 accounts: c0, c1 walled (18h refill); c2, c3 roomy. c0 holds first; then a
+// change to c0 decides whether c1 may hold too (2 peers carry one wall).
+async function secondWallHolds(mutateFirst) {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(4);
+    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    am.applyResetGrants(1, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 }), false, 'c0 holds');
+    mutateFirst(am.accounts[0]);
+    const attempted = await am.tryReactiveClaim(am.accounts[1], { kind: 'weekly', weeklyUtil: 1 });
+    return attempted === false && posts.length === 0;
+  } finally { restore(); }
+}
+
+test('RT2-2 (register): a held wall consumes budget only while it is LIVE', async () => {
+  assert.equal(await secondWallHolds(() => {}), false, 'control: c0 still holding → c1 claims');
+  assert.equal(await secondWallHolds(a => { a.enabled = false; }), true, 'c0 disabled → no load, no budget');
+  assert.equal(await secondWallHolds(a => { a.poolBenchedBy = 'cloud'; }), true, 'c0 benched to the team pool → not ours');
+  assert.equal(await secondWallHolds(a => { a.lastClaimAt = Date.now() + 1000; }), true, 'c0 claimed since its hold → not holding');
+  assert.equal(await secondWallHolds(a => { a.quota.unified7d = 0.1; }), true, 'c0 left the wall (refill landed) → not holding');
+  assert.equal(await secondWallHolds(a => { a.quota.unified7dReset = Date.now() - 1000; }), true, 'c0 refill time passed → not holding');
+});
+
+test('RT2-1 (rescue guard): a stale hold stamp on an account that has LEFT the wall never claims (the fast path trusts the 429, the rescue must not)', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'held');
+    self.quota.unified7d = 0.1;                                                     // the free refill landed
+    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
+    await failingProber(am, posts).probeOne(self);
+    assert.equal(posts.length, 0, 'no claim at 10% used');
+  } finally { restore(); }
+});
+
+test('RT2-1 (rescue): a probe that THROWS also rescues a held wall', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'held');
+    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
+    const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+      probeFn: async () => { throw new Error('socket hang up'); }, grantsFn: async () => ({ error: 'HTTP 429' }) });
+    prober._now = () => Date.now() + 6 * 60_000;
+    await prober.probeOne(self);
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
+  } finally { restore(); }
+});
+
+test('RT2-1 (scope of the rescue): a sweep that decides FRESH (probe + listing fine) never routes through the fast path', async () => {
+  const am = pool(3);
+  const self = am.accounts[0];
+  let reactiveCalls = 0;
+  const real = am.tryReactiveClaim.bind(am);
+  am.tryReactiveClaim = (...a) => { reactiveCalls++; return real(...a); };
+  const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
+    grantsFn: async () => listing({ grants: [G()] }) });
+  prober._now = () => Date.now() + 6 * 60_000;
+  await prober.probeOne(self);
+  await prober.probeOne(self);
+  assert.equal(self._wallHold?.scope, 'general', 'precondition: the sweep held and registered it');
+  assert.equal(reactiveCalls, 0);
+});
+
+test('RT2-1 (noise): the held line prints once per hold, not once per failed sweep', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  const realLog = console.log;
+  const lines = [];
+  console.log = (...a) => { lines.push(a.join(' ')); };
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 });
+    const prober = failingProber(am, posts);
+    for (let i = 0; i < 3; i++) await prober.probeOne(self);     // peers fresh → still held each time
+  } finally { console.log = realLog; restore(); }
+  assert.equal(lines.filter(l => l.includes(`c0: at wall, claim held (${HOLD})`)).length, 1, lines.join(' | '));
+});
+
+test('RT2-1 (register): both the weekly and a model wall held → the WEEKLY hold is registered (it covers every model)', () => {
+  const now = Date.now();
+  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H } };
+  const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), G({ id: 'f1', clears: ['seven_day_overage_included'] }, now)], now }), peers(5), now);
+  assert.equal(r.reason, HOLD);
+  assert.equal(r.heldScope, 'general');
+});
+
 test('RT2-2 (policy): holders multiply the peers needed', () => {
   const now = Date.now();
   const l = listing({ grants: [G({}, now)], now });

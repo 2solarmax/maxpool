@@ -6184,8 +6184,11 @@ export class AccountManager {
     if (wallClaimHeld(refillAt, grant, now,
       { peersWithRoom: scope => this.countPeersWithRoom(account, scope, now),
         holdersInPool: () => this.countHoldingWalls(account, now) }, holdScope)) {
+      // Log once per hold EPISODE: the sweep's rescue re-evaluates a held wall every
+      // failed tick, and a line per tick would bury the console.
+      const already = this.isHoldingWall(account, now);
       this.noteWallHold(account, holdScope, now);
-      console.log(`[reset-grant] ${account.name}: 429 at wall, claim held (${HOLD_POOL_HAS_ROOM})`);
+      if (!already) console.log(`[reset-grant] ${account.name}: at wall, claim held (${HOLD_POOL_HAS_ROOM})`);
       return false;
     }
     // C6: shared backoff per (account, grantId).
