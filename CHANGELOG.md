@@ -5,6 +5,17 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.92] - 2026-11-13
+
+### Added
+
+- Client-patience deadline for non-streaming + scrubbed-stream keepalive + client-gone guards
+
+### Fixed
+
+- Red-team round 1 — cloud 120s timer vs pool deadline (F3), mixed-version 504 gate (F1), chokepoint coverage (F5), test hardening (F2/F7/F8)
+- Red-team round 2 — deadline-aware backstop reaper (R2-1), 504 for direct long-patience clients at the hop cap (R2-2)
+
 ## [1.24.91] - 2026-11-12
 
 ### Changed
