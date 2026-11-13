@@ -7,6 +7,7 @@
 
 import { appendFile, stat, rename, chmod } from 'node:fs/promises';
 import { isatty } from 'node:tty';
+import { writeSync } from 'node:fs';
 
 const MAX_BYTES = 5 * 1024 * 1024;   // rotate at ~5 MB
 // Keep 5 generations (~30 MB total), not 1. With a single backup the log rotated away the
@@ -156,6 +157,37 @@ export function setConsoleNonBlocking({ streams = [process.stdout, process.stder
 export function reassertConsoleNonBlocking() {
   for (const s of nonBlockingStreams) {
     try { s._handle?.setBlocking?.(false); } catch { /* stream gone */ }
+  }
+}
+
+/**
+ * Undo setConsoleNonBlocking — for EXIT paths only. A non-blocking write still queued at
+ * process.exit is dropped, so a fatal message printed on the way out vanished
+ * (red-team 2026-11-13: a respawn's EADDRINUSE). Blocking is right there: the process
+ * is ending anyway, and the message waits for the terminal instead of being lost.
+ */
+export function setConsoleBlocking() {
+  for (const s of nonBlockingStreams) {
+    try { s._handle?.setBlocking?.(true); } catch { /* stream gone */ }
+  }
+  nonBlockingStreams.clear();
+}
+
+/**
+ * Print the lines that explain why the process is about to exit, so that they reach the
+ * terminal even when it is not reading. A stderr we made non-blocking is made blocking
+ * again and written directly (fd 2), past anything still queued in front of it; every
+ * other stderr prints through console.error as usual.
+ */
+export function printFatal(lines, { stream = process.stderr, write = writeSync } = {}) {
+  if (!nonBlockingStreams.has(stream)) {
+    for (const line of lines) console.error(line);
+    return;
+  }
+  setConsoleBlocking();
+  for (const line of lines) {
+    try { appendEventLog(line); } catch { /* never */ }
+    try { write(stream.fd, `${line}\n`); } catch { /* terminal gone */ }
   }
 }
 

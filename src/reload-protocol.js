@@ -68,7 +68,13 @@ export async function runReloadBaton({
   releaseTimeoutMs = 20_000,
   takeoverTimeoutMs = 10_000,
   log = () => {},
+  reloadId,
 }) {
+  // Every rollback notice names the reload it is about, so the old worker can tell a
+  // late notice for an EARLIER reload from one for the reload it has open.
+  const rolledBack = reason => {
+    try { oldWorker.send({ type: MSG_ROLLED_BACK, reason, reloadId }); } catch { /* old worker gone */ }
+  };
   // (a) Confirm the freshly-spawned headless worker booted the new code.
   let ready;
   try {
@@ -77,13 +83,17 @@ export async function runReloadBaton({
   } catch (err) {
     // Tell the old worker BEFORE logging: it resumes serving on this notice, and a log
     // line must never stand between the two (2026-11-13: a blocked terminal write did).
-    try { oldWorker.send({ type: MSG_ROLLED_BACK, reason: 'timeout' }); } catch { /* old worker gone */ }
+    // Only an expired timer is 'timeout' (merely slow: a cold restart may retry it). A
+    // new worker that exited or could not be spawned is 'failed' — as is any rejection
+    // whose cause is unknown, since a cold restart into a build that cannot boot leaves
+    // no working proxy.
+    rolledBack(err?.reason === 'timeout' ? 'timeout' : 'failed');
     log(`reload: readiness wait failed (${err.message}); rolling back`);
     return RELOAD_ROLLED_BACK;
   }
   // (b) New worker did not come up cleanly → roll back fully, old stays primary.
   if (!ready || ready.type === MSG_FAILED) {
-    try { oldWorker.send({ type: MSG_ROLLED_BACK, reason: 'failed' }); } catch { /* old worker gone */ }
+    rolledBack('failed');
     log(`reload: new worker reported failed (${ready?.reason || 'no ready'}); rolling back`);
     return RELOAD_ROLLED_BACK;
   }
@@ -130,6 +140,58 @@ export async function runReloadBaton({
   return RELOAD_SWAPPED;
 }
 
+/**
+ * Wrap a child process in a small IPC channel: `.send(msg[,handle])` and an
+ * async `.waitFor([types], timeoutMs)` that resolves with the first matching
+ * message, or rejects on timeout / premature child exit.
+ */
+export function makeWorkerChannel(child) {
+  return {
+    child,
+    send(msg, handle) {
+      try {
+        if (handle) child.send(msg, handle);
+        else child.send(msg);
+      } catch { /* IPC may be torn down mid-swap; baton timeouts cover it */ }
+    },
+    // A rejection carries `.reason`: 'timeout' (the timer expired), 'exited' (the child
+    // exited first — or had already exited) or 'spawn-error'.
+    waitFor(types, timeoutMs) {
+      const want = Array.isArray(types) ? types : [types];
+      const fail = (reason, message) => Object.assign(new Error(message), { reason });
+      if (child.exitCode != null || child.signalCode != null) {
+        return Promise.reject(fail('exited', `worker already exited (code ${child.exitCode}, signal ${child.signalCode}) before ${want.join('/')}`));
+      }
+      return new Promise((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          child.removeListener('message', onMsg);
+          child.removeListener('exit', onExit);
+          child.removeListener('error', onError);
+        };
+        const onMsg = msg => {
+          if (msg && want.includes(msg.type)) { cleanup(); resolve(msg); }
+        };
+        const onExit = (code, signal) => {
+          cleanup();
+          reject(fail('exited', `worker exited (code ${code}, signal ${signal}) before ${want.join('/')}`));
+        };
+        // A spawn failure (EMFILE/EAGAIN) surfaces as 'error', not 'exit' — the
+        // baton must see it as a failed step (→ ROLLED_BACK/FALLBACK), not hang.
+        const onError = err => { cleanup(); reject(fail('spawn-error', `worker spawn error before ${want.join('/')}: ${err.message}`)); };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(fail('timeout', `timed out waiting for ${want.join('/')}`));
+        }, timeoutMs);
+        timer.unref?.();
+        child.on('message', onMsg);
+        child.once('exit', onExit);
+        child.once('error', onError);
+      });
+    },
+  };
+}
+
 // Sent to the NEW primary worker once the OLD worker has actually exited. Node calls
 // libuv's uv_tty_reset_mode() on process exit, which restores the termios the dying
 // process saved when IT first enabled raw mode — clobbering the live worker's terminal
@@ -142,4 +204,20 @@ export const MSG_TTY_REASSERT = 'tty-reassert';
 export function describeOldWorkerExit({ swappedAt, exitedAt, killed = false }) {
   const after = ((exitedAt - swappedAt) / 1000).toFixed(1);
   return `reload: old worker exited at ${new Date(exitedAt).toISOString()} (${after}s after swap, ${killed ? 'SIGKILL after the drain cap' : 'clean exit'})`;
+}
+
+/**
+ * What the old worker does with a rollback notice. `noticeId` is the reload id the
+ * supervisor echoed (absent from a supervisor that predates ids), `currentId` the id
+ * of the reload this worker requested last, `open` whether that reload is still
+ * waiting for an outcome.
+ *   'settle' — the notice is about the open reload: act on it now
+ *   'ignore' — a notice about an earlier reload, or nothing is open
+ *   'record' — an id-less notice: remember the reason; the self-heal watchdog settles
+ *              (the behaviour before ids, so an old supervisor is never trusted to
+ *              name the reload it is about)
+ */
+export function rollbackNoticeAction({ noticeId, currentId, open }) {
+  if (noticeId == null) return 'record';
+  return open && noticeId === currentId ? 'settle' : 'ignore';
 }

@@ -201,13 +201,128 @@ test('rawWhenDrained: a dashboard stopped before the terminal drained is not put
   });
 });
 
+test('rawWhenDrained + modeSwitcher: a takeover never switches raw mode on its own thread, even with nothing queued', async () => {
+  // A frame under the pty's 1 KB kernel queue leaves OUR queue empty while the terminal
+  // has not read it; a synchronous switch there stalled the new worker ~1.7s (red-team).
+  await withTerminal({ writableLength: 0 }, async ({ tui, stdin }) => {
+    const asked = [];
+    const modeSwitcher = { setRaw: raw => { asked.push(raw); return new Promise(() => {}); } };
+    assert.equal(tui.start({ rawWhenDrained: true, modeSwitcher }), true);
+    await sleep(150);
+    assert.deepEqual(asked, [true], 'raw mode was requested from the helper');
+    assert.deepEqual(stdin.calls.filter(c => c !== 'resume'), [], 'no setRawMode on the serving thread');
+  });
+});
+
+test('rawWhenDrained + modeSwitcher: without a helper the takeover falls back to waiting for the terminal', async () => {
+  await withTerminal({ writableLength: 5000 }, async ({ tui, out, stdin }) => {
+    const modeSwitcher = { setRaw: async () => ({ ok: false, error: 'ENXIO', ms: 1 }) };
+    assert.equal(tui.start({ rawWhenDrained: true, modeSwitcher }), true);
+    await sleep(50);
+    assert.deepEqual(stdin.calls.filter(c => c !== 'resume'), [], 'still waiting: the terminal is behind');
+    out.writableLength = 0;
+    await sleep(250);
+    assert.deepEqual(stdin.calls.filter(c => c !== 'resume'), [false, true], 'then the usual reclaim');
+  });
+});
+
+test('terminal-mode: setRaw goes through the helper and reports how long the terminal took', async () => {
+  const { createTerminalModeSwitcher } = await import('../src/terminal-mode.js');
+  const posted = [];
+  const helper = new EventEmitter();
+  helper.unref = () => {};
+  helper.terminate = () => {};
+  helper.postMessage = m => { posted.push(m); setTimeout(() => helper.emit('message', { id: m.id, ok: true }), 30); };
+  let made = 0;
+  const sw = createTerminalModeSwitcher({ makeWorker: () => { made++; return helper; } });
+  const r1 = await sw.setRaw(true, { toggle: true });
+  const r2 = await sw.setRaw(false);
+  assert.equal(made, 1, 'one helper for the process');
+  assert.deepEqual(posted.map(m => [m.raw, m.toggle]), [[true, true], [false, false]]);
+  assert.equal(r1.ok, true);
+  assert.ok(r1.ms >= 25, `ms measured (${r1.ms})`);
+  assert.equal(r2.ok, true);
+});
+
+test('terminal-mode: a helper that dies fails its pending switches (the caller falls back), and the next call starts a new one', async () => {
+  const { createTerminalModeSwitcher } = await import('../src/terminal-mode.js');
+  const helpers = [];
+  const sw = createTerminalModeSwitcher({ makeWorker: () => {
+    const h = new EventEmitter();
+    Object.assign(h, { unref() {}, terminate() {}, postMessage() {} });
+    helpers.push(h);
+    return h;
+  } });
+  const p = sw.setRaw(true);
+  helpers[0].emit('error', new Error('boom'));
+  assert.deepEqual({ ...(await p), ms: 0 }, { ok: false, error: 'boom', ms: 0 });
+  const failing = createTerminalModeSwitcher({ makeWorker: () => { throw new Error('no threads'); } });
+  assert.equal((await failing.setRaw(true)).ok, false, 'a helper that cannot start is a fallback, not a throw');
+  void sw.setRaw(true);
+  assert.equal(helpers.length, 2, 'a fresh helper after the first one died');
+  sw.close();
+});
+
+test('terminal-mode: the real helper reports a failure (no controlling terminal) instead of hanging', { timeout: 10_000 }, async () => {
+  const { createTerminalModeSwitcher } = await import('../src/terminal-mode.js');
+  const { spawnSync } = await import('node:child_process');
+  // Run in a child with no controlling terminal (setsid), so /dev/tty cannot open.
+  const code = `import(${JSON.stringify(new URL('../src/terminal-mode.js', import.meta.url).href)}).then(async ({ createTerminalModeSwitcher }) => {
+    const r = await createTerminalModeSwitcher().setRaw(true);
+    console.log(JSON.stringify(r));
+  });`;
+  const r = spawnSync('python3', ['-c', 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])', process.execPath, '-e', code],
+    { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'pipe'] });
+  const out = JSON.parse(r.stdout.trim().split('\n').at(-1));
+  assert.equal(out.ok, false, r.stdout + r.stderr);
+  assert.ok(out.error, 'names why');
+  void createTerminalModeSwitcher;
+});
+
+test('whenTerminalCaughtUp: fires once our queue is empty — not on a mere shrink — and can be cancelled', async () => {
+  const { whenTerminalCaughtUp } = await import('../src/tui.js');
+  const out = Object.assign(new EventEmitter(), { writableLength: 3000 });
+  let fired = 0;
+  whenTerminalCaughtUp(() => fired++, { stdout: out, pollMs: 10 });
+  out.writableLength = 1000;
+  await sleep(40);
+  assert.equal(fired, 0, 'a shrink is not caught up');
+  out.writableLength = 0;
+  await sleep(40);
+  out.emit('drain');
+  await sleep(20);
+  assert.equal(fired, 1, 'fired exactly once');
+  const out2 = Object.assign(new EventEmitter(), { writableLength: 3000 });
+  let fired2 = 0;
+  const cancel = whenTerminalCaughtUp(() => fired2++, { stdout: out2, pollMs: 10 });
+  cancel();
+  out2.writableLength = 0;
+  await sleep(40);
+  assert.equal(fired2, 0, 'cancelled');
+  let fired3 = 0;
+  whenTerminalCaughtUp(() => fired3++, { stdout: Object.assign(new EventEmitter(), { writableLength: 0 }), pollMs: 10 });
+  await sleep(5);
+  assert.equal(fired3, 1, 'already caught up: fires at once');
+});
+
+test('WIRING: an update cold restart waits for the terminal, and the restart never switches the terminal mode', () => {
+  const rw = src.match(/const restartWorkerNow = \(\) => \{[\s\S]*?\n {2}\};\n/);
+  assert.ok(rw, 'restartWorkerNow found');
+  assert.match(rw[0], /keepTerminalModeOnExit = true;[\s\S]{0,80}tui\.stop\(\{ keepRaw: true \}\)/);
+  assert.match(src, /process\.stdin\.isTTY && !keepTerminalModeOnExit\) \{ try \{ process\.stdin\.setRawMode\(false\)/);
+  assert.match(src, /tui\.stop\(\{ exiting, keepRaw: keepTerminalModeOnExit \}\)/);
+  const settle = src.match(/const settleRolledBackReload = [\s\S]*?\n {2}\};\n/)[0];
+  assert.match(settle, /if \(tui\?\.running && tui\._nb && process\.stdout\.writableLength > 0\) \{[\s\S]{0,300}whenTerminalCaughtUp\(/);
+  assert.match(src, /cancelDeferredColdRestart\?\.\(\);/, 'a new reload cancels a waiting update restart');
+});
+
 // ── baton: the old worker hears about a rollback before anything is logged ──
 
 function scripted(replies) {
   const sent = [];
   return { sent, send(m) { sent.push(m); }, waitFor() {
     const r = replies.shift();
-    return r === 'TIMEOUT' ? Promise.reject(new Error('timed out')) : Promise.resolve(r);
+    return r === 'TIMEOUT' ? Promise.reject(Object.assign(new Error('timed out'), { reason: 'timeout' })) : Promise.resolve(r);
   } };
 }
 
@@ -248,24 +363,28 @@ test('WIRING: a reload fallback restores the terminal without blocking; only the
   assert.ok(nonExiting, 'a non-exiting branch exists and returns early');
   assert.doesNotMatch(nonExiting[0], /writeTerminalSync|setRawMode/, 'the fallback branch never blocks');
   const orchestrate = src.match(/const orchestrateReload = [\s\S]*?\n {2}\};\n/)[0];
-  assert.equal((orchestrate.match(/restoreTerminalFromSupervisor\(\{ exiting: false \}\)/g) || []).length, 2, 'both fallback sites use the non-blocking restore');
+  // Both fallback sites (an outcome of FALLBACK, a thrown error) go through fallBack().
+  assert.equal((orchestrate.match(/restoreTerminalFromSupervisor\(\{ exiting: false \}\)/g) || []).length, 1, 'the one fallback path uses the non-blocking restore');
+  assert.equal((orchestrate.match(/\bfallBack\(\);/g) || []).length, 2, 'both fallback sites use it');
   assert.doesNotMatch(orchestrate, /restoreTerminalFromSupervisor\(\)/);
 });
 
-test('WIRING: a takeover announces MSG_PRIMARY before it takes the terminal, which defers raw mode', () => {
+test('WIRING: a takeover announces MSG_PRIMARY before it takes the terminal, which switches raw mode off-thread', () => {
   const bp = src.match(/const becomePrimary = async[\s\S]*?\n {2}\};\n/);
   assert.ok(bp, 'becomePrimary found');
   const primary = bp[0].indexOf('type: MSG_PRIMARY');
   const takeover = bp[0].indexOf('if (viaTakeover) takeTerminal({ viaTakeover });');
   assert.ok(primary > 0 && takeover > primary, 'MSG_PRIMARY is sent before a takeover takes the terminal');
-  // Only a takeover defers raw mode; a cold start switches it before its first frame
-  // (deferring there left a busy terminal's keyboard dead — tui-terminal-pty (b)/(c)).
-  assert.match(src, /const takeTerminal = [\s\S]{0,1200}tui\.start\(viaTakeover \? \{ rawWhenDrained: true \} : \{\}\)/);
+  // Only a takeover switches raw mode off the serving thread; a cold start switches it
+  // before its first frame (deferring there left a busy terminal's keyboard dead —
+  // tui-terminal-pty (b)/(c)).
+  assert.match(src, /const takeTerminal = [\s\S]{0,1400}tui\.start\(viaTakeover \? \{ rawWhenDrained: true, modeSwitcher: terminalMode \} : \{\}\)/);
 });
 
 test('WIRING: MSG_ROLLED_BACK settles the rollback at once; the self-heal reports a missing answer as such', () => {
-  assert.match(src, /msg\?\.type === MSG_ROLLED_BACK\)[\s\S]{0,400}settleRolledBackReload\(\{ answered: true, reason: msg\.reason \|\| null \}\)/);
-  assert.match(src, /reloadWatchdog = setTimeout\(\(\) => \{[\s\S]{0,120}settleRolledBackReload\(\{ answered: false \}\)/);
+  assert.match(src, /msg\?\.type === MSG_ROLLED_BACK\)[\s\S]{0,900}if \(action === 'settle'\) settleRolledBackReload\(\{ answered: true, reason: msg\.reason \|\| null \}\)/);
+  // The self-heal settles with a reason only an id-less (older) supervisor recorded.
+  assert.match(src, /reloadWatchdog = setTimeout\(\(\) => \{[\s\S]{0,120}settleRolledBackReload\(\{ answered: lastRollbackReason != null, reason: lastRollbackReason \}\)/);
   assert.match(src, /!answered \? 'the supervisor did not answer'/);
 });
 

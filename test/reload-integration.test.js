@@ -318,13 +318,13 @@ test('an UPDATE-driven reload that rolls back falls back to a cold restart (the 
   // there, killing a healthy worker for nothing is the wrong trade (locked by the test
   // above, which asserts it resumes serving).
   const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
-  assert.match(src, /reloadIsForUpdate && swapWasSlowNotBroken && !coldFallbackUsed/,
+  assert.match(src, /forUpdate && swapWasSlowNotBroken && !coldFallbackUsed/,
     'cold fallback is gated on update-driven AND a merely-slow swap');
   assert.match(src, /lastRollbackReason === 'timeout'/,
     "a build that CRASHED never earns a cold restart — that would leave no working proxy");
   assert.match(src, /reloadIsForUpdate = true;[\s\S]{0,80}restartController\.requestRestart\(\)/,
     'the update paths mark the reload as update-driven before requesting it');
-  assert.match(src, /coldFallbackUsed = true;[\s\S]{0,200}restartWorkerNow\(\)/,
+  assert.match(src, /coldFallbackUsed = true;[\s\S]{0,1400}restartWorkerNow\(\)/,
     'the fallback is one-shot so a build that cannot boot cannot crash-loop');
 });
 

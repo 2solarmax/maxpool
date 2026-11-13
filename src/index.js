@@ -12,10 +12,11 @@ import net from 'node:net';
 // connection is opened, hence here at module top.
 net.setDefaultAutoSelectFamilyAttemptTimeout(Number(process.env.MAXPOOL_FAMILY_ATTEMPT_MS) || 2000);
 import { stat } from 'node:fs/promises';
+import { unlinkSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
-import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setConsoleNonBlocking, reassertConsoleNonBlocking, appendEventLog } from './event-log.js';
+import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setConsoleNonBlocking, reassertConsoleNonBlocking, appendEventLog, printFatal } from './event-log.js';
 import { sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
 import { SleepGuard } from './sleep-guard.js';
 import { controllingTerminalAlive } from './terminal-alive.js';
@@ -42,7 +43,8 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
 import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled } from './oauth.js';
-import { TUI, writeTerminalSync, reclaimRawModeLogged } from './tui.js';
+import { TUI, writeTerminalSync, reclaimRawModeLogged, whenTerminalCaughtUp } from './tui.js';
+import { createTerminalModeSwitcher } from './terminal-mode.js';
 import { RestartController } from './restart-controller.js';
 import { resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
@@ -51,7 +53,7 @@ import {
   RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
   MSG_LISTEN, MSG_RELEASE, MSG_TAKEOVER, MSG_PROBE_READY,
   MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
-  MSG_TTY_REASSERT, MSG_CONN, describeOldWorkerExit,
+  MSG_TTY_REASSERT, MSG_CONN, describeOldWorkerExit, makeWorkerChannel, rollbackNoticeAction,
 } from './reload-protocol.js';
 
 const args = process.argv.slice(2);
@@ -382,7 +384,7 @@ async function supervisorCommand() {
     activeWorker = worker;
     worker.child.removeAllListeners('message');
     worker.child.on('message', msg => {
-      if (msg?.type === MSG_RELOAD_REQUEST) orchestrateReload().catch(() => {});
+      if (msg?.type === MSG_RELOAD_REQUEST) orchestrateReload({ reloadId: msg.reloadId }).catch(() => {});
       else if (msg?.type === MSG_PRIMARY && activeWorker === worker) {
         // The worker is now sole acceptor on the handle → stop the supervisor
         // racing it for accepts (the steady-state ~78%-hang bug). The supervisor
@@ -403,11 +405,27 @@ async function supervisorCommand() {
   };
 
   // Reload orchestration: spawn a fresh headless worker, run the baton, swap.
-  const orchestrateReload = async () => {
+  const orchestrateReload = async ({ reloadId } = {}) => {
     if (reloadInFlight) return;
     reloadInFlight = true;
     const oldWorker = activeWorker;
+    const turnEnd = endTurn;
     let newWorker = null;
+    // The abrupt-restart fallback ends THIS reload's turn. If the old worker already
+    // exited mid-reload, that turn is over and the respawn loop has a fresh primary
+    // serving: killing the reload worker is all that is left. Ending the turn again
+    // ended the NEW worker's turn and spawned a second primary (red-team 2026-11-13).
+    const fallBack = () => {
+      try { newWorker?.child.kill('SIGKILL'); } catch { /* ignore */ }
+      if (activeWorker !== oldWorker || endTurn !== turnEnd) {
+        console.log('[Maxpool] reload: the old worker exited mid-reload; its replacement keeps serving');
+        return;
+      }
+      try { oldWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
+      restoreTerminalFromSupervisor({ exiting: false }); // SIGKILLed workers can't restore the TUI
+      activeWorker = null;
+      endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
+    };
     try {
       newWorker = spawnWorker({ reload: true });
       // Hold the new worker's spawn-error so a fork failure mid-baton becomes a
@@ -428,6 +446,7 @@ async function supervisorCommand() {
         readyTimeoutMs: RELOAD_READY_MS,
         takeoverTimeoutMs: RELOAD_READY_MS,
         log: msg => console.log(`[Maxpool] ${msg}`),
+        reloadId,
       });
 
       if (outcome === RELOAD_SWAPPED) {
@@ -459,18 +478,10 @@ async function supervisorCommand() {
       // FALLBACK: the old worker may have released; neither is reliably primary.
       // Kill both and let the respawn loop bring a fresh primary up on the
       // supervisor-owned socket. Queued conns sit in the OS backlog meanwhile.
-      try { newWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
-      try { oldWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
-      restoreTerminalFromSupervisor({ exiting: false }); // SIGKILLed workers can't restore the TUI
-      activeWorker = null;
-      endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
+      fallBack();
     } catch (err) {
       console.error(`[Maxpool] Reload error: ${err.message}; falling back to abrupt restart`);
-      try { newWorker?.child.kill('SIGKILL'); } catch { /* ignore */ }
-      try { oldWorker.child.kill('SIGKILL'); } catch { /* ignore */ }
-      restoreTerminalFromSupervisor({ exiting: false });
-      activeWorker = null;
-      endTurn?.({ code: null, signal: 'SIGKILL', fallback: true });
+      fallBack();
     } finally {
       acceptTarget = null;
       reloadInFlight = false;
@@ -568,50 +579,14 @@ function reapOldWorker(worker, onExited = () => {}) {
   worker.child.once('exit', finish);
 }
 
-/**
- * Wrap a child process in a small IPC channel: `.send(msg[,handle])` and an
- * async `.waitFor([types], timeoutMs)` that resolves with the first matching
- * message, or rejects on timeout / premature child exit.
- */
-function makeWorkerChannel(child) {
-  return {
-    child,
-    send(msg, handle) {
-      try {
-        if (handle) child.send(msg, handle);
-        else child.send(msg);
-      } catch { /* IPC may be torn down mid-swap; baton timeouts cover it */ }
-    },
-    waitFor(types, timeoutMs) {
-      const want = Array.isArray(types) ? types : [types];
-      return new Promise((resolve, reject) => {
-        const cleanup = () => {
-          clearTimeout(timer);
-          child.removeListener('message', onMsg);
-          child.removeListener('exit', onExit);
-          child.removeListener('error', onError);
-        };
-        const onMsg = msg => {
-          if (msg && want.includes(msg.type)) { cleanup(); resolve(msg); }
-        };
-        const onExit = (code, signal) => {
-          cleanup();
-          reject(new Error(`worker exited (code ${code}, signal ${signal}) before ${want.join('/')}`));
-        };
-        // A spawn failure (EMFILE/EAGAIN) surfaces as 'error', not 'exit' — the
-        // baton must see it as a failed step (→ ROLLED_BACK/FALLBACK), not hang.
-        const onError = err => { cleanup(); reject(new Error(`worker spawn error before ${want.join('/')}: ${err.message}`)); };
-        const timer = setTimeout(() => {
-          cleanup();
-          reject(new Error(`timed out waiting for ${want.join('/')}`));
-        }, timeoutMs);
-        timer.unref?.();
-        child.on('message', onMsg);
-        child.once('exit', onExit);
-        child.once('error', onError);
-      });
-    },
-  };
+// Test seam (gated: inert unless a MAXPOOL_TEST_* variable is set). '1' fires every
+// time; any other value is a file path and fires ONCE across processes: the first
+// process that deletes the file acts (a reload worker is a fresh process each time).
+function testHookFires(name) {
+  const v = process.env[name];
+  if (!v) return false;
+  if (v === '1') return true;
+  try { unlinkSync(v); return true; } catch { return false; }
 }
 
 function delay(ms) {
@@ -1008,13 +983,28 @@ async function serverWorkerCommand() {
   // so it can't flip the shared TTY's raw-mode/alt-screen back and clobber the new
   // worker's live TUI. Only the current terminal owner (or the supervisor) restores.
   let terminalHandedOff = false;
+  // Raw-mode switches that must not stall a serving worker (takeover, TTY re-assert).
+  const terminalMode = createTerminalModeSwitcher();
+  // Set when this worker exits for a cold restart: leave the terminal's mode alone on
+  // the way out — switching it waits for the terminal to read (TCSADRAIN), and Node
+  // restores the terminal at exit by itself without waiting (measured on a pty,
+  // 2026-11-13). The respawned worker takes the terminal over.
+  let keepTerminalModeOnExit = false;
+  // An update's cold restart that waits for the terminal to catch up (cancel function).
+  let cancelDeferredColdRestart = null;
   // Self-heal timer for a seamless reload that rolls back (new worker fails to boot,
   // we're never released). Cleared on MSG_RELEASE; fires cancelRestart otherwise.
   let reloadWatchdog = null;
   // One cold-restart fallback per reload request — see the rollback watchdog below.
   let coldFallbackUsed = false;
+  // Set by the update paths just before they request a restart; requestReload moves it
+  // onto the reload it opens, so it describes THAT reload and never a later one.
   let reloadIsForUpdate = false;
   let lastRollbackReason = null;
+  // The reload this worker requested last: its id (echoed by the supervisor in
+  // MSG_ROLLED_BACK) and whether an update asked for it.
+  let reloadSeq = 0;
+  let openReload = null;
 
   // Best-effort terminal restore on ANY abnormal exit path (uncaughtException,
   // a bare process.exit, a crash) so the user's shell is never left in raw mode
@@ -1029,12 +1019,12 @@ async function serverWorkerCommand() {
     // it now; restoring here would clobber its live TUI. No-op.
     if (terminalHandedOff) return;
     try {
-      if (tui?.running) { tui.stop({ exiting }); return; }
+      if (tui?.running) { tui.stop({ exiting, keepRaw: keepTerminalModeOnExit }); return; }
       if (process.stdout.isTTY) {
         if (exiting) writeTerminalSync('\x1b[?25h\x1b[?1049l');
         else process.stdout.write('\x1b[?25h\x1b[?1049l');
       }
-      if (process.stdin.isTTY) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
+      if (process.stdin.isTTY && !keepTerminalModeOnExit) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
     } catch { /* never throw from a restore */ }
   };
   process.on('exit', () => restoreTerminal({ exiting: true }));
@@ -1130,7 +1120,11 @@ async function serverWorkerCommand() {
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
     if (updateTimer) clearInterval(updateTimer);
-    if (tui?.running) { tui.stop(); }   // plain-log mode resumes for the drain messages
+    // Never switch the terminal's mode here (keepRaw + keepTerminalModeOnExit): that
+    // waits for the terminal to read, and a worker frozen on its way out still holds
+    // the listening socket — the port went dead (red-team 2026-11-13).
+    keepTerminalModeOnExit = true;
+    if (tui?.running) { tui.stop({ keepRaw: true }); }   // plain-log mode resumes for the drain messages
     console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
     // Best-effort: flush quota + settle in-flight refreshes/prober before exit so
@@ -1161,6 +1155,10 @@ async function serverWorkerCommand() {
     if (reloadWatchdog) { clearTimeout(reloadWatchdog); reloadWatchdog = null; }
     if (draining) return; // MSG_RELEASE already arrived → a real reload, not a rollback
     lastRollbackReason = reason;
+    // An update that asked while this reload was already open was folded into it.
+    const forUpdate = Boolean(openReload?.forUpdate || reloadIsForUpdate);
+    openReload = null;
+    reloadIsForUpdate = false;
     const why = !answered ? 'the supervisor did not answer'
       : reason === 'timeout' ? 'the new worker did not report ready in time'
         : reason === 'failed' ? 'the new worker failed to start'
@@ -1181,13 +1179,26 @@ async function serverWorkerCommand() {
     // working proxy at all, strictly worse than the bug being fixed. No answer / no
     // reason is treated as unsafe too.
     const swapWasSlowNotBroken = lastRollbackReason === 'timeout';
-    if (reloadIsForUpdate && swapWasSlowNotBroken && !coldFallbackUsed) {
+    if (forUpdate && swapWasSlowNotBroken && !coldFallbackUsed) {
       coldFallbackUsed = true;
-      console.log('[Maxpool] Applying the update with a full restart instead — one moment.');
-      restartWorkerNow();
-    } else if (reloadIsForUpdate && lastRollbackReason === 'failed') {
+      // The respawned worker switches the terminal to raw mode before it serves, and
+      // that waits for the terminal to read: while this terminal is behind, keep serving
+      // here and restart once it has caught up (red-team 2026-11-13: the port froze).
+      if (tui?.running && tui._nb && process.stdout.writableLength > 0) {
+        console.log('[Maxpool] The update will finish with a full restart as soon as this terminal shows output again.');
+        cancelDeferredColdRestart = whenTerminalCaughtUp(() => {
+          cancelDeferredColdRestart = null;
+          if (draining) return;
+          console.log('[Maxpool] Applying the update with a full restart instead — one moment.');
+          restartWorkerNow();
+        });
+      } else {
+        console.log('[Maxpool] Applying the update with a full restart instead — one moment.');
+        restartWorkerNow();
+      }
+    } else if (forUpdate && lastRollbackReason === 'failed') {
       console.log('[Maxpool] The new version failed to start — resumed serving on the current version. Update NOT applied.');
-    } else if (reloadIsForUpdate) {
+    } else if (forUpdate) {
       console.log(`[Maxpool] The update did not hand over (${why}) — resumed serving on the current version. Update NOT applied.`);
     } else {
       console.log('[Maxpool] Rollback complete — resumed serving on the current version.');
@@ -1210,7 +1221,11 @@ async function serverWorkerCommand() {
       try {
         coldFallbackUsed = false;   // fresh reload → fresh cold-fallback budget
         lastRollbackReason = null;
-        process.send({ type: MSG_RELOAD_REQUEST });
+        cancelDeferredColdRestart?.();   // this reload supersedes an update still waiting to restart
+        cancelDeferredColdRestart = null;
+        openReload = { id: `${process.pid}-${++reloadSeq}`, forUpdate: reloadIsForUpdate };
+        reloadIsForUpdate = false;
+        process.send({ type: MSG_RELOAD_REQUEST, reloadId: openReload.id });
         // Arm the rollback self-heal: restartController already latched
         // pending/restarting + paused admission (in _restart, before we got here).
         // On a SUCCESSFUL reload the supervisor sends MSG_RELEASE (→ releaseBaton­
@@ -1220,9 +1235,11 @@ async function serverWorkerCommand() {
         // settles the rollback at once (settleRolledBackReload). This fires when no
         // answer came — a supervisor that predates the notice, or one that is stuck.
         if (reloadWatchdog) clearTimeout(reloadWatchdog);
+        // A supervisor that predates reload ids only ever RECORDED its reason (see the
+        // MSG_ROLLED_BACK handler); settle with it here, as before ids existed.
         reloadWatchdog = setTimeout(() => {
           reloadWatchdog = null;
-          settleRolledBackReload({ answered: false });
+          settleRolledBackReload({ answered: lastRollbackReason != null, reason: lastRollbackReason });
         }, RELOAD_ROLLBACK_SELFHEAL_MS);
         reloadWatchdog.unref?.();
         return;
@@ -1253,7 +1270,10 @@ async function serverWorkerCommand() {
   // the server comes back" is provable without allocating a pty. Gated — never
   // active in normal runs.
   if (process.env.MAXPOOL_TEST_RESTART_SIGNAL === '1') {
-    process.on('SIGUSR2', () => restartController?.requestRestart());
+    process.on('SIGUSR2', () => {
+      if (testHookFires('MAXPOOL_TEST_RELOAD_IS_UPDATE')) reloadIsForUpdate = true;   // test seam: an update-driven reload
+      restartController?.requestRestart();
+    });
   }
 
   const shutdownGracefully = (reason, options = {}) => {
@@ -1386,6 +1406,7 @@ async function serverWorkerCommand() {
         shutdownGracefully('quit');
       },
       onRestart: () => {
+        if (testHookFires('MAXPOOL_TEST_RELOAD_IS_UPDATE')) reloadIsForUpdate = true;   // test seam: an update-driven reload
         restartController.requestRestart();
       },
     });
@@ -1507,17 +1528,18 @@ async function serverWorkerCommand() {
   // (only a cold supervisor start self-updates).
   // Take the terminal: lift the reload-worker boot muzzle so the TUI's first render +
   // any plain-mode fallback logs reach stdout (no-op for a worker that never muzzled),
-  // then start the dashboard. On a TAKEOVER raw mode waits for the terminal to read
-  // (rawWhenDrained): the old worker's frames may fill the terminal, this worker is
-  // serving, and switching it blocks the process while the terminal is behind
-  // (2026-11-13: the takeover froze inside tui.start() and the port went dead). A cold
+  // then start the dashboard. On a TAKEOVER raw mode is switched on a helper thread
+  // (terminal-mode.js): the old worker's frames may fill the terminal, this worker is
+  // serving, and switching it blocks the switching thread while the terminal is behind
+  // (2026-11-13: the takeover froze inside tui.start() and the port went dead; then a
+  // frame small enough to look "taken" still stalled it ~1.7s on a bursty terminal). A cold
   // start keeps the synchronous switch, made before its first frame: with nothing of
   // ours queued yet it waits only for what the terminal already holds, and a deferred
   // switch there left a busy terminal's keyboard dead (tui-terminal-pty (b)/(c)).
   const takeTerminal = ({ viaTakeover }) => {
     setConsoleStdoutSuppressed(false);
     if (tui) {
-      if (tui.start(viaTakeover ? { rawWhenDrained: true } : {})) {
+      if (tui.start(viaTakeover ? { rawWhenDrained: true, modeSwitcher: terminalMode } : {})) {
         console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
       } else {
         tui = null;
@@ -1707,6 +1729,13 @@ async function serverWorkerCommand() {
           // supervisor's rollback (old worker stays primary, zero disruption).
           if (process.env.MAXPOOL_TEST_FAIL_RELOAD_WORKER === '1') {
             process.send({ type: MSG_FAILED, reason: 'test-forced failure' });
+          } else if (testHookFires('MAXPOOL_TEST_RELOAD_NEVER_READY')) {
+            // Test seam: a new build too slow to ever report ready → the supervisor's
+            // readiness timeout ('timeout' rollback).
+          } else if (Number(process.env.MAXPOOL_TEST_RELOAD_READY_DELAY_MS) > 0) {
+            // Test seam: a new build that reports ready only after a delay.
+            setTimeout(() => { try { process.send({ type: MSG_READY }); } catch { /* gone */ } },
+              Number(process.env.MAXPOOL_TEST_RELOAD_READY_DELAY_MS));
           } else {
             process.send({ type: MSG_READY });
           }
@@ -1718,9 +1747,12 @@ async function serverWorkerCommand() {
           await becomePrimary({ viaTakeover: true });
         } else if (msg?.type === MSG_TTY_REASSERT) {
           // The old worker has now EXITED, and its exit reset the shared terminal out
-          // of raw mode (libuv's uv_tty_reset_mode on process exit). Reclaim it —
-          // without blocking on a terminal that is behind (reclaimRawMode).
-          await reclaimRawModeLogged({ flush: tui?._nb ? o => tui.flushOutput(o) : null });
+          // of raw mode (libuv's uv_tty_reset_mode on process exit). Reclaim it on the
+          // helper thread, so a terminal that is behind never stalls this worker;
+          // without a helper, reclaimRawMode (waits for our queue to drain first).
+          const r = await terminalMode.setRaw(true, { toggle: true });
+          if (r.ok) appendEventLog(`[Maxpool] reload: terminal reclaimed in ${r.ms}ms (helper thread)`);
+          else await reclaimRawModeLogged({ flush: tui?._nb ? o => tui.flushOutput(o) : null });
           // Re-assert the screen state too: the dying worker's alt-screen exit and
           // cursor-show can land after ours.
           if (tui?.running && process.stdout.isTTY) {
@@ -1731,10 +1763,16 @@ async function serverWorkerCommand() {
           }
         } else if (msg?.type === MSG_ROLLED_BACK) {
           // The supervisor gave up on the new worker; we were never released. Settle now
-          // (resume admission, maybe cold-restart for an update) — not at the self-heal.
-          // Only for a reload WE requested and that is still open (watchdog armed).
-          if (reloadWatchdog) settleRolledBackReload({ answered: true, reason: msg.reason || null });
-          else lastRollbackReason = msg.reason || null;
+          // (resume admission, maybe cold-restart for an update) — not at the self-heal —
+          // but ONLY when the notice names the reload that is open: a late notice for an
+          // earlier reload once settled the next one and cold-restarted mid-baton
+          // (red-team 2026-11-13). An id-less notice comes from a supervisor that
+          // predates ids (the supervisor survives seamless updates): record the reason,
+          // the self-heal settles with it, exactly as before.
+          const action = rollbackNoticeAction({ noticeId: msg.reloadId, currentId: openReload?.id ?? null, open: Boolean(reloadWatchdog) });
+          if (action === 'settle') settleRolledBackReload({ answered: true, reason: msg.reason || null });
+          else if (action === 'record') lastRollbackReason = msg.reason || null;
+          else appendEventLog(`[Maxpool] Ignored a rollback notice for an earlier reload (${msg.reloadId}).`);
         } else if (msg?.type === MSG_RELEASE) {
           // Baton release: stop accepting NEW (keep in-flight), retire keep-alive
           // sockets with Connection: close, stop writing, flush once, drop TUI.
@@ -2624,17 +2662,25 @@ function argValue(flag) {
 }
 
 function handleServerListenError(err, host, port) {
+  let lines;
   if (err.code === 'EADDRINUSE') {
-    console.error(`[Maxpool] ${host}:${port} is already in use.`);
-    console.error('Another Maxpool proxy may already be running.');
-    console.error('Check the existing server with: maxpool status');
-    console.error(`Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`);
+    lines = [
+      `[Maxpool] ${host}:${port} is already in use.`,
+      'Another Maxpool proxy may already be running.',
+      'Check the existing server with: maxpool status',
+      `Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`,
+    ];
   } else if (err.code === 'EACCES') {
-    console.error(`[Maxpool] Permission denied while listening on ${host}:${port}.`);
-    console.error('Choose a non-privileged port in the Maxpool config.');
+    lines = [
+      `[Maxpool] Permission denied while listening on ${host}:${port}.`,
+      'Choose a non-privileged port in the Maxpool config.',
+    ];
   } else {
-    console.error(`[Maxpool] Failed to listen on ${host}:${port}: ${err.message}`);
+    lines = [`[Maxpool] Failed to listen on ${host}:${port}: ${err.message}`];
   }
+  // The supervisor's terminal may be non-blocking by now (a respawn's bind): print
+  // synchronously, or the reason is dropped at exit.
+  printFatal(lines);
   process.exit(1);
 }
 
