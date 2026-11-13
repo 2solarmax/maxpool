@@ -14,10 +14,16 @@ import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  HAVE_PTY, Terminal, bootPool, stopTheTerminal, pressRestart, watch, describe, proxyRequest, sleep,
+  HAVE_PTY, Terminal, bootPool, stopTheTerminal, pressRestart, watch, describe, proxyRequest, sleep, probePendingSwitch,
 } from './fixtures/reload-pty-harness.js';
 
 const skip = HAVE_PTY ? false : 'python3 with pty not available';
+// Tests whose precondition is "the raw-mode switch is still waiting for the terminal"
+// run only where the kernel can produce that state (measured once, here; see
+// probePendingSwitch). On a Linux pty the switch never waits, so they skip with the
+// measurement as the reason.
+const pending = HAVE_PTY ? await probePendingSwitch() : null;
+const skipPending = skip || (pending.reachable ? false : pending.reason);
 const MARKS = ['cutover complete', 'Restarting server now', 'keyboard ready after the terminal caught up', 'Draining shutdown'];
 const TERMINAL_MODE = new URL('../src/terminal-mode.js', import.meta.url).href;
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -29,10 +35,18 @@ async function onceFile(name) {
   return f;
 }
 
+// ── the gate above must never skip where the live stall happened ──
+
+test('probe: on macOS a raw-mode switch stays pending while the pty is not reading (the gate never skips there)', { skip: skip || (process.platform !== 'darwin' && 'macOS-only tripwire for the pending-switch gate') }, () => {
+  assert.equal(pending.reachable, true, `the probe would skip the pending-switch tests on macOS: ${JSON.stringify(pending)}`);
+  assert.ok(pending.measured?.queued > 0, `precondition: the probe filled the pty queue (${JSON.stringify(pending.measured)})`);
+  assert.equal(pending.measured.settled, null, 'the switch was still waiting when the probe looked');
+});
+
 // ── finding 3, the mechanism: a process with a pending switch exits at once ──
 
 for (const close of [true, false]) {
-  test(`terminal-mode: a process whose raw-mode switch waits for a terminal that is not reading exits at once${close ? ' (after close())' : ' (no close() — the exit path still is not held)'}`, { skip, timeout: 60_000 }, async () => {
+  test(`terminal-mode: a process whose raw-mode switch waits for a terminal that is not reading exits at once${close ? ' (after close())' : ' (no close() — the exit path still is not held)'}`, { skip: skipPending, timeout: 60_000 }, async () => {
     const dir = await mkdtemp(join(tmpdir(), 'maxpool-tm-'));
     const report = join(dir, 'report.json');
     const script = join(dir, 'child.mjs');
@@ -118,7 +132,7 @@ test('a supervised worker quits on SIGTERM while the terminal is not reading', {
 
 // ── finding 6: a respawned worker never switches raw mode on its serving thread ──
 
-test('a respawned worker serves before its raw-mode switch completes on a terminal that reads in bursts', { skip, timeout: 180_000 }, async () => {
+test('a respawned worker serves before its raw-mode switch completes on a terminal that reads in bursts', { skip: skipPending, timeout: 180_000 }, async () => {
   // r with the cold path forced: the old worker exits 75 and the supervisor respawns a
   // cold worker, onto a terminal that is behind and reads 300 bytes every 2s. A small
   // terminal (30x8: a whole frame fits the pty's queue) keeps the switch's wait inside

@@ -15,6 +15,8 @@ import { fileURLToPath } from 'node:url';
 export const HEAD_CLI = fileURLToPath(new URL('../../src/index.js', import.meta.url));
 const HARNESS = fileURLToPath(new URL('./pty-run.py', import.meta.url));
 export const HAVE_PTY = spawnSync('python3', ['-c', 'import pty, termios'], { stdio: 'ignore' }).status === 0;
+const PROBE_CHILD = fileURLToPath(new URL('./pending-switch-probe.mjs', import.meta.url));
+const TERMINAL_MODE_URL = new URL('../../src/terminal-mode.js', import.meta.url).href;
 
 export const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -79,6 +81,37 @@ export class Terminal {
     try { this.cmd('kill'); this.proc.stdin.end(); } catch { /* gone */ }
     setTimeout(() => { try { this.proc.kill('SIGKILL'); } catch { /* gone */ } }, 500).unref();
   }
+}
+
+/**
+ * Can THIS kernel hold a raw-mode switch pending while the terminal is not reading?
+ * A macOS pty can: tcsetattr(TCSADRAIN) waits for the unread output queue (the live
+ * stall, 2026-11-13). A Linux pty applies it at once however much is queued (CI run
+ * 43520507097 measured {ok:true, ms:23} with the terminal paused), so a test whose
+ * precondition is "the switch is still waiting" cannot run there.
+ * Resolves {reachable, reason, measured}. reachable is false ONLY on positive evidence:
+ * the kernel queue was full (bytes still queued unread) and the switch landed anyway.
+ * Anything else (no report, helper error, queue not full) counts as reachable, so the
+ * tests run and report the problem rather than skipping it.
+ */
+export async function probePendingSwitch() {
+  if (!HAVE_PTY) return { reachable: false, reason: 'python3 with pty not available', measured: null };
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-probe-'));
+  const report = join(dir, 'probe.json');
+  const term = new Terminal({ cli: PROBE_CHILD, args: [TERMINAL_MODE_URL, report], cols: 80, rows: 24, env: process.env });
+  try {
+    await term.next('PID ');
+    term.cmd('wait 15');                 // never `read`: the terminal stays paused throughout
+    await term.next('EXIT ', 25_000);
+    let r = null;
+    try { r = JSON.parse(await readFile(report, 'utf8')); } catch { /* no report: treat as reachable */ }
+    if (r && r.queued > 0 && r.settled?.ok === true) {
+      return { reachable: false, measured: r,
+        reason: `this ${process.platform} pty applies a raw-mode switch (tcsetattr TCSADRAIN) without waiting for the terminal: `
+          + `${r.queued} bytes were still queued unread and the switch landed in ${r.settled.ms}ms, so a pending switch cannot be produced here` };
+    }
+    return { reachable: true, measured: r, reason: null };
+  } finally { term.close(); }
 }
 
 /** Boot a supervised pool on a pty; resolves once it serves and has settled 3s. */
