@@ -4,7 +4,7 @@ import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 // A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
-import { appliesTo, forgetClaimOrg } from './claude-reset-grants.js';
+import { appliesTo, clearsGeneralWeekly, forgetClaimOrg } from './claude-reset-grants.js';
 import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM } from './reset-policy.js';
 import {
   LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
@@ -3537,15 +3537,18 @@ export class AccountManager {
   }
 
   /** Is `account` holding its general weekly wall RIGHT NOW? A stamped hold that no
-   *  GENERAL claim has superseded (lastGeneralClaimAt before the stamp — a Fable
-   *  claim refills nothing the hold waits on, red-team r3 #3), on an enabled,
-   *  locally-owned account still at the wall with its refill still ahead — and that
-   *  refill is still the one it waited for (a later window is a new wall, not this
-   *  hold; holdRefillSlackMs absorbs the two sources' reading precision). */
+   *  claim CLEARING the general weekly has superseded (lastFullGeneralClaimAt before
+   *  the stamp — a Fable claim refills nothing the hold waits on, red-team r3 #3; a
+   *  give-back claim retires it only through the live reading below, r5 #1), on an
+   *  enabled, live (r5 #2), locally-owned account still at the wall with its refill
+   *  still ahead — and that refill is still the one it waited for (a later window is
+   *  a new wall, not this hold; holdRefillSlackMs absorbs the two sources' reading
+   *  precision). */
   isHoldingWall(account, now = Date.now()) {
     const h = account?._wallHold;
     if (!h || account.enabled === false || account.poolBenchedBy) return false;
-    if (account.lastGeneralClaimAt != null && account.lastGeneralClaimAt >= h.at) return false;
+    if (account.refreshDead || account.subscriptionGone) return false;   // a dead account serves nothing to hold for
+    if (account.lastFullGeneralClaimAt != null && account.lastFullGeneralClaimAt >= h.at) return false;
     const q = account.quota || {};
     if (!(q.unified7dReset <= h.refillAt + POLICY.holdRefillSlackMs)) return false;
     return Number.isFinite(q.unified7d) && q.unified7d >= CLAUDE_WALL_WEEKLY && q.unified7dReset > now;
@@ -5817,6 +5820,14 @@ export class AccountManager {
       // count instead of nothing; restoreQuotaState marks it stale.
       if (a.resetGrants) out.resetGrants = { ...a.resetGrants, grants: (a.resetGrants.grants || []).map(g => ({ ...g })) };
       if (a.resetCards) out.resetCards = { ...a.resetCards, fiveHour: (a.resetCards.fiveHour || []).map(c => ({ ...c })), weekly: (a.resetCards.weekly || []).map(c => ({ ...c })) };
+      // R7 HOLD REGISTER survives restart (red-team r5 #3): the hold and the claim
+      // stamps that retire it / guard one claim per wall. isHoldingWall re-checks the
+      // restored hold against the live wall and refill, so a stale one self-retires.
+      // Unset fields are undefined and drop out of the JSON state file; a hold is
+      // only ever replaced whole (noteWallHold), so sharing the reference is safe.
+      out.wallHold = a._wallHold;
+      out.lastGeneralClaimAt = a.lastGeneralClaimAt;
+      out.lastFullGeneralClaimAt = a.lastFullGeneralClaimAt;
       return out;
     });
   }
@@ -5863,6 +5874,11 @@ export class AccountManager {
       if (match.resetCards && !account.resetCards) {
         account.resetCards = { ...match.resetCards, stale: true };
       }
+      // R7 hold register (r5 #3). Boot-time only (index.js), so nothing live is
+      // overwritten; an absent field restores as undefined, i.e. never stamped.
+      account._wallHold = match.wallHold;
+      account.lastGeneralClaimAt = match.lastGeneralClaimAt;
+      account.lastFullGeneralClaimAt = match.lastFullGeneralClaimAt;
       // OUTSIDE-USAGE restored: keep holding R7 and force the next sweep to
       // re-verify immediately (fresh poolHourly can only re-prove the leak).
       if (match.outsideUsage?.outside) {
@@ -6213,9 +6229,12 @@ export class AccountManager {
       if (r?.ok) {
         this.noteClaimSuccess(account.name, grant.id);
         account.lastClaimAt = Date.now();
-        // A spent grant that clears the general weekly — whatever the 429 kind —
-        // retires a general hold and counts as the general wall's claim (r3 #3, r4 #3).
+        // A spent grant that applies to the general weekly — whatever the 429 kind —
+        // counts as the general wall's claim (r3 #3, r4 #3: one claim per wall). Only
+        // one that CLEARS it retires the hold (r5 #1): a give-back returns just what
+        // the model used, and the live reading retires the hold once a probe sees it.
         if (appliesTo(grant).includes('general')) account.lastGeneralClaimAt = account.lastClaimAt;
+        if (clearsGeneralWeekly(grant)) account.lastFullGeneralClaimAt = account.lastClaimAt;
         this.noteGrantClaimed(account, grant.id);
         // Clear the wall this claim refills.
         if (kind !== 'weekly' && account.quota?.scopedWeekly?.[kind]) delete account.quota.scopedWeekly[kind];

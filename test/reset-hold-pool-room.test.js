@@ -1161,3 +1161,23 @@ test('R5-3 (minor): the claim stamps survive a restart — a full claim still re
     assert.equal(claimPosts(posts), 1, 'g2 is not spent on the same wall');
   } finally { restore(); }
 });
+
+test('R5-3 (minor): a give-back claim under the hold survives a restart as a give-back — the hold stays live and G is not double-spent', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G(), GB()] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'precondition: held');
+    fableWall(self);
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'precondition: F claimed');
+    assert.ok(self.lastGeneralClaimAt != null && self.lastFullGeneralClaimAt == null, 'precondition: the two stamps differ');
+    const fresh = restart(am);
+    const s2 = fresh.accounts[0];
+    assert.equal(fresh.isHoldingWall(s2), true, 'a restored give-back stamp does not retire the restored hold');
+    fresh.accounts[1].enabled = false;                                 // no room → only the per-wall guard stops a claim
+    assert.equal(await fresh.tryReactiveClaim(s2, { kind: 'weekly', weeklyUtil: 1 }), false, 'no probe since the give-back → G waits');
+    assert.equal(claimPosts(posts), 1);
+  } finally { restore(); }
+});
