@@ -204,7 +204,8 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
   // grant that dies before (or within dyingWindowMs after) the refill never waits —
   // dying value beats the hold either way.
   const holdForRefillWithRoom = (refillAt, grant, scope = 'general') => {
-    if (refillAt == null || msLeft(refillAt, now) >= POLICY.freeRefillWaitMs) return false;
+    // Unknown refill (null) → msLeft is Infinity → no hold.
+    if (msLeft(refillAt, now) >= POLICY.freeRefillWaitMs) return false;
     if (grant?.endsAt != null && grant.endsAt - refillAt < POLICY.dyingWindowMs) return false;
     const count = opts.peersWithRoom?.(scope);
     return Number.isInteger(count) && count >= POLICY.holdMinPeers;

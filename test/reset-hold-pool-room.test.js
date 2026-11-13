@@ -48,6 +48,8 @@ test('CLAIM: capacity unknown (no peer function, or it answers null/NaN) → cla
   assert.equal(why(acct(), listing({ grants: [G()] }), {}).action?.reason, 'weekly at wall', 'no peersWithRoom');
   assert.equal(why(acct(), listing({ grants: [G()] }), { peersWithRoom: () => null }).action?.reason, 'weekly at wall', 'null');
   assert.equal(why(acct(), listing({ grants: [G()] }), { peersWithRoom: () => NaN }).action?.reason, 'weekly at wall', 'NaN');
+  assert.equal(why(acct(), listing({ grants: [G()] }), { peersWithRoom: () => 2.5 }).action?.reason, 'weekly at wall',
+    'a fractional count is not a confirmed integer of accounts');
   assert.ok(decideClaude(acct(), listing({ grants: [G()] })), 'the 2-arg prober-free call keeps claiming');
 });
 
@@ -136,10 +138,19 @@ function pool(n = 3) {
 }
 const count = (am, scope = 'general') => am.countPeersWithRoom(am.accounts[0], scope);
 
-test('ROOM: two healthy fresh peers count; self never counts', () => {
+test('ROOM: two healthy fresh peers count; self never counts — even when self itself is roomy', () => {
   const am = pool(3);
   assert.equal(typeof am.countPeersWithRoom, 'function');
   assert.equal(count(am), 2);
+  // The contract is "OTHER accounts": give SELF roomy quotas and count again —
+  // the number must not move (a future caller may hold a roomy self).
+  am.accounts[0].quota.unified7d = 0.2;
+  am.accounts[0].quota.unified5h = 0.1;
+  assert.equal(count(am), 2, 'self with room still does not count');
+  // …and when self has NO identity to match on (no uuid, no credential), only the
+  // object check keeps it out.
+  am.accounts[0].credential = null;
+  assert.equal(count(am), 2, 'identity-less roomy self still does not count');
 });
 
 test('ROOM: each disqualifier drops exactly one peer', () => {
@@ -244,6 +255,41 @@ test('PROBER: holds while two peers have room (logs the reason), claims on the s
     clock += 6 * 60_000; await prober.probeOne(self);
     assert.equal(posts.length, 1, 'the next sweep claims');
   } finally { restore(); }
+});
+
+test('PROBER (scoped): a model wall asks capacity FOR THAT MODEL — peers roomy in general but with no model bucket → claims', async () => {
+  const am = pool(3);
+  const self = am.accounts[0];
+  const posts = [];
+  const logs = [];
+  const fableWall = () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.5, resetAt: Date.now() + 3 * DAY },
+    scopedWeekly: { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }, weeklyAbsent: false });
+  const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
+    probeFn: async () => fableWall(),
+    grantsFn: async () => listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }) });
+  let clock = 1_700_000_000_000;
+  prober._now = () => clock;
+  const restore = stubFetch(posts);
+  try {
+    clock += 6 * 60_000; await prober.probeOne(self);
+    assert.equal(posts.length, 1, 'no peer has a fable reading → capacity for fable is unknown → claim');
+    assert.ok(logs.some(l => /claiming grant g1 \(fable weekly at wall/.test(l)), logs.join(' | '));
+  } finally { restore(); }
+  // control: with fable room on both peers the same wall is HELD (the scope reached the counter)
+  const am2 = pool(3);
+  for (const p of am2.accounts.slice(1)) p.quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } };
+  const posts2 = [];
+  const logs2 = [];
+  const prober2 = new Prober(am2, { intervalMs: 0, log: m => logs2.push(m), providerProbeFn: async () => null,
+    probeFn: async () => fableWall(),
+    grantsFn: async () => listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }) });
+  prober2._now = () => clock;
+  const restore2 = stubFetch(posts2);
+  try {
+    await prober2.probeOne(am2.accounts[0]);
+    assert.equal(posts2.length, 0, 'fable room on two peers → held');
+    assert.ok(logs2.some(l => l.endsWith(`at wall, claim held (${HOLD})`)), logs2.join(' | '));
+  } finally { restore2(); }
 });
 
 test('REACTIVE: a weekly 429 at the wall honours the same hold (no claim while peers have room); claims when they do not', async () => {
