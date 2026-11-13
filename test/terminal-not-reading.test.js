@@ -300,8 +300,12 @@ test('terminal-mode: this process exiting kills a helper still waiting (a stale 
   const { createTerminalModeSwitcher } = await import('../src/terminal-mode.js');
   const h = fakeHelper();
   const sw = createTerminalModeSwitcher({ makeHelper: () => h });
+  const before = process.listeners('exit');
   void sw.setRaw(true);
-  process.emit('exit', 0);
+  // Run only the hook the switcher added (emitting 'exit' would run the test runner's own).
+  const added = process.listeners('exit').filter(l => !before.includes(l));
+  assert.equal(added.length, 1, 'the switcher hooks this process\'s exit');
+  added[0](0);
   assert.deepEqual(h.killed, ['SIGKILL']);
   sw.close();
 });
@@ -324,9 +328,12 @@ test('terminal-mode: the real helper reports a failure (no controlling terminal)
   const { createTerminalModeSwitcher } = await import('../src/terminal-mode.js');
   const { spawnSync } = await import('node:child_process');
   // Run in a child with no controlling terminal (setsid), so /dev/tty cannot open.
-  const code = `import(${JSON.stringify(new URL('../src/terminal-mode.js', import.meta.url).href)}).then(async ({ createTerminalModeSwitcher }) => {
+  // The helper never keeps its process alive (a worker's server does); the probe holds a timer.
+  const code = `const keep = setInterval(() => {}, 1000);
+  import(${JSON.stringify(new URL('../src/terminal-mode.js', import.meta.url).href)}).then(async ({ createTerminalModeSwitcher }) => {
     const r = await createTerminalModeSwitcher().setRaw(true);
     console.log(JSON.stringify(r));
+    clearInterval(keep);
   });`;
   const r = spawnSync('python3', ['-c', 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])', process.execPath, '-e', code],
     { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'pipe'] });

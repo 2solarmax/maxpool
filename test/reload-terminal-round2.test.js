@@ -36,17 +36,21 @@ for (const close of [true, false]) {
     const dir = await mkdtemp(join(tmpdir(), 'maxpool-tm-'));
     const report = join(dir, 'report.json');
     const script = join(dir, 'child.mjs');
+    await writeFile(report, JSON.stringify({ stage: 'boot' }));
     await writeFile(script, `
       import { createTerminalModeSwitcher } from ${JSON.stringify(TERMINAL_MODE)};
       import { writeFileSync } from 'node:fs';
-            const sw = createTerminalModeSwitcher();
+      import { spawnSync } from 'node:child_process';
+      const set = v => { try { writeFileSync(${JSON.stringify(report)}, JSON.stringify(v)); } catch { /* keep the boot copy */ } };
+      set({ stage: 'started' });
+      const sw = createTerminalModeSwitcher();
       process.stdout._handle.setBlocking(false);
       process.stdout.write('x'.repeat(20000));   // the terminal is not reading: its queue fills
       let settled = null;
-      sw.setRaw(true).then(r => { settled = r; });
+      sw.setRaw(true).then(r => { settled = r; }, e => { settled = { error: String(e) }; });
       setTimeout(() => {
         const helpers = (spawnSync('pgrep', ['-P', String(process.pid)], { encoding: 'utf8' }).stdout || '').split('\\n').filter(Boolean).map(Number);
-        writeFileSync(${JSON.stringify(report)}, JSON.stringify({ settled, helpers }));
+        set({ stage: 'exit', settled, helpers });
         ${close ? 'sw.close();' : ''}
         process.exit(75);
       }, 3000);
@@ -58,6 +62,7 @@ for (const close of [true, false]) {
       term.cmd('wait 8');
       const exit = await term.next('EXIT ', 20_000);
       const r = JSON.parse(await readFile(report, 'utf8'));
+      assert.equal(r.stage, 'exit', `the child reached its exit step (report: ${JSON.stringify(r)})`);
       assert.equal(r.settled, null, 'precondition: the switch was still waiting for the terminal');
       assert.equal(exit, 'EXIT 75', 'the process exited (code 75) while its terminal was not reading');
       // The helper never outlives the process: it would apply a stale mode later.
@@ -115,11 +120,13 @@ test('a supervised worker quits on SIGTERM while the terminal is not reading', {
 
 test('a respawned worker serves before its raw-mode switch completes on a terminal that reads in bursts', { skip, timeout: 180_000 }, async () => {
   // r with the cold path forced: the old worker exits 75 and the supervisor respawns a
-  // cold worker, onto a terminal that is behind and reads 300 bytes every 2.5s.
-  const { port, term, pid, oldWorker, log, cleanup } = await bootPool({ env: { MAXPOOL_TEST_FORCE_COLD_RESTART: '1' } });
+  // cold worker, onto a terminal that is behind and reads 300 bytes every 2s. A small
+  // terminal (30x8: a whole frame fits the pty's queue) keeps the switch's wait inside
+  // the window; a 200-col frame at this pace takes minutes.
+  const { port, term, pid, oldWorker, log, cleanup } = await bootPool({ cols: 30, rows: 8, env: { MAXPOOL_TEST_FORCE_COLD_RESTART: '1' } });
   try {
     await stopTheTerminal(term, port);
-    term.cmd('read-slow 300 2500');
+    term.cmd('read-slow 300 2000');
     const logFrom = (await log()).length;
     await pressRestart(term);
     const back = await watch({ port, pid, log, logFrom, ms: 60_000, timeoutMs: 1500, stepMs: 300, pred: r => r.status === 200 && r.worker && r.worker !== oldWorker && /keyboard ready after the terminal caught up/.test(r.since) });
