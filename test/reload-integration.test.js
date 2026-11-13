@@ -320,10 +320,16 @@ test('an UPDATE-driven reload that rolls back falls back to a cold restart (the 
   const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
   assert.match(src, /forUpdate && swapWasSlowNotBroken && !coldFallbackUsed/,
     'cold fallback is gated on update-driven AND a merely-slow swap');
-  assert.match(src, /lastRollbackReason === 'timeout'/,
-    "a build that CRASHED never earns a cold restart — that would leave no working proxy");
-  assert.match(src, /reloadIsForUpdate = true;[\s\S]{0,80}restartController\.requestRestart\(\)/,
-    'the update paths mark the reload as update-driven before requesting it');
+  assert.match(src, /const swapWasSlowNotBroken = answered && reason === 'timeout' && !idless;/,
+    "a build that CRASHED never earns a cold restart — nor does an id-less 'timeout', which an old supervisor sends for one");
+  // Anchored inside each REAL update path: the test seams (testHookFires lines) also set
+  // the flag right before requestRestart, and an unanchored pattern matched those.
+  for (const name of ['applyUpdateIfReady', 'applyNow']) {
+    const body = src.match(new RegExp(`const ${name} = r => \\{[\\s\\S]*?\\n {2}\\};\\n`));
+    assert.ok(body, `${name} found`);
+    assert.match(body[0], /reloadIsForUpdate = true;[\s\S]{0,80}restartController\.requestRestart\(\)/,
+      `${name} marks the reload as update-driven before requesting it`);
+  }
   assert.match(src, /coldFallbackUsed = true;[\s\S]{0,1400}restartWorkerNow\(\)/,
     'the fallback is one-shot so a build that cannot boot cannot crash-loop');
 });

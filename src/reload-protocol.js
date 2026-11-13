@@ -211,13 +211,17 @@ export function describeOldWorkerExit({ swappedAt, exitedAt, killed = false }) {
  * supervisor echoed (absent from a supervisor that predates ids), `currentId` the id
  * of the reload this worker requested last, `open` whether that reload is still
  * waiting for an outcome.
- *   'settle' — the notice is about the open reload: act on it now
- *   'ignore' — a notice about an earlier reload, or nothing is open
- *   'record' — an id-less notice: remember the reason; the self-heal watchdog settles
- *              (the behaviour before ids, so an old supervisor is never trusted to
- *              name the reload it is about)
+ *   'settle'        — the notice names the open reload: act on it now
+ *   'settle-idless' — an id-less notice (a supervisor that predates ids — it survives
+ *                     seamless updates) while a reload is open: resume serving now, but
+ *                     its reason never authorizes a cold restart. That supervisor tags
+ *                     every readiness rejection 'timeout', a new build that died before
+ *                     ready included, and cannot say which reload it means (red-team
+ *                     round 2, 2026-11-13)
+ *   'ignore'        — a notice about an earlier reload, or nothing is open
  */
 export function rollbackNoticeAction({ noticeId, currentId, open }) {
-  if (noticeId == null) return 'record';
-  return open && noticeId === currentId ? 'settle' : 'ignore';
+  if (!open) return 'ignore';
+  if (noticeId == null) return 'settle-idless';
+  return noticeId === currentId ? 'settle' : 'ignore';
 }

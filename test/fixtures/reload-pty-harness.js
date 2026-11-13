@@ -119,6 +119,54 @@ export async function bootPool({ cli = HEAD_CLI, cols = 200, rows = 60, readyMs 
   return { port, term, pid, dir, oldWorker: first.worker, log, cleanup: () => { term.close(); upstream.server.close(); } };
 }
 
+/**
+ * Boot a supervised pool with NO terminal (MAXPOOL_FORCE_SUPERVISOR); resolves once it
+ * serves. `out()` is everything the processes printed, `log()` the event log.
+ */
+export async function bootHeadless({ cli = HEAD_CLI, env: extraEnv = {} } = {}) {
+  const port = await getFreePort();
+  const upstream = await startUpstream();
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-headless-'));
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    proxy: { host: '127.0.0.1', port, apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstream.port}`,
+    updateCheck: false, shutdown: { drainTimeoutMs: 4000 },
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'sk-ant-stub' }],
+  }) + '\n');
+  const env = {
+    ...process.env, MAXPOOL_CONFIG: configPath, MAXPOOL_FORCE_SUPERVISOR: '1',
+    MAXPOOL_DISABLE_SLEEP_GUARD: '1', MAXPOOL_DISABLE_QUOTA_PROBE: '1', ...extraEnv,
+  };
+  delete env.MAXPOOL_SERVER_WORKER;
+  delete env.MAXPOOL_RELOAD_WORKER;
+  let out = '';
+  const child = spawn(process.execPath, [cli, 'server'], { env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  child.stdout.on('data', d => { out += d; });
+  child.stderr.on('data', d => { out += d; });
+  const deadline = Date.now() + 30_000;
+  let first = null;
+  while (Date.now() < deadline && !((first = await proxyRequest(port)).status === 200 && first.worker)) await sleep(200);
+  assert.ok(first?.worker, `precondition: the pool came up and served:\n${out}`);
+  const logPath = configPath.replace(/\.json$/, '.log');
+  const stop = async () => {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ }
+    await new Promise(r => { if (child.exitCode != null || child.signalCode != null) r(); else { child.once('exit', r); setTimeout(r, 3000).unref(); } });
+    await new Promise(r => upstream.server.close(r));
+  };
+  return { port, child, worker: first.worker, out: () => out, log: () => readFile(logPath, 'utf8').catch(() => ''), stop };
+}
+
+/** Poll `pred` until it holds or `timeoutMs` elapse. */
+export async function until(pred, timeoutMs, stepMs = 100) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await pred()) return true;
+    await sleep(stepMs);
+  }
+  return false;
+}
+
 /** The supervisor's live worker children. */
 export function childPids(pid) {
   const r = spawnSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' });

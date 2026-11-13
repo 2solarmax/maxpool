@@ -11,7 +11,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,10 +71,12 @@ async function boot(env) {
 }
 
 test('a stale rollback notice for an earlier reload does not settle (or cold-restart) the open one', { timeout: 120_000 }, async () => {
-  // Readiness budget 30s, self-heal 15s: the worker gives up on reload #1 before the
-  // supervisor does, the user retries (#2), and only then does #1's 'timeout' arrive.
+  // Readiness budget 25s, self-heal 15s: the worker gives up on reload #1 before the
+  // supervisor does, the user retries (#2), and #1's 'timeout' arrives (~25s) while #2
+  // is still open (#2's own self-heal fires ~31s) — so ignoring it is the id check's
+  // doing, never a race with #2's self-heal (30s readiness let that race decide).
   const p = await boot({
-    MAXPOOL_RELOAD_READY_MS: '30000', MAXPOOL_RELOAD_SELFHEAL_MS: '15000',
+    MAXPOOL_RELOAD_READY_MS: '25000', MAXPOOL_RELOAD_SELFHEAL_MS: '15000',
     MAXPOOL_TEST_RESTART_SIGNAL: '1', MAXPOOL_TEST_RELOAD_IS_UPDATE: '1', MAXPOOL_TEST_RELOAD_NEVER_READY: '1',
   });
   try {
@@ -88,6 +90,8 @@ test('a stale rollback notice for an earlier reload does not settle (or cold-res
     const after = p.out().slice(before);
     assert.doesNotMatch(after, /Applying the update with a full restart/, `reload #2 was cold-restarted on reload #1's notice:\n${after}`);
     assert.doesNotMatch(after, /Reload rolled back \(the new worker did not report ready in time\)/, `reload #2 was settled by reload #1's notice:\n${after}`);
+    const events = await readFile(join(p.dir, 'config.log'), 'utf8').catch(() => '');
+    assert.match(events, /Ignored a rollback notice for an earlier reload/, `#1's notice reached #2 while it was open and was ignored by its id:\n${events.slice(-3000)}`);
   } finally { await p.stop(); }
 });
 

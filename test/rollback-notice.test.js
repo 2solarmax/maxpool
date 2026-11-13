@@ -84,15 +84,19 @@ test('baton: the rollback notice echoes the reload id it was started for', async
   }
 });
 
-test('rollbackNoticeAction: settle only a notice for the open reload; an id-less one keeps the old behaviour', async () => {
+test('rollbackNoticeAction: settle only a notice for the open reload; an id-less one settles too, flagged', async () => {
   const { rollbackNoticeAction } = await P();
   assert.equal(typeof rollbackNoticeAction, 'function', 'rollbackNoticeAction is exported');
   assert.equal(rollbackNoticeAction({ noticeId: 'r-2', currentId: 'r-2', open: true }), 'settle', 'the open reload: act now');
   assert.equal(rollbackNoticeAction({ noticeId: 'r-1', currentId: 'r-2', open: true }), 'ignore', 'a stale notice for an earlier reload');
-  assert.equal(rollbackNoticeAction({ noticeId: undefined, currentId: 'r-2', open: true }), 'record', 'an old supervisor: record, the self-heal decides');
-  assert.equal(rollbackNoticeAction({ noticeId: null, currentId: 'r-2', open: true }), 'record');
   assert.equal(rollbackNoticeAction({ noticeId: 'r-2', currentId: 'r-2', open: false }), 'ignore', 'nothing open: never act');
-  assert.equal(rollbackNoticeAction({ noticeId: undefined, currentId: null, open: false }), 'record', 'old supervisor, nothing open: record as before');
+  // Red-team round 2: an old supervisor's id-less notice settles the open reload at once
+  // (no 50s of 503s) — flagged, so its reason never authorizes a cold restart — and is
+  // never recorded for later (a stale record fed the next reload's self-heal).
+  assert.equal(rollbackNoticeAction({ noticeId: undefined, currentId: 'r-2', open: true }), 'settle-idless');
+  assert.equal(rollbackNoticeAction({ noticeId: null, currentId: 'r-2', open: true }), 'settle-idless');
+  assert.equal(rollbackNoticeAction({ noticeId: undefined, currentId: null, open: false }), 'ignore', 'old supervisor, nothing open: nothing to settle, nothing kept');
+  assert.equal(rollbackNoticeAction({ noticeId: null, currentId: 'r-2', open: false }), 'ignore');
 });
 
 // ── finding 7: an exit path writes the terminal synchronously ──

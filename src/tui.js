@@ -57,10 +57,9 @@ export function writeTerminalSync(s) {
  * kernel's ~1 KB — and a terminal that is not reading at all gets it on 'drain'.
  * Resolves true when reclaimed now, false when deferred to 'drain'.
  * 'drain' is emitted only after a write crossed the stream's high-water mark, so a
- * deferred reclaim also polls the queue length and goes ahead as soon as it SHRINKS —
- * a whole write landed, so the terminal is reading and the remaining wait is the
- * kernel's few KB (2026-11-13: a frame below 16 KB never produced 'drain', and a busy
- * dashboard that keeps adding frames never empties its queue). `guard` is re-checked
+ * deferred reclaim also polls the queue length and goes ahead once it is empty
+ * (2026-11-13: a frame below 16 KB never produced 'drain'). Fallback only: a worker
+ * with a terminal helper (terminal-mode.js) never switches on its own thread. `guard` is re-checked
  * at reclaim time (a TUI stopped meanwhile must not be put back in raw mode);
  * `onDeferredReclaim` runs once the deferred reclaim actually happened.
  */
@@ -85,13 +84,12 @@ export async function reclaimRawMode({
     reclaim();
     try { onDeferredReclaim(); } catch { /* never */ }
   };
-  let lastQueued = stdout.writableLength;
-  const poll = setInterval(() => {
-    const queued = stdout.writableLength;
-    if (typeof queued !== 'number') return;
-    if (queued === 0 || (typeof lastQueued === 'number' && queued < lastQueued)) later();
-    else lastQueued = queued;
-  }, pollMs);
+  // Only once our queue is EMPTY (polled, or 'drain'): a mere shrink — one whole write
+  // landed — fired the switch on the serving thread while a bursty terminal still held
+  // several bursts of ours, stalling the pool for each (red-team round 2). Our queue
+  // cannot grow without bound meanwhile: the dashboard stops writing at the high-water
+  // mark and owes one frame on 'drain', so a busy dashboard still reaches 'drain'.
+  const poll = setInterval(() => { if (stdout.writableLength === 0) later(); }, pollMs);
   poll.unref?.();
   stdout.once('drain', later);
   return false;
