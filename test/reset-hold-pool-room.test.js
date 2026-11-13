@@ -793,9 +793,11 @@ test('R3-3 (boundary): a general claim stamped at the very millisecond of the ho
   const self = am.accounts[0];
   am.noteWallHold(self, now - 1000);
   assert.equal(am.isHoldingWall(self, now), true, 'precondition: live');
-  self.lastGeneralClaimAt = now - 1000;
+  self.lastGeneralClaimAt = now - 1000;                                // a give-back claim (r5 #1): stamps the per-wall guard only
+  assert.equal(am.isHoldingWall(self, now), true, 'a give-back claim does not retire the hold by itself');
+  self.lastFullGeneralClaimAt = now - 1000;
   assert.equal(am.isHoldingWall(self, now), false);
-  self.lastGeneralClaimAt = now - 1001;
+  self.lastFullGeneralClaimAt = now - 1001;
   assert.equal(am.isHoldingWall(self, now), true, 'a general claim BEFORE the hold does not retire it');
   self.lastClaimAt = now;                                              // a later Fable claim
   assert.equal(am.isHoldingWall(self, now), true);
@@ -982,5 +984,180 @@ test('R4-2 (control): one claim per wall still holds for a Fable wall — a seco
     wall();                                                         // the same wall reported again before any new probe
     assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), false);
     assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
+  } finally { restore(); }
+});
+
+// ── red-team round 5 (2026-11-13) ────────────────────────────────────────────
+// A give-back Fable grant: refills the Fable weekly and returns what Fable used to
+// the general weekly — appliesTo() says 'general', but it does NOT clear seven_day.
+const GB = (o = {}, now = Date.now()) => G({ id: 'f-gb', clears: ['seven_day_overage_included'], givesBackWeekly: true, endsAt: now + 5 * DAY, ...o }, now);
+const fableWall = a => { a.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }; };
+const claimPosts = posts => posts.filter(u => /reset_rate_limits/.test(u)).length;
+
+test('R5-1 (major): a give-back Fable grant spent at a Fable 429 keeps the general hold live — the dark-endpoint rescue still runs and the wall still counts', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G(), GB()] }));          // F (5 days) sorts ahead of G (30 days)
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'precondition: general wall held');
+    fableWall(self);
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'precondition: the Fable 429 claims');
+    assert.equal(claimPosts(posts), 1);
+    assert.deepEqual(self.resetGrants.grants.map(g => g.id), ['g1'], 'precondition: F was spent, the full seven_day grant G is untouched');
+    assert.equal(am.isHoldingWall(self), true, 'a give-back claim does not retire the general hold');
+    assert.equal(am.countHoldingWalls(am.accounts[1]), 2, 'the held wall still counts against the pool budget');
+    // The usage endpoint goes dark and room can no longer be confirmed.
+    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
+    let reactive = 0;
+    const real = am.tryReactiveClaim.bind(am);
+    am.tryReactiveClaim = (...a) => { reactive++; return real(...a); };
+    await failingProber(am, posts).probeOne(self);
+    assert.equal(reactive, 1, 'the rescue still runs for the held wall');
+    assert.equal(claimPosts(posts), 1, 'one claim per wall: G is not spent before a probe measures the give-back');
+    // A probe sent after the claim measures the give-back: still at the wall → the rescue reaches G.
+    self.quota.lastProbeOkSentAt = Date.now() + 1;
+    await failingProber(am, posts).probeOne(self);
+    assert.equal(claimPosts(posts), 2, 'the give-back left the account at the wall → G is claimed');
+    assert.equal(am.isHoldingWall(self), false, 'G (seven_day) retires the hold');
+  } finally { restore(); }
+});
+
+test('R5-1 (major): a give-back that brings the account below the wall retires the hold through the live reading', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G(), GB()] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'precondition: held');
+    fableWall(self);
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true);
+    assert.equal(am.isHoldingWall(self), true, 'precondition: live after the give-back');
+    self.quota.unified7d = 0.6;                                        // the next probe measures the drop
+    assert.equal(am.isHoldingWall(self), false);
+  } finally { restore(); }
+});
+
+test('R5-1 (both claim paths): a give-back claim keeps the hold and stamps the per-wall guard; a full seven_day claim retires the hold (control)', async () => {
+  const full = () => G({ id: 'b1', clears: ['seven_day', 'seven_day_overage_included'] });
+  for (const [name, grant, live] of [['give-back', GB(), true], ['full seven_day', full(), false]]) {
+    // sweep (prober._claimClaudeGrant)
+    {
+      const posts = [];
+      const restore = stubFetch(posts);
+      try {
+        const am = pool(3);
+        const self = am.accounts[0];
+        am.noteWallHold(self, Date.now() - 1000);
+        assert.equal(am.isHoldingWall(self), true, `${name} sweep: precondition`);
+        const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null });
+        assert.equal(await prober._claimClaudeGrant(self, { kind: 'grant', grant, scope: 'fable', reason: 'fable weekly at wall' }), true);
+        assert.equal(am.isHoldingWall(self), live, `${name} sweep`);
+        assert.equal(self.lastGeneralClaimAt, self.lastClaimAt, `${name} sweep: the per-wall guard is stamped`);
+      } finally { restore(); }
+    }
+    // fast path (tryReactiveClaim at a Fable 429)
+    {
+      const posts = [];
+      const restore = stubFetch(posts);
+      try {
+        const am = pool(3);
+        const self = am.accounts[0];
+        am.applyResetGrants(0, listing({ grants: [grant] }));
+        assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, `${name} fast: precondition held`);
+        fableWall(self);
+        assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, `${name} fast: precondition claimed`);
+        assert.equal(am.isHoldingWall(self), live, `${name} fast`);
+        assert.equal(self.lastGeneralClaimAt, self.lastClaimAt, `${name} fast: the per-wall guard is stamped`);
+      } finally { restore(); }
+    }
+  }
+});
+
+test('R5-2 (major): a dead holder is no holder — its frozen wall never doubles the peers a new wall needs', async () => {
+  for (const [name, kill, wantHeld] of [
+    ['control: c0 alive and holding', () => {}, false],
+    ['c0 refresh dead', a => { a.refreshDead = true; }, true],
+    ['c0 subscription gone', a => { a.subscriptionGone = true; }, true],
+  ]) {
+    const posts = [];
+    const restore = stubFetch(posts);
+    try {
+      const am = pool(5);                                              // c0, c1 walled; c2..c4 roomy
+      const [c0, c1] = am.accounts;
+      for (const a of [c0, c1]) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+      am.applyResetGrants(0, listing({ grants: [G()] }));
+      am.applyResetGrants(1, listing({ grants: [G()] }));
+      assert.equal(await am.tryReactiveClaim(c0, { kind: 'weekly', weeklyUtil: 1 }), false, `${name}: precondition c0 held`);
+      kill(c0);
+      const attempted = await am.tryReactiveClaim(c1, { kind: 'weekly', weeklyUtil: 1 });
+      assert.equal(attempted === false && claimPosts(posts) === 0, wantHeld, `${name}: c1 held?`);
+      assert.equal(am.countHoldingWalls(c1), wantHeld ? 1 : 2, `${name}: holders`);
+    } finally { restore(); }
+  }
+});
+
+// Export → JSON → restore into a fresh manager (the real restart path, index.js state.json).
+function restart(am, mutate = s => s) {
+  const saved = mutate(JSON.parse(JSON.stringify(am.exportQuotaState())));
+  const fresh = pool(am.accounts.length);
+  fresh.restoreQuotaState(saved);
+  return fresh;
+}
+
+test('R5-3 (minor): a held wall survives a restart — the restored holder still counts against the pool budget', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 }), false, 'precondition: held');
+    const fresh = restart(am);
+    assert.equal(fresh.isHoldingWall(fresh.accounts[0]), true, 'the restored hold is live');
+    assert.equal(fresh.countHoldingWalls(fresh.accounts[1]), 2, 'and counts');
+  } finally { restore(); }
+});
+
+test('R5-3 (control): a restored hold whose refill has passed is not counted', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 }), false, 'precondition: held');
+    const past = Date.now() - H;                                       // down across the refill
+    const fresh = restart(am, s => {
+      const r = s.find(x => x.name === 'c0');
+      r.quota.unified7dReset = past;
+      if (r.wallHold) r.wallHold.refillAt = past;
+      return s;
+    });
+    assert.ok(fresh.accounts[0]._wallHold, 'precondition: the hold record itself was restored');
+    assert.equal(fresh.isHoldingWall(fresh.accounts[0]), false);
+    assert.equal(fresh.countHoldingWalls(fresh.accounts[1]), 1);
+  } finally { restore(); }
+});
+
+test('R5-3 (minor): the claim stamps survive a restart — a full claim still retires the restored hold, and one claim per wall still holds', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G(), G({ id: 'g2' })] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'precondition: held');
+    am.accounts[1].enabled = false;                                    // room gone → the next 429 claims G
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), true);
+    assert.equal(claimPosts(posts), 1);
+    assert.equal(am.isHoldingWall(self), false, 'precondition: the full claim retired the hold');
+    const fresh = restart(am);
+    const s2 = fresh.accounts[0];
+    assert.ok(s2._wallHold, 'precondition: the hold record was restored');
+    assert.equal(fresh.isHoldingWall(s2), false, 'the restored full-claim stamp still retires the restored hold');
+    fresh.accounts[1].enabled = false;                                 // no room after the restart either
+    assert.equal(await fresh.tryReactiveClaim(s2, { kind: 'weekly', weeklyUtil: 1 }), false, 'no probe since the claim → no second claim');
+    assert.equal(claimPosts(posts), 1, 'g2 is not spent on the same wall');
   } finally { restore(); }
 });
