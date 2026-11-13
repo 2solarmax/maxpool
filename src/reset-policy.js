@@ -43,7 +43,7 @@
  *     value cannot survive a wait.
  */
 import { appliesTo as defaultAppliesTo } from './claude-reset-grants.js';
-import { CLAIM_FRESH_MS } from './reset-timing.js';
+import { CLAIM_FRESH_MS, CLAIM_STALE_LISTING_MAX_MS } from './reset-timing.js';
 
 export const POLICY = {
   wallWeekly: 0.90,       // weekly at 90% = at the wall (z.ai cards; UNCHANGED — pre-mortem #22)
@@ -53,13 +53,23 @@ export const POLICY = {
   dyingMinUtilSes: 0.50,    // 5h refills are cheap capacity; demand more waste first
   freeRefillWaitMs: 24 * 3600 * 1000, // R6: hold a wall redeem this close to the free refill
   freeRefillImmediate: 0.98,          // R6: ...unless this full — never block the owner
-  // R7 (owner, 2026-11-13): a Claude WALL claim also waits for the free refill when
-  // OTHER accounts can absorb the load. Room per peer: probe-fresh (≤5 min) readings,
-  // weekly util with ≥ 35% headroom left, 5h util with ≥ 25% headroom to the 0.90
-  // session bench, routable now; a scoped wall asks the same for that model's bucket.
+  // R7 (owner, 2026-11-13): the Claude GENERAL weekly wall claim also waits for the
+  // free refill when OTHER accounts can absorb the load. Room per peer: probe-fresh
+  // (≤5 min) readings, weekly util with ≥ 35% headroom left, 5h util with ≥ 25%
+  // headroom to the 0.90 session bench, routable now.
   holdPeerWeeklyRoom: 0.35,
   holdPeerSessionRoom: 0.25,
   holdMinPeers: 2,
+  // A hold is tied to the refill it waited for (red-team r4 #4). The same refill is
+  // read from two sources with different precision (rate-limit header: whole
+  // seconds; usage probe: fractional), so a reading up to this much later is still
+  // that refill; a rolled window moves it by days.
+  holdRefillSlackMs: 3600 * 1000,
+  // The 429 fast path and the rescue claim from the STORED listing, which they
+  // refuse past CLAIM_STALE_LISTING_MAX_MS (6h). A hold therefore lets go this long
+  // before that bound (red-team r4 #6), while the reset is still claimable — a dark
+  // listing is unknown state, and unknown means claim. The rescue runs every sweep.
+  holdListingMarginMs: 30 * 60 * 1000,
 };
 
 // The plain-words decision reason for an R7 hold — exported so status/log surfaces
@@ -92,9 +102,15 @@ function msLeft(t, now) { return t == null ? Infinity : t - now; }
  *  counter, or a count that isn't an integer ≥ the pool-wide budget ⇒ false (claim).
  *  BUDGET (red-team r2 #2): roomy peers must cover EVERY wall currently held in this
  *  pool — holdMinPeers × holdersInPool(), where holdersInPool counts the walls
- *  holding now INCLUDING this one. Without a holders counter, this wall alone (1). */
-export function wallClaimHeld(refillAt, grant, now, { peersWithRoom, holdersInPool } = {}) {
+ *  holding now INCLUDING this one. Without a holders counter, this wall alone (1).
+ *  LISTING AGE (red-team r4 #6): when the caller passes `listingCheckedAt`, a stored
+ *  listing within holdListingMarginMs of the 6h claim bound — or of unknown age
+ *  (null) — releases the hold: past that bound the reset could not be claimed at
+ *  all while the listing stays dark. Both claim paths pass it. */
+export function wallClaimHeld(refillAt, grant, now, { peersWithRoom, holdersInPool, listingCheckedAt } = {}) {
   if (!(refillAt > now) || refillAt - now >= POLICY.freeRefillWaitMs) return false;
+  if (listingCheckedAt !== undefined
+    && !(now - listingCheckedAt < CLAIM_STALE_LISTING_MAX_MS - POLICY.holdListingMarginMs)) return false;
   if (grant?.endsAt != null && grant.endsAt - refillAt < POLICY.dyingWindowMs) return false;
   const holders = holdersInPool ? holdersInPool() : 1;
   if (!Number.isInteger(holders) || holders < 1) return false;
@@ -182,7 +198,8 @@ export function probeSentAt(q) {
  *  × opts.holdersInPool() — other accounts in THIS pool can absorb the load. Model
  *  (Fable) walls are never held (red-team r3) — but while the general wall is held the
  *  model WALL claim is skipped too: the account is benched by its general wall, so a
- *  Fable reset would buy nothing until the general refill lands. The hold
+ *  Fable reset would buy nothing until the general refill lands — unless that grant
+ *  would expire before (or within dyingWindowMs after) the refill: then it is claimed. The hold
  *  re-evaluates every decision tick (the caller supplies a live count), and fails
  *  CLAIM-side: capacity unknown (no counter, non-number answer) or a grant that
  *  would expire before the refill (or within a day after it — it would sit unspent
@@ -245,7 +262,8 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
     const giveBack = g.givesBackWeekly === true && !(Array.isArray(g.clears) && g.clears.includes('seven_day'));
     if (weeklyWall) {
       // R7: the free refill is imminent and the pool has room — hold the claim.
-      if (wallClaimHeld(q.unified7dReset, g, now, { peersWithRoom: opts.peersWithRoom, holdersInPool: opts.holdersInPool })) {
+      if (wallClaimHeld(q.unified7dReset, g, now,
+        { peersWithRoom: opts.peersWithRoom, holdersInPool: opts.holdersInPool, listingCheckedAt: listing.checkedAt })) {
         generalHeld = true; note(HOLD_POOL_HAS_ROOM); continue;
       }
       // A give-back-only grant (no seven_day in clears) returns only what the model
@@ -278,8 +296,10 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
       // Never held on its own (red-team r3) — but skipped while the GENERAL wall is
       // held: the account is benched by its general wall, so a model reset buys
       // nothing now; the hold re-evaluates every tick and, once the general refill
-      // lands (or the hold lets go), this wall claims as before R7.
-      if (generalHeld) continue;
+      // lands (or the hold lets go), this wall claims as before R7. ONLY when the
+      // grant outlives the general refill by a day (red-team r4 #1) — one that
+      // would expire before then is claimed now, or it is lost.
+      if (generalHeld && (cand.endsAt == null || cand.endsAt - q.unified7dReset >= POLICY.dyingWindowMs)) continue;
       return out({ kind: 'grant', grant: cand, scope: fam, reason: `${fam} weekly at wall` }, `${fam} weekly at wall`);
     }
     const dying = msLeft(cand.endsAt, now) < POLICY.dyingWindowMs

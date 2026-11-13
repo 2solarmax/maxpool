@@ -3465,9 +3465,11 @@ export class AccountManager {
    *  computed LIVE from current account state — the hold re-evaluates every sweep.
    *  Conservative per peer: only a probe-FRESH (≤ CLAIM_FRESH_MS) reading counts,
    *  every disqualifier means "cannot confirm room" (claim, never hold on a guess):
-   *   - serves the SAME traffic (red-team r3 #4): shares at least one routing
-   *     profile with self, by the router's own _matchesProfile — a peer on another
-   *     profile can't take a single one of the walled account's requests.
+   *   - serves the SAME traffic (red-team r3 #4, r4 #5): counted PER routing profile
+   *     self serves, by the router's own _matchesProfile, and the THINNEST profile
+   *     decides — every kind of traffic the walled account carries needs its own
+   *     roomy peers (a peer serving only 'all' takes none of its 'claude' requests).
+   *     A self that serves no profile has no confirmed room (0).
    *   - routable NOW: enabled, not throttled/error/exhausted, not pool-benched
    *     (another process owns it), not a remote mirror (routed by its holder pool),
    *     not auth/subscription-dead.
@@ -3490,16 +3492,16 @@ export class AccountManager {
    *     null is unknown capacity and is not counted; one equal to self's is self
    *     (or self under a second name). Self itself is excluded by the same check —
    *     its identity is either null or its own.
-   *  Returns a plain integer; the POLICY decides sufficiency (holdMinPeers). */
+   *  Returns a plain integer (the minimum over self's profiles); the POLICY decides
+   *  sufficiency (holdMinPeers × holders). */
   countPeersWithRoom(self, now = Date.now()) {
     const selfId = this.capacityIdentity(self);
     const selfProfiles = self?.profiles || ['claude', 'all'];
     const roomLeft = (util, ceiling, room) => Number.isFinite(util) && util <= ceiling - room;
-    const counted = new Set();
+    const roomy = [];
     for (const p of this.accounts) {
       const id = this.capacityIdentity(p);
       if (id == null || id === selfId) continue;
-      if (!selfProfiles.some(pr => this._matchesProfile(p, pr))) continue;
       if (p.type !== 'oauth' || p.enabled === false) continue;
       if (p.remote || p.poolBenchedBy) continue;
       if (p.refreshDead || p.subscriptionGone) continue;
@@ -3515,31 +3517,37 @@ export class AccountManager {
       if (!roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
       const buckets = Object.values(q.scopedWeekly || {}).filter(e => e && e.isActive !== false);
       if (buckets.some(e => !roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom))) continue;
-      counted.add(id);
+      roomy.push({ p, id });
     }
-    return counted.size;
+    if (!selfProfiles.length) return 0;
+    return Math.min(...selfProfiles.map(pr =>
+      new Set(roomy.filter(({ p }) => this._matchesProfile(p, pr)).map(({ id }) => id)).size));
   }
 
   // ── R7 hold register (red-team r2 #1/#2) ──────────────────────────────────
-  // account._wallHold = { at } is stamped whenever either claim path HOLDS the
+  // account._wallHold = { at, refillAt } is stamped whenever either claim path HOLDS the
   // GENERAL weekly wall (the only wall R7 holds — red-team r3). It is live only
   // while the hold still describes reality — see isHoldingWall — so a general
   // claim, the refill or leaving the wall retires it without any clearing code.
 
-  /** Record that `account`'s general weekly wall claim was held. */
+  /** Record that `account`'s general weekly wall claim was held, and WHICH refill
+   *  it waits for (red-team r4 #4). */
   noteWallHold(account, now = Date.now()) {
-    if (account) account._wallHold = { at: now };
+    if (account) account._wallHold = { at: now, refillAt: account.quota?.unified7dReset ?? null };
   }
 
   /** Is `account` holding its general weekly wall RIGHT NOW? A stamped hold that no
    *  GENERAL claim has superseded (lastGeneralClaimAt before the stamp — a Fable
    *  claim refills nothing the hold waits on, red-team r3 #3), on an enabled,
-   *  locally-owned account still at the wall with its refill still ahead. */
+   *  locally-owned account still at the wall with its refill still ahead — and that
+   *  refill is still the one it waited for (a later window is a new wall, not this
+   *  hold; holdRefillSlackMs absorbs the two sources' reading precision). */
   isHoldingWall(account, now = Date.now()) {
     const h = account?._wallHold;
     if (!h || account.enabled === false || account.poolBenchedBy) return false;
     if (account.lastGeneralClaimAt != null && account.lastGeneralClaimAt >= h.at) return false;
     const q = account.quota || {};
+    if (!(q.unified7dReset <= h.refillAt + POLICY.holdRefillSlackMs)) return false;
     return Number.isFinite(q.unified7d) && q.unified7d >= CLAUDE_WALL_WEEKLY && q.unified7dReset > now;
   }
 
@@ -6154,7 +6162,10 @@ export class AccountManager {
     if (!account.credential || account.type !== 'oauth') return false;
     // C6 (finding 1): ONE claim per wall — after a claim, only a probe SENT after
     // it may show the wall again. Repeated 429s on the same wall never re-claim.
-    const lastClaimAt = account.lastClaimAt ?? null;
+    // The general wall counts only claims that cleared it (red-team r4 #2): after a
+    // Fable claim under the hold, a dark probe can't move past the account-wide
+    // stamp, and the rescue / weekly 429 must still reach the general reset.
+    const lastClaimAt = (kind === 'weekly' ? account.lastGeneralClaimAt : account.lastClaimAt) ?? null;
     if (lastClaimAt != null && !((probeSentAt(account.quota) ?? -Infinity) > lastClaimAt)) return false;
     // No grant (or a scoped 429 without a probe-measured bucket) → the next sweep
     // decides on its own fresh reading.
@@ -6176,7 +6187,8 @@ export class AccountManager {
     // GENERAL ONLY (red-team r3): a model (Fable) 429 claims exactly as before R7.
     if (kind === 'weekly' && wallClaimHeld(account.quota?.unified7dReset, grant, now,
       { peersWithRoom: () => this.countPeersWithRoom(account, now),
-        holdersInPool: () => this.countHoldingWalls(account, now) })) {
+        holdersInPool: () => this.countHoldingWalls(account, now),
+        listingCheckedAt: account.resetGrants?.checkedAt })) {
       // Log once per hold EPISODE: the sweep's rescue re-evaluates a held wall every
       // failed tick, and a line per tick would bury the console.
       const already = this.isHoldingWall(account, now);
@@ -6201,8 +6213,9 @@ export class AccountManager {
       if (r?.ok) {
         this.noteClaimSuccess(account.name, grant.id);
         account.lastClaimAt = Date.now();
-        // Only a claim that clears the general weekly retires a general hold (r3 #3).
-        if (kind === 'weekly') account.lastGeneralClaimAt = account.lastClaimAt;
+        // A spent grant that clears the general weekly — whatever the 429 kind —
+        // retires a general hold and counts as the general wall's claim (r3 #3, r4 #3).
+        if (appliesTo(grant).includes('general')) account.lastGeneralClaimAt = account.lastClaimAt;
         this.noteGrantClaimed(account, grant.id);
         // Clear the wall this claim refills.
         if (kind !== 'weekly' && account.quota?.scopedWeekly?.[kind]) delete account.quota.scopedWeekly[kind];

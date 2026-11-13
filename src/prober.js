@@ -10,7 +10,7 @@
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
 import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
 import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
-import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
+import { listResetGrants, claimResetGrant, appliesTo } from './claude-reset-grants.js';
 import { decideZai, decideClaudeWithReason, CLAUDE_WALL_WEEKLY } from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
 // Reset-machinery timing lives in ONE leaf module (re-exported for callers that
@@ -364,9 +364,10 @@ export class Prober {
       if (r?.ok) {
         this.am.noteClaimSuccess?.(account.name, act.grant.id);
         account.lastClaimAt = Date.now();
-        // Only a claim that clears the general weekly retires a general hold (r3 #3);
-        // a Fable claim refills nothing the hold is waiting on.
-        if (act.scope === 'general') account.lastGeneralClaimAt = account.lastClaimAt;
+        // A spent grant that clears the general weekly — whatever scope it was
+        // claimed at — retires a general hold (r3 #3, r4 #3); a Fable-only grant
+        // refills nothing the hold is waiting on.
+        if (appliesTo(act.grant).includes('general')) account.lastGeneralClaimAt = account.lastClaimAt;
         // Spend it in the STORED listing too: until the next listing (≤5 min) the
         // held count, the lift and the reactive path must not see it as unspent.
         this.am.noteGrantClaimed?.(account, act.grant.id);

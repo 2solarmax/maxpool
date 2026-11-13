@@ -946,3 +946,41 @@ test('R4-6 (minor): a hold lets go before the stored listing ages past the 6h cl
     assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'listing near 6h → claimed while still claimable');
   } finally { restore(); }
 });
+
+test('R4-6 (boundary + sweep): the hold lets go at exactly 5h30m of listing age; the sweep applies the same rule; an unknown listing age claims', async () => {
+  const bound = 6 * H - 30 * 60_000;
+  for (const [name, age, want] of [['exactly 5h30m', bound, 1], ['1 ms younger', bound - 1, 0]]) {
+    const posts = [];
+    const restore = stubFetch(posts);
+    try {
+      const now = Date.now();
+      const am = pool(3, now);
+      am.applyResetGrants(0, listing({ grants: [G({}, now)], now }), now - age);
+      await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 }, now);
+      assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, want, name);
+    } finally { restore(); }
+  }
+  const now = Date.now();
+  const l = { ...listing({ grants: [G({}, now)], now }), checkedAt: now - bound };
+  assert.equal(why(acct({ now }), l, peers(9), now).action?.reason, 'weekly at wall', 'sweep: an aging listing claims too');
+  const refill = now + 18 * H;
+  assert.equal(policy.wallClaimHeld(refill, G({}, now), now, { peersWithRoom: () => 9, listingCheckedAt: null }), false, 'listing age unknown → claim');
+  assert.equal(policy.wallClaimHeld(refill, G({}, now), now, { peersWithRoom: () => 9 }), true, 'no listing-age input → the rule does not apply');
+});
+
+test('R4-2 (control): one claim per wall still holds for a Fable wall — a second Fable 429 with no newer probe never re-claims', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
+    const wall = () => { self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }; };
+    am.applyResetGrants(0, listing({ grants: [G({ id: 'f1', clears: ['seven_day_overage_included'] }), G({ id: 'f2', clears: ['seven_day_overage_included'] })] }));
+    wall();
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true);
+    wall();                                                         // the same wall reported again before any new probe
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), false);
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
+  } finally { restore(); }
+});
