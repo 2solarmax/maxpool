@@ -5,7 +5,7 @@ import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 // A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
 import { appliesTo, forgetClaimOrg } from './claude-reset-grants.js';
-import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld } from './reset-policy.js';
+import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM } from './reset-policy.js';
 import {
   LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
   CLAIM_BACKOFF_CAP_MS, REACTIVE_CLAIM_TIMEOUT_MS, CLAIM_FRESH_MS,
@@ -3484,13 +3484,18 @@ export class AccountManager {
    *   - a model `scope` instead requires a probe-MEASURED (not reactive-guessed)
    *     bucket for THAT model with ≥ holdPeerWeeklyRoom left; the account's general
    *     weekly room alone doesn't cover a scoped wall.
+   *   - a RESOLVABLE identity (red-team r2 #4): a peer whose capacityIdentity is
+   *     null is unknown capacity and is not counted; one equal to self's is self
+   *     (or self under a second name). Self itself is excluded by the same check —
+   *     its identity is either null or its own.
    *  Returns a plain integer; the POLICY decides sufficiency (holdMinPeers). */
   countPeersWithRoom(self, scope = 'general', now = Date.now()) {
-    const peers = this.accounts.filter(a => a !== self);
-    const selfIdentity = self ? (self.accountUuid || credentialFp(self.credential)) : null;
+    const selfId = this.capacityIdentity(self);
     const roomLeft = (util, ceiling, room) => Number.isFinite(util) && util <= ceiling - room;
     const counted = new Set();
-    for (const p of peers) {
+    for (const p of this.accounts) {
+      const id = this.capacityIdentity(p);
+      if (id == null || id === selfId) continue;
       if (p.type !== 'oauth' || p.enabled === false) continue;
       if (p.remote || p.poolBenchedBy) continue;
       if (p.refreshDead || p.subscriptionGone) continue;
@@ -3504,7 +3509,6 @@ export class AccountManager {
       const wkCeiling = this._effectiveCap(p, 'wk', now) ?? 1;
       if (!roomLeft(q.unified7d, wkCeiling, POLICY.holdPeerWeeklyRoom)) continue;
       if (!roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
-      if (selfIdentity != null && (p.accountUuid || credentialFp(p.credential)) === selfIdentity) continue;
       if (scope === 'general') {
         const buckets = Object.values(q.scopedWeekly || {}).filter(e => e && e.isActive !== false);
         if (buckets.some(e => !roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom))) continue;
@@ -3513,9 +3517,40 @@ export class AccountManager {
         if (!e || e.reactive === true) continue;
         if (!roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom)) continue;
       }
-      counted.add(this.capacityIdentity(p) ?? p);
+      counted.add(id);
     }
     return counted.size;
+  }
+
+  // ── R7 hold register (red-team r2 #1/#2) ──────────────────────────────────
+  // account._wallHold = { at, scope } is stamped whenever either claim path HOLDS
+  // a wall. It is live only while the hold still describes reality — see
+  // isHoldingWall — so a claim, a refill or leaving the wall retires it without
+  // any clearing code.
+
+  /** Record that `account`'s wall on `scope` ('general' | model family) was held. */
+  noteWallHold(account, scope, now = Date.now()) {
+    if (account) account._wallHold = { at: now, scope };
+  }
+
+  /** Is `account` holding a wall RIGHT NOW? A stamped hold that no claim has
+   *  superseded (lastClaimAt before the stamp), on an enabled, locally-owned
+   *  account still at that wall with its refill still ahead. */
+  isHoldingWall(account, now = Date.now()) {
+    const h = account?._wallHold;
+    if (!h || account.enabled === false || account.poolBenchedBy) return false;
+    if (account.lastClaimAt != null && account.lastClaimAt >= h.at) return false;
+    const q = account.quota || {};
+    const [util, resetAt] = h.scope === 'general'
+      ? [q.unified7d, q.unified7dReset]
+      : [q.scopedWeekly?.[h.scope]?.utilization, q.scopedWeekly?.[h.scope]?.resetAt];
+    return Number.isFinite(util) && util >= CLAUDE_WALL_WEEKLY && resetAt > now;
+  }
+
+  /** The walls a hold must budget for: every OTHER account holding now, plus
+   *  `self` (the wall being decided). Feeds wallClaimHeld's holdersInPool. */
+  countHoldingWalls(self, now = Date.now()) {
+    return 1 + this.accounts.filter(a => a !== self && this.isHoldingWall(a, now)).length;
   }
 
   _holdsUsableReset(account, now = Date.now()) {
@@ -6139,12 +6174,20 @@ export class AccountManager {
     // reading of THIS account: the refill stamp is kept current by every response's
     // rate-limit headers (updateQuota), the grant end comes from the stored listing,
     // and capacity comes from the PEERS' own fresh probes (countPeersWithRoom). A
-    // grant dying before (or within 24h after) the refill never waits.
+    // grant dying before (or within 24h after) the refill never waits. The budget
+    // counts every wall held in this pool right now (r2 #2) and the hold is
+    // registered (r2 #1) so the sweep's rescue can find it again.
     const holdScope = kind === 'weekly' ? 'general' : kind;
     const refillAt = holdScope === 'general'
       ? account.quota?.unified7dReset
       : account.quota?.scopedWeekly?.[holdScope]?.resetAt;
-    if (wallClaimHeld(refillAt, grant, now, scope => this.countPeersWithRoom(account, scope, now), holdScope)) return false;
+    if (wallClaimHeld(refillAt, grant, now,
+      { peersWithRoom: scope => this.countPeersWithRoom(account, scope, now),
+        holdersInPool: () => this.countHoldingWalls(account, now) }, holdScope)) {
+      this.noteWallHold(account, holdScope, now);
+      console.log(`[reset-grant] ${account.name}: 429 at wall, claim held (${HOLD_POOL_HAS_ROOM})`);
+      return false;
+    }
     // C6: shared backoff per (account, grantId).
     const key = `${account.name}:${grant.id}`;
     const until = this._claimRetryUntil?.get(key);

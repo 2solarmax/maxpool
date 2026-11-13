@@ -426,6 +426,41 @@ test('RT2-1 (major): a sweep-held FABLE wall is rescued the same way once Fable 
   } finally { restore(); }
 });
 
+test('RT2-1 (major): probe ANSWERS but the listing call fails (stale) → a held wall is rescued once peers go stale', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'held on the 429');
+    const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
+      grantsFn: async () => ({ error: 'HTTP 429' }) });
+    prober._now = () => Date.now() + 6 * 60_000;
+    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
+    const r = await prober.probeOne(self);
+    assert.equal(r.ok, true, 'precondition: the usage probe itself succeeded');
+    assert.equal(self.resetGrants.stale, true, 'precondition: the listing went stale this tick');
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
+  } finally { restore(); }
+});
+
+test('RT2-1 (guard): the rescue honours a listing cooldown', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'held on the 429');
+    self.resetGrants = { ...self.resetGrants, cooldownUntil: Date.now() + H };
+    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
+    await failingProber(am, posts).probeOne(self);
+    assert.equal(posts.length, 0, 'cooldown → no claim, even with capacity unknown');
+  } finally { restore(); }
+});
+
 test('RT2-1 (control): the rescue only revisits a wall this pool HELD — a never-held wall with a dark endpoint keeps today\'s behaviour', async () => {
   const posts = [];
   const restore = stubFetch(posts);

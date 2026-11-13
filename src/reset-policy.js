@@ -87,12 +87,17 @@ function msLeft(t, now) { return t == null ? Infinity : t - now; }
  *  never the walled account's own usage reading, which is routinely stale at the wall.
  *  Conservative: an unknown / past / ≥24h-away refill, a grant that dies before (or
  *  within dyingWindowMs after) the refill — it would sit unspent at ~0% used — no
- *  counter, or a count that isn't an integer ≥ holdMinPeers ⇒ false (claim). */
-export function wallClaimHeld(refillAt, grant, now, peersWithRoom, scope = 'general') {
+ *  counter, or a count that isn't an integer ≥ the pool-wide budget ⇒ false (claim).
+ *  BUDGET (red-team r2 #2): roomy peers must cover EVERY wall currently held in this
+ *  pool — holdMinPeers × holdersInPool(scope), where holdersInPool counts the walls
+ *  holding now INCLUDING this one. Without a holders counter, this wall alone (1). */
+export function wallClaimHeld(refillAt, grant, now, { peersWithRoom, holdersInPool } = {}, scope = 'general') {
   if (!(refillAt > now) || refillAt - now >= POLICY.freeRefillWaitMs) return false;
   if (grant?.endsAt != null && grant.endsAt - refillAt < POLICY.dyingWindowMs) return false;
+  const holders = holdersInPool ? holdersInPool(scope) : 1;
+  if (!Number.isInteger(holders) || holders < 1) return false;
   const count = peersWithRoom?.(scope);
-  return Number.isInteger(count) && count >= POLICY.holdMinPeers;
+  return Number.isInteger(count) && count >= POLICY.holdMinPeers * holders;
 }
 
 /** Decide the z.ai action. Returns {kind:'card', card, resetType} | null. */
@@ -154,8 +159,9 @@ export function probeSentAt(q) {
 
 /** Decide the Claude action AND say why when there is none.
  *  Returns { action: {kind:'grant', grant, scope, giveBack?, reason} | null,
- *            reason: string | null }  — `reason` names the rejection when action
- *  is null (C5: the skip log prints exactly this), or the claim reason.
+ *            reason: string | null, heldScope?: string | null }  — `reason` names
+ *  the rejection when action is null (C5: the skip log prints exactly this), or the
+ *  claim reason; `heldScope` names the limit an R7 hold kept unclaimed (null: none).
  *
  *  C1 (amended, 2026-11-10): the claim is decided per grant by appliesTo (D1),
  *  NEVER by the server's nextGrantId order alone (pre-mortem #8: a Fable 429 could
@@ -217,7 +223,14 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
   // pool can absorb the load (wallClaimHeld). A hold NOTES its reason and moves on
   // (red-team #2): the model-scoped loop below must still run, so a dying model
   // grant is spent and a model wall with no room elsewhere is claimed.
-  const holdsWall = (refillAt, grant, scope) => wallClaimHeld(refillAt, grant, now, opts.peersWithRoom, scope);
+  // heldScope reports WHICH limit was held so the caller can register the hold
+  // (it feeds the pool-wide budget and the held-wall rescue — red-team r2 #1/#2).
+  let heldScope = null;
+  const holdsWall = (refillAt, grant, scope) => {
+    const held = wallClaimHeld(refillAt, grant, now, { peersWithRoom: opts.peersWithRoom, holdersInPool: opts.holdersInPool }, scope);
+    if (held && heldScope == null) heldScope = scope;
+    return held;
+  };
   let reason = null;
   const note = r => { if (reason == null) reason = r; };
 
@@ -275,5 +288,5 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
   }
 
   // Session-only grants: NEVER claimed (owner 2026-10-30) — falls through.
-  return skip(reason ?? 'below wall');
+  return { action: null, reason: reason ?? 'below wall', heldScope };
 }
