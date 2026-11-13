@@ -455,7 +455,12 @@ test('WIRING: every worker exit path kills the terminal helper first (a pending 
   const rw = src.match(/const restartWorkerNow = \(\) => \{[\s\S]*?\n {2}\};\n/)[0];
   assert.match(rw, /draining = true;[\s\S]{0,200}terminalMode\.close\(\);/);
   assert.ok(rw.indexOf('terminalMode.close()') < rw.indexOf('process.exit('), 'restartWorkerNow: before its exit');
-  assert.match(src, /process\.on\('uncaughtException'[\s\S]{0,800}\{ terminalMode\.close\(\); process\.exit\(SERVER_RESTART_EXIT_CODE\); \}/);
+  // The crash exit also hands the terminal off when supervised (red-team round 5): it
+  // never waits for the terminal while it holds the only accepting socket.
+  assert.match(src, /process\.on\('uncaughtException'[\s\S]{0,1500}\{\s*terminalMode\.close\(\);\s*if \(supervised\) terminalHandedOff = true;\s*process\.exit\(SERVER_RESTART_EXIT_CODE\);\s*\}/);
+  // ...and so do the IPC handler's exit-75 paths (that handler only exists supervised).
+  assert.match(src, /MSG_LISTEN with no socket handle — exiting for respawn\.'\);\s*terminalHandedOff = true;[^\n]*\n\s*process\.exit\(SERVER_RESTART_EXIT_CODE\);/);
+  assert.match(src, /if \(!isReloadWorker\) \{ terminalHandedOff = true; process\.exit\(SERVER_RESTART_EXIT_CODE\); \}/);
   assert.match(src, /const exitAfterMergeFlush = \(\) => \{\s*terminalMode\.close\(\);/);
   const sg = src.match(/const shutdownGracefully = [\s\S]*?\n {2}\};\n/)[0];
   assert.match(sg, /terminalMode\.close\(\);\s[\s\S]{0,700}if \(supervised\) terminalHandedOff = true;\s*if \(tui\?\.running\) tui\.stop\(supervised \? \{ keepRaw: true \} : \{\}\);/);

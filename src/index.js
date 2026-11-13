@@ -1048,8 +1048,16 @@ async function serverWorkerCommand() {
     // skip the exit-75 restart while DRAINING: a shutdown-time write to a dead
     // terminal can throw here, and restarting then would respawn the very orphan
     // a terminal-close shutdown is trying to avoid — let the drain finish instead.
-    // Exiting → the 'exit' listener restores the terminal (synchronously, once).
-    if (!isReloadWorker && !draining) { terminalMode.close(); process.exit(SERVER_RESTART_EXIT_CODE); }
+    // Exiting → the 'exit' listener restores the terminal (synchronously, once) —
+    // unsupervised only. Supervised, the respawned worker takes the terminal over (as
+    // after restartWorkerNow): a crashed primary that waited for the terminal on its way
+    // out held the only accepting socket, and the port was dead until the terminal read
+    // (red-team round 5). Same guard at every supervised exit-75 below.
+    if (!isReloadWorker && !draining) {
+      terminalMode.close();
+      if (supervised) terminalHandedOff = true;
+      process.exit(SERVER_RESTART_EXIT_CODE);
+    }
     restoreTerminal({ exiting: false });
   });
   // Swallow EPIPE/EIO from writes to a hung-up terminal so they can't crash us.
@@ -1756,6 +1764,7 @@ async function serverWorkerCommand() {
           // a cold worker a dead/absent socket, fail LOUD and exit-75 so it respawns —
           // never sit alive-but-not-primary (the blank-screen `r`-restart hang).
           console.error('[Maxpool] Cold worker received MSG_LISTEN with no socket handle — exiting for respawn.');
+          terminalHandedOff = true;   // supervised (this branch is): never wait for the terminal on the way out
           process.exit(SERVER_RESTART_EXIT_CODE);
         } else if (msg?.type === MSG_CONN) {
           // A connection the supervisor's own accept loop won the race for (cold start
@@ -1830,10 +1839,18 @@ async function serverWorkerCommand() {
         // (closes the silent-non-primary hang class). A RELOAD worker mid-baton must
         // NOT exit (that kills the supervisor loop) — report MSG_FAILED so the
         // supervisor rolls back and the old worker stays primary (zero disruption).
-        if (!isReloadWorker) process.exit(SERVER_RESTART_EXIT_CODE);
+        if (!isReloadWorker) { terminalHandedOff = true; process.exit(SERVER_RESTART_EXIT_CODE); }   // supervised: as above
         try { process.send({ type: MSG_FAILED, reason: err.message }); } catch { /* ignore */ }
       }
     });
+    // Test seam (inert unless set): SIGUSR2 feeds the handler above a message, so a pty
+    // test can drive its exit-75 paths for real. 'listen-no-handle' = MSG_LISTEN with no
+    // socket; 'listen' = MSG_LISTEN with a handle, which a serving worker refuses
+    // (ERR_SERVER_ALREADY_LISTEN) → the handler's error path.
+    const ipcSignal = process.env.MAXPOOL_TEST_IPC_SIGNAL;
+    if (ipcSignal === 'listen-no-handle' || ipcSignal === 'listen') {
+      process.on('SIGUSR2', () => process.emit('message', { type: MSG_LISTEN }, ipcSignal === 'listen' ? {} : undefined));
+    }
   } else {
     // Direct (non-TTY service) path: bind the port ourselves, exactly as before.
     const onListenError = err => handleServerListenError(err, host, port);
