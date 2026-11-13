@@ -675,7 +675,12 @@ test('R3-2: general wall HELD + a Fable WALL → nothing claimed (the account is
   const now = Date.now();
   const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H, isActive: true } };
   const grants = [G({}, now), G({ id: 'f1', clears: ['seven_day_overage_included'] }, now)];
-  for (const [name, peersWithRoom] of [['no Fable room anywhere', s => (s == null || s === 'general' ? 2 : 0)], ['room everywhere', () => 2]]) {
+  // real counter: peers that report NO Fable reading still carry the general wall
+  // (unknown Fable binds nothing), so the general wall holds — and the Fable wall waits
+  const am = pool(3, now);
+  assert.equal(am.countPeersWithRoom(am.accounts[0], now), 2, 'precondition: the real counter finds 2 roomy peers');
+  const real = () => am.countPeersWithRoom(am.accounts[0], now);
+  for (const [name, peersWithRoom] of [['peers with no Fable reading (real counter)', real], ['room everywhere', () => 2]]) {
     const r = why(acct({ scoped, now }), listing({ grants, now }), { peersWithRoom }, now);
     assert.equal(r.action, null, `${name}: the Fable wall is not claimed (got ${r.action?.reason})`);
     assert.equal(r.reason, HOLD, name);
@@ -757,7 +762,16 @@ test('R3-4: a peer counts only if it shares a routable profile with the walled a
   am.accounts[1].profiles = ['team-b'];
   assert.equal(count(am, now), 1, 'a peer on another profile cannot take this account\'s traffic');
   am.accounts[1].profiles = ['all'];
-  assert.equal(count(am, now), 2, 'sharing "all" is enough');
+  assert.equal(count(am, now), 1, 'r4 #5: a peer serving only "all" covers none of self\'s "claude" traffic — counted per profile, the thinnest decides');
+  const split = pool(5, now);
+  split.accounts[1].profiles = ['claude']; split.accounts[2].profiles = ['claude'];
+  split.accounts[3].profiles = ['all']; split.accounts[4].profiles = ['all'];
+  assert.equal(count(split, now), 2, 'two roomy peers for EACH of self\'s profiles → 2');
+  split.accounts[4].profiles = ['team-x'];
+  assert.equal(count(split, now), 1, '"all" now has one roomy peer → 1');
+  const none = pool(3, now);
+  none.accounts[0].profiles = [];
+  assert.equal(count(none, now), 0, 'a self that serves no profile has no confirmed room (never an empty min)');
   const t = pool(3, now);
   t.accounts[0].profiles = ['team-a'];
   assert.equal(count(t, now), 0, 'self on a private profile: default peers share nothing');
@@ -799,5 +813,136 @@ test('R3-3 (fast path): a Fable 429 claim on an account holding its general wall
     assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'precondition: the Fable 429 claims (as at cb969da)');
     assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
     assert.equal(am.isHoldingWall(self), true, 'the Fable claim refilled nothing the general hold waits on');
+  } finally { restore(); }
+});
+
+// ── red-team round 4 (2026-11-13) ────────────────────────────────────────────
+test('R4-1 (blocker): under the general hold a Fable WALL grant that would die before (or within a day after) the refill is still claimed', () => {
+  const now = Date.now();
+  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H, isActive: true } };   // general refill: 18h (acct default)
+  const fable = endsAt => G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt }, now);
+  for (const [name, endsAt] of [['expires in 10h, before the refill', now + 10 * H], ['expires 12h after the refill', now + 18 * H + 12 * H]]) {
+    const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), fable(endsAt)], now }), peers(2), now);
+    assert.equal(r.action?.grant?.id, 'f1', `${name}: claimed (got ${r.reason})`);
+    assert.equal(r.action?.reason, 'fable weekly at wall', name);
+    assert.equal(r.heldScope, 'general', `${name}: the general hold is still reported`);
+  }
+  // it outlives the refill by a day or more (or never ends) → still skipped while held
+  for (const [name, endsAt] of [['ends exactly a day after the refill', now + 18 * H + DAY], ['no end date', null]]) {
+    const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), fable(endsAt)], now }), peers(2), now);
+    assert.equal(r.action, null, name);
+    assert.equal(r.reason, HOLD, name);
+  }
+});
+
+test('R4-2 (major): after a Fable claim under the hold, a dark probe with no room left still claims the GENERAL reset (rescue and weekly 429)', async () => {
+  for (const via of ['rescue', 'weekly 429']) {
+    const am = pool(3);
+    const self = am.accounts[0];
+    const posts = [];
+    const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H },
+        scopedWeekly: { fable: { utilization: 0.5, resetAt: Date.now() + 3 * DAY, isActive: true } }, weeklyAbsent: false }),
+      grantsFn: async () => listing({ grants: [G(), G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt: Date.now() + 10 * H })] }) });
+    prober._now = () => Date.now() + 6 * 60_000;
+    const restore = stubFetch(posts);
+    try {
+      await prober.probeOne(self);
+      assert.equal(posts.length, 1, `${via}: precondition — the dying Fable grant was claimed under the general hold`);
+      assert.equal(am.isHoldingWall(self), true, `${via}: precondition — still holding`);
+      for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;   // room can no longer be confirmed
+      if (via === 'rescue') await failingProber(am, posts).probeOne(self);
+      else await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 });
+      assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 2, `${via}: the general reset is claimed`);
+    } finally { restore(); }
+  }
+});
+
+test('R4-2 (control): one claim per wall still holds for the general wall — a second weekly 429 after a general claim never re-claims', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G(), G({ id: 'g2' })] }));
+    am.accounts[1].enabled = false;                                   // no room → the 429 claims
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), true);
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'no probe since the claim → no second claim');
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
+  } finally { restore(); }
+});
+
+test('R4-3 (minor): a claim that spends a grant clearing the GENERAL weekly retires the hold, whatever the 429 kind or claim scope', async () => {
+  const broad = () => G({ id: 'b1', clears: ['seven_day', 'seven_day_overage_included'] });
+  // sweep: the model loop may pick a broad grant at scope 'fable'
+  {
+    const posts = [];
+    const restore = stubFetch(posts);
+    try {
+      const am = pool(3);
+      const self = am.accounts[0];
+      am.noteWallHold(self);
+      assert.equal(am.isHoldingWall(self), true, 'precondition');
+      const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null });
+      assert.equal(await prober._claimClaudeGrant(self, { kind: 'grant', grant: broad(), scope: 'fable', reason: 'fable weekly at wall' }), true);
+      assert.equal(am.isHoldingWall(self), false, 'sweep: a broad grant spent at a Fable wall refilled the general weekly');
+    } finally { restore(); }
+  }
+  // fast path: a Fable 429 with only a broad grant left spends it
+  {
+    const posts = [];
+    const restore = stubFetch(posts);
+    try {
+      const am = pool(3);
+      const self = am.accounts[0];
+      am.applyResetGrants(0, listing({ grants: [broad()] }));
+      assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'general wall held');
+      self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
+      assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'precondition: the Fable 429 spends the broad grant');
+      assert.equal(am.isHoldingWall(self), false, 'fast path: the broad grant refilled the general weekly');
+    } finally { restore(); }
+  }
+});
+
+test('R4-4 (minor): a hold is tied to the refill it waited for — a later weekly window is not the same hold', () => {
+  const now = Date.now();
+  const am = pool(3, now);
+  const self = am.accounts[0];
+  const refill = self.quota.unified7dReset;
+  am.noteWallHold(self, now - 1000);
+  assert.equal(self._wallHold.refillAt, refill, 'the hold records the refill it waits for');
+  assert.equal(am.isHoldingWall(self, now), true, 'precondition: live');
+  self.quota.unified7dReset = refill + 1000;                         // the same refill read with a second of jitter
+  assert.equal(am.isHoldingWall(self, now), true, 'reading jitter is the same refill');
+  self.quota.unified7dReset = refill + 7 * DAY;                      // the window rolled; a new wall
+  assert.equal(am.isHoldingWall(self, now), false, 'a new weekly window is a new wall, not this hold');
+  self.quota.unified7dReset = refill - H;                            // an earlier refill reading is still before the one held for
+  assert.equal(am.isHoldingWall(self, now), true);
+});
+
+test('R4-6 (minor): a hold lets go before the stored listing ages past the 6h claim bound — never strands an unclaimable reset', async () => {
+  for (const [name, ageMs, want] of [['listing 5h45m old', 5 * H + 45 * 60_000, 1], ['listing 1h old (control)', H, 0]]) {
+    const posts = [];
+    const restore = stubFetch(posts);
+    try {
+      const am = pool(3);
+      am.applyResetGrants(0, listing({ grants: [G()] }), Date.now() - ageMs);
+      await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 });
+      assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, want, `${name}: peers roomy`);
+    } finally { restore(); }
+  }
+  // rescue: held while the listing was young; the endpoint stays dark; peers stay roomy
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G()] }), Date.now() - 2 * H);
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'held');
+    await failingProber(am, posts).probeOne(self);
+    assert.equal(posts.length, 0, 'listing 2h old → still held');
+    self.resetGrants = { ...self.resetGrants, checkedAt: Date.now() - (5 * H + 45 * 60_000) };
+    await failingProber(am, posts).probeOne(self);
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'listing near 6h → claimed while still claimable');
   } finally { restore(); }
 });
