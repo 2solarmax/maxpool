@@ -131,6 +131,7 @@ test('SCOPED (model weekly at the wall): held when peers have room for THAT mode
 function pool(n = 3, now = Date.now()) {
   const am = new AccountManager(Array.from({ length: n }, (_, i) => ({ name: `c${i}`, type: 'oauth', accessToken: `t${i}`, refreshToken: `r${i}`, expiresAt: now + 3600_000 })), 0.9);
   for (const a of am.accounts) {
+    a.accountUuid = `u-${a.name}`;   // a resolvable identity (red-team r2 #4: no identity ⇒ not a peer)
     a.quota.unified7d = 0.3; a.quota.unified7dReset = now + 3 * DAY;
     a.quota.unified5h = 0.2; a.quota.unified5hReset = now + 3 * H;
     a.quota.lastProbeOkAt = now;
@@ -150,10 +151,18 @@ test('ROOM: two healthy fresh peers count; self never counts — even when self 
   am.accounts[0].quota.unified7d = 0.2;
   am.accounts[0].quota.unified5h = 0.1;
   assert.equal(count(am), 2, 'self with room still does not count');
-  // …and when self has NO identity to match on (no uuid, no credential), only the
-  // object check keeps it out.
+  // …and when self has NO identity to match on (no uuid, no credential).
   am.accounts[0].credential = null;
+  am.accounts[0].accountUuid = null;
   assert.equal(count(am), 2, 'identity-less roomy self still does not count');
+});
+
+test('RT2-4 (minor): a peer whose identity cannot be resolved is not counted (unknown identity = unknown capacity)', () => {
+  const now = Date.now();
+  const am = pool(3, now);
+  am.accounts[1].accountUuid = null;
+  assert.equal(am.capacityIdentity(am.accounts[1]), null, 'precondition: no identity');
+  assert.equal(count(am, 'general', now), 1);
 });
 
 test('ROOM: each disqualifier drops exactly one peer', () => {
@@ -325,21 +334,153 @@ test('RT3 (major): reactive refill ≥ 24h → claims; peers stale → claims', 
   }
 });
 
-test('RT3 (insurance): a scoped (Fable) 429 honours the same hold, per model', async () => {
-  for (const [name, fableRoom, want] of [['peers have Fable room', 0.2, 0], ['peers lack Fable data', null, 1]]) {
+// Red-team r2 #3: driven in SERVER order (server.js: markRateLimited → tryReactiveClaim).
+test('RT2-3 (server order): a Fable 429 never spends a Fable reset on the fast path, and its retry-after is never read as the refill', async () => {
+  for (const fableRoomOnPeers of [true, false]) {
     const posts = [];
     const restore = stubFetch(posts);
     try {
       const am = pool(3);
       const self = am.accounts[0];
       self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
-      self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
-      if (fableRoom != null) for (const p of am.accounts.slice(1)) p.quota.scopedWeekly = { fable: { utilization: fableRoom, resetAt: Date.now() + DAY } };
+      self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };   // the probe's measurement
+      if (fableRoomOnPeers) for (const p of am.accounts.slice(1)) p.quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } };
       am.applyResetGrants(0, listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }));
-      await am.tryReactiveClaim(self, { kind: 'fable' });
+      am.markRateLimited(0, 60, { status: 429, recordFailure: false, modelScope: 'fable' });
+      const e = self.quota.scopedWeekly.fable;
+      assert.equal(e.reactive, true, 'precondition: the 429 rewrote the bucket as a reactive mark');
+      assert.ok(e.resetAt - Date.now() <= 61_000, 'precondition: the reactive resetAt IS the retry-after');
+      assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), false, 'no attempt (pre-mortem #3: a 429 guess never spends)');
+      assert.equal(posts.length, 0);
+    } finally { restore(); }
+  }
+});
+
+test('RT2-3 (server order): a WEEKLY 429\'s retry-after never stands in for the refill — the 7d reset stamp decides', async () => {
+  for (const [name, resetIn, want] of [['7d reset 30h away, retry-after 60s', 30 * H, 1], ['7d reset 18h away, retry-after 60s', 18 * H, 0]]) {
+    const posts = [];
+    const restore = stubFetch(posts);
+    try {
+      const am = pool(3);
+      const self = am.accounts[0];
+      self.quota.unified7dReset = Date.now() + resetIn;
+      am.applyResetGrants(0, listing({ grants: [G()] }));
+      const stampBefore = self.quota.unified7dReset;
+      am.markRateLimited(0, 60, { status: 429, recordFailure: false });
+      assert.equal(self.quota.unified7dReset, stampBefore, 'markRateLimited leaves the 7d stamp alone');
+      await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 });
       assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, want, name);
     } finally { restore(); }
   }
+});
+
+// Red-team r2 #1: a held reset is never stranded when the usage endpoint goes dark.
+function failingProber(am, posts, logs = []) {
+  const p = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
+    probeFn: async () => ({ error: 'HTTP 429', status: 429 }),
+    grantsFn: async () => ({ error: 'HTTP 429' }) });
+  p._now = () => Date.now() + 6 * 60_000;   // past the grants cadence: the listing call runs (and fails)
+  return p;
+}
+
+test('RT2-1 (major): held on a 429 → probe fails → peers go stale → the NEXT sweep claims through the stored listing', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    self.status = 'throttled'; self.rateLimitedUntil = Date.now() + 4 * H;
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'held on the 429');
+    const prober = failingProber(am, posts);
+    await prober.probeOne(self);
+    assert.equal(posts.length, 0, 'peers still fresh and roomy → still held');
+    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;   // the endpoint is dark for them too
+    const r = await prober.probeOne(self);
+    assert.equal(r.ok, false, 'precondition: this sweep\'s own probe failed');
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'capacity unknown → claimed');
+  } finally { restore(); }
+});
+
+test('RT2-1 (major): a sweep-held FABLE wall is rescued the same way once Fable room can no longer be confirmed', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
+    for (const p of am.accounts.slice(1)) p.quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } };
+    const okProber = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.5, resetAt: Date.now() + 3 * DAY },
+        scopedWeekly: { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }, weeklyAbsent: false }),
+      grantsFn: async () => listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }) });
+    okProber._now = () => Date.now() + 6 * 60_000;
+    await okProber.probeOne(self);
+    assert.equal(posts.length, 0, 'held by the sweep');
+    const prober = failingProber(am, posts);
+    await prober.probeOne(self);
+    assert.equal(posts.length, 0, 'Fable room still confirmed → still held');
+    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
+    await prober.probeOne(self);
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'Fable capacity unknown → claimed');
+  } finally { restore(); }
+});
+
+test('RT2-1 (control): the rescue only revisits a wall this pool HELD — a never-held wall with a dark endpoint keeps today\'s behaviour', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
+    await failingProber(am, posts).probeOne(am.accounts[0]);
+    assert.equal(posts.length, 0);
+  } finally { restore(); }
+});
+
+// Red-team r2 #2: two roomy peers carry ONE held wall, not four.
+test('RT2-2 (major): 4 walled accounts, 2 roomy peers → exactly one holds, the other three claim', async () => {
+  const posts = [];
+  const logs = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(6);
+    for (const a of am.accounts.slice(0, 4)) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+    const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
+      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
+      grantsFn: async () => listing({ grants: [G()] }) });
+    prober._now = () => Date.now() + 6 * 60_000;
+    for (const a of am.accounts.slice(0, 4)) await prober.probeOne(a);
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 3, logs.join(' | '));
+    assert.equal(logs.filter(l => l.endsWith(`claim held (${HOLD})`)).length, 1);
+    // A second sweep: the one holder keeps holding (its own hold isn't counted twice).
+    const before = posts.length;
+    await prober.probeOne(am.accounts[0]);
+    assert.equal(posts.length, before, 'the sole holder is still held');
+  } finally { restore(); }
+});
+
+test('RT2-2 (major): the same pool-wide budget on the 429 fast path', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(4);
+    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    am.applyResetGrants(1, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 }), false, 'first wall held');
+    await am.tryReactiveClaim(am.accounts[1], { kind: 'weekly', weeklyUtil: 1 });
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'second wall claims: 2 peers carry only one');
+  } finally { restore(); }
+});
+
+test('RT2-2 (policy): holders multiply the peers needed', () => {
+  const now = Date.now();
+  const l = listing({ grants: [G({}, now)], now });
+  assert.equal(why(acct({ now }), l, { peersWithRoom: () => 3, holdersInPool: () => 2 }, now).action?.reason, 'weekly at wall', '3 < 2×2');
+  assert.equal(why(acct({ now }), l, { peersWithRoom: () => 4, holdersInPool: () => 2 }, now).reason, HOLD, '4 ≥ 2×2');
+  assert.equal(why(acct({ now }), l, { peersWithRoom: () => 9, holdersInPool: () => 1.5 }, now).action?.reason, 'weekly at wall', 'non-integer holders → claim');
+  assert.equal(why(acct({ now }), l, { peersWithRoom: () => 9, holdersInPool: () => 0 }, now).action?.reason, 'weekly at wall', 'zero holders is not a count (self is one) → claim');
 });
 
 test('RT4 (major): room is measured to the peer\'s CAP on both windows', () => {
