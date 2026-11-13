@@ -80,3 +80,24 @@ test('after a takeover the new worker takes single keys (raw mode, set off its s
     assert.ok(again.ok, `the new worker never acted on r (its terminal is not in raw mode):\n${describe(again.timeline, MARKS)}`);
   } finally { cleanup(); }
 });
+
+test('a hand-off while the terminal is not reading never shuts the port (no run of refused connections)', { skip, timeout: 150_000 }, async () => {
+  // The old worker used to stop accepting BEFORE waiting (up to 3s) for the terminal to
+  // take its last frames; until the supervisor re-armed after MSG_RELEASED, every
+  // connection was refused (red-team round 1, 2026-11-13).
+  const { port, term, pid, oldWorker, log, cleanup } = await bootPool();
+  try {
+    await stopTheTerminal(term, port);
+    const logFrom = (await log()).length;
+    await pressRestart(term);
+    let cutAt = null;
+    const w = await watch({ port, pid, log, logFrom, ms: 30_000, timeoutMs: 1500, stepMs: 250, pred: r => {
+      if (cutAt == null && r.worker && r.worker !== oldWorker) cutAt = r.t;
+      return cutAt != null && r.t - cutAt >= 3;
+    } });
+    assert.ok(cutAt != null, `precondition: the reload handed over:\n${describe(w.timeline, MARKS)}`);
+    const runs = w.timeline.filter((r, i) => !r.worker && i > 0 && !w.timeline[i - 1].worker);
+    assert.deepEqual(runs.map(r => `+${r.t}s ${r.status}`), [], `connections were refused for a stretch around the hand-off:\n${describe(w.timeline, MARKS)}`);
+    assert.deepEqual(w.timeline.filter(r => /timeout/.test(String(r.status))).map(r => `+${r.t}s`), [], 'no request hung');
+  } finally { cleanup(); }
+});

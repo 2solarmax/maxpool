@@ -59,6 +59,8 @@ async function waitFor(pred, timeoutMs, stepMs = 100) {
   return false;
 }
 
+const RECOVER_MS = 3000;   // a few seconds after the notice; the self-heal is SELFHEAL_MS
+
 test('a rolled-back reload resumes serving on the supervisor\'s notice, not at the self-heal', { timeout: 90_000 }, async () => {
   const upstream = await startJsonUpstream();
   const port = await getFreePort();
@@ -86,13 +88,16 @@ test('a rolled-back reload resumes serving on the supervisor\'s notice, not at t
   child.stderr.on('data', d => { out += d; });
   try {
     assert.ok(await waitFor(async () => (await proxyGet(port, apiKey)).status === 200, 20_000), `precondition: pool came up:\n${out}`);
-    const t0 = Date.now();
     process.kill(-child.pid, 'SIGUSR2');
-    assert.ok(await waitFor(() => /rolling back/.test(out), 15_000), `precondition: the supervisor rolled back:\n${out}`);
-    // Back to 200 well inside the self-heal: only MSG_ROLLED_BACK can explain it.
-    const recovered = await waitFor(async () => (await proxyGet(port, apiKey, 1000)).status === 200, 8_000, 200);
+    assert.ok(await waitFor(() => /rolling back/.test(out), 15_000, 20), `precondition: the supervisor rolled back:\n${out}`);
+    // The clock starts at the supervisor's rollback, not at the signal: the new worker's
+    // boot time belongs to neither the notice nor the self-heal (red-team 2026-11-13).
+    const t0 = Date.now();
+    // Back to 200 within a few seconds of the notice, against a 60s self-heal: only
+    // MSG_ROLLED_BACK can explain it.
+    const recovered = await waitFor(async () => (await proxyGet(port, apiKey, 1000)).status === 200, 8_000, 100);
     const tookMs = Date.now() - t0;
-    assert.ok(recovered && tookMs < SELFHEAL_MS / 4, `the old worker kept refusing requests after the supervisor's rollback notice (${tookMs}ms):\n${out}`);
+    assert.ok(recovered && tookMs < RECOVER_MS, `the old worker kept refusing requests ${tookMs}ms after the supervisor's rollback notice (allowed ${RECOVER_MS}ms):\n${out}`);
     // The notice's reason reaches the user's log, in words.
     assert.match(out, /Reload rolled back \(the new worker failed to start\)/);
     assert.doesNotMatch(out, /never took over|did not answer/, 'the supervisor DID answer');

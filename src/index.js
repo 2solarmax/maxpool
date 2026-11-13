@@ -1613,15 +1613,37 @@ async function serverWorkerCommand() {
     const releaseBatonAndDrain = async () => {
       if (draining) { try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ } return; }
       draining = true;
-      // Terminal hand-off, part 1 (red-team S-2): stop drawing and taking keys NOW and
-      // let a slow terminal catch up WHILE steps 1-4 run — they can take many seconds,
-      // and the supervisor waits only so long for MSG_RELEASED.
+      // Terminal hand-off, part 1 (red-team S-2): stop drawing and taking keys NOW.
       const terminalCatchUp = tui?.running ? tui.beginHandOff({ timeoutMs: 1500 }) : null;
       // MSG_RELEASE arrived → the new worker booted OK and this reload is really
       // proceeding (not a rollback). Disarm the rollback self-heal.
       if (reloadWatchdog) { clearTimeout(reloadWatchdog); reloadWatchdog = null; }
       if (syncTimer) clearInterval(syncTimer);
       if (updateTimer) clearInterval(updateTimer);
+
+      // Terminal hand-off, part 2 (r2 B2, 2026-11-12): let a slow terminal catch up,
+      // then the exit sequence, each bounded (1.5s) — BEFORE releasing: the new worker
+      // paints right after MSG_RELEASED, and its first frame must not interleave with
+      // ours. Done while this worker STILL ACCEPTS: once it stops, only the supervisor's
+      // re-armed listener (after MSG_RELEASED) takes connections, and a terminal wait
+      // in between refused every connection for ~3s (red-team round 1, 2026-11-13).
+      // Muzzle our remaining logs first, so none print once stop() gives console.log
+      // back to plain stdout. Never turns blocking back on.
+      setConsoleStdoutSuppressed(true);
+      if (terminalCatchUp) {
+        await terminalCatchUp;
+        appendEventLog(`[Maxpool] Reload: handing the terminal to the new worker (${process.stdout.writableLength || 0} bytes not yet shown)`);
+        // keepRaw: the incoming worker puts the terminal in raw mode itself, and
+        // switching it here would freeze this worker — still streaming in-flight
+        // responses — for as long as the terminal is behind (TCSADRAIN; see TUI.stop).
+        await tui.handOff({ timeoutMs: 1500, flushing: terminalCatchUp, keepRaw: true });
+      }
+      // The terminal is now HANDED OFF: the incoming worker will take the TTY at
+      // MSG_TAKEOVER. Arm the guard UNCONDITIONALLY (even if the TUI was already
+      // stopped) so this worker's later exit(0) restoreTerminal can't clobber the
+      // new worker's TUI.
+      terminalHandedOff = true;
+
       // Stop accepting NEW connections; KEEP in-flight requests alive.
       server.maxpoolBeginDrain?.();
       server.close(() => {});
@@ -1647,28 +1669,6 @@ async function serverWorkerCommand() {
       //    off (M3 — otherwise the new worker boots from the invalidated token).
       await flushConfigWrites();
       await flushStateWrites();
-
-      // Muzzle our own remaining logs (in-flight requests completing) BEFORE the
-      // hand-off's stop() gives console.log back to plain stdout, so none of them
-      // print on the user's screen or paint the new worker's alt-screen.
-      setConsoleStdoutSuppressed(true);
-      // Terminal hand-off, part 2 (r2 B2, 2026-11-12): finish the catch-up started at
-      // the top, then the exit sequence, each bounded (1.5s) — BEFORE releasing: the
-      // new worker paints right after MSG_RELEASED, and its first frame must not
-      // interleave with ours. Never turns blocking back on; keeps serving in-flight.
-      if (terminalCatchUp) {
-        await terminalCatchUp;
-        appendEventLog(`[Maxpool] Reload: handing the terminal to the new worker (${process.stdout.writableLength || 0} bytes not yet shown)`);
-        // keepRaw: the incoming worker puts the terminal in raw mode itself, and
-        // switching it here would freeze this worker — still streaming in-flight
-        // responses — for as long as the terminal is behind (TCSADRAIN; see TUI.stop).
-        await tui.handOff({ timeoutMs: 1500, flushing: terminalCatchUp, keepRaw: true });
-      }
-      // The terminal is now HANDED OFF: the incoming worker will take the TTY at
-      // MSG_TAKEOVER. Arm the guard UNCONDITIONALLY (even if the TUI was already
-      // stopped) so this worker's later exit(0) restoreTerminal can't clobber the
-      // new worker's TUI.
-      terminalHandedOff = true;
       try { process.send({ type: MSG_RELEASED }); } catch { /* ignore */ }
 
       // (macOS) releaseLease() above dropped the wake-lock, but we still stream our
