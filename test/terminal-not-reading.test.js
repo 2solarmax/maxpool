@@ -112,6 +112,26 @@ test('a deferred reclaim happens once our queue empties, even though no \'drain\
   assert.deepEqual(stdin.calls, [false, true, 'resume'], 'one reclaim, not one per signal');
 });
 
+test('a deferred reclaim goes ahead once the queue SHRINKS, even if a busy dashboard never lets it empty', async () => {
+  const stdin = rawStdin();
+  const stdout = Object.assign(new EventEmitter(), { writableLength: 30_000 });
+  await reclaimRawMode({ stdin, stdout, flush: async () => false, pollMs: 10 });
+  stdout.writableLength = 45_000;           // more frames queued, nothing read: still behind
+  await sleep(40);
+  assert.deepEqual(stdin.calls, [], 'a growing queue is not progress');
+  stdout.writableLength = 15_000;           // a whole frame landed: the terminal is reading
+  await sleep(40);
+  assert.deepEqual(stdin.calls, [false, true, 'resume']);
+});
+
+test('a deferred reclaim never fires while the queue is stuck (the terminal is not reading)', async () => {
+  const stdin = rawStdin();
+  const stdout = Object.assign(new EventEmitter(), { writableLength: 30_000 });
+  await reclaimRawMode({ stdin, stdout, flush: async () => false, pollMs: 10 });
+  await sleep(80);
+  assert.deepEqual(stdin.calls, []);
+});
+
 test('a deferred reclaim is skipped when its guard says the terminal is no longer ours', async () => {
   const stdin = rawStdin();
   const stdout = Object.assign(new EventEmitter(), { writableLength: 800 });
@@ -236,9 +256,11 @@ test('WIRING: a takeover announces MSG_PRIMARY before it takes the terminal, whi
   const bp = src.match(/const becomePrimary = async[\s\S]*?\n {2}\};\n/);
   assert.ok(bp, 'becomePrimary found');
   const primary = bp[0].indexOf('type: MSG_PRIMARY');
-  const takeover = bp[0].indexOf('if (viaTakeover) takeTerminal();');
+  const takeover = bp[0].indexOf('if (viaTakeover) takeTerminal({ viaTakeover });');
   assert.ok(primary > 0 && takeover > primary, 'MSG_PRIMARY is sent before a takeover takes the terminal');
-  assert.match(src, /const takeTerminal = [\s\S]{0,400}tui\.start\(\{ rawWhenDrained: true \}\)/);
+  // Only a takeover defers raw mode; a cold start switches it before its first frame
+  // (deferring there left a busy terminal's keyboard dead — tui-terminal-pty (b)/(c)).
+  assert.match(src, /const takeTerminal = [\s\S]{0,1200}tui\.start\(viaTakeover \? \{ rawWhenDrained: true \} : \{\}\)/);
 });
 
 test('WIRING: MSG_ROLLED_BACK settles the rollback at once; the self-heal reports a missing answer as such', () => {

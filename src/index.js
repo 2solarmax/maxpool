@@ -1507,13 +1507,17 @@ async function serverWorkerCommand() {
   // (only a cold supervisor start self-updates).
   // Take the terminal: lift the reload-worker boot muzzle so the TUI's first render +
   // any plain-mode fallback logs reach stdout (no-op for a worker that never muzzled),
-  // then start the dashboard. Raw mode waits for the terminal to read (rawWhenDrained):
-  // this worker is serving, and switching it blocks the process while the terminal is
-  // behind (2026-11-13: the takeover froze inside tui.start() and the port went dead).
-  const takeTerminal = () => {
+  // then start the dashboard. On a TAKEOVER raw mode waits for the terminal to read
+  // (rawWhenDrained): the old worker's frames may fill the terminal, this worker is
+  // serving, and switching it blocks the process while the terminal is behind
+  // (2026-11-13: the takeover froze inside tui.start() and the port went dead). A cold
+  // start keeps the synchronous switch, made before its first frame: with nothing of
+  // ours queued yet it waits only for what the terminal already holds, and a deferred
+  // switch there left a busy terminal's keyboard dead (tui-terminal-pty (b)/(c)).
+  const takeTerminal = ({ viaTakeover }) => {
     setConsoleStdoutSuppressed(false);
     if (tui) {
-      if (tui.start({ rawWhenDrained: true })) {
+      if (tui.start(viaTakeover ? { rawWhenDrained: true } : {})) {
         console.log(`Listening on ${host}:${port} with ${accounts.length} account(s)`);
       } else {
         tui = null;
@@ -1528,7 +1532,7 @@ async function serverWorkerCommand() {
     // Cold start: the terminal first, as always (nothing else to hand over). A reload
     // TAKEOVER serves and announces primacy FIRST and takes the terminal last (below):
     // whatever the terminal does, the baton completes and the port keeps answering.
-    if (!viaTakeover) takeTerminal();
+    if (!viaTakeover) takeTerminal({ viaTakeover });
     // On a reload TAKEOVER, adopt the latest tokens from disk. The headless
     // reload worker loaded config at spawn time; the OLD worker may have rotated
     // a single-use refresh token DURING the handoff (and flushed it before
@@ -1552,7 +1556,7 @@ async function serverWorkerCommand() {
     // loop (the steady-state race fix). Cold start AND takeover both signal this.
     if (supervised) { try { process.send({ type: MSG_PRIMARY }); } catch { /* ignore */ } }
     // Same tick as the send: no supervisor message (MSG_TTY_REASSERT) can land between.
-    if (viaTakeover) takeTerminal();
+    if (viaTakeover) takeTerminal({ viaTakeover });
 
     // Reload-storm guard: only a cold (non-reload) lease holder probes npm.
     // A reload-spawned/takeover worker must NEVER re-probe (1x not 2x traffic).
