@@ -193,6 +193,12 @@ test('T9: onRequestEnd carries the stream flag for streaming and non-streaming r
   const port = await listen(proxy);
   const origLog = console.log; console.log = () => {};
   try {
+    // F9: count_tokens and a GET carry no streaming shape: null, never a (misleading) false.
+    await (await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' },
+      body: JSON.stringify({ model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] }),
+    })).text();
+    await (await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { 'x-api-key': 'tc-test' } })).text();
     for (const stream of [false, true]) {
       const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
         method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test', 'x-want': stream ? 'sse' : 'json' },
@@ -201,9 +207,11 @@ test('T9: onRequestEnd carries the stream flag for streaming and non-streaming r
       await r.text();
     }
   } finally { console.log = origLog; await close(proxy); await close(upstream); }
-  assert.equal(ends.length, 2);
-  assert.equal(ends[0].stream, false, 'non-streaming request-end says stream:false');
-  assert.equal(ends[1].stream, true, 'streaming request-end says stream:true');
+  assert.equal(ends.length, 4);
+  assert.equal(ends[0].stream, null, 'count_tokens is not a non-streaming message');
+  assert.equal(ends[1].stream, null, 'GET /v1/models is not a non-streaming message');
+  assert.equal(ends[2].stream, false, 'non-streaming request-end says stream:false');
+  assert.equal(ends[3].stream, true, 'streaming request-end says stream:true');
 });
 
 test('T9: the TUI tags a non-streaming request-end line " ns" and leaves streaming lines alone', () => {

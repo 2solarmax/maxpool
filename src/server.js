@@ -119,6 +119,11 @@ function parsePatience(headers = {}) {
 function computeDeadline(headers, arrivedAt) {
   const p = parsePatience(headers);
   if (!p) return null;
+  // F1 (mixed version): a request FORWARDED BY ANOTHER POOL (hop header) that carries no pool deadline header
+  // comes from an OLD Mac (v1.24.91). It forwards the client's x-stainless-timeout, but an old Mac books any
+  // 5xx it passes through as an account failure, so this pool must behave exactly as before: no deadline.
+  // (A new Mac always sends the pool header on a non-streaming link hop.)
+  if (!p.poolSupplied && headerValue(headers, HOP_HEADER) !== '') return null;
   const k = deadlineKnobs();
   const usableMs = p.poolSupplied
     ? Math.max(p.ms - k.POOL_TRANSIT_MARGIN_MS, 1_000)
@@ -130,13 +135,15 @@ function nonStreamRemainingMs(requestInfo = {}) {
   if (requestInfo.stream || requestInfo.deadlineAt == null) return Infinity;
   return requestInfo.deadlineAt - Date.now();
 }
-/** First-byte wait for one DIRECT hop: min(the scaled/flat wait, remaining, 290s) — the outer
- *  min explicit here because scaledTtfbMs floors at 120s and clientWaitCeilingMs is null for non-streaming. */
+/** First-byte wait for one DIRECT hop. WITH a deadline: min(remaining, hop cap) — the flat/scaled
+ *  first-byte floor (120s) does NOT apply, because the client has said it will wait longer and a
+ *  floor timeout would abandon an answer that still fits (F3). WITHOUT a deadline: `waitMs`, today's wait.
+ *  The cap is the 290s undici bound (injectable lower via MAXPOOL_LINK_HOP_CAP_MS for scaled tests). */
 function nonStreamFirstByteWait(requestInfo, waitMs) {
   const remaining = nonStreamRemainingMs(requestInfo);
   if (remaining === Infinity) return { ms: waitMs, deadlineBound: false };
-  const other = Math.min(waitMs, NONSTREAM_HOP_CAP_MS);
-  return remaining <= other ? { ms: Math.max(1, Math.floor(remaining)), deadlineBound: true } : { ms: other, deadlineBound: false };
+  const cap = deadlineKnobs().LINK_HOP_CAP_MS;
+  return remaining <= cap ? { ms: Math.max(1, Math.floor(remaining)), deadlineBound: true } : { ms: cap, deadlineBound: false };
 }
 /** Non-streaming body-read wait: min(UPSTREAM_BODY_MS, remaining). */
 function nonStreamBodyWait(requestInfo, bodyMs) {
@@ -698,7 +705,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           firstUpstreamByteAt: requestInfo?._firstUpstreamByteAt ?? null,
           upstreamForwardStartAt: requestInfo?._upstreamForwardStartAt ?? null,
           // B8: makes the non-streaming share measurable. null = no request shape was ever parsed.
-          stream: requestInfo?.method != null ? Boolean(requestInfo.stream) : null,
+          // F9: only the message-creating call (POST /v1/messages) has a streaming shape — count_tokens and GETs
+          // must not read as "non-streaming" and swamp the share.
+          stream: requestInfo?.method === 'POST' && /^\/v1\/messages(?:\?|$)/.test(String(req.url || '')) ? Boolean(requestInfo.stream) : null,
         });
       }
     } catch (err) {
@@ -1847,7 +1856,8 @@ async function forwardRequest(
         logSections.push(`=== RESPONSE ${upstreamRes.status} — "${account.name}" cooling down, failing over ===\n${formatHeaders(upstreamRes.headers)}`);
       }
 
-      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
+      if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
+        && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
         logFailedAttempt(account.name, `upstream_${upstreamRes.status}`, 'retriable upstream status, cooling down', 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
@@ -2006,7 +2016,8 @@ async function forwardRequest(
           : null;
         const issuerIsClaude = issuer && issuer.type !== 'provider';
         if (lease.migratedFromName && issuerIsClaude && requestInfo.sessionKey
-          && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
+          && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
+          && resendAllowed(requestInfo)) {
           accountManager.revertSessionBinding(requestInfo.sessionKey, lease.migratedFromName);
           excludedIndexes.add(account.index);
           console.log(`[Maxpool] Thinking-signature fail-safe: reverting session to issuer "${lease.migratedFromName}" and retrying`);
@@ -2022,7 +2033,8 @@ async function forwardRequest(
       // EFFORT REPAIR. A rejected output_config.effort is a hard failure of whatever the
       // client was doing (a web search, a tool call) — worth healing rather than surfacing.
       if (effortMode && !requestInfo.effortRepaired
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
+        && resendAllowed(requestInfo)) {
         const fix = repairEffort(body, effortMode, errorBody);
         if (fix.body) {
           // Latch it so LATER turns apply the working level up front: the client resends the
@@ -2066,7 +2078,7 @@ async function forwardRequest(
       const isDirectiveFormRejection = account.type !== 'provider'
         && upstreamRes.status === 400
         && /output_config[^:]*: *Extra inputs are not permitted/i.test(errorBody);
-      if (isDirectiveFormRejection && requestInfo.orderingRepaired && !requestInfo.orderingFallback && canRepairBody) {
+      if (isDirectiveFormRejection && requestInfo.orderingRepaired && !requestInfo.orderingFallback && canRepairBody && resendAllowed(requestInfo)) {
         // Rewrite every directive-only system (the repair's own output) as a PLAIN
         // assistant turn carrying the directives text — ordinary history, accepted by
         // every validator, nothing dropped. A system ENDING the array stays legal
@@ -2090,7 +2102,7 @@ async function forwardRequest(
           );
         }
       }
-      if (isOrderingRejection && !requestInfo.orderingRepaired && canRepairBody) {
+      if (isOrderingRejection && !requestInfo.orderingRepaired && canRepairBody && resendAllowed(requestInfo)) {
         const coord = /messages\.(\d+)/.exec(errorBody);
         const { messages: fixedMessages, converted } = directiveOnlySystemMessages(
           JSON.parse(body.toString('utf8')).messages ?? [],
@@ -2107,7 +2119,7 @@ async function forwardRequest(
           );
         }
       }
-      if (isSignatureRejection && !requestInfo.thinkingStripped && canRepairBody) {
+      if (isSignatureRejection && !requestInfo.thinkingStripped && canRepairBody && resendAllowed(requestInfo)) {
         console.log(`[Maxpool] Anthropic rejected a block: ${describeRejectedBlock(body, errorBody)}`);
         const { body: cleanBody, removed, converted } = stripForeignThinkingBlocks(body);
         if (cleanBody) {
@@ -2132,7 +2144,7 @@ async function forwardRequest(
       // model. Its own flag, so it still fires on a request whose broad strip already ran.
       // Same reasoning as the broad strip above: a repair SHRINKS the body, so the
       // re-send limit must not bar it.
-      if (isSignatureRejection && !requestInfo.rejectedBlockStripped && canRepairBody) {
+      if (isSignatureRejection && !requestInfo.rejectedBlockStripped && canRepairBody && resendAllowed(requestInfo)) {
         const { body: fixedBody, removed, type } = stripRejectedBlockClass(body, errorBody);
         if (fixedBody) {
           // Latch the session ONLY for the class the pre-strip can actually repair up
@@ -2179,7 +2191,8 @@ async function forwardRequest(
         || /mcp_tool_(use|result)/.test(errorBody)
           && /(does not match any of the expected tags|without a corresponding)/i.test(errorBody);
       if (anthropicIncompat && requestInfo.sessionKey && providerAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
+        && resendAllowed(requestInfo)) {
         accountManager.markSessionIncompatible?.(requestInfo.sessionKey, requestInfo.homeProvider);
         excludedIndexes.add(account.index);
         console.log(`[Maxpool] Anthropic rejected this transcript (server_tool_use/thinking); pinning session to GLM/Kimi and retrying`);
@@ -2201,7 +2214,8 @@ async function forwardRequest(
       // Claude account exists to serve it; with none, the 400 surfaces (nothing bigger).
       const claudeAvailable = accountManager.accounts?.some(a => a.type !== 'provider' && a.enabled !== false);
       if (providerTooSmall && requestInfo.sessionKey && claudeAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
+        && resendAllowed(requestInfo)) {
         accountManager.markSessionLargeContext?.(requestInfo.sessionKey);
         // Bench EVERY provider: today's GLM + Kimi coding legs both cap at ~256K, so once
         // one 400s on size the others can't hold it either. If a genuine 1M-context
@@ -2224,7 +2238,8 @@ async function forwardRequest(
       // latch the session — the fault is one request's shape, not a durable property of
       // the conversation, and latching would evict a session from GLM on a single blip.
       if (providerRejectedShape && claudeAvailable
-        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
+        && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
+        && resendAllowed(requestInfo)) {
         for (const a of (accountManager.accounts || [])) {
           if (a.type === 'provider') excludedIndexes.add(a.index);
         }
@@ -2366,7 +2381,19 @@ async function forwardRequest(
     } else {      // Bound the non-streaming body read so a mid-body upstream stall can't hang
       // the request forever and leak the lease (same class as the streaming idle
       // guard). On timeout → UPSTREAM_BODY → the caller frees the lease.
-      const bodyP = upstreamRes.arrayBuffer();
+      // F4: read through a reader we OWN so an abandoned read can really be cancelled — arrayBuffer() holds
+      // the stream's lock, which made `body.cancel()` a no-op and left the orphaned read (and its socket) running.
+      const bodyReader = upstreamRes.body?.getReader?.() ?? null;
+      const bodyP = bodyReader
+        ? (async () => {
+          const chunks = [];
+          for (;;) {
+            const { done, value } = await bodyReader.read();
+            if (done) return Buffer.concat(chunks);
+            chunks.push(Buffer.from(value));
+          }
+        })()
+        : upstreamRes.arrayBuffer();
       bodyP.catch(() => {});
       let bodyTimer;
       // B3: bounded by min(UPSTREAM_BODY_MS, remaining) when the request carries a deadline.
@@ -2393,7 +2420,8 @@ async function forwardRequest(
       try {
         arr = await Promise.race([bodyP, bodyTimeout, clientLeft]);
       } catch (e) {
-        if (e?.code === 'CLIENT_GONE_BODY') { try { await upstreamRes.body?.cancel(); } catch { /* already closed */ } }
+        // Client gone / deadline / stalled body: stop the orphaned read and close the upstream socket now.
+        try { await (bodyReader ? bodyReader.cancel() : upstreamRes.body?.cancel()); } catch { /* already closed */ }
         throw e;
       } finally {
         clearTimeout(bodyTimer);
@@ -2521,7 +2549,7 @@ async function forwardRequest(
     // would have seen before this feature existed.
     // !clientHasRealBytes, not !headersSent: a slow turn whose keep-alive committed
     // (pings only) is just as reroutable as a fast one (review r2 B).
-    if (err.code === 'REFUSAL_RETRY' && canRetryBufferedBody && !clientHasRealBytes(res, requestInfo)) {
+    if (err.code === 'REFUSAL_RETRY' && canRetryBufferedBody && !clientHasRealBytes(res, requestInfo) && resendAllowed(requestInfo)) {
       const category = err.refusalCategory || 'unknown';
       const anthropicIndexes = accountManager.accounts
         .filter(a => a.type !== 'provider')
@@ -2612,6 +2640,14 @@ async function forwardRequest(
         { attempt: [account.name, transientKind, 'transient; no other route'] },
       );
       if (queued) return;
+      // F3: a request that carried the POOL deadline and ran out of routes on a first-byte timeout answers the
+      // request-scoped 504 (the Mac books it neutral), never a bare 503 that cools its row and counts a failure.
+      if (err.code === 'UPSTREAM_TTFB' && !requestInfo.stream && requestInfo.deadlineAt != null && requestInfo.deadlinePoolSupplied) {
+        ctx.status = 504;
+        logFailedAttempt(account.name, 'deadline', `no first byte after ${heldSeconds(lease)}s (hop cap), no route left`, 'surfaced');
+        sendDeadlineResponse(res, requestInfo);
+        return;
+      }
       ctx.status = 503;
       // Record the user-facing failure explicitly so it's greppable in the event
       // log (the in-memory TUI feed scrolls away). `err` is the last network error.
@@ -2636,7 +2672,8 @@ async function forwardRequest(
     }
 
     accountManager.releaseAccount(lease, { error: err.message });
-    if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
+    if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
+      && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
       account.status = 'error';
       excludedIndexes.add(account.index);
       logFailedAttempt(account.name, (err.code || err.message || 'error').toString().slice(0, 40), err.message, 'moved');
@@ -2752,8 +2789,11 @@ function isProviderAuthStatus(status) {
   return status === 401 || status === 403;
 }
 
-function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = new Set()) {
-  // B10: ONE client-gone check in the same chokepoint — never pick a route to re-send for a client that left.
+/** F5: the re-send guard shared by EVERY site that sends a request upstream a second time (account moves
+ *  AND body-repair / pin re-sends, which need no route check because they are not a fresh placement):
+ *  B10 — never re-send for a client that left; B6 — a non-streaming request with under the minimum
+ *  time left is not re-sent (a fresh hop cannot finish). */
+function resendAllowed(requestInfo = {}) {
   if (clientAlreadyGone(requestInfo)) {
     if (!requestInfo._clientGoneLogged) {
       requestInfo._clientGoneLogged = true;
@@ -2762,9 +2802,11 @@ function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = ne
     }
     return false;
   }
-  // B6: ONE check in the chokepoint every re-send site falls through — a non-streaming request with
-  // under the minimum time left is not moved to another account (a fresh hop cannot finish).
-  if (nonStreamRemainingMs(requestInfo) < deadlineKnobs().NONSTREAM_MIN_MOVE_MS) return false;
+  return nonStreamRemainingMs(requestInfo) >= deadlineKnobs().NONSTREAM_MIN_MOVE_MS;
+}
+
+function hasEligibleRoute(accountManager, requestInfo = {}, excludedIndexes = new Set()) {
+  if (!resendAllowed(requestInfo)) return false;
   return accountManager.hasAvailableRoute?.(requestInfo, excludedIndexes) || false;
 }
 
@@ -2983,7 +3025,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { hasEligibleRoute, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';

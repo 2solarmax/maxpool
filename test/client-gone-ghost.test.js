@@ -133,3 +133,36 @@ test('B10 chokepoint: hasEligibleRoute refuses a re-send for a client whose sock
   } finally { console.log = orig; }
   assert.equal(logs.filter(l => /client_cancelled/.test(l)).length, 2, `logged once per request (2 requests): ${logs.join('|')}`);
 });
+
+// F4: the abandoned body read must really be CANCELLED (arrayBuffer() holds the stream lock, so the old
+// `body.cancel()` threw "ReadableStream is locked" and the upstream socket stayed open until undici's own timeout).
+test('F4: when the client leaves mid body read the UPSTREAM socket is closed promptly (read cancelled, not orphaned)', async () => {
+  let upstreamClosedAt = null;
+  let firstHit; const firstHitP = new Promise(r => { firstHit = r; });
+  const server = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': '5000' });
+    res.write('{"id":"msg_part');                       // headers + a partial body, then silence (never ends)
+    res.on('close', () => { upstreamClosedAt = Date.now(); });
+    firstHit();
+  });
+  const am = accounts();
+  const upPort = await listen(server);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const port = await listen(proxy);
+  try {
+    let leftAt;
+    await captureLog(async () => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/v1/messages', method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test' } });
+      req.on('error', () => {});
+      req.end(JSON.stringify({ model: 'claude-opus-5-5', stream: false, max_tokens: 10, messages: [{ role: 'user', content: 'hi' }] }));
+      await firstHitP;
+      await sleep(300);
+      leftAt = Date.now(); req.destroy();
+      await sleep(1000);
+    });
+    assert.ok(upstreamClosedAt != null, 'the upstream connection was closed within 1s of the client leaving');
+    assert.ok(upstreamClosedAt - leftAt < 1000, `closed ${upstreamClosedAt - leftAt}ms after the client left`);
+    assert.equal(am.accounts.reduce((n, a) => n + a.inFlight, 0), 0, 'lease freed');
+  } finally { await close(proxy); await close(server); }
+});

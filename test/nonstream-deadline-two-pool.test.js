@@ -4,7 +4,7 @@
 //
 // SKIPPED BY DEFAULT — they take minutes and bind several ports. Run later, against scratch
 // pools only:   MAXPOOL_TWO_POOL_TESTS=1 node --test test/nonstream-deadline-two-pool.test.js
-// T10b additionally needs a checkout of the OLD (v1.24.91) code:  MAXPOOL_OLD_MAC_DIR=<path>
+// T10b additionally needs an extract of the OLD (v1.24.91) code:  MAXPOOL_OLD_MAC_DIR=<path> (how: see T10b below)
 //
 // Module constants are read at import; node --test gives each file its own process, so the
 // knobs are set here BEFORE the dynamic imports. The link hop cap is injected small so the
@@ -36,7 +36,7 @@ async function captureLog(fn) {
 }
 
 // A real cloud pool (one account) whose upstream answers after `delayMs` (null = never).
-async function bootTwoPools(delayMs, { macCreate = createProxyServer, macAm = new AccountManager([], 0.9), stripDeadline = false } = {}) {
+async function bootTwoPools(delayMs, { macCreate = createProxyServer, macAm = new AccountManager([], 0.9), stripDeadline = false, LinkClass = PoolLink } = {}) {
   const upstreamHits = [];
   const upstream = http.createServer((req, res) => {
     let raw = '';
@@ -60,14 +60,16 @@ async function bootTwoPools(delayMs, { macCreate = createProxyServer, macAm = ne
   const cloudPort = await listen(cloud);
   // Spy on what the Mac sends: wrap the cloud's request listener to record the deadline header.
   const sent = [];
+  const sentStainless = [];
   cloud.prependListener('request', req => {
     if (req.url !== '/v1/messages') return;
     sent.push(req.headers['x-maxpool-deadline-ms']);
+    sentStainless.push(req.headers['x-stainless-timeout']);
     // stripDeadline: the cloud never sees the header, i.e. behaves like v1.24.91 (T10).
     if (stripDeadline) delete req.headers['x-maxpool-deadline-ms'];
   });
 
-  const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${cloudPort}`, key: 'mp-max' });
+  const link = new LinkClass({ name: 'team', url: `http://127.0.0.1:${cloudPort}`, key: 'mp-max' });
   await link.poll();
   macAm.setPoolLinks([link]);
   const deadUp = http.createServer((req, res) => { res.writeHead(500); res.end('{}'); });
@@ -75,7 +77,7 @@ async function bootTwoPools(delayMs, { macCreate = createProxyServer, macAm = ne
   const mac = macCreate(macAm, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${deadPort}`, queue: { enabled: true, streamForwardGraceMs: 1000 } });
   const macPort = await listen(mac);
   return {
-    macAm, cloudAm, macPort, upstreamHits, sent,
+    macAm, cloudAm, macPort, upstreamHits, sent, sentStainless,
     cleanup: async () => { macAm.setPoolLinks([]); await close(mac); await close(deadUp); await close(cloud); await close(upstream); },
   };
 }
@@ -145,17 +147,50 @@ test('T10: new Mac vs a cloud that ignores the deadline header → the Mac still
     } finally { await pools.cleanup(); }
   });
 
-// T10b — OLD Mac (v1.24.91 code) vs NEW cloud, request WITHOUT the deadline header → today's 503, old Mac row unchanged.
-test('T10b: OLD Mac vs new cloud, header-less request → cloud answers today\'s 503; old Mac row counters unchanged',
-  { skip: (!ENABLED && 'two-pool: set MAXPOOL_TWO_POOL_TESTS=1') || (!process.env.MAXPOOL_OLD_MAC_DIR && 'needs MAXPOOL_OLD_MAC_DIR=<checkout of v1.24.91>') }, async () => {
-    const oldServer = await import(`${process.env.MAXPOOL_OLD_MAC_DIR}/src/server.js`);
-    const oldAm = await import(`${process.env.MAXPOOL_OLD_MAC_DIR}/src/account-manager.js`);
-    const macAm = new oldAm.AccountManager([], 0.9);
-    const pools = await bootTwoPools(null, { macCreate: oldServer.createProxyServer, macAm });
-    try {
-      const r = await sendThroughMac(pools.macPort, false, {});
-      assert.ok(r.status === 503 || r.status === 502, `today's answer, got ${r.status}`);
-      assert.deepEqual(pools.sent.filter(Boolean), [], 'the old Mac sent no deadline header, so the cloud must not 504');
-      assert.notEqual(r.headers['x-maxpool-request-scoped'], '1');
-    } finally { await pools.cleanup(); }
-  });
+// T10b — OLD Mac (v1.24.91 code) vs NEW cloud (mixed version, F1/F2). An old Mac never sends the pool deadline header,
+// but it DOES forward the client's X-Stainless-Timeout: a naive new cloud derives a deadline from it and answers a 504 the
+// old Mac books as an account failure (failedRequests++, consecutiveFailures++). The new cloud must treat a request
+// forwarded by another pool (hop header) WITHOUT the pool header exactly as before: no deadline, no 504, no marker.
+//
+// HOW TO RUN (needs an extract of the OLD code; takes ~1 min per case):
+//   git -C <maxpool repo> archive a90f324 | tar -x -C <empty dir>      # v1.24.91
+//   MAXPOOL_TWO_POOL_TESTS=1 MAXPOOL_OLD_MAC_DIR=<that dir> node --test test/nonstream-deadline-two-pool.test.js
+// The old Mac's link timer is MAXPOOL_LINK_TTFB_MS: it is set to 40s INSIDE this test so it is LONGER than the 15s
+// deadline a naive new cloud would derive from X-Stainless-Timeout 30 (30s − 15s margin). With a shorter old-Mac timer
+// the old Mac would give up first and this test could not tell fixed from broken (it passed on the unfixed code at 15s).
+const OLD_MAC_SKIP = (!ENABLED && 'two-pool: set MAXPOOL_TWO_POOL_TESTS=1') || (!process.env.MAXPOOL_OLD_MAC_DIR && 'needs MAXPOOL_OLD_MAC_DIR=<extract of v1.24.91, see above>');
+for (const [label, clientHeaders] of [
+  ['client X-Stainless-Timeout 30 (the F1 path: old Mac forwards it)', { 'x-stainless-timeout': '30' }],
+  ['no client patience header', {}],
+]) {
+  test(`T10b: OLD Mac vs new cloud, ${label} → cloud sends no 504/marker; old Mac row counters unchanged`,
+    { skip: OLD_MAC_SKIP }, async () => {
+      const savedLinkTtfb = process.env.MAXPOOL_LINK_TTFB_MS;
+      process.env.MAXPOOL_LINK_TTFB_MS = '40000';
+      const oldServer = await import(`${process.env.MAXPOOL_OLD_MAC_DIR}/src/server.js`);
+      const oldAm = await import(`${process.env.MAXPOOL_OLD_MAC_DIR}/src/account-manager.js`);
+      const oldLink = await import(`${process.env.MAXPOOL_OLD_MAC_DIR}/src/pool-link.js`);
+      const macAm = new oldAm.AccountManager([], 0.9);
+      const pools = await bootTwoPools(null, { macCreate: oldServer.createProxyServer, macAm, LinkClass: oldLink.PoolLink });
+      try {
+        const r = await sendThroughMac(pools.macPort, false, clientHeaders);
+        assert.notEqual(r.status, 504, `the cloud must not 504 an old Mac: ${r.text.slice(0, 200)}`);
+        assert.notEqual(r.headers['x-maxpool-request-scoped'], '1');
+        assert.ok(pools.sent.length >= 1, 'the cloud was reached');
+        assert.deepEqual(pools.sent.filter(Boolean), [], 'the old Mac sent no pool deadline header');
+        if (clientHeaders['x-stainless-timeout']) {
+          assert.ok(pools.sentStainless.includes('30'), 'precondition: the old Mac forwarded the client\'s x-stainless-timeout');
+        }
+        assert.ok(macAm.accounts.length >= 1, 'the old Mac has its cloud mirror row');
+        for (const row of macAm.accounts) {
+          assert.ok(!(row.cooldownUntil > Date.now()), `${row.name}: cooldownUntil unchanged`);
+          assert.equal(row.failedRequests, 0, `${row.name}: failedRequests`);
+          assert.equal(row.consecutiveFailures, 0, `${row.name}: consecutiveFailures`);
+          assert.equal(macAm._loadSummary(row, 15 * 60_000).failed, 0, `${row.name}: last15m.failed`);
+        }
+      } finally {
+        if (savedLinkTtfb === undefined) delete process.env.MAXPOOL_LINK_TTFB_MS; else process.env.MAXPOOL_LINK_TTFB_MS = savedLinkTtfb;
+        await pools.cleanup();
+      }
+    });
+}

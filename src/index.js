@@ -530,7 +530,9 @@ function reapOldWorker(worker, onExited = () => {}) {
     reaped = true;
     clearTimeout(timer);
     // B11: the update-window record — when the old worker actually exited (its exit resets the shared terminal).
-    console.log(`[Maxpool] ${describeOldWorkerExit({ swappedAt, exitedAt: Date.now(), killed })}`);
+    // Event log ONLY (F6): the supervisor shares the terminal with the new worker's dashboard and is not
+    // stdout-muted, so a console line here would paint over the dashboard in the very window it measures.
+    try { appendEventLog(`[Maxpool] ${describeOldWorkerExit({ swappedAt, exitedAt: Date.now(), killed })}`); } catch { /* never break reaping */ }
     try { onExited(); } catch { /* never let the callback break reaping */ }
   };
   const timer = setTimeout(() => {

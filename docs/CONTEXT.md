@@ -49,6 +49,20 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-11-13 · release B red-team round 1 — first-byte floor vs client patience, mixed-version 504
+
+- **Deadline present ⇒ the first-byte wait is min(remaining, hop cap), not the 120s floor.** The floor still applies to
+  requests with no patience header. Before: a >120s non-streaming answer on the cloud timed out at the floor, came back as
+  a bare 503 and the Mac booked a failure on the cloud row (F3). A pool-deadline request that times out with no route
+  left now answers the request-scoped 504 (Mac books it neutral).
+- **A request forwarded by another pool (hop header) without the pool deadline header is an OLD Mac: no deadline at all.**
+  It forwards the client's X-Stainless-Timeout; answering a deadline 504 made it book a failed request (F1). Direct
+  clients with X-Stainless-Timeout still get the 504 (T2).
+- **Every re-send site shares one guard** (`resendAllowed`: client gone + 60s minimum-move); moves also check a route (F5).
+- Nits: body read goes through an owned reader so a cancel really closes the socket (F4); the B11 exit line goes to the
+  event log only (F6); the `ns` tag is POST /v1/messages only (F9).
+- Release evidence for the two-pool tests needs an explicit gated run (`MAXPOOL_TWO_POOL_TESTS=1`, `MAXPOOL_OLD_MAC_DIR`).
+
 ### 2026-11-10 · reset machinery — scope from `clears`, cap lift (D2), reactive claim
 
 **Context:** resets were invisible on cloud rows (the export omitted `eligible`),
