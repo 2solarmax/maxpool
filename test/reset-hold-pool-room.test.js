@@ -275,6 +275,19 @@ test('RT2 (blocker): general held + a Fable WALL with no Fable room on peers →
   assert.equal(h.reason, HOLD);
 });
 
+test('RT2 (fall-through, model loop): a held model wall does not stop a LATER model\'s wall from being claimed', () => {
+  // Only `fable` maps from the grant keys today; inject a second family so the
+  // model loop's own hold must fall through rather than return.
+  const now = Date.now();
+  const famOf = g => (g.id === 'f1' ? ['fable'] : g.id === 'o1' ? ['opus'] : []);
+  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H }, opus: { utilization: 0.995, resetAt: now + 18 * H } };
+  const r = decideClaudeWithReason(acct({ wk: 0.5, resetIn: 3 * DAY, scoped, now }),
+    listing({ grants: [G({ id: 'f1' }, now), G({ id: 'o1', endsAt: now + 40 * DAY }, now)], now }), now,
+    { now, appliesTo: famOf, peersWithRoom: s => (s === 'fable' ? 2 : 0) });
+  assert.equal(r.action?.grant?.id, 'o1', `opus has no room elsewhere → claimed (got ${r.reason})`);
+  assert.equal(r.action?.reason, 'opus weekly at wall');
+});
+
 test('RT3 (major): the reactive weekly-429 path holds even when the walled account\'s probe and listing are stale (the normal state at the wall)', async () => {
   const posts = [];
   const restore = stubFetch(posts);
