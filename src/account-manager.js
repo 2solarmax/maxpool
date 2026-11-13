@@ -5,7 +5,7 @@ import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 // A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
 import { appliesTo, forgetClaimOrg } from './claude-reset-grants.js';
-import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, decideClaudeWithReason, HOLD_POOL_HAS_ROOM } from './reset-policy.js';
+import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld } from './reset-policy.js';
 import {
   LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
   CLAIM_BACKOFF_CAP_MS, REACTIVE_CLAIM_TIMEOUT_MS, CLAIM_FRESH_MS,
@@ -3465,21 +3465,31 @@ export class AccountManager {
    *  every disqualifier means "cannot confirm room" (claim, never hold on a guess):
    *   - routable NOW: enabled, not throttled/error/exhausted, not pool-benched
    *     (another process owns it), not a remote mirror (routed by its holder pool),
-   *     not auth/subscription-dead. A usage cap below the wall ends it at the cap.
-   *   - weekly util (unified7d) leaves ≥ POLICY.holdPeerWeeklyRoom unused, i.e.
-   *     below the 0.65 `soft` tier the router already spreads load at.
-   *   - 5h util (unified5h) leaves ≥ POLICY.holdPeerSessionRoom to the 0.90 switch
-   *     threshold — a session-benched account absorbs nothing.
+   *     not auth/subscription-dead.
+   *   - weekly util (unified7d) leaves ≥ POLICY.holdPeerWeeklyRoom to the peer's
+   *     weekly ceiling — its effective usage cap, else 1.0 (uncapped: below the 0.65
+   *     `soft` tier the router already spreads load at). Red-team #4: room is
+   *     measured to the CAP, so a 0.70 cap at 0.64 is not room.
+   *   - 5h util (unified5h) leaves ≥ POLICY.holdPeerSessionRoom to the peer's
+   *     session bench (_sessionBenchThreshold: its 5h cap, else the 0.90 switch
+   *     threshold) — a session-benched account absorbs nothing.
    *   - a DIFFERENT identity (accountUuid/credential fingerprint) — not this same
-   *     account under a second name.
-   *   - `scope` (a model family) additionally requires a probe-MEASURED (not
-   *     reactive-guessed) bucket for THAT model with ≥ holdPeerWeeklyRoom left;
-   *     the account's general weekly room alone doesn't cover a scoped wall.
+   *     account under a second name; peers sharing one capacityIdentity (two local
+   *     names for one subscription) count ONCE (red-team #6).
+   *   - `general` scope (red-team #1): every ACTIVE model bucket the peer reports
+   *     also has ≥ holdPeerWeeklyRoom left — the walled account serves no model at
+   *     all, so a peer whose Fable is exhausted/full (or 429-marked, or unreadable)
+   *     would leave Fable with no route for up to a day. An inactive bucket binds
+   *     nothing (the router's _scopedExhausted rule).
+   *   - a model `scope` instead requires a probe-MEASURED (not reactive-guessed)
+   *     bucket for THAT model with ≥ holdPeerWeeklyRoom left; the account's general
+   *     weekly room alone doesn't cover a scoped wall.
    *  Returns a plain integer; the POLICY decides sufficiency (holdMinPeers). */
   countPeersWithRoom(self, scope = 'general', now = Date.now()) {
     const peers = this.accounts.filter(a => a !== self);
     const selfIdentity = self ? (self.accountUuid || credentialFp(self.credential)) : null;
-    let n = 0;
+    const roomLeft = (util, ceiling, room) => Number.isFinite(util) && util <= ceiling - room;
+    const counted = new Set();
     for (const p of peers) {
       if (p.type !== 'oauth' || p.enabled === false) continue;
       if (p.remote || p.poolBenchedBy) continue;
@@ -3491,22 +3501,21 @@ export class AccountManager {
       // unknown capacity, and unknown capacity must not hold a claim.
       const fresh = q.lastProbeOkAt != null && now - q.lastProbeOkAt <= CLAIM_FRESH_MS;
       if (!fresh) continue;
-      if (!Number.isFinite(q.unified7d) || !Number.isFinite(q.unified5h)) continue;
-      if (q.unified7d > 1 - POLICY.holdPeerWeeklyRoom) continue;
-      if (q.unified5h > this.switchThreshold - POLICY.holdPeerSessionRoom) continue;
+      const wkCeiling = this._effectiveCap(p, 'wk', now) ?? 1;
+      if (!roomLeft(q.unified7d, wkCeiling, POLICY.holdPeerWeeklyRoom)) continue;
+      if (!roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
       if (selfIdentity != null && (p.accountUuid || credentialFp(p.credential)) === selfIdentity) continue;
-      // A usage cap below the soft tier is the account's real ceiling — room is
-      // measured to the CAP, not to the plan limit.
-      const cap = this._effectiveCap(p, 'wk', now);
-      if (cap != null && cap <= 1 - POLICY.holdPeerWeeklyRoom) continue;
-      if (scope !== 'general') {
+      if (scope === 'general') {
+        const buckets = Object.values(q.scopedWeekly || {}).filter(e => e && e.isActive !== false);
+        if (buckets.some(e => !roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom))) continue;
+      } else {
         const e = q.scopedWeekly?.[scope];
-        if (!e || e.reactive === true || !Number.isFinite(e.utilization)) continue;
-        if (e.utilization > 1 - POLICY.holdPeerWeeklyRoom) continue;
+        if (!e || e.reactive === true) continue;
+        if (!roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom)) continue;
       }
-      n++;
+      counted.add(this.capacityIdentity(p) ?? p);
     }
-    return n;
+    return counted.size;
   }
 
   _holdsUsableReset(account, now = Date.now()) {
@@ -6120,17 +6129,22 @@ export class AccountManager {
     // decides on its own fresh reading.
     const grant = this._reactiveClaimGrant(account, kind, now);
     if (!grant) return false;
-    // R7 (owner, 2026-11-13): a weekly-wall 429 claims a held reset only when the
-    // free refill ISN'T imminent-with-pool-room — the same gate the sweep uses, so
-    // the fast path cannot spend a card the sweep deliberately held. The reactive
-    // grant pick has already enforced a fresh-enough reading for the account; a
+    // R7 (owner, 2026-11-13): a wall 429 claims a held reset only when the free
+    // refill of the limit it clears ISN'T imminent-with-pool-room — the same
+    // wallClaimHeld rule the sweep uses, so the fast path cannot spend a reset the
+    // sweep deliberately holds. Evaluated DIRECTLY here, not via the sweep's full
+    // decision (red-team #3): at the wall the account's own usage probe and listing
+    // are routinely stale (the usage endpoint 429s), and the sweep's freshness skips
+    // would read as "not held" and fall through to a claim. The hold needs no fresh
+    // reading of THIS account: the refill stamp is kept current by every response's
+    // rate-limit headers (updateQuota), the grant end comes from the stored listing,
+    // and capacity comes from the PEERS' own fresh probes (countPeersWithRoom). A
     // grant dying before (or within 24h after) the refill never waits.
-    if (kind === 'weekly') {
-      const held = decideClaudeWithReason(account, account.resetGrants, now, {
-        peersWithRoom: scope => this.countPeersWithRoom(account, scope, now),
-      });
-      if (held.action == null && held.reason === HOLD_POOL_HAS_ROOM) return false;
-    }
+    const holdScope = kind === 'weekly' ? 'general' : kind;
+    const refillAt = holdScope === 'general'
+      ? account.quota?.unified7dReset
+      : account.quota?.scopedWeekly?.[holdScope]?.resetAt;
+    if (wallClaimHeld(refillAt, grant, now, scope => this.countPeersWithRoom(account, scope, now), holdScope)) return false;
     // C6: shared backoff per (account, grantId).
     const key = `${account.name}:${grant.id}`;
     const until = this._claimRetryUntil?.get(key);

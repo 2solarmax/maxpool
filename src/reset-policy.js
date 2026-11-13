@@ -80,6 +80,21 @@ export { CLAIM_FRESH_MS };
 
 function msLeft(t, now) { return t == null ? Infinity : t - now; }
 
+/** R7 (owner, 2026-11-13): should a WALL claim of `grant` wait for the free refill at
+ *  `refillAt`? The ONE hold rule, shared by the sweep (decideClaudeWithReason) and the
+ *  reactive 429 path (account-manager tryReactiveClaim) so neither can spend what the
+ *  other holds. Reads only the refill stamp, the grant's end and a LIVE peer count —
+ *  never the walled account's own usage reading, which is routinely stale at the wall.
+ *  Conservative: an unknown / past / ≥24h-away refill, a grant that dies before (or
+ *  within dyingWindowMs after) the refill — it would sit unspent at ~0% used — no
+ *  counter, or a count that isn't an integer ≥ holdMinPeers ⇒ false (claim). */
+export function wallClaimHeld(refillAt, grant, now, peersWithRoom, scope = 'general') {
+  if (!(refillAt > now) || refillAt - now >= POLICY.freeRefillWaitMs) return false;
+  if (grant?.endsAt != null && grant.endsAt - refillAt < POLICY.dyingWindowMs) return false;
+  const count = peersWithRoom?.(scope);
+  return Number.isInteger(count) && count >= POLICY.holdMinPeers;
+}
+
 /** Decide the z.ai action. Returns {kind:'card', card, resetType} | null. */
 export function decideZai(account, cards, now = Date.now()) {
   if (account?.enabled === false) return null;               // R0
@@ -199,17 +214,10 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
   // D4: the free refill of a limit < 24h away makes a not-at-the-wall spend redundant.
   const refillSoon = resetAt => resetAt != null && msLeft(resetAt, now) < POLICY.freeRefillWaitMs;
   // R7: hold a WALL claim for the imminent free refill while other accounts in this
-  // pool can absorb the load. Conservative by construction: no counter / a
-  // non-number answer / capacity below holdMinPeers ⇒ false (claim as today), and a
-  // grant that dies before (or within dyingWindowMs after) the refill never waits —
-  // dying value beats the hold either way.
-  const holdForRefillWithRoom = (refillAt, grant, scope = 'general') => {
-    // Unknown refill (null) → msLeft is Infinity → no hold.
-    if (msLeft(refillAt, now) >= POLICY.freeRefillWaitMs) return false;
-    if (grant?.endsAt != null && grant.endsAt - refillAt < POLICY.dyingWindowMs) return false;
-    const count = opts.peersWithRoom?.(scope);
-    return Number.isInteger(count) && count >= POLICY.holdMinPeers;
-  };
+  // pool can absorb the load (wallClaimHeld). A hold NOTES its reason and moves on
+  // (red-team #2): the model-scoped loop below must still run, so a dying model
+  // grant is spent and a model wall with no room elsewhere is claimed.
+  const holdsWall = (refillAt, grant, scope) => wallClaimHeld(refillAt, grant, now, opts.peersWithRoom, scope);
   let reason = null;
   const note = r => { if (reason == null) reason = r; };
 
@@ -221,9 +229,7 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
     const giveBack = g.givesBackWeekly === true && !(Array.isArray(g.clears) && g.clears.includes('seven_day'));
     if (weeklyWall) {
       // R7: the free refill is imminent and the pool has room — hold the claim.
-      if (holdForRefillWithRoom(q.unified7dReset, g)) {
-        return skip(HOLD_POOL_HAS_ROOM);
-      }
+      if (holdsWall(q.unified7dReset, g, 'general')) { note(HOLD_POOL_HAS_ROOM); continue; }
       // A give-back-only grant (no seven_day in clears) returns only what the model
       // used — the claim snapshots unified7d so the next probe measures the drop.
       return { action: { kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'weekly at wall' }, reason: 'weekly at wall' };
@@ -252,9 +258,7 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
     if (!cand) continue;
     if (e.utilization >= CLAUDE_WALL_WEEKLY) {
       // R7 twin for a model-scoped wall: ask the counter for THAT model's bucket.
-      if (holdForRefillWithRoom(e.resetAt, cand, fam)) {
-        return skip(HOLD_POOL_HAS_ROOM);
-      }
+      if (holdsWall(e.resetAt, cand, fam)) { note(HOLD_POOL_HAS_ROOM); continue; }
       return { action: { kind: 'grant', grant: cand, scope: fam, reason: `${fam} weekly at wall` }, reason: `${fam} weekly at wall` };
     }
     const dying = msLeft(cand.endsAt, now) < POLICY.dyingWindowMs
