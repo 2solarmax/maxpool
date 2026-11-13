@@ -6,6 +6,7 @@
 // write is fire-and-forget and all errors are swallowed.
 
 import { appendFile, stat, rename, chmod } from 'node:fs/promises';
+import { isatty } from 'node:tty';
 
 const MAX_BYTES = 5 * 1024 * 1024;   // rotate at ~5 MB
 // Keep 5 generations (~30 MB total), not 1. With a single backup the log rotated away the
@@ -122,6 +123,47 @@ let stdoutSuppressed = false;
  */
 export function setConsoleStdoutSuppressed(v) { stdoutSuppressed = !!v; }
 
+// Streams made non-blocking by setConsoleNonBlocking (real terminals only).
+const nonBlockingStreams = new Set();
+
+/**
+ * Never let the terminal stall this process (2026-11-13: the supervisor sat inside a
+ * console.log for 7+ minutes while the terminal was not reading, so a failed reload was
+ * neither rolled back nor reaped). Node writes a TTY synchronously; this turns the real
+ * terminal streams non-blocking — the same switch the TUI makes for its own frames
+ * (tui.js start()) — and the console mirror then drops a line's terminal copy while the
+ * terminal has not taken what it already got. The event log still gets every line.
+ * libuv reopens a TTY per process, so this never changes another process's terminal.
+ * Returns the number of streams switched.
+ */
+export function setConsoleNonBlocking({ streams = [process.stdout, process.stderr], isTTY = s => isatty(s.fd) } = {}) {
+  let n = 0;
+  for (const s of streams) {
+    if (!s || nonBlockingStreams.has(s) || !isTTY(s) || typeof s._handle?.setBlocking !== 'function') continue;
+    try { s._handle.setBlocking(false); nonBlockingStreams.add(s); n++; } catch { /* not a libuv tty */ }
+  }
+  return n;
+}
+
+/**
+ * Turn the switched streams non-blocking AGAIN. Call right after spawning a child with
+ * inherited stdio: libuv's child setup clears O_NONBLOCK on fds 0-2 (uv__process_child_init),
+ * and an inherited fd shares the parent's open file description, so every such spawn
+ * silently makes the parent's terminal blocking again (2026-11-13: the supervisor still
+ * froze in write() after spawning the reload worker). spawn() returns only after the
+ * child has exec'd, so the child's reset is already done when this runs.
+ */
+export function reassertConsoleNonBlocking() {
+  for (const s of nonBlockingStreams) {
+    try { s._handle?.setBlocking?.(false); } catch { /* stream gone */ }
+  }
+}
+
+/** True when `stream` is one we made non-blocking and the terminal has not drained it. */
+function terminalBehind(stream) {
+  return nonBlockingStreams.has(stream) && Boolean(stream.writableNeedDrain);
+}
+
 export function installConsoleMirror() {
   if (origConsole) return; // idempotent
   origConsole = { log: console.log.bind(console), error: console.error.bind(console) };
@@ -129,7 +171,10 @@ export function installConsoleMirror() {
     const orig = origConsole[method];
     console[method] = (...args) => {
       try { appendEventLog(args.map(a => (typeof a === 'string' ? a : String(a))).join(' ')); } catch { /* never */ }
-      if (!stdoutSuppressed) orig(...args);
+      if (stdoutSuppressed) return;
+      // Read the stream live: a test (or the TUI) may swap process.stdout.
+      if (terminalBehind(method === 'log' ? process.stdout : process.stderr)) return;
+      orig(...args);
     };
   }
 }
@@ -142,4 +187,5 @@ export function __resetEventLogForTest() {
   if (origConsole) { console.log = origConsole.log; console.error = origConsole.error; origConsole = null; }
   if (rotationTimer) { clearInterval(rotationTimer); rotationTimer = null; }
   logPath = null; manageRotation = false; writeChain = Promise.resolve(); queued = 0; dropped = 0; stdoutSuppressed = false;
+  nonBlockingStreams.clear();
 }

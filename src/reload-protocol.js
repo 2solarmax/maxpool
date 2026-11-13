@@ -75,14 +75,16 @@ export async function runReloadBaton({
     newWorker.send({ type: MSG_PROBE_READY });
     ready = await newWorker.waitFor([MSG_READY, MSG_FAILED], readyTimeoutMs);
   } catch (err) {
-    log(`reload: readiness wait failed (${err.message}); rolling back`);
+    // Tell the old worker BEFORE logging: it resumes serving on this notice, and a log
+    // line must never stand between the two (2026-11-13: a blocked terminal write did).
     try { oldWorker.send({ type: MSG_ROLLED_BACK, reason: 'timeout' }); } catch { /* old worker gone */ }
+    log(`reload: readiness wait failed (${err.message}); rolling back`);
     return RELOAD_ROLLED_BACK;
   }
   // (b) New worker did not come up cleanly → roll back fully, old stays primary.
   if (!ready || ready.type === MSG_FAILED) {
-    log(`reload: new worker reported failed (${ready?.reason || 'no ready'}); rolling back`);
     try { oldWorker.send({ type: MSG_ROLLED_BACK, reason: 'failed' }); } catch { /* old worker gone */ }
+    log(`reload: new worker reported failed (${ready?.reason || 'no ready'}); rolling back`);
     return RELOAD_ROLLED_BACK;
   }
 

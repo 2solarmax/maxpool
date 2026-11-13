@@ -56,16 +56,38 @@ export function writeTerminalSync(s) {
  * toggle waits until our own queued output has drained — the remaining wait is the
  * kernel's ~1 KB — and a terminal that is not reading at all gets it on 'drain'.
  * Resolves true when reclaimed now, false when deferred to 'drain'.
+ * 'drain' is emitted only after a write crossed the stream's high-water mark, so a
+ * deferred reclaim also polls the queue length (2026-11-13: a frame below 16 KB left
+ * queued never produced 'drain', and raw mode never came back). `guard` is re-checked
+ * at reclaim time (a TUI stopped meanwhile must not be put back in raw mode);
+ * `onDeferredReclaim` runs once the deferred reclaim actually happened.
  */
-export async function reclaimRawMode({ stdin = process.stdin, stdout = process.stdout, flush, timeoutMs = 1500 } = {}) {
+export async function reclaimRawMode({
+  stdin = process.stdin, stdout = process.stdout, flush, timeoutMs = 1500,
+  guard = () => true, onDeferredReclaim = () => {}, pollMs = 100,
+} = {}) {
   if (!stdin.isTTY) return true;
   // OFF then ON: Node short-circuits setRawMode(true) while it believes isRaw is already
   // true, and the reset happened in ANOTHER process (verified on a real pty 2026-08-07).
   const reclaim = () => {
+    if (!guard()) return;
     try { stdin.setRawMode(false); stdin.setRawMode(true); stdin.resume(); } catch { /* terminal gone */ }
   };
   if (!flush || await flush({ timeoutMs })) { reclaim(); return true; }
-  stdout.once('drain', reclaim);
+  let settled = false;
+  const later = () => {
+    if (settled) return;
+    settled = true;
+    clearInterval(poll);
+    stdout.removeListener?.('drain', later);
+    reclaim();
+    try { onDeferredReclaim(); } catch { /* never */ }
+  };
+  const poll = setInterval(() => {
+    if (typeof stdout.writableLength === 'number' && stdout.writableLength === 0) later();
+  }, pollMs);
+  poll.unref?.();
+  stdout.once('drain', later);
   return false;
 }
 
@@ -76,13 +98,12 @@ export async function reclaimRawMode({ stdin = process.stdin, stdout = process.s
  */
 export async function reclaimRawModeLogged({ stdout = process.stdout, log = m => console.log(`[Maxpool] ${m}`), now = Date.now, ...rest } = {}) {
   const t0 = now();
-  const done = await reclaimRawMode({ stdout, ...rest });
-  if (done) {
-    log(`reload: terminal reclaimed in ${now() - t0}ms`);
-  } else {
-    log('reload: terminal reclaim deferred to drain');
-    stdout.once('drain', () => log(`reload: terminal reclaimed after drain in ${now() - t0}ms`));
-  }
+  const done = await reclaimRawMode({
+    stdout, ...rest,
+    onDeferredReclaim: () => log(`reload: terminal reclaimed after drain in ${now() - t0}ms`),
+  });
+  if (done) log(`reload: terminal reclaimed in ${now() - t0}ms`);
+  else log('reload: terminal reclaim deferred to drain');
   return done;
 }
 
@@ -596,12 +617,28 @@ export class TUI {
 
   // ── lifecycle ──────────────────────────────────────
 
-  start() {
-    try {
-      process.stdin.setRawMode(true);
-    } catch (err) {
-      process.stderr.write(`[Maxpool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`);
-      return false;
+  /** `rawWhenDrained` (a worker that is already serving — reload takeover, a respawn):
+   *  enter raw mode only once the terminal has taken our first frame. setRawMode is
+   *  tcsetattr(TCSADRAIN) and blocks the WHOLE process until the terminal has read
+   *  everything queued; on a terminal that is not reading that is forever, and the port
+   *  goes dead with it (2026-11-13). So the dashboard is drawn non-blocking first and the
+   *  mode switch waits for the terminal (reclaimRawMode) — the keyboard, not the serving,
+   *  is what a stalled terminal delays. A terminal that took the frame at once gets raw
+   *  mode synchronously, so a broken one still falls back to plain logs (returns false). */
+  start({ rawWhenDrained = false } = {}) {
+    const rawError = err => `[Maxpool] TUI unavailable (${err.code || err.message}); continuing with plain logs.\n`;
+    if (rawWhenDrained) {
+      if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== 'function') {
+        process.stderr.write(rawError({ message: 'stdin is not a terminal' }));
+        return false;
+      }
+    } else {
+      try {
+        process.stdin.setRawMode(true);
+      } catch (err) {
+        process.stderr.write(rawError(err));
+        return false;
+      }
     }
 
     this.running = true;
@@ -632,6 +669,22 @@ export class TUI {
       this.frame = (this.frame + 1) % SPINNER.length;
       this.requestRender();
     }, 500);
+    if (rawWhenDrained) {
+      if (!process.stdout.writableLength) {
+        // The terminal took the whole frame: it is reading, so the drain wait is short.
+        try {
+          process.stdin.setRawMode(true);
+        } catch (err) {
+          this.stop({ keepRaw: true });
+          console.error(rawError(err).trim());
+          return false;
+        }
+      } else {
+        reclaimRawMode({ flush: o => this.flushOutput(o), guard: () => this.running })
+          .then(now => { if (!now) appendEventLog('[Maxpool] TUI: keyboard waits for the terminal to read (raw mode deferred to drain)'); })
+          .catch(() => {});
+      }
+    }
     return true;
   }
 
