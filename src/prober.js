@@ -509,7 +509,11 @@ export class Prober {
     if (!this.am.applyResetGrants) return;
     const listing = account.resetGrants;
     if (!listing) return;
-    const { action, reason } = decideClaudeWithReason(account, listing);
+    // R7 (2026-11-13): the wall claim waits for an imminent free refill only while
+    // other accounts in THIS pool have room. Counted LIVE per sweep, so the hold
+    // ends the moment capacity disappears; unknown capacity claims (never hold).
+    const peersWithRoom = this.am.countPeersWithRoom ? scope => this.am.countPeersWithRoom(account, scope) : null;
+    const { action, reason } = decideClaudeWithReason(account, listing, Date.now(), { peersWithRoom });
     if (action) {
       account._claimSkipKey = null;
       await this._claimClaudeGrant(account, action);

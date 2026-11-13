@@ -177,6 +177,24 @@ test('ROOM: boundaries — 0.645 weekly / 0.645 5h still count', () => {
   assert.equal(count(am), 2);
 });
 
+test('BOUNDARIES: refill exactly 24h away → claim; a grant ending exactly 24h AFTER the refill → held', () => {
+  assert.equal(why(acct({ resetIn: 24 * H }), listing({ grants: [G()] }), peers(5)).action?.reason, 'weekly at wall');
+  const endsAtRefillPlus24 = Date.now() + 18 * H + 24 * H;
+  const h = why(acct({ resetIn: 18 * H }), listing({ grants: [G({ endsAt: endsAtRefillPlus24 })] }), peers(5));
+  assert.equal(h.action, null);
+  assert.equal(h.reason, HOLD);
+});
+
+test('BOUNDARIES: a peer probe exactly 5 min old still counts; weekly/5h exactly at the room line still count', () => {
+  const am = pool(3);
+  am.accounts[1].quota.lastProbeOkAt = Date.now() - 5 * 60_000;   // exactly CLAIM_FRESH_MS
+  am.accounts[2].quota.unified7d = 0.65;                          // exactly 1 - holdPeerWeeklyRoom
+  assert.equal(count(am), 2);
+  const am2 = pool(3);
+  am2.accounts[1].quota.unified5h = 0.65;                         // exactly switchThreshold - holdPeerSessionRoom
+  assert.equal(count(am2), 2);
+});
+
 test('ROOM: a provider (GLM/Kimi) is not a Claude peer', () => {
   const am = pool(2);
   am.accounts[1].type = 'provider';
