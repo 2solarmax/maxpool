@@ -112,21 +112,6 @@ test('RE-EVALUATED every tick: capacity gone → the very next decision claims; 
   assert.equal(why(a, listing({ grants: [G()] }), opts).action?.reason, 'weekly at wall', 'tick 3: refill ≥ 24h → claim');
 });
 
-test('SCOPED (model weekly at the wall): held when peers have room for THAT model; the scope is passed through', () => {
-  const scoped = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
-  const fableG = G({ clears: ['seven_day_overage_included'] });
-  const asked = [];
-  const h = why(acct({ wk: 0.5, resetIn: 3 * DAY, scoped }), listing({ grants: [fableG] }), { peersWithRoom: s => { asked.push(s); return 2; } });
-  assert.equal(h.action, null);
-  assert.equal(h.reason, HOLD);
-  assert.deepEqual(asked, ['fable'], 'capacity asked for the fable bucket');
-  const c = why(acct({ wk: 0.5, resetIn: 3 * DAY, scoped }), listing({ grants: [fableG] }), { peersWithRoom: s => (s === 'fable' ? 1 : 9) });
-  assert.equal(c.action?.reason, 'fable weekly at wall');
-  // the fable refill far away → claims
-  const far = { fable: { utilization: 0.995, resetAt: Date.now() + 3 * DAY, isActive: true } };
-  assert.equal(why(acct({ wk: 0.5, resetIn: 3 * DAY, scoped: far }), listing({ grants: [fableG] }), peers(9)).action?.reason, 'fable weekly at wall');
-});
-
 // ── "has room": the per-peer predicate through a REAL AccountManager ─────────
 function pool(n = 3, now = Date.now()) {
   const am = new AccountManager(Array.from({ length: n }, (_, i) => ({ name: `c${i}`, type: 'oauth', accessToken: `t${i}`, refreshToken: `r${i}`, expiresAt: now + 3600_000 })), 0.9);
@@ -270,33 +255,6 @@ test('RT2 (blocker): a general hold falls through to the model loop — a DYING 
   assert.equal(r.action?.reason, 'dying value');
 });
 
-test('RT2 (blocker): general held + a Fable WALL with no Fable room on peers → the Fable grant is claimed', () => {
-  const now = Date.now();
-  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H, isActive: true } };
-  const fableG = G({ id: 'f1', clears: ['seven_day_overage_included'] }, now);
-  const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), fableG], now }),
-    { peersWithRoom: s => (s === 'general' ? 2 : 0) }, now);
-  assert.equal(r.action?.grant?.id, 'f1');
-  assert.equal(r.action?.reason, 'fable weekly at wall');
-  // both held → the reason is still the hold
-  const h = why(acct({ scoped, now }), listing({ grants: [G({}, now), fableG], now }), { peersWithRoom: () => 2 }, now);
-  assert.equal(h.action, null);
-  assert.equal(h.reason, HOLD);
-});
-
-test('RT2 (fall-through, model loop): a held model wall does not stop a LATER model\'s wall from being claimed', () => {
-  // Only `fable` maps from the grant keys today; inject a second family so the
-  // model loop's own hold must fall through rather than return.
-  const now = Date.now();
-  const famOf = g => (g.id === 'f1' ? ['fable'] : g.id === 'o1' ? ['opus'] : []);
-  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H }, opus: { utilization: 0.995, resetAt: now + 18 * H } };
-  const r = decideClaudeWithReason(acct({ wk: 0.5, resetIn: 3 * DAY, scoped, now }),
-    listing({ grants: [G({ id: 'f1' }, now), G({ id: 'o1', endsAt: now + 40 * DAY }, now)], now }), now,
-    { now, appliesTo: famOf, peersWithRoom: s => (s === 'fable' ? 2 : 0) });
-  assert.equal(r.action?.grant?.id, 'o1', `opus has no room elsewhere → claimed (got ${r.reason})`);
-  assert.equal(r.action?.reason, 'opus weekly at wall');
-});
-
 test('RT3 (major): the reactive weekly-429 path holds even when the walled account\'s probe and listing are stale (the normal state at the wall)', async () => {
   const posts = [];
   const restore = stubFetch(posts);
@@ -399,30 +357,6 @@ test('RT2-1 (major): held on a 429 → probe fails → peers go stale → the NE
     const r = await prober.probeOne(self);
     assert.equal(r.ok, false, 'precondition: this sweep\'s own probe failed');
     assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'capacity unknown → claimed');
-  } finally { restore(); }
-});
-
-test('RT2-1 (major): a sweep-held FABLE wall is rescued the same way once Fable room can no longer be confirmed', async () => {
-  const posts = [];
-  const restore = stubFetch(posts);
-  try {
-    const am = pool(3);
-    const self = am.accounts[0];
-    self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
-    for (const p of am.accounts.slice(1)) p.quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } };
-    const okProber = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
-      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.5, resetAt: Date.now() + 3 * DAY },
-        scopedWeekly: { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }, weeklyAbsent: false }),
-      grantsFn: async () => listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }) });
-    okProber._now = () => Date.now() + 6 * 60_000;
-    await okProber.probeOne(self);
-    assert.equal(posts.length, 0, 'held by the sweep');
-    const prober = failingProber(am, posts);
-    await prober.probeOne(self);
-    assert.equal(posts.length, 0, 'Fable room still confirmed → still held');
-    for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
-    await prober.probeOne(self);
-    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'Fable capacity unknown → claimed');
   } finally { restore(); }
 });
 
@@ -531,7 +465,6 @@ test('RT2-2 (register): a held wall consumes budget only while it is LIVE', asyn
   assert.equal(await secondWallHolds(() => {}), false, 'control: c0 still holding → c1 claims');
   assert.equal(await secondWallHolds(a => { a.enabled = false; }), true, 'c0 disabled → no load, no budget');
   assert.equal(await secondWallHolds(a => { a.poolBenchedBy = 'cloud'; }), true, 'c0 benched to the team pool → not ours');
-  assert.equal(await secondWallHolds(a => { a.lastClaimAt = Date.now() + 1000; }), true, 'c0 claimed since its hold → not holding');
   assert.equal(await secondWallHolds(a => { a.quota.unified7d = 0.1; }), true, 'c0 left the wall (refill landed) → not holding');
   assert.equal(await secondWallHolds(a => { a.quota.unified7dReset = Date.now() - 1000; }), true, 'c0 refill time passed → not holding');
 });
@@ -580,7 +513,7 @@ test('RT2-1 (scope of the rescue): a sweep that decides FRESH (probe + listing f
   prober._now = () => Date.now() + 6 * 60_000;
   await prober.probeOne(self);
   await prober.probeOne(self);
-  assert.equal(self._wallHold?.scope, 'general', 'precondition: the sweep held and registered it');
+  assert.equal(am.isHoldingWall(self), true, 'precondition: the sweep held and registered it');
   assert.equal(reactiveCalls, 0);
 });
 
@@ -599,14 +532,6 @@ test('RT2-1 (noise): the held line prints once per hold, not once per failed swe
     for (let i = 0; i < 3; i++) await prober.probeOne(self);     // peers fresh → still held each time
   } finally { console.log = realLog; restore(); }
   assert.equal(lines.filter(l => l.includes(`c0: at wall, claim held (${HOLD})`)).length, 1, lines.join(' | '));
-});
-
-test('RT2-1 (register): both the weekly and a model wall held → the WEEKLY hold is registered (it covers every model)', () => {
-  const now = Date.now();
-  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H } };
-  const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), G({ id: 'f1', clears: ['seven_day_overage_included'] }, now)], now }), peers(5), now);
-  assert.equal(r.reason, HOLD);
-  assert.equal(r.heldScope, 'general');
 });
 
 test('RT2-2 (policy): holders multiply the peers needed', () => {
@@ -645,19 +570,6 @@ test('ROOM: a provider (GLM/Kimi) is not a Claude peer', () => {
   assert.equal(count(am), 0);
 });
 
-test('ROOM (scoped): a peer counts for a model only with a measured, roomy bucket for it', () => {
-  const am = pool(3);
-  am.accounts[1].quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } };
-  am.accounts[2].quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } };
-  assert.equal(count(am, 'fable'), 2);
-  am.accounts[2].quota.scopedWeekly = {};                                       // unknown → not counted
-  assert.equal(count(am, 'fable'), 1);
-  am.accounts[2].quota.scopedWeekly = { fable: { utilization: 0.2, reactive: true } };  // a 429 guess is not a reading
-  assert.equal(count(am, 'fable'), 1);
-  am.accounts[2].quota.scopedWeekly = { fable: { utilization: 0.7 } };            // too full for that model
-  assert.equal(count(am, 'fable'), 1);
-});
-
 // ── end to end: the real prober decides with the real pool ───────────────────
 function stubFetch(posts) {
   const realFetch = globalThis.fetch;
@@ -690,41 +602,6 @@ test('PROBER: holds while two peers have room (logs the reason), claims on the s
   } finally { restore(); }
 });
 
-test('PROBER (scoped): a model wall asks capacity FOR THAT MODEL — peers roomy in general but with no model bucket → claims', async () => {
-  const am = pool(3);
-  const self = am.accounts[0];
-  const posts = [];
-  const logs = [];
-  const fableWall = () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.5, resetAt: Date.now() + 3 * DAY },
-    scopedWeekly: { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }, weeklyAbsent: false });
-  const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
-    probeFn: async () => fableWall(),
-    grantsFn: async () => listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }) });
-  let clock = 1_700_000_000_000;
-  prober._now = () => clock;
-  const restore = stubFetch(posts);
-  try {
-    clock += 6 * 60_000; await prober.probeOne(self);
-    assert.equal(posts.length, 1, 'no peer has a fable reading → capacity for fable is unknown → claim');
-    assert.ok(logs.some(l => /claiming grant g1 \(fable weekly at wall/.test(l)), logs.join(' | '));
-  } finally { restore(); }
-  // control: with fable room on both peers the same wall is HELD (the scope reached the counter)
-  const am2 = pool(3);
-  for (const p of am2.accounts.slice(1)) p.quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } };
-  const posts2 = [];
-  const logs2 = [];
-  const prober2 = new Prober(am2, { intervalMs: 0, log: m => logs2.push(m), providerProbeFn: async () => null,
-    probeFn: async () => fableWall(),
-    grantsFn: async () => listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }) });
-  prober2._now = () => clock;
-  const restore2 = stubFetch(posts2);
-  try {
-    await prober2.probeOne(am2.accounts[0]);
-    assert.equal(posts2.length, 0, 'fable room on two peers → held');
-    assert.ok(logs2.some(l => l.endsWith(`at wall, claim held (${HOLD})`)), logs2.join(' | '));
-  } finally { restore2(); }
-});
-
 test('REACTIVE: a weekly 429 at the wall honours the same hold (no claim while peers have room); claims when they do not', async () => {
   const posts = [];
   const restore = stubFetch(posts);
@@ -740,4 +617,152 @@ test('REACTIVE: a weekly 429 at the wall honours the same hold (no claim while p
     await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 });
     assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'claims once capacity is short');
   } finally { restore(); }
+});
+
+// ── red-team round 3 (2026-11-13): the hold is for the GENERAL weekly wall ONLY ──
+// Orchestrator decision: a per-model (Fable) wall and a dying-value grant claim
+// exactly as at cb969da — no hold, no hold record, no rescue for them.
+const fableWallProbe = (wk = 0.5, wkResetIn = 3 * DAY) => async () => ({
+  fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: wk, resetAt: Date.now() + wkResetIn },
+  scopedWeekly: { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }, weeklyAbsent: false });
+const fableRoomOn = ps => { for (const p of ps) p.quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } }; };
+
+test('R3-1: a Fable WALL claims as at cb969da — no hold, whatever room the peers have; capacity is never asked', () => {
+  const now = Date.now();
+  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H, isActive: true } };
+  const asked = [];
+  const r = why(acct({ wk: 0.5, resetIn: 3 * DAY, scoped, now }), listing({ grants: [G({ clears: ['seven_day_overage_included'] }, now)], now }),
+    { peersWithRoom: (...a) => { asked.push(a); return 9; }, holdersInPool: () => 1 }, now);
+  assert.equal(r.action?.reason, 'fable weekly at wall');
+  assert.equal(r.heldScope ?? null, null, 'nothing held');
+  assert.deepEqual(asked, [], 'a model wall never consults pool capacity');
+});
+
+test('R3-1 (sweep): a Fable wall is claimed on the FIRST sweep with Fable room on every peer, and no hold is recorded', async () => {
+  const am = pool(3);
+  const self = am.accounts[0];
+  self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
+  fableRoomOn(am.accounts.slice(1));
+  const posts = [];
+  const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+    probeFn: fableWallProbe(), grantsFn: async () => listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }) });
+  prober._now = () => Date.now() + 6 * 60_000;
+  const restore = stubFetch(posts);
+  try { await prober.probeOne(self); } finally { restore(); }
+  assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'claimed at once');
+  assert.equal(self._wallHold, undefined, 'no hold record for a model wall');
+});
+
+test('R3-1 (fast path): a 429 over a probe-measured Fable wall claims as at cb969da — no hold, no hold record', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
+    self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
+    fableRoomOn(am.accounts.slice(1));
+    am.applyResetGrants(0, listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'attempted');
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
+    assert.equal(self._wallHold, undefined);
+  } finally { restore(); }
+});
+
+test('R3-2: general wall HELD + a Fable WALL → nothing claimed (the account is benched by the general wall; a Fable reset buys nothing)', () => {
+  const now = Date.now();
+  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H, isActive: true } };
+  const grants = [G({}, now), G({ id: 'f1', clears: ['seven_day_overage_included'] }, now)];
+  for (const [name, peersWithRoom] of [['no Fable room anywhere', s => (s == null || s === 'general' ? 2 : 0)], ['room everywhere', () => 2]]) {
+    const r = why(acct({ scoped, now }), listing({ grants, now }), { peersWithRoom }, now);
+    assert.equal(r.action, null, `${name}: the Fable wall is not claimed (got ${r.action?.reason})`);
+    assert.equal(r.reason, HOLD, name);
+    assert.equal(r.heldScope, 'general', name);
+  }
+  // control: the general wall NOT held (one peer only) → the general grant is claimed, as today
+  assert.equal(why(acct({ scoped, now }), listing({ grants, now }), peers(1), now).action?.reason, 'weekly at wall');
+  // control: no general grant at all → the Fable wall claims as at cb969da
+  assert.equal(why(acct({ scoped, now }), listing({ grants: [grants[1]], now }), peers(9), now).action?.reason, 'fable weekly at wall');
+});
+
+test('R3-2: general wall HELD + a DYING Fable grant → the Fable grant is claimed AND the general hold is still reported', () => {
+  const now = Date.now();
+  const scoped = { fable: { utilization: 0.5, resetAt: now + 3 * DAY, isActive: true } };
+  const dyingFable = G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt: now + 10 * H }, now);
+  const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), dyingFable], now }), peers(2), now);
+  assert.equal(r.action?.grant?.id, 'f1');
+  assert.equal(r.action?.reason, 'dying value');
+  assert.equal(r.heldScope, 'general', 'the caller must still register the general hold');
+  // control: nothing held → no heldScope on the same dying claim
+  const c = why(acct({ wk: 0.5, resetIn: 3 * DAY, scoped, now }), listing({ grants: [G({}, now), dyingFable], now }), peers(2), now);
+  assert.equal(c.action?.grant?.id, 'f1');
+  assert.equal(c.heldScope ?? null, null);
+});
+
+test('R3-2/3 (sweep): a dying Fable claimed under a general hold registers the hold, and that Fable claim does not retire it', async () => {
+  const am = pool(3);
+  const self = am.accounts[0];
+  const posts = [];
+  const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
+    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H },
+      scopedWeekly: { fable: { utilization: 0.5, resetAt: Date.now() + 3 * DAY, isActive: true } }, weeklyAbsent: false }),
+    grantsFn: async () => listing({ grants: [G(), G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt: Date.now() + 10 * H })] }) });
+  prober._now = () => Date.now() + 6 * 60_000;
+  const restore = stubFetch(posts);
+  try { await prober.probeOne(self); } finally { restore(); }
+  assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'the dying Fable grant was claimed');
+  assert.equal(am.isHoldingWall(self), true, 'the general hold is registered and still live');
+});
+
+test('R3-3: a general hold is retired only by a claim that clears the GENERAL weekly limit — never by a Fable claim', async () => {
+  const posts = [];
+  const restore = stubFetch(posts);
+  try {
+    const am = pool(4);
+    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    am.applyResetGrants(1, listing({ grants: [G()] }));
+    const [c0, c1] = am.accounts;
+    assert.equal(await am.tryReactiveClaim(c0, { kind: 'weekly', weeklyUtil: 1 }), false, 'c0 holds');
+    const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null });
+    const fable = G({ id: 'f1', clears: ['seven_day_overage_included'] });
+    assert.equal(await prober._claimClaudeGrant(c0, { kind: 'grant', grant: fable, scope: 'fable', reason: 'dying value' }), true, 'precondition: Fable claimed');
+    assert.equal(am.isHoldingWall(c0), true, 'a Fable claim leaves the general hold live');
+    await am.tryReactiveClaim(c1, { kind: 'weekly', weeklyUtil: 1 });
+    assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 2, 'c0 still holds → its budget is spent → c1 claims');
+    const general = G({ id: 'g2' });
+    assert.equal(await prober._claimClaudeGrant(c0, { kind: 'grant', grant: general, scope: 'general', reason: 'weekly at wall' }), true);
+    assert.equal(am.isHoldingWall(c0), false, 'a general claim retires it');
+  } finally { restore(); }
+  // the fast path's own general claim retires it too
+  const posts2 = [];
+  const restore2 = stubFetch(posts2);
+  try {
+    const am = pool(3);
+    const self = am.accounts[0];
+    am.applyResetGrants(0, listing({ grants: [G()] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'held');
+    am.accounts[1].enabled = false;                                   // room gone → the next 429 claims
+    await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 });
+    assert.equal(posts2.filter(u => /reset_rate_limits/.test(u)).length, 1);
+    assert.equal(am.isHoldingWall(self), false);
+  } finally { restore2(); }
+});
+
+test('R3-4: a peer counts only if it shares a routable profile with the walled account (the router\'s _matchesProfile)', () => {
+  const now = Date.now();
+  const am = pool(3, now);
+  am.accounts[1].profiles = ['team-b'];
+  assert.equal(count(am, 'general', now), 1, 'a peer on another profile cannot take this account\'s traffic');
+  am.accounts[1].profiles = ['all'];
+  assert.equal(count(am, 'general', now), 2, 'sharing "all" is enough');
+  const t = pool(3, now);
+  t.accounts[0].profiles = ['team-a'];
+  assert.equal(count(t, 'general', now), 0, 'self on a private profile: default peers share nothing');
+  t.accounts[2].profiles = ['claude', 'team-a'];
+  assert.equal(count(t, 'general', now), 1);
+  // the router's own predicate decides (one definition of "can serve this traffic")
+  const r = pool(3, now);
+  r._matchesProfile = () => false;
+  assert.equal(count(r, 'general', now), 0);
 });
