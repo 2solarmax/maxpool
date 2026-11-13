@@ -985,11 +985,6 @@ async function serverWorkerCommand() {
   let terminalHandedOff = false;
   // Raw-mode switches that must not stall a serving worker (takeover, TTY re-assert).
   const terminalMode = createTerminalModeSwitcher();
-  // Set when this worker exits for a cold restart: leave the terminal's mode alone on
-  // the way out — switching it waits for the terminal to read (TCSADRAIN), and Node
-  // restores the terminal at exit by itself without waiting (measured on a pty,
-  // 2026-11-13). The respawned worker takes the terminal over.
-  let keepTerminalModeOnExit = false;
   // An update's cold restart that waits for the terminal to catch up (cancel function).
   let cancelDeferredColdRestart = null;
   // Self-heal timer for a seamless reload that rolls back (new worker fails to boot,
@@ -997,12 +992,12 @@ async function serverWorkerCommand() {
   let reloadWatchdog = null;
   // One cold-restart fallback per reload request — see the rollback watchdog below.
   let coldFallbackUsed = false;
-  // Set by the update paths just before they request a restart; requestReload moves it
-  // onto the reload it opens, so it describes THAT reload and never a later one.
+  // Set by the update paths just before they request a restart; the reload's settle
+  // clears it, so it describes THAT reload and never a later one.
   let reloadIsForUpdate = false;
   let lastRollbackReason = null;
-  // The reload this worker requested last: its id (echoed by the supervisor in
-  // MSG_ROLLED_BACK) and whether an update asked for it.
+  // The reload this worker requested last: its id, echoed by the supervisor in
+  // MSG_ROLLED_BACK.
   let reloadSeq = 0;
   let openReload = null;
 
@@ -1019,12 +1014,12 @@ async function serverWorkerCommand() {
     // it now; restoring here would clobber its live TUI. No-op.
     if (terminalHandedOff) return;
     try {
-      if (tui?.running) { tui.stop({ exiting, keepRaw: keepTerminalModeOnExit }); return; }
+      if (tui?.running) { tui.stop({ exiting }); return; }
       if (process.stdout.isTTY) {
         if (exiting) writeTerminalSync('\x1b[?25h\x1b[?1049l');
         else process.stdout.write('\x1b[?25h\x1b[?1049l');
       }
-      if (process.stdin.isTTY && !keepTerminalModeOnExit) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
+      if (process.stdin.isTTY) { try { process.stdin.setRawMode(false); } catch { /* ignore */ } }
     } catch { /* never throw from a restore */ }
   };
   process.on('exit', () => restoreTerminal({ exiting: true }));
@@ -1120,11 +1115,16 @@ async function serverWorkerCommand() {
     draining = true;
     if (syncTimer) clearInterval(syncTimer);
     if (updateTimer) clearInterval(updateTimer);
-    // Never switch the terminal's mode here (keepRaw + keepTerminalModeOnExit): that
-    // waits for the terminal to read, and a worker frozen on its way out still holds
-    // the listening socket — the port went dead (red-team 2026-11-13).
-    keepTerminalModeOnExit = true;
-    if (tui?.running) { tui.stop({ keepRaw: true }); }   // plain-log mode resumes for the drain messages
+    // Supervised, the respawned worker takes the terminal over (and the supervisor's
+    // exit restores it if none does): hand it off like a seamless reload does, so
+    // neither this stop() nor the exit handler waits for the terminal — a mode switch
+    // (TCSADRAIN) or the exit handler's synchronous write. A worker stuck there still
+    // holds the listening socket, and the port went dead while the terminal was not
+    // reading (red-team round 1, 2026-11-13). Node restores the terminal mode at exit
+    // by itself, without waiting (measured on a pty). Unsupervised, nothing else will
+    // restore the user's shell, so the exit path keeps its synchronous restore.
+    if (supervised) terminalHandedOff = true;
+    if (tui?.running) { tui.stop(supervised ? { keepRaw: true } : {}); }   // plain-log mode resumes for the drain messages
     console.log('\n[Maxpool] Restarting server now; queued requests will reconnect automatically.');
     server.closeAllConnections?.();
     // Best-effort: flush quota + settle in-flight refreshes/prober before exit so
@@ -1156,7 +1156,7 @@ async function serverWorkerCommand() {
     if (draining) return; // MSG_RELEASE already arrived → a real reload, not a rollback
     lastRollbackReason = reason;
     // An update that asked while this reload was already open was folded into it.
-    const forUpdate = Boolean(openReload?.forUpdate || reloadIsForUpdate);
+    const forUpdate = reloadIsForUpdate;
     openReload = null;
     reloadIsForUpdate = false;
     const why = !answered ? 'the supervisor did not answer'
@@ -1223,8 +1223,7 @@ async function serverWorkerCommand() {
         lastRollbackReason = null;
         cancelDeferredColdRestart?.();   // this reload supersedes an update still waiting to restart
         cancelDeferredColdRestart = null;
-        openReload = { id: `${process.pid}-${++reloadSeq}`, forUpdate: reloadIsForUpdate };
-        reloadIsForUpdate = false;
+        openReload = { id: `${process.pid}-${++reloadSeq}` };
         process.send({ type: MSG_RELOAD_REQUEST, reloadId: openReload.id });
         // Arm the rollback self-heal: restartController already latched
         // pending/restarting + paused admission (in _restart, before we got here).

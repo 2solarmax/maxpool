@@ -101,3 +101,22 @@ test('a hand-off while the terminal is not reading never shuts the port (no run 
     assert.deepEqual(w.timeline.filter(r => /timeout/.test(String(r.status))).map(r => `+${r.t}s`), [], 'no request hung');
   } finally { cleanup(); }
 });
+
+test('a cold restart with the terminal not reading: the old worker leaves promptly (no terminal-mode switch on its way out)', { skip, timeout: 150_000 }, async () => {
+  // restartWorkerNow used to switch raw mode off (TCSADRAIN) in tui.stop() and again
+  // at exit — a worker that still held the listening socket waited for a terminal that
+  // was not reading (red-team round 1, finding 3). Node restores the terminal at exit
+  // by itself, without waiting.
+  const { port, term, pid, oldWorker, log, cleanup } = await bootPool({ env: { MAXPOOL_TEST_FORCE_COLD_RESTART: '1' } });
+  try {
+    await stopTheTerminal(term, port);
+    const logFrom = (await log()).length;
+    await pressRestart(term);
+    const gone = await watch({ port, pid, log, logFrom, ms: 12_000, timeoutMs: 500, stepMs: 300, pred: r => !r.kids.includes(oldWorker) });
+    assert.ok(gone.ok, `the old worker never left while the terminal was not reading:\n${describe(gone.timeline, MARKS)}`);
+    assert.match(gone.row.since, /Restarting server now/, 'precondition: the cold-restart path ran');
+    term.cmd('read');
+    const back = await watch({ port, pid, log, logFrom, ms: 20_000, pred: r => r.status === 200 && r.worker && r.worker !== oldWorker });
+    assert.ok(back.ok, `the pool did not come back once the terminal read:\n${describe(back.timeline, MARKS)}`);
+  } finally { cleanup(); }
+});

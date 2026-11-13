@@ -308,9 +308,7 @@ test('whenTerminalCaughtUp: fires once our queue is empty — not on a mere shri
 test('WIRING: an update cold restart waits for the terminal, and the restart never switches the terminal mode', () => {
   const rw = src.match(/const restartWorkerNow = \(\) => \{[\s\S]*?\n {2}\};\n/);
   assert.ok(rw, 'restartWorkerNow found');
-  assert.match(rw[0], /keepTerminalModeOnExit = true;[\s\S]{0,80}tui\.stop\(\{ keepRaw: true \}\)/);
-  assert.match(src, /process\.stdin\.isTTY && !keepTerminalModeOnExit\) \{ try \{ process\.stdin\.setRawMode\(false\)/);
-  assert.match(src, /tui\.stop\(\{ exiting, keepRaw: keepTerminalModeOnExit \}\)/);
+  assert.match(rw[0], /if \(supervised\) terminalHandedOff = true;\s*if \(tui\?\.running\) \{ tui\.stop\(supervised \? \{ keepRaw: true \} : \{\}\); \}/);
   const settle = src.match(/const settleRolledBackReload = [\s\S]*?\n {2}\};\n/)[0];
   assert.match(settle, /if \(tui\?\.running && tui\._nb && process\.stdout\.writableLength > 0\) \{[\s\S]{0,300}whenTerminalCaughtUp\(/);
   assert.match(src, /cancelDeferredColdRestart\?\.\(\);/, 'a new reload cancels a waiting update restart');
