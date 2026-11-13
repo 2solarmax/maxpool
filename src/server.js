@@ -212,12 +212,16 @@ const REFUSAL_HOLD_MAX_MS = 30_000;
 // disabling it. Short (not reset-length) so a provider-pinned session's hold window
 // isn't blown, and a still-exhausted provider just re-benches on the next single retry.
 const PROVIDER_FORBIDDEN_COOLDOWN_SEC = Math.max(60, Number(process.env.MAXPOOL_PROVIDER_403_COOLDOWN_SEC) || 1800);
-// Backstop reaper idle ceiling. Floored WELL above the longest a legit NON-streaming
-// request can go silent (no heartbeat there): TTFB 120s + nonStreamMaxWaitMs 300s +
-// UPSTREAM_BODY_MS 300s ≈ 720s — so a slow-but-alive non-streaming request is never
-// reaped at completion. Streaming holds heartbeat, so they're safe at any ceiling.
+// Backstop reaper idle ceiling. Floored WELL above the longest a legit header-less
+// NON-streaming request can go silent (no heartbeat there): TTFB 120s + nonStreamMaxWaitMs
+// 300s + UPSTREAM_BODY_MS 300s ≈ 720s — so a slow-but-alive non-streaming request is never
+// reaped at completion. A request with a client-patience deadline can legitimately stay
+// silent longer (290s hops, up to ~1470s inside a 1h patience); the reaper extends to
+// deadlineAt + DEADLINE_REAP_GRACE_MS for those, since the deadline itself ends them.
+// Streaming holds heartbeat, so they're safe at any ceiling.
 // Exported so index.js sizes RELOAD_DRAIN_MS off the SAME value (no drift).
 export const REQUEST_IDLE_MAX_MS = Math.max(900_000, Number(process.env.MAXPOOL_REQUEST_IDLE_MAX_MS) || 1_200_000);
+const DEADLINE_REAP_GRACE_MS = 60_000;
 
 const DEFAULT_QUEUE = {
   enabled: true,
@@ -2640,9 +2644,10 @@ async function forwardRequest(
         { attempt: [account.name, transientKind, 'transient; no other route'] },
       );
       if (queued) return;
-      // F3: a request that carried the POOL deadline and ran out of routes on a first-byte timeout answers the
-      // request-scoped 504 (the Mac books it neutral), never a bare 503 that cools its row and counts a failure.
-      if (err.code === 'UPSTREAM_TTFB' && !requestInfo.stream && requestInfo.deadlineAt != null && requestInfo.deadlinePoolSupplied) {
+      // F3: a request with a deadline that ran out of routes on a first-byte timeout answers the request-scoped
+      // 504 (the Mac books it neutral), never a bare 503 that cools its row and counts a failure. Direct
+      // long-patience clients get the same answer (R2-2); an old Mac never has a deadline here (F1 gate).
+      if (err.code === 'UPSTREAM_TTFB' && !requestInfo.stream && requestInfo.deadlineAt != null) {
         ctx.status = 504;
         logFailedAttempt(account.name, 'deadline', `no first byte after ${heldSeconds(lease)}s (hop cap), no route left`, 'surfaced');
         sendDeadlineResponse(res, requestInfo);
@@ -4595,6 +4600,10 @@ function startIdleRequestReaper(res, reqId, idleMs, { now = Date.now, setInterva
     if (getRequestInfo?.()?.queueHeartbeatActive) { lastProgressAt = now(); return; }
     const bytes = res.socket?.bytesWritten ?? lastBytes;
     if (bytes !== lastBytes) { lastBytes = bytes; lastProgressAt = now(); return; }
+    // R2-1: a non-streaming request with a deadline is bounded by that deadline (504 at
+    // deadlineAt); never cut it before deadline + grace. Never SHORTENS the ceiling.
+    const info = getRequestInfo?.();
+    if (info && !info.stream && info.deadlineAt != null && now() < info.deadlineAt + DEADLINE_REAP_GRACE_MS) return;
     if (now() - lastProgressAt >= idleMs && !res.writableEnded && !res.destroyed) {
       console.error(`[Maxpool] Request ${reqId} — no write progress for ${Math.round(idleMs / 1000)}s (backstop reaper); force-aborting a stuck request to free its account slot`);
       res.destroy();

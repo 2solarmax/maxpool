@@ -123,6 +123,25 @@ test('F3 pool deadline: a first-byte timeout with no route left answers the requ
   } finally { process.env.MAXPOOL_LINK_HOP_CAP_MS = '30000'; await close(proxy); await close(stub.server); }
 });
 
+test('R2-2 direct client: a first-byte timeout at the hop cap with no route left also answers the 504 (not a bare 503)', async () => {
+  // A direct long-patience client (stainless header, no pool hop) used to get 503 here while a pool-deadline
+  // request got 504 for the same event. Both are this request running out of time, not an account fault.
+  process.env.MAXPOOL_LINK_HOP_CAP_MS = '4000';
+  const stub = upstreamStub(null);
+  const upPort = await listen(stub.server);
+  const am = new AccountManager(oauth(1), 0.9);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue: { enabled: false } });
+  const port = await listen(proxy);
+  try {
+    let r;
+    await captureLog(async () => { r = await post(port, { 'x-stainless-timeout': '60' }); });
+    assert.equal(r.status, 504, `${r.status} ${r.text.slice(0, 200)}`);
+    assert.equal(JSON.parse(r.text).error.type, 'timeout_error');
+    assert.ok(r.elapsedMs >= 3_500 && r.elapsedMs <= 7_000, `timed out at the 4s hop cap, got ${r.elapsedMs}ms`);
+    assert.equal(stub.hits.length, 1);
+  } finally { process.env.MAXPOOL_LINK_HOP_CAP_MS = '30000'; await close(proxy); await close(stub.server); }
+});
+
 test('F3 through a real link: Mac + cloud, answer slower than the cloud\'s floor, patience 60s → served; Mac row AND cloud row untouched', async () => {
   const stub = upstreamStub(6_000);
   const upPort = await listen(stub.server);
