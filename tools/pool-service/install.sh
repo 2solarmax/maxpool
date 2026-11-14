@@ -45,6 +45,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMUX_BIN=/opt/homebrew/bin/tmux
 [ -x "$TMUX_BIN" ] || die "tmux not found at $TMUX_BIN (brew install tmux)"
 [ -x "$HERE/pane.sh" ] || die "not executable: $HERE/pane.sh"
+[ -x "$HERE/start.sh" ] || die "not executable: $HERE/start.sh"
+# A unix socket path over ~104 bytes cannot be bound ("File name too long").
+SOCK="$DIR/tmux.sock"
+[ "${#SOCK}" -le 100 ] || die "socket path $SOCK is ${#SOCK} chars; tmux needs 100 or fewer. Use a shorter --dir"
 
 # ── the installed maxpool must carry the service-mode changes ────────────────
 if [ -n "${MAXPOOL_NPM_ROOT:-}" ]; then NPM_ROOT="$MAXPOOL_NPM_ROOT"; else NPM_ROOT="$(npm root -g)"; fi
@@ -61,7 +65,6 @@ NODE_BIN="$(cd "$(dirname "$NODE_PATH_BIN")" && pwd)"
 
 mkdir -p "$DIR"
 chmod 700 "$DIR"
-SOCK="$DIR/tmux.sock"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 mkdir -p "$(dirname "$PLIST")"
 
@@ -77,7 +80,8 @@ else
     ( umask 077; cat > "$CONFIG" <<CONFIG_EOF
 {
   "proxy": { "host": "127.0.0.1", "port": $PORT, "apiKey": "$KEY" },
-  "accounts": [],
+  "upstream": "http://127.0.0.1:9",
+  "accounts": [{ "name": "canary-dummy", "type": "apikey", "apiKey": "canary-not-a-real-key" }],
   "providers": [],
   "preventSleep": false,
   "updateCheck": false,
@@ -86,7 +90,7 @@ else
 }
 CONFIG_EOF
     )
-    echo "wrote canary config $CONFIG (port $PORT, no accounts, updates off)"
+    echo "wrote canary config $CONFIG (port $PORT, one dummy account, upstream 127.0.0.1:9, updates off)"
   fi
 fi
 
@@ -109,12 +113,8 @@ cat > "$PLIST" <<PLIST_EOF
     <string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$TMUX_BIN</string>
-        <string>-D</string>
-        <string>-S</string>
-        <string>$SOCK</string>
-        <string>-f</string>
-        <string>$DIR/tmux.conf</string>
+        <string>/bin/bash</string>
+        <string>$HERE/start.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

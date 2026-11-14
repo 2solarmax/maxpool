@@ -126,8 +126,10 @@ test('install.sh at MIN_VERSION writes plist, tmux.conf and canary config', asyn
   assert.match(xml, /ThrottleInterval<\/key>\s*<integer>10<\/integer>/);
   assert.match(xml, /ProcessType<\/key>\s*<string>Interactive<\/string>/);
   assert.match(xml, new RegExp(`StandardOutPath</key>\\s*<string>${stage.dir.replace(/\//g, '\\/')}\/tmux\.log<\/string>`));
-  assert.match(xml, /\/opt\/homebrew\/bin\/tmux<\/string>/);
-  assert.match(xml, /<string>-D<\/string>/);
+  // launchd runs start.sh (it starts tmux AND pokes it — a -D server runs its
+  // config only once a client connects), never tmux directly.
+  assert.match(xml, new RegExp(`<string>${tools.replace(/\//g, '\\/')}\/start\.sh<\/string>`));
+  assert.doesNotMatch(xml, /<string>-D<\/string>/);
 
   // The generated tmux.conf: the committed settings plus the pool session with
   // an absolute pane.sh path (tmux refuses a command with -D at the CLI, and
@@ -138,12 +140,15 @@ test('install.sh at MIN_VERSION writes plist, tmux.conf and canary config', asyn
   assert.match(conf, /bind -n C-c detach-client/);
   assert.match(conf, new RegExp(`new-session -d -s pool ${tools.replace(/\//g, '\\/')}\/pane\\.sh`));
 
-  // Canary config pre-written (non-default label): own port, no accounts or
-  // providers, sleep + all update machinery off, own API key.
+  // Canary config pre-written (non-default label): own port, own API key, sleep +
+  // all update machinery off. One dummy apikey account (a pool with no accounts and
+  // no providers refuses to start), and an upstream that cannot leave the Mac.
   const canary = JSON.parse(readFileSync(join(stage.dir, 'config.json'), 'utf8'));
   assert.equal(canary.proxy.port, 39402);
   assert.match(canary.proxy.apiKey, /^mp-/);
-  assert.deepEqual(canary.accounts, []);
+  assert.deepEqual(canary.accounts, [{ name: 'canary-dummy', type: 'apikey', apiKey: 'canary-not-a-real-key' }]);
+  assert.equal(canary.upstream, 'http://127.0.0.1:9');
+  assert.ok(!(r.stdout + r.stderr).includes(canary.proxy.apiKey), 'install must never print the config API key');
   assert.deepEqual(canary.providers ?? [], []);
   assert.equal(canary.preventSleep, false);
   assert.equal(canary.updateCheck, false);
@@ -168,6 +173,91 @@ test('install.sh with the default label writes no canary config and points at th
   const xml = readFileSync(join(stage.home, 'Library/LaunchAgents/com.maxpool.pool.plist'), 'utf8');
   // Live config resolution mirrors config.js: teamclaude.json when maxpool.json is absent.
   assert.match(xml, /MAXPOOL_CONFIG<\/key>\s*<string>[^<]*teamclaude\.json<\/string>/);
+});
+
+test('install.sh refuses a --dir whose socket path is over 100 chars', async () => {
+  const stage = await makeStage();
+  await writeStub(join(stage.bin, 'launchctl'), `echo "launchctl $*" >> "${join(stage.stage, 'launchctl-calls.txt')}"`);
+  const npmRoot = await stubNpmRoot(stage, MIN_VERSION);
+  const nodeDir = await stubNodeDir(stage, 'nodebin');
+  const longDir = join(stage.dir, 'x'.repeat(110));
+
+  const r = run('bash', [join(tools, 'install.sh'), '--dir', longDir, '--label', 'com.maxpool.test'],
+    envFor(stage, { MAXPOOL_NPM_ROOT: npmRoot, PATH: `${nodeDir}:${stage.bin}:${process.env.PATH}` }));
+  assert.notEqual(r.status, 0, 'a socket path tmux cannot bind must be refused');
+  assert.match(r.stderr, /socket path .* 100/);
+  assert.equal(existsSync(join(stage.home, 'Library/LaunchAgents/com.maxpool.test.plist')), false);
+  assert.equal(existsSync(join(stage.stage, 'launchctl-calls.txt')), false);
+});
+
+// ── start.sh: launchd's program ─────────────────────────────────────────────
+
+// A stub tmux: `-D` is the server (records, then runs until the `killed` marker
+// appears, then exits 3); `has-session` is a client poke that succeeds from the
+// Nth attempt on (a -D server only creates the pool session once a client connects).
+async function startStage(okFromAttempt) {
+  const stage = await makeStage();
+  const calls = join(stage.stage, 'tmux-calls.txt');
+  const tries = join(stage.stage, 'tries');
+  const killed = join(stage.stage, 'killed');
+  await writeStub(join(stage.bin, 'tmux'), [
+    `echo "tmux $*" >> "${calls}"`,
+    `case " $* " in`,
+    `  *" -D "*) while [ ! -f "${killed}" ]; do sleep 0.1; done; exit 3 ;;`,
+    `  *" has-session "*) echo x >> "${tries}"; [ "$(wc -l < "${tries}")" -ge ${okFromAttempt} ] && exit 0 || exit 1 ;;`,
+    `esac`,
+  ].join('\n'));
+  const env = envFor(stage, {
+    MAXPOOL_DIR: stage.dir,
+    MAXPOOL_TMUX_SOCK: join(stage.dir, 'tmux.sock'),
+    MAXPOOL_TMUX_BIN: join(stage.bin, 'tmux'),
+    MAXPOOL_START_WAIT_SECS: '3',
+  });
+  return { stage, calls, killed, env };
+}
+
+async function runStart(env) {
+  const child = spawn('bash', [join(tools, 'start.sh')], { env, stdio: 'ignore' });
+  const exited = new Promise(resolve => child.on('exit', code => resolve(code)));
+  return { child, exited };
+}
+
+test('start.sh pokes the tmux server until the pool session exists, then waits on tmux', async () => {
+  const { stage, calls, killed, env } = await startStage(2);   // first poke fails, second succeeds
+  const { child, exited } = await runStart(env);
+  try {
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline && (readFileSync(calls, { flag: 'a+' }).toString().match(/has-session/g) || []).length < 2) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+    const log = readFileSync(calls, 'utf8');
+    assert.match(log, new RegExp(`tmux -D -S ${stage.dir.replace(/\//g, '\\/')}\/tmux\.sock -f ${stage.dir.replace(/\//g, '\\/')}\/tmux\.conf`));
+    assert.equal((log.match(/has-session -t pool/g) || []).length, 2, 'retry until the session exists, then stop poking');
+    // Still running: launchd must see tmux's lifetime, not the poke's.
+    await new Promise(r => setTimeout(r, 1500));
+    assert.equal(child.exitCode, null, 'start.sh must wait on the tmux server');
+    assert.equal((readFileSync(calls, 'utf8').match(/has-session/g) || []).length, 2, 'no polling after startup');
+    await writeFile(killed, '');
+    assert.equal(await exited, 3, "start.sh exits with tmux's exit code");
+  } finally {
+    await writeFile(killed, '').catch(() => {});
+    child.kill('SIGKILL');
+  }
+});
+
+test('start.sh logs when the pool session never appears, and still waits on tmux', async () => {
+  const { stage, killed, env } = await startStage(999);   // never succeeds
+  const { child, exited } = await runStart(env);
+  try {
+    await waitForFile(join(stage.dir, 'pane.log'), 15000, 'pane.log');
+    assert.match(readFileSync(join(stage.dir, 'pane.log'), 'utf8'), /never created the pool session/);
+    assert.equal(child.exitCode, null);
+    await writeFile(killed, '');
+    assert.equal(await exited, 3);
+  } finally {
+    await writeFile(killed, '').catch(() => {});
+    child.kill('SIGKILL');
+  }
 });
 
 // ── pane.sh: node fallback ──────────────────────────────────────────────────

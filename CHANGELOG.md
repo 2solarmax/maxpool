@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Q closes the view when Maxpool runs as a background service
 - Background service keeps the pool running when Terminal closes
 
+### Fixed
+
+- Background service starts the pool without waiting for a viewer
+
 ## [1.24.93] - 2026-11-14
 
 ### Changed

@@ -242,7 +242,7 @@ Request logging includes prompt and response bodies. Use it only for short debug
 
 Keeps the pool running when you close the Terminal tab, quit Terminal, or something kills it. launchd starts the pool at login and restarts it within seconds if it stops. The dashboard is the same one you see in a tab.
 
-How it works: launchd runs a private tmux server (its own socket and config, so your `~/.tmux.conf` never loads). The tmux pane runs `tools/pool-service/pane.sh`, which runs `maxpool` with a real terminal, so the dashboard and seamless updates behave exactly as in a tab.
+How it works: launchd runs `tools/pool-service/start.sh`, which starts a private tmux server (its own socket and config, so your `~/.tmux.conf` never loads) and connects to it once, because the server only creates the pool session after a client connects. The tmux pane runs `tools/pool-service/pane.sh`, which runs `maxpool` with a real terminal, so the dashboard and seamless updates behave exactly as in a tab.
 
 Install (needs Homebrew tmux at `/opt/homebrew/bin/tmux` and maxpool 1.24.95 or newer):
 
@@ -287,7 +287,7 @@ launchctl bootout gui/$(id -u)/com.maxpool.pool && rm ~/Library/LaunchAgents/com
 
 Then remove the `source` line from `~/.zshrc` and start the pool in a tab with `maxpool` as before, followed by `maxpool route pool`.
 
-A test copy that never touches the live pool: `install.sh --label com.maxpool.canary --port 3466 --dir ~/.config/maxpool-canary`. Any label other than `com.maxpool.pool` gets its own config with no accounts, no providers and updates off.
+A test copy that never touches the live pool: `install.sh --label com.maxpool.canary --port 3466 --dir ~/.config/maxpool-canary`. Any label other than `com.maxpool.pool` gets its own config: one dummy local account, an upstream that cannot leave the Mac (`127.0.0.1:9`), no providers and updates off. The socket path (`<dir>/tmux.sock`) must be 100 characters or fewer.
 
 An earlier launchd attempt (July 2026) was reverted within hours with no reason recorded. Two likely causes: it ran without a terminal, so there was no dashboard to open; and its wrapper could take the port while a Terminal pool was restarting. This design keeps the dashboard and waits for the port to be free before it starts.
 
