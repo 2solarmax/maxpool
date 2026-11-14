@@ -25,7 +25,7 @@ function fakeWorker(script) {
     waitFor(types, _timeoutMs) {
       const want = Array.isArray(types) ? types : [types];
       const reply = script.shift();
-      if (reply === 'TIMEOUT') return Promise.reject(new Error('timed out'));
+      if (reply === 'TIMEOUT') return Promise.reject(Object.assign(new Error('timed out'), { reason: 'timeout' }));
       if (reply === 'EXIT') return Promise.reject(new Error('worker exited'));
       if (!want.includes(reply.type)) {
         return Promise.reject(new Error(`unexpected ${reply.type}`));

@@ -5,6 +5,25 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.93] - 2026-11-14
+
+### Changed
+
+- RED — seamless reload stalls when the terminal is not reading (supervisor + reload worker block on tty writes)
+- Pin the terminal-not-reading fix elements the pty test cannot see
+- Red-team round 2 — id-less notices settle but never cold-restart; helper process; quit/respawn never wait on the terminal
+- Round-2 greens hardened; dead reload worker never touches the live dashboard
+- Gate the pending-raw-switch pty tests on a measured kernel capability
+
+### Fixed
+
+- Seamless reload no longer stalls when the terminal is not reading
+- Cold start keeps synchronous raw mode; deferred reclaim fires on progress
+- Red-team round 1 — rollback notices name their reload, terminal mode switches never stall a serving worker
+- Hand the terminal over before closing the listener; old-supervisor compat test; rollback clock
+- A supervised cold restart hands the terminal to its successor; one update-flag reset
+- Crash-class exit-75s hand the terminal off when supervised
+
 ## [1.24.92] - 2026-11-13
 
 ### Added
