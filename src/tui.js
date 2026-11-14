@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { spawn } from 'node:child_process';
 import { readFileSync, writeSync } from 'node:fs';
 import { isatty } from 'node:tty';
 import { homedir } from 'node:os';
@@ -9,6 +10,9 @@ import { describeLinkError } from './pool-link.js';
 import { normalizeRemoteResets } from './account-manager.js';
 import { appliesTo } from './claude-reset-grants.js';
 import { LISTING_FRESH_MS } from './reset-timing.js';
+
+// Running as the background service (tools/pool-service): set by its launchd plist.
+const serviceMode = () => process.env.MAXPOOL_SERVICE === '1';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -593,8 +597,12 @@ export function decideLoginTarget({ mirror, links, existing, accountUuid }) {
 }
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart, spawnDetached }) {
     this.am = accountManager;
+    // Runs the tmux detach for q in service mode; a seam so tests never start tmux.
+    this._spawnDetached = spawnDetached || ((cmd, args) => {
+      try { spawn(cmd, args, { stdio: 'ignore', detached: true }).on('error', () => {}).unref(); } catch { /* no tmux */ }
+    });
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
@@ -919,8 +927,19 @@ export class TUI {
     this.forceRender();
   }
 
+  /** Close every viewer of the service dashboard (viewers are view-only); the pool
+   *  keeps running. `-s pool` detaches all clients of the session, deterministically. */
+  detachView() {
+    const sock = process.env.MAXPOOL_TMUX_SOCK;
+    this._spawnDetached('tmux', [...(sock ? ['-S', sock] : []), 'detach-client', '-s', 'pool']);
+  }
+
   _keyNormal(k) {
-    if (k === 'q') {
+    if (k === 'q' && serviceMode()) {
+      // Under the background service the pool lives in a tmux pane launchd owns:
+      // stopping it here would only make launchd cold-restart it. q closes the view.
+      this.detachView();
+    } else if (k === 'q') {
       this._confirm(
         'Stop Maxpool?',
         'New requests will stop; active requests will drain before the server exits.',
@@ -3316,7 +3335,7 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('p')} People  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} Stop server`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('p')} People  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} ${serviceMode() ? 'Close view' : 'Stop server'}`;
       case 'capacity': {
         const other = this.capacityWindow === 'wk' ? '5h session' : 'weekly (7d)';
         return ` ${bold('w')} Show ${cyan(other)}  ${bold('Esc')} Back`;

@@ -2730,6 +2730,7 @@ function handleServerListenError(err, host, port) {
       `[Maxpool] ${host}:${port} is already in use.`,
       'Another Maxpool proxy may already be running.',
       'Check the existing server with: maxpool status',
+      'Dashboard: maxpool (attaches to the running service)',
       `Find the listener with: lsof -nP -iTCP:${port} -sTCP:LISTEN`,
     ];
   } else if (err.code === 'EACCES') {
