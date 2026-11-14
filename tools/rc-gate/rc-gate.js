@@ -417,12 +417,29 @@ const mitmServer = http.createServer((creq, cres) => {
       // [direct-stall] on a request that owned its socket the whole time.
       if (tStall) { clearTimeout(tStall); tStall = null; }
       cres.writeHead(ures.statusCode, ures.headers);
+      // UPSTREAM DIED MID-RESPONSE => END THE CLIENT LEG TOO (2026-11-14). Same shape as the
+      // pool leg below: this response had NO error handling at all, so a long-poll /events
+      // stream (or any body) that died upstream after headers left the CLI on an open 200
+      // that never ends — the CLI's reconnect logic never ran. Long-poll streams are NOT
+      // replayed (bytes may duplicate); surfacing the break lets the CLI reconnect itself.
+      let ended = false;
+      ures.on('end', () => { ended = true; });
+      ures.on('error', e => {
+        console.log('[direct-break] upstream errored mid-response', creq.url, String(e?.code || e?.message || e));
+        if (!ended && !cres.writableFinished) cres.destroy(e);
+      });
+      ures.on('aborted', () => {
+        console.log('[direct-break] upstream aborted mid-response', creq.url);
+        if (!ended && !cres.writableFinished) cres.destroy();
+      });
       ures.pipe(cres);
     });
         curDir = dir;
         dir.on('error', err => {
           if (tStall) { clearTimeout(tStall); tStall = null; }
-          if (cres.headersSent) return;               // mid-stream: never duplicate bytes
+          // mid-stream: never duplicate bytes — and never leave the client on a stream that
+          // will not end (see the ures handlers above): end it with an error instead.
+          if (cres.headersSent) { if (!cres.writableFinished) cres.destroy(err); return; }
           // REPLAY SAFETY (2026-10-05, corrects 29b58e7). A replayed /bridge or bare
           // /worker registration makes the server evict the live connection (close
           // 4090 — the header comment above; pinned by rc-gate.test.js "4090
@@ -519,11 +536,20 @@ const mitmServer = http.createServer((creq, cres) => {
     cres.writeHead(ures.statusCode, ures.headers);
     ures.on('data', c => { bytes += c.length; });
     ures.on('end', () => { upstreamEnded = true; });
+    // UPSTREAM DIED MID-RESPONSE => END THE CLIENT LEG TOO (2026-11-14). The status line is
+    // already on the wire, so there is no 502 to send, and `ures.pipe(cres)` neither ends
+    // nor destroys cres when ures errors/aborts. The client (Claude Code) then sat on an
+    // open 200 stream forever: no bytes, no end, no error — so its own stream timeout and
+    // retry never fired (~3,350 "UPSTREAM aborted/errored" log lines, bursts after network
+    // changes). Destroying cres surfaces the break to the client as a connection error it
+    // already knows how to retry. Mirrors the client-gone teardown below, in reverse.
     ures.on('error', e => {
       console.log(`[resp-break] UPSTREAM errored mid-response ${creq.url} after ${bytes}B/${Date.now() - t0}ms — ${e?.code || e?.message}`);
+      if (!upstreamEnded && !cres.writableFinished) cres.destroy(e);
     });
     ures.on('aborted', () => {
       console.log(`[resp-break] UPSTREAM aborted mid-response ${creq.url} after ${bytes}B/${Date.now() - t0}ms`);
+      if (!upstreamEnded && !cres.writableFinished) cres.destroy();
     });
     ures.pipe(cres);
   });
@@ -547,6 +573,9 @@ const mitmServer = http.createServer((creq, cres) => {
   });
   up.on('error', err => {
     console.log(`[resp-break] forward to maxpool failed ${creq.url} after ${Date.now() - t0}ms — ${err?.code || err?.message}${clientAborted ? ' (client had already gone)' : ''}`);
+    // Status already sent: a 502 is impossible and appending JSON would corrupt the stream
+    // (and end it as if complete). End the client leg with an error instead.
+    if (cres.headersSent) { if (!cres.writableFinished) cres.destroy(err); return; }
     try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
     cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_upstream_error', message: String(err?.message || err) } }));
   });
