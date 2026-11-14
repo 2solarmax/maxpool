@@ -9,7 +9,7 @@ import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor, f
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { modelFamily } from './oauth.js';
+import { modelFamily, sameAccountIdentity } from './oauth.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -460,6 +460,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { body = null; }
         const acct = body?.account;
         if (acct && typeof acct.name === 'string') acct.name = safeText(acct.name);
+        if (acct && typeof acct.organizationUuid !== 'string') delete acct.organizationUuid;
         if (!acct || acct.type !== 'oauth' || typeof acct.accountUuid !== 'string' || !acct.accountUuid ||
             typeof acct.refreshToken !== 'string' || !acct.refreshToken || typeof acct.accessToken !== 'string' || !acct.accessToken) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -467,7 +468,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           return;
         }
         const who = caller.name || 'legacy-key';
-        const amAcct = accountManager.accounts.find(a => a.accountUuid === acct.accountUuid);
+        const amAcct = accountManager.accounts.find(a => sameAccountIdentity(a, acct));
         const tokenFields = {
           accessToken: acct.accessToken,
           refreshToken: acct.refreshToken,
@@ -485,26 +486,26 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           if (amAcct.status === 'error') amAcct.status = 'active';
           appendEventLog(`[Maxpool] Remote re-auth: "${amAcct.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
         } else {
-          const entry = { name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields };
+          const entry = newInjectedEntry(acct, tokenFields);
           accountManager.addAccount(entry);
           appendEventLog(`[Maxpool] Remote add: "${entry.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
         }
         try {
           await atomicConfigUpdate(diskConfig => {
-            const onDisk = diskConfig.accounts.find(a => a.accountUuid === acct.accountUuid);
+            const onDisk = diskConfig.accounts.find(a => sameAccountIdentity(a, acct));
             if (onDisk) {
               Object.assign(onDisk, tokenFields);
             } else {
-              diskConfig.accounts.push({ name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields });
+              diskConfig.accounts.push(newInjectedEntry(acct, tokenFields));
             }
           });
           // Keep the in-memory config mirror in step so a later TUI saveConfig
           // can't clobber the fresh tokens with stale ones.
           // A NEW row must enter the mirror too: the disk sync adds any disk row whose
           // uuid the mirror lacks, so a missing entry became a second live row.
-          const mem = (config.accounts || []).find(a => a.accountUuid === acct.accountUuid);
+          const mem = (config.accounts || []).find(a => sameAccountIdentity(a, acct));
           if (mem) Object.assign(mem, tokenFields);
-          else if (Array.isArray(config.accounts)) config.accounts.push({ name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields });
+          else if (Array.isArray(config.accounts)) config.accounts.push(newInjectedEntry(acct, tokenFields));
         } catch (err) {
           // A single-use credential write is only "ok" when it is DURABLE: the browser
           // login may have invalidated the previous refresh token, so memory-only means
@@ -755,6 +756,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
  */
+/** The account a remote login adds: one Claude user in one organization, plus its tokens. */
+function newInjectedEntry(acct, tokenFields) {
+  const entry = { name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields };
+  if (acct.organizationUuid) entry.organizationUuid = acct.organizationUuid;
+  return entry;
+}
+
 async function relayRaw(req, res, upstream) {
   const bodyChunks = [];
   for await (const chunk of req) bodyChunks.push(chunk);

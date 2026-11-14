@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline';
 import { readFileSync, writeSync } from 'node:fs';
 import { isatty } from 'node:tty';
 import { homedir } from 'node:os';
-import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
@@ -140,8 +140,8 @@ const vw = s => strip(s).length;
 // ── Accounts-table columns ───────────────────────────────────
 // Fixed column widths shared by the header row (acctHeader) AND every data row, so
 // the header labels stay aligned with the columns they name. The Account/Provider/
-// Status/Quota start offsets (4/25/35/49) are pure functions of these widths + the
-// 4-col row prefix, independent of the quota-bar width.
+// Status/Rst/Quota start offsets (4/25/35/49/56) are pure functions of these widths +
+// the 4-col row prefix, independent of the quota-bar width.
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
 const WHERE_W = 5;         // 'Local' / 'Cloud' — where the account is provisioned
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
@@ -171,8 +171,8 @@ function providerLabel(a) {
 
 /**
  * Aligned column header for the accounts table. Names the three columns that carry
- * NO inline label (Account / Type / Status) plus a group label over the two quota
- * bars (Quota). The per-bar naming (Ses/Wk for OAuth, Tok/Req for API keys) and the
+ * NO inline label (Account / Type / Status) plus a group label over the quota bars
+ * (Quota). The per-bar naming (Ses/Fbl/Wk for OAuth, Tok/Fbl/Req for API keys) and the
  * load fields (Now/15m/1h) stay inline per row — they're row-type-dependent and
  * begin at a variable offset — so the header stops after the Quota group label.
  */
@@ -191,6 +191,45 @@ function acctHeader(W) {
 function lpadVis(s, w) {
   const gap = w - vw(s);
   return gap > 0 ? ' '.repeat(gap) + s : s;
+}
+
+/**
+ * Which quota bars fit a terminal W columns wide, and how wide each bar is. The
+ * space before the first bar comes from the column widths above, never from a
+ * hard-coded number (the old number went stale when the Rst column was added).
+ * Each extra bar costs its label gap ("  Fbl " or "  Wk  ") plus one bar width.
+ * Under 70 columns only the session bar shows, 5 to 20 wide; from 70 the weekly
+ * bar joins it, both 5 to 20 wide. The Fable bar joins only once all three can be
+ * 9 wide (112 columns), the narrowest bar that still shows "100% 2d5h", and three
+ * bars stop growing at 11 wide, so the row never passes column 118 and the tags
+ * after the bars (cap, prefer, staleness) keep the room they have with two bars.
+ * Narrower terminals keep today's two bars plus the "Fable NN%" tag.
+ * When no account reports a session window, the session bar is left out: the
+ * weekly bar always shows and the Fable bar joins it from 97 columns.
+ */
+const BAR_START = ROW_PREFIX.length + NAME_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + RESETS_W + 1 + 'Ses '.length;
+const BAR_GAP = '  Wk  '.length;
+const BAR_MIN_W = 5;
+const BAR_MAX_W = 20;
+const FABLE_BAR_MIN_W = 9;
+const THREE_BAR_MAX_W = 11;
+function barLayout(W, showSession = true) {
+  const showBoth = W >= 70 || !showSession;
+  const others = (showSession ? 1 : 0) + (showBoth ? 1 : 0);
+  const showFable = W >= BAR_START + (others + 1) * FABLE_BAR_MIN_W + others * BAR_GAP;
+  const bars = others + (showFable ? 1 : 0);
+  const free = W - BAR_START - (bars - 1) * BAR_GAP;
+  const fit = Math.floor(free / bars);
+  const maxW = bars === 3 ? THREE_BAR_MAX_W : BAR_MAX_W;
+  const bw = Math.max(BAR_MIN_W, Math.min(maxW, fit));
+  return { showSession, showBoth, showFable, bw };
+}
+
+/** True when the account's first bar (Ses, or Tok for an API key) has a reading. */
+function hasSessionReading(a) {
+  const q = a?.quota || {};
+  if (a?.type === 'provider') return q.providerSes != null;
+  return q.unified5h != null || (q.tokensLimit != null && q.tokensRemaining != null);
 }
 
 function rpad(s, w) {
@@ -541,6 +580,20 @@ function emptyBar(label, w = 10) {
   return `${ESC}100m${' '.repeat(lp)}${text}${' '.repeat(rp)}${RESET}`;
 }
 
+/**
+ * The "Fbl" bar: one model family's weekly limit, which Anthropic counts separately
+ * from the account-wide weekly. Drawn with the same bar() as Ses and Wk, so it reads
+ * the same way (used% and time to reset). Shows the empty dash cell when there is
+ * nothing to show: a provider row, no probe result yet, or a limit Anthropic marks
+ * as inactive. Routing
+ * and the "Fable NN%" tag ignore an inactive limit too, so the bar stays quiet as well.
+ */
+function scopedWeeklyBar(quota, family, w) {
+  const e = quota?.scopedWeekly?.[family];
+  if (!e || e.isActive === false || e.utilization == null) return emptyBar('—', w);
+  return bar(e.utilization, w, e.resetAt);
+}
+
 /** Write a provider's enabled flag into the CONFIG entry `loadConfigProviders` reads.
  *
  *  A config-sourced provider is re-created from config on every reload
@@ -562,7 +615,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -1160,7 +1213,7 @@ export class TUI {
     } else if (k === 'l') {
       this._confirm(
         'Log in / re-authenticate via browser?',
-        'Opens a browser. Logging into an account that\'s already added RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Otherwise a new account is added.',
+        'Opens a browser. Logging into an account that\'s already added (same user, same organization) RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Another organization of the same user, or a new user, is added as a new account.',
         () => this._doLogin(),
       );
     } else if (k === 'n' && this.am.accounts.length > 0) {
@@ -1200,7 +1253,7 @@ export class TUI {
       this.mode = 'accounts';
       this._confirm(
         'Log in / re-authenticate via browser?',
-        'Opens a browser. Logging into an account that is already added RE-AUTHENTICATES it in place — no duplicate.',
+        'Opens a browser. Logging into an account that is already added (same user, same organization) RE-AUTHENTICATES it in place — no duplicate. Another organization of the same user is added as a new account.',
         () => this._doLogin(),
       );
       return;
@@ -1731,7 +1784,7 @@ export class TUI {
   }
 
   // Browser OAuth login — the SAME flow re-authenticates an existing account (matched
-  // by accountUuid) or adds a new one. When the login is for an account already added,
+  // by user + organization) or adds a new one. When the login is for an account already added,
   // we say so, keep its name, and skip the "name this account" prompt — so it's clear
   // it's a RE-AUTH in place (revives a dead-refresh/reauth account), not a duplicate.
   async _doLogin() {
@@ -1771,12 +1824,9 @@ export class TUI {
   // a mirror match → that team pool; a brand-new account with a linked team pool →
   // ask once (default team pool); otherwise the local save path.
   async _routeLogin(creds, profile) {
-    const decision = decideLoginTarget({
-      mirror: this._findRemoteMirrorFor(profile),
-      links: this.am.poolLinks,
-      existing: this._findExistingOAuthAccount(profile),
-      accountUuid: profile?.accountUuid,
-    });
+    const mirror = this._findRemoteMirrorFor(profile);
+    const existing = mirror ? null : await this._matchLogin(profile);
+    const decision = decideLoginTarget({ mirror, links: this.am.poolLinks, existing, accountUuid: profile?.accountUuid });
     if (decision.kind === 'no-uuid') {
       setConsoleStdoutSuppressed(false);
       process.stdout.write("\nCould not read this account's id — the team pool needs it. Nothing was saved; try again.\n");
@@ -1787,14 +1837,14 @@ export class TUI {
       await this._sendLoginToRemote(decision.mirror, creds, profile);
       return;
     }
-    const existing = this._findExistingOAuthAccount(profile);
     let name;
     if (existing) {
       process.stdout.write(`\nThis Claude account is already added as "${existing.name}" — re-authenticating it in place (no duplicate).\n`);
       name = existing.name;
     } else {
-      const suggested = profile?.email
-        || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
+      const sibling = this._oauthAccounts().find(a => sameUser(a, profile));
+      if (sibling) process.stdout.write(`\nSame Claude user as "${sibling.name}": adding a second account.\n`);
+      const suggested = suggestAccountName(this.config.accounts, profile);
       let toTeam = false;
       if (decision.kind === 'ask-team') {
         const where = String(await this._ask(`\nThis is a new account. Add it to the team pool "${decision.link.name}" (recommended) or this laptop only? [T/l]: `) || '').trim().toLowerCase();
@@ -1835,7 +1885,8 @@ export class TUI {
   // uuid-first matcher cannot alias onto a local account).
   _findRemoteMirrorFor(profile) {
     if (!profile?.accountUuid) return null;
-    return this.am.accounts.find(a => a.remote && a.remoteUuid === profile.accountUuid) || null;
+    return this.am.accounts.find(a => a.remote
+      && sameAccountIdentity({ accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid }, profile)) || null;
   }
 
   // Send a fresh browser login to the linked team pool that OWNS this account
@@ -1955,23 +2006,19 @@ export class TUI {
   }
 
   // Upsert an OAuth account into config + the running manager. Dedupes by
-  // accountUuid, then name. Shared by import and browser login.
+  // user + organization, then name. Shared by import and browser login.
   async _upsertOAuthAccount({ creds, profile, name, source, verb = 'Added' }) {
-    if (!name) {
-      name = profile?.email
-        || `account-${this.config.accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
-    }
+    if (!name) name = suggestAccountName(this.config.accounts, profile);
     const entry = {
       name, type: 'oauth', source,
       accountUuid: profile?.accountUuid || null,
+      organizationUuid: profile?.organizationUuid || null,
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
     };
 
-    let idx = entry.accountUuid
-      ? this.config.accounts.findIndex(a => a.accountUuid === entry.accountUuid)
-      : -1;
+    let idx = this.config.accounts.findIndex(a => sameAccountIdentity(a, entry));
     if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
 
     if (idx >= 0) {
@@ -1987,13 +2034,14 @@ export class TUI {
       // heal disk (persistTokenRefresh's generation guard skips a disk token that
       // != _refreshedFrom), so disk must be made correct right here.
       const amAcct = this.am.accounts.find(account =>
-        (entry.accountUuid && account.accountUuid === entry.accountUuid) || account.name === name
+        sameAccountIdentity(account, entry) || account.name === name
       );
       if (amAcct) {
         amAcct.credential = creds.accessToken;
         amAcct.refreshToken = creds.refreshToken;
         amAcct.expiresAt = creds.expiresAt;
         amAcct.accountUuid = entry.accountUuid;
+        amAcct.organizationUuid = entry.organizationUuid;
         amAcct.name = name;
         // Fresh tokens from re-auth revive a dead-refresh account. This in-place
         // update is the actual re-login path (the index.js reconcile sees no change
@@ -2035,15 +2083,84 @@ export class TUI {
     }
   }
 
+  // Decide what a fresh browser-login profile is: an account already in the pool
+  // (re-authenticate in place) or a new one. Same-user entries that do not know
+  // their organization are read first; when one still cannot be read, the user decides.
+  async _matchLogin(profile) {
+    await this._resolveOrganizations(profile);
+    const existing = this._findExistingOAuthAccount(profile);
+    if (this._organizationUnknown(existing, profile)) return this._confirmReauth(existing);
+    return existing;
+  }
+
+  // Fill in the organization of same-user entries that lack one, reading each with
+  // the running account's live token (read only, never refreshed), and mirror the
+  // result to the manager. The upsert that follows persists it.
+  async _resolveOrganizations(profile) {
+    if (!profile?.accountUuid) return;
+    await resolveOrganizations(this._oauthAccounts(), profile.accountUuid, entry => this._liveCredentials(entry));
+    this._mirrorOrganizations(profile);
+  }
+
+  _liveCredentials(entry) {
+    const live = this._runningAccount(entry);
+    return live ? { accessToken: live.credential, expiresAt: live.expiresAt } : entry;
+  }
+
+  _mirrorOrganizations(profile) {
+    const known = this._oauthAccounts().filter(a => sameUser(a, profile) && a.organizationUuid);
+    for (const entry of known) this._mirrorOrganization(entry);
+  }
+
+  _mirrorOrganization(entry) {
+    const live = this._runningAccount(entry);
+    if (live) live.organizationUuid = entry.organizationUuid;
+  }
+
+  _runningAccount(entry) {
+    return this.am.accounts.find(a => a.name === entry.name);
+  }
+
+  _oauthAccounts() {
+    return this.config.accounts.filter(a => a.type === 'oauth');
+  }
+
   // Find an already-configured OAuth account matching a fresh browser-login profile —
-  // by accountUuid (primary), then name===email — the SAME precedence _upsertOAuthAccount
-  // dedupes on, so the login flow can honestly say "re-authenticating" vs "adding new".
+  // the same user in the same organization; else a same-user entry that does not know
+  // its organization (the login then asks); else, for a profile without a uuid,
+  // name===email; else an entry saved before uuids were stored. The SAME precedence
+  // _upsertOAuthAccount dedupes on, so the login flow can honestly say
+  // "re-authenticating" vs "adding new".
   _findExistingOAuthAccount(profile) {
-    const uuid = profile?.accountUuid || null;
+    const accounts = this._oauthAccounts();
     const email = profile?.email || null;
-    let acct = uuid ? this.config.accounts.find(a => a.type === 'oauth' && a.accountUuid === uuid) : null;
-    if (!acct && email) acct = this.config.accounts.find(a => a.type === 'oauth' && a.name === email);
-    return acct || null;
+    if (!profile?.accountUuid) return (email && accounts.find(a => a.name === email)) || null;
+    return accounts.find(a => sameAccountIdentity(a, profile))
+      || organizationUnknownMatch(accounts, profile)
+      || accounts.find(a => !a.accountUuid && a.name === email)
+      || null;
+  }
+
+  // True when the match rests on the user alone: the entry's organization is unknown
+  // while the login names one.
+  _organizationUnknown(existing, profile) {
+    return Boolean(existing?.accountUuid && profile?.organizationUuid && !existing.organizationUuid);
+  }
+
+  // The user decides a same-user login whose organization could not be read: Enter
+  // or r re-authenticates the entry, a adds a second account; anything else asks again.
+  async _confirmReauth(existing) {
+    const choice = await this._askReauthOrAdd(existing.name);
+    if (choice === 'add') return null;
+    if (choice === 'reauth') return existing;
+    return this._confirmReauth(existing);
+  }
+
+  async _askReauthOrAdd(name) {
+    const raw = await this._ask(`Same Claude user as "${name}", organization unknown. Re-authenticate it (r) or add a second account (a)? [r] `);
+    const answer = String(raw || '').trim().toLowerCase();
+    if (['', 'r', 're-authenticate'].includes(answer)) return 'reauth';
+    return ['a', 'add'].includes(answer) ? 'add' : null;
   }
 
   async _doAddKey(apiKey) {
@@ -2096,7 +2213,7 @@ export class TUI {
   _configAccountIndex(account) {
     if (!account) return -1;
     if (account.accountUuid) {
-      const byUuid = this.config.accounts.findIndex(candidate => candidate.accountUuid === account.accountUuid);
+      const byUuid = this.config.accounts.findIndex(candidate => sameAccountIdentity(candidate, account));
       if (byUuid >= 0) return byUuid;
     }
     return this.config.accounts.findIndex(candidate => candidate.name === account.name);
@@ -2433,18 +2550,13 @@ export class TUI {
     } else {
       lines.push('');
       // Aligned column header (dim + underline so it reads as chrome, not data). It
-      // labels the fixed columns that have no inline label; the Ses/Wk/Tok/Req and
+      // labels the fixed columns that have no inline label; the Ses/Fbl/Wk/Tok/Req and
       // Now/15m/1h labels stay inline per row. It sits DIRECTLY above the rows — the
       // abbreviation glossary is a FOOTER below the rows (a caption), never between
       // the header and the data (a left-aligned sentence there reads as a broken,
       // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
-      const showBoth = W >= 70;
-      // 65/54 = the fixed pre-bar column span (prefix + Account + Provider + Status +
-      // gaps); grew by +4 with the wider 20-col Account column (was 61/50 at NAME_W 16).
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 65) / 2)))
-        : Math.max(5, Math.min(20, W - 54));
+      const { showSession, showBoth, showFable, bw } = barLayout(W, this.am.accounts.some(hasSessionReading));
 
       // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
       // display order over the canonical am.accounts array (which stays untouched so
@@ -2457,7 +2569,7 @@ export class TUI {
         // effectively off (owner 2026-10-29: "should it hide the local ones that are
         // in the cloud... they're effectively disabled as well"). No separate key.
         if (this.hideDisabled && this.am.accounts[i]?.poolBenchedBy) { hidden++; continue; }
-        lines.push(this._renderAcct(i, bw, showBoth));
+        lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession));
       }
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
@@ -2573,7 +2685,7 @@ export class TUI {
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth) {
+  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true) {
     let a = this.am.accounts[idx];
     // A row benched by the duplicate guard renders the CLOUD's live copy (status,
     // bars, in-flight, request counts) — never the stale local snapshot. Identity
@@ -2842,7 +2954,7 @@ export class TUI {
     }
 
     if (a.type === 'provider') {
-      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth);
+      return this._renderProviderAcct(sel, cur, name, type, status + ' ' + resetsCell, a, bw, showBoth, showFable, showSession);
     }
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
@@ -2865,15 +2977,20 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${l1} ${bar(r1, bw, t1)}`;
+    const bars = [];
+    if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
+    // The Fable bar goes between the session and weekly bars on every row type, so
+    // the Wk column starts at the same offset on OAuth, API-key and provider rows.
+    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
       // (privacy@gomokka.com, measured 2026-08-06) doesn't read as broken.
-      line += (r2 == null && q.weeklyAbsent)
-        ? `  ${l2} ${emptyBar('none', bw)}`
-        : `  ${l2} ${bar(r2, bw, t2)}`;
+      bars.push((r2 == null && q.weeklyAbsent)
+        ? `${l2} ${emptyBar('none', bw)}`
+        : `${l2} ${bar(r2, bw, t2)}`);
     }
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${bars.join('  ')}`;
     const weekly = weeklyPolicyText(this.am, a);
     if (weekly) line += `  ${weekly}`;
     // Per-account SETTINGS (preferred pin, usage cap), whatever the account is
@@ -2930,7 +3047,9 @@ export class TUI {
     // so a BUSY oauth account with a header-fresh reading and no probe-only scoped
     // cap is NOT stale, even if its background probe is 429-throttled. Provider bars
     // and per-model scoped caps ARE probe-only, so for those a stale probe genuinely
-    // means stale data → keep flagging.
+    // means stale data → keep flagging. The Fbl bar shows the Fable reading at any
+    // level, but a stale low reading changes no routing decision, so this flag keeps
+    // the same reserve-floor gate as the tag.
     const q = a.quota || {};
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85; // mirrors _renderAcct's scoped-tag gate
     const hasDisplayedScopedCap = Object.values(q.scopedWeekly || {}).some(
@@ -2971,7 +3090,7 @@ export class TUI {
     return interval > 0 ? `every ${formatAge(interval)}` : 'shortly';
   }
 
-  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true) {
+  _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true, showFable = showBoth, showSession = true) {
     const q = a.quota || {};
 
     // Ses/Wk bars in the SAME columns as OAuth rows (right after status) so the
@@ -3029,8 +3148,11 @@ export class TUI {
     // setting whenever the probe is quiet is how a shipped feature reads as absent.
     for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
-    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} Ses ${sesCell}`;
-    if (showBoth) line += `  Wk  ${wkCell}`;
+    const bars = [];
+    if (showSession) bars.push(`Ses ${sesCell}`);
+    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+    if (showBoth) bars.push(`Wk  ${wkCell}`);
+    let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${bars.join('  ')}`;
     line += note;
     // Same recent-load columns as OAuth (providers track inFlight + load events),
     // plus a compact Last <status> <ms> — the one signal that matters for a

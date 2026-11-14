@@ -153,6 +153,7 @@ export async function fetchProfile(accessToken) {
     const data = await res.json();
     return {
       accountUuid: data.account?.uuid,
+      organizationUuid: data.organization?.uuid,
       email: data.account?.email,
       name: data.account?.display_name,
       orgName: data.organization?.name,
@@ -163,6 +164,70 @@ export async function fetchProfile(accessToken) {
   } catch (err) {
     return { error: err.message || String(err) };
   }
+}
+
+/** True when both records belong to the same Claude user (account.uuid). */
+export function sameUser(a, b) {
+  return Boolean(a?.accountUuid) && a.accountUuid === b?.accountUuid;
+}
+
+/**
+ * True when both records are the same Claude login: the same user in the same
+ * organization. One user can hold a personal Max org and a Team org under one
+ * email; each is its own account. Records saved before organizations were
+ * recorded have no organizationUuid and match each other on the user alone; an
+ * entry with an org never matches one without, so a rotated single-use refresh
+ * token can never be written to the wrong entry.
+ */
+export function sameAccountIdentity(a, b) {
+  return sameUser(a, b) && (a.organizationUuid || null) === (b.organizationUuid || null);
+}
+
+/**
+ * The one OAuth entry of the login's user whose organization is still unknown,
+ * when no entry matches the login exactly; null otherwise. The TUI then asks
+ * "re-authenticate or add?", the CLI re-authenticates it in place. One shared
+ * rule for both so they can never drift apart.
+ */
+export function organizationUnknownMatch(accounts, profile) {
+  if (accounts.some(a => sameAccountIdentity(a, profile))) return null;
+  return accounts.find(a => a.type === 'oauth' && sameUser(a, profile) && !a.organizationUuid) || null;
+}
+
+/**
+ * Fill in organizationUuid on the accounts of one user that lack it, by reading
+ * each one's profile with its own current access token. Read only: an expired or
+ * missing token is skipped, never refreshed. `credentialsOf` supplies the live
+ * token of a running account; by default the stored one is used. Returns the
+ * accounts still without an organization.
+ */
+export async function resolveOrganizations(accounts, accountUuid, credentialsOf = a => a) {
+  const missing = accounts.filter(a => sameUser(a, { accountUuid }) && !a.organizationUuid);
+  for (const account of missing) {
+    const organizationUuid = await readOrganization(credentialsOf(account));
+    if (organizationUuid) account.organizationUuid = organizationUuid;
+  }
+  return missing.filter(a => !a.organizationUuid);
+}
+
+/** The organization uuid behind an unexpired access token (read only), else null. */
+async function readOrganization({ accessToken, expiresAt } = {}) {
+  if (!accessToken || isTokenExpiringSoon(expiresAt, 0)) return null;
+  const profile = await fetchProfile(accessToken);
+  return profile?.organizationUuid || null;
+}
+
+/**
+ * Default name for a new account: its email, or "<email> (<plan type>)" when
+ * another account already carries that email as its name (the same user in
+ * another organization), or a numbered fallback when the profile has no email.
+ */
+export function suggestAccountName(accounts, profile) {
+  const email = profile?.email;
+  if (!email) return `account-${accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
+  if (!accounts.some(a => a.name === email)) return email;
+  const type = String(profile.orgType || '').replace(/^claude_/, '');
+  return `${email} (${type || '2'})`;
 }
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
