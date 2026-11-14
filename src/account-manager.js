@@ -3449,13 +3449,6 @@ export class AccountManager {
    *   - ramp:        ease a just-recovered account back in instead of slamming it
    *   - failures:    direct per-account backoff after errors
    */
-  /**
-   * Does this account hold a banked reset that can actually lift its BINDING limit?
-   * Claude grants: usable, not paused, unexpired. z.ai cards: unexpired five-hour cards
-   * always count; weekly cards count only when the account HAS a weekly limit (a legacy
-   * plan has none — z.ai support, 2026-10-03 — so a weekly card there lifts nothing).
-   * Disabled accounts never count (owner gate R0). Display state only otherwise.
-   */
   /** R7 (owner, 2026-11-13 — task-2026-11-13-maxpool-hold-resets-when-pool-has-room):
    *  how many OTHER accounts in THIS pool have room to absorb the load while the
    *  GENERAL weekly wall claim waits for the account's free weekly refill (< 24h
@@ -3560,6 +3553,13 @@ export class AccountManager {
     return 1 + this.accounts.filter(a => a !== self && this.isHoldingWall(a, now)).length;
   }
 
+  /**
+   * Does this account hold a banked reset that can actually lift its BINDING limit?
+   * Claude grants: usable, not paused, unexpired. z.ai cards: unexpired five-hour cards
+   * always count; weekly cards count only when the account HAS a weekly limit (a legacy
+   * plan has none — z.ai support, 2026-10-03 — so a weekly card there lifts nothing).
+   * Disabled accounts never count (owner gate R0). Display state only otherwise.
+   */
   _holdsUsableReset(account, now = Date.now()) {
     if (!account || account.enabled === false) return false;
     if (account.refreshDead || account.subscriptionGone) return false;   // C4: a dead account can never spend
