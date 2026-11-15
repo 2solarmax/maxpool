@@ -5,6 +5,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
+// A turn SERVED by `account`: the home memory (written at acquire) plus the last-account
+// memory, which since 2026-11-15 is written at the first real byte (noteConversationServed).
+const noteServed = (m, ri, account) => { m._noteConversationAccount(ri, account); m.noteConversationServed({ ...ri }, account); };
 
 const acct = (n) => ({ name: n, type: 'oauth', accessToken: 't', refreshToken: 'r',
   expiresAt: Date.now() + 3600_000, accountUuid: `U-${n}`, upstream: 'http://127.0.0.1:1' });
@@ -35,7 +38,7 @@ const evictionPressure = (m) => {
   const other = m.accounts.find(a => a.name === 'other');
   capture(() => {
     for (let i = 0; i < 5200; i++) {
-      m._noteConversationAccount(RI({ affinityKey: `o${i}:h`, sessionKey: `o${i}` }), other);
+      noteServed(m, RI({ affinityKey: `o${i}:h`, sessionKey: `o${i}` }), other);
       if (i % 500 === 0) step(m, RI({ pinAccount: 'glm' }));
     }
   });

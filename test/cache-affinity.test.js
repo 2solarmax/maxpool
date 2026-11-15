@@ -6,6 +6,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { __serverTest } from '../src/server.js';
+// A turn SERVED by `account`: the home memory (written at acquire) plus the last-account
+// memory, which since 2026-11-15 is written at the first real byte (noteConversationServed).
+const noteServed = (m, ri, account) => { m._noteConversationAccount(ri, account); m.noteConversationServed({ ...ri }, account); };
 
 const acct = (n) => ({ name: n, type: 'oauth', accessToken: 't', refreshToken: 'r',
   expiresAt: Date.now() + 3600_000, accountUuid: `U-${n}`, upstream: 'http://127.0.0.1:1' });
@@ -109,7 +112,7 @@ test('HOLD: GLM weekly-less plan tiers on its 5h reading — held at 0.90, relea
   m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
   const glm = m.accounts.find(a => a.type === 'provider');
   glm.quota.weeklyAbsent = true; // z.ai plan with no weekly window: _weeklyRawState follows the 5h reading
-  m._noteConversationAccount({ sessionKey: 'sess-g' }, glm);
+  noteServed(m, { sessionKey: 'sess-g' }, glm);
   glm.quota.providerSes = 0.9;
   assert.equal(m._weeklyRawState(glm), 'reserve', 'the exact state the old 0.85 gate released');
   assert.ok(m._cacheAffinity(glm, { sessionKey: 'sess-g' }) > 0, '0.90 → held (reserve tier: tighter-capped, 320)');
@@ -214,7 +217,7 @@ test('SPREAD: parallel conversations bound to ONE account fan out as depth grows
   const m = am(3); am_ref = m;
   const home = m.accounts[0];
   const N = 8; const keys = Array.from({ length: N }, (_, i) => `term-1:C${i}`);
-  keys.forEach(k => m._noteConversationAccount({ affinityKey: k }, home)); // all bound to a1
+  keys.forEach(k => noteServed(m, { affinityKey: k }, home)); // all bound to a1
   const leases = keys.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: 10 }));
   const per = {}; leases.forEach(l => { per[l.account.name] = (per[l.account.name] || 0) + 1; });
   // Measured shape at weight 10: the first 4 hold (depth 40 vs 0 → 120/turn past the target
@@ -299,7 +302,7 @@ test('why=: peak-suppressed provider (priority tier) → released:priority-tier'
   m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
   const glm = m.accounts.find(a => a.type === 'provider');
   m._peakTier = (a) => (a.type === 'provider' ? 1 : 0); // provider peak de-preference active
-  m._noteConversationAccount({ sessionKey: 's', affinityKey: 's:h' }, glm);
+  noteServed(m, { sessionKey: 's', affinityKey: 's:h' }, glm);
   assert.match(movedLine(m, glm, undefined, undefined, 'all'), /why=released:priority-tier$/);
 });
 
@@ -354,14 +357,14 @@ test('no readable quota (Kimi console-only) → no affinity', () => {
   m.addAccount({ name: 'kimi', type: 'provider', provider: 'kimi', apiKey: 'kk' });
   const kimi = m.accounts.find(a => a.provider === 'kimi');
   kimi.quota.providerQuotaSource = 'console-only';
-  m._noteConversationAccount({ sessionKey: 'k' }, kimi);
+  noteServed(m, { sessionKey: 'k' }, kimi);
   assert.equal(m._cacheAffinity(kimi, { sessionKey: 'k' }), 0);
 });
 
 test('bonus is scaled to the row\'s per-unit price (discounted rows tolerate the same depth)', () => {
   const m = am(1); am_ref = m;
   const a = m.accounts[0];
-  m._noteConversationAccount({ sessionKey: 's' }, a);
+  noteServed(m, { sessionKey: 's' }, a);
   assert.equal(m._cacheAffinity(a, { sessionKey: 's' }), 400, 'undiscounted row: full bonus');
   const orig = m._fastRefillMultiplier.bind(m);
   m._fastRefillMultiplier = () => 0.4;
@@ -371,8 +374,9 @@ test('bonus is scaled to the row\'s per-unit price (discounted rows tolerate the
 
 test('conversation map is bounded (LRU)', () => {
   const m = am(1); am_ref = m;
-  for (let i = 0; i < 5005; i++) m._noteConversationAccount({ affinityKey: `k${i}` }, m.accounts[0]);
+  for (let i = 0; i < 5005; i++) m.noteConversationServed({ affinityKey: `k${i}` }, m.accounts[0]);
   assert.equal(m.conversationLastAccount.size, 5000);
+  assert.equal(m.conversationLastServedAt.size, 5000, 'served-at map shares the bound');
   assert.equal(m.conversationLastAccount.has('k0'), false, 'oldest dropped');
   assert.equal(m.conversationLastAccount.has('k5004'), true);
 });
@@ -405,7 +409,7 @@ test('bonus scales with conversation size but is CAPPED at cacheAffinityMaxExtra
 test('cap is priced per row: a discounted GLM row buys the same DEPTH (units), fewer points', () => {
   const m = am(1); am_ref = m;
   const a = m.accounts[0];
-  m._noteConversationAccount({ sessionKey: 's' }, a);
+  noteServed(m, { sessionKey: 's' }, a);
   const orig = m._fastRefillMultiplier.bind(m);
   m._fastRefillMultiplier = () => 0.4;
   const unit = 2 * 0.4 + 10 * 0.4;
@@ -447,7 +451,7 @@ for (const bytes of SIZES) {
     const m = fleet(8); am_ref = m;
     const home = m.accounts[0];
     const keys = Array.from({ length: 20 }, (_, i) => `term-1:C${i}`);
-    keys.forEach(k => m._noteConversationAccount({ affinityKey: k }, home));
+    keys.forEach(k => noteServed(m, { affinityKey: k }, home));
     const leases = keys.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes }));
     const per = dist(leases);
     const shallowest = Math.min(...m.accounts.slice(1).map(a => a.activeWeight));
@@ -465,7 +469,7 @@ for (const bytes of SIZES) {
     const home = m.accounts[0];
     home.quota.unified7d = 0.9; home.quota.unified7dReset = FAR();
     const keys = Array.from({ length: 20 }, (_, i) => `term-1:C${i}`);
-    keys.forEach(k => m._noteConversationAccount({ affinityKey: k }, home));
+    keys.forEach(k => noteServed(m, { affinityKey: k }, home));
     const leases = keys.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes }));
     const shallowest = Math.min(...m.accounts.slice(1).map(a => a.activeWeight));
     const reserveCap = m.scheduler.cacheAffinityMaxExtraDepth * (m.scheduler.reserveConcurrencyTarget / m.scheduler.perAccountConcurrencyTarget);
@@ -478,7 +482,7 @@ for (const bytes of SIZES) {
     const m = fleet(4); am_ref = m;
     const home = m.accounts[0];
     const bound = Array.from({ length: 6 }, (_, i) => `term-1:B${i}`);
-    bound.forEach(k => m._noteConversationAccount({ affinityKey: k }, home));
+    bound.forEach(k => noteServed(m, { affinityKey: k }, home));
     const held = bound.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes }));
     const fresh = Array.from({ length: 12 }, (_, i) => m.acquireAccount({ sessionKey: 'term-1', affinityKey: `term-1:N${i}`, model: 'claude-opus-5-5', weight: TURN, bodyBytes: bytes }));
     const depths = m.accounts.map(a => a.activeWeight);
@@ -529,7 +533,7 @@ test('conversation-move evidence log: fires once when a known conversation chang
     const m = am(2); am_ref = m;
     const first = m.acquireAccount({ sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 10_000 });
     m.releaseAccount(first, { status: 200, success: true });
-    m._noteConversationAccount({ affinityKey: 's:h' }, m.accounts.find(a => a.name !== first.account.name)); // pretend it ran elsewhere
+    noteServed(m, { affinityKey: 's:h' }, m.accounts.find(a => a.name !== first.account.name)); // pretend it ran elsewhere
     // Force a move back: exclude everyone except the first account.
     const excl = new Set(m.accounts.filter(a => a.name !== first.account.name).map(a => a.index));
     const next = m.acquireAccount({ sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 10_000 }, excl);
@@ -554,8 +558,8 @@ const byName = (m, n) => m.accounts.find(a => a.name === n);
 // Conversation used a2, then a GLM turn; a2 is a little busier than its siblings.
 const detour = (m, ri = RI()) => {
   const a2 = byName(m, 'a2'); const glm = byName(m, 'glm');
-  m._noteConversationAccount(ri, a2);
-  m._noteConversationAccount(ri, glm);
+  noteServed(m, ri, a2);
+  noteServed(m, ri, glm);
   a2.activeWeight = 6;
   return { a2, glm };
 };
@@ -642,11 +646,11 @@ test('RETURN HOME only while the stored copy lives: older than the window → no
 test('RETURN HOME memory holds only Claude accounts (allow-list): GLM, pool rows never become home', () => {
   const m = detourMgr();
   const ri = RI();
-  m._noteConversationAccount(ri, byName(m, 'a3'));
-  m._noteConversationAccount(ri, byName(m, 'glm'));
-  m._noteConversationAccount(ri, { name: 'legacy-pool', type: 'pool' });
+  noteServed(m, ri, byName(m, 'a3'));
+  noteServed(m, ri, byName(m, 'glm'));
+  noteServed(m, ri, { name: 'legacy-pool', type: 'pool' });
   assert.equal(m.conversationLastClaudeAccount.get('s:h').name, 'a3');
-  m._noteConversationAccount(ri, { name: 'key-acct', type: 'apikey' });
+  noteServed(m, ri, { name: 'key-acct', type: 'apikey' });
   assert.equal(m.conversationLastClaudeAccount.get('s:h').name, 'key-acct', 'API-key accounts carry their own cache too');
 });
 
@@ -671,7 +675,7 @@ test('RETURN HOME spread: 20 detoured conversations sharing one home stay within
   m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
   const home = m.accounts[0]; const glm = byName(m, 'glm');
   const keys = Array.from({ length: 20 }, (_, i) => `term-1:D${i}`);
-  keys.forEach(k => { m._noteConversationAccount({ affinityKey: k }, home); m._noteConversationAccount({ affinityKey: k }, glm); });
+  keys.forEach(k => { noteServed(m, { affinityKey: k }, home); noteServed(m, { affinityKey: k }, glm); });
   const leases = keys.map(k => m.acquireAccount({ sessionKey: 'term-1', affinityKey: k, model: 'claude-opus-5-5', weight: TURN, bodyBytes: 450_000, profile: 'all' }, new Set([glm.index])));
   const claude = m.accounts.filter(a => a.type === 'oauth');
   const shallowest = Math.min(...claude.slice(1).map(a => a.activeWeight));
@@ -707,8 +711,8 @@ test('RETURN HOME with genuinely broken identity (churning hash): home is never 
   // carries a fresh hash there is no home to find — never a forced or wrong return.
   const m = detourMgr(); m.identityHealth.degraded = true;
   const a2 = byName(m, 'a2'); const glm = byName(m, 'glm');
-  m._noteConversationAccount(RI({ affinityKey: 's:h1' }), a2);
-  m._noteConversationAccount(RI({ affinityKey: 's:h1' }), glm);
+  noteServed(m, RI({ affinityKey: 's:h1' }), a2);
+  noteServed(m, RI({ affinityKey: 's:h1' }), glm);
   a2.activeWeight = 6;
   const { lease, line } = returnTurn(m, RI({ affinityKey: 's:h2' }));
   assert.notEqual(lease.account.name, 'a2', line);
@@ -742,7 +746,7 @@ test('RETURN HOME a reused requestInfo does not carry returnedHome into a later 
   assert.equal(first.returnedHome, true);
   release(first);
   // Second turn: hold on home through the normal path, no detour.
-  m._noteConversationAccount(ri, a2);
+  noteServed(m, ri, a2);
   a2.activeWeight = 0;
   const second = m.acquireAccount(ri, new Set([byName(m, 'glm').index]));
   assert.equal(second.account.name, 'a2');

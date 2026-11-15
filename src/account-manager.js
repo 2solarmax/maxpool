@@ -225,6 +225,11 @@ const DEFAULT_SCHEDULER = {
   // is alive: Claude Code writes 1-hour copies (measured 2026-11-09: 272 of 272 cache
   // writes `ephemeral_1h`; 55 of 64 detours came back within the hour, median 533 s).
   cacheAffinityReturnWindowMs: 3_600_000,
+  // STICKY BUSY WAIT (owner 2026-11-15): how long, in total, a warm Claude conversation
+  // waits for its own cloud account to stop being busy before it moves (a move re-writes
+  // its whole prompt cache). Edited live from the TUI routing screen (`b`); env
+  // MAXPOOL_STICKY_BUSY_BUDGET_MS overrides it when set. 0 = never wait.
+  stickyBusyBudgetMs: 60_000,
   concurrencyWeight: 2,           // multiplies in-flight load (activeWeight+reqWeight) — dominant
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
@@ -342,6 +347,16 @@ const DEFAULT_SCHEDULER = {
   providers: {},
 };
 const LOAD_EVENT_MAX_AGE_MS = 60 * 60 * 1000;
+// Absolute weekly headroom TIE-BREAK for new placements (2026-11-15): at equal load a
+// fresh-weekly account beats a 60%-weekly one. ~0.75 points at 100% used vs ~70 per
+// in-flight unit, so it only ever decides near-ties; held conversations are unaffected
+// (their steering terms are zeroed).
+const ABS_UTIL_WEIGHT = 0.25;
+// Pinned-busy back-off bounds for a cloud row (markPinBusy).
+const PIN_BUSY_MIN_MS = 1000;
+const PIN_BUSY_MAX_MS = 5000;
+// Edge-pool client outcomes ring (noteClientOutcome).
+const CLIENT_OUTCOME_MAX_AGE_MS = 60 * 60 * 1000;
 // Consecutive failed recovery probes before we stop trusting the SHARED breaker and
 // fall back to per-account handling. Bounds any future "poisoned probe" from becoming
 // an indefinite fleet-wide outage (2026-07-25 incident).
@@ -380,6 +395,41 @@ const PERSISTED_QUOTA_FIELDS = [
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
   'providerQuotaSource', 'lastProbeOkAt', 'noPlan',
 ];
+
+function emptyEfficiency() {
+  return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0,
+    movedByCause: { busy: 0, wall: 0, balance: 0, link: 0, other: 0 },
+    newConversation: 0, bounced: 0, refused: 0, waited: 0, waitMs: 0, waitThenMoved: 0, e2e: [] };
+}
+/** Add one exported/summarized efficiency block into an accumulator (missing fields = 0). */
+function addEfficiency(acc, e) {
+  for (const k of ['served', 'in', 'out', 'cr', 'cc', 'moved', 'newConversation', 'bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved']) {
+    acc[k] += Number(e[k]) || 0;
+  }
+  for (const c of Object.keys(acc.movedByCause)) acc.movedByCause[c] += Number(e.movedByCause?.[c]) || 0;
+  // Latency samples exist for this pool's own rows only (percentiles do not add).
+  if (Array.isArray(e.e2e)) acc.e2e.push(...e.e2e);
+}
+const pct = (arr, p) => {
+  if (!arr.length) return null;
+  const s = [...arr].sort((x, y) => x - y);
+  return s[Math.min(s.length - 1, Math.floor(p * s.length))];
+};
+/** Derived figures: hit = cr/(cr+cc+in) (GLM has no cc → r/(r+in)); missTokens = in+cc. */
+function finishEfficiency(acc, provider) {
+  const prompt = acc.cr + acc.cc + acc.in;
+  const { e2e, ...sums } = acc;
+  return {
+    ...sums,
+    provider,
+    hit: prompt > 0 ? acc.cr / prompt : null,
+    missTokens: acc.in + acc.cc,
+    promptTokens: prompt,
+    lowVolume: acc.served < 20 || prompt < 100_000,
+    e2eP50: pct(e2e, 0.5),
+    e2eP95: pct(e2e, 0.95),
+  };
+}
 
 const CONVERSATION_AFFINITY_MAX = 5000;
 /** Bounded LRU insert: re-insert = most recent; the oldest key drops past the cap. */
@@ -698,6 +748,11 @@ export class AccountManager {
     // Bounded LRU — oldest conversations drop first; a dropped entry only means the
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
+    // When that account last SERVED the conversation (first real upstream byte) —
+    // holdsWarmConversation reads it. Same LRU bound, in-memory like the map above.
+    this.conversationLastServedAt = new Map();
+    // Final client outcomes of POST /v1/messages at THIS (edge) pool, 1 h ring.
+    this.clientOutcomes = [];
     // _homeKey (affinityKey, else sessionKey) → { name, at, detoured } of the last CLAUDE
     // account only (a GLM/Kimi turn never overwrites the name; it sets `detoured`), so a
     // conversation returning from a provider detour can go home.
@@ -952,6 +1007,11 @@ export class AccountManager {
     return weeklyPasses.some(options => this.accounts.some(account => {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
+      // A busy cloud row is no route for a NEW placement — else the queue pacer re-tries
+      // an all-busy pool in a sub-second spin. Its holder may still use it, unless this
+      // request already gave up waiting on it (_busyExcluded).
+      if (this._pinBusyForNew(account, now)
+        && (!this._holdsRequest(account, requestInfo) || requestInfo._busyExcluded?.has(account.name))) return false;
       return this._isAvailable(account, { ...options, model: requestInfo.model, now });
     }));
   }
@@ -1001,7 +1061,7 @@ export class AccountManager {
     const migratedFromName = (prevCurrentName && account.name !== prevCurrentName) ? prevCurrentName : null;
     const returnedHome = requestInfo.returnedHome?.name === account.name;
     const returnedHomeSwitched = returnedHome && requestInfo.returnedHome.switched === true;
-    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName, returnedHome, returnedHomeSwitched };
+    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName, returnedHome, returnedHomeSwitched, requestInfo };
   }
 
   /** Fail-safe: snap a session's binding back to the pre-migration issuing account
@@ -1160,6 +1220,13 @@ export class AccountManager {
       return;
     }
 
+    // A pinned refusal (busy / unavailable / throttled cloud row) never reached the
+    // client: one BOUNCED load event, no failure counters, no streak, no error text.
+    if (outcome.bounced) {
+      this._recordLoadEvent(account, lease, { ...outcome, success: false, bounced: true });
+      return;
+    }
+
     // A per-model weekly cap is NOT an account failure — the account is healthy for
     // every other model. Don't poison its failure counters / scoring penalty (mirror
     // the network-blip carve-out); the scoped bench is already set in markRateLimited.
@@ -1183,7 +1250,10 @@ export class AccountManager {
         account.lastError = null;
         account.lastErrorAt = null;
       }
-      this._recordLoadEvent(account, lease, { ...outcome, success: true });
+      // Backstop for callers that never saw a first byte (unit callers): a 2xx served
+      // the conversation. Idempotent — the first-byte note already ran on the real paths.
+      if (lease.requestInfo && !(outcome.status >= 300)) this.noteConversationServed(lease.requestInfo, account);
+      this._recordLoadEvent(account, lease, { ...outcome, success: true, ...this._servedTelemetry(lease.requestInfo, account) });
       account.lastSuccessAt = Date.now();
       return;
     }
@@ -1214,8 +1284,102 @@ export class AccountManager {
       success: Boolean(outcome.success),
       linkFault: Boolean(outcome.linkFault),
       status: outcome.status || null,
+      // Efficiency telemetry (2026-11-15) — optional, read by _efficiencySummary only.
+      bounced: Boolean(outcome.bounced),
+      usage: outcome.usage || null,
+      moved: Boolean(outcome.moved),
+      newConversation: Boolean(outcome.newConversation),
+      moveCause: outcome.moveCause || null,
+      busyWaitMs: outcome.busyWaitMs || 0,
+      e2eFirstByteMs: Number.isFinite(outcome.e2eFirstByteMs) ? outcome.e2eFirstByteMs : null,
+      refusal: outcome.refusal || null,
     });
     this._pruneLoadEvents(account, now);
+  }
+
+  /** Efficiency fields of a SERVED event, read off the request that was served. */
+  _servedTelemetry(ri, account) {
+    if (!ri) return {};
+    const moved = Boolean(ri._servedMoved) && ri._notedServed === account.name;
+    return {
+      countTokens: Boolean(ri.isCountTokens),
+      usage: ri.isCountTokens ? null : {
+        in: ri._capacityInput || 0, out: ri._capacityOutput || 0,
+        cr: ri._capacityCacheRead || 0, cc: ri._capacityCacheCreation || 0,
+      },
+      moved,
+      moveCause: moved ? (ri._moveCause || (ri._hop > 0 ? 'other' : 'balance')) : null,
+      newConversation: Boolean(ri._newConversation) && ri._notedServed === account.name,
+      busyWaitMs: ri._busyWaitMs || 0,
+      e2eFirstByteMs: ri._servedAt && ri.startedAt ? Math.max(0, ri._servedAt - ri.startedAt) : null,
+    };
+  }
+
+  /** Cache / move / bounce figures for one account over a window (getStatus + TUI only —
+   *  never on the scoring path). Additive sums plus derived hit share. */
+  _efficiencySummary(account, windowMs, now = Date.now()) {
+    return finishEfficiency(this._efficiencyAcc(account, windowMs, now), isClaudeAccount(account) ? 'claude' : 'glm');
+  }
+
+  _efficiencyAcc(account, windowMs, now = Date.now()) {
+    this._pruneLoadEvents(account, now);
+    const since = now - windowMs;
+    const out = emptyEfficiency();
+    for (const e of account.loadEvents || []) {
+      if (e.at < since || e.countTokens) continue;
+      if (e.bounced) {
+        out.bounced++;
+        if (e.refusal && e.refusal !== 'busy') out.refused++;
+        continue;
+      }
+      if (!e.success) continue;
+      out.served++;
+      if (e.usage) { out.in += e.usage.in; out.out += e.usage.out; out.cr += e.usage.cr; out.cc += e.usage.cc; }
+      if (e.moved) {
+        out.moved++;
+        const c = Object.hasOwn(out.movedByCause, e.moveCause) ? e.moveCause : 'other';
+        out.movedByCause[c]++;
+        if (e.busyWaitMs > 0) out.waitThenMoved++;
+      }
+      if (e.newConversation) out.newConversation++;
+      if (e.busyWaitMs > 0) { out.waited++; out.waitMs += e.busyWaitMs; }
+      if (e.e2eFirstByteMs != null) out.e2e.push(e.e2eFirstByteMs);
+    }
+    return out;
+  }
+
+  /** Overall efficiency, per provider, for the TUI / `maxpool status`: this pool's own
+   *  (non-mirror) rows + each cloud mirror's EXPORTED figures. A request is counted
+   *  once, by the pool that served it — so the Mac's own events on a mirror row
+   *  (already in the cloud's export) never enter this sum. */
+  efficiencyOverall(windowKey = 'last15m', now = Date.now(), { mirrors = true } = {}) {
+    const windowMs = windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000;
+    const by = { claude: emptyEfficiency(), glm: emptyEfficiency() };
+    for (const a of this.accounts) {
+      if (a.enabled === false || (a.remote && !mirrors)) continue;
+      const tag = isClaudeAccount(a) ? 'claude' : 'glm';
+      const e = a.remote ? a._remoteLoad?.[windowKey]?.efficiency : this._efficiencyAcc(a, windowMs, now);
+      if (e) addEfficiency(by[tag], e);
+    }
+    return { claude: finishEfficiency(by.claude, 'claude'), glm: finishEfficiency(by.glm, 'glm') };
+  }
+
+  /** Final client outcome of one request at THIS pool. Edge-only: a request pinned to
+   *  us by a linked pool is that pool's client, never ours (its refusals would read as
+   *  our client errors). POST /v1/messages only, count_tokens skipped. */
+  noteClientOutcome(requestInfo, status, now = Date.now()) {
+    if (!requestInfo || requestInfo.pinAccount != null || requestInfo.isCountTokens) return;
+    if (requestInfo.method !== 'POST' || !/^\/v1\/messages(\?|$)/.test(requestInfo.path || '')) return;
+    this.clientOutcomes.push({ at: now, status: Number(status) || 0 });
+    const cutoff = now - CLIENT_OUTCOME_MAX_AGE_MS;
+    while (this.clientOutcomes.length && this.clientOutcomes[0].at < cutoff) this.clientOutcomes.shift();
+  }
+
+  clientOutcomeSummary(windowMs = 15 * 60_000, now = Date.now()) {
+    const ev = this.clientOutcomes.filter(e => e.at >= now - windowMs);
+    const poolErrors = ev.filter(e => e.status >= 500 || e.status === 429).length;
+    const requestErrors = ev.filter(e => e.status >= 400 && e.status < 500 && e.status !== 429).length;
+    return { total: ev.length, poolErrors, requestErrors };
   }
 
   _pruneLoadEvents(account, now = Date.now()) {
@@ -1229,7 +1393,11 @@ export class AccountManager {
   _loadSummary(account, windowMs, now = Date.now()) {
     this._pruneLoadEvents(account, now);
     const since = now - windowMs;
-    const events = (account.loadEvents || []).filter(e => e.at >= since);
+    const all = (account.loadEvents || []).filter(e => e.at >= since);
+    // A BOUNCE (pinned refusal, 2026-11-15) never served anything: out of every
+    // denominator — requests, weight (spread share), avgMs — and out of `failed`.
+    const bounced = all.filter(e => e.bounced).length;
+    const events = all.filter(e => !e.bounced);
     const requests = events.length;
     // "failed" is what the operator reads as the ACCOUNT misbehaving; a link fault is
     // the pool's own tunnel to the team pool and gets its own field (2026-11-12).
@@ -1244,6 +1412,7 @@ export class AccountManager {
       requests,
       failed,
       linkFailed,
+      bounced,
       weight,
       avgMs: timed.length ? Math.round(durationMs / timed.length) : null,
     };
@@ -2680,7 +2849,7 @@ export class AccountManager {
         // timeout the account is deprioritised for NEW placements only — a cold pick
         // takes it last. A conversation it HOLDS (_holdsRequest) is not touched:
         // evicting those is exactly what a request-scoped fault must never do.
-        if (this._softCooling(account, now) && !this._holdsRequest(account, requestInfo)) {
+        if ((this._softCooling(account, now) || this._pinBusyForNew(account, now)) && !this._holdsRequest(account, requestInfo)) {
           if (!coolBest || priority < coolBest.priority || (priority === coolBest.priority && score < coolBest.score)) {
             coolBest = { account, priority, score, critUnlock };
           }
@@ -2952,6 +3121,49 @@ export class AccountManager {
     return profiles.includes(profile);
   }
 
+  /** The in-flight depth at which a PINNED request is refused busy (the cloud's only
+   *  hard per-account cap for pinned traffic). One helper for the gate and the export. */
+  _pinBusyLimit(_account) {
+    return 2 * this.scheduler.perAccountConcurrencyTarget;
+  }
+
+  /** A cloud row NEW placements should skip right now: it just refused busy
+   *  (pinBusyUntil), or its last known depth is one short of the cloud's pin limit.
+   *  Placement-scoped only — never in _isAvailable, so a holder still reaches it. */
+  _pinBusyForNew(a, now = Date.now()) {
+    if (a.pinBusyUntil && now < a.pinBusyUntil) return true;
+    return Boolean(a.remote && Number.isFinite(a._remotePinLimit) && Number.isFinite(a._remoteInflightCount)
+      && a._remoteInflightCount >= a._remotePinLimit - 1);
+  }
+
+  /** A busy refusal on this row: repel new placements for `ms` (clamped 1-5 s). A
+   *  success does NOT clear it — the refusal said the row is at its pin limit. */
+  markPinBusy(index, ms) {
+    const a = this.accounts[index];
+    if (!a) return;
+    const d = Math.min(PIN_BUSY_MAX_MS, Math.max(PIN_BUSY_MIN_MS, Number(ms) || PIN_BUSY_MIN_MS));
+    a.pinBusyUntil = Math.max(a.pinBusyUntil || 0, Date.now() + d);
+  }
+
+  /** A throttled linked pool (its egress to Anthropic is held): cool every mirror row
+   *  of that link at once, so the request moves off the link in ONE hop. */
+  markLinkMirrorsCooldown(fromAccount, ms) {
+    const linkName = fromAccount?.remote?.linkName;
+    if (!linkName) return [];
+    const until = Date.now() + Math.max(0, Number(ms) || 0);
+    const cooled = this.accounts.filter(a => a.remote && a.remote.linkName === linkName);
+    for (const a of cooled) a.cooldownUntil = Math.max(a.cooldownUntil || 0, until);
+    return cooled;
+  }
+
+  /** Fresher depth for a cloud row from a refusal's x-maxpool-pin-* headers. */
+  noteRemoteDepth(name, inflight, limit) {
+    const a = this.accounts.find(x => x.remote && x.name === name);
+    if (!a) return;
+    if (Number.isFinite(inflight)) a._remoteInflightCount = inflight;
+    if (Number.isFinite(limit)) a._remotePinLimit ??= limit;
+  }
+
   _matchesRequest(account, profile, requestInfo = {}) {
     if (this.admissionPaused) return false;
     // A pinned request (from a linked pool) may ONLY run on the named account, and
@@ -2960,15 +3172,19 @@ export class AccountManager {
       if (account.remote || account.name !== requestInfo.pinAccount) return false;
       // P1: the pin bypasses this pool's balancer, so keep its anti-dogpile floor
       // here — refuse past 2x the soft per-account target; the caller fails over.
-      if ((account.inFlight || 0) >= 2 * this.scheduler.perAccountConcurrencyTarget) {
+      if ((account.inFlight || 0) >= this._pinBusyLimit(account)) {
         requestInfo.pinRefusedBusy = true;
+        requestInfo.pinRefusal = 'busy';
         return false;
       }
       // P3: a pinned request isn't competing in this pool's queue — it skips the
       // queue-fairness gate (that alone 503'd every pinned Claude request). The
       // upstream throttle STAYS: it describes this pool's real egress to Anthropic.
       if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
-      if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) return false;
+      if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) {
+        requestInfo.pinRefusal = 'throttled';
+        return false;
+      }
       return true;
     }
     // Duplicate guard: a local account whose identity also lives in a team pool
@@ -3606,7 +3822,10 @@ export class AccountManager {
     // A cloud mirror's depth includes OTHER teammates' live load on that same cloud
     // account (mirrored from the link poll), so every routing term below — the
     // unchanged balancing logic — sees it as busy as it really is.
-    const inflight = account.activeWeight + reqWeight + (account._remoteOtherLoad || 0);
+    // Other teammates' load in WEIGHT units (the cloud's activeWeight minus ours, 2026-11-15);
+    // an older cloud that omits activeWeight falls back to its in-flight count.
+    const remoteLoadW = Number.isFinite(account._remoteOtherWeight) ? account._remoteOtherWeight : (account._remoteOtherLoad || 0);
+    const inflight = account.activeWeight + reqWeight + remoteLoadW;
     const refillMult = this._fastRefillMultiplier(account);
 
     // DOMINANT term: in-flight concurrency. Short-term throttling is driven by
@@ -3669,7 +3888,10 @@ export class AccountManager {
     // benching, but wrong for load balancing: an account at 80% should be clearly less
     // attractive than one at 10% even if both are "on pace". Measured 2026-08-10: cc at
     // 80% scored 52.30 vs glm at 10% at 52.15 — a 0.15 gap drowned by round-robin.
-    const utilizationCost = this._rawUtilization(account) * this.scheduler.utilizationWeight * refillMult * resetMult;
+    // + the absolute weekly headroom tie-break (ABS_UTIL_WEIGHT), behind the same
+    // weekly-aware flag so the 5h-only mode stays byte-identical.
+    const absUsed = this.scheduler.weeklyAwareScoring !== false ? this._absWeeklyUsed(account) : 0;
+    const utilizationCost = (this._rawUtilization(account) + ABS_UTIL_WEIGHT * absUsed) * this.scheduler.utilizationWeight * refillMult * resetMult;
 
     // Per-model weekly de-preference: an account whose scoped weekly for THIS
     // request's model (e.g. Fable) is high-but-not-exhausted is a poor pick for
@@ -3683,7 +3905,8 @@ export class AccountManager {
 
     const fleetRecentWeight = ctx?.fleetRecentWeight ?? 0;
     const recentWeight = this._loadSummary(account, this.scheduler.spreadWindowMs, now).weight;
-    const share = fleetRecentWeight > 0 ? recentWeight / fleetRecentWeight : 0;
+    // Clamped: a provider is outside the denominator, so its raw share can exceed 1.
+    const share = fleetRecentWeight > 0 ? Math.min(1, recentWeight / fleetRecentWeight) : 0;
     // SPREAD also carries the fast-refill discount (2026-08-29, owner option 1). The
     // spread term is the equaliser that pulls every account back to fleet parity — at
     // converged equal share it is ~10x larger than the utilization+pace gap the
@@ -3740,8 +3963,9 @@ export class AccountManager {
    * Applies in every scored mode (balance, prefer-*); never in sticky (see below).
    */
   _noteConversationAccount(requestInfo, account) {
-    const key = this._affinityKey(requestInfo);
-    if (key) lruSet(this.conversationLastAccount, key, account.name);
+    // conversationLastAccount is written at the first real upstream byte
+    // (noteConversationServed), never here: a refused/failed hop must not re-point the
+    // conversation (2026-11-15).
     // Home memory: ONE key per conversation, independent of identity health, so the
     // degraded <-> ok flip of _affinityKey can neither hide a home nor lend it to the
     // sibling conversations that share the terminal key. The entry carries its own
@@ -3756,6 +3980,32 @@ export class AccountManager {
       const home = this.conversationLastClaudeAccount.get(homeKey);
       if (home) lruSet(this.conversationLastClaudeAccount, homeKey, { ...home, detoured: true });
     }
+  }
+
+  /** The conversation was SERVED by `account` (first real upstream byte). Idempotent
+   *  per request. Records whether this turn moved the conversation (for telemetry). */
+  noteConversationServed(requestInfo, account) {
+    if (!requestInfo || !account || requestInfo._notedServed === account.name) return;
+    requestInfo._notedServed = account.name;
+    requestInfo._servedAt = Date.now();
+    const key = this._affinityKey(requestInfo);
+    if (!key) return;
+    const prev = this.conversationLastAccount.get(key);
+    requestInfo._newConversation = prev == null;
+    requestInfo._servedMoved = prev != null && prev !== account.name;
+    lruSet(this.conversationLastAccount, key, account.name);
+    lruSet(this.conversationLastServedAt, key, Date.now());
+  }
+
+  /** Does `account` hold this conversation's WARM Claude cache — it served the last
+   *  turn, within the cache window? (The sticky busy wait is only worth it then.) */
+  holdsWarmConversation(account, requestInfo = {}) {
+    if (!isClaudeAccount(account)) return false;
+    const key = this._affinityKey(requestInfo);
+    if (!key || this.conversationLastAccount.get(key) !== account.name) return false;
+    let windowMs = Number(this.scheduler.cacheAffinityReturnWindowMs);
+    if (!Number.isFinite(windowMs) || windowMs < 0) windowMs = DEFAULT_SCHEDULER.cacheAffinityReturnWindowMs;
+    return Date.now() - (this.conversationLastServedAt.get(key) || 0) <= windowMs;
   }
 
   /** Key of the conversation's home entry: the conversation itself, never the shared
@@ -4044,6 +4294,13 @@ export class AccountManager {
       }
     }
     return util;
+  }
+
+  /** Absolute weekly used fraction (0..1), not pace-adjusted — the tie-break input. */
+  _absWeeklyUsed(account) {
+    const q = account?.quota;
+    if (!q) return 0;
+    return Math.max(q.unified7d != null ? clamp01(q.unified7d) : 0, q.providerWk != null ? clamp01(q.providerWk) : 0);
   }
 
   _windowScarcity(util, resetMs, windowLen, now = Date.now()) {
@@ -6070,6 +6327,10 @@ export class AccountManager {
       // Other teammates' live load on this cloud account (remote inFlight minus our
       // own leases) — so the balancer sees the account as busy as it really is.
       a._remoteOtherLoad = Math.max(0, (ra.inFlight || 0) - (a.inFlight || 0));
+      // The same in WEIGHT units (NaN → fallback when an older cloud omits activeWeight).
+      a._remoteOtherWeight = Number.isFinite(ra.activeWeight) ? Math.max(0, ra.activeWeight - (a.activeWeight || 0)) : NaN;
+      a._remoteInflightCount = Number.isFinite(ra.inFlight) ? ra.inFlight : null;
+      a._remotePinLimit = Number.isFinite(ra.pinBusyAt) ? ra.pinBusyAt : null;
       a._remoteLoad = ra.load || null;
       a.probing = false;
       a.enabled = true;
@@ -6303,6 +6564,10 @@ export class AccountManager {
         since: this.identityHealth.since,
       },
       currentAccount: this.accounts[this.currentIndex]?.name,
+      // Cache / move / bounce figures of THIS pool's own rows (mirror rows excluded:
+      // the serving pool exports those itself), plus edge client outcomes.
+      efficiency: { last15m: this.efficiencyOverall('last15m', now, { mirrors: false }), last1h: this.efficiencyOverall('last1h', now, { mirrors: false }) },
+      clientOutcomes: { last15m: this.clientOutcomeSummary(15 * 60_000, now), last1h: this.clientOutcomeSummary(60 * 60_000, now) },
       switchThreshold: this.switchThreshold,
       routing: {
         mode: this.routingMode,
@@ -6386,9 +6651,11 @@ export class AccountManager {
             inFlight: a.inFlight,
             activeWeight: a.activeWeight,
           },
-          last15m: this._loadSummary(a, 15 * 60 * 1000, now),
-          last1h: this._loadSummary(a, 60 * 60 * 1000, now),
+          last15m: { ...this._loadSummary(a, 15 * 60 * 1000, now), efficiency: this._efficiencySummary(a, 15 * 60 * 1000, now) },
+          last1h: { ...this._loadSummary(a, 60 * 60 * 1000, now), efficiency: this._efficiencySummary(a, 60 * 60 * 1000, now) },
         },
+        // The cloud's pin limit for this row (linked pools skip it one short of this).
+        pinBusyAt: a.remote ? null : this._pinBusyLimit(a),
         lastError: a.lastError,
         lastErrorAt: a.lastErrorAt ? new Date(a.lastErrorAt).toISOString() : null,
         cooldownUntil: Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)

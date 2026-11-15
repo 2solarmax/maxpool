@@ -80,6 +80,20 @@ const posMsFromEnv = (name, dflt) => {
   const n = Number(process.env[name]);
   return Number.isFinite(n) && n > 0 ? n : dflt;
 };
+// STICKY BUSY WAIT (2026-11-15) — a warm Claude conversation whose cloud account says
+// "busy" waits for it (bounded) instead of moving and re-writing its prompt cache.
+const PIN_BUSY_MAX_RETRY_AFTER_S = 10;     // a header-less 429/503 asking ≤ this is busy-class
+const STICKY_BUSY_MAX_ATTEMPTS = posMsFromEnv('MAXPOOL_STICKY_BUSY_MAX_ATTEMPTS', 6);
+const STICKY_BUSY_MIN_BYTES = posMsFromEnv('MAXPOOL_PIN_BUSY_MIN_BYTES', BIG_PROMPT_BYTES);
+const STICKY_BUSY_WAIT_CAP_MS = 5000;      // one wait = retry-after × full jitter, capped here
+/** The total wait budget, read LIVE per request (TUI-editable `stickyBusyBudgetMs`);
+ *  env MAXPOOL_STICKY_BUSY_BUDGET_MS overrides it only when set. */
+function stickyBusyBudgetMs(accountManager) {
+  const env = process.env.MAXPOOL_STICKY_BUSY_BUDGET_MS;
+  if (env != null && env !== '' && Number.isFinite(Number(env)) && Number(env) >= 0) return Number(env);
+  const v = Number(accountManager?.scheduler?.stickyBusyBudgetMs);
+  return Number.isFinite(v) && v >= 0 ? v : 60_000;
+}
 /** Live knob values (env read per call so a two-pool test can inject a small cap). */
 function deadlineKnobs() {
   return {
@@ -717,6 +731,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         }
       } finally {
         clearInterval(reaperTimer);
+        accountManager.noteClientOutcome?.(requestInfo, ctx.status);
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
           account: ctx.account, status: ctx.status,
@@ -734,6 +749,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           // F9: only the message-creating call (POST /v1/messages) has a streaming shape — count_tokens and GETs
           // must not read as "non-streaming" and swamp the share.
           stream: requestInfo?.method === 'POST' && /^\/v1\/messages(?:\?|$)/.test(String(req.url || '')) ? Boolean(requestInfo.stream) : null,
+          // The served attempt's cache figures, for the `cache r… w… in…` line tag.
+          cacheUsage: requestInfo && !requestInfo.isCountTokens && (requestInfo._capacityInput || requestInfo._capacityCacheRead || requestInfo._capacityCacheCreation)
+            ? { input_tokens: requestInfo._capacityInput || 0, cache_read_input_tokens: requestInfo._capacityCacheRead || 0, cache_creation_input_tokens: requestInfo._capacityCacheCreation || 0 }
+            : null,
         });
       }
     } catch (err) {
@@ -919,8 +938,23 @@ async function forwardRequest(
   // actually happened (acquireAccount consumes the one-shot hint either way).
   const pendingSame = requestInfo.pendingRetrySame || null;
   requestInfo.pendingRetrySame = null;
+  // A cloud row this request already gave up waiting on stays out while it is still
+  // busy — including after a queue resume, whose fresh exclusion set would re-pick it.
+  // (Gated on the same pinBusyUntil hasAvailableRoute reads, so the two never disagree.)
+  if (requestInfo._busyExcluded) {
+    const now = Date.now();
+    for (const a of accountManager.accounts) {
+      if (requestInfo._busyExcluded.has(a.name) && a.pinBusyUntil > now) excludedIndexes.add(a.index);
+    }
+  }
   const lease = accountManager.acquireAccount(requestInfo, excludedIndexes);
   const account = lease?.account;
+  requestInfo._hop = retryCount;
+  // The sticky-wait retry pin is good for exactly this one acquire.
+  if (requestInfo._stickyPin) {
+    requestInfo.pinnedAccountName = requestInfo._stickyPinPrev ?? null;
+    requestInfo._stickyPin = false;
+  }
   if (pendingSame && account) {
     if (account.name === pendingSame.account) logFailedAttempt(pendingSame.account, pendingSame.kind, pendingSame.detail, 'retry-same');
     else logFailedAttempt(pendingSame.account, pendingSame.kind, `${pendingSame.detail}; same account refused by selection, served by "${account.name}"`, 'moved');
@@ -938,7 +972,16 @@ async function forwardRequest(
       ctx.status = 503;
       const busy = Boolean(requestInfo.pinRefusedBusy);
       ctx.account = `(pinned ${requestInfo.pinAccount} ${busy ? 'busy' : 'unavailable'})`;
-      try { res.setHeader('retry-after', busy ? '2' : '30'); } catch { /* headers sent */ }
+      try {
+        res.setHeader('retry-after', busy ? '2' : '30');
+        // Machine-readable cause + depth for the linked pool (additive; old pools ignore them).
+        res.setHeader('x-maxpool-pin-refusal', requestInfo.pinRefusal || 'unavailable');
+        const pinned = accountManager.accounts.find(a => !a.remote && a.name === requestInfo.pinAccount);
+        if (pinned) {
+          res.setHeader('x-maxpool-pin-inflight', String(pinned.inFlight || 0));
+          res.setHeader('x-maxpool-pin-limit', String(accountManager._pinBusyLimit(pinned)));
+        }
+      } catch { /* headers sent */ }
       sendErrorResponse(res, requestInfo, 503, { type: 'error', error: {
         type: busy ? 'pinned_account_busy' : 'pinned_account_unavailable',
         message: `Account "${requestInfo.pinAccount}" is ${busy ? 'busy' : 'not available'} right now` } });
@@ -1214,14 +1257,56 @@ async function forwardRequest(
       // streamed: cool THIS mirror row and fail over through the normal path to the
       // next-best account, local or cloud — exactly like a local account's 429.
       if (account.remote && (upRes.status === 429 || upRes.status === 503) && !clientHasRealBytes(res, requestInfo)) {
-        try { await upRes.body?.cancel(); } catch { /* drained */ }
-        const ra = Number(upRes.headers.get('retry-after'));
-        // P3: "busy" is a 2s back-off on this row only; "unavailable"/429 cools longer.
-        account.cooldownUntil = Date.now() + (Number.isFinite(ra) && ra > 0 ? Math.min(ra, 300) * 1000 : 30_000);
-        finishLink({ status: upRes.status, error: 'remote_pinned_unavailable' });
+        const refusal = await readPinRefusal(upRes);
+        accountManager.noteRemoteDepth?.(account.name, refusal.inflight, refusal.limit);
+        if (refusal.cause === 'busy') {
+          // BUSY is seconds, not an account fault: a bounce (no cooldown, no failure
+          // count), and the row repels new placements for a moment.
+          const raMs = (refusal.retryAfterS ?? 1) * 1000;
+          finishLink({ bounced: true, status: upRes.status, error: 'remote_pinned_busy', refusal: 'busy' });
+          accountManager.markPinBusy(account.index, raMs);
+          const waitMs = Math.min(STICKY_BUSY_WAIT_CAP_MS, raMs * (0.5 + Math.random()));
+          if (stickyBusyWaitEligible(account, requestInfo, res, queueConfig, accountManager, waitMs)) {
+            requestInfo._busyWaits = (requestInfo._busyWaits || 0) + 1;
+            requestInfo._busyWaitMs = (requestInfo._busyWaitMs || 0) + waitMs;
+            detachLinkClose();
+            // Keep a streaming client fed through the wait; no lease, no queue ticket held.
+            const grace = armStreamForwardGrace(res, requestInfo, queueConfig, accountManager);
+            const stayed = await sleepUnlessClientGone(waitMs, req, res);
+            if (grace) clearTimeout(grace);
+            if (!stayed) {
+              clearQueueHeartbeat(requestInfo);
+              logFailedAttempt(account.name, `remote-${upRes.status}`, 'linked pool busy; client left during the wait', 'released-cancel');
+              return;
+            }
+            if (resendAllowed(requestInfo)) {
+              // Retry the SAME row: a hard one-shot pin (selection cannot outscore it).
+              requestInfo._stickyPinPrev = requestInfo.pinnedAccountName ?? null;
+              requestInfo.pinnedAccountName = account.name;
+              requestInfo._stickyPin = true;
+              requestInfo.pendingRetrySame = { account: account.name, kind: `remote-${upRes.status}`,
+                detail: `linked pool busy; waited ${(waitMs / 1000).toFixed(1)}s for the account holding this conversation` };
+              return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+            }
+          }
+          (requestInfo._busyExcluded ||= new Set()).add(account.name);
+          requestInfo._moveCause = 'busy';
+        } else if (refusal.cause === 'throttled') {
+          // The linked pool's egress is held: every row behind it is out — one move.
+          finishLink({ bounced: true, status: upRes.status, error: 'remote_pinned_throttled', refusal: 'throttled' });
+          const cooled = accountManager.markLinkMirrorsCooldown(account, Math.min((refusal.retryAfterS || 5) * 1000, 30_000));
+          for (const a of cooled) excludedIndexes.add(a.index);
+          requestInfo._moveCause = 'wall';
+        } else {
+          const ra = refusal.retryAfterS;
+          // "unavailable"/429 cools this row; booked as a bounce, not a failure.
+          account.cooldownUntil = Date.now() + (ra != null ? Math.min(ra, 300) * 1000 : 30_000);
+          finishLink({ bounced: true, status: upRes.status, error: 'remote_pinned_unavailable', refusal: 'unavailable' });
+          requestInfo._moveCause = 'wall';
+        }
         excludedIndexes.add(account.index);
         if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
-          logFailedAttempt(account.name, `remote-${upRes.status}`, `linked pool refused before any byte`, 'moved');
+          logFailedAttempt(account.name, `remote-${upRes.status}`, `linked pool refused before any byte (${refusal.cause})`, 'moved');
           detachLinkClose();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
         }
@@ -1317,9 +1402,16 @@ async function forwardRequest(
             // a conditional clear let pings land inside the real stream when the grace
             // timer had already fired).
             if (requestInfo.queueHeartbeatActive) clearQueueHeartbeat(requestInfo);
+            if (upRes.status < 300) {
+              // The conversation now lives on this row (first REAL byte), and its usage
+              // is read off the relayed bytes — figures only, never a booking.
+              accountManager.noteConversationServed?.(requestInfo, account);
+              tapLinkUsage(value, requestInfo);
+            }
             res.write(Buffer.from(value));
           }
         } finally { try { await reader.cancel(); } catch { /* already done */ } }
+        if (upRes.status < 300) tapLinkUsage(null, requestInfo);   // flush the non-stream tail
       }
       res.end();   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded
       finishLink({ success: ctx.status < 500, status: ctx.status });
@@ -1370,6 +1462,7 @@ async function forwardRequest(
         finishLink({ status: 502, error: linkKind, scope: 'request', linkFault: true });
       }
       excludedIndexes.add(account.index);   // P4b: never re-pick a row that just failed
+      if (!linkClientGone) requestInfo._moveCause = 'link';
       const streamTag = requestInfo.stream ? 'streaming' : 'non-streaming';
       // A string code (UND_ERR_SOCKET, ECONNRESET) names the fault; DOMException
       // codes are numbers (AbortError = 20), so fall back to the cause, then the name.
@@ -1517,6 +1610,8 @@ async function forwardRequest(
     // Log-only: no setting reads it.
     requestInfo._upstreamForwardStartAt = upstreamForwardStartAt;
     requestInfo._firstUpstreamByteAt = Date.now();
+    // A 2xx answer: the conversation now lives on this account (never on a refusal).
+    if (upstreamRes.status < 300) accountManager.noteConversationServed?.(requestInfo, account);
     // Response arrived — the pre-response leak window is over. Stop guarding for
     // client-disconnect via abort (streamResponse handles mid-stream disconnects).
     res.off('close', onClientClose);
@@ -2801,6 +2896,64 @@ function retrySameEligible(account, requestInfo, res, queueConfig = {}) {
   return !clientHasRealBytes(res, requestInfo);
 }
 
+/** R3: may a busy refusal on this cloud row WAIT and retry the same row? Only a warm
+ *  Claude conversation (its cache is on this row), a big prompt, nothing sent yet, and
+ *  inside the attempt cap, the live wait budget and the client's patience. */
+function stickyBusyWaitEligible(account, requestInfo, res, queueConfig, accountManager, waitMs) {
+  if (requestInfo.isCountTokens || clientHasRealBytes(res, requestInfo)) return false;
+  if ((requestInfo.bodyBytes || 0) < STICKY_BUSY_MIN_BYTES) return false;
+  // Non-streaming waits only with a real deadline that still leaves time to move after.
+  if (!requestInfo.stream && (requestInfo.deadlineAt == null
+    || nonStreamRemainingMs(requestInfo) - waitMs < deadlineKnobs().NONSTREAM_MIN_MOVE_MS)) return false;
+  if (!accountManager.holdsWarmConversation?.(account, requestInfo)) return false;
+  if ((requestInfo._busyWaits || 0) >= STICKY_BUSY_MAX_ATTEMPTS) return false;
+  if ((requestInfo._busyWaitMs || 0) + waitMs > stickyBusyBudgetMs(accountManager)) return false;
+  const ceilingMs = clientWaitCeilingMs(requestInfo, queueConfig);
+  if (ceilingMs != null && Date.now() - (requestInfo.startedAt || Date.now()) + waitMs > ceilingMs) return false;
+  return true;
+}
+
+/** R1: classify a linked pool's 429/503 before any byte. Header cause first, then the
+ *  503 body type (sent by every version), then a short retry-after = busy-class;
+ *  anything else is "unavailable" (never guessed busy). Reads ≤ 4 KB of the body. */
+async function readPinRefusal(upRes) {
+  const num = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+  const ra = num(upRes.headers.get('retry-after'));
+  const retryAfterS = ra != null && ra > 0 ? ra : null;
+  let bodyType = null;
+  if (upRes.body) {
+    try {
+      const reader = upRes.body.getReader();
+      const r = await Promise.race([reader.read(), sleep(2000).then(() => null)]);
+      if (r?.value) {
+        try { bodyType = JSON.parse(Buffer.from(r.value).subarray(0, 4096).toString())?.error?.type ?? null; } catch { /* not JSON */ }
+      }
+      reader.cancel().catch(() => {});
+    } catch { /* drained */ }
+  }
+  const header = String(upRes.headers.get('x-maxpool-pin-refusal') || '').toLowerCase();
+  const cause = ['busy', 'unavailable', 'throttled'].includes(header) ? header
+    : bodyType === 'pinned_account_busy' ? 'busy'
+      : bodyType === 'pinned_account_unavailable' ? 'unavailable'
+        : retryAfterS != null && retryAfterS <= PIN_BUSY_MAX_RETRY_AFTER_S ? 'busy'
+          : 'unavailable';
+  return { cause, retryAfterS, bodyType,
+    inflight: num(upRes.headers.get('x-maxpool-pin-inflight')), limit: num(upRes.headers.get('x-maxpool-pin-limit')) };
+}
+
+/** Sleep `ms` unless the client leaves first. true = slept the whole time. */
+function sleepUnlessClientGone(ms, req, res) {
+  if (res.destroyed || res.writableEnded) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let timer = null;
+    const done = (stayed) => { clearTimeout(timer); req.off('aborted', gone); res.off('close', gone); resolve(stayed); };
+    const gone = () => done(false);
+    req.once('aborted', gone);
+    res.once('close', gone);
+    timer = setTimeout(() => done(!res.destroyed), ms);
+  });
+}
+
 /**
  * D5: one line per FAILED attempt, naming the account, the error class and what the
  * pool did next — so "why did this move" is answerable from the log without a forensic
@@ -3069,7 +3222,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -5031,6 +5184,71 @@ function noteCapacityCache(requestInfo, usage) {
   requestInfo._capacityCacheCreation = Math.max(requestInfo._capacityCacheCreation || 0, usage?.cache_creation_input_tokens || 0);
 }
 
+/** Pure: the usage object one parsed SSE event carries — message_start's
+ *  `message.usage` or message_delta's `usage` — else null. No side effects. */
+function usageFromSseData(data) {
+  if (data?.type === 'message_start' && data.message?.usage) return data.message.usage;
+  if (data?.type === 'message_delta' && data.usage) return data.usage;
+  return null;
+}
+
+/** Running-max one event's usage into the request's capacity figures. Output only from
+ *  message_delta (Anthropic's interim delta usage is CUMULATIVE — M3). Providers differ
+ *  in WHICH event carries the cache/input counters (z.ai: all of them on message_delta,
+ *  message_start is zeros — captured 2026-11-06, pinned by test/capacity-seam.test.js +
+ *  test/fixtures/zai-sse-usage.txt), so input/cache are a running max over BOTH events. */
+function noteCapacityUsage(requestInfo, usage, withOutput) {
+  requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, usage?.input_tokens || 0);
+  if (withOutput) requestInfo._capacityOutput = Math.max(requestInfo._capacityOutput || 0, usage?.output_tokens || 0);
+  noteCapacityCache(requestInfo, usage);
+}
+
+/** Pure: the usage object at the END of a JSON message body, from its tail (the body
+ *  may be cut at the front). Finds the last `"usage":{…}` and parses that object. */
+function usageFromBodyTail(text) {
+  const at = String(text || '').lastIndexOf('"usage"');
+  if (at < 0) return null;
+  const open = text.indexOf('{', at);
+  if (open < 0) return null;
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '{') depth++;
+    else if (text[i] === '}' && --depth === 0) {
+      try { return JSON.parse(text.slice(open, i + 1)); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+/** LINK USAGE TAP: read the usage a linked pool relays (it is the SERVING pool and books
+ *  the tokens itself), into this request's capacity figures ONLY — never a ledger,
+ *  usage or caller booking. Streaming: SSE events split across chunks are re-joined.
+ *  Non-streaming: keeps the last 64 KB, parsed when called with null at stream end. */
+function tapLinkUsage(chunk, requestInfo) {
+  if (requestInfo.isCountTokens) return;
+  if (!requestInfo.stream) {
+    if (chunk) {
+      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + Buffer.from(chunk).toString()).slice(-64 * 1024);
+      return;
+    }
+    const u = usageFromBodyTail(requestInfo._tapBuf);
+    requestInfo._tapBuf = '';
+    if (u) noteCapacityUsage(requestInfo, u, true);
+    return;
+  }
+  if (!chunk) return;
+  const parts = ((requestInfo._tapBuf || '') + Buffer.from(chunk).toString()).split('\n\n');
+  requestInfo._tapBuf = parts.pop().slice(-64 * 1024);
+  for (const event of parts) {
+    const dataLine = event.split('\n').find(l => l.startsWith('data: '));
+    if (!dataLine) continue;
+    let data;
+    try { data = JSON.parse(dataLine.slice(6)); } catch { continue; }
+    const u = usageFromSseData(data);
+    if (u) noteCapacityUsage(requestInfo, u, data.type === 'message_delta');
+  }
+}
+
 function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
@@ -5041,23 +5259,13 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
     // M3: Anthropic interim message_delta usage is CUMULATIVE — add-semantics inflates
     // output on long generations. Track a per-stream RUNNING MAX, accrue once at end.
     // M4: count_tokens responses are prompt-size echoes, not delivered work — skip.
-    if (!requestInfo.isCountTokens) {
-      if (data.type === 'message_start' && data.message?.usage) {
-        accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
-        accountManager.countCallerTokens?.(requestInfo.caller, data.message.usage.input_tokens);
-        requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, data.message.usage.input_tokens || 0);
-        noteCapacityCache(requestInfo, data.message.usage);
-      } else if (data.type === 'message_delta' && data.usage) {
-        accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
-        accountManager.countCallerTokens?.(requestInfo.caller, data.usage.output_tokens);
-        requestInfo._capacityOutput = Math.max(requestInfo._capacityOutput || 0, data.usage.output_tokens || 0);
-        // Providers differ in WHICH event carries the cache/input counters (z.ai: all of
-        // them on message_delta, message_start is zeros — captured 2026-11-06, pinned by
-        // test/capacity-seam.test.js + test/fixtures/zai-sse-usage.txt), so every field is
-        // a running max over BOTH events.
-        requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, data.usage.input_tokens || 0);
-        noteCapacityCache(requestInfo, data.usage);
-      }
+    const usage = requestInfo.isCountTokens ? null : usageFromSseData(data);
+    if (usage) {
+      const isDelta = data.type === 'message_delta';
+      const n = isDelta ? usage.output_tokens : usage.input_tokens;
+      accountManager.updateUsage(accountIndex, isDelta ? 0 : n, isDelta ? n : 0);
+      accountManager.countCallerTokens?.(requestInfo.caller, n);
+      noteCapacityUsage(requestInfo, usage, isDelta);
     }
     if (sseEventContainsThinking(data)) {
       accountManager.markSessionThinkingProtected?.(requestInfo.sessionKey, requestInfo.model);
@@ -5114,6 +5322,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo 
       // work delivered. Claude Code calls it constantly; counting it would inflate every
       // cycle by whole prompt sizes.
       if (!requestInfo.isCountTokens) {
+        noteCapacityUsage(requestInfo, json.usage, true);   // efficiency figures (no booking)
         accountManager.accrueCapacity?.(accountIndex, {
           input: json.usage.input_tokens || 0,
           output: json.usage.output_tokens || 0,
