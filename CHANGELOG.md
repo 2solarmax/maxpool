@@ -5,10 +5,30 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.24.93] - 2026-11-14
+## [1.24.94] - 2026-11-14
 
 ### Changed
 
+- Simplify pass — reattach _holdsUsableReset JSDoc displaced by the R7 block
+- Isolated reload files get the same one-retry policy as the fast tests
+
+## [1.24.93] - 2026-11-14
+
+### Added
+
+- Hold a wall claim for the imminent free refill while the pool has room
+
+### Changed
+
+- RED — hold the wall claim when the free refill is <24h away and the pool has room
+- Mutation round — pin fractional peer count, roomy/identity-less self, scoped prober wiring; drop dead null check
+- RED — red-team round 1 findings 1-4, 6 (+ scoped reactive insurance); single-now boundary tests (#5)
+- Pin the model-loop hold fall-through with a second (injected) model family
+- RED — red-team round 2 (#1 stranded hold, #2 pool-wide budget, #4 identity-less peer); #3 driven in server order
+- Round-2 mutation pins; held line logs once per hold episode
+- RED — red-team round 3: the hold is for the general weekly wall only
+- RED — red-team round 4 (7 findings)
+- RED — red-team round 5 (3 findings)
 - RED — seamless reload stalls when the terminal is not reading (supervisor + reload worker block on tty writes)
 - Pin the terminal-not-reading fix elements the pty test cannot see
 - Red-team round 2 — id-less notices settle but never cold-restart; helper process; quit/respawn never wait on the terminal
@@ -17,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Red-team round 1 — model-aware room, fall-through hold, direct reactive gate, cap-measured room, distinct identities
+- Red-team round 2 — held-wall rescue, pool-wide hold budget, identity-less peers skipped
+- Red-team round 3 — hold only the general weekly wall
+- Red-team round 4 — seven findings
+- Red-team round 5 — give-back keeps the hold, dead holders don't count, hold survives restart
 - Seamless reload no longer stalls when the terminal is not reading
 - Cold start keeps synchronous raw mode; deferred reclaim fires on progress
 - Red-team round 1 — rollback notices name their reload, terminal mode switches never stall a serving worker

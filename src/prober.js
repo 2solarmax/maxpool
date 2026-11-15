@@ -10,7 +10,7 @@
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
 import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
 import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
-import { listResetGrants, claimResetGrant } from './claude-reset-grants.js';
+import { listResetGrants, claimResetGrant, appliesTo, clearsGeneralWeekly } from './claude-reset-grants.js';
 import { decideZai, decideClaudeWithReason, CLAUDE_WALL_WEEKLY } from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
 // Reset-machinery timing lives in ONE leaf module (re-exported for callers that
@@ -21,6 +21,10 @@ export { GRANTS_EVERY_MS, GRANTS_RETRY_MS, CLAIM_BACKOFF_STEPS_MS, CLAIM_BACKOFF
 // How often a subscription-latched account is rechecked (one probe + at most one
 // token refresh per window — cheap, and bounded so a truly canceled plan isn't hammered).
 export const SUB_RECHECK_MS = 30 * 60_000;
+
+// The sweep-decision skips that mean "this tick's LISTING can't be trusted" — the
+// only skips after a successful probe that hand a held wall to the rescue (r2 #1).
+const STALE_LISTING_SKIPS = new Set(['listing stale', 'listing failed']);
 
 export class Prober {
   constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null, zaiUsageFn = fetchZaiModelUsage, cardsFn = listResetCards, now = Date.now } = {}) {
@@ -360,6 +364,12 @@ export class Prober {
       if (r?.ok) {
         this.am.noteClaimSuccess?.(account.name, act.grant.id);
         account.lastClaimAt = Date.now();
+        // A spent grant that applies to the general weekly — whatever scope it was
+        // claimed at — is the general wall's claim (r3 #3, r4 #3); only one that
+        // CLEARS it retires the hold (r5 #1, same rule as the 429 fast path). A
+        // Fable-only grant refills nothing the hold is waiting on.
+        if (appliesTo(act.grant).includes('general')) account.lastGeneralClaimAt = account.lastClaimAt;
+        if (clearsGeneralWeekly(act.grant)) account.lastFullGeneralClaimAt = account.lastClaimAt;
         // Spend it in the STORED listing too: until the next listing (≤5 min) the
         // held count, the lift and the reactive path must not see it as unspent.
         this.am.noteGrantClaimed?.(account, act.grant.id);
@@ -481,13 +491,11 @@ export class Prober {
           usage = await this._withTimeout(this.probeFn(account.credential));
         }
       }
-      if (usage == null) { // timed out
-        this.am.recordProbeError?.(account.index, 'probe timed out', null);
-        return { ok: false, status: null };
-      }
-      if (usage.error) { // HTTP error (e.g. 429) or fetch failure
-        this.am.recordProbeError?.(account.index, usage.error, usage.status ?? null);
-        return { ok: false, status: usage.status ?? null };
+      if (usage == null || usage.error) { // timed out / HTTP error (e.g. 429) / fetch failure
+        const e = usage == null ? 'probe timed out' : usage.error;
+        this.am.recordProbeError?.(account.index, e, usage?.status ?? null);
+        await this._rescueHeldWall(account);   // red-team r2 #1: a held wall must not strand
+        return { ok: false, status: usage?.status ?? null };
       }
       this.am.applyUsageData(account.index, usage, { sentAt: probeSentAt }); // clears the error + stamps freshness
       // C1: decide the claim on the reading JUST stored (this sweep's probe), on
@@ -496,6 +504,7 @@ export class Prober {
       return { ok: true, status: 200 };
     } catch (e) { // best-effort; never let a probe throw
       this.am.recordProbeError?.(account.index, e?.message || String(e), null);
+      await this._rescueHeldWall(account);   // red-team r2 #1
       return { ok: false, status: null };
     } finally {
       account._subRecheck = false;
@@ -509,12 +518,27 @@ export class Prober {
     if (!this.am.applyResetGrants) return;
     const listing = account.resetGrants;
     if (!listing) return;
-    const { action, reason } = decideClaudeWithReason(account, listing);
+    // R7 (2026-11-13): the GENERAL weekly wall claim (the only one R7 holds — red-team
+    // r3) waits for an imminent free refill only while
+    // other accounts in THIS pool have room. Counted LIVE per sweep, so the hold
+    // ends the moment capacity disappears; unknown capacity claims (never hold).
+    // holdersInPool budgets one hold per holdMinPeers roomy peers across the pool
+    // (r2 #2); a hold is registered so a later failed probe can still rescue it (r2 #1).
+    const peersWithRoom = this.am.countPeersWithRoom ? () => this.am.countPeersWithRoom(account) : null;
+    const holdersInPool = this.am.countHoldingWalls ? () => this.am.countHoldingWalls(account) : null;
+    const { action, reason, heldScope } = decideClaudeWithReason(account, listing, Date.now(), { peersWithRoom, holdersInPool });
+    // heldScope rides on every return once the general wall is held — a dying model
+    // grant claimed in the same decision included (r3 #2) — so the hold is always registered.
+    if (heldScope === 'general') this.am.noteWallHold?.(account);
     if (action) {
       account._claimSkipKey = null;
       await this._claimClaudeGrant(account, action);
       return;
     }
+    // The probe answered but the stored LISTING is stale/failed (the grants call
+    // shares the rate-limited endpoint): the fresh decision can't run, so a held
+    // wall goes through the rescue exactly as on a failed probe (r2 #1).
+    if (STALE_LISTING_SKIPS.has(reason)) await this._rescueHeldWall(account);
     // C5: at a reached limit with a held-but-unspent grant, say WHY once per
     // (account, reason) change — the owner's live check reads exactly these lines.
     // The reason is the POLICY's own rejection (stale listing, cooldown, already
@@ -535,6 +559,24 @@ export class Prober {
       account._claimSkipKey = reason;
       this.log(`[reset-grant] ${account.name}: at wall, claim held (${reason})`);
     }
+  }
+
+  /** Red-team r2 #1 — the held-wall rescue. A wall this pool HELD (its stamp is
+   *  still live) must not strand: while the account's own usage endpoint is dark
+   *  (a 429'd probe, a timeout, a throw — every early return of probeOne), no fresh
+   *  decision can be made, yet "capacity unknown" means CLAIM. Re-evaluate the hold
+   *  directly (wallClaimHeld: header/probe refill stamp, stored listing ≤ 6h,
+   *  peers' LIVE probe freshness) and claim through the reactive route — the same
+   *  one the 429 fast path uses, whose pick tolerates a stale listing on purpose.
+   *  A still-roomy pool keeps holding; a refill that moved past 24h (or a dying
+   *  grant) makes wallClaimHeld itself release. Never claims a wall nobody held.
+   *  General weekly wall only (red-team r3): no model wall is ever held. */
+  async _rescueHeldWall(account) {
+    if (!this.am.isHoldingWall?.(account)) return;   // never a wall nobody held
+    // A listing-side cooldown is a server instruction the reactive route doesn't read.
+    const cd = account.resetGrants?.cooldownUntil;
+    if (cd != null && cd > Date.now()) return;
+    await this.am.tryReactiveClaim(account, { kind: 'weekly' });
   }
 
   _withTimeout(promise) {

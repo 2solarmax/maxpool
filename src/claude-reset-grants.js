@@ -80,6 +80,14 @@ export function appliesTo(grant) {
   return [...out];
 }
 
+/** Does spending this grant REFILL the general weekly outright (clears seven_day)?
+ *  A give-back-only grant also applies to 'general' (appliesTo), but it returns
+ *  only what one model used — whether that leaves the general wall is known only
+ *  once a probe measures the drop (red-team r5 #1). */
+export function clearsGeneralWeekly(grant) {
+  return Array.isArray(grant?.clears) && grant.clears.includes('seven_day');
+}
+
 // Process-wide: the first listing logs the raw grant KEY SET (keys only, never
 // values) once, so a schema drift is visible without per-sweep spam. Set by
 // listResetGrants on the first grants-bearing response.

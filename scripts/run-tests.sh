@@ -64,10 +64,17 @@ if node --test --test-concurrency="$_conc" "${fast[@]}" 2>&1 | tee "$_fast_log";
 fi
 rm -f "$_fast_log"
 
-# Subprocess-heavy reload tests: one fresh node process per file.
+# Subprocess-heavy reload tests: one fresh node process per file, with the same
+# one-retry policy as the fast tests above. These are the most timing-sensitive files
+# (real child processes, ptys, cutover deadlines); on 2026-11-14 three releases at load
+# 100-300 each failed on a different one, every one passing when re-run alone.
 for f in test/reload-*.test.js; do
   echo "== $f (isolated process) =="
-  node --test "$f"
+  if node --test "$f"; then :; else
+    echo "== retrying $f once =="
+    node --test "$f" || { echo "== $f failed twice — real failure ==" >&2; exit 1; }
+    echo "== retry passed (timing flake under load) =="
+  fi
 done
 
 echo "== all suites passed =="
