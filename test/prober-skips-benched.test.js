@@ -39,6 +39,17 @@ test('a sweep never probes a benched duplicate', async () => {
   assert.deepEqual(probed, ['healthy-token'], 'only the healthy row is probed');
 });
 
+test('a benched duplicate costs the sweep no pacing slot', async () => {
+  // Each swept row waits one inter-probe gap first; a benched row must not take a slot
+  // (and must not stamp the shared last-probe time) even if probeOne itself bails.
+  const { prober } = harness();
+  let paced = 0;
+  const orig = prober._paceUsage.bind(prober);
+  prober._paceUsage = async () => { paced++; return orig(); };
+  await prober.probeAll();
+  assert.equal(paced, 1, 'one pacing wait for the one healthy row');
+});
+
 test('a benched duplicate cannot widen the shared inter-probe gap', async () => {
   const { prober } = harness();
   await prober.probeAll();
