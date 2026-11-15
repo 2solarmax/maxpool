@@ -1261,18 +1261,11 @@ export class AccountManager {
       // Backstop for callers that never saw a first byte (unit callers): a 2xx served
       // the conversation. Idempotent — the first-byte note already ran on the real paths.
       if (lease.requestInfo && !(outcome.status >= 300)) this.noteConversationServed(lease.requestInfo, account);
+      // Efficiency fields derived from the served request; a field the caller passed
+      // explicitly on the outcome wins.
       const tel = this._servedTelemetry(lease.requestInfo, account);
-      this._recordLoadEvent(account, lease, {
-        ...outcome, success: true,
-        ...tel,
-        // An outcome-provided explicit value (tests, the link relay) wins over the
-        // request-derived one; tel keys are always present so ?? keeps them honest.
-        ...Object.fromEntries(Object.entries(tel).filter(([, v]) => v !== 0 && v !== null && v !== false)),
-        ...(outcome.usage ? { usage: outcome.usage } : {}),
-        ...(outcome.moved != null ? { moved: outcome.moved, moveCause: outcome.moveCause ?? tel.moveCause } : {}),
-        ...(outcome.newConversation != null ? { newConversation: outcome.newConversation } : {}),
-        ...(outcome.busyWaitMs ? { busyWaitMs: outcome.busyWaitMs } : {}),
-      });
+      for (const k of Object.keys(tel)) if (outcome[k] != null) tel[k] = outcome[k];
+      this._recordLoadEvent(account, lease, { ...outcome, ...tel, success: true });
       account.lastSuccessAt = Date.now();
       return;
     }
@@ -1306,7 +1299,7 @@ export class AccountManager {
       // Efficiency telemetry (2026-11-15) — optional, read by _efficiencySummary only.
       bounced: Boolean(outcome.bounced),
       usage: outcome.usage || null,
-      moved: Boolean(outcome.moved ?? outcome._servedMoved),
+      moved: Boolean(outcome.moved),
       newConversation: Boolean(outcome.newConversation),
       moveCause: outcome.moveCause || null,
       busyWaitMs: outcome.busyWaitMs || 0,
