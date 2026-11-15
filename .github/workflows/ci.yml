@@ -1,15 +1,36 @@
 name: CI
 
+# Cost shape (same across 2solarmax/gomokka projects): a pull request runs ONE
+# Node version (the lowest maxpool supports) plus lint; main and release tags run
+# the full Node matrix. maxpool is public, so standard ubuntu-latest runners bill
+# nothing; never switch to a larger runner label (those bill even on public repos)
+# and never attach a self-hosted runner (a fork PR could run anything on it).
+#
+# Required check = `ci-gate` only. It always reports (if: always()), so a skipped
+# or matrix-shaped job can never leave a PR stuck on "Expected". Never add
+# workflow-level `paths:` filters here: a skipped required workflow blocks merges.
+
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
+      fail-fast: false
       matrix:
-        node: [18, 20, 22]
+        node: ${{ github.event_name == 'pull_request' && fromJSON('[18]') || fromJSON('[18, 20, 22]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,3 +38,14 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm test
       - run: npx eslint src/ test/
+
+  ci-gate:
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every test job passed
+        run: |
+          echo "test: ${{ needs.test.result }}"
+          [ "${{ needs.test.result }}" = "success" ]
