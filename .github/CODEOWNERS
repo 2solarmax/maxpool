@@ -1,0 +1,3 @@
+# Changes to CI, workflows or this file need the maintainer's eyes before their
+# workflow run is approved: a pull request runs the workflow files from its own branch.
+/.github/ @2solarmax
