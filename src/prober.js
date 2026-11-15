@@ -109,9 +109,15 @@ export class Prober {
         // a user often disables an account precisely BECAUSE it's exhausted, and still
         // wants to see its quota recover — so keep refreshing its usage for visibility
         // even though routing skips it. Do NOT add an enabled gate here.
-        // Skip only auth-dead accounts (dead refresh token): probing them just re-POSTs
+        // Skip auth-dead accounts (dead refresh token): probing them just re-POSTs
         // the rejected token every cycle — a 400 storm. They recover only on re-auth.
-        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential && !a.refreshDead);
+        // Also skip BENCHED rows (`poolBenchedBy`): a local duplicate of an account the
+        // cloud team pool owns is never token-refreshed (account-manager
+        // ensureTokenFresh returns early so the cloud keeps the single-use refresh
+        // token), so its access token is dead and every probe fails — each failure
+        // widens the shared inter-probe gap and slows the HEALTHY rows. Its quota is
+        // shown from the cloud mirror (am.remoteRowFor), not from a local probe.
+        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential && !a.refreshDead && !a.poolBenchedBy);
         // Pool links are probed by their own PoolLink status poll, not here.
         const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);  // 'pool' rows are excluded by type
 
@@ -413,6 +419,9 @@ export class Prober {
    *  than silently swallowed — a swallowed failing probe is what let a stale
    *  weekly look fresh. Never throws. */
   async probeOne(account) {
+    // Benched duplicate: never refreshed locally (see the sweep filter in probeAll),
+    // so the token is dead — a probe can only fail. Quota comes from the cloud mirror.
+    if (account.poolBenchedBy) return { ok: false, status: null, skipped: 'benched' };
     // Subscription latched org-disabled (account-manager recordProbeError): the quota
     // endpoint 403s before answering anything, so probing is pure waste until the org
     // accepts OAuth again. Skipping also stops the every-60s hammer that ran 700+ times

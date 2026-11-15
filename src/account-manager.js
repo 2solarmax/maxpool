@@ -6394,7 +6394,11 @@ export class AccountManager {
         cooldownUntil: Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)
           ? new Date(Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)).toISOString()
           : null,
-        quota: { ...a.quota },
+        // A BENCHED duplicate is never probed or refreshed locally, so its own quota is
+        // stale by design — don't export it as current. The cloud pool owns the live
+        // numbers (the TUI overlays them via remoteRowFor); consumers read this marker.
+        quota: a.poolBenchedBy ? null : { ...a.quota },
+        quotaSource: a.poolBenchedBy ? 'cloud-mirror' : 'local',
         outsideUsage: a.outsideUsage ? { ...a.outsideUsage } : null,
         weekly: {
           state: this._weeklyState(a),
