@@ -41,12 +41,12 @@ function frameRows(am, columns) {
   return strip(buf).split(/\r?\n/).filter(l => /^ {4}(home|work|glm) /.test(l));
 }
 
-test('barLayout without the session column: Wk alone under 97 columns, Fbl and Wk from 97', () => {
+test('barLayout without the session column: Wk alone under 103 columns, Fbl and Wk from 103', () => {
   assert.deepEqual(barLayout(69, false), { showSession: false, showBoth: true, showFable: false, bw: 5 });
-  assert.deepEqual(barLayout(89, false), { showSession: false, showBoth: true, showFable: false, bw: 16 });
-  assert.deepEqual(barLayout(96, false), { showSession: false, showBoth: true, showFable: false, bw: 20 });
-  assert.deepEqual(barLayout(97, false), { showSession: false, showBoth: true, showFable: true, bw: 9 });
-  assert.deepEqual(barLayout(119, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
+  assert.deepEqual(barLayout(95, false), { showSession: false, showBoth: true, showFable: false, bw: 16 });
+  assert.deepEqual(barLayout(102, false), { showSession: false, showBoth: true, showFable: false, bw: 20 });
+  assert.deepEqual(barLayout(103, false), { showSession: false, showBoth: true, showFable: true, bw: 9 });
+  assert.deepEqual(barLayout(125, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
   assert.deepEqual(barLayout(140, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
 });
 

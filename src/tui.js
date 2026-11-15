@@ -140,14 +140,16 @@ const vw = s => strip(s).length;
 // ── Accounts-table columns ───────────────────────────────────
 // Fixed column widths shared by the header row (acctHeader) AND every data row, so
 // the header labels stay aligned with the columns they name. The Account/Provider/
-// Status/Rst/Quota start offsets (4/25/35/49/56) are pure functions of these widths +
+// Status/MRst/ARst/Quota start offsets are pure functions of these widths +
 // the 4-col row prefix, independent of the quota-bar width.
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
 const WHERE_W = 5;         // 'Local' / 'Cloud' — where the account is provisioned
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
-const RESETS_W = 13;       // 'Rst' column — FIXED width (fits '1+3Fable~118d': count AND expiry, owner 2026-11-11); a variable
-                           // width ('0' vs '1~21d') shifted every quota bar per row.
+const MRST_W = 11;         // 'MRst' column (model resets) — FIXED width (fits '2Fable~118d': count AND expiry, owner 2026-11-11);
+                           // a variable width ('0' vs '1~21d') shifted every quota bar per row.
+const ARST_W = 7;          // 'ARst' column (account-level resets) — FIXED width (fits '1~118d?'); owner 2026-11-15: model and
+                           // account resets in ONE mixed cell read as confusing, so they are two aligned columns.
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
 
 // Human provider name for the accounts-table "Provider" column. account.provider
@@ -183,7 +185,8 @@ function acctHeader(W) {
     + 'Where'.padEnd(WHERE_W) + ' '
     + 'Provider'.padEnd(PROVIDER_W) + ' '
     + 'Status'.padEnd(STATUS_W) + ' '
-    + 'Rst'.padEnd(RESETS_W) + ' '
+    + 'MRst'.padEnd(MRST_W) + ' '
+    + 'ARst'.padEnd(ARST_W) + ' '
     + quota;
 }
 
@@ -196,18 +199,18 @@ function lpadVis(s, w) {
 /**
  * Which quota bars fit a terminal W columns wide, and how wide each bar is. The
  * space before the first bar comes from the column widths above, never from a
- * hard-coded number (the old number went stale when the Rst column was added).
+ * hard-coded number (the old number went stale when the reset columns were added).
  * Each extra bar costs its label gap ("  Fbl " or "  Wk  ") plus one bar width.
  * Under 70 columns only the session bar shows, 5 to 20 wide; from 70 the weekly
  * bar joins it, both 5 to 20 wide. The Fable bar joins only once all three can be
- * 9 wide (112 columns), the narrowest bar that still shows "100% 2d5h", and three
- * bars stop growing at 11 wide, so the row never passes column 118 and the tags
+ * 9 wide (118 columns), the narrowest bar that still shows "100% 2d5h", and three
+ * bars stop growing at 11 wide, so the row never passes column 124 and the tags
  * after the bars (cap, prefer, staleness) keep the room they have with two bars.
  * Narrower terminals keep today's two bars plus the "Fable NN%" tag.
  * When no account reports a session window, the session bar is left out: the
- * weekly bar always shows and the Fable bar joins it from 97 columns.
+ * weekly bar always shows and the Fable bar joins it from 103 columns.
  */
-const BAR_START = ROW_PREFIX.length + NAME_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + RESETS_W + 1 + 'Ses '.length;
+const BAR_START = ROW_PREFIX.length + NAME_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + MRST_W + 1 + ARST_W + 1 + 'Ses '.length;
 const BAR_GAP = '  Wk  '.length;
 const BAR_MIN_W = 5;
 const BAR_MAX_W = 20;
@@ -590,7 +593,9 @@ function emptyBar(label, w = 10) {
  */
 function scopedWeeklyBar(quota, family, w) {
   const e = quota?.scopedWeekly?.[family];
-  if (!e || e.isActive === false || e.utilization == null) return emptyBar('—', w);
+  // is_active=false still carries a REAL reading (percent + reset days out): the
+  // limit exists and counts. Only a MISSING reading dashes.
+  if (!e || e.utilization == null) return emptyBar('—', w);
   return bar(e.utilization, w, e.resetAt);
 }
 
@@ -2868,17 +2873,16 @@ export class TUI {
     // Widened from 10 to fit "throttled 59s" so the quota bars stay column-aligned.
     status = rpad(status, STATUS_W);
 
-    // Rst column — banked limit resets (owner request 2026-09-30: a separate
+    // MRst/ARst columns — banked limit resets (owner request 2026-09-30: a separate
     // column showing 0 or the count). z.ai cards + Claude cedar_ember grants,
     // not-yet-expired, on ENABLED accounts only: a disabled account's resets are
     // not ours to spend, and showing a count there would imply otherwise.
     //
-    // B3 grammar (2026-11-10), rendered width EXACTLY RESETS_W (6):
-    //   general  n~Xd       e.g. 2~119d
-    //   scoped   nF~Xd      e.g. 2F~4d   (model-scoped, e.g. Fable)
-    //   mixed    g+sF       e.g. 1+2F
-    //   unknown  n?         scope unknown — count shown, never claimed
-    //   not-fresh = gray + trailing '?' (stale listing, dead account, old check)
+    // B3 grammar (2026-11-10), split into two cells 2026-11-15:
+    //   MRst (width MRST_W)  model-scoped  nFable~Xd  e.g. 2Fable~114d ('-' when none)
+    //   ARst (width ARST_W)  account-level n~Xd       e.g. 1~29d ('0' when none)
+    //   unknown  n?   scope unknown (ARst only) — count shown, never claimed
+    //   not-fresh = gray + trailing '?' when it fits (stale listing, dead account, old check)
     // Count = SUM of resetsLeft over spendable grants + live cards (not entries).
     // Overflow order: drop the suffix first, then collapse to total+'*'.
     // Expiry is checked LIVE here: grants endsAt>now, cards !expired &&
@@ -2890,13 +2894,14 @@ export class TUI {
       let general = 0;       // resetsLeft of general-weekly grants + live cards
       let scoped = 0;        // resetsLeft of model-scoped grants (tagged F)
       let unknown = 0;       // resetsLeft of scope-unknown grants
-      let soonest = Infinity;
+      let soonestG = Infinity;  // soonest expiry among account-level (general/unknown) resets
+      let soonestS = Infinity;  // soonest expiry among model-scoped resets
       if (a.enabled !== false) {
         const liveCard = c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now);
         const rc = a.resetCards;
         if (rc) {
           for (const c of [...(rc.fiveHour || []), ...(rc.weekly || [])]) {
-            if (liveCard(c)) { general += 1; if (c.expiresAt != null && c.expiresAt < soonest) soonest = c.expiresAt; }
+            if (liveCard(c)) { general += 1; if (c.expiresAt != null && c.expiresAt < soonestG) soonestG = c.expiresAt; }
           }
         }
         const rg = a.resetGrants;
@@ -2918,11 +2923,15 @@ export class TUI {
             const clearsWeekly = (Array.isArray(g.clears) ? g.clears : []).includes('seven_day');
             const hasScoped = scopes.some(x => x !== 'general' && x !== 'session');
             const left = Math.max(0, Math.floor(g.resetsLeft ?? 1));
+            let isScoped = false;
             if (clearsWeekly) general += left;
-            else if (hasScoped) scoped += left;
+            else if (hasScoped) { scoped += left; isScoped = true; }
             else if (scopes.includes('general')) general += left;
             else unknown += left;
-            if (g.endsAt != null && g.endsAt < soonest) soonest = g.endsAt;
+            if (g.endsAt != null) {
+              if (isScoped) { if (g.endsAt < soonestS) soonestS = g.endsAt; }
+              else if (g.endsAt < soonestG) soonestG = g.endsAt;
+            }
           }
         }
       }
@@ -2936,38 +2945,37 @@ export class TUI {
         && (a.resetCards.checkedAt == null || now - a.resetCards.checkedAt <= LISTING_FRESH_MS));
       const notFresh = total > 0 && (!freshGrants || !freshCards || a.refreshDead || a.subscriptionGone);
 
-      // Core text per the grammar.
-      let core;
-      if (total === 0) core = '0';
-      else if (unknown > 0 && general === 0 && scoped === 0) core = `${unknown}?`;
-      else if (general > 0 && scoped > 0) core = `${general}+${scoped}F`;
-      else if (scoped > 0) core = `${scoped}F`;
-      else core = `${general}`;
-
-      // Expiry suffix (owner 2026-10-01: always show when a reset exists).
-      let suffix = '';
-      if (total > 0 && soonest !== Infinity) {
+      // Two cells (owner 2026-11-15): MRst = model-scoped resets, ARst = account-level.
+      // Each cell has its OWN count, expiry and fit; the staleness flag is shared.
+      const expirySuffix = (n, soonest) => {
+        if (!(n > 0) || soonest === Infinity) return '';
         const days = (soonest - now) / 86400_000;
-        suffix = days < 1 ? `~${Math.max(1, Math.round(days * 24))}h` : `~${Math.max(1, Math.round(days))}d`;
-      }
-
-      // Fit to EXACTLY RESETS_W: full form, then drop the suffix, then total+'*'.
-      // OWNER READABILITY (2026-11-10: "What does the letter F mean? I have no
-      // idea"): a bare F is undecodable shorthand — the 2026-08-27 no-glossary
-      // rule says the cell says what it means in words. Model-scoped resets spell
-      // the model: '2Fable' / '1Opus'. RESETS_W grows to fit '99Fable' (8) so the
-      // word is never truncated into a mystery tag again; plain counts keep the
-      // compact n~Xd form.
-      const coreFable = core.replace(/F\b/, 'Fable');
-      let text = coreFable + suffix;
-      if (text.length > RESETS_W) text = coreFable;
-      if (text.length > RESETS_W) text = `${total}*`.slice(0, RESETS_W);
-      // Not-fresh: append '?' only when it fits. When it does not ('1+2Fable' is
-      // already 8), keep the breakdown and let the gray colour carry staleness —
-      // collapsing to '3?' made the cell flip 1+2Fable → 3? → 1+2Fable across every
-      // self-update (owner 2026-11-10: "the number of resets keeps changing").
-      if (notFresh && (text + '?').length <= RESETS_W) text += '?';
-      resetsCell = rpad(total > 0 && !notFresh ? green(text) : gray(text), RESETS_W);
+        return days < 1 ? `~${Math.max(1, Math.round(days * 24))}h` : `~${Math.max(1, Math.round(days))}d`;
+      };
+      // Fit to EXACTLY w: full form, then drop the suffix, then n+'*'. Not-fresh:
+      // append '?' only when it fits; otherwise gray carries the staleness (a
+      // '1+2Fable' -> '3?' collapse flipped the count on every self-update,
+      // owner 2026-11-10).
+      const renderCell = (core, suffix, n, w, sticky) => {
+        let text = core + suffix;
+        if (text.length > w) text = core;
+        if (text.length > w) text = `${n}*`.slice(0, w);
+        if (notFresh && n > 0 && !sticky && (text + '?').length <= w) text += '?';
+        return rpad(n > 0 && !notFresh ? green(text) : gray(text), w);
+      };
+      // MRst: model-scoped grants spell the model ('2Fable'), never a bare F
+      // (owner 2026-11-10: "What does the letter F mean?"). Nothing -> a dim dash.
+      const mCell = scoped > 0
+        ? renderCell(`${scoped}Fable`, expirySuffix(scoped, soonestS), scoped, MRST_W, false)
+        : rpad(gray('-'), MRST_W);
+      // ARst: account-level count; scope-unknown grants show 'n?' when they are all there is.
+      const unknownOnly = unknown > 0 && general === 0;
+      const aN = unknownOnly ? unknown : general;
+      const aCore = unknownOnly ? `${unknown}?` : `${general}`;
+      const aCell = aN > 0
+        ? renderCell(aCore, expirySuffix(aN, soonestG), aN, ARST_W, unknownOnly)
+        : rpad(gray('0'), ARST_W);
+      resetsCell = mCell + ' ' + aCell;
     }
 
     if (a.type === 'provider') {
@@ -3028,7 +3036,7 @@ export class TUI {
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85;
     const scopedTags = [];
     for (const [fam, e] of Object.entries(q.scopedWeekly || {})) {
-      if (!e || e.isActive === false || e.utilization == null) continue;
+      if (!e || e.utilization == null) continue;
       if (e.utilization < reserveFloor) continue;
       const Fam = fam.charAt(0).toUpperCase() + fam.slice(1);
       scopedTags.push(e.utilization >= exhaustedFloor

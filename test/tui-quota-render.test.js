@@ -51,12 +51,27 @@ test('a below-reserve scoped cap shows no tag at all', () => {
   assert.doesNotMatch(line, /Fable/, 'plenty of headroom → nothing to surface');
 });
 
-test('an inactive scoped cap shows no tag (matches the routing gate)', () => {
+test('an INACTIVE Fable cap with a stale probe still shows the Fable 90% tag (is_active=false is a live limit)', () => {
   const am = oauthAM();
-  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.99, severity: 'critical', isActive: false, resetAt: Date.now() + 3 * DAY } } });
+  am.quotaProbeIntervalMs = 60_000;
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.90, severity: 'critical', isActive: false, resetAt: Date.now() + 3 * DAY } } });
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;   // stale probe
+  am.accounts[0].quota.lastProbeErrorStatus = 429;
   const tui = new TUI({ accountManager: am });
-  const line = strip(tui._renderAcct(0, 11, true));
-  assert.doesNotMatch(line, /Fable/);
+  const raw = tui._renderAcct(0, 11, true);
+  assert.match(strip(raw), /Fable 90%/, 'the trailing tag draws the real reading, aligned with the Fbl bar');
+  assert.match(raw, /\x1b\[33mFable 90%/, 'yellow while usable');
+  assert.doesNotMatch(strip(raw), /maxed/);
+});
+
+test('an INACTIVE Fable cap at >= 0.999 shows the red "Fable maxed" tag', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.9995, severity: 'critical', isActive: false, resetAt: Date.now() + 3 * DAY } } });
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
+  am.accounts[0].quota.lastProbeErrorStatus = 429;
+  const raw = new TUI({ accountManager: am })._renderAcct(0, 11, true);
+  assert.match(raw, /\x1b\[31mFable maxed/, 'red at genuine exhaustion, even when inactive');
 });
 
 // ── cap VISIBILITY (2026-08-27): "I need to be able to see whether an account
@@ -462,6 +477,12 @@ test('the column header sits exactly over the Account/Provider/Status/Quota colu
   assert.equal(hdr.indexOf('Where'), row.indexOf('Local'), 'Where header over the Local/Cloud cell');
   assert.equal(hdr.indexOf('Provider'), 31, 'Provider over the provider column (after Where)');
   assert.equal(hdr.indexOf('Status'), 41, 'Status over the status column');
+  assert.equal(hdr.indexOf('MRst'), 55, 'MRst (model resets) right after the 13-wide Status col');
+  assert.equal(hdr.indexOf('ARst'), 67, 'ARst (account resets) right after the 11-wide MRst col');
+  // Both reset cells sit exactly under their headers: the model cell is '-' (none),
+  // the account cell is '0'.
+  assert.equal(row.slice(hdr.indexOf('MRst'), hdr.indexOf('MRst') + 1), '-', 'MRst cell under its header');
+  assert.equal(row.slice(hdr.indexOf('ARst'), hdr.indexOf('ARst') + 1), '0', 'ARst cell under its header');
   // the Quota group label lands exactly on the first inline quota label (Fbl, the
   // Fable bar, comes first; Ses follows it)
   assert.equal(hdr.indexOf('Quota'), row.indexOf('Fbl '), 'Quota over the quota bars');
@@ -488,9 +509,11 @@ test('narrow mode: the header still aligns and shrinks Quota to avoid overflow',
   assert.equal(narrow.indexOf('Account'), 4);
   assert.equal(narrow.indexOf('Status'), 41);
   assert.match(wide, /Quota \(used% · resets-in\)/, 'wide shows the full quota key');
-  // Fixed-width Rst column (13 + space) before Quota — width 13 fits '1+3Fable~118d'
-  // so a row with resets never pushes its quota bars right.
-  assert.equal(narrow.indexOf('Quota'), 69);
+  // Fixed-width MRst (11) + ARst (7) columns before Quota — they fit '2Fable~118d' and
+  // '1~118d?' so a row with resets never pushes its quota bars right.
+  assert.equal(narrow.indexOf('MRst'), 55);
+  assert.equal(narrow.indexOf('ARst'), 67);
+  assert.equal(narrow.indexOf('Quota'), 75);
   assert.doesNotMatch(narrow, /resets-in/, 'narrow drops the parenthetical so it does not clip');
 });
 
@@ -737,19 +760,19 @@ test('an ENABLED account with a dead token still reads "reauth" (unchanged)', ()
   assert.doesNotMatch(line, /disabled/, 'nothing was switched off');
 });
 
-// ── Rst column: banked limit resets, owner request 2026-09-30 ────────────────
+// ── ARst column: banked limit resets, owner request 2026-09-30 ────────────────
 
-test('Rst column shows 0 when no cards/grants, aligned under the header', () => {
+test('ARst column shows 0 when no cards/grants, aligned under the header', () => {
   const am = oauthAM();
   const tui = new TUI({ accountManager: am });
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
-  const col = hdr.indexOf('Rst');
+  const col = hdr.indexOf('ARst');
   assert.ok(col > 0);
   assert.equal(row.slice(col, col + 1), '0', 'shows plain 0');
 });
 
-test('Rst column counts live cards + grants (expired excluded)', () => {
+test('ARst column counts live cards + grants (expired excluded)', () => {
   const am = oauthAM();
   am.accounts[0].resetCards = { fiveHour: [], weekly: [
     { recordId: 1, expiresAt: Date.now() + 3600e3, expired: false },
@@ -759,25 +782,25 @@ test('Rst column counts live cards + grants (expired excluded)', () => {
   const tui = new TUI({ accountManager: am });
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
-  assert.equal(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), '1');
+  assert.equal(row.slice(hdr.indexOf('ARst'), hdr.indexOf('ARst') + 1), '1');
 });
 
-test('Rst column shows 0 on a DISABLED account even with cards present', () => {
+test('ARst column shows 0 on a DISABLED account even with cards present', () => {
   const am = oauthAM();
   am.accounts[0].enabled = false;
   am.accounts[0].resetCards = { fiveHour: [{ recordId: 9, expiresAt: Date.now() + 3600e3, expired: false }], weekly: [], checkedAt: Date.now() };
   const tui = new TUI({ accountManager: am });
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
-  assert.equal(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 1), '0',
+  assert.equal(row.slice(hdr.indexOf('ARst'), hdr.indexOf('ARst') + 1), '0',
     "disabled accounts' resets are not ours — the column must not advertise them");
 });
 
 const H1 = 3600_000;
 const DAY1 = 24 * H1;
 
-// ── Rst column expiry suffix: "1~2d" when the reset expires soon ──────────────
-test('Rst column appends ~Nd when the soonest card expires within 7 days', () => {
+// ── ARst column expiry suffix: "1~2d" when the reset expires soon ──────────────
+test('ARst column appends ~Nd when the soonest card expires within 7 days', () => {
   const am = oauthAM();
   am.accounts[0].resetCards = { fiveHour: [], weekly: [
     { recordId: 1, expiresAt: Date.now() + 2 * DAY1, expired: false },
@@ -785,10 +808,10 @@ test('Rst column appends ~Nd when the soonest card expires within 7 days', () =>
   const tui = new TUI({ accountManager: am });
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
-  assert.match(row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 6), /^1~2d/);
+  assert.match(row.slice(hdr.indexOf('ARst'), hdr.indexOf('ARst') + 6), /^1~2d/);
 });
 
-test('Rst column appends ~Nh under 24h; no suffix when expiry is far', () => {
+test('ARst column appends ~Nh under 24h; no suffix when expiry is far', () => {
   const am = oauthAM();
   am.accounts[0].resetCards = { fiveHour: [], weekly: [
     { recordId: 1, expiresAt: Date.now() + 10 * H1, expired: false },
@@ -801,19 +824,26 @@ test('Rst column appends ~Nh under 24h; no suffix when expiry is far', () => {
   const hdr = strip(__tuiTest.acctHeader(100));
   const r0 = strip(tui._renderAcct(0, 11, true));
   const r1 = strip(tui._renderAcct(1, 11, true));
-  assert.match(r0.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 6), /^1~10h/);
+  assert.match(r0.slice(hdr.indexOf('ARst'), hdr.indexOf('ARst') + 6), /^1~10h/);
   // 2026-10-01 owner rule: expiry ALWAYS shows when a reset exists — even weeks out.
-  assert.match(r1.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + 5), /^1~20d/, 'far expiry shows ~20d, not a bare count');
+  assert.match(r1.slice(hdr.indexOf('ARst'), hdr.indexOf('ARst') + 5), /^1~20d/, 'far expiry shows ~20d, not a bare count');
 });
 
 // ── B3 grammar (2026-11-10): scope tags, resetsLeft sum, live expiry, freshness ─
 // TEST PLAN 2: {1,2,10 resets} x {general, scoped, mixed, unknown} x {fresh, stale} x {6d, 119d}.
-const GRANT_SCOPE_W = 13;  // RESETS_W — count AND expiry always fit (owner 2026-11-11)
+const ARST_W = 7;   // account-level reset cell — count AND expiry fit ('1~118d?')
+const MRST_W = 11;  // model-scoped reset cell — '2Fable~118d' fits (owner 2026-11-11)
+// The ARst (account-level) cell and the MRst (model-scoped) cell, sliced from the
+// stripped row at the header's own column offsets.
 function rstCellOf(tui, idx) {
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(idx, 11, true));
-  const cell = row.slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + GRANT_SCOPE_W);
-  return cell;
+  return row.slice(hdr.indexOf('ARst'), hdr.indexOf('ARst') + ARST_W);
+}
+function mrstCellOf(tui, idx) {
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const row = strip(tui._renderAcct(idx, 11, true));
+  return row.slice(hdr.indexOf('MRst'), hdr.indexOf('MRst') + MRST_W);
 }
 function grantRow({ n = 1, clears = ['seven_day'], resetsLeft = 1, endsIn = 119 * DAY, givesBack = false } = {}) {
   return { grants: Array.from({ length: n }, (_, i) => ({
@@ -832,11 +862,11 @@ test('B3: general grant renders n~Xd with resetsLeft summed, width exactly 6', (
   assert.match(rstCellOf(tui, 0), /^2~119d\s*$/, 'two single-use grants → 2~119d');
   assert.match(rstCellOf(tui, 1), /^2~119d\s*$/, 'ONE multi-use grant (resetsLeft 2) counts 2, not 1');
   const overflow = rstCellOf(tui, 2).trim();
-  assert.equal(overflow, '10~119d'.slice(0,8).trim(), '10 grants keep the compact form at width 8');
+  assert.equal(overflow, '10~119d', '10 grants still fit count+expiry in the 7-wide cell');
   assert.equal(strip(tui._renderAcct(0, 11, true)).length > 0, true);
 });
 
-test('B3: scoped grant renders nF~Xd; mixed renders g+sF', () => {
+test('B3: scoped grant renders nFable~Xd in MRst; mixed splits into MRst + ARst', () => {
   const am = oauthAM(4);
   am.accounts[0].resetGrants = grantRow({ n: 2, clears: ['seven_day_overage_included'], endsIn: 4 * DAY });
   am.accounts[1].resetGrants = { ...grantRow({ n: 1 }), grants: [
@@ -845,9 +875,11 @@ test('B3: scoped grant renders nF~Xd; mixed renders g+sF', () => {
   ] };
   am.accounts[2].resetGrants = grantRow({ n: 3, clears: ['seven_day_overage_included'], resetsLeft: 1, endsIn: 119 * DAY });
   const tui = new TUI({ accountManager: am });
-  assert.match(rstCellOf(tui, 0), /^2Fable~\d+d\s*$/, 'Fable grants tagged by model name, expiry kept');
-  assert.match(rstCellOf(tui, 1), /^1\+2Fable~\d+d\s*$/, 'mixed general+scoped spells the model, expiry kept');
-  assert.match(rstCellOf(tui, 2), /^3Fable~119d\s*$/, 'count and expiry both shown');
+  assert.match(mrstCellOf(tui, 0), /^2Fable~\d+d\s*$/, 'Fable grants tagged by model name, expiry kept');
+  assert.match(rstCellOf(tui, 0), /^0\s*$/, 'no account-level resets: ARst reads 0');
+  assert.match(mrstCellOf(tui, 1), /^2Fable~119d\s*$/, 'mixed: the model half is in MRst');
+  assert.match(rstCellOf(tui, 1), /^1~119d\s*$/, 'mixed: the account half is in ARst');
+  assert.match(mrstCellOf(tui, 2), /^3Fable~119d\s*$/, 'count and expiry both shown');
 });
 
 // B3.1 (owner 2026-11-10 "distinguish model-specific vs general"): a grant that is
@@ -865,9 +897,12 @@ test('B3.1: scoped+gives-back grant displays as F, not general', () => {
   const tui = new TUI({ accountManager: am });
   // Identity counting (2026-11-11): give-back adds no display count — 2 scoped+
   // giveback grants are 2 Fable resets, matching Anthropic's own screen.
-  assert.match(rstCellOf(tui, 0), /^2Fable~\d+d\s*$/, 'scoped+giveback grants stay 2Fable (give-back adds no count)');
-  assert.match(rstCellOf(tui, 1), /^1\+1Fable~\d+d\s*$/, 'one true general + one scoped+giveback = 1+1Fable');
-  assert.match(rstCellOf(tui, 2), /^1~119d\s*$/, 'general grant with give-back stays general (no F)');
+  assert.match(mrstCellOf(tui, 0), /^2Fable~\d+d\s*$/, 'scoped+giveback grants stay 2Fable (give-back adds no count)');
+  assert.match(rstCellOf(tui, 0), /^0\s*$/, 'and add nothing to ARst');
+  assert.match(mrstCellOf(tui, 1), /^1Fable~\d+d\s*$/, 'one scoped+giveback = 1Fable in MRst');
+  assert.match(rstCellOf(tui, 1), /^1~\d+d\s*$/, 'one true general = 1 in ARst');
+  assert.match(rstCellOf(tui, 2), /^1~119d\s*$/, 'general grant with give-back stays general (no Fable)');
+  assert.match(mrstCellOf(tui, 2), /^-\s*$/, 'and leaves MRst empty');
 });
 
 test('B3: unknown-scope grants render n? (shown, never claimed)', () => {
@@ -924,7 +959,7 @@ test('B3 TEST 4: refreshDead/subscriptionGone renders gray-with-? even when the 
   assert.doesNotMatch(rstCellOf(freshTui, 0), /\?/, 'a fresh healthy listing stays clean');
 });
 
-test('B3: every grammar form renders at width exactly 6 (vw assertion)', () => {
+test('B3: every grammar form keeps both reset cells at a fixed width (vw assertion)', () => {
   const am = oauthAM(8);
   am.accounts[0].resetGrants = grantRow({ n: 2 });
   am.accounts[1].resetGrants = grantRow({ n: 2, clears: ['seven_day_overage_included'], endsIn: 4 * DAY });
@@ -937,15 +972,15 @@ test('B3: every grammar form renders at width exactly 6 (vw assertion)', () => {
   am.accounts[6].resetCards = { fiveHour: [], weekly: [{ recordId: 1, expiresAt: Date.now() + 2 * DAY, expired: false }], checkedAt: Date.now() };
   const tui = new TUI({ accountManager: am });
   for (let i = 0; i <= 6; i++) {
-    assert.equal(vwOf(tui, i), GRANT_SCOPE_W, `row ${i} cell width is exactly 6`);
+    assert.equal(vwOf(tui, i), MRST_W + 1 + ARST_W + 1, `row ${i}: MRst+ARst cells (with separators) are exactly ${MRST_W}+1+${ARST_W}+1 wide`);
   }
   function vwOf(t, i) {
-    const raw = t._renderAcct(i, 11, true);
+    // Fixed width = the first quota label starts at the same offset on every row:
+    // MRST_W + 1 (space) + ARST_W + 1 (space) columns after the MRst header start.
+    const raw = strip(t._renderAcct(i, 11, true));
     const hdr = strip(__tuiTest.acctHeader(100));
-    // visible width from the cell start to the next column boundary is asserted by
-    // the header alignment: extract via strip+slice as everywhere else.
-    const cell = strip(raw).slice(hdr.indexOf('Rst'), hdr.indexOf('Rst') + GRANT_SCOPE_W);
-    return cell.trimEnd().length <= GRANT_SCOPE_W ? GRANT_SCOPE_W : cell.length;
+    const starts = ['Fbl ', 'Ses ', 'Tok '].map(l => raw.indexOf(l)).filter(x => x >= 0);
+    return Math.min(...starts) - hdr.indexOf('MRst');
   }
 });
 
@@ -967,7 +1002,8 @@ test('B3.2: a full reset (weekly+model clears) counts in BOTH buckets — 1+2Fab
   // 2 fable-only give-back grants = "two fable and one regular weekly" on
   // Anthropic's screen. Identity counting renders 1+2Fable — grant-for-grant
   // equal to what the owner sees there.
-  assert.match(rstCellOf(tui, 0), /1\+2Fable/, 'full reset = 1 general; 2 fable-only = 1+2Fable (owner math)');
+  assert.match(mrstCellOf(tui, 0), /^2Fable/, 'two fable-only grants = 2Fable in MRst (owner math)');
+  assert.match(rstCellOf(tui, 0), /^1~/, 'the full reset is the one general = 1 in ARst');
 });
 
 // RED (2026-11-11, live after the 1.24.86 self-update): a stale mixed cell
@@ -981,7 +1017,8 @@ test('B3.3: a stale mixed cell keeps its breakdown (no collapse to total?)', () 
     { id: 'fable-b', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 120 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
   ] };
   const tui = new TUI({ accountManager: am });
-  assert.match(rstCellOf(tui, 0), /^1\+2Fable~\d+d\?\s*$/, 'stale mixed cell keeps breakdown + expiry, marked ?; never 3?');
+  assert.match(mrstCellOf(tui, 0), /^2Fable~\d+d\s*$/, 'stale: model cell keeps its count + expiry (gray carries staleness; no room for ?)');
+  assert.match(rstCellOf(tui, 0), /^1~29d\?\s*$/, 'stale: account cell keeps count + expiry, marked ?; never 3?');
 });
 
 // RED (owner 2026-11-11): "No date of expiration is shown in the reset column when
@@ -992,5 +1029,43 @@ test('B3.4: a mixed cell shows the count AND the expiry date', () => {
     { id: 'full-reset', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 29 * DAY + 3600_000, clears: ['seven_day', 'seven_day_overage_included'], givesBackWeekly: false },
     { id: 'fable-a', resetsLeft: 2, resetsTotal: 2, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 118 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
   ] };
-  assert.match(rstCellOf(new TUI({ accountManager: am }), 0), /^1\+2Fable~29d\s*$/);
+  const t = new TUI({ accountManager: am });
+  assert.match(rstCellOf(t, 0), /^1~29d\s*$/, 'ARst: own count + own (soonest general) expiry');
+  assert.match(mrstCellOf(t, 0), /^2Fable~118d\s*$/, 'MRst: own count + own (soonest model) expiry');
+});
+
+// ── MRst / ARst split (owner 2026-11-15): model resets and account resets are two columns ──
+test('a row with BOTH model and account resets shows two separate cells, each with its own content', () => {
+  const am = oauthAM(1);
+  am.accounts[0].resetGrants = { eligible: true, checkedAt: Date.now(), stale: false, grants: [
+    { id: 'full', resetsLeft: 1, resetsTotal: 1, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 29 * DAY, clears: ['seven_day', 'seven_day_overage_included'], givesBackWeekly: false },
+    { id: 'fable', resetsLeft: 2, resetsTotal: 2, usableNow: true, paused: false, blocking: false, unavailableReason: null, startsAt: Date.now() - DAY, endsAt: Date.now() + 114 * DAY, clears: ['seven_day_overage_included'], givesBackWeekly: true },
+  ] };
+  const tui = new TUI({ accountManager: am });
+  assert.equal(mrstCellOf(tui, 0).trim(), '2Fable~114d', 'model cell: model name + its own expiry only');
+  assert.equal(rstCellOf(tui, 0).trim(), '1~29d', 'account cell: bare count + its own expiry only');
+  const row = strip(tui._renderAcct(0, 11, true));
+  assert.doesNotMatch(row, /1\+2/, 'the old mixed 1+2Fable form is gone');
+});
+
+test('the MRst / ARst headers sit exactly over their cells on every row type', () => {
+  const am = oauthAM(3);
+  am.accounts[0].resetGrants = grantRow({ n: 2, clears: ['seven_day_overage_included'], endsIn: 114 * DAY });
+  am.accounts[1].resetGrants = grantRow({ n: 1 });
+  am.accounts[2].quota.tokensLimit = 1000; am.accounts[2].quota.tokensRemaining = 700;
+  am.accounts[2].quota.requestsLimit = 100; am.accounts[2].quota.requestsRemaining = 90;
+  const tui = new TUI({ accountManager: am });
+  const hdr = strip(__tuiTest.acctHeader(100));
+  const m = hdr.indexOf('MRst'), a = hdr.indexOf('ARst');
+  assert.equal(a - m, 12, 'ARst starts one separator after the 11-wide MRst cell');
+  const r0 = strip(tui._renderAcct(0, 11, true));
+  const r1 = strip(tui._renderAcct(1, 11, true));
+  const r2 = strip(tui._renderAcct(2, 11, true));
+  assert.equal(r0.indexOf('2Fable'), m, 'model cell starts under MRst');
+  assert.equal(r0.slice(a, a + 1), '0', 'account cell starts under ARst (0 when no account-level resets)');
+  assert.equal(r1.slice(m, m + 1), '-', 'an account with no model resets shows a dash under MRst');
+  assert.equal(r1.slice(a, a + 6), '1~119d', 'account cell under ARst');
+  assert.equal(r2.slice(m, m + 1), '-', 'api-key row keeps both cells');
+  assert.equal(r2.slice(a, a + 1), '0');
+  assert.equal(hdr.indexOf('Quota'), r0.indexOf('Fbl '), 'Quota still sits over the first bar');
 });
