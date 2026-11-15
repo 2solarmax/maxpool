@@ -267,6 +267,19 @@ test('a probe-only scoped cap still reads stale on a stale probe even when the u
   assert.match(line, /rate-limited, retrying/, 'a displayed scoped cap is probe-only → still warn');
 });
 
+test('a low Fable reading drawn in the Fbl bar still reads stale on a stale probe', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.40, severity: 'normal', isActive: true, resetAt: Date.now() + 3 * DAY } } });
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;  // the shown Fbl 40% is now unconfirmed
+  am.accounts[0].quota.lastProbeErrorStatus = 429;
+  am.accounts[0].quota.lastHeaderQuotaAt = Date.now();           // Ses/Wk fresh from headers, Fable is probe-ONLY
+  const tui = new TUI({ accountManager: am });
+  assert.match(strip(tui._renderAcct(0, 11, true, true)), /rate-limited, retrying/, 'the Fbl bar shows it → warn');
+  assert.doesNotMatch(strip(tui._renderAcct(0, 11, true, false)), /quota .* old|rate-limited/,
+    'no Fbl bar and below the tag floor → nothing displayed is stale');
+});
+
 test('automatic mode marks accounts SERVING right now (inFlight>0) with ►, not the last-routed idle one', () => {
   const am = oauthAM();
   am.routingMode = 'automatic';
@@ -449,8 +462,10 @@ test('the column header sits exactly over the Account/Provider/Status/Quota colu
   assert.equal(hdr.indexOf('Where'), row.indexOf('Local'), 'Where header over the Local/Cloud cell');
   assert.equal(hdr.indexOf('Provider'), 31, 'Provider over the provider column (after Where)');
   assert.equal(hdr.indexOf('Status'), 41, 'Status over the status column');
-  // the Quota group label lands exactly on the inline Ses/Tok quota label
-  assert.equal(hdr.indexOf('Quota'), row.indexOf('Ses '), 'Quota over the quota bars');
+  // the Quota group label lands exactly on the first inline quota label (Fbl, the
+  // Fable bar, comes first; Ses follows it)
+  assert.equal(hdr.indexOf('Quota'), row.indexOf('Fbl '), 'Quota over the quota bars');
+  assert.ok(row.indexOf('Ses ') > row.indexOf('Fbl '), 'Ses follows Fbl');
 });
 
 test('the header aligns for an API-key row too (Quota group label over Tok, not mislabeled)', () => {
@@ -463,7 +478,8 @@ test('the header aligns for an API-key row too (Quota group label over Tok, not 
   const tui = new TUI({ accountManager: am });
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
-  assert.equal(hdr.indexOf('Quota'), row.indexOf('Tok '), 'group label sits over Tok — a single "Quota" is honest for both row types');
+  assert.equal(hdr.indexOf('Quota'), row.indexOf('Fbl '), 'group label sits over the first bar (Fbl) — a single "Quota" is honest for both row types');
+  assert.ok(row.indexOf('Tok ') > row.indexOf('Fbl '), 'Tok follows Fbl');
 });
 
 test('narrow mode: the header still aligns and shrinks Quota to avoid overflow', () => {

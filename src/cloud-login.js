@@ -23,6 +23,7 @@ export async function sendLoginToPool({ url, key, name, profile, creds, fetchImp
         account: {
           name, type: 'oauth',
           accountUuid: profile?.accountUuid,
+          organizationUuid: profile?.organizationUuid,
           accessToken: creds.accessToken,
           refreshToken: creds.refreshToken,
           expiresAt: creds.expiresAt,

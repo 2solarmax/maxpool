@@ -1,4 +1,4 @@
-import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint, sameUser, sameAccountIdentity } from './oauth.js';
 import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity } from './pool-link.js';
 import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
@@ -625,6 +625,7 @@ export class AccountManager {
       type: acct.type,
       provider: acct.provider || (acct.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acct.accountUuid || null,
+      organizationUuid: acct.organizationUuid || null,
       credential: acct.accessToken || acct.authToken || acct.apiKey,
       upstream: acct.upstream || null,
       authHeader: acct.authHeader || null,
@@ -3488,13 +3489,16 @@ export class AccountManager {
    *  Returns a plain integer (the minimum over self's profiles); the POLICY decides
    *  sufficiency (holdMinPeers × holders). */
   countPeersWithRoom(self, now = Date.now()) {
-    const selfId = this.capacityIdentity(self);
+    // Peers are deduped by capacity GROUP, not identity string: an org-less twin
+    // of the same subscription (uuid:U vs uuid:U:org) groups with self and must
+    // never count as a second roomy member of the pool.
+    const selfGroup = new Set(this.capacityGroupOf(self));
     const selfProfiles = self?.profiles || ['claude', 'all'];
     const roomLeft = (util, ceiling, room) => Number.isFinite(util) && util <= ceiling - room;
     const roomy = [];
     for (const p of this.accounts) {
       const id = this.capacityIdentity(p);
-      if (id == null || id === selfId) continue;
+      if (id == null || selfGroup.has(p)) continue;
       if (p.type !== 'oauth' || p.enabled === false) continue;
       if (p.remote || p.poolBenchedBy) continue;
       if (p.refreshDead || p.subscriptionGone) continue;
@@ -4964,7 +4968,7 @@ export class AccountManager {
    *  fingerprint (same key shape). null = unresolvable (never merged by name). */
   capacityIdentity(a) {
     if (!a) return null;
-    if (a.remote) return remoteAccountIdentity({ type: a.type, provider: a.provider, accountUuid: a.remoteUuid, keyFingerprint: a.remoteKeyFp });
+    if (a.remote) return remoteAccountIdentity({ type: a.type, provider: a.provider, accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid, keyFingerprint: a.remoteKeyFp });
     return accountIdentity(a);
   }
 
@@ -4972,7 +4976,19 @@ export class AccountManager {
   capacityGroupOf(a) {
     const id = this.capacityIdentity(a);
     if (!id) return [a];
-    return this.accounts.filter(x => this.capacityIdentity(x) === id);
+    const same = this.accounts.filter(x => this.capacityIdentity(x) === id);
+    // `uuid:<user>[:<org>]`: a row whose organization is unknown (saved before orgs
+    // were recorded, or mirrored from an older pool) is still the same login as the
+    // user's org-bearing row while that user has ONE known organization here. Two
+    // known organizations are two subscriptions: then only exact ids group.
+    if (!id.startsWith('uuid:')) return same;
+    const user = id.split(':')[1];
+    const rows = this.accounts.filter(x => {
+      const xid = this.capacityIdentity(x);
+      return xid && xid.startsWith('uuid:') && xid.split(':')[1] === user;
+    });
+    const orgs = new Set(rows.map(x => this.capacityIdentity(x).split(':')[2]).filter(Boolean));
+    return orgs.size > 1 ? same : rows;
   }
 
   /** Merged closed-cycle history of an account's whole identity: this pool's ledger
@@ -5532,6 +5548,7 @@ export class AccountManager {
       type: acctData.type,
       provider: acctData.provider || (acctData.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acctData.accountUuid || null,
+      organizationUuid: acctData.organizationUuid || null,
       credential: acctData.accessToken || acctData.authToken || acctData.apiKey,
       upstream: acctData.upstream || null,
       authHeader: acctData.authHeader || null,
@@ -5793,11 +5810,17 @@ export class AccountManager {
     return true;
   }
 
-  // Match a saved state entry to a live account by stable identity: prefer the
-  // account UUID when both have one, otherwise fall back to the name.
+  /**
+   * Match a saved state entry to a live account by stable identity: the account
+   * UUID + organization UUID when both have a UUID, otherwise the name. A saved
+   * entry without an organization (written before organizations were recorded)
+   * also matches the same user under the same name, so quota survives the first
+   * restart after an account learns its organization.
+   */
   _sameIdentity(saved, account) {
-    if (saved.accountUuid && account.accountUuid) return saved.accountUuid === account.accountUuid;
-    return saved.name === account.name;
+    if (!saved.accountUuid || !account.accountUuid) return saved.name === account.name;
+    return sameAccountIdentity(saved, account)
+      || (!saved.organizationUuid && sameUser(saved, account) && saved.name === account.name);
   }
 
   /**
@@ -5808,7 +5831,7 @@ export class AccountManager {
     return this.accounts.filter(a => !a.remote).map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
-      const out = { accountUuid: a.accountUuid, name: a.name, quota };
+      const out = { accountUuid: a.accountUuid, organizationUuid: a.organizationUuid, name: a.name, quota };
       // OUTSIDE-USAGE flag survives restart (red-team R1.2): a restart is exactly
       // when a leak's cards are most at risk — remediation rotates keys and
       // restarts the pool, and the in-memory flag would vanish mid-remediation.
@@ -6018,6 +6041,7 @@ export class AccountManager {
       // persistence, re-auth, disk sync) can never resolve to a mirror row.
       a.accountUuid = null;
       a.remoteUuid = ra.accountUuid || null;
+      a.remoteOrganizationUuid = ra.organizationUuid || null;
       a.provider = ra.provider || a.provider;
       a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
       a.status = ra.status || 'active';
@@ -6332,6 +6356,7 @@ export class AccountManager {
         // fingerprint. Without these a linked pool can't see a duplicate Claude login
         // (live-rehearsal 2026-10-29: status omitted accountUuid → no bench).
         accountUuid: a.type === 'oauth' ? (a.accountUuid || null) : null,
+        organizationUuid: a.type === 'oauth' ? (a.organizationUuid || null) : null,
         keyFingerprint: (a.type === 'provider' && a.credential) ? credentialFp(a.credential) : null,
         // Plan config (display-only) + this pool's closed cycles per window so a linked
         // pool can UNION history instead of picking one ledger (bounded: 12 weekly /

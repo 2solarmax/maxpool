@@ -9,7 +9,7 @@ import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor, f
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { modelFamily } from './oauth.js';
+import { modelFamily, organizationUnknownMatch, sameAccountIdentity, sameUser } from './oauth.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -460,6 +460,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { body = null; }
         const acct = body?.account;
         if (acct && typeof acct.name === 'string') acct.name = safeText(acct.name);
+        if (acct && typeof acct.organizationUuid !== 'string') delete acct.organizationUuid;
         if (!acct || acct.type !== 'oauth' || typeof acct.accountUuid !== 'string' || !acct.accountUuid ||
             typeof acct.refreshToken !== 'string' || !acct.refreshToken || typeof acct.accessToken !== 'string' || !acct.accessToken) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -467,7 +468,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           return;
         }
         const who = caller.name || 'legacy-key';
-        const amAcct = accountManager.accounts.find(a => a.accountUuid === acct.accountUuid);
+        // Exact match (user + org), else the ONE same-user row with no org yet: a
+        // login to a pool saved before organizations were recorded re-authenticates
+        // that row and stamps the organization onto it, exactly like the local path.
+        // Healing, BOTH directions: (a) an org-bearing login into a pool whose row
+        // predates orgs re-authenticates that row and stamps the org onto it; (b) an
+        // org-less login from an OLDER client re-authenticates the user's single row
+        // (any org) without touching its org. Two rows of the user → ambiguous: add.
+        const sameUserRows = accountManager.accounts.filter(a => sameUser(a, acct));
+        const amAcct = accountManager.accounts.find(a => sameAccountIdentity(a, acct))
+          || (acct.organizationUuid ? organizationUnknownMatch(accountManager.accounts, acct)
+            : (sameUserRows.length === 1 ? sameUserRows[0] : null));
+        if (amAcct && acct.organizationUuid) amAcct.organizationUuid = acct.organizationUuid;
         const tokenFields = {
           accessToken: acct.accessToken,
           refreshToken: acct.refreshToken,
@@ -485,26 +497,36 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           if (amAcct.status === 'error') amAcct.status = 'active';
           appendEventLog(`[Maxpool] Remote re-auth: "${amAcct.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
         } else {
-          const entry = { name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields };
+          const entry = newInjectedEntry(acct, tokenFields, accountManager.accounts);
+          acct.name = entry.name; // the disk row and config mirror below take the same unique name
           accountManager.addAccount(entry);
           appendEventLog(`[Maxpool] Remote add: "${entry.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
         }
         try {
           await atomicConfigUpdate(diskConfig => {
-            const onDisk = diskConfig.accounts.find(a => a.accountUuid === acct.accountUuid);
+            let onDisk = diskConfig.accounts.find(a => sameAccountIdentity(a, acct));
+            if (!onDisk && acct.organizationUuid) onDisk = organizationUnknownMatch(diskConfig.accounts, acct);
+            if (!onDisk && !acct.organizationUuid) onDisk = diskConfig.accounts.filter(a => sameUser(a, acct)).length === 1
+              ? diskConfig.accounts.find(a => sameUser(a, acct)) : null;
             if (onDisk) {
               Object.assign(onDisk, tokenFields);
+              if (acct.organizationUuid) onDisk.organizationUuid = acct.organizationUuid;
             } else {
-              diskConfig.accounts.push({ name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields });
+              diskConfig.accounts.push(newInjectedEntry(acct, tokenFields, diskConfig.accounts));
             }
           });
           // Keep the in-memory config mirror in step so a later TUI saveConfig
           // can't clobber the fresh tokens with stale ones.
           // A NEW row must enter the mirror too: the disk sync adds any disk row whose
           // uuid the mirror lacks, so a missing entry became a second live row.
-          const mem = (config.accounts || []).find(a => a.accountUuid === acct.accountUuid);
-          if (mem) Object.assign(mem, tokenFields);
-          else if (Array.isArray(config.accounts)) config.accounts.push({ name: acct.name || acct.accountUuid.slice(0, 8), type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields });
+          let mem = (config.accounts || []).find(a => sameAccountIdentity(a, acct));
+          if (!mem && acct.organizationUuid) mem = organizationUnknownMatch(config.accounts || [], acct);
+          if (!mem && !acct.organizationUuid) mem = (config.accounts || []).filter(a => sameUser(a, acct)).length === 1
+            ? (config.accounts || []).find(a => sameUser(a, acct)) : null;
+          if (mem) {
+            Object.assign(mem, tokenFields);
+            if (acct.organizationUuid) mem.organizationUuid = acct.organizationUuid;
+          } else if (Array.isArray(config.accounts)) config.accounts.push(newInjectedEntry(acct, tokenFields, config.accounts));
         } catch (err) {
           // A single-use credential write is only "ok" when it is DURABLE: the browser
           // login may have invalidated the previous refresh token, so memory-only means
@@ -755,6 +777,23 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
  */
+/** The account a remote login adds: one Claude user in one organization, plus its tokens. */
+function newInjectedEntry(acct, tokenFields, existing = []) {
+  // Two organizations of one user must never share a name: name-keyed lookups
+  // (disk sync, config writer) would write one org's tokens over the other's.
+  let name = acct.name || acct.accountUuid.slice(0, 8);
+  if (existing.some(a => !sameAccountIdentity(a, acct) && a.name === name)) {
+    const type = String(acct.orgType || '').replace(/^claude_/, '');
+    const suffix = type || '2';
+    let n = 2;
+    while (existing.some(a => a.name === `${name} (${suffix}${n > 2 ? ' ' + n : ''})`)) n++;
+    name = `${name} (${suffix}${n > 2 ? ' ' + n : ''})`;
+  }
+  const entry = { name, type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields };
+  if (acct.organizationUuid) entry.organizationUuid = acct.organizationUuid;
+  return entry;
+}
+
 async function relayRaw(req, res, upstream) {
   const bodyChunks = [];
   for await (const chunk of req) bodyChunks.push(chunk);
