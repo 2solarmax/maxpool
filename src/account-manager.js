@@ -3465,8 +3465,10 @@ export class AccountManager {
    *     roomy peers (a peer serving only 'all' takes none of its 'claude' requests).
    *     A self that serves no profile has no confirmed room (0).
    *   - routable NOW: enabled, not throttled/error/exhausted, not pool-benched
-   *     (another process owns it), not a remote mirror (routed by its holder pool),
-   *     not auth/subscription-dead.
+   *     (a benched local copy is counted through its cloud mirror, never twice),
+   *     not auth/subscription-dead. A cloud MIRROR row counts like a local one,
+   *     judged on the cloud's exported state; its freshness is the cloud's own
+   *     quota.lastProbeOkAt (an older cloud that sends none = unknown = not counted).
    *   - weekly util (unified7d) leaves ≥ POLICY.holdPeerWeeklyRoom to the peer's
    *     weekly ceiling — its effective usage cap, else 1.0 (uncapped: below the 0.65
    *     `soft` tier the router already spreads load at). Red-team #4: room is
@@ -3475,8 +3477,9 @@ export class AccountManager {
    *     session bench (_sessionBenchThreshold: its 5h cap, else the 0.90 switch
    *     threshold) — a session-benched account absorbs nothing.
    *   - a DIFFERENT identity (accountUuid/credential fingerprint) — not this same
-   *     account under a second name; peers sharing one capacityIdentity (two local
-   *     names for one subscription) count ONCE (red-team #6).
+   *     account under a second name; peers sharing one capacity group (two local
+   *     names, or a mirror and its org-less twin, for one subscription) count ONCE
+   *     (red-team #6).
    *   - every ACTIVE model bucket the peer reports also has ≥ holdPeerWeeklyRoom
    *     left (red-team #1) — the walled account serves no model at all, so a peer
    *     whose Fable is exhausted/full (or 429-marked, or unreadable) would leave
@@ -3500,10 +3503,16 @@ export class AccountManager {
       const id = this.capacityIdentity(p);
       if (id == null || selfGroup.has(p)) continue;
       if (p.type !== 'oauth' || p.enabled === false) continue;
-      if (p.remote || p.poolBenchedBy) continue;
+      // A benched local copy is skipped; its identity is counted through the cloud
+      // MIRROR of the same account (one peer per capacity identity, below).
+      if (p.poolBenchedBy) continue;
       if (p.refreshDead || p.subscriptionGone) continue;
       if (p.status === 'throttled' || p.status === 'error' || p.status === 'exhausted') continue;
       if (p.cooldownUntil && p.cooldownUntil > now) continue;
+      // A cloud MIRROR carries the cloud's own exported state (status, refreshDead,
+      // quota incl. the cloud's lastProbeOkAt, cap, cap-lift) — judged below by the
+      // same gates as a local row. Its cooldown is the cloud's, copied separately.
+      if (p.remote && p.remoteCooldownUntil && p.remoteCooldownUntil > now) continue;
       const q = p.quota || {};
       // Probe-fresh only: a peer whose reading predates this sweep's decision is
       // unknown capacity, and unknown capacity must not hold a claim.
@@ -3514,11 +3523,13 @@ export class AccountManager {
       if (!roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
       const buckets = Object.values(q.scopedWeekly || {}).filter(e => e && e.isActive !== false);
       if (buckets.some(e => !roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom))) continue;
-      roomy.push({ p, id });
+      // One peer per capacity GROUP (lowest member index as its key): an org-less twin
+      // of the same login, or a mirror + a second mirror of it, is one subscription.
+      roomy.push({ p, key: Math.min(...this.capacityGroupOf(p).map(x => x.index)) });
     }
     if (!selfProfiles.length) return 0;
     return Math.min(...selfProfiles.map(pr =>
-      new Set(roomy.filter(({ p }) => this._matchesProfile(p, pr)).map(({ id }) => id)).size));
+      new Set(roomy.filter(({ p }) => this._matchesProfile(p, pr)).map(({ key }) => key)).size));
   }
 
   // ── R7 hold register (red-team r2 #1/#2) ──────────────────────────────────
@@ -6046,6 +6057,9 @@ export class AccountManager {
       a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
       a.status = ra.status || 'active';
       a.refreshDead = Boolean(ra.refreshDead);
+      // The CLOUD's cooldown (additive export; an older cloud omits it = none). Kept off
+      // `cooldownUntil`, which is this process's own routing gate for the mirror row.
+      { const cd = ra.cooldownUntil ? Date.parse(ra.cooldownUntil) : NaN; a.remoteCooldownUntil = Number.isFinite(cd) ? cd : null; }
       a.lastError = ra.lastError || null;
       a.rateLimitedUntil = ra.rateLimitedUntil ? Date.parse(ra.rateLimitedUntil) : null;
       a.capUtilization = ra.capUtilization ?? null;
