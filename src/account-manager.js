@@ -4973,7 +4973,19 @@ export class AccountManager {
   capacityGroupOf(a) {
     const id = this.capacityIdentity(a);
     if (!id) return [a];
-    return this.accounts.filter(x => this.capacityIdentity(x) === id);
+    const same = this.accounts.filter(x => this.capacityIdentity(x) === id);
+    // `uuid:<user>[:<org>]`: a row whose organization is unknown (saved before orgs
+    // were recorded, or mirrored from an older pool) is still the same login as the
+    // user's org-bearing row while that user has ONE known organization here. Two
+    // known organizations are two subscriptions: then only exact ids group.
+    if (!id.startsWith('uuid:')) return same;
+    const user = id.split(':')[1];
+    const rows = this.accounts.filter(x => {
+      const xid = this.capacityIdentity(x);
+      return xid && xid.startsWith('uuid:') && xid.split(':')[1] === user;
+    });
+    const orgs = new Set(rows.map(x => this.capacityIdentity(x).split(':')[2]).filter(Boolean));
+    return orgs.size > 1 ? same : rows;
   }
 
   /** Merged closed-cycle history of an account's whole identity: this pool's ledger

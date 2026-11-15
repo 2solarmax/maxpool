@@ -491,7 +491,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           if (amAcct.status === 'error') amAcct.status = 'active';
           appendEventLog(`[Maxpool] Remote re-auth: "${amAcct.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
         } else {
-          const entry = newInjectedEntry(acct, tokenFields);
+          const entry = newInjectedEntry(acct, tokenFields, accountManager.accounts);
+          acct.name = entry.name; // the disk row and config mirror below take the same unique name
           accountManager.addAccount(entry);
           appendEventLog(`[Maxpool] Remote add: "${entry.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
         }
