@@ -16,6 +16,8 @@ test('3 consecutive busy refusals move the turn; a queue resume never re-picks t
     return n === 1 ? pinRefusal('pinned_account_busy', 1) : 'sse';   // the sibling is busy once
   });
   const { am, port, cleanup } = await bootLink(remote, { enabled: true, pollMs: 50, heartbeatMs: 1000 });
+  // Balance mode: the pick is scored (sticky mode's session binding would hide the rule).
+  am.setProviderRoutingMode('balance');
   try {
     const body = bigBody(260_000, true);
     assert.equal((await postTurn(port, body)).status, 200);

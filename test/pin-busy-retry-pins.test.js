@@ -14,6 +14,8 @@ test('after the wait the retry acquires the same account even with an idle sibli
     return 'sse';
   });
   const { am, port, cleanup } = await bootLink(remote);
+  // Balance mode: the pick is scored (sticky mode's session binding would hide the rule).
+  am.setProviderRoutingMode('balance');
   try {
     const body = bigBody(260_000, true);
     assert.equal((await postTurn(port, body)).status, 200);
