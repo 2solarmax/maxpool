@@ -3504,7 +3504,7 @@ export class AccountManager {
       if (id == null || selfGroup.has(p)) continue;
       if (p.type !== 'oauth' || p.enabled === false) continue;
       // A benched local copy is skipped; its identity is counted through the cloud
-      // MIRROR of the same account (one peer per capacity identity, below).
+      // MIRROR of the same account (one peer per capacity group, below).
       if (p.poolBenchedBy) continue;
       if (p.refreshDead || p.subscriptionGone) continue;
       if (p.status === 'throttled' || p.status === 'error' || p.status === 'exhausted') continue;
