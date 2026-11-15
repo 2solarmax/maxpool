@@ -431,6 +431,14 @@ function finishEfficiency(acc, provider) {
   };
 }
 
+/** Combine efficiency blocks (summaries or exports) into one, with derived figures —
+ *  `maxpool status` uses it to add linked pools' exported sums to the local ones. */
+export function combineEfficiency(blocks, provider) {
+  const acc = emptyEfficiency();
+  for (const b of blocks) if (b) addEfficiency(acc, b);
+  return finishEfficiency(acc, provider);
+}
+
 const CONVERSATION_AFFINITY_MAX = 5000;
 /** Bounded LRU insert: re-insert = most recent; the oldest key drops past the cap. */
 function lruSet(map, key, value) {
@@ -1253,7 +1261,18 @@ export class AccountManager {
       // Backstop for callers that never saw a first byte (unit callers): a 2xx served
       // the conversation. Idempotent — the first-byte note already ran on the real paths.
       if (lease.requestInfo && !(outcome.status >= 300)) this.noteConversationServed(lease.requestInfo, account);
-      this._recordLoadEvent(account, lease, { ...outcome, success: true, ...this._servedTelemetry(lease.requestInfo, account) });
+      const tel = this._servedTelemetry(lease.requestInfo, account);
+      this._recordLoadEvent(account, lease, {
+        ...outcome, success: true,
+        ...tel,
+        // An outcome-provided explicit value (tests, the link relay) wins over the
+        // request-derived one; tel keys are always present so ?? keeps them honest.
+        ...Object.fromEntries(Object.entries(tel).filter(([, v]) => v !== 0 && v !== null && v !== false)),
+        ...(outcome.usage ? { usage: outcome.usage } : {}),
+        ...(outcome.moved != null ? { moved: outcome.moved, moveCause: outcome.moveCause ?? tel.moveCause } : {}),
+        ...(outcome.newConversation != null ? { newConversation: outcome.newConversation } : {}),
+        ...(outcome.busyWaitMs ? { busyWaitMs: outcome.busyWaitMs } : {}),
+      });
       account.lastSuccessAt = Date.now();
       return;
     }
@@ -1287,7 +1306,7 @@ export class AccountManager {
       // Efficiency telemetry (2026-11-15) — optional, read by _efficiencySummary only.
       bounced: Boolean(outcome.bounced),
       usage: outcome.usage || null,
-      moved: Boolean(outcome.moved),
+      moved: Boolean(outcome.moved ?? outcome._servedMoved),
       newConversation: Boolean(outcome.newConversation),
       moveCause: outcome.moveCause || null,
       busyWaitMs: outcome.busyWaitMs || 0,
@@ -1310,6 +1329,7 @@ export class AccountManager {
       moved,
       moveCause: moved ? (ri._moveCause || (ri._hop > 0 ? 'other' : 'balance')) : null,
       newConversation: Boolean(ri._newConversation) && ri._notedServed === account.name,
+
       busyWaitMs: ri._busyWaitMs || 0,
       e2eFirstByteMs: ri._servedAt && ri.startedAt ? Math.max(0, ri._servedAt - ri.startedAt) : null,
     };
@@ -1361,7 +1381,10 @@ export class AccountManager {
       const e = a.remote ? a._remoteLoad?.[windowKey]?.efficiency : this._efficiencyAcc(a, windowMs, now);
       if (e) addEfficiency(by[tag], e);
     }
-    return { claude: finishEfficiency(by.claude, 'claude'), glm: finishEfficiency(by.glm, 'glm') };
+    // Arrival-to-first-real-byte over this pool's own rows (percentiles do not add).
+    const e2e = [...by.claude.e2e, ...by.glm.e2e];
+    return { claude: finishEfficiency(by.claude, 'claude'), glm: finishEfficiency(by.glm, 'glm'),
+      e2eP50: pct(e2e, 0.5), e2eP95: pct(e2e, 0.95) };
   }
 
   /** Final client outcome of one request at THIS pool. Edge-only: a request pinned to
@@ -6656,6 +6679,12 @@ export class AccountManager {
         },
         // The cloud's pin limit for this row (linked pools skip it one short of this).
         pinBusyAt: a.remote ? null : this._pinBusyLimit(a),
+        // A cloud row's cache figures as the SERVING pool exported them (team-wide on
+        // that account); null on an older cloud or a local row.
+        teamEfficiency: a.remote ? {
+          last15m: a._remoteLoad?.last15m?.efficiency ?? null,
+          last1h: a._remoteLoad?.last1h?.efficiency ?? null,
+        } : null,
         lastError: a.lastError,
         lastErrorAt: a.lastErrorAt ? new Date(a.lastErrorAt).toISOString() : null,
         cooldownUntil: Math.max(a.cooldownUntil || 0, a.provisionalUpstreamUntil || 0)

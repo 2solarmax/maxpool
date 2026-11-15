@@ -12,19 +12,19 @@ export const close = s => { s.closeAllConnections?.(); return new Promise(r => s
 const SSE_OK = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_link_ok"}}\n\n'
   + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 
-export function remotePool(plan) {
+export function remotePool(plan, { accounts = null } = {}) {
   const hits = [];
   const per = new Map();
   const server = http.createServer((req, res) => {
     if (req.url === '/maxpool/status') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ accounts: [
+      res.end(JSON.stringify({ accounts: accounts || [
         { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
         { name: 'personal', type: 'oauth', accountUuid: 'U2', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } },
       ] }));
       return;
     }
-    if (req.url !== '/v1/messages') { res.writeHead(404); res.end('{}'); return; }
+    if (!req.url.startsWith('/v1/messages')) { res.writeHead(404); res.end('{}'); return; }
     req.resume();
     const pin = req.headers['x-maxpool-pin-account'] || '?';
     const n = (per.get(pin) || 0) + 1; per.set(pin, n);
@@ -59,17 +59,17 @@ export function remotePool(plan) {
   return { server, hits };
 }
 
-export async function bootLink(remote, queue = { enabled: false }) {
+export async function bootLink(remote, queue = { enabled: false }, { localAccounts = [], upstreamHandler = null } = {}) {
   const remotePort = await listen(remote.server);
-  const upstream = http.createServer((req, res) => { res.writeHead(500); res.end('{}'); });
+  const upstream = http.createServer(upstreamHandler || ((req, res) => { res.writeHead(500); res.end('{}'); }));
   const upPort = await listen(upstream);
-  const am = new AccountManager([], 0.9);
+  const am = new AccountManager(localAccounts, 0.9);
   const link = new PoolLink({ name: 'team', url: `http://127.0.0.1:${remotePort}`, key: 'mp-max' });
   await link.poll();
   am.setPoolLinks([link]);
   const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: `http://127.0.0.1:${upPort}`, queue });
   const port = await listen(proxy);
-  return { am, port, cleanup: async () => { am.setPoolLinks([]); await close(proxy); await close(remote.server); await close(upstream); } };
+  return { am, port, link, cleanup: async () => { am.setPoolLinks([]); await close(proxy); await close(remote.server); await close(upstream); } };
 }
 
 export function bigBody(bytes, stream) {
@@ -84,3 +84,17 @@ export async function captureLog(fn) {
   return lines;
 }
 export const attempts = lines => lines.filter(l => l.startsWith('[Maxpool] attempt failed ('));
+
+// Sticky-busy fixtures (2026-11-15): a pinned refusal, and a POST that carries the
+// conversation's terminal key so every turn of one test is the same conversation.
+export const pinRefusal = (type, retryAfter = 1, headers = {}) => ({
+  status: 503, headers: { 'retry-after': String(retryAfter), ...headers },
+  body: { type: 'error', error: { type, message: type } },
+});
+export async function postTurn(port, body, { session = 'sess-warm', headers = {}, signal } = {}) {
+  const r = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'tc-test', 'x-maxpool-session': session, ...headers }, body, signal,
+  });
+  return { status: r.status, text: await r.text() };
+}
+export const mirror = (am, name) => am.accounts.find(a => a.name === `${name} ☁`);

@@ -20,7 +20,8 @@ import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setC
 import { sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
 import { SleepGuard } from './sleep-guard.js';
 import { controllingTerminalAlive } from './terminal-alive.js';
-import { AccountManager } from './account-manager.js';
+import { AccountManager, combineEfficiency } from './account-manager.js';
+import { cacheUsageLabel } from './usage-label.js';
 import { createProxyServer, REQUEST_IDLE_MAX_MS } from './server.js';
 
 // ── Happy Eyeballs: stop racing a dead IPv6 leg ────────────────────────────────
@@ -1089,7 +1090,8 @@ async function serverWorkerCommand() {
         // Headless (service / shared VM) pools have no TUI log buffer, so named-caller
         // attribution would otherwise reach no log at all. Only named callers are
         // logged here — a solo headless pool stays as quiet as before.
-        appendEventLog(`[Maxpool] ${info.caller} · ${info.method} ${info.path} → ${info.account || '?'} (${info.status})${info.conversation ? `  [cv ${info.conversation.slice(0, 8)}]` : ''}`);
+        const cache = cacheUsageLabel(info.cacheUsage);
+        appendEventLog(`[Maxpool] ${info.caller} · ${info.method} ${info.path} → ${info.account || '?'} (${info.status})${info.conversation ? `  [cv ${info.conversation.slice(0, 8)}]` : ''}${cache ? ` ${cache}` : ''}`);
       }
     },
   };
@@ -1395,7 +1397,8 @@ async function serverWorkerCommand() {
         // in memory but silently reverts on the next config write / restart. Merge
         // onto the existing disk scheduler block so other scheduler keys survive.
         if (config.scheduler?.crossProviderFallbackPolicy || config.scheduler?.providers
-          || config.scheduler?.weeklyAwareScoring !== undefined) {
+          || config.scheduler?.weeklyAwareScoring !== undefined
+          || config.scheduler?.stickyBusyBudgetMs !== undefined) {
           diskConfig.scheduler = {
             ...diskConfig.scheduler,
             ...(config.scheduler.crossProviderFallbackPolicy
@@ -1408,6 +1411,9 @@ async function serverWorkerCommand() {
             // default on the next restart.
             ...(config.scheduler.weeklyAwareScoring !== undefined
               ? { weeklyAwareScoring: config.scheduler.weeklyAwareScoring } : {}),
+            // Wait for busy account (TUI routing b) — same reason as above.
+            ...(config.scheduler.stickyBusyBudgetMs !== undefined
+              ? { stickyBusyBudgetMs: config.scheduler.stickyBusyBudgetMs } : {}),
           };
         }
         // Persist live-toggled automatic-update flags (the TUI 'u' Updates menu). Same
@@ -2230,6 +2236,8 @@ async function statusCommand() {
       console.log(`Anthropic:      temporarily throttled (${state}, queued ${queued}${oldest})\n`);
     }
 
+    for (const line of efficiencyLines(data)) console.log(line);
+
     for (const acct of data.accounts) {
       const q = acct.quota;
       const current = acct.name === data.currentAccount ? ' *' : '';
@@ -2237,6 +2245,9 @@ async function statusCommand() {
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.enabled === false ? 'disabled' : acct.status}`);
       console.log(`    Load:     current ${acct.load?.current?.inFlight || 0}/${acct.load?.current?.activeWeight || 0} weight, 15m ${formatLoadWindow(acct.load?.last15m)}, 1h ${formatLoadWindow(acct.load?.last1h)}`);
+      // Cloud rows: the cache figure the serving pool exported (team-wide on that account).
+      const eff = acct.remote ? acct.teamEfficiency?.last1h : acct.load?.last1h?.efficiency;
+      if (eff && (eff.served || eff.bounced)) console.log(`    Cache:    ${pctOrDash(eff.hit)} over 1h${acct.remote ? ' (team)' : ''}, ${eff.served || 0} served, ${eff.bounced || 0} bounced`);
 
       if (acct.type === 'provider') {
         const last = acct.lastStatus ? `${acct.lastStatus} in ${formatDurationMs(acct.lastResponseMs)}` : '-';
@@ -2761,6 +2772,38 @@ function formatDurationMs(ms) {
   const sec = ms / 1000;
   if (sec < 60) return `${sec.toFixed(1)}s`;
   return `${Math.floor(sec / 60)}m${String(Math.round(sec % 60)).padStart(2, '0')}s`;
+}
+
+// A function declaration, not a const: commands dispatch before later consts initialise.
+function pctOrDash(x) { return x == null ? '—' : `${Math.round(x * 100)}%`; }
+
+/** `maxpool status` Efficiency block. Overall = this pool's own rows + each linked
+ *  pool's exported sums (a request counted once, by the pool that served it). Missing
+ *  fields (an older pool) read '—', never 0. */
+function efficiencyLines(data, key = 'last15m') {
+  const accts = data.accounts || [];
+  const local = data.efficiency?.[key];
+  if (!local) return [];
+  const team = (p) => accts.filter(a => a.remote && a.teamEfficiency?.[key]?.provider === p).map(a => a.teamEfficiency[key]);
+  const claude = combineEfficiency([local.claude, ...team('claude')], 'claude');
+  const glm = combineEfficiency([local.glm, ...team('glm')], 'glm');
+  const served = claude.served + glm.served;
+  const sum = (f) => claude[f] + glm[f];
+  const cause = (c) => claude.movedByCause[c] + glm.movedByCause[c];
+  const failed = accts.reduce((n, a) => n + (a.load?.[key]?.failed || 0), 0);
+  const linkDrops = accts.reduce((n, a) => n + (a.load?.[key]?.linkFailed || 0), 0);
+  const co = data.clientOutcomes?.[key];
+  const s = (ms) => (ms == null ? '—' : `${(ms / 1000).toFixed(1)}s`);
+  return [
+    `Efficiency (${key === 'last1h' ? '1h' : '15m'}):`,
+    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)`,
+    `  Moves:        ${served ? Math.round(sum('moved') * 100 / served) : 0}/100 served (busy ${cause('busy')} · balance ${cause('balance')} · wall ${cause('wall')} · link ${cause('link')} · other ${cause('other')})`,
+    `  Bounced:      ${sum('bounced')} (refused ${sum('refused')}) · failed ${failed} · link drops ${linkDrops}`,
+    `  Waited:       ${sum('waited')}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${sum('waitThenMoved')}`,
+    `  Client errors: ${co ? `${co.poolErrors + co.requestErrors} of ${co.total} (pool ${co.poolErrors} · request ${co.requestErrors})` : '—'}`,
+    `  First byte:   p50 ${s(local.e2eP50)} · p95 ${s(local.e2eP95)} (this pool)`,
+    '',
+  ];
 }
 
 function formatLoadWindow(load = {}) {
