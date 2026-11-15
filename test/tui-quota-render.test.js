@@ -267,6 +267,19 @@ test('a probe-only scoped cap still reads stale on a stale probe even when the u
   assert.match(line, /rate-limited, retrying/, 'a displayed scoped cap is probe-only → still warn');
 });
 
+test('a low Fable reading drawn in the Fbl bar still reads stale on a stale probe', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 60_000;
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.40, severity: 'normal', isActive: true, resetAt: Date.now() + 3 * DAY } } });
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;  // the shown Fbl 40% is now unconfirmed
+  am.accounts[0].quota.lastProbeErrorStatus = 429;
+  am.accounts[0].quota.lastHeaderQuotaAt = Date.now();           // Ses/Wk fresh from headers, Fable is probe-ONLY
+  const tui = new TUI({ accountManager: am });
+  assert.match(strip(tui._renderAcct(0, 11, true, true)), /rate-limited, retrying/, 'the Fbl bar shows it → warn');
+  assert.doesNotMatch(strip(tui._renderAcct(0, 11, true, false)), /quota .* old|rate-limited/,
+    'no Fbl bar and below the tag floor → nothing displayed is stale');
+});
+
 test('automatic mode marks accounts SERVING right now (inFlight>0) with ►, not the last-routed idle one', () => {
   const am = oauthAM();
   am.routingMode = 'automatic';

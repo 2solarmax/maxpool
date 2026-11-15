@@ -80,3 +80,25 @@ test('a provider session reading also keeps the Ses column', () => {
   const rows = frameRows(am, 120);
   for (const l of rows) assert.match(l, /Fbl .*Ses .* Wk /, `three bars: ${l}`);
 });
+
+test('a session window that expires on an idle pool keeps the Ses column (no width jump)', () => {
+  const am = pool();
+  withSession(am, 0);
+  weeklyOnly(am, 1);
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } } });
+  const render = () => {
+    const saved = { columns: process.stdout.columns, rows: process.stdout.rows, write: process.stdout.write };
+    let buf = '';
+    process.stdout.columns = 120; process.stdout.rows = 24;
+    process.stdout.write = s => { buf += s; return true; };
+    try { tui._render(); } finally { Object.assign(process.stdout, saved); }
+    return strip(buf).split(/\r?\n/).filter(l => /^ {4}(home|work|glm) /.test(l));
+  };
+  const before = render();
+  assert.match(before[0], /Fbl .*Ses .* Wk /);
+  am.accounts[0].quota.unified5h = null;          // the 5h window expired, nothing served since
+  am.accounts[0].quota.unified5hReset = null;
+  const after = render();
+  for (const l of after) assert.match(l, /(Ses|Tok) /, `Ses column stays: ${l}`);
+  assert.equal(after[1].indexOf(' Wk '), before[1].indexOf(' Wk '), 'bars keep their width');
+});

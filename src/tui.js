@@ -2556,7 +2556,12 @@ export class TUI {
       // the header and the data (a left-aligned sentence there reads as a broken,
       // misaligned second header).
       lines.push(dimUnderline(acctHeader(W)));
-      const { showSession, showBoth, showFable, bw } = barLayout(W, this.am.accounts.some(hasSessionReading));
+      // Sticky: once any account has reported a session window in this run, keep the
+      // Ses column. A window that simply expires on an idle pool nulls its reading
+      // until the next request or probe; dropping and re-adding the column then
+      // would make every bar jump width. Pools that never report one keep it hidden.
+      this._sessionColumnSeen = this._sessionColumnSeen || this.am.accounts.some(hasSessionReading);
+      const { showSession, showBoth, showFable, bw } = barLayout(W, this._sessionColumnSeen);
 
       // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
       // display order over the canonical am.accounts array (which stays untouched so
@@ -3023,7 +3028,7 @@ export class TUI {
     // headers don't carry them). If the probe has gone stale, say so — and name the
     // cause (e.g. rate-limited) when a probe failure is on record — rather than imply
     // the last-known value is current.
-    line += this._probeHealthNote(a);
+    line += this._probeHealthNote(a, showFable);
     const act = loadText(this._accountLoad(a));
     if (act) line += `  ${dim(act)}`;
     return line;
@@ -3033,7 +3038,7 @@ export class TUI {
    *  stale, names the cause from the last recorded probe failure (e.g. a 429 from
    *  the usage endpoint) so a self-throttling probe reads as "rate-limited" rather
    *  than an unexplained "stale". Leading spaces included so callers append raw. */
-  _probeHealthNote(a) {
+  _probeHealthNote(a, showFable = false) {
     // A dead account (reauth / disabled) already surfaces its state in the status
     // column, and its quota reading is frozen and moot — the prober skips it, so a
     // "stale·probe 401" here is just the perpetual echo of the 401 that killed it.
@@ -3047,13 +3052,15 @@ export class TUI {
     // so a BUSY oauth account with a header-fresh reading and no probe-only scoped
     // cap is NOT stale, even if its background probe is 429-throttled. Provider bars
     // and per-model scoped caps ARE probe-only, so for those a stale probe genuinely
-    // means stale data → keep flagging. The Fbl bar shows the Fable reading at any
-    // level, but a stale low reading changes no routing decision, so this flag keeps
-    // the same reserve-floor gate as the tag.
+    // means stale data → keep flagging. A scoped reading is DISPLAYED when its tag
+    // shows (at or above the reserve floor) or, for Fable, whenever the Fbl bar is on
+    // screen: the bar draws the reading at any level, so a stale low Fbl value must
+    // carry the age marker too.
     const q = a.quota || {};
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85; // mirrors _renderAcct's scoped-tag gate
-    const hasDisplayedScopedCap = Object.values(q.scopedWeekly || {}).some(
-      e => e && e.isActive !== false && e.utilization != null && e.utilization >= reserveFloor);
+    const hasDisplayedScopedCap = Object.entries(q.scopedWeekly || {}).some(([family, e]) =>
+      e && e.isActive !== false && e.utilization != null
+      && (e.utilization >= reserveFloor || (showFable && family === 'fable')));
     if (a.type !== 'provider' && !hasDisplayedScopedCap) {
       const interval = this.am.quotaProbeIntervalMs; // > 0 here (else _quotaProbeStale returned false)
       const headerFresh = q.lastHeaderQuotaAt && (Date.now() - q.lastHeaderQuotaAt) <= Math.max(3 * interval, 180_000);
