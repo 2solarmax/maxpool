@@ -5,17 +5,26 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.24.94] - 2026-11-14
+## [1.24.95] - 2026-11-15
 
 ### Changed
 
-- Simplify pass — reattach _holdsUsableReset JSDoc displaced by the R7 block
-- Isolated reload files get the same one-retry policy as the fast tests
+- Contributor guide + lean, gated CI
 
-## [1.24.93] - 2026-11-14
+### Fixed
+
+- End client stream when the upstream leg dies after the status was sent
+- Capacity history spans an org-less row; injected rows get one unique name; regression tests
+- Round-2 from adversarial verification — symmetric healing, local-side wildcard ambiguity, group-deduped peers
+
+## [1.24.94] - 2026-11-14
 
 ### Added
 
+- Show a Fable weekly bar between the session and week bars
+- Keep two organizations of one Claude login as separate accounts
+- Leave out the session bar when no account reports a session window
+- Put the Fable weekly bar first, before the session and week bars
 - Hold a wall claim for the imminent free refill while the pool has room
 
 ### Changed
@@ -29,6 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - RED — red-team round 3: the hold is for the general weekly wall only
 - RED — red-team round 4 (7 findings)
 - RED — red-team round 5 (3 findings)
+- Simplify pass — reattach _holdsUsableReset JSDoc displaced by the R7 block
+- Isolated reload files get the same one-retry policy as the fast tests
+
+### Fixed
+
+- Fbl staleness marker + stable Ses column
+- Org-less rows heal instead of duplicating; two orgs never share tokens by name
+- Red-team round 1 — model-aware room, fall-through hold, direct reactive gate, cap-measured room, distinct identities
+- Red-team round 2 — held-wall rescue, pool-wide hold budget, identity-less peers skipped
+- Red-team round 3 — hold only the general weekly wall
+- Red-team round 4 — seven findings
+- Red-team round 5 — give-back keeps the hold, dead holders don't count, hold survives restart
+
+## [1.24.93] - 2026-11-14
+
+### Changed
+
 - RED — seamless reload stalls when the terminal is not reading (supervisor + reload worker block on tty writes)
 - Pin the terminal-not-reading fix elements the pty test cannot see
 - Red-team round 2 — id-less notices settle but never cold-restart; helper process; quit/respawn never wait on the terminal
@@ -37,11 +63,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Red-team round 1 — model-aware room, fall-through hold, direct reactive gate, cap-measured room, distinct identities
-- Red-team round 2 — held-wall rescue, pool-wide hold budget, identity-less peers skipped
-- Red-team round 3 — hold only the general weekly wall
-- Red-team round 4 — seven findings
-- Red-team round 5 — give-back keeps the hold, dead holders don't count, hold survives restart
 - Seamless reload no longer stalls when the terminal is not reading
 - Cold start keeps synchronous raw mode; deferred reclaim fires on progress
 - Red-team round 1 — rollback notices name their reload, terminal mode switches never stall a serving worker
