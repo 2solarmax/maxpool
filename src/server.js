@@ -9,7 +9,7 @@ import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor, f
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { modelFamily, organizationUnknownMatch, sameAccountIdentity } from './oauth.js';
+import { modelFamily, organizationUnknownMatch, sameAccountIdentity, sameUser } from './oauth.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -471,8 +471,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // Exact match (user + org), else the ONE same-user row with no org yet: a
         // login to a pool saved before organizations were recorded re-authenticates
         // that row and stamps the organization onto it, exactly like the local path.
+        // Healing, BOTH directions: (a) an org-bearing login into a pool whose row
+        // predates orgs re-authenticates that row and stamps the org onto it; (b) an
+        // org-less login from an OLDER client re-authenticates the user's single row
+        // (any org) without touching its org. Two rows of the user → ambiguous: add.
+        const sameUserRows = accountManager.accounts.filter(a => sameUser(a, acct));
         const amAcct = accountManager.accounts.find(a => sameAccountIdentity(a, acct))
-          || (acct.organizationUuid ? organizationUnknownMatch(accountManager.accounts, acct) : null);
+          || (acct.organizationUuid ? organizationUnknownMatch(accountManager.accounts, acct)
+            : (sameUserRows.length === 1 ? sameUserRows[0] : null));
         if (amAcct && acct.organizationUuid) amAcct.organizationUuid = acct.organizationUuid;
         const tokenFields = {
           accessToken: acct.accessToken,
@@ -500,6 +506,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           await atomicConfigUpdate(diskConfig => {
             let onDisk = diskConfig.accounts.find(a => sameAccountIdentity(a, acct));
             if (!onDisk && acct.organizationUuid) onDisk = organizationUnknownMatch(diskConfig.accounts, acct);
+            if (!onDisk && !acct.organizationUuid) onDisk = diskConfig.accounts.filter(a => sameUser(a, acct)).length === 1
+              ? diskConfig.accounts.find(a => sameUser(a, acct)) : null;
             if (onDisk) {
               Object.assign(onDisk, tokenFields);
               if (acct.organizationUuid) onDisk.organizationUuid = acct.organizationUuid;
@@ -513,6 +521,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           // uuid the mirror lacks, so a missing entry became a second live row.
           let mem = (config.accounts || []).find(a => sameAccountIdentity(a, acct));
           if (!mem && acct.organizationUuid) mem = organizationUnknownMatch(config.accounts || [], acct);
+          if (!mem && !acct.organizationUuid) mem = (config.accounts || []).filter(a => sameUser(a, acct)).length === 1
+            ? (config.accounts || []).find(a => sameUser(a, acct)) : null;
           if (mem) {
             Object.assign(mem, tokenFields);
             if (acct.organizationUuid) mem.organizationUuid = acct.organizationUuid;

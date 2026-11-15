@@ -2038,13 +2038,6 @@ async function loginOAuthCommand() {
     process.exit(1);
   }
   if (!name) name = profile?.email || `account-${Date.now().toString(36)}`;
-  // The pool may already hold this email as ANOTHER organization of the same
-  // user; the server suffixes duplicates itself, but name it well up front when
-  // we can see the org type.
-  if (name === profile?.email && profile?.orgType) {
-    const suggested = suggestAccountName([], profile);
-    if (suggested !== profile.email) name = suggested;
-  }
   console.log(`Sending "${name}" to the team pool "${pool.name}"...`);
   const r = await sendLoginToPool({ url: pool.url, key: pool.key, name, profile, creds });
   if (r.ok) {

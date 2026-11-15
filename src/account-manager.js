@@ -3489,13 +3489,16 @@ export class AccountManager {
    *  Returns a plain integer (the minimum over self's profiles); the POLICY decides
    *  sufficiency (holdMinPeers × holders). */
   countPeersWithRoom(self, now = Date.now()) {
-    const selfId = this.capacityIdentity(self);
+    // Peers are deduped by capacity GROUP, not identity string: an org-less twin
+    // of the same subscription (uuid:U vs uuid:U:org) groups with self and must
+    // never count as a second roomy member of the pool.
+    const selfGroup = new Set(this.capacityGroupOf(self));
     const selfProfiles = self?.profiles || ['claude', 'all'];
     const roomLeft = (util, ceiling, room) => Number.isFinite(util) && util <= ceiling - room;
     const roomy = [];
     for (const p of this.accounts) {
       const id = this.capacityIdentity(p);
-      if (id == null || id === selfId) continue;
+      if (id == null || selfGroup.has(p)) continue;
       if (p.type !== 'oauth' || p.enabled === false) continue;
       if (p.remote || p.poolBenchedBy) continue;
       if (p.refreshDead || p.subscriptionGone) continue;

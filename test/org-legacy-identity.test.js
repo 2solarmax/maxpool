@@ -244,3 +244,28 @@ test('capacityGroupOf: an org-less mirror groups with the one-org local row; a s
   assert.ok(!split.includes(other), 'the second org is not in the first org\'s group');
   assert.ok(split.includes(localOne));
 });
+
+// ── round-2 verification: the reverse healing direction and wildcard ambiguity ──
+
+test('inject from an OLDER client (no organizationUuid) re-authenticates the one org-bearing row, no duplicate', async () => {
+  const { am, port } = await startPool([row({ organizationUuid: O1 })]);
+  await inject(port, { name: NAME, accountUuid: U1, accessToken: 'T2-acc', refreshToken: 'T2-ref' }); // no org
+  const rows = am.accounts.filter(a => a.accountUuid === U1);
+  assert.equal(rows.length, 1, 'no second row for the same subscription');
+  assert.equal(rows[0].organizationUuid, O1, 'the row keeps its known org');
+  assert.equal(rows[0].refreshToken, 'T2-ref');
+});
+
+test('one org-less remote row never benches BOTH local orgs of a user (local-side ambiguity)', async () => {
+  const { remoteIdentities, computeDuplicates } = await import('../src/pool-link.js');
+  const ids = remoteIdentities({ accounts: [{ name: 'u@x (cloud)', type: 'oauth', accountUuid: U1, enabled: true }] });
+  const local = [
+    { name: 'u@x', type: 'oauth', accountUuid: U1, organizationUuid: O1, index: 0 },
+    { name: 'u@x (team)', type: 'oauth', accountUuid: U1, organizationUuid: 'org-two', index: 1 },
+  ];
+  assert.equal(computeDuplicates(local, ids).length, 0, 'ambiguous: bench neither local org');
+  // control: a single local org still benches against the org-less remote row
+  const single = [local[0]];
+  single[0] = { ...local[0], index: 0 };
+  assert.equal(computeDuplicates([single[0]], ids).length, 1, 'one local org → benched');
+});

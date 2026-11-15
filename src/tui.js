@@ -1889,7 +1889,7 @@ export class TUI {
     // pool saved the account before organizations were recorded) still owns the
     // login when it is the only same-user mirror: re-authenticate it rather than
     // add a second row. Two known orgs never alias.
-    const mirrors = this.am.accounts.filter(a => a.remote && sameUser({ accountUuid: a.remoteUuid }, profile));
+    const mirrors = this.am.accounts.filter(a => a.remote && a.enabled !== false && sameUser({ accountUuid: a.remoteUuid }, profile));
     return mirrors.find(a => sameAccountIdentity({ accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid }, profile))
       || (profile.organizationUuid && mirrors.filter(a => !a.remoteOrganizationUuid).length === 1
         ? mirrors.find(a => !a.remoteOrganizationUuid) : null);
@@ -2570,7 +2570,10 @@ export class TUI {
       // until the next request or probe; dropping and re-adding the column then
       // would make every bar jump width. Pools that never report one keep it hidden.
       this._sessionColumnSeen = this._sessionColumnSeen || this.am.accounts.some(hasSessionReading);
-      const { showSession, showBoth, showFable, bw } = barLayout(W, this._sessionColumnSeen);
+      // Below 70 columns only ONE bar fits: Wk (real data) wins over a latched-but-
+      // expired Ses, so the collapse logic still applies at narrow widths.
+      const latch = W >= 70 ? this._sessionColumnSeen : this.am.accounts.some(hasSessionReading);
+      const { showSession, showBoth, showFable, bw } = barLayout(W, latch);
 
       // Claude/OAuth accounts first, providers (GLM/Kimi fallback) last — a stable
       // display order over the canonical am.accounts array (which stays untouched so

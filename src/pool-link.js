@@ -110,10 +110,23 @@ export function remoteIdentities(status) {
 export function computeDuplicates(accounts, remoteIdentitiesMap) {
   const out = [];
   if (!remoteIdentitiesMap || remoteIdentitiesMap.size === 0) return out;
+  // The org-less wildcard `uuid:<user>:*` is resolved only while the user has at
+  // most ONE known organization locally. Two local orgs against one org-less
+  // remote row is ambiguous (the remote holds at most one of the two
+  // subscriptions), so then only an exact identity match benches — mirroring the
+  // remote-side ambiguity rule below.
+  const orgCount = new Map();
   for (const a of accounts) {
-    const own = identitiesOf(a);
-    const hit = own.map(id => remoteIdentitiesMap.get(id)).find(Boolean);
-    if (hit) out.push({ index: a.index, identity: own[0], remoteName: hit.name, provider: hit.provider });
+    if (a?.type === 'oauth' && a.accountUuid && a.organizationUuid) {
+      orgCount.set(a.accountUuid, (orgCount.get(a.accountUuid) || 0) + 1);
+    }
+  }
+  for (const a of accounts) {
+    const ids = identitiesOf(a);
+    const wildcard = ids[1];
+    const usable = orgCount.get(a.accountUuid) > 1 && wildcard ? ids.slice(0, 1) : ids;
+    const hit = usable.map(id => remoteIdentitiesMap.get(id)).find(Boolean);
+    if (hit) out.push({ index: a.index, identity: ids[0], remoteName: hit.name, provider: hit.provider });
   }
   return out;
 }
