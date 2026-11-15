@@ -590,7 +590,9 @@ function emptyBar(label, w = 10) {
  */
 function scopedWeeklyBar(quota, family, w) {
   const e = quota?.scopedWeekly?.[family];
-  if (!e || e.isActive === false || e.utilization == null) return emptyBar('—', w);
+  // is_active=false still carries a REAL reading (percent + reset days out): the
+  // limit exists and counts. Only a MISSING reading dashes.
+  if (!e || e.utilization == null) return emptyBar('—', w);
   return bar(e.utilization, w, e.resetAt);
 }
 

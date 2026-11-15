@@ -75,11 +75,11 @@ test('an exhausted Fable weekly shows 100% in the bar and still the "Fable maxed
   assert.match(line, /Fable maxed/, 'the existing tag stays');
 });
 
-test('a Fable limit Anthropic reports as inactive shows a dash, like no reading (routing ignores it too)', () => {
+test('a Fable limit Anthropic reports as inactive still shows its number (the limit exists and counts)', () => {
   const am = pool();
   fable(am, 0, { utilization: 0.99, isActive: false });
   const line = row(am, 0);
-  assert.equal(fableCell(line).trim(), '—');
+  assert.match(fableCell(line), /99%/, 'is_active=false is a real reading, not a dash');
 });
 
 test('a narrow terminal (showBoth=false) shows neither Fbl nor Wk', () => {
