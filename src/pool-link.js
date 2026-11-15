@@ -31,8 +31,9 @@ export function credentialFp(credential) {
 }
 
 /** Stable identity of an account for duplicate matching. Claude OAuth →
- *  accountUuid; provider key → provider + key fingerprint. null = no identity
- *  (an unnamed apikey account can't be matched — it never benches anything). */
+ *  accountUuid (+ organizationUuid when known); provider key → provider + key
+ *  fingerprint. null = no identity (an unnamed apikey account can't be matched —
+ *  it never benches anything). */
 export function accountIdentity(account) {
   if (!account) return null;
   if (account.type === 'oauth') {
@@ -43,6 +44,19 @@ export function accountIdentity(account) {
     return `key:${account.provider}:${credentialFp(account.credential)}`;
   }
   return null;
+}
+
+// Keys a LOCAL row looks up in a remote identity map. A row whose organization is
+// known also accepts the remote's org-less wildcard `uuid:<uuid>:*` (the remote
+// saved the login before organizations were recorded, or runs an older version);
+// an org-less row looks up the bare `uuid:<uuid>`, which an org-bearing remote row
+// also registers while that user has a single organization there. Two KNOWN and
+// different organizations never match.
+export function identitiesOf(account) {
+  const id = accountIdentity(account);
+  if (!id) return [];
+  if (account.type === 'oauth' && account.organizationUuid) return [id, `uuid:${account.accountUuid}:*`];
+  return [id];
 }
 
 /** Identity of a REMOTE status row (same key shape as accountIdentity). */
@@ -60,12 +74,33 @@ export function remoteAccountIdentity(a) {
 export function remoteIdentities(status) {
   const out = new Map();
   if (!status || !Array.isArray(status.accounts)) return out;
+  const orgsByUser = new Map();   // uuid -> Set of known organizations
+  const exactBare = new Set();    // bare keys owned by an org-less remote row
   for (const a of status.accounts) {
     if (a.enabled === false) continue; // a benched remote row doesn't bench the local copy
-    let id = null;
-    if (a.type === 'oauth') id = accountIdentity(a);
-    else if (a.type === 'provider' && a.keyFingerprint) id = `key:${a.provider}:${a.keyFingerprint}`;
-    if (id) out.set(id, { name: a.name, provider: a.provider, type: a.type });
+    const row = { name: a.name, provider: a.provider, type: a.type };
+    if (a.type === 'oauth') {
+      if (!a.accountUuid) continue;
+      const bare = `uuid:${a.accountUuid}`;
+      if (a.organizationUuid) {
+        out.set(`${bare}:${a.organizationUuid}`, row);
+        if (!out.has(bare)) out.set(bare, row);       // for an org-less local copy
+        const set = orgsByUser.get(a.accountUuid) || new Set();
+        set.add(a.organizationUuid); orgsByUser.set(a.accountUuid, set);
+      } else {
+        out.set(bare, row); exactBare.add(bare);
+        out.set(`${bare}:*`, row);                     // for an org-bearing local copy
+      }
+    } else if (a.type === 'provider' && a.keyFingerprint) {
+      out.set(`key:${a.provider}:${a.keyFingerprint}`, row);
+    }
+  }
+  // Two known organizations of one user make an org-less local copy ambiguous:
+  // drop the bare key rather than bench on a guess (unless an org-less remote row
+  // owns it exactly).
+  for (const [uuid, orgs] of orgsByUser) {
+    const bare = `uuid:${uuid}`;
+    if (orgs.size > 1 && !exactBare.has(bare)) out.delete(bare);
   }
   return out;
 }
@@ -76,9 +111,9 @@ export function computeDuplicates(accounts, remoteIdentitiesMap) {
   const out = [];
   if (!remoteIdentitiesMap || remoteIdentitiesMap.size === 0) return out;
   for (const a of accounts) {
-    const id = accountIdentity(a);
-    const hit = id ? remoteIdentitiesMap.get(id) : null;
-    if (hit) out.push({ index: a.index, identity: id, remoteName: hit.name, provider: hit.provider });
+    const own = identitiesOf(a);
+    const hit = own.map(id => remoteIdentitiesMap.get(id)).find(Boolean);
+    if (hit) out.push({ index: a.index, identity: own[0], remoteName: hit.name, provider: hit.provider });
   }
   return out;
 }

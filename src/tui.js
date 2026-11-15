@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline';
 import { readFileSync, writeSync } from 'node:fs';
 import { isatty } from 'node:tty';
 import { homedir } from 'node:os';
-import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
@@ -1885,8 +1885,14 @@ export class TUI {
   // uuid-first matcher cannot alias onto a local account).
   _findRemoteMirrorFor(profile) {
     if (!profile?.accountUuid) return null;
-    return this.am.accounts.find(a => a.remote
-      && sameAccountIdentity({ accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid }, profile)) || null;
+    // Exact match first (user + org). A mirror whose org is unknown (the cloud
+    // pool saved the account before organizations were recorded) still owns the
+    // login when it is the only same-user mirror: re-authenticate it rather than
+    // add a second row. Two known orgs never alias.
+    const mirrors = this.am.accounts.filter(a => a.remote && sameUser({ accountUuid: a.remoteUuid }, profile));
+    return mirrors.find(a => sameAccountIdentity({ accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid }, profile))
+      || (profile.organizationUuid && mirrors.filter(a => !a.remoteOrganizationUuid).length === 1
+        ? mirrors.find(a => !a.remoteOrganizationUuid) : null);
   }
 
   // Send a fresh browser login to the linked team pool that OWNS this account
@@ -2018,8 +2024,11 @@ export class TUI {
       expiresAt: creds.expiresAt,
     };
 
+    // Identity first; the name only picks up rows that cannot carry an identity
+    // (saved before uuids were stored). A row of the SAME USER with a KNOWN,
+    // DIFFERENT organization never matches by name: its tokens are its own.
     let idx = this.config.accounts.findIndex(a => sameAccountIdentity(a, entry));
-    if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+    if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name && !knownDifferentOrg(a, entry));
 
     if (idx >= 0) {
       const previous = this.config.accounts[idx];
@@ -2034,7 +2043,7 @@ export class TUI {
       // heal disk (persistTokenRefresh's generation guard skips a disk token that
       // != _refreshedFrom), so disk must be made correct right here.
       const amAcct = this.am.accounts.find(account =>
-        sameAccountIdentity(account, entry) || account.name === name
+        sameAccountIdentity(account, entry) || (account.name === name && !knownDifferentOrg(account, entry))
       );
       if (amAcct) {
         amAcct.credential = creds.accessToken;

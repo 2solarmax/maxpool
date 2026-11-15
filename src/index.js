@@ -42,7 +42,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 );
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
 import { TUI, writeTerminalSync, reclaimRawModeLogged, whenTerminalCaughtUp } from './tui.js';
 import { createTerminalModeSwitcher } from './terminal-mode.js';
 import { RestartController } from './restart-controller.js';
@@ -939,7 +939,7 @@ async function serverWorkerCommand() {
         // Pick up any new accounts from disk so index matching stays correct
         // (only add, don't refresh credentials — we're about to write the authoritative tokens)
         for (const diskAcct of diskConfig.accounts) {
-          const known = config.accounts.some(a => sameAccountIdentity(a, diskAcct) || a.name === diskAcct.name);
+          const known = config.accounts.some(a => sameAccountIdentity(a, diskAcct) || nameMatches(a, diskAcct));
           if (!known) {
             config.accounts.push(diskAcct);
             accountManager.addAccount(diskAcct);
@@ -1422,7 +1422,7 @@ async function serverWorkerCommand() {
         // Use live tokens from AccountManager (not the stale config.accounts copy).
         diskConfig.accounts = config.accounts.map(a => {
           const am = accountManager.accounts.find(candidate =>
-            sameAccountIdentity(candidate, a) || candidate.name === a.name
+            sameAccountIdentity(candidate, a) || nameMatches(candidate, a)
           );
           const live = am ? {
             ...a,
@@ -1431,7 +1431,7 @@ async function serverWorkerCommand() {
             expiresAt: am.expiresAt,
           } : a;
           const diskAcct = diskConfig.accounts.find(
-            d => sameAccountIdentity(d, a) || d.name === a.name
+            d => sameAccountIdentity(d, a) || nameMatches(d, a)
           );
           return diskAcct ? { ...diskAcct, ...live } : live;
         });
@@ -2038,6 +2038,13 @@ async function loginOAuthCommand() {
     process.exit(1);
   }
   if (!name) name = profile?.email || `account-${Date.now().toString(36)}`;
+  // The pool may already hold this email as ANOTHER organization of the same
+  // user; the server suffixes duplicates itself, but name it well up front when
+  // we can see the org type.
+  if (name === profile?.email && profile?.orgType) {
+    const suggested = suggestAccountName([], profile);
+    if (suggested !== profile.email) name = suggested;
+  }
   console.log(`Sending "${name}" to the team pool "${pool.name}"...`);
   const r = await sendLoginToPool({ url: pool.url, key: pool.key, name, profile, creds });
   if (r.ok) {
@@ -2576,6 +2583,11 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown', prefe
  * Find a config account entry matching an in-memory account (by user + organization,
  * then name).
  */
+// Name fallback must never cross organizations: a same-user row with a KNOWN,
+// DIFFERENT organization owns its name and its tokens.
+function nameMatches(a, diskAcct) {
+  return a.name === diskAcct.name && !knownDifferentOrg(a, diskAcct);
+}
 function findConfigAccount(diskConfig, account) {
   const idx = diskConfig.accounts.findIndex(a => sameAccountIdentity(a, account));
   if (idx >= 0) return idx;
@@ -2617,9 +2629,10 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 
     // Find the corresponding AccountManager entry and update credentials
     const mgr = accountManager.accounts.find(a =>
-      sameAccountIdentity(a, diskAcct) || a.name === diskAcct.name
+      sameAccountIdentity(a, diskAcct) || nameMatches(a, diskAcct)
     );
     if (!mgr) continue;
+    if (diskAcct.organizationUuid && !mgr.organizationUuid) mgr.organizationUuid = diskAcct.organizationUuid;
     const enabled = diskAcct.enabled !== false;
     if (mgr.enabled !== enabled) {
       accountManager.setAccountEnabled(mgr.index, enabled);

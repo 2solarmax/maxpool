@@ -184,6 +184,15 @@ export function sameAccountIdentity(a, b) {
 }
 
 /**
+ * True when both records are the same Claude user in two KNOWN, DIFFERENT
+ * organizations: two separate accounts that must never be matched by name.
+ */
+export function knownDifferentOrg(a, b) {
+  return sameUser(a, b) && Boolean(a.organizationUuid) && Boolean(b?.organizationUuid)
+    && a.organizationUuid !== b.organizationUuid;
+}
+
+/**
  * The one OAuth entry of the login's user whose organization is still unknown,
  * when no entry matches the login exactly; null otherwise. The TUI then asks
  * "re-authenticate or add?", the CLI re-authenticates it in place. One shared
@@ -227,7 +236,12 @@ export function suggestAccountName(accounts, profile) {
   if (!email) return `account-${accounts.filter(a => a.name.startsWith('account-')).length + 1}`;
   if (!accounts.some(a => a.name === email)) return email;
   const type = String(profile.orgType || '').replace(/^claude_/, '');
-  return `${email} (${type || '2'})`;
+  const base = `${email} (${type || '2'})`;
+  if (!accounts.some(a => a.name === base)) return base;
+  // A THIRD org of the same plan type must not reuse the second's name.
+  let n = 2;
+  while (accounts.some(a => a.name === `${email} (${type || '2'} ${n})`)) n++;
+  return `${email} (${type || '2'} ${n})`;
 }
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
