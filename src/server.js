@@ -85,7 +85,7 @@ const posMsFromEnv = (name, dflt) => {
 const PIN_BUSY_MAX_RETRY_AFTER_S = 10;     // a header-less 429/503 asking ≤ this is busy-class
 const STICKY_BUSY_MAX_ATTEMPTS = posMsFromEnv('MAXPOOL_STICKY_BUSY_MAX_ATTEMPTS', 6);
 const STICKY_BUSY_MIN_BYTES = posMsFromEnv('MAXPOOL_PIN_BUSY_MIN_BYTES', BIG_PROMPT_BYTES);
-const STICKY_BUSY_WAIT_CAP_MS = 5000;      // one wait = retry-after × full jitter, capped here
+const STICKY_BUSY_WAIT_CAP_MS = 15_000;    // per-wait cap for the growing waits (nextStickyBusyWaitMs)
 /** The total wait budget, read LIVE per request (TUI-editable `stickyBusyBudgetMs`);
  *  env MAXPOOL_STICKY_BUSY_BUDGET_MS overrides it only when set. */
 function stickyBusyBudgetMs(accountManager) {
@@ -1265,12 +1265,18 @@ async function forwardRequest(
           const raMs = (refusal.retryAfterS ?? 1) * 1000;
           finishLink({ bounced: true, status: upRes.status, error: 'remote_pinned_busy', refusal: 'busy' });
           accountManager.markPinBusy(account.index, raMs);
-          const waitMs = Math.min(STICKY_BUSY_WAIT_CAP_MS, raMs * (0.5 + Math.random()));
-          if (stickyBusyWaitEligible(account, requestInfo, res, queueConfig, accountManager, waitMs)) {
+          const waitMs = nextStickyBusyWaitMs(requestInfo._busyWaits || 0, raMs, requestInfo._busyWaitMs || 0, stickyBusyBudgetMs(accountManager));
+          if (waitMs > 0 && stickyBusyWaitEligible(account, requestInfo, res, queueConfig, accountManager, waitMs)) {
             requestInfo._busyWaits = (requestInfo._busyWaits || 0) + 1;
             requestInfo._busyWaitMs = (requestInfo._busyWaitMs || 0) + waitMs;
             detachLinkClose();
-            // Keep a streaming client fed through the wait; no lease, no queue ticket held.
+            // KEEP-ALIVE through the wait (a wait can run 15 s+, the last one longer): re-arm the stream-forward
+            // grace around EVERY sleep. Its deadline is anchored once per request (default 10 s
+            // after arrival), so it fires mid-sleep and commits the SSE stream + the heartbeat
+            // interval (a ping every queue.heartbeatMs, 10 s default) — the client's idle
+            // watchdog is fed for the whole wait and every later hop, until the first real
+            // chunk stops it. Only the grace TIMER is cleared after the sleep; a committed
+            // heartbeat keeps running. No lease and no queue ticket is held while waiting.
             const grace = armStreamForwardGrace(res, requestInfo, queueConfig, accountManager);
             const stayed = await sleepUnlessClientGone(waitMs, req, res);
             if (grace) clearTimeout(grace);
@@ -2896,9 +2902,23 @@ function retrySameEligible(account, requestInfo, res, queueConfig = {}) {
   return !clientHasRealBytes(res, requestInfo);
 }
 
+/** The next sticky wait (ms) for 0-based attempt `attempt`, or 0 = stop waiting and move.
+ *  The 6-attempt cap bounds body re-uploads, so the waits GROW to still cover the budget:
+ *  min(15 s, retry-after × 2^attempt) × full jitter (0.5-1.5), and the LAST attempt waits
+ *  whatever is left. Every wait is clipped to the budget left, so the total equals the
+ *  setting and never exceeds it. At retry-after 2 s, jitter midpoint:
+ *    15 s → 2+4+8+1   30 s → 2+4+8+15+1   60 s → 2+4+8+15+15+16   120 s → 2+4+8+15+15+76
+ *  Budget 0 ('off') → never waits (moves at once, as before). */
+function nextStickyBusyWaitMs(attempt, retryAfterMs, spentMs, budgetMs, rand = Math.random) {
+  const remaining = budgetMs - spentMs;
+  if (attempt >= STICKY_BUSY_MAX_ATTEMPTS || remaining <= 0) return 0;
+  if (attempt === STICKY_BUSY_MAX_ATTEMPTS - 1) return remaining;
+  return Math.min(remaining, Math.min(STICKY_BUSY_WAIT_CAP_MS, retryAfterMs * 2 ** attempt) * (0.5 + rand()));
+}
+
 /** R3: may a busy refusal on this cloud row WAIT and retry the same row? Only a warm
  *  Claude conversation (its cache is on this row), a big prompt, nothing sent yet, and
- *  inside the attempt cap, the live wait budget and the client's patience. */
+ *  inside the client's patience (the attempt cap and the live budget: nextStickyBusyWaitMs). */
 function stickyBusyWaitEligible(account, requestInfo, res, queueConfig, accountManager, waitMs) {
   if (requestInfo.isCountTokens || clientHasRealBytes(res, requestInfo)) return false;
   if ((requestInfo.bodyBytes || 0) < STICKY_BUSY_MIN_BYTES) return false;
@@ -2906,8 +2926,6 @@ function stickyBusyWaitEligible(account, requestInfo, res, queueConfig, accountM
   if (!requestInfo.stream && (requestInfo.deadlineAt == null
     || nonStreamRemainingMs(requestInfo) - waitMs < deadlineKnobs().NONSTREAM_MIN_MOVE_MS)) return false;
   if (!accountManager.holdsWarmConversation?.(account, requestInfo)) return false;
-  if ((requestInfo._busyWaits || 0) >= STICKY_BUSY_MAX_ATTEMPTS) return false;
-  if ((requestInfo._busyWaitMs || 0) + waitMs > stickyBusyBudgetMs(accountManager)) return false;
   const ceilingMs = clientWaitCeilingMs(requestInfo, queueConfig);
   if (ceilingMs != null && Date.now() - (requestInfo.startedAt || Date.now()) + waitMs > ceilingMs) return false;
   return true;
@@ -3222,7 +3240,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { nextStickyBusyWaitMs, readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
