@@ -69,7 +69,7 @@ test('one account still reports a session window: every row keeps the Ses column
   weeklyOnly(am, 0);
   withSession(am, 1);
   const rows = frameRows(am, 120);
-  for (const l of rows) assert.match(l, /(Ses|Tok) .*Fbl .* Wk /, `three bars: ${l}`);
+  for (const l of rows) assert.match(l, /Fbl .*(Ses|Tok) .* Wk /, `three bars: ${l}`);
 });
 
 test('a provider session reading also keeps the Ses column', () => {
@@ -78,5 +78,5 @@ test('a provider session reading also keeps the Ses column', () => {
   weeklyOnly(am, 1);
   am.applyProviderUsage(2, { source: 'zai', ses: { utilization: 0.42, resetAt: Date.now() + 3600_000 } });
   const rows = frameRows(am, 120);
-  for (const l of rows) assert.match(l, /Ses .*Fbl .* Wk /, `three bars: ${l}`);
+  for (const l of rows) assert.match(l, /Fbl .*Ses .* Wk /, `three bars: ${l}`);
 });

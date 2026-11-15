@@ -27,20 +27,21 @@ function row(am, idx, bw = 11, showBoth = true, showFable = showBoth) {
   return strip(new TUI({ accountManager: am })._renderAcct(idx, bw, showBoth, showFable));
 }
 
-// The cell that follows a label: the bar text between "Fbl " and the next "  Wk".
+// The cell that follows a label: the bar text between "Fbl " and the next bar label.
 function fableCell(line) {
   const start = line.indexOf('Fbl ') + 4;
-  return line.slice(start, line.indexOf('  Wk', start));
+  const next = line.slice(start).search(/  (Ses|Tok|Wk|Req) /);
+  return next < 0 ? line.slice(start) : line.slice(start, start + next);
 }
 
-// The ask: a third bar, between Ses and Wk, with the Fable weekly used% and reset.
+// The ask: a third bar, first in the row before Ses and Wk, with the Fable weekly used% and reset.
 
-test('an OAuth row shows a Fbl bar between Ses and Wk with the Fable used% and resets-in', () => {
+test('an OAuth row shows a Fbl bar first, before Ses and Wk, with the Fable used% and resets-in', () => {
   const am = pool();
   fable(am, 0, { utilization: 0.45 });
   const line = row(am, 0);
   const ses = line.indexOf('Ses '), fbl = line.indexOf('Fbl '), wk = line.indexOf(' Wk ');
-  assert.ok(ses >= 0 && fbl > ses && wk > fbl, `Ses, then Fbl, then Wk: ${JSON.stringify(line)}`);
+  assert.ok(fbl >= 0 && ses > fbl && wk > ses, `Fbl, then Ses, then Wk: ${JSON.stringify(line)}`);
   assert.match(fableCell(line), /45% 3d/, 'used% and resets-in, like the other two bars');
 });
 
@@ -152,7 +153,7 @@ test('a full frame at 112 columns shows three bars on every account row, each ro
   const rows = frameRows(am, 112);
   assert.equal(rows.length, 3, 'one row per account');
   for (const l of rows) {
-    assert.match(l, /(Ses|Tok) .*Fbl .* (Wk|Req) /, 'three bars in order');
+    assert.match(l, /Fbl .*(Ses|Tok) .* (Wk|Req) /, 'three bars in order');
     assert.ok(l.length <= 112, `fits 112 columns: ${l.length}`);
   }
   assert.match(rows[0], /Fbl\s+45% 3d/, 'the used% is readable at the first three-bar width');

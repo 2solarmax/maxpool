@@ -2978,10 +2978,10 @@ export class TUI {
     }
 
     const bars = [];
-    if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
-    // The Fable bar goes between the session and weekly bars on every row type, so
-    // the Wk column starts at the same offset on OAuth, API-key and provider rows.
+    // The Fable bar comes first, before the session and weekly bars, on every row
+    // type, so each bar starts at the same offset on OAuth, API-key and provider rows.
     if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+    if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
     if (showBoth) {
       // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
       // both render as an empty bar. Say which, so a healthy uncapped account
@@ -3149,8 +3149,8 @@ export class TUI {
     for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
     const bars = [];
-    if (showSession) bars.push(`Ses ${sesCell}`);
     if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+    if (showSession) bars.push(`Ses ${sesCell}`);
     if (showBoth) bars.push(`Wk  ${wkCell}`);
     let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${bars.join('  ')}`;
     line += note;
