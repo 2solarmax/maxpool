@@ -101,33 +101,33 @@ test('a mid-width terminal (showBoth, no showFable) shows Ses and Wk but not Fbl
 
 // Width tiers: the third bar drops out on a narrow terminal the way the second one does.
 
-test('barLayout: one bar under 70 columns, two from 70, three from 112, three bars capped at 11', () => {
+test('barLayout: one bar under 70 columns, two from 70, three from 118, three bars capped at 11', () => {
   const { barLayout } = __tuiTest;
   assert.deepEqual(barLayout(69), { showSession: true, showBoth: false, showFable: false, bw: 5 });
   assert.deepEqual(barLayout(70), { showSession: true, showBoth: true, showFable: false, bw: 5 });
-  assert.deepEqual(barLayout(93), { showSession: true, showBoth: true, showFable: false, bw: 7 });
-  assert.deepEqual(barLayout(99), { showSession: true, showBoth: true, showFable: false, bw: 10 });
-  assert.deepEqual(barLayout(111), { showSession: true, showBoth: true, showFable: false, bw: 16 });
-  assert.deepEqual(barLayout(112), { showSession: true, showBoth: true, showFable: true, bw: 9 });
-  assert.deepEqual(barLayout(117), { showSession: true, showBoth: true, showFable: true, bw: 10 });
-  assert.deepEqual(barLayout(118), { showSession: true, showBoth: true, showFable: true, bw: 11 });
-  assert.deepEqual(barLayout(120), { showSession: true, showBoth: true, showFable: true, bw: 11 });
+  assert.deepEqual(barLayout(99), { showSession: true, showBoth: true, showFable: false, bw: 7 });
+  assert.deepEqual(barLayout(105), { showSession: true, showBoth: true, showFable: false, bw: 10 });
+  assert.deepEqual(barLayout(117), { showSession: true, showBoth: true, showFable: false, bw: 16 });
+  assert.deepEqual(barLayout(118), { showSession: true, showBoth: true, showFable: true, bw: 9 });
+  assert.deepEqual(barLayout(123), { showSession: true, showBoth: true, showFable: true, bw: 10 });
+  assert.deepEqual(barLayout(124), { showSession: true, showBoth: true, showFable: true, bw: 11 });
+  assert.deepEqual(barLayout(126), { showSession: true, showBoth: true, showFable: true, bw: 11 });
   assert.deepEqual(barLayout(140), { showSession: true, showBoth: true, showFable: true, bw: 11 });
 });
 
-test('barLayout: a two-bar row fills the terminal exactly at 95 columns and never overflows it', () => {
+test('barLayout: a two-bar row fills the terminal exactly at 101 columns and never overflows it', () => {
   const { barLayout } = __tuiTest;
-  // 89 = the first width where two 5-wide bars fit; 70..88 is the long-standing
+  // 95 = the first width where two 5-wide bars fit; 70..88 is the long-standing
   // two-bar tier, where the second bar is clipped at the right edge as before.
-  for (let W = 89; W <= 140; W++) {
+  for (let W = 95; W <= 140; W++) {
     const { showFable, bw } = barLayout(W);
-    const rowWidth = 73 + bw + (showFable ? 6 + bw : 0) + 6 + bw;
+    const rowWidth = 79 + bw + (showFable ? 6 + bw : 0) + 6 + bw;
     assert.ok(rowWidth <= W, `W=${W}: bars end at column ${rowWidth}`);
-    // Three bars never take more of the line than two bars could (119 columns), so
+    // Three bars never take more of the line than two bars could (125 columns), so
     // the tags after the bars keep their room on a wide terminal.
-    if (showFable) assert.ok(rowWidth <= 119, `W=${W}: three bars end at column ${rowWidth}`);
+    if (showFable) assert.ok(rowWidth <= 125, `W=${W}: three bars end at column ${rowWidth}`);
   }
-  assert.equal(73 + 2 * barLayout(95).bw + 6, 95);
+  assert.equal(79 + 2 * barLayout(101).bw + 6, 101);
 });
 
 // Capture the full-screen paint at a given terminal size, stripped of ANSI.
@@ -147,14 +147,14 @@ function frameRows(am, columns) {
   return lines.filter(l => /^ {4}(home|work|glm) /.test(l));
 }
 
-test('a full frame at 112 columns shows three bars on every account row, each row fitting the width', () => {
+test('a full frame at 118 columns shows three bars on every account row, each row fitting the width', () => {
   const am = pool();
   fable(am, 0, { utilization: 0.45 });
-  const rows = frameRows(am, 112);
+  const rows = frameRows(am, 118);
   assert.equal(rows.length, 3, 'one row per account');
   for (const l of rows) {
     assert.match(l, /Fbl .*(Ses|Tok) .* (Wk|Req) /, 'three bars in order');
-    assert.ok(l.length <= 112, `fits 112 columns: ${l.length}`);
+    assert.ok(l.length <= 118, `fits 118 columns: ${l.length}`);
   }
   assert.match(rows[0], /Fbl\s+45% 3d/, 'the used% is readable at the first three-bar width');
 });
