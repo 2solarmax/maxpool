@@ -5,15 +5,45 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.24.96] - 2026-11-16
 
 ### Added
 
+- Two reset columns (MRst model / ARst account); Fable tag matches the bar
+- A warm conversation waits for its busy cloud account instead of moving
+- Cache efficiency line, per-account cache share and busy-wait setting
 - Q closes the view when Maxpool runs as a background service
 - Background service keeps the pool running when Terminal closes
 
+### Changed
+
+- RED — prober sweeps benched duplicates with dead tokens
+- Pin that a benched row takes no pacing slot (kills sweep-filter mutant)
+- RED — countPeersWithRoom ignores every cloud mirror row
+- Comment wording
+- Fix/skip-benched-probes into the 1.24.96 release
+- RED — warm conversation's busy refusal moves instead of waiting
+- One rule for served-event telemetry (explicit outcome fields win)
+- Pin the busy-exclusion and hard-pin rules in balance mode
+- Shared helpers for the cache-affinity window and efficiency window mapping
+- Feat/sticky-busy-and-efficiency into the 1.24.96 release
+- Skip the launchd/tmux/plutil harness on non-macOS runners
+- Feat/pool-launchd-service into the 1.24.96 release
+
 ### Fixed
 
+- Fbl bar draws a real reading even when Anthropic reports is_active=false
+- Prober skips benched duplicates; status marks their quota as cloud-mirror
+- Reset-hold counts fresh cloud mirror rows as peers with room
+- Maxpool status no longer crashes on a benched duplicate's null quota
+- The Mac counts the cloud's own wall holds against shared spare capacity
+- The busy wait now reaches the whole budget (60s by default)
+- Throttle cooldown spares GLM mirrors; stale depth no longer denies a route
+- Count_tokens calls are not turns — not counted served, never re-point a conversation
+- The dashboard sees cloud traffic — bounces, waits, move causes, latency
+- The cloud says 'busy' only for an account that can serve once a slot frees
+- Client cancels aren't pool errors; forced moves keep their cause; the wait setting can't lie; cloud depth is live
+- Two regressions the full suite caught (pre-existing on the branch)
 - Background service starts the pool without waiting for a viewer
 
 ## [1.24.95] - 2026-11-15
