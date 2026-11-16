@@ -3326,7 +3326,11 @@ export class TUI {
     for (const tag of settingsTags(this.am, a)) note += `  ${tag}`;
 
     const bars = [];
-    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+    // Fable is an Anthropic model family: a provider (GLM, Kimi, …) has no such limit,
+    // so its row shows blank space where an OAuth row draws "Fbl <bar>" (owner
+    // 2026-11-16: "why does it say Fable for GLM? That makes no sense"). Same visible
+    // width ("Fbl " + bar), so Ses and Wk stay in the OAuth rows' columns.
+    if (showFable) bars.push(' '.repeat(4 + bw));
     if (showSession) bars.push(`Ses ${sesCell}`);
     if (showBoth) bars.push(`Wk  ${wkCell}`);
     let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${bars.join('  ')}`;

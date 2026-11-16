@@ -56,13 +56,18 @@ test('an OAuth row with no Fable reading shows an empty dash cell under Fbl', ()
   assert.equal(fableCell(line).trim(), '—');
 });
 
-test('a provider row shows a dash under Fbl and keeps every bar column aligned with the OAuth row', () => {
+// Owner 2026-11-16: "why does it say Fable for GLM? That makes no sense." Fable is an
+// Anthropic model family; a GLM (or any non-Anthropic) row has no such limit, so it
+// shows NO Fbl label at all — blank space of the same width keeps Ses and Wk aligned.
+test('a provider row shows no Fbl label at all and keeps Ses and Wk aligned with the OAuth row', () => {
   const am = pool();
   fable(am, 0, { utilization: 0.45 });
   am.applyProviderUsage(2, { source: 'zai', ses: { utilization: 0.42, resetAt: Date.now() + 3600_000 } });
   const oauth = row(am, 0), provider = row(am, 2);
-  assert.equal(fableCell(provider).trim(), '—', 'a non-Anthropic provider has no Fable data');
-  for (const label of ['Ses ', 'Fbl ', ' Wk ']) {
+  assert.doesNotMatch(provider, /Fbl|Fable/, 'a non-Anthropic provider has no Fable limit to label');
+  assert.ok(oauth.indexOf('Fbl ') >= 0, 'the OAuth row still shows its Fable bar');
+  for (const label of ['Ses ', ' Wk ']) {
+    assert.ok(oauth.indexOf(label) > 0, `${label.trim()} present on the OAuth row`);
     assert.equal(provider.indexOf(label), oauth.indexOf(label), `${label.trim()} column aligned`);
   }
 });
@@ -153,7 +158,14 @@ test('a full frame at 118 columns shows three bars on every account row, each ro
   const rows = frameRows(am, 118);
   assert.equal(rows.length, 3, 'one row per account');
   for (const l of rows) {
-    assert.match(l, /Fbl .*(Ses|Tok) .* (Wk|Req) /, 'three bars in order');
+    // A GLM row has no Fable limit: no Fbl label, its Ses/Wk in the same columns.
+    if (/^ {4}glm /.test(l)) {
+      assert.doesNotMatch(l, /Fbl|Fable/, `no Fable label on a GLM row: ${l}`);
+      assert.match(l, /(Ses|Tok) .* (Wk|Req) /, 'its own two bars in order');
+      assert.equal(l.indexOf(' Wk '), rows[0].indexOf(' Wk '), 'Wk aligned with the Claude rows');
+    } else {
+      assert.match(l, /Fbl .*(Ses|Tok) .* (Wk|Req) /, 'three bars in order');
+    }
     assert.ok(l.length <= 118, `fits 118 columns: ${l.length}`);
   }
   assert.match(rows[0], /Fbl\s+45% 3d/, 'the used% is readable at the first three-bar width');

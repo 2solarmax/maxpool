@@ -50,6 +50,39 @@ test('barLayout without the session column: Wk alone under 103 columns, Fbl and 
   assert.deepEqual(barLayout(140, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
 });
 
+// A GLM row has no Fable limit, so it carries no Fbl label (blank space keeps the
+// columns); every other row leads with Fbl. Wk sits in the same column on every row.
+const isProvider = l => /^ {4}glm /.test(l);
+function assertBars(rows, claudeRe, providerRe, what) {
+  const wkCol = rows.find(l => !isProvider(l)).indexOf(' Wk ');
+  for (const l of rows) {
+    if (isProvider(l)) {
+      assert.doesNotMatch(l, /Fbl|Fable/, `no Fable label on a GLM row: ${l}`);
+      assert.match(l, providerRe, `${what}: ${l}`);
+    } else {
+      assert.match(l, claudeRe, `${what}: ${l}`);
+    }
+    assert.equal(l.indexOf(' Wk '), wkCol, `Wk column aligned: ${l}`);
+  }
+}
+
+// Peer review (contribution session, 2026-11-16): the provider blank must ride the SAME
+// showFable switch the OAuth rows use. A pool where NO account has a Fable reading keeps
+// the Fbl column dashed on OAuth rows (width-based layout), and the GLM blank must match
+// it exactly — otherwise GLM Ses/Wk drift out of the OAuth columns.
+test('a pool with no Fable readings anywhere: the GLM blank keeps Wk in the OAuth rows column', () => {
+  const am = pool();                       // no applyUsageData with scopedWeekly on any row
+  withSession(am, 0);
+  const rows = frameRows(am, 118);
+  assert.equal(rows.length, 3);
+  const oauth = rows.find(l => /^ {4}home /.test(l));
+  const glm = rows.find(l => /^ {4}glm /.test(l));
+  assert.match(oauth, /Fbl /, 'OAuth rows keep the dashed Fbl column');
+  assert.doesNotMatch(glm, /Fbl|Fable/, 'GLM row still shows no Fable label');
+  assert.equal(glm.indexOf(' Wk '), oauth.indexOf(' Wk '), 'Wk column aligned');
+  for (const l of rows) assert.ok(l.length <= 118, `fits 118 columns: ${l.length}`);
+});
+
 test('no account reports a session window: rows show Fbl then Wk and no Ses column', () => {
   const am = pool();
   weeklyOnly(am, 0);
@@ -58,9 +91,9 @@ test('no account reports a session window: rows show Fbl then Wk and no Ses colu
   assert.equal(rows.length, 3);
   for (const l of rows) {
     assert.doesNotMatch(l, /\bSes\b|\bTok\b/, `no session column: ${l}`);
-    assert.match(l, /Fbl .* Wk /, `Fbl then Wk: ${l}`);
     assert.ok(l.length <= 120, `fits 120 columns: ${l.length}`);
   }
+  assertBars(rows, /Fbl .* Wk /, / Wk /, 'Fbl then Wk');
   assert.match(rows[0], /Fbl\s+45% 3d/);
 });
 
@@ -69,7 +102,7 @@ test('one account still reports a session window: every row keeps the Ses column
   weeklyOnly(am, 0);
   withSession(am, 1);
   const rows = frameRows(am, 120);
-  for (const l of rows) assert.match(l, /Fbl .*(Ses|Tok) .* Wk /, `three bars: ${l}`);
+  assertBars(rows, /Fbl .*(Ses|Tok) .* Wk /, /(Ses|Tok) .* Wk /, 'three bars');
 });
 
 test('a provider session reading also keeps the Ses column', () => {
@@ -78,7 +111,7 @@ test('a provider session reading also keeps the Ses column', () => {
   weeklyOnly(am, 1);
   am.applyProviderUsage(2, { source: 'zai', ses: { utilization: 0.42, resetAt: Date.now() + 3600_000 } });
   const rows = frameRows(am, 120);
-  for (const l of rows) assert.match(l, /Fbl .*Ses .* Wk /, `three bars: ${l}`);
+  assertBars(rows, /Fbl .*Ses .* Wk /, /Ses .* Wk /, 'three bars');
 });
 
 test('a session window that expires on an idle pool keeps the Ses column (no width jump)', () => {
