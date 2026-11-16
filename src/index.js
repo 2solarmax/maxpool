@@ -2245,9 +2245,11 @@ async function statusCommand() {
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.enabled === false ? 'disabled' : acct.status}`);
       console.log(`    Load:     current ${acct.load?.current?.inFlight || 0}/${acct.load?.current?.activeWeight || 0} weight, 15m ${formatLoadWindow(acct.load?.last15m)}, 1h ${formatLoadWindow(acct.load?.last1h)}`);
-      // Cloud rows: the cache figure the serving pool exported (team-wide on that account).
-      const eff = acct.remote ? acct.teamEfficiency?.last1h : acct.load?.last1h?.efficiency;
-      if (eff && (eff.served || eff.bounced)) console.log(`    Cache:    ${pctOrDash(eff.hit)} over 1h${acct.remote ? ' (team)' : ''}, ${eff.served || 0} served, ${eff.bounced || 0} bounced`);
+      // Cloud rows merge server-side: cache + served from the serving pool's export
+      // (team-wide on that account), bounced from this pool's own refusals on it.
+      const eff = acct.load?.last1h?.efficiency;
+      const team = acct.remote && acct.teamEfficiency?.last1h ? ' (team)' : '';
+      if (eff && (eff.served || eff.bounced)) console.log(`    Cache:    ${pctOrDash(eff.hit)} over 1h${team}, ${eff.served || 0} served, ${eff.bounced || 0} bounced`);
 
       if (acct.type === 'provider') {
         const last = acct.lastStatus ? `${acct.lastStatus} in ${formatDurationMs(acct.lastResponseMs)}` : '-';
@@ -2777,31 +2779,33 @@ function formatDurationMs(ms) {
 // A function declaration, not a const: commands dispatch before later consts initialise.
 function pctOrDash(x) { return x == null ? '—' : `${Math.round(x * 100)}%`; }
 
-/** `maxpool status` Efficiency block. Overall = this pool's own rows + each linked
- *  pool's exported sums (a request counted once, by the pool that served it). Missing
- *  fields (an older pool) read '—', never 0. */
+/** `maxpool status` Efficiency block. The server merges every row once (mirror rows:
+ *  cache + served from the serving pool's export, bounces / waits / moves / latency from
+ *  this pool's own events) — the same figures the TUI Cache line shows. With nothing
+ *  served or bounced in the window, rates read '—', never a measured-looking 0. */
 function efficiencyLines(data, key = 'last15m') {
   const accts = data.accounts || [];
-  const local = data.efficiency?.[key];
-  if (!local) return [];
-  const team = (p) => accts.filter(a => a.remote && a.teamEfficiency?.[key]?.provider === p).map(a => a.teamEfficiency[key]);
-  const claude = combineEfficiency([local.claude, ...team('claude')], 'claude');
-  const glm = combineEfficiency([local.glm, ...team('glm')], 'glm');
+  const overall = data.efficiency?.[key];
+  if (!overall) return [];
+  const claude = overall.claude || combineEfficiency([], 'claude');
+  const glm = overall.glm || combineEfficiency([], 'glm');
   const served = claude.served + glm.served;
-  const sum = (f) => claude[f] + glm[f];
-  const cause = (c) => claude.movedByCause[c] + glm.movedByCause[c];
-  const failed = accts.reduce((n, a) => n + (a.load?.[key]?.failed || 0), 0);
-  const linkDrops = accts.reduce((n, a) => n + (a.load?.[key]?.linkFailed || 0), 0);
+  const sum = (f) => (claude[f] || 0) + (glm[f] || 0);
+  const cause = (c) => (claude.movedByCause?.[c] || 0) + (glm.movedByCause?.[c] || 0);
+  const anyData = served + sum('bounced') > 0;
+  const n = (x) => (anyData ? String(x) : '—');
+  const failed = accts.reduce((t, a) => t + (a.load?.[key]?.failed || 0), 0);
+  const linkDrops = accts.reduce((t, a) => t + (a.load?.[key]?.linkFailed || 0), 0);
   const co = data.clientOutcomes?.[key];
   const s = (ms) => (ms == null ? '—' : `${(ms / 1000).toFixed(1)}s`);
   return [
     `Efficiency (${key === 'last1h' ? '1h' : '15m'}):`,
     `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)`,
-    `  Moves:        ${served ? Math.round(sum('moved') * 100 / served) : 0}/100 served (busy ${cause('busy')} · balance ${cause('balance')} · wall ${cause('wall')} · link ${cause('link')} · other ${cause('other')})`,
-    `  Bounced:      ${sum('bounced')} (refused ${sum('refused')}) · failed ${failed} · link drops ${linkDrops}`,
-    `  Waited:       ${sum('waited')}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${sum('waitThenMoved')}`,
+    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))})`,
+    `  Bounced:      ${n(sum('bounced'))} (refused ${n(sum('refused'))}) · failed ${failed} · link drops ${linkDrops}`,
+    `  Waited:       ${n(sum('waited'))}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${n(sum('waitThenMoved'))}`,
     `  Client errors: ${co ? `${co.poolErrors + co.requestErrors} of ${co.total} (pool ${co.poolErrors} · request ${co.requestErrors})` : '—'}`,
-    `  First byte:   p50 ${s(local.e2eP50)} · p95 ${s(local.e2eP95)} (this pool)`,
+    `  First byte:   p50 ${s(overall.e2eP50)} · p95 ${s(overall.e2eP95)} (this pool's clients, waits included)`,
     '',
   ];
 }

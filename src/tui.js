@@ -3323,10 +3323,15 @@ export class TUI {
     const now = Date.now();
     const base = w => {
       const load = this.am._loadSummary(account, w, now);
-      // A cloud row's cache figures come from the serving pool's own export (team-wide
-      // on that account); this Mac's local figures are what the cloud cannot see.
-      const remoteEff = account.remote ? account._remoteLoad?.[w === 15 * 60_000 ? 'last15m' : 'last1h']?.efficiency : null;
-      return remoteEff ? { ...load, efficiency: remoteEff, team: true } : { ...load, efficiency: this.am._efficiencySummary(account, w, now) };
+      const key = w === 15 * 60_000 ? 'last15m' : 'last1h';
+      // A cloud row merges both pools' halves (rowEfficiencySummary): cache + served
+      // from the serving pool's export (team-wide on that account), bounces / waits /
+      // moves from this Mac's own events — the parts the cloud cannot see.
+      const team = Boolean(account.remote && account._remoteLoad?.[key]?.efficiency);
+      const efficiency = this.am.rowEfficiencySummary
+        ? this.am.rowEfficiencySummary(account, key, now)
+        : this.am._efficiencySummary(account, w, now);
+      return team ? { ...load, efficiency, team: true } : { ...load, efficiency };
     };
     return {
       current: {

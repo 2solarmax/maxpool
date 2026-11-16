@@ -396,6 +396,10 @@ const PERSISTED_QUOTA_FIELDS = [
   'providerQuotaSource', 'lastProbeOkAt', 'noPlan',
 ];
 
+/** Figures only the EDGE pool (the one the client talks to) can know for a request it
+ *  forwarded to a cloud row — see _mirrorEfficiencyAcc. */
+const EDGE_EFFICIENCY_FIELDS = ['bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved', 'moved', 'newConversation'];
+
 function emptyEfficiency() {
   return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0,
     movedByCause: { busy: 0, wall: 0, balance: 0, link: 0, other: 0 },
@@ -1318,7 +1322,12 @@ export class AccountManager {
   /** Efficiency fields of a SERVED event, read off the request that was served. */
   _servedTelemetry(ri, account) {
     if (!ri) return {};
-    const moved = Boolean(ri._servedMoved) && ri._notedServed === account.name;
+    // A PINNED request was routed by the linked (edge) pool: the edge books its move,
+    // cause, wait and client-felt latency on its own mirror row. Booking them here too
+    // would double-count the move (as 'balance' — this pool never knew the cause) and
+    // add a latency sample that starts AFTER the edge's wait. Served + tokens stay here.
+    const pinned = ri.pinAccount != null;
+    const moved = !pinned && Boolean(ri._servedMoved) && ri._notedServed === account.name;
     return {
       countTokens: Boolean(ri.isCountTokens),
       usage: ri.isCountTokens ? null : {
@@ -1327,10 +1336,10 @@ export class AccountManager {
       },
       moved,
       moveCause: moved ? (ri._moveCause || (ri._hop > 0 ? 'other' : 'balance')) : null,
-      newConversation: Boolean(ri._newConversation) && ri._notedServed === account.name,
+      newConversation: !pinned && Boolean(ri._newConversation) && ri._notedServed === account.name,
 
       busyWaitMs: ri._busyWaitMs || 0,
-      e2eFirstByteMs: ri._servedAt && ri.startedAt ? Math.max(0, ri._servedAt - ri.startedAt) : null,
+      e2eFirstByteMs: !pinned && ri._servedAt && ri.startedAt ? Math.max(0, ri._servedAt - ri.startedAt) : null,
     };
   }
 
@@ -1367,20 +1376,52 @@ export class AccountManager {
     return out;
   }
 
+  /** One cloud MIRROR row's figures, each field taken from the only pool that can know it
+   *  (review 2026-11-16, cluster 1):
+   *  - served / tokens / cache hit: the SERVING pool's export (it saw every client of that
+   *    account, teammates included);
+   *  - bounced / refused / waited / waitMs / waitThenMoved / moved / movedByCause /
+   *    newConversation, and first-byte latency: THIS pool's own events on the row. The
+   *    cloud books a pin refusal before any lease, never sees the edge's wait or its move
+   *    cause, and starts its clock after the edge's wait — and it no longer counts pinned
+   *    requests as its own moves (_servedTelemetry), so nothing here is counted twice.
+   *  An older cloud with no export: this pool's own events alone (it counts nothing). */
+  _mirrorEfficiencyAcc(account, windowKey, windowMs, now = Date.now()) {
+    const edge = this._efficiencyAcc(account, windowMs, now);
+    const exp = account._remoteLoad?.[windowKey]?.efficiency;
+    if (!exp) return edge;
+    const acc = emptyEfficiency();
+    for (const k of ['served', 'in', 'out', 'cr', 'cc']) acc[k] = Number(exp[k]) || 0;
+    for (const k of EDGE_EFFICIENCY_FIELDS) acc[k] = (Number(exp[k]) || 0) + edge[k];
+    for (const c of Object.keys(acc.movedByCause)) {
+      acc.movedByCause[c] = (Number(exp.movedByCause?.[c]) || 0) + edge.movedByCause[c];
+    }
+    acc.e2e = edge.e2e;
+    return acc;
+  }
+
+  /** The per-row summary the TUI and `maxpool status` show: a mirror row merges the
+   *  serving pool's export with this pool's edge-only fields; a local row is its own. */
+  rowEfficiencySummary(account, windowKey = 'last15m', now = Date.now()) {
+    const windowMs = windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000;
+    const acc = account.remote ? this._mirrorEfficiencyAcc(account, windowKey, windowMs, now) : this._efficiencyAcc(account, windowMs, now);
+    return finishEfficiency(acc, isClaudeAccount(account) ? 'claude' : 'glm');
+  }
+
   /** Overall efficiency, per provider, for the TUI / `maxpool status`: this pool's own
-   *  (non-mirror) rows + each cloud mirror's EXPORTED figures. A request is counted
-   *  once, by the pool that served it — so the Mac's own events on a mirror row
-   *  (already in the cloud's export) never enter this sum. */
+   *  rows plus each cloud mirror row (_mirrorEfficiencyAcc: cache/served from the cloud's
+   *  export, bounces/waits/moves/latency from this pool's own events — each counted once).
+   *  First-byte percentiles cover this pool's CLIENTS, mirror-served turns included, so
+   *  an edge busy wait shows up in p95. */
   efficiencyOverall(windowKey = 'last15m', now = Date.now(), { mirrors = true } = {}) {
     const windowMs = windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000;
     const by = { claude: emptyEfficiency(), glm: emptyEfficiency() };
     for (const a of this.accounts) {
       if (a.enabled === false || (a.remote && !mirrors)) continue;
       const tag = isClaudeAccount(a) ? 'claude' : 'glm';
-      const e = a.remote ? a._remoteLoad?.[windowKey]?.efficiency : this._efficiencyAcc(a, windowMs, now);
-      if (e) addEfficiency(by[tag], e);
+      const e = a.remote ? this._mirrorEfficiencyAcc(a, windowKey, windowMs, now) : this._efficiencyAcc(a, windowMs, now);
+      addEfficiency(by[tag], e);
     }
-    // Arrival-to-first-real-byte over this pool's own rows (percentiles do not add).
     const e2e = [...by.claude.e2e, ...by.glm.e2e];
     return { claude: finishEfficiency(by.claude, 'claude'), glm: finishEfficiency(by.glm, 'glm'),
       e2eP50: pct(e2e, 0.5), e2eP95: pct(e2e, 0.95) };
@@ -6600,9 +6641,10 @@ export class AccountManager {
         since: this.identityHealth.since,
       },
       currentAccount: this.accounts[this.currentIndex]?.name,
-      // Cache / move / bounce figures of THIS pool's own rows (mirror rows excluded:
-      // the serving pool exports those itself), plus edge client outcomes.
-      efficiency: { last15m: this.efficiencyOverall('last15m', now, { mirrors: false }), last1h: this.efficiencyOverall('last1h', now, { mirrors: false }) },
+      // Overall cache / move / bounce / wait figures — the SAME merge the TUI Cache line
+      // uses (mirror rows: cache + served from the serving pool's export, edge-only
+      // fields from this pool's own events), plus edge client outcomes.
+      efficiency: { last15m: this.efficiencyOverall('last15m', now), last1h: this.efficiencyOverall('last1h', now) },
       clientOutcomes: { last15m: this.clientOutcomeSummary(15 * 60_000, now), last1h: this.clientOutcomeSummary(60 * 60_000, now) },
       switchThreshold: this.switchThreshold,
       routing: {
@@ -6687,8 +6729,8 @@ export class AccountManager {
             inFlight: a.inFlight,
             activeWeight: a.activeWeight,
           },
-          last15m: { ...this._loadSummary(a, 15 * 60 * 1000, now), efficiency: this._efficiencySummary(a, 15 * 60 * 1000, now) },
-          last1h: { ...this._loadSummary(a, 60 * 60 * 1000, now), efficiency: this._efficiencySummary(a, 60 * 60 * 1000, now) },
+          last15m: { ...this._loadSummary(a, 15 * 60 * 1000, now), efficiency: this.rowEfficiencySummary(a, 'last15m', now) },
+          last1h: { ...this._loadSummary(a, 60 * 60 * 1000, now), efficiency: this.rowEfficiencySummary(a, 'last1h', now) },
         },
         // The cloud's pin limit for this row (linked pools skip it one short of this).
         pinBusyAt: a.remote ? null : this._pinBusyLimit(a),
