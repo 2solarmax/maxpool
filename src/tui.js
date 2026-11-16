@@ -6,9 +6,10 @@ import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser,
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
-import { normalizeRemoteResets } from './account-manager.js';
+import { normalizeRemoteResets, resolveStickyBusyBudget } from './account-manager.js';
 import { appliesTo } from './claude-reset-grants.js';
 import { LISTING_FRESH_MS } from './reset-timing.js';
+import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -27,6 +28,8 @@ const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
 const dimUnderline = s => `${ESC}2;4m${s}${RESET}`;
+// The cache figures of a request line, by whether the cache held (#642 port, 2026-11-15).
+const CACHE_PAINT = { hit: green, partial: yellow, miss: red, none: dim };
 
 // Terminal output budget (2026-11-12: the pool froze for up to 60s inside a synchronous
 // TTY write() — a full-screen redraw per log line, 4.9 GB in 12h49m). Frames are
@@ -261,6 +264,11 @@ function truncate(s, w) {
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
+/** Truncate only when too wide (no padding) — for header lines. */
+function truncLine(s, w) {
+  return vw(s) > w ? truncate(s, w) : s;
+}
+
 function fitLine(s, w) {
   const v = vw(s);
   if (v > w) return truncate(s, w);
@@ -364,10 +372,19 @@ function loadText(load) {
   const hourReq = load?.last1h?.requests || 0;
   const failed = load?.last15m?.failed || 0;
   const linkFailed = load?.last15m?.linkFailed || 0;
-  if (!inflight && !hourReq && !failed && !linkFailed) return '';
+  const bounced = load?.last15m?.bounced || 0;
+  const eff = load?.last15m?.efficiency;
+  // Dim below the volume floors (too few turns to mean much). A cloud row's figure is the
+  // serving pool's own, team-wide on that account — tagged (team).
+  const cacheTxt = eff && eff.hit != null ? `cache ${Math.round(eff.hit * 100)}%` : null;
+  const cache = cacheTxt
+    ? `${eff.lowVolume ? dim(cacheTxt) : cacheTxt}${load.last15m.team ? dim(' (team)') : ''}` : null;
+  if (!inflight && !hourReq && !failed && !linkFailed && !bounced && !cache) return '';
   const parts = [];
   if (inflight) parts.push(`${inflight} live`);
   if (hourReq) parts.push(`${hourReq} req/hr`);
+  if (cache) parts.push(cache);
+  if (bounced) parts.push(dim(`${bounced} bounced`));
   if (failed) parts.push(red(`${failed} failed`));
   if (linkFailed) parts.push(yellow(`${linkFailed} link drop${linkFailed === 1 ? '' : 's'}`));
   return parts.join(' · ');
@@ -658,6 +675,7 @@ export class TUI {
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
+    this._startedAt = Date.now();   // the efficiency line's "since restart" window
     // Set by index.js after construction (a deferred closure, not a constructor literal —
     // avoids the const TDZ on applyUpdateIfReady, which is defined after `new TUI`).
     this.checkNow = null;
@@ -903,7 +921,13 @@ export class TUI {
     const ttfbTag = ttfbMs != null ? ` ttfb=${(Math.max(0, ttfbMs) / 1000).toFixed(1)}s` : '';
     // B8: ' ns' = a non-streaming request (strict false: the oauth relay carries no shape, so no tag).
     const nsTag = info.stream === false ? ' ns' : '';
-    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${nsTag}${provTag}${cvTag}${ttfbTag}`);
+    // The served attempt's cache figures (~25B, well inside the 480B line cap): whether
+    // the cache held is the one thing a request line could not say (#642 port).
+    const cacheLabel = cacheUsageLabel(info.cacheUsage);
+    const cacheTag = cacheLabel ? ` ${CACHE_PAINT[cacheUsageState(info.cacheUsage)](cacheLabel)}` : '';
+    // ttfb= stays the LAST field — the request-line contract (reset-count-stale-and-ttfb
+    // test 13); the cache tag goes just before it.
+    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${nsTag}${provTag}${cvTag}${cacheTag}${ttfbTag}`);
   }
 
   _addLog(msg) {
@@ -1132,6 +1156,71 @@ export class TUI {
 
   _routingLine(routing, xpText) {
     return ` Routing  ${cyan(routing)}${xpText}`;
+  }
+
+  /** EFFICIENCY line (2026-11-15), directly under Routing: is the prompt cache holding,
+   *  and what are moves costing — Claude and GLM never blended. null with no traffic.
+   *  Colours are WARN-only proposals until a one-day baseline exists; a red names the
+   *  cause and the account. */
+  _efficiencyLine(W = 80, now = Date.now()) {
+    const eff = this.am.efficiencyOverall?.('last15m', now);
+    if (!eff) return null;
+    const { claude: c, glm: g } = eff;
+    const served = c.served + g.served;
+    const bounced = c.bounced + g.bounced;
+    if (served + bounced === 0) return null;
+    const sinceMs = now - (this._startedAt ?? now);
+    const since = sinceMs < 15 * 60_000 ? dim(`  since restart ${Math.max(1, Math.round(sinceMs / 60_000))}m`) : '';
+    if (c.lowVolume && g.lowVolume) return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
+    const pctTxt = x => `${Math.round(x * 100)}%`;
+    const parts = [];
+    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}`);
+    if (g.hit != null) parts.push(`GLM ${g.lowVolume ? dim(pctTxt(g.hit)) : pctTxt(g.hit)}`);
+    const miss = c.missTokens + g.missTokens;
+    parts.push(`miss ${miss >= 1e6 ? `${(miss / 1e6).toFixed(1)}M` : `${Math.round(miss / 1000)}k`} tok`);
+    const cause = k => c.movedByCause[k] + g.movedByCause[k];
+    const per100 = n => (served ? Math.round(n * 100 / served) : 0);
+    parts.push(`moves ${per100(c.moved + g.moved)}/100 (busy ${cause('busy')} · balance ${cause('balance')} · wall ${cause('wall')}${cause('link') ? ` · link ${cause('link')}` : ''}${cause('other') ? ` · other ${cause('other')}` : ''})`);
+    const bounceShare = bounced / (served + bounced);
+    if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}`);
+    const waited = c.waited + g.waited;
+    if (waited) parts.push(`waited ${waited} (avg ${((c.waitMs + g.waitMs) / waited / 1000).toFixed(1)}s)`);
+
+    // RED — the first cause that applies, named with the account behind it.
+    const forced = cause('busy') + cause('wall') + cause('link');
+    const wtm = c.waitThenMoved + g.waitThenMoved;
+    let red_ = null;
+    if (!c.lowVolume && c.hit != null && c.hit < 0.5) red_ = `Claude ${pctTxt(c.hit)} on ${this._worstCacheAccount() || '?'}`;
+    else if (per100(forced) > 2) red_ = `${per100(forced)} forced moves/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
+    else if (bounceShare > 0.1) red_ = `${pctTxt(bounceShare)} bounced — most on ${this._mostBouncedAccount(now) || '?'}`;
+    else if (wtm * 100 / Math.max(1, served) > 0.5) red_ = `${wtm} waits still moved — on ${this._mostBouncedAccount(now) || '?'}`;
+    if (red_) return truncLine(` ${red('Cache')}    ${red(`⚠ ${red_}`)} ${dim('·')} ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+    // YELLOW — Claude below 70%, drifting 15+ points under its hour, or waits are common.
+    const hour = this.am.efficiencyOverall('last1h', now).claude;
+    const drift = !c.lowVolume && !hour.lowVolume && c.hit != null && hour.hit != null && hour.hit - c.hit >= 0.15;
+    const warn = (!c.lowVolume && c.hit != null && c.hit < 0.7) || drift || waited > 0.25 * served;
+    return truncLine(` ${warn ? yellow('Cache') : green('Cache')}    ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+  }
+
+  /** The Claude row with the lowest cache share in the window (enough volume only). */
+  _worstCacheAccount() {
+    let worst = null;
+    for (const a of this.am.accounts) {
+      if (a.enabled === false || a.type === 'provider') continue;
+      const e = this._accountLoad(a)?.last15m?.efficiency;
+      if (e && !e.lowVolume && e.hit != null && (!worst || e.hit < worst.hit)) worst = { name: a.name, hit: e.hit };
+    }
+    return worst?.name || null;
+  }
+
+  /** The row with the most pinned refusals (bounces) seen by this pool in the window. */
+  _mostBouncedAccount(now = Date.now()) {
+    let best = null;
+    for (const a of this.am.accounts) {
+      const n = this.am._loadSummary(a, 15 * 60_000, now).bounced;
+      if (n > 0 && (!best || n > best.n)) best = { name: a.name, n };
+    }
+    return best?.name || null;
   }
 
   /** One line per unreachable team pool, so a lost connection reads as ONE cause
@@ -1455,6 +1544,10 @@ export class TUI {
       // mode — under balance/prefer-* the mode itself controls eligibility. Still
       // safe to set (it'll apply if you switch back to sticky).
       this._cycleProviderClaudeFallback(k === 'g' ? 'zai' : 'kimi');
+    } else if (k === 'b' || k === 'B') {
+      // STICKY BUSY WAIT (2026-11-15): how long a conversation waits for its own busy
+      // account before moving (a move re-writes its whole prompt cache).
+      this._cycleStickyBusyBudget();
     } else if (k === 'w' || k === 'W') {
       // WEEKLY-AWARE SCORING (2026-09-16): fold weekly utilization into the routing
       // score, not just the 5h session. Without it, an account at 89% weekly with a
@@ -1573,6 +1666,42 @@ export class TUI {
     this._addLog(next
       ? 'Weekly-aware routing: ON — accounts near their weekly limit rank last, all day'
       : 'Weekly-aware routing: OFF — score sees only the 5h session window again');
+  }
+
+  static STICKY_BUSY_STEPS = [15_000, 30_000, 60_000, 120_000, 0];
+
+  _stickyBusyLabel() {
+    // The value IN FORCE — the server's own resolver, so an env override shows as such.
+    const { ms, fromEnv } = resolveStickyBusyBudget(this.am.scheduler);
+    const txt = ms > 0 ? `${Math.round(ms / 1000)}s` : 'off';
+    return fromEnv ? `${txt} (env)` : txt;
+  }
+
+  /** Cycle the busy-account wait. Live: the server reads it per request, so the next
+   *  request uses the new value; saved so it survives a restart. */
+  async _cycleStickyBusyBudget() {
+    if (resolveStickyBusyBudget(this.am.scheduler).fromEnv) {
+      // Saving a setting the server ignores would make the screen lie about the wait.
+      this._addLog('Wait for busy account is pinned by MAXPOOL_STICKY_BUSY_BUDGET_MS — unset it to change it here');
+      return;
+    }
+    const steps = TUI.STICKY_BUSY_STEPS;
+    const cur = this.am.scheduler.stickyBusyBudgetMs ?? 60_000;
+    const next = steps[(steps.indexOf(cur) + 1) % steps.length];
+    this.am.scheduler.stickyBusyBudgetMs = next;
+    const prevSched = this.config.scheduler;
+    this.config.scheduler = { ...(prevSched || {}), stickyBusyBudgetMs: next };
+    try {
+      await this.saveConfig(this.config);
+    } catch (e) {
+      this.am.scheduler.stickyBusyBudgetMs = cur;
+      this.config.scheduler = prevSched;
+      this._addLog(`Could not save: ${e.message}`);
+      return;
+    }
+    this._addLog(next > 0
+      ? `Wait for busy account: up to ${Math.round(next / 1000)}s before a conversation moves to another account`
+      : 'Wait for busy account: off — a busy account moves the conversation at once');
   }
 
   async _cycleRoutingMode() {
@@ -2507,6 +2636,8 @@ export class TUI {
       if (provReq > 0) xpText += `  ${dim('·')}  ${yellow(`providers: ${provReq} req/15m`)}`;
     }
     lines.push(this._routingLine(routing, xpText));
+    const effLine = this._efficiencyLine(W);
+    if (effLine != null) lines.push(effLine);
     lines.push(...this._cloudLinkLines(W));
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     // Throttle and WAITING are different things and used to share one line labelled
@@ -3207,13 +3338,25 @@ export class TUI {
     if (account.load) return account.load;
     if (!this.am?._loadSummary) return null;
     const now = Date.now();
+    const base = w => {
+      const load = this.am._loadSummary(account, w, now);
+      const key = w === 15 * 60_000 ? 'last15m' : 'last1h';
+      // A cloud row merges both pools' halves (rowEfficiencySummary): cache + served
+      // from the serving pool's export (team-wide on that account), bounces / waits /
+      // moves from this Mac's own events — the parts the cloud cannot see.
+      const team = Boolean(account.remote && account._remoteLoad?.[key]?.efficiency);
+      const efficiency = this.am.rowEfficiencySummary
+        ? this.am.rowEfficiencySummary(account, key, now)
+        : this.am._efficiencySummary(account, w, now);
+      return team ? { ...load, efficiency, team: true } : { ...load, efficiency };
+    };
     return {
       current: {
         inFlight: account.inFlight,
         activeWeight: account.activeWeight,
       },
-      last15m: this.am._loadSummary(account, 15 * 60 * 1000, now),
-      last1h: this.am._loadSummary(account, 60 * 60 * 1000, now),
+      last15m: base(15 * 60 * 1000),
+      last1h: base(60 * 60 * 1000),
     };
   }
 
@@ -3453,6 +3596,7 @@ export class TUI {
     if (hasPeak) {
       out.push(` ${bold('c')} GLM peak cap ${dim('— GLM accounts only, in GLM peak hours. Not Claude.')}`);
     }
+    out.push(` ${bold('b')} Wait for busy account  ${cyan(this._stickyBusyLabel())}`);
     // Where the per-account cap actually is.
     out.push(` ${dim('Usage cap for ONE account:')} ${bold('Esc')} ${dim('then')} ${bold('a')} ${dim('→')} ${bold('u')} ${dim('(Claude or GLM)')}`);
     const capped = this.am.accounts.filter(a => a.capUtilization != null && a.enabled !== false);

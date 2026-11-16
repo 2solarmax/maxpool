@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
+// A turn SERVED by `account`: the home memory (written at acquire) plus the last-account
+// memory, which since 2026-11-15 is written at the first real byte (noteConversationServed).
+const noteServed = (m, ri, account) => { m._noteConversationAccount(ri, account); m.noteConversationServed({ ...ri }, account); };
 
 const HOUR = 60 * 60 * 1000;
 
@@ -68,7 +71,7 @@ test('W4.3 warmup-pull never lands a session on a provider, even under always po
   am.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' }); // also freshly added, but a provider
   addFresh(am, 'fresh');
   am._bindSession('sess1', am.accounts[0], 'claude-sonnet-5');
-  am._noteConversationAccount({ sessionKey: 'sess1' }, am.accounts[0]); // its last turn ran on a1
+  noteServed(am, { sessionKey: 'sess1' }, am.accounts[0]); // its last turn ran on a1
   // A signed-thinking request is migration-safe by default (crossAccountThinkingMigration),
   // and _isRequestCompatible does NOT bar providers in the compatible case — so only the
   // DIRECTED non-provider warmup-pull keeps this off glm.

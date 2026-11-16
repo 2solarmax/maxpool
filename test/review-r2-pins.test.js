@@ -9,6 +9,9 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { PoolLink } from '../src/pool-link.js';
 import { ReadableStream } from 'node:stream/web';
+// A turn SERVED by `account`: the home memory (written at acquire) plus the last-account
+// memory, which since 2026-11-15 is written at the first real byte (noteConversationServed).
+const noteServed = (m, ri, account) => { m._noteConversationAccount(ri, account); m.noteConversationServed({ ...ri }, account); };
 
 const listen = s => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
 const close = s => { s.closeAllConnections?.(); return new Promise(r => s.close(r)); };
@@ -29,7 +32,9 @@ const mgr = (n = 2, extra = {}) => new AccountManager(Array.from({ length: n }, 
 })), 0.9, extra);
 
 const TTFB = (am, i = 0) => am.markTransientFailure(i, 'UPSTREAM_TTFB', { network: true, scope: 'request' });
-const pick = (am, info) => { const l = am.acquireAccount({ profile: 'claude', ...info }); const name = l?.account?.name ?? null; if (l) am.releaseAccount(l); return name; };
+// A placement that reached its first byte (the conversation now lives there), released
+// neutrally so success/failure streaks are untouched.
+const pick = (am, info) => { const l = am.acquireAccount({ profile: 'claude', ...info }); const name = l?.account?.name ?? null; if (l) { am.noteConversationServed({ ...info }, l.account); am.releaseAccount(l); } return name; };
 
 // ---------------------------------------------------------------- A: request-scoped faults
 
@@ -611,8 +616,8 @@ function homeRig(prio) {
   m.addAccount({ name: 'glm', type: 'provider', provider: 'zai', apiKey: 'zk' });
   const ri = { sessionKey: 's', affinityKey: 's:h', model: 'claude-opus-5-5', weight: 10, bodyBytes: 10_000, profile: 'all' };
   const by = n => m.accounts.find(a => a.name === n);
-  m._noteConversationAccount(ri, by('a1'));
-  m._noteConversationAccount(ri, by('glm'));          // a GLM detour: home is a1
+  noteServed(m, ri, by('a1'));
+  noteServed(m, ri, by('glm'));          // a GLM detour: home is a1
   const base = m._effectivePriority.bind(m);
   m._effectivePriority = (acc, r, now) => (acc.name === 'a1' ? prio.a1 : acc.name === 'a2' ? prio.a2 : base(acc, r, now));
   m.markTransientFailure(by('a1').index, 'UPSTREAM_TTFB', { network: true, scope: 'request' });   // home soft-cooled
