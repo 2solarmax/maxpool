@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 
 const execFileAsync = promisify(execFile);
 const PACKAGE = 'maxpool';
@@ -58,10 +59,14 @@ export async function checkForUpdate(currentVersion, { timeoutMs = 4000, registr
   }
 }
 
-/** Run `npm install -g maxpool@latest`. Returns {ok, output|error}. */
+/** Run `npm install -g maxpool@latest`. Returns {ok, output|error}.
+ *  npm runs from the home directory, never the inherited cwd: the pool lives for days,
+ *  and a launch directory deleted under it (2026-11-16 workspace wipe+restore) made
+ *  every `npm i -g` die at startup with ENOENT uv_cwd — a global install never needs
+ *  the caller's cwd. */
 export async function selfUpdate({ timeoutMs = 120_000 } = {}) {
   try {
-    const { stdout, stderr } = await execFileAsync('npm', ['install', '-g', `${PACKAGE}@latest`], { timeout: timeoutMs });
+    const { stdout, stderr } = await execFileAsync('npm', ['install', '-g', `${PACKAGE}@latest`], { timeout: timeoutMs, cwd: homedir() });
     return { ok: true, output: (stdout || stderr || '').trim() };
   } catch (err) {
     return { ok: false, error: err.message };
