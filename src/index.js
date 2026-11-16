@@ -2231,12 +2231,17 @@ async function statusCommand() {
     }
 
     for (const acct of data.accounts) {
-      const q = acct.quota;
+      // A benched duplicate exports quota: null (its local numbers are stale by design —
+      // the cloud owns the live ones). {} keeps every quota read below safe.
+      const q = acct.quota || {};
       const current = acct.name === data.currentAccount ? ' *' : '';
 
       console.log(`  ${acct.name} (${acct.type})${current}`);
       console.log(`    Status:   ${acct.enabled === false ? 'disabled' : acct.status}`);
       console.log(`    Load:     current ${acct.load?.current?.inFlight || 0}/${acct.load?.current?.activeWeight || 0} weight, 15m ${formatLoadWindow(acct.load?.last15m)}, 1h ${formatLoadWindow(acct.load?.last1h)}`);
+      if (acct.quotaSource === 'cloud-mirror') {
+        console.log('    Quota:    from team pool (this local copy is benched)');
+      }
 
       if (acct.type === 'provider') {
         const last = acct.lastStatus ? `${acct.lastStatus} in ${formatDurationMs(acct.lastResponseMs)}` : '-';
