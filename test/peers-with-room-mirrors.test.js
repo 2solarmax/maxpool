@@ -137,3 +137,34 @@ test('(e) a benched local copy alone (no mirror yet) still does not count', () =
   });
   assert.equal(count(am, now), 0);
 });
+
+// Review 2026-11-16, cluster 6: counting shared cloud mirrors as peers while counting
+// only THIS pool's holders let two pools budget the same spare cloud accounts — the
+// cloud holding C1 against C2+C3, and the Mac holding its own wall against the same two.
+// The cloud now exports which of its rows hold a wall; the Mac counts those holds.
+test('(h) a cloud row that is holding its own wall counts as a holder on the Mac', () => {
+  const now = Date.now();
+  const holding = cloudRow('cloud-held', 'u-ch', now, {
+    wallHolding: true,
+    quota: { unified7d: 0.995, unified7dReset: now + 10 * H, unified5h: 0.2, lastProbeOkAt: now },
+  });
+  const am = withMirrors([holding, cloudRow('cloud-2', 'u-c2', now), cloudRow('cloud-3', 'u-c3', now)], now);
+  assert.equal(count(am, now), 2, 'the two roomy cloud rows are peers');
+  assert.equal(am.countHoldingWalls(am.accounts[0], now), 2,
+    'self + the cloud\'s own hold share those peers');
+});
+
+test('(h2) an older cloud that exports no wallHolding counts no cloud holders', () => {
+  const now = Date.now();
+  const am = withMirrors([cloudRow('cloud-2', 'u-c2', now)], now);
+  assert.equal(am.countHoldingWalls(am.accounts[0], now), 1);
+});
+
+test('(h3) the status export says whether a local row is holding its wall', () => {
+  const now = Date.now();
+  const am = localPool(now);
+  const self = am.accounts[0];
+  am.noteWallHold(self, now);
+  const row = am.getStatus().accounts.find(r => r.name === 'self');
+  assert.equal(row.wallHolding, am.isHoldingWall(self, now));
+});

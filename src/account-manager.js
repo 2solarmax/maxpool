@@ -3565,7 +3565,15 @@ export class AccountManager {
   /** The walls a hold must budget for: every OTHER account holding now, plus
    *  `self` (the wall being decided). Feeds wallClaimHeld's holdersInPool. */
   countHoldingWalls(self, now = Date.now()) {
-    return 1 + this.accounts.filter(a => a !== self && this.isHoldingWall(a, now)).length;
+    // Cloud mirrors are peers in countPeersWithRoom, so the cloud's OWN holds draw on the
+    // same spare capacity and count as holders here (review 2026-11-16, cluster 6) —
+    // else two pools each budget the same roomy cloud accounts. A mirror of self's own
+    // capacity group is self, never a second holder. An older cloud exports no
+    // wallHolding, so it adds none (the previous behaviour).
+    const selfGroup = new Set(this.capacityGroupOf(self).map(x => x.index));
+    const remoteHolders = this.accounts.filter(a => a !== self && a.remote && a.enabled !== false
+      && a._remoteWallHolding === true && !selfGroup.has(a.index)).length;
+    return 1 + this.accounts.filter(a => a !== self && this.isHoldingWall(a, now)).length + remoteHolders;
   }
 
   /**
@@ -6085,6 +6093,7 @@ export class AccountManager {
       // own leases) — so the balancer sees the account as busy as it really is.
       a._remoteOtherLoad = Math.max(0, (ra.inFlight || 0) - (a.inFlight || 0));
       a._remoteLoad = ra.load || null;
+      a._remoteWallHolding = ra.wallHolding === true;
       a.probing = false;
       a.enabled = true;
     }
@@ -6413,6 +6422,8 @@ export class AccountManager {
         // numbers (the TUI overlays them via remoteRowFor); consumers read this marker.
         quota: a.poolBenchedBy ? null : { ...a.quota },
         quotaSource: a.poolBenchedBy ? 'cloud-mirror' : 'local',
+        // A linked pool counts this row's hold against the spare capacity it shares.
+        wallHolding: a.remote ? false : this.isHoldingWall(a, now),
         outsideUsage: a.outsideUsage ? { ...a.outsideUsage } : null,
         weekly: {
           state: this._weeklyState(a),
