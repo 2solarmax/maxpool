@@ -3244,19 +3244,25 @@ export class AccountManager {
     // never on a mirror row (no chained forwarding between pools).
     if (requestInfo.pinAccount != null) {
       if (account.remote || account.name !== requestInfo.pinAccount) return false;
-      // P1: the pin bypasses this pool's balancer, so keep its anti-dogpile floor
-      // here — refuse past 2x the soft per-account target; the caller fails over.
-      if ((account.inFlight || 0) >= this._pinBusyLimit(account)) {
-        requestInfo.pinRefusedBusy = true;
-        requestInfo.pinRefusal = 'busy';
-        return false;
-      }
       // P3: a pinned request isn't competing in this pool's queue — it skips the
       // queue-fairness gate (that alone 503'd every pinned Claude request). The
       // upstream throttle STAYS: it describes this pool's real egress to Anthropic.
       if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
       if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) {
         requestInfo.pinRefusal = 'throttled';
+        return false;
+      }
+      // P1: the pin bypasses this pool's balancer, so keep its anti-dogpile floor
+      // here — refuse past 2x the soft per-account target; the caller fails over.
+      // 'busy' tells the edge "servable once a slot frees — wait for it", so it is said
+      // ONLY for an account that is otherwise available (review 2026-11-16, 2d). An
+      // unavailable one (rate-limited, cooling, exhausted) matches here and is rejected
+      // by the selection loop's _isAvailable, so the refusal reads 'unavailable' and the
+      // edge moves at once instead of waiting out its budget on it.
+      if ((account.inFlight || 0) >= this._pinBusyLimit(account)
+        && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
+        requestInfo.pinRefusedBusy = true;
+        requestInfo.pinRefusal = 'busy';
         return false;
       }
       return true;
