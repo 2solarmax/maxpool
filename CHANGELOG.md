@@ -5,6 +5,18 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.98] - 2026-11-16
+
+### Changed
+
+- Pin the GLM blank against a pool with no Fable readings anywhere
+- GLM rows show no Fable label (into 1.24.98)
+
+### Fixed
+
+- Log the reason when the cloud pool relays a refusal
+- GLM and other non-Anthropic rows show no Fable label
+
 ## [1.24.97] - 2026-11-16
 
 ### Fixed
