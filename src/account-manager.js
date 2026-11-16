@@ -4000,7 +4000,10 @@ export class AccountManager {
     // 80% scored 52.30 vs glm at 10% at 52.15 — a 0.15 gap drowned by round-robin.
     // + the absolute weekly headroom tie-break (ABS_UTIL_WEIGHT), behind the same
     // weekly-aware flag so the 5h-only mode stays byte-identical.
-    const absUsed = this.scheduler.weeklyAwareScoring !== false ? this._absWeeklyUsed(account) : 0;
+    // A FULL lift refilled the week: like every other weekly term, the tie-break must
+    // not price it on its pre-refill usage (else a lifted 0.97 is worst-of-pool again).
+    const absUsed = this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)
+      ? this._absWeeklyUsed(account) : 0;
     const utilizationCost = (this._rawUtilization(account) + ABS_UTIL_WEIGHT * absUsed) * this.scheduler.utilizationWeight * refillMult * resetMult;
 
     // Per-model weekly de-preference: an account whose scoped weekly for THIS

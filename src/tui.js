@@ -920,7 +920,9 @@ export class TUI {
     // the cache held is the one thing a request line could not say (#642 port).
     const cacheLabel = cacheUsageLabel(info.cacheUsage);
     const cacheTag = cacheLabel ? ` ${CACHE_PAINT[cacheUsageState(info.cacheUsage)](cacheLabel)}` : '';
-    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${nsTag}${provTag}${cvTag}${ttfbTag}${cacheTag}`);
+    // ttfb= stays the LAST field — the request-line contract (reset-count-stale-and-ttfb
+    // test 13); the cache tag goes just before it.
+    this._addLog(`${who}${info.method} ${info.path} → ${acct} (${info.status}, ${dur}s)${nsTag}${provTag}${cvTag}${cacheTag}${ttfbTag}`);
   }
 
   _addLog(msg) {

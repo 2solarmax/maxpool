@@ -219,7 +219,9 @@ test('request log line keeps its exact prefix and gains ttfb= at the END', async
     const line = lines.find(l => l.includes('→ acct-a'));
     assert.ok(line, lines.join(' | '));
     // B8 (release B): a non-streaming request's line carries the ` ns` tag; this request is non-streaming.
-    assert.match(line, /^POST \/v1\/messages → acct-a \((\w+), ([0-9.]+)s\) ns  \[cv [0-9a-f]{8} term-abc\] ttfb=[0-9.]+s$/);
+    // The served attempt's cache tag (2026-11-15, usage-label port) sits between [cv …]
+    // and ttfb=; the prefix is unchanged and ttfb= is still the LAST field.
+    assert.match(line, /^POST \/v1\/messages → acct-a \((\w+), ([0-9.]+)s\) ns  \[cv [0-9a-f]{8} term-abc\](?: \x1B\[[0-9;]*mcache r\d+ w\d+ in\d+\x1B\[0m)? ttfb=[0-9.]+s$/);
     const total = Number(/, ([0-9.]+)s\)/.exec(line)[1]);
     const ttfb = Number(/ttfb=([0-9.]+)s$/.exec(line)[1]);
     assert.ok(ttfb >= 0.3 && ttfb <= total, `ttfb ${ttfb} reflects the 300ms upstream wait and is <= total ${total}`);
