@@ -5,6 +5,17 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Q closes the view when Maxpool runs as a background service
+- Background service keeps the pool running when Terminal closes
+
+### Fixed
+
+- Background service starts the pool without waiting for a viewer
+
 ## [1.24.95] - 2026-11-15
 
 ### Changed

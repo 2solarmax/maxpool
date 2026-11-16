@@ -238,6 +238,59 @@ maxpool server --log-to /tmp/requests
 
 Request logging includes prompt and response bodies. Use it only for short debugging windows and delete logs afterwards.
 
+## Run as a background service (macOS)
+
+Keeps the pool running when you close the Terminal tab, quit Terminal, or something kills it. launchd starts the pool at login and restarts it within seconds if it stops. The dashboard is the same one you see in a tab.
+
+How it works: launchd runs `tools/pool-service/start.sh`, which starts a private tmux server (its own socket and config, so your `~/.tmux.conf` never loads) and connects to it once, because the server only creates the pool session after a client connects. The tmux pane runs `tools/pool-service/pane.sh`, which runs `maxpool` with a real terminal, so the dashboard and seamless updates behave exactly as in a tab.
+
+Install (needs Homebrew tmux at `/opt/homebrew/bin/tmux` and maxpool 1.24.95 or newer):
+
+```bash
+tools/pool-service/install.sh              # writes ~/Library/LaunchAgents/com.maxpool.pool.plist and loads it
+tools/pool-service/install.sh --no-load    # writes the plist only, so you can inspect it first
+```
+
+Then source the shell function from `~/.zshrc`:
+
+```bash
+source ~/maxpool/tools/pool-service/maxpool.zsh
+```
+
+| Command | What it does |
+|---------|--------------|
+| `maxpool` | Shows the dashboard. If you turned the pool off it says so; if it is starting it says so and points to the log. It never starts a second pool. |
+| `q` or `Ctrl-C` in the dashboard | Closes the view. The pool keeps running. `q` closes every open view; `Ctrl-C` closes only yours. |
+| `maxpool off` | Sends every session straight to Anthropic, then stops the pool. It stays off, even after a restart. |
+| `maxpool on` | Starts the pool and sends sessions back to it once it answers. If it does not start, it says so loudly and sessions keep going direct. |
+| anything else | Runs the real `maxpool` command unchanged. |
+
+A shell without the function (bash, scripts) runs the real binary. Typing `maxpool server` there while the service runs fails with "already in use".
+
+Switching over from a Terminal pool, once, while idle (install prints these steps):
+
+1. `maxpool route direct`, so sessions go straight to Anthropic.
+2. In the Terminal tab running the pool, press `q`, then `y`.
+3. Wait until `maxpool status` answers. The service takes the port within about a second.
+4. `maxpool route pool`, so sessions go back to the pool.
+
+Logs: `~/.config/maxpool/pane.log` (start, node/npm/gcloud found, port waits, exit codes) and `~/.config/maxpool/tmux.log`.
+
+After a node upgrade, rerun `install.sh` so the service pins the new node. Until you do, it falls back to your nvm default and notes `FALLBACK` in `pane.log`.
+
+Remove it:
+
+```bash
+maxpool route direct
+launchctl bootout gui/$(id -u)/com.maxpool.pool && rm ~/Library/LaunchAgents/com.maxpool.pool.plist
+```
+
+Then remove the `source` line from `~/.zshrc` and start the pool in a tab with `maxpool` as before, followed by `maxpool route pool`.
+
+A test copy that never touches the live pool: `install.sh --label com.maxpool.canary --port 3466 --dir ~/.config/maxpool-canary`. Any label other than `com.maxpool.pool` gets its own config: one dummy local account, an upstream that cannot leave the Mac (`127.0.0.1:9`), no providers and updates off. The socket path (`<dir>/tmux.sock`) must be 100 characters or fewer.
+
+An earlier launchd attempt (July 2026) was reverted within hours with no reason recorded. Two likely causes: it ran without a terminal, so there was no dashboard to open; and its wrapper could take the port while a Terminal pool was restarting. This design keeps the dashboard and waits for the port to be free before it starts.
+
 ## Configuration
 
 Config is stored at `~/.config/maxpool.json` (or `$XDG_CONFIG_HOME/maxpool.json`). A random proxy API key is generated on first use.

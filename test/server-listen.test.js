@@ -54,6 +54,7 @@ test('server exits cleanly when configured port is already in use', async () => 
     });
     assert.equal(result.code, 1);
     assert.match(stderr, new RegExp(`127\\.0\\.0\\.1:${port} is already in use`));
+    assert.match(stderr, /Dashboard: maxpool \(attaches to the running service\)/);
     assert.doesNotMatch(stderr, /Unhandled 'error' event/);
   } finally {
     await close(occupied);
