@@ -50,6 +50,22 @@ test('barLayout without the session column: Wk alone under 103 columns, Fbl and 
   assert.deepEqual(barLayout(140, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
 });
 
+// A GLM row has no Fable limit, so it carries no Fbl label (blank space keeps the
+// columns); every other row leads with Fbl. Wk sits in the same column on every row.
+const isProvider = l => /^ {4}glm /.test(l);
+function assertBars(rows, claudeRe, providerRe, what) {
+  const wkCol = rows.find(l => !isProvider(l)).indexOf(' Wk ');
+  for (const l of rows) {
+    if (isProvider(l)) {
+      assert.doesNotMatch(l, /Fbl|Fable/, `no Fable label on a GLM row: ${l}`);
+      assert.match(l, providerRe, `${what}: ${l}`);
+    } else {
+      assert.match(l, claudeRe, `${what}: ${l}`);
+    }
+    assert.equal(l.indexOf(' Wk '), wkCol, `Wk column aligned: ${l}`);
+  }
+}
+
 test('no account reports a session window: rows show Fbl then Wk and no Ses column', () => {
   const am = pool();
   weeklyOnly(am, 0);
@@ -58,9 +74,9 @@ test('no account reports a session window: rows show Fbl then Wk and no Ses colu
   assert.equal(rows.length, 3);
   for (const l of rows) {
     assert.doesNotMatch(l, /\bSes\b|\bTok\b/, `no session column: ${l}`);
-    assert.match(l, /Fbl .* Wk /, `Fbl then Wk: ${l}`);
     assert.ok(l.length <= 120, `fits 120 columns: ${l.length}`);
   }
+  assertBars(rows, /Fbl .* Wk /, / Wk /, 'Fbl then Wk');
   assert.match(rows[0], /Fbl\s+45% 3d/);
 });
 
@@ -69,7 +85,7 @@ test('one account still reports a session window: every row keeps the Ses column
   weeklyOnly(am, 0);
   withSession(am, 1);
   const rows = frameRows(am, 120);
-  for (const l of rows) assert.match(l, /Fbl .*(Ses|Tok) .* Wk /, `three bars: ${l}`);
+  assertBars(rows, /Fbl .*(Ses|Tok) .* Wk /, /(Ses|Tok) .* Wk /, 'three bars');
 });
 
 test('a provider session reading also keeps the Ses column', () => {
@@ -78,7 +94,7 @@ test('a provider session reading also keeps the Ses column', () => {
   weeklyOnly(am, 1);
   am.applyProviderUsage(2, { source: 'zai', ses: { utilization: 0.42, resetAt: Date.now() + 3600_000 } });
   const rows = frameRows(am, 120);
-  for (const l of rows) assert.match(l, /Fbl .*Ses .* Wk /, `three bars: ${l}`);
+  assertBars(rows, /Fbl .*Ses .* Wk /, /Ses .* Wk /, 'three bars');
 });
 
 test('a session window that expires on an idle pool keeps the Ses column (no width jump)', () => {
