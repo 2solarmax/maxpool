@@ -1309,6 +1309,8 @@ export class AccountManager {
       busyWaitMs: outcome.busyWaitMs || 0,
       e2eFirstByteMs: Number.isFinite(outcome.e2eFirstByteMs) ? outcome.e2eFirstByteMs : null,
       refusal: outcome.refusal || null,
+      // _efficiencyAcc skips these: a count_tokens call is not a conversation turn.
+      countTokens: Boolean(outcome.countTokens),
     });
     this._pruneLoadEvents(account, now);
   }
@@ -4017,6 +4019,9 @@ export class AccountManager {
    *  per request. Records whether this turn moved the conversation (for telemetry). */
   noteConversationServed(requestInfo, account) {
     if (!requestInfo || !account || requestInfo._notedServed === account.name) return;
+    // count_tokens carries no prompt cache: it must not re-point the conversation's
+    // account memory (holdsWarmConversation / move telemetry read it).
+    if (requestInfo.isCountTokens) return;
     requestInfo._notedServed = account.name;
     requestInfo._servedAt = Date.now();
     const key = this._affinityKey(requestInfo);
