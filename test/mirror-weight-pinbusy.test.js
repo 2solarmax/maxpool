@@ -40,5 +40,11 @@ test('a refusal\'s depth headers (5 of 6) make new placements skip the row; its 
   assert.equal(l.account.name, a.name, 'the holder still reaches its row'); am.releaseAccount(l);
   l = am.acquireAccount(ri('lone'), new Set([b.index]));
   assert.equal(l?.account.name, a.name, 'the only candidate still serves'); am.releaseAccount(l);
-  assert.equal(am.hasAvailableRoute(ri('lone2'), new Set([b.index])), false, 'but the queue does not count it as a free route');
+  // Review 2026-11-16 (3/3 verifiers): route EXISTENCE must agree with placement. The
+  // cloud still accepts at 5 of 6, and acquire just placed 'lone' there, so the queue
+  // counts it as a route too — else a failover queues (or 429s) while a slot is free.
+  assert.equal(am.hasAvailableRoute(ri('lone2'), new Set([b.index])), true, 'depth one short of the limit is still a route');
+  // Only a fresh busy REFUSAL (time-capped pinBusyUntil) closes it for a non-holder.
+  am.markPinBusy(a.index, 2000);
+  assert.equal(am.hasAvailableRoute(ri('lone3'), new Set([b.index])), false, 'a just-refused row is no route for a new placement');
 });

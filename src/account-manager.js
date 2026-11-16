@@ -1015,10 +1015,14 @@ export class AccountManager {
     return weeklyPasses.some(options => this.accounts.some(account => {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
-      // A busy cloud row is no route for a NEW placement — else the queue pacer re-tries
-      // an all-busy pool in a sub-second spin. Its holder may still use it, unless this
-      // request already gave up waiting on it (_busyExcluded).
-      if (this._pinBusyForNew(account, now)
+      // A row that JUST refused busy (pinBusyUntil, clamped 1-5 s) is no route for a NEW
+      // placement — else the queue pacer re-tries an all-busy pool in a sub-second spin.
+      // Its holder may still use it, unless this request already gave up waiting on it
+      // (_busyExcluded). The DEPTH half of _pinBusyForNew (30 s-poll snapshot, one slot
+      // short of the limit) is deliberately NOT consulted here: the cloud still accepts
+      // at limit-1, so that row is a route — depth belongs to placement RANKING only
+      // (_selectNext's coolBest), matching what the acquire path would actually do.
+      if (this._recentlyRefusedBusy(account, now)
         && (!this._holdsRequest(account, requestInfo) || requestInfo._busyExcluded?.has(account.name))) return false;
       return this._isAvailable(account, { ...options, model: requestInfo.model, now });
     }));
@@ -3147,9 +3151,16 @@ export class AccountManager {
    *  (pinBusyUntil), or its last known depth is one short of the cloud's pin limit.
    *  Placement-scoped only — never in _isAvailable, so a holder still reaches it. */
   _pinBusyForNew(a, now = Date.now()) {
-    if (a.pinBusyUntil && now < a.pinBusyUntil) return true;
+    if (this._recentlyRefusedBusy(a, now)) return true;
     return Boolean(a.remote && Number.isFinite(a._remotePinLimit) && Number.isFinite(a._remoteInflightCount)
       && a._remoteInflightCount >= a._remotePinLimit - 1);
+  }
+
+  /** Only the TIME-CAPPED half of the busy signal: the row refused busy within its
+   *  1-5 s pinBusyUntil window. Route-existence checks use this alone; the depth
+   *  snapshot (30 s poll) ranks placement but never denies a route. */
+  _recentlyRefusedBusy(a, now = Date.now()) {
+    return Boolean(a.pinBusyUntil && now < a.pinBusyUntil);
   }
 
   /** A busy refusal on this row: repel new placements for `ms` (clamped 1-5 s). A
@@ -3161,13 +3172,17 @@ export class AccountManager {
     a.pinBusyUntil = Math.max(a.pinBusyUntil || 0, Date.now() + d);
   }
 
-  /** A throttled linked pool (its egress to Anthropic is held): cool every mirror row
-   *  of that link at once, so the request moves off the link in ONE hop. */
+  /** A throttled linked pool (its ANTHROPIC egress is held): cool every Claude-egress
+   *  mirror row of that link at once, so the request moves off the link in ONE hop.
+   *  Provider (GLM/Kimi) mirrors are NEVER cooled by a Claude throttle — the cloud
+   *  only refuses 'throttled' for account.type !== 'provider' (see _matchesRequest),
+   *  so those rows can still serve, and cooling them would black out GLM/'all'
+   *  routing for up to 30 s. */
   markLinkMirrorsCooldown(fromAccount, ms) {
     const linkName = fromAccount?.remote?.linkName;
     if (!linkName) return [];
     const until = Date.now() + Math.max(0, Number(ms) || 0);
-    const cooled = this.accounts.filter(a => a.remote && a.remote.linkName === linkName);
+    const cooled = this.accounts.filter(a => a.remote && a.remote.linkName === linkName && a.type !== 'provider');
     for (const a of cooled) a.cooldownUntil = Math.max(a.cooldownUntil || 0, until);
     return cooled;
   }
