@@ -412,6 +412,8 @@ export function resolveStickyBusyBudget(scheduler, env = process.env) {
  *  forwarded to a cloud row — see _mirrorEfficiencyAcc. */
 const EDGE_EFFICIENCY_FIELDS = ['bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved', 'moved', 'newConversation'];
 
+const efficiencyWindowMs = (windowKey) => (windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000);
+
 function emptyEfficiency() {
   return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0,
     movedByCause: { busy: 0, wall: 0, balance: 0, link: 0, other: 0 },
@@ -1415,7 +1417,7 @@ export class AccountManager {
   /** The per-row summary the TUI and `maxpool status` show: a mirror row merges the
    *  serving pool's export with this pool's edge-only fields; a local row is its own. */
   rowEfficiencySummary(account, windowKey = 'last15m', now = Date.now()) {
-    const windowMs = windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000;
+    const windowMs = efficiencyWindowMs(windowKey);
     const acc = account.remote ? this._mirrorEfficiencyAcc(account, windowKey, windowMs, now) : this._efficiencyAcc(account, windowMs, now);
     return finishEfficiency(acc, isClaudeAccount(account) ? 'claude' : 'glm');
   }
@@ -1426,7 +1428,7 @@ export class AccountManager {
    *  First-byte percentiles cover this pool's CLIENTS, mirror-served turns included, so
    *  an edge busy wait shows up in p95. */
   efficiencyOverall(windowKey = 'last15m', now = Date.now(), { mirrors = true } = {}) {
-    const windowMs = windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000;
+    const windowMs = efficiencyWindowMs(windowKey);
     const by = { claude: emptyEfficiency(), glm: emptyEfficiency() };
     for (const a of this.accounts) {
       if (a.enabled === false || (a.remote && !mirrors)) continue;
@@ -4119,9 +4121,13 @@ export class AccountManager {
     if (!isClaudeAccount(account)) return false;
     const key = this._affinityKey(requestInfo);
     if (!key || this.conversationLastAccount.get(key) !== account.name) return false;
-    let windowMs = Number(this.scheduler.cacheAffinityReturnWindowMs);
-    if (!Number.isFinite(windowMs) || windowMs < 0) windowMs = DEFAULT_SCHEDULER.cacheAffinityReturnWindowMs;
-    return Date.now() - (this.conversationLastServedAt.get(key) || 0) <= windowMs;
+    return Date.now() - (this.conversationLastServedAt.get(key) || 0) <= this._cacheAffinityWindowMs();
+  }
+
+  /** cacheAffinityReturnWindowMs, falling back to the default when unset/invalid. */
+  _cacheAffinityWindowMs() {
+    const w = Number(this.scheduler.cacheAffinityReturnWindowMs);
+    return Number.isFinite(w) && w >= 0 ? w : DEFAULT_SCHEDULER.cacheAffinityReturnWindowMs;
   }
 
   /** Key of the conversation's home entry: the conversation itself, never the shared
@@ -4145,9 +4151,7 @@ export class AccountManager {
     const home = this.conversationLastClaudeAccount.get(homeKey);
     if (!home || !home.detoured) return null;
     const ageMs = now - home.at;
-    let windowMs = Number(this.scheduler.cacheAffinityReturnWindowMs);
-    if (!Number.isFinite(windowMs) || windowMs < 0) windowMs = DEFAULT_SCHEDULER.cacheAffinityReturnWindowMs;
-    return { name: home.name, stale: ageMs > windowMs, ageMs };
+    return { name: home.name, stale: ageMs > this._cacheAffinityWindowMs(), ageMs };
   }
 
   /** Conversation identity: terminal + prefix hash when the server computed one;
