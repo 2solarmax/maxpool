@@ -1253,7 +1253,19 @@ export class AccountManager {
     // A pinned refusal (busy / unavailable / throttled cloud row) never reached the
     // client: one BOUNCED load event, no failure counters, no streak, no error text.
     if (outcome.bounced) {
-      this._recordLoadEvent(account, lease, { ...outcome, success: false, bounced: true });
+      // ONE bounced request per row, however many queue releases it refuses on: a
+      // request held in the queue re-asks the same full row every release, and counting
+      // each refusal read "bounced 69%" when far fewer requests were ever refused
+      // (2026-11-16). The event is still recorded (lease accounting); repeats are flagged
+      // and left out of every bounced/refused count.
+      const ri = lease.requestInfo;
+      let repeat = false;
+      if (ri) {
+        ri._bouncedOn ||= new Set();
+        repeat = ri._bouncedOn.has(account.name);
+        ri._bouncedOn.add(account.name);
+      }
+      this._recordLoadEvent(account, lease, { ...outcome, success: false, bounced: true, repeatBounce: repeat });
       return;
     }
 
@@ -1320,6 +1332,7 @@ export class AccountManager {
       status: outcome.status || null,
       // Efficiency telemetry (2026-11-15) — optional, read by _efficiencySummary only.
       bounced: Boolean(outcome.bounced),
+      repeatBounce: Boolean(outcome.repeatBounce),
       usage: outcome.usage || null,
       moved: Boolean(outcome.moved),
       newConversation: Boolean(outcome.newConversation),
@@ -1370,6 +1383,7 @@ export class AccountManager {
     for (const e of account.loadEvents || []) {
       if (e.at < since || e.countTokens) continue;
       if (e.bounced) {
+        if (e.repeatBounce) continue;
         out.bounced++;
         if (e.refusal && e.refusal !== 'busy') out.refused++;
         continue;
@@ -1475,7 +1489,7 @@ export class AccountManager {
     const all = (account.loadEvents || []).filter(e => e.at >= since);
     // A BOUNCE (pinned refusal, 2026-11-15) never served anything: out of every
     // denominator — requests, weight (spread share), avgMs — and out of `failed`.
-    const bounced = all.filter(e => e.bounced).length;
+    const bounced = all.filter(e => e.bounced && !e.repeatBounce).length;
     const events = all.filter(e => !e.bounced);
     const requests = events.length;
     // "failed" is what the operator reads as the ACCOUNT misbehaving; a link fault is
@@ -3010,7 +3024,11 @@ export class AccountManager {
         // conversation leaves its last account (bounded by moves, not by requests).
         const ckey = this._affinityKey(requestInfo);
         const lastName = ckey ? this.conversationLastAccount.get(ckey) : null;
-        if (lastName && lastName !== best.name) {
+        const moveKey = lastName ? `${lastName}>${best.name}` : null;
+        if (lastName && lastName !== best.name && requestInfo?._movedLogged !== moveKey) {
+          // One line per request per move: a queued request re-routes on every release and
+          // used to log the same move each time (29× in 27 min for one request, 2026-11-16).
+          requestInfo._movedLogged = moveKey;
           // why= explains why the conversation LEFT its last account — measured against
           // the loop's own pick, before any return-home switch.
           let why = 'unknown';
