@@ -43,3 +43,18 @@ test('an edit is saved to config and the next request uses it', async () => {
     assert.notEqual(remote.hits[2], warm, `moved: ${remote.hits.join(', ')}`);
   } finally { await cleanup(); }
 });
+
+test('an env override shows as "(env)" and b does not save a setting the server ignores', async () => {
+  // Review 2026-11-16, 5c: the screen showed the saved setting while the env value won.
+  process.env.MAXPOOL_STICKY_BUSY_BUDGET_MS = '0';
+  try {
+    const am = new AccountManager([], 0.9);
+    const saved = [];
+    const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 }, scheduler: {} }, saveConfig: async c => { saved.push(c); } });
+    const detail = tui._renderRoutingDetail().map(strip);
+    assert.ok(detail.some(l => l.includes('Wait for busy account  off (env)')), `shows the value in force: ${detail.join('\n')}`);
+    await tui._cycleStickyBusyBudget();
+    assert.equal(saved.length, 0, 'nothing saved while the env pins it');
+    assert.equal(am.scheduler.stickyBusyBudgetMs ?? 60_000, 60_000, 'the in-memory setting is untouched');
+  } finally { delete process.env.MAXPOOL_STICKY_BUSY_BUDGET_MS; }
+});

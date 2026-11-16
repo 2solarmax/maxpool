@@ -10,6 +10,7 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { modelFamily, organizationUnknownMatch, sameAccountIdentity, sameUser } from './oauth.js';
+import { resolveStickyBusyBudget } from './account-manager.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -87,12 +88,10 @@ const STICKY_BUSY_MAX_ATTEMPTS = posMsFromEnv('MAXPOOL_STICKY_BUSY_MAX_ATTEMPTS'
 const STICKY_BUSY_MIN_BYTES = posMsFromEnv('MAXPOOL_PIN_BUSY_MIN_BYTES', BIG_PROMPT_BYTES);
 const STICKY_BUSY_WAIT_CAP_MS = 15_000;    // per-wait cap for the growing waits (nextStickyBusyWaitMs)
 /** The total wait budget, read LIVE per request (TUI-editable `stickyBusyBudgetMs`);
- *  env MAXPOOL_STICKY_BUSY_BUDGET_MS overrides it only when set. */
+ *  env MAXPOOL_STICKY_BUSY_BUDGET_MS overrides it only when set. Same resolver as the
+ *  TUI setting, so the screen always shows the value in force. */
 function stickyBusyBudgetMs(accountManager) {
-  const env = process.env.MAXPOOL_STICKY_BUSY_BUDGET_MS;
-  if (env != null && env !== '' && Number.isFinite(Number(env)) && Number(env) >= 0) return Number(env);
-  const v = Number(accountManager?.scheduler?.stickyBusyBudgetMs);
-  return Number.isFinite(v) && v >= 0 ? v : 60_000;
+  return resolveStickyBusyBudget(accountManager?.scheduler).ms;
 }
 /** Live knob values (env read per call so a two-pool test can inject a small cap). */
 function deadlineKnobs() {
@@ -1282,6 +1281,10 @@ async function forwardRequest(
             if (grace) clearTimeout(grace);
             if (!stayed) {
               clearQueueHeartbeat(requestInfo);
+              // The CLIENT cancelled mid-wait: not a pool error. ctx.status still holds
+              // the refusal's 503 — 499 (client closed) keeps the request-end log honest.
+              requestInfo._clientCancelled = true;
+              ctx.status = 499;
               logFailedAttempt(account.name, `remote-${upRes.status}`, 'linked pool busy; client left during the wait', 'released-cancel');
               return;
             }
@@ -1436,6 +1439,7 @@ async function forwardRequest(
       if (linkClientGone && !clientHasRealBytes(res, requestInfo)) {
         finishLink({ success: false, neutral: true, error: 'client_cancelled' });
         clearQueueHeartbeat(requestInfo);
+        requestInfo._clientCancelled = true;
         console.log(`[Maxpool] Client left after ${heldS}s on "${account.name}" (link, still waiting) — released, not retried`);
         logFailedAttempt(account.name, 'client_cancelled', `client left after ${heldS}s, nothing sent`, 'released-cancel');
         return;
@@ -1721,6 +1725,9 @@ async function forwardRequest(
           && !clientHasRealBytes(res, requestInfo)
           && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
         ) {
+          // Forced move (review 2026-11-16, 5b): label it, so the TUI breakdown and the
+          // forced-moves signal see it instead of an unlabelled 'other'.
+          requestInfo._moveCause = 'wall';
           logFailedAttempt(account.name, 'upstream_429', `server-side throttle, retry-after ${retryAfter}s`, 'moved');
           return forwardRequest(
             req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
@@ -1839,6 +1846,7 @@ async function forwardRequest(
         !clientHasRealBytes(res, requestInfo) &&
         hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
       ) {
+        requestInfo._moveCause = 'wall';
         logFailedAttempt(account.name, rlKind, `HTTP 429, benched ${retryAfter}s`, 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
@@ -1946,6 +1954,7 @@ async function forwardRequest(
         && !clientHasRealBytes(res, requestInfo)
         && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)
       ) {
+        requestInfo._moveCause = 'wall';
         logFailedAttempt(account.name, 'upstream_529', `overloaded, retry-after ${retryAfter}s`, 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
@@ -2002,6 +2011,7 @@ async function forwardRequest(
 
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
         && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+        requestInfo._moveCause = 'link';
         logFailedAttempt(account.name, `upstream_${upstreamRes.status}`, 'retriable upstream status, cooling down', 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
@@ -2646,6 +2656,7 @@ async function forwardRequest(
       console.log(`[Maxpool] Client left after ${(heldMs / 1000).toFixed(1)}s on "${account.name}" `
         + `(${gotOutput ? 'mid-response — output already sent' : 'still waiting, nothing sent'})`);
       logFailedAttempt(account.name, 'client_cancelled', `client left after ${(heldMs / 1000).toFixed(1)}s (${gotOutput ? 'mid-response' : 'still waiting'})`, 'released-cancel');
+      requestInfo._clientCancelled = true;
       releaseOnClientGone();
       return;
     }
@@ -2655,6 +2666,7 @@ async function forwardRequest(
       const heldMs = Date.now() - (requestInfo.startedAt || Date.now());
       console.log(`[Maxpool] Client left after ${(heldMs / 1000).toFixed(1)}s on "${account.name}" (during the response body read) — released, not retried`);
       logFailedAttempt(account.name, 'client_cancelled', `client left after ${(heldMs / 1000).toFixed(1)}s (body read)`, 'released-cancel');
+      requestInfo._clientCancelled = true;
       accountManager.relinquishUpstreamProbe?.(lease);
       accountManager.releaseAccount(lease, { neutral: true, error: 'client_cancelled', kind: 'client_cancelled' });
       clearQueueHeartbeat(requestInfo);
@@ -2771,6 +2783,7 @@ async function forwardRequest(
       // answer with a misleading quota message).
       if (canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)
         && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+        requestInfo._moveCause = 'link';
         logFailedAttempt(account.name, transientKind, `transient after ${heldSeconds(lease)}s`, 'moved');
         return forwardRequest(
           req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
@@ -2821,6 +2834,7 @@ async function forwardRequest(
       && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
       account.status = 'error';
       excludedIndexes.add(account.index);
+      requestInfo._moveCause = 'link';
       logFailedAttempt(account.name, (err.code || err.message || 'error').toString().slice(0, 40), err.message, 'moved');
       return forwardRequest(
         req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,

@@ -52,3 +52,27 @@ test('the holder still sees its busy row as a route; a non-holder does not', () 
   assert.equal(am.hasAvailableRoute(holder, new Set()), false,
     'once the holder gave up waiting on it (_busyExcluded), it is no route either');
 });
+
+// Review 2026-11-16, 2c: the poll snapshot counted this pool's own leases at poll time,
+// and a refusal's depth overwrote it until the next poll (~30 s).
+test('our own finished requests stop counting against a cloud row before the next poll', () => {
+  const am = build();
+  const a = am.accounts[0];
+  a.inFlight = 4;                 // 4 of the 5 at poll time are ours
+  a._remoteOwnAtSync = 4;
+  assert.equal(am._pinBusyForNew(a), true, 'at poll time: 5 of 6, skipped by new placements');
+  a.inFlight = 0;                 // ours finished
+  assert.equal(am._remoteDepthEstimate(a), 1, 'only the teammate request remains');
+  assert.equal(am._pinBusyForNew(a), false, 'the row is open to new placements again');
+});
+
+test('a refusal depth repels only within its busy window, not until the next poll', () => {
+  const am = build();
+  const a = am.accounts[1];
+  a._remoteInflightCount = 0; a._remoteOwnAtSync = 0;
+  am.noteRemoteDepth(a.name, 6, 6);
+  assert.equal(am._pinBusyForNew(a), true, 'fresh refusal depth repels');
+  a._refusalDepthUntil = Date.now() - 1;   // the window passed
+  assert.equal(am._pinBusyForNew(a), false, 'the poll snapshot (0) rules again');
+  assert.equal(a._remoteInflightCount, 0, 'the refusal never overwrote the snapshot');
+});

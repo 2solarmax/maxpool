@@ -6,7 +6,7 @@ import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser,
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
-import { normalizeRemoteResets } from './account-manager.js';
+import { normalizeRemoteResets, resolveStickyBusyBudget } from './account-manager.js';
 import { appliesTo } from './claude-reset-grants.js';
 import { LISTING_FRESH_MS } from './reset-timing.js';
 import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
@@ -1173,7 +1173,7 @@ export class TUI {
     parts.push(`miss ${miss >= 1e6 ? `${(miss / 1e6).toFixed(1)}M` : `${Math.round(miss / 1000)}k`} tok`);
     const cause = k => c.movedByCause[k] + g.movedByCause[k];
     const per100 = n => (served ? Math.round(n * 100 / served) : 0);
-    parts.push(`moves ${per100(c.moved + g.moved)}/100 (busy ${cause('busy')} · balance ${cause('balance')} · wall ${cause('wall')}${cause('link') ? ` · link ${cause('link')}` : ''})`);
+    parts.push(`moves ${per100(c.moved + g.moved)}/100 (busy ${cause('busy')} · balance ${cause('balance')} · wall ${cause('wall')}${cause('link') ? ` · link ${cause('link')}` : ''}${cause('other') ? ` · other ${cause('other')}` : ''})`);
     const bounceShare = bounced / (served + bounced);
     if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}`);
     const waited = c.waited + g.waited;
@@ -1664,13 +1664,20 @@ export class TUI {
   static STICKY_BUSY_STEPS = [15_000, 30_000, 60_000, 120_000, 0];
 
   _stickyBusyLabel() {
-    const ms = this.am.scheduler?.stickyBusyBudgetMs ?? 60_000;
-    return ms > 0 ? `${Math.round(ms / 1000)}s` : 'off';
+    // The value IN FORCE — the server's own resolver, so an env override shows as such.
+    const { ms, fromEnv } = resolveStickyBusyBudget(this.am.scheduler);
+    const txt = ms > 0 ? `${Math.round(ms / 1000)}s` : 'off';
+    return fromEnv ? `${txt} (env)` : txt;
   }
 
   /** Cycle the busy-account wait. Live: the server reads it per request, so the next
    *  request uses the new value; saved so it survives a restart. */
   async _cycleStickyBusyBudget() {
+    if (resolveStickyBusyBudget(this.am.scheduler).fromEnv) {
+      // Saving a setting the server ignores would make the screen lie about the wait.
+      this._addLog('Wait for busy account is pinned by MAXPOOL_STICKY_BUSY_BUDGET_MS — unset it to change it here');
+      return;
+    }
     const steps = TUI.STICKY_BUSY_STEPS;
     const cur = this.am.scheduler.stickyBusyBudgetMs ?? 60_000;
     const next = steps[(steps.indexOf(cur) + 1) % steps.length];

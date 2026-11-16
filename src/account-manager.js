@@ -396,6 +396,18 @@ const PERSISTED_QUOTA_FIELDS = [
   'providerQuotaSource', 'lastProbeOkAt', 'noPlan',
 ];
 
+/** The sticky busy-wait budget actually in force, and where it comes from — ONE resolver
+ *  for the server (per request, live) and the TUI setting (review 2026-11-16, 5c: the
+ *  screen used to show the saved setting while an env override silently won). */
+export function resolveStickyBusyBudget(scheduler, env = process.env) {
+  const raw = env.MAXPOOL_STICKY_BUSY_BUDGET_MS;
+  if (raw != null && raw !== '' && Number.isFinite(Number(raw)) && Number(raw) >= 0) {
+    return { ms: Number(raw), fromEnv: true };
+  }
+  const v = Number(scheduler?.stickyBusyBudgetMs);
+  return { ms: Number.isFinite(v) && v >= 0 ? v : 60_000, fromEnv: false };
+}
+
 /** Figures only the EDGE pool (the one the client talks to) can know for a request it
  *  forwarded to a cloud row — see _mirrorEfficiencyAcc. */
 const EDGE_EFFICIENCY_FIELDS = ['bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved', 'moved', 'newConversation'];
@@ -1432,6 +1444,8 @@ export class AccountManager {
    *  our client errors). POST /v1/messages only, count_tokens skipped. */
   noteClientOutcome(requestInfo, status, now = Date.now()) {
     if (!requestInfo || requestInfo.pinAccount != null || requestInfo.isCountTokens) return;
+    // The client cancelled (Esc / Ctrl-C) — no error was served to anyone.
+    if (requestInfo._clientCancelled) return;
     if (requestInfo.method !== 'POST' || !/^\/v1\/messages(\?|$)/.test(requestInfo.path || '')) return;
     this.clientOutcomes.push({ at: now, status: Number(status) || 0 });
     const cutoff = now - CLIENT_OUTCOME_MAX_AGE_MS;
@@ -3195,8 +3209,19 @@ export class AccountManager {
    *  Placement-scoped only — never in _isAvailable, so a holder still reaches it. */
   _pinBusyForNew(a, now = Date.now()) {
     if (this._recentlyRefusedBusy(a, now)) return true;
-    return Boolean(a.remote && Number.isFinite(a._remotePinLimit) && Number.isFinite(a._remoteInflightCount)
-      && a._remoteInflightCount >= a._remotePinLimit - 1);
+    const depth = this._remoteDepthEstimate(a, now);
+    return Boolean(a.remote && Number.isFinite(a._remotePinLimit) && depth != null
+      && depth >= a._remotePinLimit - 1);
+  }
+
+  /** A cloud row's in-flight depth NOW, as best this pool can tell (review 2026-11-16,
+   *  2c). The poll snapshot (every ~30 s) counted our own leases at poll time; swap those
+   *  for our current leases. A refusal's depth header is fresher but describes one
+   *  instant, so it counts only within the busy window it came with (pinBusyUntil). */
+  _remoteDepthEstimate(a, now = Date.now()) {
+    if (Number.isFinite(a._refusalDepth) && a._refusalDepthUntil > now) return a._refusalDepth;
+    if (!Number.isFinite(a._remoteInflightCount)) return null;
+    return Math.max(0, a._remoteInflightCount - (a._remoteOwnAtSync || 0)) + (a.inFlight || 0);
   }
 
   /** Only the TIME-CAPPED half of the busy signal: the row refused busy within its
@@ -3234,7 +3259,12 @@ export class AccountManager {
   noteRemoteDepth(name, inflight, limit) {
     const a = this.accounts.find(x => x.remote && x.name === name);
     if (!a) return;
-    if (Number.isFinite(inflight)) a._remoteInflightCount = inflight;
+    // Held only for the busy window it came with — never overwrites the poll snapshot,
+    // so a refusal can't keep the row repelled until the next poll.
+    if (Number.isFinite(inflight)) {
+      a._refusalDepth = inflight;
+      a._refusalDepthUntil = Date.now() + PIN_BUSY_MAX_MS;
+    }
     if (Number.isFinite(limit)) a._remotePinLimit ??= limit;
   }
 
@@ -6413,6 +6443,10 @@ export class AccountManager {
       // The same in WEIGHT units (NaN → fallback when an older cloud omits activeWeight).
       a._remoteOtherWeight = Number.isFinite(ra.activeWeight) ? Math.max(0, ra.activeWeight - (a.activeWeight || 0)) : NaN;
       a._remoteInflightCount = Number.isFinite(ra.inFlight) ? ra.inFlight : null;
+      // Our own leases on this row at poll time (already inside ra.inFlight): the depth
+      // estimate swaps them for our CURRENT leases, so our finished requests stop
+      // counting against the row until the next poll (review 2026-11-16, 2c).
+      a._remoteOwnAtSync = a.inFlight || 0;
       a._remotePinLimit = Number.isFinite(ra.pinBusyAt) ? ra.pinBusyAt : null;
       a._remoteLoad = ra.load || null;
       a.probing = false;
