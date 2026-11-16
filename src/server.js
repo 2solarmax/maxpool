@@ -1377,6 +1377,13 @@ async function forwardRequest(
         && !requestInfo.queueHeartbeatActive) {
         ensureQueueHeartbeatInterval(res, requestInfo, Math.max(1000, Number(queueConfig?.heartbeatMs) || 10_000));
       }
+      // A refusal the cloud pool relays (4xx, not 429 — those have their own branches)
+      // used to pass through with nothing logged here, so a 400 on a ☁ row had no
+      // recorded reason on this side (2026-11-16: 13 instant 400/404s, cause unknowable).
+      // Keep the first bytes while relaying them unchanged; log the reason at the end,
+      // the same line shape as the direct path.
+      const refusalTap = (upRes.status >= 400 && upRes.status < 500 && upRes.status !== 429) ? [] : null;
+      let refusalTapBytes = 0;
       if (upRes.body) {
         const reader = upRes.body.getReader();
         // R3-3/r4: bound the link body like the direct path bounds its stream
@@ -1417,10 +1424,17 @@ async function forwardRequest(
               accountManager.noteConversationServed?.(requestInfo, account);
               tapLinkUsage(value, requestInfo);
             }
+            if (refusalTap && refusalTapBytes < 4096) { refusalTap.push(Buffer.from(value)); refusalTapBytes += value.length; }
             res.write(Buffer.from(value));
           }
         } finally { try { await reader.cancel(); } catch { /* already done */ } }
         if (upRes.status < 300) tapLinkUsage(null, requestInfo);   // flush the non-stream tail
+      }
+      if (refusalTap) {
+        const text = Buffer.concat(refusalTap).toString('utf8');
+        let why = text;
+        try { why = JSON.parse(text)?.error?.message || text; } catch { /* not JSON — log raw */ }
+        console.log(`[Maxpool] ${upRes.status} from "${account.name}": ${String(why).slice(0, 300)}`);
       }
       res.end();   // an empty 2xx body: the heartbeat reaps itself on res.writableEnded
       finishLink({ success: ctx.status < 500, status: ctx.status });
