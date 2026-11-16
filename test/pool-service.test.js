@@ -17,6 +17,12 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// macOS-only harness: launchd, tmux at /opt/homebrew and /usr/bin/plutil are the
+// environment under test. None exist on a Linux runner (GitHub CI), where every
+// test here would fail on the missing environment rather than on a defect. Full
+// run on the Mac; skip everywhere else.
+const macOSOnly = process.platform === 'darwin' ? {} : { skip: 'macOS-only service machinery (launchd/tmux/plutil)' };
+
 const repo = dirname(dirname(fileURLToPath(import.meta.url)));
 const tools = join(repo, 'tools', 'pool-service');
 const MIN_VERSION = '1.24.95';
@@ -82,7 +88,7 @@ async function stubNodeDir(stage, name, maxpoolBody = 'exit 0') {
 
 // ── install.sh: version gate ────────────────────────────────────────────────
 
-test('install.sh refuses a version below MIN_VERSION and writes no plist', async () => {
+test('install.sh refuses a version below MIN_VERSION and writes no plist', macOSOnly, async () => {
   const stage = await makeStage();
   await writeStub(join(stage.bin, 'launchctl'), `echo "launchctl $*" >> "${join(stage.stage, 'launchctl-calls.txt')}"`);
   const npmRoot = await stubNpmRoot(stage, '1.24.93');   // current release — too old
@@ -98,7 +104,7 @@ test('install.sh refuses a version below MIN_VERSION and writes no plist', async
     'install must not call launchctl at all before the version gate passes');
 });
 
-test('install.sh at MIN_VERSION writes plist, tmux.conf and canary config', async () => {
+test('install.sh at MIN_VERSION writes plist, tmux.conf and canary config', macOSOnly, async () => {
   const stage = await makeStage();
   await writeStub(join(stage.bin, 'launchctl'), `echo "launchctl $*" >> "${join(stage.stage, 'launchctl-calls.txt')}"`);
   const npmRoot = await stubNpmRoot(stage, MIN_VERSION);
@@ -156,7 +162,7 @@ test('install.sh at MIN_VERSION writes plist, tmux.conf and canary config', asyn
   assert.equal(canary.autoApply, false);
 });
 
-test('install.sh with the default label writes no canary config and points at the real config', async () => {
+test('install.sh with the default label writes no canary config and points at the real config', macOSOnly, async () => {
   const stage = await makeStage();
   const npmRoot = await stubNpmRoot(stage, MIN_VERSION);
   const nodeDir = await stubNodeDir(stage, 'nodebin');
@@ -175,7 +181,7 @@ test('install.sh with the default label writes no canary config and points at th
   assert.match(xml, /MAXPOOL_CONFIG<\/key>\s*<string>[^<]*teamclaude\.json<\/string>/);
 });
 
-test('install.sh refuses a --dir whose socket path is over 100 chars', async () => {
+test('install.sh refuses a --dir whose socket path is over 100 chars', macOSOnly, async () => {
   const stage = await makeStage();
   await writeStub(join(stage.bin, 'launchctl'), `echo "launchctl $*" >> "${join(stage.stage, 'launchctl-calls.txt')}"`);
   const npmRoot = await stubNpmRoot(stage, MIN_VERSION);
@@ -222,7 +228,7 @@ async function runStart(env) {
   return { child, exited };
 }
 
-test('start.sh pokes the tmux server until the pool session exists, then waits on tmux', async () => {
+test('start.sh pokes the tmux server until the pool session exists, then waits on tmux', macOSOnly, async () => {
   const { stage, calls, killed, env } = await startStage(2);   // first poke fails, second succeeds
   const { child, exited } = await runStart(env);
   try {
@@ -245,7 +251,7 @@ test('start.sh pokes the tmux server until the pool session exists, then waits o
   }
 });
 
-test('start.sh logs when the pool session never appears, and still waits on tmux', async () => {
+test('start.sh logs when the pool session never appears, and still waits on tmux', macOSOnly, async () => {
   const { stage, killed, env } = await startStage(999);   // never succeeds
   const { child, exited } = await runStart(env);
   try {
@@ -262,7 +268,7 @@ test('start.sh logs when the pool session never appears, and still waits on tmux
 
 // ── pane.sh: node fallback ──────────────────────────────────────────────────
 
-test('pane.sh falls back to the nvm default alias when the pinned node is gone', async () => {
+test('pane.sh falls back to the nvm default alias when the pinned node is gone', macOSOnly, async () => {
   const stage = await makeStage();
   const nvmBin = join(stage.home, '.nvm/versions/node/v20.9.9/bin');
   await mkdir(nvmBin, { recursive: true });
@@ -289,7 +295,7 @@ test('pane.sh falls back to the nvm default alias when the pinned node is gone',
 
 // ── pane.sh: port wait ──────────────────────────────────────────────────────
 
-test('pane.sh waits while the port is served and starts within seconds of it freeing', async () => {
+test('pane.sh waits while the port is served and starts within seconds of it freeing', macOSOnly, async () => {
   const stage = await makeStage();
   const nodeDir = await stubNodeDir(stage, 'nodebin');
   await writeStub(join(stage.bin, 'stub-maxpool'), `echo "ran $*" >> "${join(stage.stage, 'maxpool-ran.txt')}"`);
@@ -333,7 +339,7 @@ test('pane.sh waits while the port is served and starts within seconds of it fre
 
 // ── pane.sh: kill-server after exit ─────────────────────────────────────────
 
-test('pane.sh kills the tmux server after maxpool exits and records a fast exit', async () => {
+test('pane.sh kills the tmux server after maxpool exits and records a fast exit', macOSOnly, async () => {
   const stage = await makeStage();
   const nodeDir = await stubNodeDir(stage, 'nodebin');
   await writeStub(join(stage.bin, 'stub-maxpool'), 'exit 0');
@@ -391,7 +397,7 @@ function zshRun(stage, fnArgs, extraEnv = {}) {
   }));
 }
 
-test('bare maxpool in each service state attaches, reports off, or reports starting — never starts a pool', async () => {
+test('bare maxpool in each service state attaches, reports off, or reports starting — never starts a pool', macOSOnly, async () => {
   const { stage, calls, state } = await zshStage();
 
   // State 1: running (socket session alive) → attach, no bare binary run.
@@ -417,7 +423,7 @@ test('bare maxpool in each service state attaches, reports off, or reports start
   assert.ok(!existsSync(`${calls}.maxpool`), 'the starting state must not run the real binary');
 });
 
-test('maxpool off routes direct before disabling, and tolerates an unloaded job', async () => {
+test('maxpool off routes direct before disabling, and tolerates an unloaded job', macOSOnly, async () => {
   const { stage, calls } = await zshStage();
   const r = zshRun(stage, 'off');
   assert.equal(r.status, 0, `off failed: ${r.stdout}${r.stderr}`);
@@ -431,7 +437,7 @@ test('maxpool off routes direct before disabling, and tolerates an unloaded job'
   assert.match(r.stdout, /off/i);
 });
 
-test('maxpool on succeeds through a tolerated bootstrap and routes back to the pool', async () => {
+test('maxpool on succeeds through a tolerated bootstrap and routes back to the pool', macOSOnly, async () => {
   const { stage, calls, state } = await zshStage();
   await writeFile(`${state}.statusok`, '');   // status succeeds on the first poll
   const r = zshRun(stage, 'on');
@@ -447,7 +453,7 @@ test('maxpool on succeeds through a tolerated bootstrap and routes back to the p
   assert.match(maxpoolCalls.trim().split('\n').pop(), /route pool/);
 });
 
-test('maxpool on timeout leaves the job enabled, stays direct, and says so loudly', async () => {
+test('maxpool on timeout leaves the job enabled, stays direct, and says so loudly', macOSOnly, async () => {
   const { stage, calls } = await zshStage();
   // No ${state}.statusok → status never succeeds; MAXPOOL_ON_WAIT_SECS=2 keeps the test fast.
   const r = zshRun(stage, 'on');
