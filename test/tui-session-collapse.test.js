@@ -66,6 +66,23 @@ function assertBars(rows, claudeRe, providerRe, what) {
   }
 }
 
+// Peer review (contribution session, 2026-11-16): the provider blank must ride the SAME
+// showFable switch the OAuth rows use. A pool where NO account has a Fable reading keeps
+// the Fbl column dashed on OAuth rows (width-based layout), and the GLM blank must match
+// it exactly — otherwise GLM Ses/Wk drift out of the OAuth columns.
+test('a pool with no Fable readings anywhere: the GLM blank keeps Wk in the OAuth rows column', () => {
+  const am = pool();                       // no applyUsageData with scopedWeekly on any row
+  withSession(am, 0);
+  const rows = frameRows(am, 118);
+  assert.equal(rows.length, 3);
+  const oauth = rows.find(l => /^ {4}home /.test(l));
+  const glm = rows.find(l => /^ {4}glm /.test(l));
+  assert.match(oauth, /Fbl /, 'OAuth rows keep the dashed Fbl column');
+  assert.doesNotMatch(glm, /Fbl|Fable/, 'GLM row still shows no Fable label');
+  assert.equal(glm.indexOf(' Wk '), oauth.indexOf(' Wk '), 'Wk column aligned');
+  for (const l of rows) assert.ok(l.length <= 118, `fits 118 columns: ${l.length}`);
+});
+
 test('no account reports a session window: rows show Fbl then Wk and no Ses column', () => {
   const am = pool();
   weeklyOnly(am, 0);
