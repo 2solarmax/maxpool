@@ -1016,8 +1016,8 @@ export class AccountManager {
       const matches = this._matchesRequest(account, profile, requestInfo);
 
       // A signed-thinking request behind the TRANSIENT FIFO queue-fairness gate
-      // (a queue already exists and this newcomer hasn't registered a ticket yet
-      // — the `!requestInfo.queueTicket` clause in _matchesRequest) must still be
+      // (a ticket in its way is queued and this newcomer hasn't registered a ticket
+      // yet - the `!requestInfo.queueTicket` clause in _matchesRequest) must still be
       // CONSIDERED for retry timing, not skipped. Such a request has NO fallback:
       // providers are barred (signed thinking), so dropping the account here — and
       // losing its REAL cooldown / rate-limit / 5h reset — collapses the oracle to
@@ -1038,9 +1038,9 @@ export class AccountManager {
         && this._isRequestCompatible(account, profile, requestInfo)
         && !this.admissionPaused
         && !this._isUpstreamThrottleBlocking()
-        && this.queueState.waiting.length > 0
         && !requestInfo.queueTicket
-        && !requestInfo.queueAdmitted;
+        && !requestInfo.queueAdmitted
+        && this._queuedAheadInTheWay(requestInfo);
 
       if (!matches && !fairnessOnlyBlock) {
         if (account.type === 'provider' && this._requiresAnthropicThinkingIntegrity(requestInfo)) {
@@ -2283,7 +2283,8 @@ export class AccountManager {
     // up to 25 min of "pool dead" while capacity idled. A waiter that has already
     // waited HEAD_SKIP_MS may be admitted even when tickets ahead of it exist.
     // Fairness stays: the skip only fires after a real wait, and the head's own
-    // window (queueAndRetry's ceiling) still bounds IT.
+    // window (queueAndRetry's ceiling) still bounds IT. A ticket stuck on another
+    // model's weekly limit does not hold this one at all (_queuedAheadInTheWay).
     const HEAD_SKIP_MS = 60_000;
     // A cold-held ticket (waiting for a GLM row only) is no head for anyone else to
     // queue behind (red-team 2026-11-17 f1); it keeps its own FIFO place for GLM rows.
@@ -2292,7 +2293,7 @@ export class AccountManager {
       : this.queueState.waiting.find(t => !this._coldHeldTicket(t));
     if (!head || head.id === ticket.id) {
       // fast path: unchanged FIFO
-    } else {
+    } else if (this._queuedAheadInTheWay(requestInfo)) {
       const waited = Date.now() - (ticket.queuedAt ?? Date.now());
       if (waited < HEAD_SKIP_MS) return false;
     }
@@ -2308,6 +2309,59 @@ export class AccountManager {
     requestInfo.queueTicket = null;
     requestInfo.queueAdmitted = true;
     return true;
+  }
+
+  /** True when a queued ticket ahead of this request must go first (see _isInTheWay).
+   *  Used by the fairness gate in _matchesRequest, the same check in the retry oracle
+   *  and canAdmitQueuedRequest, so all three agree. A cold-held ticket (waiting for a
+   *  GLM row only) holds no one else, unless this request is cold-held too. */
+  _queuedAheadInTheWay(requestInfo = {}) {
+    const ownColdHeld = this._coldHeldTicket(requestInfo.queueTicket);
+    const ahead = this._ticketsAhead(requestInfo.queueTicket)
+      .filter(ticket => ownColdHeld || !this._coldHeldTicket(ticket));
+    return ahead.some(ticket => this._isInTheWay(ticket.requestInfo || {}, requestInfo));
+  }
+
+  /** Waiting tickets ahead of this one. A request without a ticket (or whose ticket
+   *  already left the queue) counts every waiting ticket as ahead. */
+  _ticketsAhead(ticket) {
+    const waiting = this.queueState.waiting;
+    const own = ticket ? waiting.findIndex(t => t.id === ticket.id) : -1;
+    return own < 0 ? waiting : waiting.slice(0, own);
+  }
+
+  /** A queued request is in another request's way, unless both hold:
+   *  - the two ask for different model families (Fable and Opus, say), and
+   *  - the queued one hit its own model's weekly limit on every account it could use.
+   *  Such a request cannot be served before that limit resets, so it does not compete. */
+  _isInTheWay(queuedInfo, requestInfo) {
+    const family = modelFamily(requestInfo.model);
+    const queuedFamily = modelFamily(queuedInfo.model);
+    if (!family || family === queuedFamily) return true;
+    return !this._benchedOnEveryUsableAccount(queuedInfo);
+  }
+
+  /** True when the request's model family hit its weekly sub-limit on every account
+   *  that could serve it. False when no account could serve it at all: that is not a
+   *  model limit. */
+  _benchedOnEveryUsableAccount(requestInfo) {
+    const usable = this._accountsThatCouldServe(requestInfo);
+    return usable.length > 0 && usable.every(account => this._scopedExhausted(account, requestInfo.model));
+  }
+
+  /** Enabled accounts whose profile and provider rules accept this request. Accounts
+   *  that never serve are left out: they carry no model data, so they would look like
+   *  room for the request and keep its ticket in other requests' way. */
+  _accountsThatCouldServe(requestInfo) {
+    const profile = requestInfo.profile || 'claude';
+    return this.accounts.filter(account => account.enabled && !this._neverServes(account)
+      && this._isRequestCompatible(account, profile, requestInfo));
+  }
+
+  /** A duplicate of a team-pool account, dead credentials or a cancelled subscription:
+   *  the same rule refreshCapLift uses for an account that cannot serve. */
+  _neverServes(account) {
+    return Boolean(account.poolBenchedBy || account.refreshDead || account.subscriptionGone);
   }
 
   removeQueuedRequest(requestInfo = {}) {
@@ -3825,9 +3879,9 @@ export class AccountManager {
     const coldHeld = isClaudeAccount(account) && this._coldClaudeHold(requestInfo);
     if (
       !providerLike
-      && this.queueState.waiting.some(t => !this._coldHeldTicket(t))
       && !requestInfo.queueTicket
       && !requestInfo.queueAdmitted
+      && this._queuedAheadInTheWay(requestInfo)
     ) return false;
     if (!providerLike && this._isUpstreamThrottleBlocking()) return false;
     if (coldHeld) return false;
