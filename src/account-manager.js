@@ -415,15 +415,19 @@ const EDGE_EFFICIENCY_FIELDS = ['bounced', 'refused', 'waited', 'waitMs', 'waitT
 const efficiencyWindowMs = (windowKey) => (windowKey === 'last1h' ? 60 * 60_000 : 15 * 60_000);
 
 function emptyEfficiency() {
-  return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0,
+  return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0, movedSame: 0, movedCross: 0,
     movedByCause: { busy: 0, wall: 0, balance: 0, link: 0, other: 0 },
     newConversation: 0, bounced: 0, refused: 0, waited: 0, waitMs: 0, waitThenMoved: 0, e2e: [] };
 }
-/** Add one exported/summarized efficiency block into an accumulator (missing fields = 0). */
+/** Add one exported/summarized efficiency block into an accumulator (missing fields = 0).
+ *  Old blocks without movedSame/movedCross keep their moved total (shown as same-family
+ *  — the cheap side, so a mixed fleet under-reports cross moves rather than inventing them). */
 function addEfficiency(acc, e) {
-  for (const k of ['served', 'in', 'out', 'cr', 'cc', 'moved', 'newConversation', 'bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved']) {
+  const hasSplit = Number.isFinite(Number(e.movedSame)) || Number.isFinite(Number(e.movedCross));
+  for (const k of ['served', 'in', 'out', 'cr', 'cc', 'moved', 'movedSame', 'movedCross', 'newConversation', 'bounced', 'refused', 'waited', 'waitMs', 'waitThenMoved']) {
     acc[k] += Number(e[k]) || 0;
   }
+  if (!hasSplit) acc.movedSame += Number(e.moved) || 0;
   for (const c of Object.keys(acc.movedByCause)) acc.movedByCause[c] += Number(e.movedByCause?.[c]) || 0;
   // Latency samples exist for this pool's own rows only (percentiles do not add).
   if (Array.isArray(e.e2e)) acc.e2e.push(...e.e2e);
@@ -433,14 +437,21 @@ const pct = (arr, p) => {
   const s = [...arr].sort((x, y) => x - y);
   return s[Math.min(s.length - 1, Math.floor(p * s.length))];
 };
-/** Derived figures: hit = cr/(cr+cc+in) (GLM has no cc → r/(r+in)); missTokens = in+cc. */
+/** Derived figures: hit = cr/(cr+cc+in) (GLM has no cc → r/(r+in)); missTokens = in+cc;
+ *  writeShare = 1.25·cc / (0.1·cr + 1.25·cc + in) — the price-weighted share of
+ *  cost-equivalent spend the cache WRITES carry (reads 0.1x, writes 1.25x, uncached
+ *  input 1x). hit% alone read green while writes carried 55% of Claude spend
+ *  (2026-11-17 audit, finding 2). Cost-equivalent = quota-burn proxy (OAuth
+ *  subscriptions), not dollars. */
 function finishEfficiency(acc, provider) {
   const prompt = acc.cr + acc.cc + acc.in;
+  const cost = 0.1 * acc.cr + 1.25 * acc.cc + acc.in;
   const { e2e, ...sums } = acc;
   return {
     ...sums,
     provider,
     hit: prompt > 0 ? acc.cr / prompt : null,
+    writeShare: cost > 0 ? (1.25 * acc.cc) / cost : null,
     missTokens: acc.in + acc.cc,
     promptTokens: prompt,
     lowVolume: acc.served < 20 || prompt < 100_000,
@@ -467,6 +478,11 @@ function lruSet(map, key, value) {
 /** An Anthropic account with its own prompt cache (allow-list: a provider or legacy
  *  pool row can forward to GLM, so "not a provider" is not proof of a Claude cache). */
 const isClaudeAccount = (a) => a?.type === 'oauth' || a?.type === 'apikey';
+/** ROUTING FAMILY for the moved split (2026-11-17 audit, finding 4): every Claude
+ *  account shares one cache-per-account world; each provider (zai, kimi) is its own
+ *  family — z.ai's cache is shared across that provider's accounts, so a zai→zai hop
+ *  re-writes ~nothing while a Claude↔provider hop re-writes the whole prompt. */
+const accountFamily = (a) => (isClaudeAccount(a) ? 'claude' : String(a?.provider || 'provider'));
 const IDENTITY_WINDOW_MS = 15 * 60_000;
 const IDENTITY_MAX_SAMPLES = 4000;
 const IDENTITY_MIN_PER_SESSION = 8;
@@ -742,6 +758,7 @@ export class AccountManager {
       usage: {
         totalInputTokens: 0,
         totalOutputTokens: 0,
+        totalPaidTokens: 0,
         totalRequests: 0,
         lastUsed: null,
       },
@@ -1115,23 +1132,45 @@ export class AccountManager {
     this._bumpCaller(callerName, 1, 0);
   }
 
-  /** Attribute response TOKENS to the caller (SC22: tokens + requests). */
+  /** Attribute response TOKENS to the caller (SC22: tokens + requests).
+   *  Counting callers are callers with no full-prompt booking (tests, legacy paths);
+   *  full-prompt accounting books the SAME buckets once per request via
+   *  noteCallerPrompt (the running-max capacity figures), so the two never mix on a
+   *  request — releaseAccount books `caller` only when _callerPromptBooked is unset. */
   countCallerTokens(callerName, tokens) {
     if (!callerName || !tokens) return;
-    this._bumpCaller(callerName, 0, tokens);
+    this._bumpCaller(callerName, 0, tokens, 0);
   }
 
-  _bumpCaller(callerName, req, tok) {
+  /** Book one request's FULL token figures for the caller (audit 2026-11-17, finding 3):
+   *  prompt = input + cache_read + cache_creation (provider-native), plus output; paid =
+   *  cache write + uncached input — the part that actually consumes quota/money.
+   *  Called ONCE per request, at the terminal release, off the request's running-max
+   *  capacity book (per-request max ⇒ a rerouted request books once, not per hop).
+   *  Legacy SSE/non-stream per-event countCallerTokens calls are dropped for requests
+   *  that route through this — this supersedes them (they booked message_start input
+   *  + output only: a 908k-token cache-write MISS booked 2 tokens). */
+  noteCallerPrompt(callerName, { input = 0, cacheRead = 0, cacheCreation = 0, output = 0 }) {
+    if (!callerName) return 0;
+    const prompt = (input || 0) + (cacheRead || 0) + (cacheCreation || 0);
+    const paid = (input || 0) + (cacheCreation || 0);
+    if (!(prompt + (output || 0) > 0)) return 0;
+    this._bumpCaller(callerName, 0, prompt + (output || 0), paid);
+    return prompt;
+  }
+
+  _bumpCaller(callerName, req, tok, paid = 0) {
     const now = new Date();
     const hourKey = now.toISOString().slice(0, 13);        // 'YYYY-MM-DDTHH' UTC
     const dayKey = now.toISOString().slice(0, 10);         // 'YYYY-MM-DD' UTC
     let st = this.callerStats.get(callerName);
-    if (!st) { st = { hours: {}, days: {}, total: { req: 0, tok: 0 } }; this.callerStats.set(callerName, st); }
+    if (!st) { st = { hours: {}, days: {}, total: { req: 0, tok: 0, paid: 0 } }; this.callerStats.set(callerName, st); }
     for (const [bucket, key] of [[st.hours, hourKey], [st.days, dayKey]]) {
-      bucket[key] = bucket[key] || { req: 0, tok: 0 };
-      bucket[key].req += req; bucket[key].tok += tok;
+      bucket[key] = bucket[key] || { req: 0, tok: 0, paid: 0 };
+      bucket[key].req += req; bucket[key].tok += tok; bucket[key].paid += paid;
     }
     st.total.req += req; st.total.tok += tok;
+    st.total.paid = (st.total.paid || 0) + paid;
     this._pruneCallerBuckets(st);
   }
 
@@ -1174,22 +1213,22 @@ export class AccountManager {
     const now = Date.now();
     const out = new Map();
     const win = (st, ms, hourly) => {
-      let req = 0, tok = 0;
+      let req = 0, tok = 0, paid = 0;
       const src = hourly ? st.hours : st.days;
       for (const [k, v] of Object.entries(src)) {
         const t = Date.parse(hourly ? k + ':00:00Z' : k + 'T00:00:00Z');
-        if (t <= now && now - t < ms) { req += v.req; tok += v.tok; }
+        if (t <= now && now - t < ms) { req += v.req; tok += v.tok; paid += v.paid || 0; }
       }
-      return { req, tok };
+      return { req, tok, paid };
     };
     const winPrior = (st, fromMs, toMs) => {
-      let req = 0, tok = 0;
+      let req = 0, tok = 0, paid = 0;
       for (const [k, v] of Object.entries(st.days)) {
         const t = Date.parse(k + 'T00:00:00Z');
         const age = now - t;
-        if (t <= now && age >= fromMs && age < toMs) { req += v.req; tok += v.tok; }
+        if (t <= now && age >= fromMs && age < toMs) { req += v.req; tok += v.tok; paid += v.paid || 0; }
       }
-      return { req, tok };
+      return { req, tok, paid };
     };
     for (const [name, st] of this.callerStats) {
       out.set(name, {
@@ -1231,6 +1270,13 @@ export class AccountManager {
       const scope = outcome.upstreamThrottled ? ' pool-wide' : '';
       console.log(`[Maxpool] return-home lease throttled (${outcome.status} ${outcome.error || '-'}${scope}, ${lease.returnedHomeSwitched ? 'switched' : 'natural'}): ${account.name} depth=${depthBefore}`);
     }
+
+    // Per-account + per-caller token totals, booked ONCE per request at its terminal
+    // release off the running-max capacity book (finding 3, 2026-11-17): a stream that
+    // died mid-flight still delivered its tokens, so this runs for every non-neutral
+    // outcome, success or not. A request with no capacity figures (a refusal, a bounce)
+    // books nothing.
+    if (!outcome.neutral) this._bookRequestTokens(lease, account, outcome);
 
     if (lease.upstreamThrottleProbe) {
       if (outcome.success) {
@@ -1294,7 +1340,7 @@ export class AccountManager {
       }
       // Backstop for callers that never saw a first byte (unit callers): a 2xx served
       // the conversation. Idempotent — the first-byte note already ran on the real paths.
-      if (lease.requestInfo && !(outcome.status >= 300)) this.noteConversationServed(lease.requestInfo, account);
+      if (lease.requestInfo && !(outcome.status >= 300)) { this.stampMovedFrom(lease.requestInfo); this.noteConversationServed(lease.requestInfo, account); }
       // Efficiency fields derived from the served request; a field the caller passed
       // explicitly on the outcome wins.
       const tel = this._servedTelemetry(lease.requestInfo, account);
@@ -1335,6 +1381,17 @@ export class AccountManager {
       repeatBounce: Boolean(outcome.repeatBounce),
       usage: outcome.usage || null,
       moved: Boolean(outcome.moved),
+      // Moved split by routing family (finding 4): same = within one family (a zai→zai
+      // hop, near-free — z.ai's cache is shared across its accounts); cross = the
+      // prompt re-wrote wholesale on the new family (e.g. Claude↔provider). A caller
+      // passing `moved` without a family gets it classified HERE (off the lease's
+      // request when it exists, else off the serving account alone).
+      movedSame: Boolean(outcome.movedSame)
+        || (Boolean(outcome.moved) && outcome.movedCross !== true
+          && !this._outcomeMoveCross(outcome, lease, account)),
+      movedCross: Boolean(outcome.movedCross)
+        || (Boolean(outcome.moved) && outcome.movedSame !== true
+          && this._outcomeMoveCross(outcome, lease, account)),
       newConversation: Boolean(outcome.newConversation),
       moveCause: outcome.moveCause || null,
       busyWaitMs: outcome.busyWaitMs || 0,
@@ -1346,6 +1403,58 @@ export class AccountManager {
     this._pruneLoadEvents(account, now);
   }
 
+  /** Book one request's FULL token figures (input + cache read + cache write, provider-
+   *  native, plus output) on the account's usage and the named caller — once per
+   *  request (`_tokensBooked`), at the terminal release (finding 3, 2026-11-17: the
+   *  old per-event booking counted message_start input + output only, so a 908k-token
+   *  cache-write miss booked 2 tokens, and GLM input — which rides message_delta —
+   *  never landed). Unit callers that pass `outcome.usage` instead of filling the
+   *  request's capacity book are honoured when the request carries no figures. */
+  _bookRequestTokens(lease, account, outcome) {
+    const ri = lease.requestInfo;
+    if (ri?.isCountTokens || ri?._tokensBooked) return;
+    // A cloud MIRROR row is served by the linked pool, which books its own tokens (the
+    // People page counts each request once, at the pool that served it); the edge only
+    // taps the usage for efficiency figures.
+    if (account.remote) return;
+    const has = ri && (ri._capacityInput != null || ri._capacityCacheRead != null
+      || ri._capacityCacheCreation != null || ri._capacityOutput != null);
+    const u = has
+      ? { input: ri._capacityInput || 0, cacheRead: ri._capacityCacheRead || 0, cacheCreation: ri._capacityCacheCreation || 0, output: ri._capacityOutput || 0 }
+      : (outcome.success && outcome.usage
+        ? { input: outcome.usage.in || 0, cacheRead: outcome.usage.cr || 0, cacheCreation: outcome.usage.cc || 0, output: outcome.usage.out || 0 }
+        : null);
+    if (!u || !(u.input + u.cacheRead + u.cacheCreation + u.output > 0)) return;
+    if (ri) ri._tokensBooked = true;
+    const idx = Number.isInteger(account.index) ? account.index : this.accounts.indexOf(account);
+    this.updateUsage(idx, { input: u.input, cacheRead: u.cacheRead, cacheCreation: u.cacheCreation }, u.output);
+    this.noteCallerPrompt(ri?.caller ?? outcome.caller, u);
+  }
+
+  /** Classify an outcome-passed move (no family on the outcome): cross unless the
+   *  request's remembered previous holder is a same-family account. No previous holder
+   *  known (no request identity, unit callers) → a Claude serve is cross (unknown prev
+   *  could have re-written the whole prompt — over-report the costly side), a provider
+   *  serve same (its family's shared cache makes the rewrite assumption weak). */
+  _outcomeMoveCross(outcome, lease, account) {
+    const ri = lease?.requestInfo;
+    const fromName = ri ? (ri._servedMovedFrom ?? ri._prevServedName ?? null) : null;
+    const fromAccount = fromName != null ? this.accounts.find(a => a.name === fromName) : null;
+    if (fromAccount == null) return isClaudeAccount(account);
+    return accountFamily(fromAccount) !== accountFamily(account);
+  }
+
+  /** Remember which account served this conversation's PREVIOUS turn, on the request,
+   *  BEFORE noteConversationServed overwrites the memory (finding 4: the move's family
+   *  split needs the previous holder). Idempotent per request; a request that already
+   *  carries `_servedMovedFrom` (set by noteConversationServed itself) is left alone.
+   *  Never touches the conversation maps — display/telemetry only. */
+  stampMovedFrom(requestInfo) {
+    if (!requestInfo || requestInfo._notedServed || requestInfo.isCountTokens || '_prevServedName' in requestInfo) return;
+    const key = this._affinityKey(requestInfo);
+    requestInfo._prevServedName = key ? (this.conversationLastAccount.get(key) ?? null) : null;
+  }
+
   /** Efficiency fields of a SERVED event, read off the request that was served. */
   _servedTelemetry(ri, account) {
     if (!ri) return {};
@@ -1355,6 +1464,19 @@ export class AccountManager {
     // add a latency sample that starts AFTER the edge's wait. Served + tokens stay here.
     const pinned = ri.pinAccount != null;
     const moved = !pinned && Boolean(ri._servedMoved) && ri._notedServed === account.name;
+    // Family split of the move (finding 4): prev family read off the request — the
+    // other engineer's noteConversationServed will soon stamp `ri._servedMovedFrom`;
+    // until then the name is derived here (same key, same map, no edit there).
+    let movedSame = null, movedCross = null;
+    if (moved) {
+      const fromName = ri._servedMovedFrom ?? ri._prevServedName ?? null;
+      const fromAccount = fromName != null ? this.accounts.find(a => a.name === fromName) : null;
+      // No prev row found (renamed/offline) → CROSS: unknown prev family could have
+      // re-written the whole prompt, and over-reporting the costly side is the honest
+      // failure direction for an alarm.
+      const cross = fromAccount == null || accountFamily(fromAccount) !== accountFamily(account);
+      if (cross) movedCross = true; else movedSame = true;
+    }
     return {
       countTokens: Boolean(ri.isCountTokens),
       usage: ri.isCountTokens ? null : {
@@ -1362,6 +1484,7 @@ export class AccountManager {
         cr: ri._capacityCacheRead || 0, cc: ri._capacityCacheCreation || 0,
       },
       moved,
+      movedSame, movedCross,
       moveCause: moved ? (ri._moveCause || (ri._hop > 0 ? 'other' : 'balance')) : null,
       newConversation: !pinned && Boolean(ri._newConversation) && ri._notedServed === account.name,
 
@@ -1393,6 +1516,8 @@ export class AccountManager {
       if (e.usage) { out.in += e.usage.in; out.out += e.usage.out; out.cr += e.usage.cr; out.cc += e.usage.cc; }
       if (e.moved) {
         out.moved++;
+        if (e.movedCross) out.movedCross++;
+        else out.movedSame++;   // legacy events (no split) default to the cheap side
         const c = Object.hasOwn(out.movedByCause, e.moveCause) ? e.moveCause : 'other';
         out.movedByCause[c]++;
         if (e.busyWaitMs > 0) out.waitThenMoved++;
@@ -1420,6 +1545,11 @@ export class AccountManager {
     if (!exp) return edge;
     const acc = emptyEfficiency();
     for (const k of ['served', 'in', 'out', 'cr', 'cc']) acc[k] = Number(exp[k]) || 0;
+    // Family split (finding 4): an export that carries it adds both halves; an older
+    // export keeps its moved total on the cheap side (same) — never invents cross moves.
+    const expSplit = Number.isFinite(Number(exp.movedSame)) || Number.isFinite(Number(exp.movedCross));
+    acc.movedSame = (expSplit ? Number(exp.movedSame) || 0 : Number(exp.moved) || 0) + edge.movedSame;
+    acc.movedCross = (expSplit ? Number(exp.movedCross) || 0 : 0) + edge.movedCross;
     for (const k of EDGE_EFFICIENCY_FIELDS) acc[k] = (Number(exp[k]) || 0) + edge[k];
     for (const c of Object.keys(acc.movedByCause)) {
       acc.movedByCause[c] = (Number(exp.movedByCause?.[c]) || 0) + edge.movedByCause[c];
@@ -5594,12 +5724,24 @@ export class AccountManager {
 
   /**
    * Update cumulative token usage from response body data.
+   * `inputTokens` may be a number (legacy: uncached input only) or a usage object
+   * {input, cacheRead, cacheCreation} — the object books FULL prompt tokens
+   * (input + cache read + cache write, provider-native; finding 3, 2026-11-17), and
+   * paid (write + uncached) into totalPaidTokens beside it.
    */
   updateUsage(accountIndex, inputTokens, outputTokens) {
     const account = this.accounts[accountIndex];
     if (!account) return;
-    if (inputTokens) account.usage.totalInputTokens += inputTokens;
+    let input = inputTokens, paid = null;
+    if (inputTokens && typeof inputTokens === 'object') {
+      input = (inputTokens.input || 0) + (inputTokens.cacheRead || 0) + (inputTokens.cacheCreation || 0);
+      paid = (inputTokens.input || 0) + (inputTokens.cacheCreation || 0);
+    }
+    if (input) account.usage.totalInputTokens += input;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
+    // Legacy two-arg calls carry uncached input → it counts as paid too.
+    const paidAdd = paid != null ? paid : (typeof inputTokens === 'number' ? inputTokens : 0);
+    if (paidAdd) account.usage.totalPaidTokens = (account.usage.totalPaidTokens || 0) + paidAdd;
   }
 
   /**
@@ -5986,7 +6128,7 @@ export class AccountManager {
       // Unknown quota until the first response — probe it like startup accounts.
       probing: true,
       quota: emptyQuota(),
-      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
+      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalPaidTokens: 0, totalRequests: 0, lastUsed: null },
       inFlight: 0,
       activeWeight: 0,
       completedRequests: 0,

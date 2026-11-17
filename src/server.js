@@ -1421,6 +1421,7 @@ async function forwardRequest(
             if (upRes.status < 300) {
               // The conversation now lives on this row (first REAL byte), and its usage
               // is read off the relayed bytes — figures only, never a booking.
+              accountManager.stampMovedFrom?.(requestInfo);
               accountManager.noteConversationServed?.(requestInfo, account);
               tapLinkUsage(value, requestInfo);
             }
@@ -1635,7 +1636,7 @@ async function forwardRequest(
     requestInfo._upstreamForwardStartAt = upstreamForwardStartAt;
     requestInfo._firstUpstreamByteAt = Date.now();
     // A 2xx answer: the conversation now lives on this account (never on a refusal).
-    if (upstreamRes.status < 300) accountManager.noteConversationServed?.(requestInfo, account);
+    if (upstreamRes.status < 300) { accountManager.stampMovedFrom?.(requestInfo); accountManager.noteConversationServed?.(requestInfo, account); }
     // Response arrived — the pre-response leak window is over. Stop guarding for
     // client-disconnect via abort (streamResponse handles mid-stream disconnects).
     res.off('close', onClientClose);
@@ -5305,13 +5306,12 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
     // M3: Anthropic interim message_delta usage is CUMULATIVE — add-semantics inflates
     // output on long generations. Track a per-stream RUNNING MAX, accrue once at end.
     // M4: count_tokens responses are prompt-size echoes, not delivered work — skip.
+    // Per-account / per-caller totals are booked ONCE per request at the terminal
+    // release, off the running-max capacity book (finding 3, 2026-11-17) — booking
+    // here would double-count hops and re-add cumulative deltas.
     const usage = requestInfo.isCountTokens ? null : usageFromSseData(data);
     if (usage) {
-      const isDelta = data.type === 'message_delta';
-      const n = isDelta ? usage.output_tokens : usage.input_tokens;
-      accountManager.updateUsage(accountIndex, isDelta ? 0 : n, isDelta ? n : 0);
-      accountManager.countCallerTokens?.(requestInfo.caller, n);
-      noteCapacityUsage(requestInfo, usage, isDelta);
+      noteCapacityUsage(requestInfo, usage, data.type === 'message_delta');
     }
     if (sseEventContainsThinking(data)) {
       accountManager.markSessionThinkingProtected?.(requestInfo.sessionKey, requestInfo.model);
@@ -5362,8 +5362,8 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo 
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
-      accountManager.countCallerTokens?.(requestInfo.caller, (json.usage.input_tokens || 0) + (json.usage.output_tokens || 0));
+      // Per-account / per-caller totals book once per request at the terminal release
+      // (finding 3, 2026-11-17) — off the running-max capacity figures booked here.
       // CAPACITY LEDGER — M4: a /count_tokens response is a prompt-size echo with ZERO
       // work delivered. Claude Code calls it constantly; counting it would inflate every
       // cycle by whole prompt sizes.

@@ -1180,7 +1180,16 @@ export class TUI {
   /** EFFICIENCY line (2026-11-15), directly under Routing: is the prompt cache holding,
    *  and what are moves costing — Claude and GLM never blended. null with no traffic.
    *  Colours are WARN-only proposals until a one-day baseline exists; a red names the
-   *  cause and the account. */
+   *  cause and the account.
+   *  Honest-efficiency rework (2026-11-17, audit findings 2-6):
+   *  - hit% never travels alone: writeShare (1.25·cc / 0.1·cr+1.25·cc+in) rides beside
+   *    it — a 91% hit line can carry writes worth half the spend, and that is the number
+   *    that hid the cold-hop waste. Yellow >40%, red >60% (Claude).
+   *  - moves split cross-family (the prompt re-wrote wholesale; drives the red alarm)
+   *    vs same-family (near-free: z.ai's cache is shared across its accounts).
+   *  - miss is per provider — GLM and Claude tokenizers differ ~1.6x, a blended sum is
+   *    unit-inconsistent.
+   *  - waits say what they count: busy-bounce waits only (queue holds book 0 here). */
   _efficiencyLine(W = 80, now = Date.now()) {
     const eff = this.am.efficiencyOverall?.('last15m', now);
     if (!eff) return null;
@@ -1193,31 +1202,40 @@ export class TUI {
     if (c.lowVolume && g.lowVolume) return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
     const pctTxt = x => `${Math.round(x * 100)}%`;
     const parts = [];
-    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}`);
+    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}${c.writeShare != null ? ` (w/ ${pctTxt(c.writeShare)} of cost)` : ''}`);
     if (g.hit != null) parts.push(`GLM ${g.lowVolume ? dim(pctTxt(g.hit)) : pctTxt(g.hit)}`);
-    const miss = c.missTokens + g.missTokens;
-    parts.push(`miss ${miss >= 1e6 ? `${(miss / 1e6).toFixed(1)}M` : `${Math.round(miss / 1000)}k`} tok`);
+    const missTxt = t => t >= 1e6 ? `${(t / 1e6).toFixed(1)}M` : `${Math.round(t / 1000)}k`;
+    if (c.hit != null || c.missTokens) parts.push(`Claude miss ${missTxt(c.missTokens)} tok`);
+    if (g.hit != null || g.missTokens) parts.push(`GLM miss ${missTxt(g.missTokens)} tok`);
     const cause = k => c.movedByCause[k] + g.movedByCause[k];
     const per100 = n => (served ? Math.round(n * 100 / served) : 0);
-    parts.push(`moves ${per100(c.moved + g.moved)}/100 (busy ${cause('busy')} · balance ${cause('balance')} · wall ${cause('wall')}${cause('link') ? ` · link ${cause('link')}` : ''}${cause('other') ? ` · other ${cause('other')}` : ''})`);
+    const cross = (c.movedCross || 0) + (g.movedCross || 0);
+    // Causes list only what happened — a row of zeros is width the line cannot spare.
+    const causeTxt = ['busy', 'balance', 'wall', 'link', 'other'].filter(k => cause(k) > 0).map(k => ` · ${k} ${cause(k)}`).join('');
+    parts.push(`cross-moves ${per100(cross)}/100 (same ${(c.movedSame || 0) + (g.movedSame || 0)}${causeTxt})`);
     const bounceShare = bounced / (served + bounced);
     if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}`);
+    const glmBusy = g.movedByCause.busy || 0;
+    if (glmBusy) parts.push(`glm busy-bounced ${glmBusy}`);
     const waited = c.waited + g.waited;
-    if (waited) parts.push(`waited ${waited} (avg ${((c.waitMs + g.waitMs) / waited / 1000).toFixed(1)}s)`);
+    if (waited) parts.push(`busy-bounce waits ${waited} (avg ${((c.waitMs + g.waitMs) / waited / 1000).toFixed(1)}s)`);
 
     // RED — the first cause that applies, named with the account behind it.
-    const forced = cause('busy') + cause('wall') + cause('link');
     const wtm = c.waitThenMoved + g.waitThenMoved;
     let red_ = null;
     if (!c.lowVolume && c.hit != null && c.hit < 0.5) red_ = `Claude ${pctTxt(c.hit)} on ${this._worstCacheAccount() || '?'}`;
-    else if (per100(forced) > 2) red_ = `${per100(forced)} forced moves/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
+    else if (!c.lowVolume && c.writeShare != null && c.writeShare > 0.6) red_ = `write share ${pctTxt(c.writeShare)} of cost on ${this._worstCacheAccount() || '?'}`;
+    else if (per100(cross) > 2) red_ = `cross moves ${per100(cross)}/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
     else if (bounceShare > 0.1) red_ = `${pctTxt(bounceShare)} bounced — most on ${this._mostBouncedAccount(now) || '?'}`;
     else if (wtm * 100 / Math.max(1, served) > 0.5) red_ = `${wtm} waits still moved — on ${this._mostBouncedAccount(now) || '?'}`;
     if (red_) return truncLine(` ${red('Cache')}    ${red(`⚠ ${red_}`)} ${dim('·')} ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
-    // YELLOW — Claude below 70%, drifting 15+ points under its hour, or waits are common.
+    // YELLOW — Claude below 70%, write share over 40% of cost, drifting 15+ points
+    // under its hour, or waits are common.
     const hour = this.am.efficiencyOverall('last1h', now).claude;
     const drift = !c.lowVolume && !hour.lowVolume && c.hit != null && hour.hit != null && hour.hit - c.hit >= 0.15;
-    const warn = (!c.lowVolume && c.hit != null && c.hit < 0.7) || drift || waited > 0.25 * served;
+    const warn = (!c.lowVolume && c.hit != null && c.hit < 0.7)
+      || (!c.lowVolume && c.writeShare != null && c.writeShare > 0.4)
+      || drift || waited > 0.25 * served;
     return truncLine(` ${warn ? yellow('Cache') : green('Cache')}    ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
   }
 
@@ -3396,9 +3414,10 @@ export class TUI {
 
     const merged = new Map();
     const addWin = (name, w) => {
-      const cur = merged.get(name) || { h24: 0, h24p: 0, d7: 0, d7p: 0, d30: 0, d30p: 0, total: 0, tok7: 0 };
+      const cur = merged.get(name) || { h24: 0, h24p: 0, d7: 0, d7p: 0, d30: 0, d30p: 0, total: 0, tok7: 0, paid7: 0 };
       for (const k of ['h24', 'h24p', 'd7', 'd7p', 'd30', 'd30p', 'total']) cur[k] += (w[k]?.req ?? 0);
       cur.tok7 += (w.d7?.tok ?? 0);
+      cur.paid7 += (w.d7?.paid ?? 0);
       merged.set(name, cur);
     };
     for (const [n, w] of this.am.callerWindowStats?.() || []) addWin(n, w);
@@ -3422,22 +3441,23 @@ export class TUI {
     };
     const CW = 9;
     const header = '  ' + 'person'.padEnd(10)
-      + ['24h', 'Δ24h', '7d', 'Δ7d', '30d', 'Δ30d', 'total', '~7d tok'].map(c => c.padStart(CW)).join('');
+      + ['24h', 'Δ24h', '7d', 'Δ7d', '30d', 'Δ30d', 'total', '~7d tok', '~7d paid'].map(c => c.padStart(CW)).join('');
     out.push(dimUnderline(fitLine(header, W)));
 
     const rows = [...merged.entries()].sort((a, b) => b[1].d7 - a[1].d7);
-    const tot = { h24: 0, h24p: 0, d7: 0, d7p: 0, d30: 0, d30p: 0, total: 0, tok7: 0 };
+    const tot = { h24: 0, h24p: 0, d7: 0, d7p: 0, d30: 0, d30p: 0, total: 0, tok7: 0, paid7: 0 };
     for (const [name, w] of rows) {
       for (const k of Object.keys(tot)) tot[k] += w[k];
       out.push('  ' + name.slice(0, 10).padEnd(10)
-        + [fmt(w.h24), delta(w.h24, w.h24p), fmt(w.d7), delta(w.d7, w.d7p), fmt(w.d30), delta(w.d30, w.d30p), fmt(w.total), fmtTok(w.tok7)]
+        + [fmt(w.h24), delta(w.h24, w.h24p), fmt(w.d7), delta(w.d7, w.d7p), fmt(w.d30), delta(w.d30, w.d30p), fmt(w.total), fmtTok(w.tok7), fmtTok(w.paid7)]
           .map(c => lpadVis(String(c), CW)).join(''));
     }
     out.push(dim('  ' + 'total'.padEnd(10)
-      + [fmt(tot.h24), delta(tot.h24, tot.h24p), fmt(tot.d7), delta(tot.d7, tot.d7p), fmt(tot.d30), delta(tot.d30, tot.d30p), fmt(tot.total), fmtTok(tot.tok7)]
+      + [fmt(tot.h24), delta(tot.h24, tot.h24p), fmt(tot.d7), delta(tot.d7, tot.d7p), fmt(tot.d30), delta(tot.d30, tot.d30p), fmt(tot.total), fmtTok(tot.tok7), fmtTok(tot.paid7)]
         .map(c => lpadVis(String(c), CW)).join('')));
 
     const link = (this.am.poolLinks || []).find(l => l.lastOkAt);
+    out.push(dim('  tok = full prompt (input + cache read + cache write) + output, provider-native · paid = cache write + uncached input'));
     out.push(dim(`  rolling windows · restarts included${link ? ` · team pool synced ${new Date(link.lastOkAt).toLocaleTimeString()}` : ''}`));
     return out;
   }
@@ -3590,10 +3610,14 @@ export class TUI {
     out.push('');
     out.push(' ' + dim('Capacity = median of tokens ÷ % full across readings in each cycle. Med-3 = median of last 3 cycles, Med-all = every cycle.'));
     out.push(' ' + dim('One row per account. Where = which side holds its history: cloud, laptop or both. ? = identity unknown.'));
-    out.push(' ' + dim('Tokens = everything the provider processed (input + cached + output), same for Claude and GLM.'));
+    // Axis honesty (audit 2026-11-17, finding 5): the figure counts processed tokens in
+    // EACH provider's own tokenizer (GLM ≈ 0.6x Anthropic for the same prompt), and a
+    // cache read (0.1x) weighs the same as a cache write (1.25x). So $/1M across a
+    // Claude and a GLM row is not a like-for-like price per Claude-equivalent token.
+    out.push(' ' + dim('Tokens = processed tokens (provider-native): input + cached + output, counted in each provider\'s own tokenizer.'));
     out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise.'));
     out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
-    out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized). -- = no price or tank yet.'));
+    out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized), per processed tokens (provider-native). -- = no price or tank yet.'));
     return out;
   }
 

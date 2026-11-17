@@ -44,10 +44,10 @@ test('status prints the Efficiency block and per-account cache figures', async (
       child.on('exit', () => resolve(buf));
     });
     assert.match(out, /Efficiency \(15m\):/, out);
-    assert.match(out, /Claude 88% \(miss 0\.0M tok\)/, `local + cloud export combined: ${out}`);
+    assert.match(out, /Claude 88% \(miss 0\.0M tok · writes 0% of cost\)/, `local + cloud export combined: ${out}`);
     assert.match(out, /GLM —/, 'missing GLM figures read as a dash');
-    assert.match(out, /Moves:\s+17\/100 served \(busy 1 · balance 0 · wall 0 · link 0 · other 0\)/, out);
-    assert.match(out, /Waited:\s+1 \(avg 1\.2s\) · waited then moved 1/, 'a wait that still moved is counted as waste');
+    assert.match(out, /Moves:\s+17\/100 served \(cross-family 1 · same-family 0 · busy 1 · balance 0 · wall 0 · link 0 · other 0\)/, out);
+    assert.match(out, /Busy waits:\s+1 \(avg 1\.2s\) · waited then moved 1/, 'a wait that still moved is counted as waste');
     assert.doesNotMatch(out, /g1 \(provider\)\n(?:.*\n){2}\s+Cache:/, 'an idle row prints no cache line');
     assert.match(out, /Cache:\s+88% over 1h, 6 served, 0 bounced/, `per-account row: ${out}`);
     assert.match(out, /Cache:\s+90% over 1h \(team\), 20 served/, `cloud row shows the serving pool's export: ${out}`);

@@ -385,7 +385,10 @@ export class CapacityLedger {
   accrue(name, { input, output, cacheRead = 0, cacheCreation = 0, model = null }, at = this._now(), windows = ['ses', 'wk']) {
     // TOKEN DEFINITION (v5, owner 2026-11-06): every token the provider processed =
     // input + cache_read + cache_creation + output, identical for Anthropic and z.ai so
-    // both sit on one axis. (The cache counters are also kept separately per cycle.)
+    // both sit on one axis. NOTE (audit 2026-11-17): "one axis" means
+    // one DEFINITION — counts stay provider-native (GLM's tokenizer reads ~0.6x Anthropic's
+    // for the same prompt) and a 0.1x cache read weighs the same as a 1.25x write; the
+    // Capacity page labels the axis "processed tokens (provider-native)". (The cache counters are also kept separately per cycle.)
     const cr = cacheRead > 0 ? cacheRead : 0, cc = cacheCreation > 0 ? cacheCreation : 0;
     const total = (input > 0 ? input : 0) + (output > 0 ? output : 0) + cr + cc;
     if (!(total > 0)) return;
