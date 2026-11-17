@@ -730,6 +730,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         }
       } finally {
         clearInterval(reaperTimer);
+        // THREAD OWNERSHIP, recorded at terminal release: the reply id captured during
+        // the response (message_start for streaming, body id for non-streaming) belongs
+        // to the account that SERVED the turn — pin it so the next continue is judged
+        // by thread identity. Only a served (2xx-5xx upstream answer) turn reaches here
+        // with _threadReplyId set; refusals return before the fetch.
+        if (requestInfo?._threadReplyId && ctx.account) {
+          threadOwners.noteThreadId(requestInfo._threadReplyId, ctx.account);
+        }
         accountManager.noteClientOutcome?.(requestInfo, ctx.status);
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
@@ -1530,6 +1538,7 @@ async function forwardRequest(
   // `kind:'none'` when the gate is off makes every branch below a no-op, so the
   // disabled path costs one comparison and needs no further guarding.
   const threadIntent = THREAD_GATE_ENABLED ? readThreadIntent(body) : { kind: 'none' };
+  requestInfo._threadIntent = threadIntent;
   if (threadOwners.shouldRefuse(requestInfo.sessionKey, account.name, threadIntent, isThreadlessAccount(account))) {
     threadOwners.noteRefused(requestInfo.sessionKey, account.name);
     accountManager.releaseAccount(lease, { neutral: true });
@@ -1540,6 +1549,9 @@ async function forwardRequest(
   }
   // This account is about to serve the turn, so it holds the thread from here on.
   // Recorded optimistically: if the turn fails, the next one is refused anyway.
+  // The reply's own message id is captured during the response (message_start / body
+  // head — see parseSSEEvent and the non-streaming read) and recorded at release, so
+  // the next continue is judged by THREAD identity rather than by terminal.
   threadOwners.noteServed(requestInfo.sessionKey, account.name, threadIntent);
 
   // Build log sections
@@ -5275,7 +5287,15 @@ function tapLinkUsage(chunk, requestInfo) {
   if (requestInfo.isCountTokens) return;
   if (!requestInfo.stream) {
     if (chunk) {
-      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + Buffer.from(chunk).toString()).slice(-64 * 1024);
+      const text = Buffer.from(chunk).toString();
+      // THREAD OWNERSHIP (link path): the reply's own id sits at the HEAD of a
+      // non-streaming body — keep the first slice, the usage tail keeps the last.
+      if (requestInfo._threadIntent && !requestInfo._threadReplyId && !requestInfo._tapHead) {
+        requestInfo._tapHead = text.slice(0, 2048);
+        const idm = requestInfo._tapHead.match(/"id"\s*:\s*"([^"]+)"/);
+        if (idm) requestInfo._threadReplyId = idm[1];
+      }
+      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + text).slice(-64 * 1024);
       return;
     }
     const u = usageFromBodyTail(requestInfo._tapBuf);
@@ -5291,6 +5311,11 @@ function tapLinkUsage(chunk, requestInfo) {
     if (!dataLine) continue;
     let data;
     try { data = JSON.parse(dataLine.slice(6)); } catch { continue; }
+    // THREAD OWNERSHIP (link path): the linked pool serves the turn; its reply id is
+    // pinned to THIS row so the Mac-side gate judges the next continue by thread.
+    if (data?.type === 'message_start' && typeof data.message?.id === 'string' && requestInfo._threadIntent) {
+      requestInfo._threadReplyId = data.message.id;
+    }
     const u = usageFromSseData(data);
     if (u) noteCapacityUsage(requestInfo, u, data.type === 'message_delta');
   }
@@ -5302,6 +5327,12 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
 
   try {
     const data = JSON.parse(dataLine.slice(6));
+    // THREAD OWNERSHIP: message_start carries the reply's own id — the id the client
+    // will continue from (previous_message_id). Capture it on the SERVING account so
+    // the gate can judge the next continue by thread identity instead of by terminal.
+    if (data?.type === 'message_start' && typeof data.message?.id === 'string' && requestInfo._threadIntent) {
+      requestInfo._threadReplyId = data.message.id;
+    }
     // CAPACITY LEDGER (2026-08-22): stream-level usage feeds the per-cycle ledger.
     // M3: Anthropic interim message_delta usage is CUMULATIVE — add-semantics inflates
     // output on long generations. Track a per-stream RUNNING MAX, accrue once at end.
@@ -5361,6 +5392,10 @@ function classifyHeldStreamPrefix(prefix) {
 function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo = {}) {
   try {
     const json = JSON.parse(buffer.toString());
+    // THREAD OWNERSHIP: a non-streaming reply's own id is the next continue's anchor.
+    if (typeof json.id === 'string' && requestInfo._threadIntent) {
+      requestInfo._threadReplyId = json.id;
+    }
     if (json.usage) {
       // Per-account / per-caller totals book once per request at the terminal release
       // (finding 3, 2026-11-17) — off the running-max capacity figures booked here.

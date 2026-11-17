@@ -27,7 +27,10 @@ export function isThreadlessAccount(account) {
 }
 
 /** What kind of thread intent a request body carries. Cheap: only the head of the body
- *  is JSON-parsed, and a non-JSON body is simply 'none'. */
+ *  is JSON-parsed, and a non-JSON body is simply 'none'. A `continue` also carries the
+ *  id of the reply it follows — the ONE identifier that names the thread itself, so the
+ *  gate returns it (session keys are per terminal and sibling agents inside one terminal
+ *  hold threads on different accounts; 2026-11-17: 60 of 109 thread 404s). */
 export function readThreadIntent(body) {
   try {
     const j = JSON.parse(body.toString('utf8'));
@@ -36,7 +39,10 @@ export function readThreadIntent(body) {
       // `previous_message_id` can also ride in `diagnostics`; that alone is not a thread.
       return { kind: 'none' };
     }
-    if (t.type === 'continue') return { kind: 'continue' };
+    if (t.type === 'continue') {
+      const previousMessageId = typeof t.previous_message_id === 'string' ? t.previous_message_id : null;
+      return { kind: 'continue', previousMessageId };
+    }
     if (t.type === 'create') return { kind: 'create' };
     return { kind: 'none' };
   } catch {
@@ -71,6 +77,12 @@ const NO_SESSION_PREFIX = '\u0000nosession:';
 export class ThreadOwners {
   constructor({ maxSessions = MAX_SESSIONS, maxRefusals = MAX_CONSECUTIVE_REFUSALS } = {}) {
     this.map = new Map();          // sessionKey -> { owner, refusals }
+    // reply message id -> owning account name. The THREAD is keyed by the reply id the
+    // client sends back as previous_message_id — a session key is per TERMINAL, and
+    // sibling agents inside one terminal hold threads on different accounts, so the
+    // per-terminal entry both mis-serves siblings and never expires per thread.
+    // Bounded LRU, same lifetime class as the per-session map above it.
+    this.threads = new Map();
     this.maxSessions = maxSessions;
     this.maxRefusals = maxRefusals;
   }
@@ -85,6 +97,23 @@ export class ThreadOwners {
     this.map.delete(key);
     this.map.set(key, value);
     while (this.map.size > this.maxSessions) this.map.delete(this.map.keys().next().value);
+  }
+
+  /** Record which account produced a threaded reply (the id the client will continue
+   *  from). Streaming: the message_start event's message.id; non-streaming: the body's
+   *  leading id. Called on every served turn that carried thread intent — a `create`
+   *  starts a thread, a `continue` extends it onto whoever served the follow-up. */
+  noteThreadId(threadId, accountName) {
+    if (!threadId || !accountName) return;
+    this.threads.delete(threadId);
+    this.threads.set(threadId, accountName);
+    while (this.threads.size > this.maxSessions) this.threads.delete(this.threads.keys().next().value);
+  }
+
+  /** The account that holds `threadId`, if we saw its reply. Null = unknown. */
+  threadOwner(threadId) {
+    const v = threadId ? this.threads.get(threadId) : undefined;
+    return v ?? null;
   }
 
   /** Decide AFTER routing has chosen. Returns true only for a `continue` turn that the
@@ -106,7 +135,15 @@ export class ThreadOwners {
   shouldRefuse(sessionKey, accountName, intent, isProvider = false) {
     if (!accountName) return false;
     if (intent?.kind !== 'continue') return false;          // `create` carries the full transcript
-    if (isProvider) return true;                            // can never serve an Anthropic thread
+    if (isProvider) return true;                            // can never serve an Anthropic thread — even as the recorded holder
+    // THREAD identity first: the previous_message_id names the exact thread being
+    // continued. When we know its holder, the answer is exact (the holder passes,
+    // everyone else is refused) and never falls through to the terminal-keyed guess —
+    // which is what mis-served sibling agents inside one terminal (2026-11-17).
+    if (intent?.previousMessageId) {
+      const holder = this.threads.get(intent.previousMessageId);
+      if (holder != null) return holder !== accountName;
+    }
     // A request with NO session header is invisible to ownership tracking, and measured
     // 2026-09-11 those are the majority of traffic — 14 of 20 consecutive /v1/messages
     // lines carried no `[sess …]`. Skipping them left threaded turns reaching GLM and
@@ -129,10 +166,13 @@ export class ThreadOwners {
   }
 
   /** Record that `accountName` served a threaded turn for this session — it now holds
-   *  the thread. Any refusal streak ends here. */
-  noteServed(sessionKey, accountName, intent) {
+   *  the thread. Any refusal streak ends here. The reply's own message id (when the
+   *  caller captured it from the response) is recorded as the newest link of the
+   *  thread, so the NEXT continue is judged by thread identity, not by terminal. */
+  noteServed(sessionKey, accountName, intent, replyMessageId = null) {
     if (!accountName) return;
     if (intent?.kind !== 'create' && intent?.kind !== 'continue') return;
+    if (replyMessageId) this.noteThreadId(replyMessageId, accountName);
     // Without a session header there is no conversation to attribute ownership to; only
     // clear the per-account refusal streak so a served turn re-arms the bound.
     const key = sessionKey || `${NO_SESSION_PREFIX}${accountName}`;
