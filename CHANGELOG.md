@@ -5,6 +5,20 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.100] - 2026-11-17
+
+### Changed
+
+- Pin the hold guards that survived mutation; drop a redundant one
+- A busy GLM row moves to its GLM sibling, not Claude
+
+### Fixed
+
+- Route warm GLM conversations to GLM siblings and cap repeat cold Claude re-writes
+- A GLM-held request never stalls other traffic; dead GLM rows end the hold
+- Show the true cost on the efficiency dashboard
+- Red-team round 2 polish on the GLM hold
+
 ## [1.24.99] - 2026-11-16
 
 ### Fixed
