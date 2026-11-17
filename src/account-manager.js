@@ -4943,7 +4943,7 @@ export class AccountManager {
 
   /** The weekly tier from the readings AS THEY STAND — no expiry clearing, so the
    *  account table can ask the router's exact question without mutating the quota
-   *  mid-render (the "wk full" status word must never disagree with routing). */
+   *  mid-render (the "exhausted" status word must never disagree with routing). */
   _weeklyTier(account, now = Date.now()) {
     const q = account.quota;
     if (this._isAccountWideRejected(account)) return 'exhausted';

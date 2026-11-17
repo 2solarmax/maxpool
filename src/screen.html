@@ -79,7 +79,9 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     if (a.enabled === false) return ['', 'Off'];
     if (a.refreshDead) return ['bad', 'Needs login'];
     if (a.status === 'error') return ['bad', 'Error'];
-    if (week != null && week >= 0.999) return ['warn', 'Used up this week'];
+    // One word per state: the terminal UI calls this state "exhausted" for BOTH
+    // Anthropic and GLM accounts; the web screen used a GLM-era phrase here.
+    if (week != null && week >= 0.999) return ['warn', 'Exhausted this week'];
     if (a.status === 'throttled' || a.rateLimitedUntil) return ['warn', 'Resting'];
     return ['ok', 'Ready'];
   }
@@ -96,7 +98,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
         var q = ra.quota || {};
         var five = q.unified5h != null ? q.unified5h : q.providerSes;
         var week = q.unified7d != null ? q.unified7d : q.providerWk;
-        var st = ra.refreshDead ? ['bad', 'Needs login'] : ra.status === 'error' ? ['bad', 'Error'] : (week != null && week >= 0.999) ? ['warn', 'Used up this week'] : ra.status === 'throttled' ? ['warn', 'Resting'] : ['ok', 'Ready'];
+        var st = ra.refreshDead ? ['bad', 'Needs login'] : ra.status === 'error' ? ['bad', 'Error'] : (week != null && week >= 0.999) ? ['warn', 'Exhausted this week'] : ra.status === 'throttled' ? ['warn', 'Resting'] : ['ok', 'Ready'];
         return '<div class="acct">' +
           '<div><div class="name">' + esc(ra.name) + '</div><div class="sub">' + esc(ra.provider || (ra.type === 'oauth' ? 'Claude' : ra.type)) + ' · cloud</div></div>' +
           '<div class="bars">' + bar('5h', five) + bar('7d', week) + '</div>' +

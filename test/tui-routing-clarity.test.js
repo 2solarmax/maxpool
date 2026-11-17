@@ -150,35 +150,36 @@ test('pressing a with nothing pinned does not offer to "unpin"', () => {
 
 // WEEKLY WINDOW FULL (Max, 2026-11-18): four GLM rows read "active" next to "Wk 100%"
 // with resets 22h-2d away. The router skips a weekly-full account (_weeklyRawState
-// 'exhausted'), so the Status column must say so, the same way it says "5h full".
+// 'exhausted'), so the Status column must say "exhausted" — the SAME word an
+// Anthropic account uses for this state (owner 2026-11-18: one state, one word).
 const wkFull = (extra = {}) => ({ providerSes: 0, providerWk: 1, providerWkReset: Date.now() + 22 * 3600_000, ...extra });
 
-test('a GLM account whose WEEKLY window is full reads "wk full", not "active"', () => {
+test('a GLM account whose WEEKLY window is full reads "exhausted", not "active"', () => {
   const am = new AccountManager([provider('glm wkfull'), provider('glm fine')], 0.95);
   Object.assign(am.accounts[0].quota, wkFull());
   Object.assign(am.accounts[1].quota, { providerSes: 0.1, providerWk: 0.5, providerWkReset: Date.now() + 3 * 86400_000 });
   assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: the router refuses this account');
   assert.equal(am._isAvailable(am.accounts[1]), true, 'precondition: the router uses the other one');
   const text = captureRender(tuiFor(am));
-  assert.match(rowFor(text, 'glm wkfull'), /wk full/, `row: ${rowFor(text, 'glm wkfull')}`);
+  assert.match(rowFor(text, 'glm wkfull'), /exhausted/, `row: ${rowFor(text, 'glm wkfull')}`);
   assert.doesNotMatch(rowFor(text, 'glm wkfull'), /\bactive\b/);
   assert.match(rowFor(text, 'glm fine'), /\bactive\b/);
 });
 
-test('a CLOUD GLM row (the reported case) whose weekly window is full reads "wk full"', () => {
+test('a CLOUD GLM row (the reported case) whose weekly window is full reads "exhausted"', () => {
   const am = new AccountManager([provider('glm cloudfull', { remoteUuid: 'U1', remote: { linkName: 'team', remoteName: 'glm cloudfull', url: 'http://127.0.0.1:9', key: 'k', link: { lastOkAt: Date.now() } } })], 0.95);
   Object.assign(am.accounts[0].quota, wkFull());
   const row = strip(tuiFor(am)._renderAcct(0, 11, true));
-  assert.match(row, /wk full/, `row: ${row}`);
+  assert.match(row, /exhausted/, `row: ${row}`);
   assert.doesNotMatch(row, /\bactive\b/);
 });
 
-test('a GLM weekly reading past its reset stamp still reads "wk full" while the router still refuses it', () => {
+test('a GLM weekly reading past its reset stamp still reads "exhausted" while the router still refuses it', () => {
   const am = new AccountManager([provider('glm stalewk')], 0.95);
   Object.assign(am.accounts[0].quota, wkFull({ providerWkReset: Date.now() - 60_000 }));
   assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: GLM readings are only cleared by the next usage check');
   const row = strip(tuiFor(am)._renderAcct(0, 11, true));
-  assert.match(row, /wk full/, `row: ${row}`);
+  assert.match(row, /exhausted/, `row: ${row}`);
 });
 
 test('a Claude account at 100% weekly that Anthropic still ALLOWS stays "active" (the router keeps it as a last resort)', () => {
@@ -188,15 +189,15 @@ test('a Claude account at 100% weekly that Anthropic still ALLOWS stays "active"
   assert.equal(am._isAvailable(am.accounts[0], { allowWeeklyCritical: true }), true, 'precondition: the router can still serve it');
   const row = strip(tuiFor(am)._renderAcct(0, 11, true));
   assert.match(row, /\bactive\b/, `row: ${row}`);
-  assert.doesNotMatch(row, /wk full/);
+  assert.doesNotMatch(row, /exhausted/);
 });
 
-test('a Claude account at 100% weekly with no "allowed" verdict reads "wk full"', () => {
+test('a Claude account at 100% weekly with no "allowed" verdict reads "exhausted"', () => {
   const am = new AccountManager([oauth('claude wkfull')], 0.95);
   Object.assign(am.accounts[0].quota, { unified5h: 0.1, unified5hReset: Date.now() + 3600_000, unified7d: 1, unified7dReset: Date.now() + 86400_000 });
   assert.equal(am._isAvailable(am.accounts[0]), false, 'precondition: the router refuses it');
   const row = strip(tuiFor(am)._renderAcct(0, 11, true));
-  assert.match(row, /wk full/, `row: ${row}`);
+  assert.match(row, /exhausted/, `row: ${row}`);
 });
 
 test('a Claude weekly window whose reset has PASSED is free again', () => {
@@ -206,9 +207,20 @@ test('a Claude weekly window whose reset has PASSED is free again', () => {
   assert.match(row, /\bactive\b/, `row: ${row}`);
 });
 
-test('a GLM account with BOTH windows full names the longer wait: "wk full"', () => {
+test('a GLM account with BOTH windows full names the longer wait: "exhausted"', () => {
   const am = new AccountManager([provider('glm bothfull')], 0.95);
   Object.assign(am.accounts[0].quota, wkFull({ providerSes: 1, providerSesReset: Date.now() + 2 * 3600_000 }));
   const row = strip(tuiFor(am)._renderAcct(0, 11, true));
-  assert.match(row, /wk full/, `row: ${row}`);
+  assert.match(row, /exhausted/, `row: ${row}`);
+});
+
+test('terminology: the SAME status word "exhausted" serves both Anthropic and GLM weekly-full rows', () => {
+  const am = new AccountManager([oauth('cla wk', { }), provider('glm wk2')], 0.95);
+  const now = Date.now();
+  Object.assign(am.accounts[0].quota, { unified5h: 0.1, unified5hReset: now + 3600_000, unified7d: 1, unified7dReset: now + 86400_000 });
+  Object.assign(am.accounts[1].quota, { providerSes: 0, providerWk: 1, providerWkReset: now + 22 * 3600_000 });
+  const r1 = strip(tuiFor(am)._renderAcct(0, 11, true));
+  const r2 = strip(tuiFor(am)._renderAcct(1, 11, true));
+  assert.match(r1, /exhausted/); assert.match(r2, /exhausted/);
+  assert.doesNotMatch(r1 + r2, /wk full/i);
 });
