@@ -167,3 +167,63 @@ test('an invalid hold setting never holds (not an endless wait)', () => {
   const m = repeatOffender({ coldClaudeRepeatHoldMs: 'soon' });
   assert.equal(m.hasAvailableRoute(ri(), new Set([byName(m, 'g1').index, byName(m, 'g2').index])), true);
 });
+
+// ── red-team 2026-11-17 f1: a held request must not stall unrelated traffic ─────
+test('a held request waiting for GLM does not block another request from an idle Claude row', () => {
+  const m = repeatOffender();
+  const allGlm = new Set([byName(m, 'g1').index, byName(m, 'g2').index]);
+  const held = ri();
+  assert.equal(m.hasAvailableRoute(held, allGlm), false, 'the repeat offender holds');
+  held._coldHoldStartedAt = Date.now();               // it is now parked, polling
+  m.registerQueuedRequest({ ...held, sessionKey: 'sess-held' }, {});
+  m.queueState.waiting[0].requestInfo = held;          // in the line, as queueAndRetry leaves it
+  // An unrelated small claude-profile request from another terminal, c1 idle:
+  const other = { sessionKey: 'sess-other', profile: 'claude', model: 'claude-opus-5-5', weight: 1, bodyBytes: 30_000, stream: true };
+  assert.equal(m.hasAvailableRoute(other, new Set()), true, 'Claude is a route for it');
+  const lease = m.acquireAccount(other, new Set());
+  assert.equal(lease?.account.name, 'c1', 'served at once on the idle Claude row');
+});
+
+// ── red-team 2026-11-17 f2: dead GLM rows must not keep the hold alive ─────────
+for (const [what, mark] of [
+  ['auth error', (a) => { a.status = 'error'; }],
+  ['exhausted', (a) => { a.status = 'exhausted'; }],
+  ['subscription gone', (a) => { a.subscriptionGone = true; }],
+  ['provisional upstream block past the cap', (a) => { a.provisionalUpstreamUntil = Date.now() + 3_600_000; }],
+]) {
+  test(`no hold when every GLM row is ${what}`, () => {
+    const m = repeatOffender();
+    for (const n of ['g1', 'g2']) mark(byName(m, n));
+    assert.equal(m.hasAvailableRoute(ri(), new Set()), true, 'waiting would buy nothing -> Claude now');
+  });
+}
+
+test('a ticketed request is not kept behind a cold-held ticket at the head of the line', () => {
+  const m = repeatOffender();
+  const held = ri();
+  m.hasAvailableRoute(held, new Set([byName(m, 'g1').index, byName(m, 'g2').index]));
+  assert.ok(held._coldHoldStartedAt != null);
+  assert.ok(m.registerQueuedRequest({ ...held, sessionKey: 'sess-held' }, {}) || true);
+  m.queueState.waiting[0].requestInfo = held;
+  const other = { sessionKey: 'sess-other', profile: 'claude', model: 'claude-opus-5-5', weight: 1, bodyBytes: 30_000, stream: true };
+  m.registerQueuedRequest(other, {});
+  assert.equal(m.queueState.waiting.length, 2, 'both in line, the held one first');
+  assert.equal(m.canAdmitQueuedRequest(other), true, 'admitted at once, not after the 60 s head-skip');
+});
+
+test('once the hold cap has passed, the ticket is an ordinary fair waiter again', () => {
+  const m = repeatOffender({ coldClaudeRepeatHoldMs: 120_000 });
+  const t = { id: 1, queuedAt: Date.now(), requestInfo: { _coldHoldStartedAt: Date.now() - 121_000 } };
+  assert.equal(m._coldHeldTicket(t), false);
+  assert.equal(m._coldHeldTicket({ ...t, requestInfo: { _coldHoldStartedAt: Date.now() } }), true);
+});
+
+test('a cold-held ticket at the FRONT of the line keeps its turn for GLM rows', () => {
+  const m = repeatOffender();
+  const held = ri();
+  m.hasAvailableRoute(held, new Set([byName(m, 'g1').index, byName(m, 'g2').index]));
+  m.registerQueuedRequest(held, {});
+  const other = { sessionKey: 'sess-other', profile: 'claude', model: 'claude-opus-5-5', weight: 1, bodyBytes: 30_000, stream: true };
+  m.registerQueuedRequest(other, {});
+  assert.equal(m.canAdmitQueuedRequest(held), true, 'front of the line, admitted for a GLM row');
+});

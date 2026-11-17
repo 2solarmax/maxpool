@@ -1895,7 +1895,12 @@ export class AccountManager {
     // Fairness stays: the skip only fires after a real wait, and the head's own
     // window (queueAndRetry's ceiling) still bounds IT.
     const HEAD_SKIP_MS = 60_000;
-    if (this.queueState.waiting[0]?.id === ticket.id) {
+    // A cold-held ticket (waiting for a GLM row only) is no head for anyone else to
+    // queue behind (red-team 2026-11-17 f1); it keeps its own FIFO place for GLM rows.
+    const head = this._coldHeldTicket(ticket)
+      ? this.queueState.waiting[0]
+      : this.queueState.waiting.find(t => !this._coldHeldTicket(t));
+    if (!head || head.id === ticket.id) {
       // fast path: unchanged FIFO
     } else {
       const waited = Date.now() - (ticket.queuedAt ?? Date.now());
@@ -3350,14 +3355,21 @@ export class AccountManager {
     // Cloud mirrors egress from the cloud's own IP — this machine's upstream throttle
     // and local queue fairness don't describe them.
     const providerLike = account.type === 'provider' || Boolean(account.remote);
+    // A request parked by the repeat cold-hop hold (red-team 2026-11-17 f1) must not
+    // sit in the FIFO waiting line: a queued waiter makes local Claude rows refuse
+    // every NEW request without a ticket, and a ticket-holder queues behind it — so
+    // one held conversation stalled unrelated traffic on an idle Claude row for up to
+    // HEAD_SKIP_MS (60 s). It waits by polling (waitForAvailableRoute re-checks
+    // hasAvailableRoute every poll) and never registers a queue ticket.
+    const coldHeld = isClaudeAccount(account) && this._coldClaudeHold(requestInfo);
     if (
       !providerLike
-      && this.queueState.waiting.length
+      && this.queueState.waiting.some(t => !this._coldHeldTicket(t))
       && !requestInfo.queueTicket
       && !requestInfo.queueAdmitted
     ) return false;
     if (!providerLike && this._isUpstreamThrottleBlocking()) return false;
-    if (isClaudeAccount(account) && this._coldClaudeHold(requestInfo)) return false;
+    if (coldHeld) return false;
     return true;
   }
 
@@ -3395,15 +3407,29 @@ export class AccountManager {
     return true;
   }
 
+  /** Is this queue ticket's request inside a live repeat cold-hop hold? */
+  _coldHeldTicket(t, now = Date.now()) {
+    const started = t?.requestInfo?._coldHoldStartedAt;
+    if (started == null) return false;
+    const capMs = Number(this.scheduler.coldClaudeRepeatHoldMs);
+    return capMs > 0 && now < started + capMs;
+  }
+
   /** Could a z.ai row sharing `holder`'s cache serve this request before `until`?
    *  (Enabled, eligible, not weekly-out, not benched or 5h-walled past `until`.) */
   _sharedCacheRowSoon(holder, requestInfo, until, now) {
     const profile = requestInfo.profile || 'claude';
     return this.accounts.some(a => {
       if (a.enabled === false || !sharesProviderCache(holder, a)) return false;
+      // Permanent outs (red-team 2026-11-17 f2): auth-dead, subscription gone,
+      // terminal statuses, a dead cloud mirror — no wait can end in a serve, so the
+      // hold must release at once instead of idling to the cap.
+      if (a.status === 'error' || a.status === 'exhausted' || a.subscriptionGone) return false;
+      if (a.remote && (a.refreshDead || a.status === 'error')) return false;
       if (!this._matchesRequest(a, profile, requestInfo)) return false;
       if ((a.rateLimitedUntil || 0) > until && a.status === 'throttled') return false;
       if ((a.cooldownUntil || 0) > until) return false;
+      if ((a.provisionalUpstreamUntil || 0) > until) return false;
       if (this._isSessionQuotaUnavailable(a, now)) return false;
       const w = this._weeklyRawState(a, now);
       return w !== 'exhausted' && w !== 'capped';
@@ -4190,7 +4216,7 @@ export class AccountManager {
    * there but costs nothing either, and one rule is simpler to reason about.
    * Applies in every scored mode (balance, prefer-*); never in sticky (see below).
    */
-  _noteConversationAccount(requestInfo, account) {
+  _noteConversationAccount(_requestInfo, _account) {
     // Both conversation memories are written at the first real upstream byte
     // (noteConversationServed), never here: a refused/failed attempt must not re-point
     // the conversation (last account: 2026-11-15; Claude home + detour flag: 2026-11-17).
