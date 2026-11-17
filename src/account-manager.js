@@ -3378,7 +3378,8 @@ export class AccountManager {
     const key = this._affinityKey(requestInfo);
     if (!homeKey || !key) return false;
     const last = this.accounts.find(a => a.name === this.conversationLastAccount.get(key));
-    if (!last || last.type !== 'provider' || !SHARED_CACHE_PROVIDERS.has(last.provider)) return false;
+    // A non-z.ai holder (Claude, Kimi) ends at _sharedCacheRowSoon: no row shares its cache.
+    if (!last) return false;
     const hopAt = this.conversationColdClaudeHops.get(homeKey);
     if (hopAt == null || now - hopAt > COLD_HOP_MEMORY_MS) return false;
     const home = this.conversationLastClaudeAccount.get(homeKey);

@@ -147,3 +147,23 @@ test('a served GLM->Claude hop with a cold Claude copy is remembered as a cold h
   served(m, byName(m, 'c1'));
   assert.equal(m.conversationColdClaudeHops.has('cv:A'), true, 'cold return remembered');
 });
+
+// ── guards pinned by mutation (each of these survived a mutant before) ─────────
+test('Kimi caches stay per account: a Kimi sibling of a Kimi holder gets no bonus', () => {
+  const m = mgr([kimi('k1'), kimi('k2'), claude('c1')]);
+  served(m, byName(m, 'k1'));
+  assert.ok(m._cacheAffinity(byName(m, 'k1'), ri()) > 0, 'holder keeps its bonus');
+  assert.equal(m._cacheAffinity(byName(m, 'k2'), ri()), 0, 'unmeasured provider: no family bonus');
+});
+
+test('no hold once the conversation is back on Claude (Claude is its holder, even if idle a while)', () => {
+  const m = repeatOffender();
+  served(m, byName(m, 'c1'));
+  m.conversationLastClaudeAccount.get('cv:A').at = Date.now() - 20 * 60_000;
+  assert.equal(m.hasAvailableRoute(ri(), new Set([byName(m, 'g1').index, byName(m, 'g2').index])), true);
+});
+
+test('an invalid hold setting never holds (not an endless wait)', () => {
+  const m = repeatOffender({ coldClaudeRepeatHoldMs: 'soon' });
+  assert.equal(m.hasAvailableRoute(ri(), new Set([byName(m, 'g1').index, byName(m, 'g2').index])), true);
+});
