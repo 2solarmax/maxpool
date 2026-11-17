@@ -230,6 +230,13 @@ const DEFAULT_SCHEDULER = {
   // its whole prompt cache). Edited live from the TUI routing screen (`b`); env
   // MAXPOOL_STICKY_BUSY_BUDGET_MS overrides it when set. 0 = never wait.
   stickyBusyBudgetMs: 60_000,
+  // REPEAT COLD-HOP HOLD (owner 2026-11-17): a long conversation that already paid one
+  // cold Claude re-write after a GLM turn, and is back on GLM, waits up to this long for
+  // a GLM row instead of paying a second cold re-write on Claude (audit 2026-11-16: 55-58
+  // conversations paid a >50k write more than once, 36M tokens in ~5h). Streaming only
+  // (the SSE heartbeat keeps the client alive); off when no GLM row can serve soon.
+  // 0 = never hold.
+  coldClaudeRepeatHoldMs: 120_000,
   concurrencyWeight: 2,           // multiplies in-flight load (activeWeight+reqWeight) — dominant
   perAccountConcurrencyTarget: 3,  // D: soft per-account in-flight target; past it, capPenalty bites
   capPenaltyWeight: 10,            // steep penalty per unit of in-flight depth past D (throttle safety floor)
@@ -467,6 +474,22 @@ function lruSet(map, key, value) {
 /** An Anthropic account with its own prompt cache (allow-list: a provider or legacy
  *  pool row can forward to GLM, so "not a provider" is not proof of a Claude cache). */
 const isClaudeAccount = (a) => a?.type === 'oauth' || a?.type === 'apikey';
+// Providers whose prompt cache is shared by every account of that provider, so a
+// conversation warm on one row is warm on all of them. Measured 2026-11-16 (Mac pool,
+// 4.9h): z.ai GLM->GLM hops re-wrote ~150-2.6k tokens vs ~190k per GLM->Claude hop.
+// Kimi is unmeasured, so it stays per account.
+const SHARED_CACHE_PROVIDERS = new Set(['zai']);
+const sharesProviderCache = (a, b) => Boolean(a && b && a.type === 'provider' && b.type === 'provider'
+  && a.provider === b.provider && SHARED_CACHE_PROVIDERS.has(a.provider));
+// A Claude copy of a conversation that went to GLM is treated as dead after this long:
+// audit 2026-11-16 — returns <5 min after the last Claude turn stayed cheap (32 hops,
+// 0.5M), later ones re-wrote nearly in full (median dead-copy age 519 s; a detour pushes
+// the prefix past the cache lookback, so the 1-hour copy does not survive it).
+const COLD_CLAUDE_AFTER_MS = 300_000;
+// How long a paid cold GLM->Claude hop marks the conversation as a repeat offender.
+const COLD_HOP_MEMORY_MS = 6 * 3_600_000;
+// Only conversations big enough that a re-write matters (~40k+ tokens).
+const COLD_HOLD_MIN_BYTES = 150_000;
 const IDENTITY_WINDOW_MS = 15 * 60_000;
 const IDENTITY_MAX_SAMPLES = 4000;
 const IDENTITY_MIN_PER_SESSION = 8;
@@ -783,6 +806,9 @@ export class AccountManager {
     // account only (a GLM/Kimi turn never overwrites the name; it sets `detoured`), so a
     // conversation returning from a provider detour can go home.
     this.conversationLastClaudeAccount = new Map();
+    // _homeKey → time of the last SERVED GLM->Claude hop that landed on a cold Claude copy
+    // (repeat cold-hop hold, see _coldClaudeHold).
+    this.conversationColdClaudeHops = new Map();
     // Conversation-identity HEALTH (owner 2026-11-08: "make sure this cannot degrade
     // silently"). Twice in one day a Claude Code request-shape detail (a moving
     // cache_control marker, then a per-request billing checksum) made every turn hash
@@ -3331,7 +3357,56 @@ export class AccountManager {
       && !requestInfo.queueAdmitted
     ) return false;
     if (!providerLike && this._isUpstreamThrottleBlocking()) return false;
+    if (isClaudeAccount(account) && this._coldClaudeHold(requestInfo)) return false;
     return true;
+  }
+
+  /**
+   * REPEAT COLD-HOP HOLD (owner 2026-11-17, "yes"): true while Claude rows must NOT take
+   * this request, so it waits (queue + SSE heartbeat) for a GLM row instead of paying a
+   * second cold Claude re-write. All of: the knob is on; a big streaming /v1/messages
+   * turn; the conversation is warm on z.ai (served there last); it already paid a cold
+   * GLM->Claude hop in the last COLD_HOP_MEMORY_MS; its Claude copy is dead; some z.ai
+   * row can serve before the cap ends; and the cap (from the first time the hold
+   * engaged for this request) has not run out.
+   */
+  _coldClaudeHold(requestInfo = {}, now = Date.now()) {
+    const capMs = Number(this.scheduler.coldClaudeRepeatHoldMs);
+    if (!(capMs > 0) || requestInfo.isCountTokens || !requestInfo.stream) return false;
+    if ((requestInfo.bodyBytes || 0) < COLD_HOLD_MIN_BYTES) return false;
+    const homeKey = this._homeKey(requestInfo);
+    const key = this._affinityKey(requestInfo);
+    if (!homeKey || !key) return false;
+    const last = this.accounts.find(a => a.name === this.conversationLastAccount.get(key));
+    if (!last || last.type !== 'provider' || !SHARED_CACHE_PROVIDERS.has(last.provider)) return false;
+    const hopAt = this.conversationColdClaudeHops.get(homeKey);
+    if (hopAt == null || now - hopAt > COLD_HOP_MEMORY_MS) return false;
+    const home = this.conversationLastClaudeAccount.get(homeKey);
+    if (home && now - home.at <= COLD_CLAUDE_AFTER_MS) return false;
+    const started = requestInfo._coldHoldStartedAt ?? now;
+    const until = started + capMs;
+    if (now >= until) return false;
+    if (!this._sharedCacheRowSoon(last, requestInfo, until, now)) return false;
+    if (requestInfo._coldHoldStartedAt == null) {
+      requestInfo._coldHoldStartedAt = now;
+      console.log(`[Maxpool] holding a ${requestInfo.bodyBytes}B conversation for GLM up to ${Math.round(capMs / 1000)}s: it already paid one cold Claude re-write and its Claude copy is ${home ? `${Math.round((now - home.at) / 1000)}s old` : 'absent'}`);
+    }
+    return true;
+  }
+
+  /** Could a z.ai row sharing `holder`'s cache serve this request before `until`?
+   *  (Enabled, eligible, not weekly-out, not benched or 5h-walled past `until`.) */
+  _sharedCacheRowSoon(holder, requestInfo, until, now) {
+    const profile = requestInfo.profile || 'claude';
+    return this.accounts.some(a => {
+      if (a.enabled === false || !sharesProviderCache(holder, a)) return false;
+      if (!this._matchesRequest(a, profile, requestInfo)) return false;
+      if ((a.rateLimitedUntil || 0) > until && a.status === 'throttled') return false;
+      if ((a.cooldownUntil || 0) > until) return false;
+      if (this._isSessionQuotaUnavailable(a, now)) return false;
+      const w = this._weeklyRawState(a, now);
+      return w !== 'exhausted' && w !== 'capped';
+    });
   }
 
   _crossProviderFallbackPolicy() {
@@ -4115,22 +4190,31 @@ export class AccountManager {
    * Applies in every scored mode (balance, prefer-*); never in sticky (see below).
    */
   _noteConversationAccount(requestInfo, account) {
-    // conversationLastAccount is written at the first real upstream byte
-    // (noteConversationServed), never here: a refused/failed hop must not re-point the
-    // conversation (2026-11-15).
-    // Home memory: ONE key per conversation, independent of identity health, so the
-    // degraded <-> ok flip of _affinityKey can neither hide a home nor lend it to the
-    // sibling conversations that share the terminal key. The entry carries its own
-    // detour state: a Claude turn clears it, a provider turn sets it (same name and
-    // `at`, only the LRU position moves so other traffic cannot evict a long detour).
+    // Both conversation memories are written at the first real upstream byte
+    // (noteConversationServed), never here: a refused/failed attempt must not re-point
+    // the conversation (last account: 2026-11-15; Claude home + detour flag: 2026-11-17).
+  }
+
+  /** Home memory: ONE key per conversation, independent of identity health, so the
+   *  degraded <-> ok flip of _affinityKey can neither hide a home nor lend it to the
+   *  sibling conversations that share the terminal key. The entry carries its own detour
+   *  state: a served Claude turn clears it, a served provider turn sets it (same name and
+   *  `at`, only the LRU position moves so other traffic cannot evict a long detour).
+   *  Also remembers a served GLM->Claude hop that landed on a dead Claude copy. */
+  _noteHomeServed(requestInfo, account, prevName) {
     const homeKey = this._homeKey(requestInfo);
     if (!homeKey) return;
+    const now = requestInfo.now ?? Date.now();
+    const home = this.conversationLastClaudeAccount.get(homeKey);
     if (isClaudeAccount(account)) {
-      lruSet(this.conversationLastClaudeAccount, homeKey,
-        { name: account.name, at: requestInfo.now ?? Date.now(), detoured: false });
-    } else {
-      const home = this.conversationLastClaudeAccount.get(homeKey);
-      if (home) lruSet(this.conversationLastClaudeAccount, homeKey, { ...home, detoured: true });
+      const prev = prevName != null ? this.accounts.find(a => a.name === prevName) : null;
+      const copyDead = !home || home.name !== account.name || now - home.at > COLD_CLAUDE_AFTER_MS;
+      if (prev && SHARED_CACHE_PROVIDERS.has(prev.provider) && prev.type === 'provider' && copyDead) {
+        lruSet(this.conversationColdClaudeHops, homeKey, now);
+      }
+      lruSet(this.conversationLastClaudeAccount, homeKey, { name: account.name, at: now, detoured: false });
+    } else if (home) {
+      lruSet(this.conversationLastClaudeAccount, homeKey, { ...home, detoured: true });
     }
   }
 
@@ -4144,10 +4228,12 @@ export class AccountManager {
     requestInfo._notedServed = account.name;
     requestInfo._servedAt = Date.now();
     const key = this._affinityKey(requestInfo);
+    const prev = key ? this.conversationLastAccount.get(key) : undefined;
+    this._noteHomeServed(requestInfo, account, prev);
     if (!key) return;
-    const prev = this.conversationLastAccount.get(key);
     requestInfo._newConversation = prev == null;
     requestInfo._servedMoved = prev != null && prev !== account.name;
+    requestInfo._servedMovedFrom = requestInfo._servedMoved ? prev : null;
     lruSet(this.conversationLastAccount, key, account.name);
     lruSet(this.conversationLastServedAt, key, Date.now());
   }
@@ -4284,7 +4370,12 @@ export class AccountManager {
     if (base <= 0 || (this.scheduler.routingMode === 'sticky' && !retrySame)) return 0;
     if (!retrySame) {
       const key = this._affinityKey(requestInfo);
-      if (!key || (holderName ?? this.conversationLastAccount.get(key)) !== account.name) return 0;
+      const holder = key ? (holderName ?? this.conversationLastAccount.get(key)) : null;
+      // FAMILY AFFINITY (owner 2026-11-17): a z.ai holder makes every z.ai row warm (the
+      // cache is shared), so when the holder is excluded/busy a GLM sibling — not a cold
+      // Claude row — inherits the hold. Same bonus, release gates and anti-dogpile cap.
+      if (!holder || (holder !== account.name
+        && !sharesProviderCache(this.accounts.find(a => a.name === holder), account))) return 0;
     }
     // Scale with the CONVERSATION'S SIZE too: losing the cache costs the prefix a
     // hop re-writes, and requestInfo.bodyBytes ≈ prefix + this turn. Checkpoint
