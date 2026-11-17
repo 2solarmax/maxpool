@@ -488,6 +488,18 @@ function sessionFull(am, a) {
   return false;
 }
 
+/** True when the WEEKLY window is what keeps traffic off this account — the router's
+ *  own tier (_weeklyTier, the non-clearing half of _weeklyRawState) says 'exhausted'.
+ *  Claude weekly readings are cleared at their reset by the manager, so a passed reset
+ *  reads as free here without clearing anything; GLM readings are kept until the next
+ *  usage check and the router keeps refusing until then, so they are judged as they
+ *  stand. (Max 2026-11-18: four GLM rows read "active" next to "Wk 100%".) */
+function weekFull(am, a, now = Date.now()) {
+  if (typeof am?._weeklyTier !== 'function' || !a?.quota) return false;
+  if (a.type !== 'provider' && a.quota.unified7dReset != null && now >= a.quota.unified7dReset) return false;
+  return am._weeklyTier(a, now) === 'exhausted';
+}
+
 /** True when the reservation is what is currently keeping traffic off this account
  *  — either window at or past the cap. Reads the manager's own predicate so the
  *  label can never disagree with routing. */
@@ -2992,6 +3004,8 @@ export class TUI {
     // manager's expiry refresh once per frame, before any row is drawn.)
     if (a.enabled !== false && effectiveStatus === 'active') {
       if (capBenched(this.am, a)) effectiveStatus = 'capped';
+      // The weekly wait outlasts the 5h one, so it names the account's state first.
+      else if (weekFull(this.am, a)) effectiveStatus = 'wk full';
       else if (sessionFull(this.am, a)) effectiveStatus = '5h full';
     }
     if (a.refreshDead) effectiveStatus = a.enabled === false ? 'disabled-reauth' : 'reauth';
@@ -3035,6 +3049,7 @@ export class TUI {
       case 'exhausted': status = red('exhausted'); break;
       case 'capped':    status = yellow('capped'); break;
       case '5h full':   status = yellow('5h full'); break;
+      case 'wk full':   status = yellow('wk full'); break;
       case 'error':     status = red('error'); break;
       default:          status = a.status || 'ready';
     }

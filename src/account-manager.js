@@ -4937,8 +4937,15 @@ export class AccountManager {
   }
 
   _weeklyRawState(account, now = Date.now()) {
-    const q = account.quota;
     this._clearExpiredQuotas(account);
+    return this._weeklyTier(account, now);
+  }
+
+  /** The weekly tier from the readings AS THEY STAND — no expiry clearing, so the
+   *  account table can ask the router's exact question without mutating the quota
+   *  mid-render (the "wk full" status word must never disagree with routing). */
+  _weeklyTier(account, now = Date.now()) {
+    const q = account.quota;
     if (this._isAccountWideRejected(account)) return 'exhausted';
 
     // Provider accounts (GLM/Kimi) carry their quota in providerSes/providerWk, NOT
