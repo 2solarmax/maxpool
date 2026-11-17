@@ -3485,12 +3485,13 @@ export class AccountManager {
     // Cloud mirrors egress from the cloud's own IP — this machine's upstream throttle
     // and local queue fairness don't describe them.
     const providerLike = account.type === 'provider' || Boolean(account.remote);
-    // A request parked by the repeat cold-hop hold (red-team 2026-11-17 f1) must not
-    // sit in the FIFO waiting line: a queued waiter makes local Claude rows refuse
-    // every NEW request without a ticket, and a ticket-holder queues behind it — so
-    // one held conversation stalled unrelated traffic on an idle Claude row for up to
-    // HEAD_SKIP_MS (60 s). It waits by polling (waitForAvailableRoute re-checks
-    // hasAvailableRoute every poll) and never registers a queue ticket.
+    // A request parked by the repeat cold-hop hold (red-team 2026-11-17 f1) still
+    // registers a queue ticket like any queued request, but its ticket must not count
+    // as a WAITER for anyone else: a queued waiter makes local Claude rows refuse every
+    // NEW request without a ticket, and a ticket-holder queues behind it — so one held
+    // conversation stalled unrelated traffic on an idle Claude row for up to
+    // HEAD_SKIP_MS (60 s). Held tickets are therefore skipped by the fairness gate
+    // below and by the head pick in canAdmitQueuedRequest (_coldHeldTicket).
     const coldHeld = isClaudeAccount(account) && this._coldClaudeHold(requestInfo);
     if (
       !providerLike
@@ -3537,12 +3538,15 @@ export class AccountManager {
     return true;
   }
 
-  /** Is this queue ticket's request inside a live repeat cold-hop hold? */
+  /** Is this queue ticket's request inside a LIVE repeat cold-hop hold? The stamp
+   *  alone is not enough (red-team r2): when the hold releases early — every GLM row
+   *  went dead mid-wait — the ticket becomes an ordinary fair waiter again at once,
+   *  instead of staying invisible to the head pick until the cap expires. */
   _coldHeldTicket(t, now = Date.now()) {
     const started = t?.requestInfo?._coldHoldStartedAt;
     if (started == null) return false;
     const capMs = Number(this.scheduler.coldClaudeRepeatHoldMs);
-    return capMs > 0 && now < started + capMs;
+    return capMs > 0 && now < started + capMs && this._coldClaudeHold(t.requestInfo, now);
   }
 
   /** Could a z.ai row sharing `holder`'s cache serve this request before `until`?
@@ -3560,6 +3564,10 @@ export class AccountManager {
       if ((a.rateLimitedUntil || 0) > until && a.status === 'throttled') return false;
       if ((a.cooldownUntil || 0) > until) return false;
       if ((a.provisionalUpstreamUntil || 0) > until) return false;
+      // Peak-hour hard bar (red-team r2 f3): peakCap 0 = never during the window, so
+      // waiting cannot end in a serve. Judged at the END of the cap: a window that
+      // closes before then still counts as soon.
+      if (this._peakHardBarred(a, until)) return false;
       if (this._isSessionQuotaUnavailable(a, now)) return false;
       const w = this._weeklyRawState(a, now);
       return w !== 'exhausted' && w !== 'capped';

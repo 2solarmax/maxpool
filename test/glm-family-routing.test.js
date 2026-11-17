@@ -213,9 +213,12 @@ test('a ticketed request is not kept behind a cold-held ticket at the head of th
 
 test('once the hold cap has passed, the ticket is an ordinary fair waiter again', () => {
   const m = repeatOffender({ coldClaudeRepeatHoldMs: 120_000 });
-  const t = { id: 1, queuedAt: Date.now(), requestInfo: { _coldHoldStartedAt: Date.now() - 121_000 } };
-  assert.equal(m._coldHeldTicket(t), false);
-  assert.equal(m._coldHeldTicket({ ...t, requestInfo: { _coldHoldStartedAt: Date.now() } }), true);
+  // same request shape the live hold stamped (big, streaming, GLM-warm, cold-hop remembered)
+  const req = ri();
+  assert.equal(m._coldClaudeHold(req), true, 'the hold is live for this request');
+  const t = { id: 1, queuedAt: Date.now(), requestInfo: { ...req, _coldHoldStartedAt: Date.now() - 121_000 } };
+  assert.equal(m._coldHeldTicket(t), false, 'cap passed -> ordinary waiter');
+  assert.equal(m._coldHeldTicket({ id: 2, queuedAt: Date.now(), requestInfo: { ...req, _coldHoldStartedAt: Date.now() } }), true);
 });
 
 test('a cold-held ticket at the FRONT of the line keeps its turn for GLM rows', () => {
@@ -226,4 +229,26 @@ test('a cold-held ticket at the FRONT of the line keeps its turn for GLM rows', 
   const other = { sessionKey: 'sess-other', profile: 'claude', model: 'claude-opus-5-5', weight: 1, bodyBytes: 30_000, stream: true };
   m.registerQueuedRequest(other, {});
   assert.equal(m.canAdmitQueuedRequest(held), true, 'front of the line, admitted for a GLM row');
+});
+
+// ── red-team r2 ───────────────────────────────────────────────────────────────
+test('a hold that releases early (GLM rows die mid-wait) turns its ticket back into a normal waiter', () => {
+  const m = repeatOffender();
+  const held = ri();
+  m.hasAvailableRoute(held, new Set([byName(m, 'g1').index, byName(m, 'g2').index]));
+  m.registerQueuedRequest(held, {});
+  assert.equal(m._coldHeldTicket(m.queueState.waiting[0]), true);
+  for (const n of ['g1', 'g2']) { byName(m, n).status = 'error'; }
+  assert.equal(m._coldHeldTicket(m.queueState.waiting[0]), false, 'hold is off -> ordinary waiter');
+  const other = { sessionKey: 'sess-other', profile: 'claude', model: 'claude-opus-5-5', weight: 1, bodyBytes: 30_000, stream: true };
+  m.registerQueuedRequest(other, {});
+  assert.equal(m.canAdmitQueuedRequest(other), false, 'queued behind a normal head again (fairness restored)');
+});
+
+test('no hold when GLM is hard-barred by the peak-hour setting for the whole cap', () => {
+  const m = repeatOffender();
+  // peak window covering now through the end of the cap, cap 0 = never serve.
+  m.scheduler.providers = { zai: { peakCap: 0, peakTimezone: 'UTC', peakWindows: [{ days: [0, 1, 2, 3, 4, 5, 6], startMin: 0, endMin: 1440 }] } };
+  m._peakCache = null;
+  assert.equal(m.hasAvailableRoute(ri(), new Set([byName(m, 'g1').index, byName(m, 'g2').index])), true, 'GLM can never serve -> Claude now');
 });
