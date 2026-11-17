@@ -1,5 +1,5 @@
 // A busy GLM/Kimi cloud row never gets the sticky wait: z.ai's cache is not per key, so
-// staying buys nothing — the turn moves at once (2026-11-15).
+// staying buys nothing — the turn moves at once (2026-11-15), to another GLM row.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { remotePool, bootLink, bigBody, pinRefusal, postTurn } from './link-fixture.js';
@@ -10,10 +10,13 @@ const GLM_ROWS = [
 ];
 
 test('a busy provider cloud row moves at once even when the conversation is warm there', async () => {
-  let warm = null;
-  const remote = remotePool((pin, n) => {
-    if (warm == null) { warm = pin; return 'sse'; }
-    if (pin === warm && n === 2) return pinRefusal('pinned_account_busy', 2);
+  // Since 2026-11-17 every z.ai row is warm for a z.ai conversation (family affinity), so
+  // turn 2 may start on either row: refuse its FIRST attempt, wherever it lands.
+  let calls = 0;
+  let firstOfTurn2 = null;
+  const remote = remotePool((pin) => {
+    calls++;
+    if (calls === 2) { firstOfTurn2 = pin; return pinRefusal('pinned_account_busy', 2); }
     return 'sse';
   }, { accounts: GLM_ROWS });
   const { am, port, cleanup } = await bootLink(remote);
@@ -27,8 +30,9 @@ test('a busy provider cloud row moves at once even when the conversation is warm
     const elapsed = Date.now() - t0;
     assert.equal(r.status, 200);
     assert.equal(remote.hits.length, 3);
-    assert.equal(remote.hits[1], warm, 'turn 2 went to its warm row first');
-    assert.notEqual(remote.hits[2], warm, 'then moved instead of waiting');
+    assert.equal(remote.hits[1], firstOfTurn2, 'turn 2 was refused busy on its first row');
+    assert.notEqual(remote.hits[2], firstOfTurn2, 'then moved to the other GLM row instead of waiting');
+    assert.match(String(remote.hits[2]), /^glm /, 'and stayed in the GLM family');
     assert.ok(elapsed < 1000, `no wait on a provider row (took ${elapsed}ms)`);
   } finally { await cleanup(); }
 });
