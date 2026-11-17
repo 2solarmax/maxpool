@@ -5,6 +5,15 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.101] - 2026-11-17
+
+### Changed
+
+- Thread gate: judge a continue by its thread id, not the terminal
+- Pin the three thread-id capture seams (stream, body, link tap)
+- Thread gate: drop the inert link-path capture; pin the direct path end to end
+- Thread gate: red-team fixes — capture survives repairs, threaded-only, own bound
+
 ## [1.24.100] - 2026-11-17
 
 ### Changed
