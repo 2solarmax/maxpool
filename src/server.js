@@ -5287,15 +5287,7 @@ function tapLinkUsage(chunk, requestInfo) {
   if (requestInfo.isCountTokens) return;
   if (!requestInfo.stream) {
     if (chunk) {
-      const text = Buffer.from(chunk).toString();
-      // THREAD OWNERSHIP (link path): the reply's own id sits at the HEAD of a
-      // non-streaming body — keep the first slice, the usage tail keeps the last.
-      if (requestInfo._threadIntent && !requestInfo._threadReplyId && !requestInfo._tapHead) {
-        requestInfo._tapHead = text.slice(0, 2048);
-        const idm = requestInfo._tapHead.match(/"id"\s*:\s*"([^"]+)"/);
-        if (idm) requestInfo._threadReplyId = idm[1];
-      }
-      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + text).slice(-64 * 1024);
+      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + Buffer.from(chunk).toString()).slice(-64 * 1024);
       return;
     }
     const u = usageFromBodyTail(requestInfo._tapBuf);
@@ -5311,11 +5303,6 @@ function tapLinkUsage(chunk, requestInfo) {
     if (!dataLine) continue;
     let data;
     try { data = JSON.parse(dataLine.slice(6)); } catch { continue; }
-    // THREAD OWNERSHIP (link path): the linked pool serves the turn; its reply id is
-    // pinned to THIS row so the Mac-side gate judges the next continue by thread.
-    if (data?.type === 'message_start' && typeof data.message?.id === 'string' && requestInfo._threadIntent) {
-      requestInfo._threadReplyId = data.message.id;
-    }
     const u = usageFromSseData(data);
     if (u) noteCapacityUsage(requestInfo, u, data.type === 'message_delta');
   }
