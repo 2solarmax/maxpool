@@ -59,7 +59,7 @@ test('thread identity: noteServed extends the thread onto whoever served the fol
 });
 
 test('thread identity: the thread map is bounded and LRU-evicts', () => {
-  const o = new ThreadOwners({ maxSessions: 10 });
+  const o = new ThreadOwners({ maxThreads: 10 });
   for (let i = 0; i < 50; i++) o.noteThreadId(`msg_${i}`, 'acct');
   assert.equal(o.threadOwner('msg_49'), 'acct', 'newest retained');
   assert.equal(o.threadOwner('msg_0'), null, 'oldest evicted falls back to legacy');
@@ -71,4 +71,39 @@ test('thread identity: no id → noteThreadId is a no-op, nothing recorded', () 
   o.noteThreadId('msg_x', '');
   assert.equal(o.threadOwner('msg_x'), null);
   assert.equal(o.size, 0);
+});
+
+test('thread identity: the thread map has its own bound, far above the 500-session bound', () => {
+  const o = new ThreadOwners();
+  for (let i = 0; i < 5000; i++) o.noteThreadId(`msg_${i}`, 'acct');
+  assert.equal(o.threadOwner('msg_0'), 'acct', '5,000 threaded turns must not evict the first');
+  assert.equal(o.maxThreads, 20000);
+});
+
+test('thread identity: a continue refreshes its thread so a busy pool cannot evict it', () => {
+  const o = new ThreadOwners({ maxThreads: 3 });
+  o.noteThreadId('msg_live', 'one');
+  o.noteThreadId('msg_x', 'one');
+  o.noteThreadId('msg_y', 'one');
+  o.shouldRefuse('s1', 'one', readThreadIntent(contOf('msg_live')));   // read bumps it
+  o.noteThreadId('msg_z', 'one');                                       // evicts the oldest
+  assert.equal(o.threadOwner('msg_live'), 'one', 'the just-read thread survives');
+  assert.equal(o.threadOwner('msg_x'), null);
+});
+
+test('thread identity: a known NON-holder is refused under the per-session bound, then forwarded', () => {
+  // Four sibling agents with threads on "A"; the terminal's account then moves to "B".
+  // Refusing every one would downgrade every sibling to stateless for the session; past
+  // the bound the real 404 lets the client replay with thread:create and keep threading.
+  const o = new ThreadOwners({ maxRefusals: 2 });
+  for (const id of ['x1', 'y1', 'z1', 'w1']) o.noteThreadId(id, 'A');
+  const out = [];
+  for (const id of ['x1', 'y1', 'z1', 'w1']) {
+    const refuse = o.shouldRefuse('S', 'B', readThreadIntent(contOf(id)));
+    if (refuse) o.noteRefused('S', 'B');
+    out.push(refuse);
+  }
+  assert.deepEqual(out, [true, true, false, false]);
+  // the holder itself still passes regardless of the streak
+  assert.equal(o.shouldRefuse('S', 'A', readThreadIntent(contOf('x1'))), false);
 });

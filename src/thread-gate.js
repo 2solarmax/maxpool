@@ -50,6 +50,11 @@ export function readThreadIntent(body) {
   }
 }
 
+/** Whether a turn carries thread state at all — only these replies name a thread. */
+export function isThreadedIntent(intent) {
+  return intent?.kind === 'create' || intent?.kind === 'continue';
+}
+
 /** The exact body the client's classifier reads. `details.error_code` is the field it
  *  keys on; the message is free text and is never shown to a person. */
 export function threadRefusalBody(accountName) {
@@ -66,6 +71,11 @@ export function threadRefusalBody(accountName) {
 // Sessions whose last threaded turn we served, and how many times we have refused them.
 // Two short strings per entry; bounded and LRU-evicted.
 const MAX_SESSIONS = 500;
+// Reply ids are one per threaded TURN (every superseded id is kept: a client retry or a
+// rewind may still continue it), so the thread map needs a turn-volume bound, not a
+// session bound: 500 was exhausted in ~10-20 min on the shared cloud pool and a busy
+// thread's holder fell back to the per-terminal guess. ~100 bytes an entry → ~2 MB.
+const MAX_THREADS = 20000;
 // A session that keeps sending threaded turns after being refused is one whose client
 // did NOT take the downgrade (a different agent id, a model switch, an older build).
 // Refusing forever would double its request volume, so stop and forward instead.
@@ -75,7 +85,7 @@ const MAX_CONSECUTIVE_REFUSALS = 2;
 const NO_SESSION_PREFIX = '\u0000nosession:';
 
 export class ThreadOwners {
-  constructor({ maxSessions = MAX_SESSIONS, maxRefusals = MAX_CONSECUTIVE_REFUSALS } = {}) {
+  constructor({ maxSessions = MAX_SESSIONS, maxThreads = MAX_THREADS, maxRefusals = MAX_CONSECUTIVE_REFUSALS } = {}) {
     this.map = new Map();          // sessionKey -> { owner, refusals }
     // reply message id -> owning account name. The THREAD is keyed by the reply id the
     // client sends back as previous_message_id — a session key is per TERMINAL, and
@@ -84,6 +94,7 @@ export class ThreadOwners {
     // Bounded LRU, same lifetime class as the per-session map above it.
     this.threads = new Map();
     this.maxSessions = maxSessions;
+    this.maxThreads = maxThreads;
     this.maxRefusals = maxRefusals;
   }
 
@@ -107,7 +118,7 @@ export class ThreadOwners {
     if (!threadId || !accountName) return;
     this.threads.delete(threadId);
     this.threads.set(threadId, accountName);
-    while (this.threads.size > this.maxSessions) this.threads.delete(this.threads.keys().next().value);
+    while (this.threads.size > this.maxThreads) this.threads.delete(this.threads.keys().next().value);
   }
 
   /** The account that holds `threadId`, if we saw its reply. Null = unknown. */
@@ -140,9 +151,20 @@ export class ThreadOwners {
     // continued. When we know its holder, the answer is exact (the holder passes,
     // everyone else is refused) and never falls through to the terminal-keyed guess —
     // which is what mis-served sibling agents inside one terminal (2026-11-17).
+    const key = sessionKey || `${NO_SESSION_PREFIX}${accountName}`;
     if (intent?.previousMessageId) {
       const holder = this.threads.get(intent.previousMessageId);
-      if (holder != null) return holder !== accountName;
+      if (holder != null) {
+        this.noteThreadId(intent.previousMessageId, holder);   // LRU bump: a live thread stays
+        if (holder === accountName) return false;
+        // A known non-holder is refused under the SAME per-session bound as an unknown
+        // owner. Past it we forward: the real 404 makes the client replay with
+        // thread:create and KEEP threading, where our 400 would downgrade that agent to
+        // stateless for the whole session (Claude Code 2.1.325) — unbounded refusals
+        // would downgrade every sibling after a terminal's account moves.
+        const entry = this._touch(key);
+        return !(entry && entry.refusals >= this.maxRefusals);
+      }
     }
     // A request with NO session header is invisible to ownership tracking, and measured
     // 2026-09-11 those are the majority of traffic — 14 of 20 consecutive /v1/messages
@@ -150,7 +172,6 @@ export class ThreadOwners {
     // failing exactly as before the gate existed. We cannot know the owner, so treat it
     // as an unknown session (refuse, the safe direction) and bucket the refusal COUNT
     // per account so the storm bound still applies.
-    const key = sessionKey || `${NO_SESSION_PREFIX}${accountName}`;
     const entry = this._touch(key);
     if (entry && entry.owner === accountName) return false; // the account that holds it
     if (entry && entry.refusals >= this.maxRefusals) return false;  // bounded fail-open
