@@ -178,13 +178,18 @@ const providerSSE = stream([
 
 test('wiring STREAM: streamResponse with a scrubber drops provider thinking; usage still parsed from the ORIGINAL stream', async () => {
   const got = [];
-  const am = { ...dummyManager(), updateUsage(idx, inp, _out) { got._usageIn = inp; } };
+  // Usage is read off the ORIGINAL stream into the request's running-max capacity book
+  // (per-account / per-caller totals book from it ONCE at the terminal release —
+  // honest-token-accounting, 2026-11-17).
+  const am = dummyManager();
+  const ri = { model: 'claude-opus-5', stream: true };
   const sc = new ProviderThinkingScrubber();
-  await streamResponse(sseBody([providerSSE]), mockRes(got), 200, { 'content-type': 'text/event-stream' }, 0, am, [], { model: 'claude-opus-5', stream: true }, undefined, sc);
+  await streamResponse(sseBody([providerSSE]), mockRes(got), 200, { 'content-type': 'text/event-stream' }, 0, am, [], ri, undefined, sc);
   assert.doesNotMatch(got.join(''), /thinking/);
   const r = pushReducer(parse(got.join('')));
   assert.deepEqual(r.map(b => [b.type, b.text]), [['text', 'Answer']]);
-  assert.ok(got._usageIn !== undefined, 'usage accounting ran on the pre-scrub stream');
+  assert.ok(ri._capacityInput !== undefined || ri._capacityOutput !== undefined, 'usage accounting ran on the pre-scrub stream');
+  assert.ok((ri._capacityInput || 0) + (ri._capacityCacheRead || 0) + (ri._capacityOutput || 0) > 0, 'real figures were read');
 });
 
 test('wiring STREAM flag OFF (scrubber null): bytes identical apart from model echo', async () => {

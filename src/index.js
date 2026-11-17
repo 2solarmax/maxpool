@@ -2275,7 +2275,11 @@ async function statusCommand() {
         console.log(`    Tokens:   ${tok} used    Requests: ${req} used`);
       }
 
-      console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
+      // Full prompt (input + cache read + cache write) + output, provider-native; paid =
+      // cache write + uncached input (audit 2026-11-17, finding 3). Older servers book
+      // uncached input only and carry no paid figure — then Total reads as before.
+      const paidTok = acct.usage.totalPaidTokens;
+      console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens${paidTok != null ? ` (paid ${paidTok})` : ''}, ${acct.usage.totalRequests} requests`);
       if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
       console.log('');
     }
@@ -2806,10 +2810,10 @@ function efficiencyLines(data, key = 'last15m') {
   const s = (ms) => (ms == null ? '—' : `${(ms / 1000).toFixed(1)}s`);
   return [
     `Efficiency (${key === 'last1h' ? '1h' : '15m'}):`,
-    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)`,
-    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))})`,
+    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok${claude.writeShare != null ? ` · writes ${pctOrDash(claude.writeShare)} of cost` : ''}) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)`,
+    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))})`,
     `  Bounced:      ${n(sum('bounced'))} (refused ${n(sum('refused'))}) · failed ${failed} · link drops ${linkDrops}`,
-    `  Waited:       ${n(sum('waited'))}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${n(sum('waitThenMoved'))}`,
+    `  Busy waits:   ${n(sum('waited'))}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${n(sum('waitThenMoved'))} (busy-bounce waits only; queue holds show in first-byte p95)`,
     `  Client errors: ${co ? `${co.poolErrors + co.requestErrors} of ${co.total} (pool ${co.poolErrors} · request ${co.requestErrors})` : '—'}`,
     `  First byte:   p50 ${s(overall.e2eP50)} · p95 ${s(overall.e2eP95)} (this pool's clients, waits included)`,
     '',
