@@ -360,3 +360,31 @@ test('D3: exportOpenCycle returns null when no cycle is open', () => {
   const l = new CapacityLedger({ now: () => Date.now() });
   assert.equal(l.exportOpenCycle('nobody', 'wk'), null);
 });
+
+// F3 (red team 2026-11-18): the exporter's est must win over slopes recomputed from
+// THINNED samples — exportCycles always ships samples alongside est, so the importer
+// re-derives from 16 of 64 readings unless est is preferred.
+test('F3: cycleEstimate prefers the exported est even when thinned samples are present', () => {
+  const exported = cycle({
+    est: 2_090_000_000,
+    samples: slopeSamples(1_750_000_000),   // what the importer recomputes from 16 thinned
+  });
+  const t = tankStatsFromCycles([exported], WK);
+  assert.equal(t.avg, 2_090_000_000, 'the cloud\'s own 64-sample estimate wins');
+});
+test('F3: an unexported local cycle still uses its own slopes (est absent)', () => {
+  const local = cycle({ samples: slopeSamples(3_000_000_000) });
+  const t = tankStatsFromCycles([local], WK);
+  assert.equal(t.avg, 3_000_000_000);
+});
+// F4: a finalUtilization spike (the throttled wall at 1.0) must not widen the util
+// span enough to admit a ONE-segment cycle.
+test('F4: a one-segment cycle whose final utilization (1.0) exceeds every sample is REJECTED', () => {
+  const sneaky = cycle({
+    startedAt: 5 * day, endedAt: 7 * day,
+    samples: [{ t: 5 * day, util: 0.55, tokens: 0 }, { t: 7 * day, util: 0.60, tokens: 1_100_000 }],
+    finalUtilization: 1.0,
+  });
+  const t = tankStatsFromCycles([sneaky], WK);
+  assert.equal(t, null, 'the span rule reads SAMPLES, not the closing wall');
+});

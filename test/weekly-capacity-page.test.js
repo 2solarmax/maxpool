@@ -47,13 +47,13 @@ test('P2: an open weekly cycle renders as the live Current, not empty', () => {
   am.accrueCapacity(0, { input: 1_000_000, output: 0 });
   am.accounts[0].quota.unified7d = 0.5;
   am.capacity.noteUtilizationObserved();
-  // AUDIT D2 (2026-11-18): Current is the LIVE window. Here the open cycle has one
-  // accrual (1M) at 50% util → 2M live, and the closed history (10M) belongs in
-  // Prev/Med columns. What must NOT happen is an empty Current with history sitting
-  // right there.
+  // AUDIT D2 + RED-TEAM F1 (2026-11-18): Current prefers the LIVE window, but this
+  // fixture's open cycle is late-joined (started mid-window) with a single reading —
+  // an understating lower bound, so history (10M) shows instead. The columns are
+  // never empty and never a fiction.
   const row = renderWk(am).split('\n').find(l => l.includes('kira'));
   assert.ok(row, 'row present');
-  assert.match(row, /2\.0M\s+10M\s+10M\s+10M\s+1/, 'live Current, then Prev/Med-3/Med-all from history, N=1');
+  assert.match(row, /10M\s+10M\s+10M\s+10M\s+1/, 'Current falls to history, Prev/Med-3/Med-all from history, N=1');
 });
 
 test('P3: the no-weekly derived row is marked "≈" so it reads as derived', () => {
@@ -118,7 +118,7 @@ test('D10: a huge tank never renders $0.00 (significant digits, not toFixed(2))'
   const row = renderWk(am).split('\n').find(l => l.includes('kira'));
   // '$0.00' followed by a digit is fine ($0.005); a bare '$0.00' cell is the bug.
   assert.ok(!/\$0\.00(?![0-9])/.test(row), `no bare $0.00 cell, row: ${row}`);
-  assert.match(row, /\$0\.005/, `a real sub-cent price shows digits, row: ${row}`);
+  assert.match(row, /\$0\.0046/, `a real sub-cent price shows 2 significant digits ($0.0046), row: ${row}`);
 });
 
 // ── D11/D12: the no-weekly row's ceiling is peak-aware and N is labelled ──
@@ -146,8 +146,8 @@ test('D11/D12: a weeklyAbsent provider labels its ceiling max, its N as 5h cycle
   const txt = tui._renderCapacityPage(160).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
   const row = txt.split('\n').find(l => l.includes('glm max'));
   assert.ok(row, 'row present');
-  assert.match(row, /max/i, 'the derived weekly figure is labelled as a ceiling (max)');
-  assert.match(row, /5h/, 'N is labelled as 5h cycles');
+  assert.match(row, /B max/, 'the derived weekly figure is labelled as a ceiling ("… max")');
+  assert.match(row, /2 \(5h\)/, 'N is labelled "(5h)" — not the footer derivation text');
 });
 
 // ── D13: the Plan column shows the live z.ai price when no plan object exists ──
@@ -161,4 +161,31 @@ test('D13: a provider row with a live monthly price shows it in the Plan cell', 
   const txt = tui._renderCapacityPage(160).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
   const row = txt.split('\n').find(l => l.includes('glm priced'));
   assert.match(row, /\$111\/mo/, `live z.ai price in the Plan cell, row: ${row}`);
+});
+
+// ── Red team 2026-11-18 (F1-F4): the live Current must respect the same floors the
+// ledger applies; mirror rows use the cloud's live week even with history; exported
+// est beats thinned samples; a final-utilization spike cannot smuggle a one-slice cycle. ──
+test('F1: a low-fullness open week does NOT render an inflated Current — history shows instead', () => {
+  const am = amWith('kira');
+  const end = Date.now();
+  closeWeek(am, 'kira', { tokens: 5_000_000, util: 0.5, endedAt: end - SEVEN_D, complete: false });
+  am.capacity.accrue('kira', { input: 455_000, output: 0 }, end);
+  am.capacity.noteUtilizationObserved(end, [{ name: 'kira', window: 'wk', utilization: 0.01 }]);
+  const row = renderWk(am).split('\n').find(l => l.includes('kira'));
+  assert.match(row, /10M/, 'history shows — the 455k@1% window is rounding noise');
+  assert.doesNotMatch(row, /46M/, 'no inflated 46M from 455k ÷ 1%');
+});
+test('F1: a late-joined open week does NOT render a low Current — history shows instead', () => {
+  const am = amWith('kira');
+  const end = Date.now();
+  closeWeek(am, 'kira', { tokens: 5_000_000, util: 0.5, endedAt: end - SEVEN_D, complete: false });
+  // Joined 4 days in; the ledger's open cycle started mid-window.
+  am.capacity.accrue('kira', { input: 1_000_000, output: 0 }, end);
+  am.capacity.noteUtilizationObserved(end, [{ name: 'kira', window: 'wk', utilization: 0.50 }]);
+  const o = am.capacity.openCycle('kira', 'wk');
+  o.windowStartedAt = end - 4 * SEVEN_D;   // window began 4d before the ledger did
+  const row = renderWk(am).split('\n').find(l => l.includes('kira'));
+  assert.match(row, /10M/, 'history shows; a 2M lower-bound is not the tank');
+  assert.doesNotMatch(row, /2\.0M/, 'no understated 2.0M from a late-joined divide');
 });

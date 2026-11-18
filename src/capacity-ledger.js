@@ -150,9 +150,13 @@ export function segmentSlopes(samples) {
  *   3. close-time tokens/util, ONLY when the window ended nearly full (>= 0.5)
  *  else null = too little data (never shown as a bogus number). */
 export function cycleEstimate(c) {
+  // EXPORTED EST FIRST (red team F3, 2026-11-18): an export carries BOTH its own est
+  // (computed from up to 64 samples) and the 16-sample thinned list; recomputing
+  // slopes from the thinned list drifted every cloud row (reports −16%, mk +12%).
+  // `est` is attached ONLY by exportCycles — a local cycle never carries it.
+  if (Number.isFinite(c.est) && c.est > 0 && !c.merged) return { tokens: c.est, method: 'exported', segments: 0 };
   const slopes = segmentSlopes(c.samples);
   if (slopes.length) return { tokens: median(slopes), method: 'slopes', segments: slopes.length };
-  if (Number.isFinite(c.est) && c.est > 0 && !c.merged) return { tokens: c.est, method: 'exported', segments: 0 };
   if (Number.isFinite(c.finalUtilization) && c.finalUtilization >= CLOSE_FALLBACK_MIN_UTIL && c.tokens > 0) {
     return { tokens: c.tokens / c.finalUtilization, method: 'close', segments: 0 };
   }
@@ -190,8 +194,10 @@ export function tankStatsFromCycles(cycles, window, { readFloor = null, ignoreCe
     // kira's admitted cycle was ONE 5-point slice reading 3x low). Exported cycles
     // carry no samples; their est is trusted as exported (audit D7 — without this,
     // short cloud exports like mk@gomokka 1.01d / security 2.24d blank the row).
-    const utilSpan = Math.max(...(c.samples || []).map(x => x?.util ?? 0), c.finalUtilization ?? 0)
-      - Math.min(...(c.samples || []).map(x => x?.util ?? 1), ...(c.samples?.length ? [] : [c.finalUtilization ?? 1]));
+    // F4: SAMPLES ONLY — finalUtilization can be the throttled wall (1.0) that no
+    // sample ever recorded; folding it into the span admitted one-slice cycles.
+    const sampleUtils = (c.samples || []).map(x => x?.util).filter(Number.isFinite);
+    const utilSpan = sampleUtils.length ? Math.max(...sampleUtils) - Math.min(...sampleUtils) : 0;
     const strong = est?.method === 'exported'
       || (est?.method === 'slopes' && (est.segments >= 3 || utilSpan >= 0.20 - 1e-9));
     const realShort = strong && c.finalUtilization >= CLOSE_FALLBACK_MIN_UTIL;

@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { TANK_MIN_UTIL } from './capacity-ledger.js';
 import { spawn } from 'node:child_process';
 import { readFileSync, writeSync } from 'node:fs';
 import { isatty } from 'node:tty';
@@ -481,8 +482,11 @@ function pricePerMTokens(monthlyPrice, weeklyTankTokens) {
   if (!(monthlyPrice > 0) || !(weeklyTankTokens > 0)) return null;
   const perM = monthlyPrice / (weeklyTankTokens * (30.44 / 7) / 1e6);
   if (!(perM > 0)) return null;
-  const digits = perM >= 1 ? 2 : perM >= 0.1 ? 2 : 3;
-  return '$' + perM.toFixed(digits);
+  // Significant digits (red team F5): toFixed(3) still printed $0.000 for a $30/mo
+  // plan over a 21.8B tank. Show 2 significant figures below 10 cents.
+  if (perM >= 0.1) return '$' + perM.toFixed(2);
+  // 2 significant digits below 10 cents: $0.015 (not $0.02), $0.0029 (not $0.003).
+  return '$' + Number(perM.toPrecision(2)).toString();
 }
 
 function sessionFull(am, a) {
@@ -3603,21 +3607,32 @@ export class TUI {
 
       // Current = the LIVE window (audit D2, 2026-11-18): the open cycle's own
       // estimate — its slope median when it has segments, else the whole-window
-      // absolute (tokens÷util), else the ledger's live estimate. The closed median
-      // is what Med-all shows; repeating it in Current hid the running week (kira
-      // showed 1.1B while its live week held 3.5B on 15 of 25 rows).
+      // absolute (tokens÷util) when the ledger provably watched from the window
+      // start. The closed median is what Med-all shows; repeating it in Current hid
+      // the running week (kira showed 1.1B while its live week held 3.5B).
+      // RED-TEAM F1 (2026-11-18): the same floors the ledger applies — a low-fullness
+      // window (tokens÷1% = 100x rounding noise) and a late-joined window (an
+      // understating lower bound) must NOT render; history shows instead. Mirrors
+      // (no local ledger entry) read the exported OPEN cycle from the cloud (F2).
       let cur = '--';
-      if (nowOpen) {
-        const est = this.am.capacity?.exportOpenCycle?.(a.name, win);
-        if (est?.est) cur = formatTokens(est.est);
-        else if (est && Number.isFinite(est.peakUtilization) && est.peakUtilization > 0 && est.peakUtilization < 1) {
-          cur = formatTokens(Math.round(est.tokensSoFar / est.peakUtilization));
-        } else if (nowOpen.tokensSoFar > 0 && util > 0 && util < 1) {
-          cur = formatTokens(Math.round(nowOpen.tokensSoFar / util));
-        }
+      const localOpen = nowOpen;
+      const remoteOpenCycle = a.remote ? (a.remoteOpen?.[win] || null) : null;
+      const openSrc = localOpen
+        ? { ...this.am.capacity?.exportOpenCycle?.(a.name, win), tokensSoFar: localOpen.tokensSoFar }
+        : remoteOpenCycle;
+      if (openSrc && openSrc.est) {
+        cur = formatTokens(openSrc.est);
+      } else if (openSrc
+        && Number.isFinite(openSrc.peakUtilization) && openSrc.peakUtilization >= TANK_MIN_UTIL && openSrc.peakUtilization < 1
+        && openSrc.tokensSoFar > 0
+        && (openSrc.windowStartedAt == null || openSrc.startedAt == null
+          || openSrc.startedAt <= openSrc.windowStartedAt + 60_000)) {
+        // Whole-window absolute only (a late join divides a partial numerator by a
+        // full-window denominator — a lower bound, and usually a bad one).
+        cur = formatTokens(Math.round(openSrc.tokensSoFar / openSrc.peakUtilization));
       }
       if (cur === '--' && tank && !(tank.source === 'live' && unprovenLive)) {
-        cur = formatTokens(tank.avg);   // no live reading yet — history as the fallback
+        cur = formatTokens(tank.avg);   // no proven live reading — history as the fallback
       }
       const curPct = util != null && cur !== '--' ? dim(`@${Math.round(util * 100)}%`) : '';
       // Every history column is a TANK number (tokens ÷ closing %). Prev/N used to
