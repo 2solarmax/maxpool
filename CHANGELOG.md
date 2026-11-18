@@ -7,16 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.24.105] - 2026-11-18
 
-### Changed
+### Added
 
-- Link probe: 5s fresh-connection ping marks a dead tunnel down in ~15s; mirrors leave routing
-- Link hop: probe-down cuts waiting requests; a link fault moves off the whole link
-- Link probe test: pin agent:false — a probe never borrows a pooled keep-alive socket
-- Link fault bench is probe-gated: an answering ping lifts the link-wide cooldown at once (only this fault's exact stamp)
-- Capacity screen: a row with no finished week says why in Prev ('1st wk MM-DD' / 'old count' / 'too short') + legend line (audit D16)
-- Link probe: check the tunnel before benching (probe-first), veto DOWN while replies flow, never write after a cut; fake clouds answer pings outside the hop count
-- Fake clouds answer the 5s link probe; accounting pin moves to probe-first semantics
-- Restore main's original link-fault expectations — probe-first preserves the sibling move on a live tunnel
+- The provider add flow asks cloud-or-laptop and can land the key on the team pool
+
+### Fixed
+
+- The GLM/Kimi add flow imports resolve again ('./config.js', not '../config.js')
 
 ## [1.24.104] - 2026-11-18
 
