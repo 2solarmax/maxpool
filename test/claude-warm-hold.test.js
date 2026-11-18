@@ -32,10 +32,10 @@ const pick = (m, excluded, over) => {
 };
 // The holder a1 carries 60 weight units from OTHER conversations: past the 400-point
 // affinity bonus (~33 units), so today's score loop moves the conversation to an idle
-// Claude sibling. The load sits UNDER the F1 depth ceiling (target 3 + 2x40 = 83 units),
-// so the hold keeps this conversation; past the ceiling it moves as today.
+// Claude sibling. With this turn's 10 units it sits UNDER the F1 depth ceiling (target 3 +
+// 2x40 = 83 units), so the hold keeps this conversation; past the ceiling it moves as today.
 const loadHolder = (a) => { a.activeWeight = 60; a.inFlight = 6; };
-const loadHolderPastCeiling = (a) => { a.activeWeight = 84; a.inFlight = 9; };
+const loadHolderPastCeiling = (a) => { a.activeWeight = 74; a.inFlight = 8; };   // 74 + 10 = 84
 
 test('knob: scheduler.claudeWarmHold defaults to true', () => {
   assert.equal(claude3().scheduler.claudeWarmHold, true);
@@ -226,10 +226,10 @@ test('RT-F1: past the depth ceiling the warm conversation moves as today', () =>
   assert.notEqual(name, 'a1', `moved off an over-ceiling holder: ${logs.join(' | ')}`);
   assert.ok(!logs.some(l => l.includes('warm-hold=a1:kept')), 'no kept line past the ceiling');
 });
-test('RT-F1: the ceiling edge — exactly 83 units still holds', () => {
+test('RT-F1: the ceiling edge — 73 units + this 10-unit turn = exactly 83 still holds', () => {
   const m = claude3(); const a1 = byName(m, 'a1');
-  served(m, a1); a1.activeWeight = 83; a1.inFlight = 9;
-  assert.equal(pick(m).name, 'a1', 'at the ceiling the hold keeps the conversation');
+  served(m, a1); a1.activeWeight = 73; a1.inFlight = 8;
+  assert.equal(pick(m).name, 'a1', 'at the ceiling (counting this turn) the hold keeps the conversation');
 });
 test('RT-F1: the ceiling is tighter on a reserve holder (scaled by reserve/target)', () => {
   const m = claude3(); const a1 = byName(m, 'a1');

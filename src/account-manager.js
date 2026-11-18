@@ -3192,10 +3192,10 @@ export class AccountManager {
         && isClaudeAccount(holdCand.account) && isClaudeAccount(best)
         && !(home && best.name === home.name)
         && holdCand.priority <= bestPriority
-        // DEPTH CEILING (red team F1, 2026-11-19): the hold never stacks a holder past
-        // its target + 2x the anti-dogpile allowance — "regardless of score", not
-        // "regardless of depth". Past the ceiling the conversation moves as today.
-        && (holdCand.account.activeWeight ?? 0) <= holdCeiling
+        // DEPTH CEILING (red team F1): the hold never stacks a holder past its target +
+        // 2x the anti-dogpile allowance, counting THIS turn's weight — "regardless of
+        // score", not "regardless of depth". Past the ceiling the conversation moves as today.
+        && (holdCand.account.activeWeight ?? 0) + Math.max(1, requestInfo.weight || 1) <= holdCeiling
         && !this._affinityRelease(holdCand.account, holdCand.critUnlock)) {
         const outscoredBy = best;
         best = holdCand.account;
