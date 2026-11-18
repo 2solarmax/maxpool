@@ -3179,15 +3179,9 @@ export class AccountManager {
       // on the new account. Not when the hold has let go (_affinityRelease), the holder sits
       // in a worse priority tier, the pick is a provider row (cross-family is untouched),
       // or return-home just chose home (that block owns the detour return).
-      const holdCeiling = !holdCand ? Infinity : (() => {
-        const target = Number(this.scheduler.perAccountConcurrencyTarget) || 3;
-        let maxExtra = 2 * (Number(this.scheduler.cacheAffinityMaxExtraDepth) || 40);
-        const wk = this._weeklyRawState(holdCand.account);
-        if (wk === 'reserve' || (wk === 'critical' && holdCand.critUnlock)) {
-          maxExtra *= Math.min(1, this.scheduler.reserveConcurrencyTarget / Math.max(1, this.scheduler.perAccountConcurrencyTarget));
-        }
-        return target + maxExtra;
-      })();
+      const holdCeiling = !holdCand ? Infinity
+        : (Number(this.scheduler.perAccountConcurrencyTarget) || 3)
+          + 2 * (Number(this.scheduler.cacheAffinityMaxExtraDepth) || 40) * this._reserveTightening(holdCand.account, holdCand.critUnlock);
       if (best && holdCand && best !== holdCand.account
         && isClaudeAccount(holdCand.account) && isClaudeAccount(best)
         && !(home && best.name === home.name)
@@ -4662,11 +4656,19 @@ export class AccountManager {
     // A reserve (or unlocked-critical) account has the TIGHTER concurrency target; its
     // hold gets the same tightening so the hold never stretches the lowest-headroom tier
     // as far as a healthy one (reserveConcurrencyTarget / perAccountConcurrencyTarget).
+    maxExtra *= this._reserveTightening(account, criticalUnlock);
+    return Math.min(bonus, maxExtra * unit);
+  }
+
+  /** Multiplier (<= 1) on the anti-dogpile depth allowance: a reserve (or unlocked-critical)
+   *  account's tighter concurrency target, reserveConcurrencyTarget / perAccountConcurrencyTarget;
+   *  1 for every other account. */
+  _reserveTightening(account, criticalUnlock) {
     const wk = this._weeklyRawState(account);
     if (wk === 'reserve' || (wk === 'critical' && criticalUnlock)) {
-      maxExtra *= Math.min(1, this.scheduler.reserveConcurrencyTarget / Math.max(1, this.scheduler.perAccountConcurrencyTarget));
+      return Math.min(1, this.scheduler.reserveConcurrencyTarget / Math.max(1, this.scheduler.perAccountConcurrencyTarget));
     }
-    return Math.min(bonus, maxExtra * unit);
+    return 1;
   }
 
   /**
