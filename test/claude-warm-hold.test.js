@@ -30,9 +30,12 @@ const pick = (m, excluded, over) => {
   if (lease) m.releaseAccount(lease, { status: 200, success: true });
   return { name: lease?.account.name ?? null, logs };
 };
-// The holder a1 carries ~100 weight units from OTHER conversations: far past the 400-point
-// affinity bonus, so today's score loop moves the conversation to an idle Claude sibling.
-const loadHolder = (a) => { a.activeWeight = 1200; a.inFlight = 12; };
+// The holder a1 carries 60 weight units from OTHER conversations: past the 400-point
+// affinity bonus (~33 units), so today's score loop moves the conversation to an idle
+// Claude sibling. The load sits UNDER the F1 depth ceiling (target 3 + 2x40 = 83 units),
+// so the hold keeps this conversation; past the ceiling it moves as today.
+const loadHolder = (a) => { a.activeWeight = 60; a.inFlight = 6; };
+const loadHolderPastCeiling = (a) => { a.activeWeight = 84; a.inFlight = 9; };
 
 test('knob: scheduler.claudeWarmHold defaults to true', () => {
   assert.equal(claude3().scheduler.claudeWarmHold, true);
@@ -46,7 +49,7 @@ test('HOLD: a warm conversation stays on its available Claude holder although a 
   const { name, logs } = pick(m);
   assert.equal(name, 'a1', `kept on the holder: ${logs.join(' | ')}`);
   assert.ok(!logs.some(l => l.includes('conversation moved:')), 'no move line');
-  assert.ok(logs.some(l => /warm-hold=a1:kept\(pick a[23]\)/.test(l)), `one kept line naming the pick: ${logs.join(' | ')}`);
+  assert.ok(logs.some(l => /warm-hold=a1:kept\(pick a[23] depth=\d+\/\d+\)/.test(l)), `one kept line naming the pick: ${logs.join(' | ')}`);
 });
 
 test('HOLD applies in prefer-claude mode too (scored mode)', () => {
@@ -183,9 +186,10 @@ test('KNOB: claudeWarmHold=false restores score-based moves', () => {
 test('BUSY holder: the warm conversation keeps landing on its busy holder (no sibling re-write) while NEW conversations spread', () => {
   const m = claude3(); const a1 = byName(m, 'a1');
   served(m, a1);
-  // a1 is deep with other conversations' turns and just refused busy for new placements.
+  // a1 is deep with other conversations' turns (6 x 10 = 60 units, under the 83-unit
+  // depth ceiling) and just refused busy for new placements.
   const others = [];
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 6; i++) {
     others.push(m.acquireAccount(ri({ affinityKey: `s:other-${i}` }), new Set([byName(m, 'a2').index, byName(m, 'a3').index])));
   }
   assert.ok(others.every(l => l.account.name === 'a1'));
@@ -197,4 +201,43 @@ test('BUSY holder: the warm conversation keeps landing on its busy holder (no si
   assert.notEqual(pick(m, undefined, { affinityKey: 's:new' }).name, 'a1', 'new work spreads');
   others.forEach(l => m.releaseAccount(l, { status: 200, success: true }));
   assert.equal(pick(m).name, 'a1', 'served on the holder once it frees');
+});
+
+
+// Red-team round 1
+// F2: a degraded identity (no per-conversation key: the terminal-wide key stands in) must
+// route exactly as with the hold OFF — the hold would otherwise pin a whole terminal.
+const spread = (holdOn) => {
+  const m = claude3({ claudeWarmHold: holdOn }); const a1 = byName(m, 'a1');
+  m.identityHealth = { degraded: true };
+  served(m, a1, { affinityKey: undefined }); loadHolder(a1);
+  return pick(m, undefined, { affinityKey: undefined }).name;
+};
+test('RT-F2: degraded identity — the warm hold does not fire (routes as with the hold off)', () => {
+  assert.notEqual(spread(false), 'a1', 'fixture: with the hold off the loaded holder loses');
+  assert.equal(spread(true), spread(false), 'hold on == hold off when identity is degraded');
+});
+
+// F1: the hold never stacks its holder past target + 2x the anti-dogpile allowance.
+test('RT-F1: past the depth ceiling the warm conversation moves as today', () => {
+  const m = claude3(); const a1 = byName(m, 'a1');
+  served(m, a1); loadHolderPastCeiling(a1);
+  const { name, logs } = pick(m);
+  assert.notEqual(name, 'a1', `moved off an over-ceiling holder: ${logs.join(' | ')}`);
+  assert.ok(!logs.some(l => l.includes('warm-hold=a1:kept')), 'no kept line past the ceiling');
+});
+test('RT-F1: the ceiling edge — exactly 83 units still holds', () => {
+  const m = claude3(); const a1 = byName(m, 'a1');
+  served(m, a1); a1.activeWeight = 83; a1.inFlight = 9;
+  assert.equal(pick(m).name, 'a1', 'at the ceiling the hold keeps the conversation');
+});
+test('RT-F1: the ceiling is tighter on a reserve holder (scaled by reserve/target)', () => {
+  const m = claude3(); const a1 = byName(m, 'a1');
+  served(m, a1); loadHolder(a1);
+  const orig = m._weeklyRawState.bind(m);
+  m._weeklyRawState = (a) => (a === a1 ? 'reserve' : orig(a));
+  const r = m.scheduler.reserveConcurrencyTarget / m.scheduler.perAccountConcurrencyTarget;
+  const ceiling = m.scheduler.perAccountConcurrencyTarget + 2 * m.scheduler.cacheAffinityMaxExtraDepth * Math.min(1, r);
+  assert.ok(a1.activeWeight > ceiling, `fixture: 60 units sits past the reserve ceiling ${ceiling}`);
+  assert.notEqual(pick(m).name, 'a1', 'reserve holder past its tighter ceiling lets go');
 });

@@ -3179,10 +3179,23 @@ export class AccountManager {
       // on the new account. Not when the hold has let go (_affinityRelease), the holder sits
       // in a worse priority tier, the pick is a provider row (cross-family is untouched),
       // or return-home just chose home (that block owns the detour return).
+      const holdCeiling = !holdCand ? Infinity : (() => {
+        const target = Number(this.scheduler.perAccountConcurrencyTarget) || 3;
+        let maxExtra = 2 * (Number(this.scheduler.cacheAffinityMaxExtraDepth) || 40);
+        const wk = this._weeklyRawState(holdCand.account);
+        if (wk === 'reserve' || (wk === 'critical' && holdCand.critUnlock)) {
+          maxExtra *= Math.min(1, this.scheduler.reserveConcurrencyTarget / Math.max(1, this.scheduler.perAccountConcurrencyTarget));
+        }
+        return target + maxExtra;
+      })();
       if (best && holdCand && best !== holdCand.account
         && isClaudeAccount(holdCand.account) && isClaudeAccount(best)
         && !(home && best.name === home.name)
         && holdCand.priority <= bestPriority
+        // DEPTH CEILING (red team F1, 2026-11-19): the hold never stacks a holder past
+        // its target + 2x the anti-dogpile allowance — "regardless of score", not
+        // "regardless of depth". Past the ceiling the conversation moves as today.
+        && (holdCand.account.activeWeight ?? 0) <= holdCeiling
         && !this._affinityRelease(holdCand.account, holdCand.critUnlock)) {
         const outscoredBy = best;
         best = holdCand.account;
@@ -3192,7 +3205,7 @@ export class AccountManager {
         const hkey = this._affinityKey(requestInfo);
         if (hkey && this.conversationWarmHoldLogged.get(hkey) !== best.name) {
           lruSet(this.conversationWarmHoldLogged, hkey, best.name);
-          console.log(`[Maxpool] warm-hold=${best.name}:kept(pick ${outscoredBy.name}) (${requestInfo.bodyBytes ?? '?'}B)`);
+          console.log(`[Maxpool] warm-hold=${best.name}:kept(pick ${outscoredBy.name} depth=${best.activeWeight}/${outscoredBy.activeWeight}) (${requestInfo.bodyBytes ?? '?'}B)`);
         }
       }
 
@@ -4482,6 +4495,12 @@ export class AccountManager {
    *  keeps its own scoring. Availability and release gates are checked per pass. */
   _claudeWarmHolder(requestInfo = {}) {
     if (!this.scheduler.claudeWarmHold || this.scheduler.routingMode === 'sticky') return null;
+    // TERMINAL-WIDE KEY IS NOT A CONVERSATION (red team F2, 2026-11-19): when identity
+    // is degraded _affinityKey falls back to the per-terminal sessionKey, and "warm"
+    // would mean "this terminal was served anything in the last hour" — pinning every
+    // NEW conversation in the terminal (all of a session's parallel subagents) onto one
+    // account at any depth. The hold needs a real per-conversation key.
+    if (this.identityHealth?.degraded || !requestInfo.affinityKey) return null;
     const key = this._affinityKey(requestInfo);
     const name = key ? this.conversationLastAccount.get(key) : null;
     if (!name) return null;
