@@ -3567,9 +3567,14 @@ export class TUI {
       // N is the count of session cycles it rests on.
       if (win === 'wk' && a.type === 'provider' && a.quota?.weeklyAbsent) {
         const sesTank = this.am.capacityTank?.(i, 'ses');
+        // D11/D12 (audit 2026-11-18): the ×33.6 ceiling assumes every 5h window holds
+        // the off-peak median, but z.ai peak windows (Mon-Fri 06:00-10:00 UTC, 20h of
+        // 168h) hold ~1/3 of that (measured 218.6M vs 648.2M). Label the figure as a
+        // ceiling ("max") so it reads as an upper bound, and mark N as 5h cycles —
+        // the footer's "N = cycles in Med-all" is false on this row by construction.
         const approx = sesTank && sesTank.n > 0
           ? formatTokens(Math.round(sesTank.avg * (7 * 24) / 5)) : '--';
-        const cellsByName = { Current: cyan(approx), Prev: '--', 'Med-3': '--', 'Med-all': '--', N: sesTank?.n ? String(sesTank.n) : '--' };
+        const cellsByName = { Current: cyan((approx === '--' ? '--' : approx + ' max')), Prev: '--', 'Med-3': '--', 'Med-all': '--', N: sesTank?.n ? `${sesTank.n} (5h)` : '--' };
         // Same price cell as the main path: this account's weekly capacity IS the
         // derived tank (avg 5h × 33.6) — the price column must not go blank here.
         const p2 = this.am.monthlyPriceFor?.(cr.priceAccount);
@@ -3577,7 +3582,7 @@ export class TUI {
         cellsByName['$/1M'] = gray((pricePerMTokens(p2, weeklyDerived) ?? '--').padStart(CW));
         out.push('  ' + lead
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
-          + dim('  no weekly limit · avg 5h × 33.6'));
+          + dim('  no weekly limit · avg 5h × 33.6 · peak hours hold less'));
         continue;
       }
 

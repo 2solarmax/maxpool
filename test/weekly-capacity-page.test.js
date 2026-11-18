@@ -120,3 +120,32 @@ test('D10: a huge tank never renders $0.00 (significant digits, not toFixed(2))'
   assert.ok(!/\$0\.00(?![0-9])/.test(row), `no bare $0.00 cell, row: ${row}`);
   assert.match(row, /\$0\.005/, `a real sub-cent price shows digits, row: ${row}`);
 });
+
+// ── D11/D12: the no-weekly row's ceiling is peak-aware and N is labelled ──
+const providerNoWeekly = (name) => {
+  const a = {
+    name, type: 'provider', provider: 'zai', authToken: 'k', upstream: 'http://x',
+    profiles: ['all'],
+  };
+  return a;
+};
+const markNoWeekly = (am) => { am.accounts[0].quota.weeklyAbsent = true; };
+test('D11/D12: a weeklyAbsent provider labels its ceiling max, its N as 5h cycles, and stays honest about the derivation', () => {
+  const am = new AccountManager([providerNoWeekly('glm max')], 0.95);
+  markNoWeekly(am);   // addAccount replaces quota with emptyQuota — set it after
+  // Two 5h session cycles at 400M and 600M → ses median 500M.
+  const now = Date.now();
+  for (const [tok, end] of [[400e6, now - 5*3600e3], [600e6, now]]) {
+    am.capacity.accrue('glm max', { input: tok, output: 0 }, end - 5 * 3600e3);
+    const o = am.capacity.openCycle('glm max', 'ses');
+    o.windowStartedAt = end - 5 * 3600e3;
+    am.capacity.closeCycle('glm max', 'ses', end, { resetAt: end, finalUtilization: 0.9 });
+  }
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'wk';
+  const txt = tui._renderCapacityPage(160).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  const row = txt.split('\n').find(l => l.includes('glm max'));
+  assert.ok(row, 'row present');
+  assert.match(row, /max/i, 'the derived weekly figure is labelled as a ceiling (max)');
+  assert.match(row, /5h/, 'N is labelled as 5h cycles');
+});
