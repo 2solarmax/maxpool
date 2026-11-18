@@ -676,10 +676,12 @@ test('capacity page $/1M: price ÷ measured weekly tank, monthly-normalized (own
   const { TUI } = await import('../src/tui.js');
   const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
   const page = new TUI({ accountManager: am, config: {} })._renderCapacityPage(140).map(strip).join('\n');
-  assert.match(page, /\$16\.80/, 'glm q: 134.4 ÷ 8M');
-  assert.match(page, /\$100\.00/, 'claude priced: $200 ÷ measured 2M tank');
+  // Audit D8 (2026-11-18): the price is monthly-normalized — a month buys 4.3486
+  // weekly tanks, so these cells dropped 4.35x versus the old week-only division.
+  assert.match(page, /\$3\.86/, 'glm q: 134.4 ÷ (8M × 4.3486)');
+  assert.match(page, /\$23\.00/, 'claude priced: $200 ÷ (2M × 4.3486)');
   assert.match(page, /\$\/1M/, 'header present');
-  assert.match(page, /price per token|monthly-normalized/, 'legend names the derivation');
+  assert.match(page, /monthly plan price/, 'legend names the derivation');
 });
 
 test('queue head-skip: a serveable waiter is not blocked forever by an unserveable head (redteam#5)', () => {
@@ -727,7 +729,7 @@ test('price cell derivation: weekly-plan accounts derive weekly tank at 5h × 5.
   const { TUI } = await import('../src/tui.js');
   const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
   const page = new TUI({ accountManager: am, config: {} })._renderCapacityPage(140).map(strip).join('\n');
-  assert.match(page, /\$20\.36/, '134.4 ÷ (1.2M × 5.5)');
+  assert.match(page, /\$4\.68/, '134.4 ÷ (1.2M × 5.5 × 4.3486)');
   assert.doesNotMatch(page, /\$3\.\d\d/, 'the ×33.6 figure ($3.34) must not appear');
 });
 
@@ -756,8 +758,8 @@ test('capacity page on the REAL two-pool shape: cloud rows get their price and t
   const t = new TUI({ accountManager: am, config: {} });
   t.capacityWindow = 'wk';
   const page = t._renderCapacityPage(140).map(strip).join('\n');
-  assert.match(page, /\$20\.00/, 'Claude mirror: $200 ÷ 10M local pre-migration tank');
-  assert.match(page, /\$16\.80/, 'GLM mirror: $134.4 cloud-read price ÷ 8M cloud tank');
+  assert.match(page, /\$4\.60/, 'Claude mirror: $200 ÷ (10M × 4.3486) local pre-migration tank');
+  assert.match(page, /\$3\.86/, 'GLM mirror: $134.4 ÷ (8M × 4.3486) cloud tank');
   am.setPoolLinks([]);
 });
 
