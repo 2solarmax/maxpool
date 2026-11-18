@@ -47,14 +47,13 @@ test('P2: an open weekly cycle renders as the live Current, not empty', () => {
   am.accrueCapacity(0, { input: 1_000_000, output: 0 });
   am.accounts[0].quota.unified7d = 0.5;
   am.capacity.noteUtilizationObserved();
-  // The CURRENT window is open but already carries one usable closed cycle in
-  // history: Current falls back to the measured tank average (10M) rather than the
-  // 2M open-window estimate — the existing M4 precedence, kept. The open cycle's
-  // own number will become a proper column when it closes. What must NOT happen is
-  // an empty Current with history sitting right there.
+  // AUDIT D2 (2026-11-18): Current is the LIVE window. Here the open cycle has one
+  // accrual (1M) at 50% util → 2M live, and the closed history (10M) belongs in
+  // Prev/Med columns. What must NOT happen is an empty Current with history sitting
+  // right there.
   const row = renderWk(am).split('\n').find(l => l.includes('kira'));
   assert.ok(row, 'row present');
-  assert.match(row, /10M\s+--\s+10M\s+10M\s+1/, 'closed history renders (Current=tank avg, Med-3, Med-all, N)');
+  assert.match(row, /2\.0M\s+10M\s+10M\s+10M\s+1/, 'live Current, then Prev/Med-3/Med-all from history, N=1');
 });
 
 test('P3: the no-weekly derived row is marked "≈" so it reads as derived', () => {
@@ -77,4 +76,47 @@ test('P3: the no-weekly derived row is marked "≈" so it reads as derived', () 
   assert.match(row, /\s67M\s/, 'the ×33.6 derivation renders (2M tank × 33.6)');
   assert.match(row, /no weekly limit/, 'the row still says why');
   assert.doesNotMatch(row, /≈/, 'the owner-removed ≈ marker stays out');
+});
+
+// ── 2026-11-18 audit D2/D4: Current is the LIVE window; Prev is the newest FINISHED cycle ──
+test('D2: Current shows the OPEN window, not the closed median, when history exists', () => {
+  const am = amWith('kira');
+  const end = Date.now();
+  closeWeek(am, 'kira', { tokens: 5_000_000, util: 0.5, endedAt: end - SEVEN_D, complete: false });
+  // An open week, watched from its start: util 0.20→0.77 with 2.7B counted → ~3.5B tank.
+  const T0 = end;
+  am.capacity.accrue('kira', { input: 2_700_000_000, output: 0 }, T0);
+  am.capacity.noteUtilizationObserved(T0, [{ name: 'kira', window: 'wk', utilization: 0.20 }]);
+  am.capacity.noteUtilizationObserved(end, [{ name: 'kira', window: 'wk', utilization: 0.77 }]);
+  am.capacity.openCycle('kira', 'wk').windowStartedAt = T0;
+  am.accounts[0].quota.unified7d = 0.77;
+  const row = renderWk(am).split('\n').find(l => l.includes('kira'));
+  assert.match(row, /3\.5B/, `Current must be the live window (~3.5B), row: ${row}`);
+  assert.doesNotMatch(row, /10M\s+--\s+10M/, 'Current must not repeat the closed median');
+});
+test('D4: Prev renders the newest finished cycle once Current is live', () => {
+  const am = amWith('kira');
+  const end = Date.now();
+  closeWeek(am, 'kira', { tokens: 5_000_000, util: 0.5, endedAt: end - 2 * SEVEN_D, complete: false });
+  closeWeek(am, 'kira', { tokens: 8_000_000, util: 0.8, endedAt: end - SEVEN_D, complete: false });
+  const row = renderWk(am).split('\n').find(l => l.includes('kira'));
+  assert.match(row, /10M\s+10M\s+10M\s+2/, 'two finished cycles: Prev=10M (newest finished), Med columns, N=2');
+});
+
+// ── D8/D10: the price is monthly-normalized and never rounds to $0.00 ──
+test('D8: $/1M divides the monthly price by 4.3486 weekly tanks (kira $200/mo, 3.0B tank → ≈$0.015)', () => {
+  const am = amWith('kira');
+  const end = Date.now();
+  closeWeek(am, 'kira', { tokens: 1_500_000_000, util: 0.5, endedAt: end, complete: false });
+  const row = renderWk(am).split('\n').find(l => l.includes('kira'));
+  assert.match(row, /\$0\.015/, `monthly-normalized price, row: ${row}`);
+});
+test('D10: a huge tank never renders $0.00 (significant digits, not toFixed(2))', () => {
+  const am = amWith('kira');
+  const end = Date.now();
+  closeWeek(am, 'kira', { tokens: 10_000_000_000, util: 1.0, endedAt: end, complete: false });
+  const row = renderWk(am).split('\n').find(l => l.includes('kira'));
+  // '$0.00' followed by a digit is fine ($0.005); a bare '$0.00' cell is the bug.
+  assert.ok(!/\$0\.00(?![0-9])/.test(row), `no bare $0.00 cell, row: ${row}`);
+  assert.match(row, /\$0\.005/, `a real sub-cent price shows digits, row: ${row}`);
 });

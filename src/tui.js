@@ -472,6 +472,19 @@ function settingsTags(am, a) {
  *  the Claude 5h reading and the API-key limits when their reset passes, but NEVER
  *  a provider's (GLM/Kimi) providerSes — that stays until the next usage probe, so a
  *  provider past its reset stamp is still refused and must not read "active". */
+/** $ per 1M processed tokens, monthly-normalized (audit D8, 2026-11-18): a monthly
+ *  price buys 30.44/7 = 4.3486 weekly tanks per month, so the per-token price is
+ *  price ÷ (weeklyTank × 4.3486) — the old code divided by ONE week's tank, making
+ *  every price on the screen 4.35x too high (\$0.07 shown where the truth is \$0.0155).
+ *  3 significant digits so small true prices never round to \$0.00 (D10). */
+function pricePerMTokens(monthlyPrice, weeklyTankTokens) {
+  if (!(monthlyPrice > 0) || !(weeklyTankTokens > 0)) return null;
+  const perM = monthlyPrice / (weeklyTankTokens * (30.44 / 7) / 1e6);
+  if (!(perM > 0)) return null;
+  const digits = perM >= 1 ? 2 : perM >= 0.1 ? 2 : 3;
+  return '$' + perM.toFixed(digits);
+}
+
 function sessionFull(am, a) {
   const q = a?.quota || {};
   const now = Date.now();
@@ -3560,8 +3573,8 @@ export class TUI {
         // Same price cell as the main path: this account's weekly capacity IS the
         // derived tank (avg 5h × 33.6) — the price column must not go blank here.
         const p2 = this.am.monthlyPriceFor?.(cr.priceAccount);
-        cellsByName['$/1M'] = gray((sesTank?.avg && p2)
-          ? ('$' + (p2 / (Math.round(sesTank.avg * (7 * 24) / 5) / 1e6)).toFixed(2)).padStart(CW) : '--'.padStart(CW));
+        const weeklyDerived = sesTank?.avg ? Math.round(sesTank.avg * (7 * 24) / 5) : null;
+        cellsByName['$/1M'] = gray((pricePerMTokens(p2, weeklyDerived) ?? '--').padStart(CW));
         out.push('  ' + lead
           + COLS.map(c => cellsByName[c].padStart(CW)).join('')
           + dim('  no weekly limit · avg 5h × 33.6'));
@@ -3575,13 +3588,23 @@ export class TUI {
       const util = this.am._windowUtilization?.(a, win);
       const nowOpen = ledger.openCycle(a.name, win);
 
-      // Current = the live window: capacity estimate so far, tagged with how full the
-      // vendor says it is. `~` estimate-from-open-window, `≥` lower bound (joined late).
+      // Current = the LIVE window (audit D2, 2026-11-18): the open cycle's own
+      // estimate — its slope median when it has segments, else the whole-window
+      // absolute (tokens÷util), else the ledger's live estimate. The closed median
+      // is what Med-all shows; repeating it in Current hid the running week (kira
+      // showed 1.1B while its live week held 3.5B on 15 of 25 rows).
       let cur = '--';
-      if (tank && !(tank.source === 'live' && unprovenLive)) {
-        cur = formatTokens(tank.avg);
-      } else if (nowOpen?.tokensSoFar > 0 && util > 0) {
-        cur = formatTokens(Math.round(nowOpen.tokensSoFar / util));
+      if (nowOpen) {
+        const est = this.am.capacity?.exportOpenCycle?.(a.name, win);
+        if (est?.est) cur = formatTokens(est.est);
+        else if (est && Number.isFinite(est.peakUtilization) && est.peakUtilization > 0 && est.peakUtilization < 1) {
+          cur = formatTokens(Math.round(est.tokensSoFar / est.peakUtilization));
+        } else if (nowOpen.tokensSoFar > 0 && util > 0 && util < 1) {
+          cur = formatTokens(Math.round(nowOpen.tokensSoFar / util));
+        }
+      }
+      if (cur === '--' && tank && !(tank.source === 'live' && unprovenLive)) {
+        cur = formatTokens(tank.avg);   // no live reading yet — history as the fallback
       }
       const curPct = util != null && cur !== '--' ? dim(`@${Math.round(util * 100)}%`) : '';
       // Every history column is a TANK number (tokens ÷ closing %). Prev/N used to
@@ -3589,7 +3612,10 @@ export class TUI {
       // row mixed units (2026-10-13 owner report; see tankStats' reading-set note).
       const cellsByName = {
         Current: cur.padStart(CW - (curPct ? curPct.length + 1 : 0)),
-        Prev: (tank?.source === 'cycles' && tank.prev != null ? formatTokens(tank.prev) : '--'),
+        // Prev = the newest FINISHED cycle (audit D4) — once Current is live, the
+        // reader wants "what did last week hold", which is `last`, not the
+        // second-newest (that comparison is Med-3's job).
+        Prev: (tank?.source === 'cycles' && tank.last != null ? formatTokens(tank.last) : '--'),
         'Med-3': (tank?.source === 'cycles' && tank.recent != null ? formatTokens(tank.recent) : '--'),
         'Med-all': (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
         // `n*` = at least one contributing cycle is a two-pool merge (no per-reading
@@ -3612,9 +3638,7 @@ export class TUI {
         : (this.am.capacityTank?.(i, 'wk')?.avg
           ?? (a.type === 'provider' && sesTankObj?.avg ? Math.round(sesTankObj.avg * WK_PER_SES) : null));
       const price = this.am.monthlyPriceFor?.(cr.priceAccount);
-      const priceCell = (wkTank && price)
-        ? '$' + (price / (wkTank / 1e6)).toFixed(2)
-        : '--';
+      const priceCell = pricePerMTokens(price, wkTank) ?? '--';
       cellsByName['$/1M'] = gray(priceCell.padStart(CW));
       const row = '  ' + lead
         + COLS.map(c => cellsByName[c].padStart(CW)).join('');
