@@ -118,8 +118,9 @@ test('a cloud reply that already streamed real bytes is NOT cut by the probe', a
 // The probe itself answers here (the tunnel is fine as far as the 5 s ping knows) so
 // the REQUEST-level fault path is what moves the request, not a probe cut.
 const ALIVE = async () => ({ status: 200, error: null });
-async function faultCase(onMsg) {
-  const r = await rig(onMsg, { probeFn: ALIVE });
+const DEAD = async () => ({ status: null, error: 'timeout' });
+async function faultCase(onMsg, { probeFn = DEAD, expectLifted = false } = {}) {
+  const r = await rig(onMsg, { probeFn });
   let probes = 0;
   const orig = r.link.probeNow.bind(r.link);
   r.link.probeNow = () => { probes++; return orig(); };
@@ -129,12 +130,21 @@ async function faultCase(onMsg) {
     assert.equal(out.status, 200, out.text.slice(0, 200));
     assert.match(out.text, /msg_local/);
     assert.equal(r.hits.length, 1, `one link hop, then off the link: ${r.hits.join(', ')}`);
-    const now = Date.now();
-    for (const m of r.am.accounts.filter(a => a.remote)) {
-      assert.ok(m.cooldownUntil > now + 20_000, `${m.name} cooled for the link fault`);
-    }
-    assert.ok(r.am.accounts.some(a => a.remote && a.type === 'provider' && a.cooldownUntil > now + 20_000), 'provider mirror cooled too');
     assert.ok(probes >= 1, 'an immediate probe was fired');
+    await r.link._probing;                 // let the immediate probe settle
+    await new Promise(res => setImmediate(res));
+    const now = Date.now();
+    if (expectLifted) {
+      // Probe-gated (2026-11-18): the tunnel answered → the link-wide bench is lifted.
+      for (const m of r.am.accounts.filter(a => a.remote)) {
+        assert.ok(!(m.cooldownUntil > now), `${m.name}: an answering probe lifts the link-fault bench`);
+      }
+    } else {
+      for (const m of r.am.accounts.filter(a => a.remote)) {
+        assert.ok(m.cooldownUntil > now + 20_000, `${m.name} stays cooled while the probe gets no answer`);
+      }
+      assert.ok(r.am.accounts.some(a => a.remote && a.type === 'provider' && a.cooldownUntil > now + 20_000), 'provider mirror cooled too');
+    }
     return lines;
   } finally { await r.cleanup(); }
 }
@@ -143,11 +153,32 @@ test('request-level link fault (connection reset): every mirror on the link cool
   await faultCase((req) => { req.socket.destroy(); });
 });
 
+test('a one-request blip on a LIVE tunnel: the immediate probe answers, so the link-wide bench is lifted at once', async () => {
+  await faultCase((req) => { req.socket.destroy(); }, { probeFn: ALIVE, expectLifted: true });
+});
+
+test('liftLinkMirrorsCooldown lifts only rows carrying THIS fault\'s exact stamp', () => {
+  const am = new AccountManager([
+    { name: 'c ☁', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
+    { name: 'd ☁', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
+  ], 0.9);
+  for (const a of am.accounts) a.remote = { linkName: 'team' };
+  const cooled = am.markLinkMirrorsCooldown(am.accounts[0], 30_000, { includeProviders: true });
+  am.accounts[1].cooldownUntil = cooled.until + 60_000;   // a longer, unrelated cooldown
+  am.liftLinkMirrorsCooldown(am.accounts[0], cooled.until);
+  assert.equal(am.accounts[0].cooldownUntil, null, 'this fault\'s bench lifted');
+  assert.equal(am.accounts[1].cooldownUntil, cooled.until + 60_000, 'a different cooldown is left alone');
+});
+
 test('request-level link fault (no-headers timeout): same — and the throttle cooldown default still spares providers', { timeout: 60_000 }, async () => {
   const saved = process.env.MAXPOOL_LINK_TTFB_MS;
   process.env.MAXPOOL_LINK_TTFB_MS = '15000';   // the floor; the 120 s default stays untouched
   try {
-    const lines = await faultCase(() => { /* never answers */ });
+    // The ping answers (tunnel alive, only the request hung): the request-level path
+    // moves it as link_ttfb and, being probe-gated, lifts the link-wide bench. (With a
+    // DEAD ping the 5 s probe declares the link down first — that is the link_down path,
+    // covered by the probe-cut test above.)
+    const lines = await faultCase(() => { /* never answers */ }, { probeFn: ALIVE, expectLifted: true });
     assert.ok(attempts(lines).some(l => /\(link_ttfb\)/.test(l)), attempts(lines).join('\n'));
   } finally { if (saved == null) delete process.env.MAXPOOL_LINK_TTFB_MS; else process.env.MAXPOOL_LINK_TTFB_MS = saved; }
   const am = new AccountManager([

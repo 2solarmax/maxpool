@@ -419,7 +419,7 @@ export class PoolLink {
   /** Fire one probe now (a request just hit a link fault). Non-blocking; joins an
    *  in-flight probe instead of stacking. */
   probeNow() {
-    this.probe().catch(() => {});
+    return this.probe().catch(() => false);
   }
 
   /** Register a callback run once per DOWN transition (the server cuts in-flight

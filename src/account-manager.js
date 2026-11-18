@@ -3435,7 +3435,21 @@ export class AccountManager {
     const until = Date.now() + Math.max(0, Number(ms) || 0);
     const cooled = this.accounts.filter(a => a.remote && a.remote.linkName === linkName && (includeProviders || a.type !== 'provider'));
     for (const a of cooled) a.cooldownUntil = Math.max(a.cooldownUntil || 0, until);
+    cooled.until = until;   // the exact stamp, so a probe that answers can lift ONLY this cooldown
     return cooled;
+  }
+
+  /** Lift a link-fault cooldown when the immediate probe proves the tunnel ALIVE
+   *  (red-team decision 2026-11-18): a single mid-request reset on a healthy link
+   *  must not bench every cloud row for 30 s — the audit counted 33 such blips in 34 h,
+   *  each followed by normal service. Only rows still carrying THIS fault's exact stamp
+   *  are lifted; a later/longer cooldown (a throttle, another fault) is left alone. */
+  liftLinkMirrorsCooldown(fromAccount, until) {
+    const linkName = fromAccount?.remote?.linkName;
+    if (!linkName || !Number.isFinite(until)) return [];
+    const lifted = this.accounts.filter(a => a.remote && a.remote.linkName === linkName && a.cooldownUntil === until);
+    for (const a of lifted) a.cooldownUntil = null;
+    return lifted;
   }
 
   /** Fresher depth for a cloud row from a refusal's x-maxpool-pin-* headers. */

@@ -1541,7 +1541,12 @@ async function forwardRequest(
       if (!linkClientGone && LINK_TRANSPORT_FAULTS.has(linkKind) && !clientHasRealBytes(res, requestInfo)) {
         const cooled = accountManager.markLinkMirrorsCooldown(account, LINK_FAULT_COOLDOWN_MS, { includeProviders: true });
         for (const a of cooled) excludedIndexes.add(a.index);
-        account.remote?.link?.probeNow?.();
+        // Probe-gated: if the immediate probe answers, the tunnel is alive and this was a
+        // one-request blip — lift the link-wide bench at once (THIS request still moves).
+        const probed = account.remote?.link?.probeNow?.();
+        if (probed && typeof probed.then === 'function') {
+          probed.then(alive => { if (alive) accountManager.liftLinkMirrorsCooldown?.(account, cooled.until); }).catch(() => {});
+        }
       }
       if (!clientHasRealBytes(res, requestInfo)) {
         if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
