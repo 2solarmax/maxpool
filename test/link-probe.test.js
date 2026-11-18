@@ -138,6 +138,26 @@ test('real socket: an old cloud answering 404 is alive, and each probe opens a f
   } finally { await close(srv); }
 });
 
+test('real socket: the probe never borrows an idle pooled keep-alive socket (agent:false)', async () => {
+  const sockets = new Set();
+  const srv = http.createServer({ keepAlive: true }, (req, res) => { res.writeHead(404, { connection: 'keep-alive' }); res.end('{}'); });
+  srv.on('connection', s => sockets.add(s));
+  const port = await listen(srv);
+  try {
+    // Park a keep-alive socket in the global agent's free pool — the kind a silently
+    // dropped tunnel leaves half-dead. A pooled probe would reuse it.
+    await new Promise((resolve, reject) => {
+      const req = http.get(`http://127.0.0.1:${port}/warm`, res => { res.resume(); res.on('end', resolve); });
+      req.on('error', reject);
+    });
+    await new Promise(r => setImmediate(r));
+    assert.equal(sockets.size, 1);
+    const r = await probeLink(`http://127.0.0.1:${port}`);
+    assert.equal(r.status, 404);
+    assert.equal(sockets.size, 2, 'the probe opened its own connection');
+  } finally { http.globalAgent.destroy(); await close(srv); }
+});
+
 test('real socket: a server that accepts and never answers is a miss within ~3.5 s', async () => {
   const held = [];
   const srv = net.createServer(s => { held.push(s); s.on('error', () => {}); });
