@@ -1,6 +1,7 @@
 // Red-team round 2 on the link work (v1.24.108):
 //   1. A short blip never reaches 3 probe misses, so no DOWN->UP ever lifts the 30 s link-fault
-//      bench a request fault set; the next probe ANSWER must lift it (stamp-equality guard intact).
+//      bench a request fault set; two probe ANSWERS in a row must lift it (stamp-equality guard
+//      intact), and a lossy link (miss, answer, miss, answer) must never lift it.
 //   2. A tunnel that answers the tiny ping but blackholes large bodies must not keep the link
 //      "up" forever: consecutive soft status-poll failures (or a stale last-good status) mark it
 //      down — while one slow poll still must not (status-poll-false-down.test.js).
