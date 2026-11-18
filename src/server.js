@@ -1590,11 +1590,17 @@ async function forwardRequest(
         // a one-request blip — retry normally, sibling cloud rows included (the old path;
         // a pool with no local route still recovers). No answer → treat the tunnel as dead:
         // bench EVERY mirror of the link (providers too — z.ai egress rides it) for 30 s and
-        // keep the retry off them. A probe-declared down (link_down) skips the wait.
+        // keep the retry off them.
+        // A probe-declared DOWN (link_down) benches NOTHING on a timer (2026-11-18 live
+        // outage): the probe already holds every mirror of the link out of routing and
+        // revives them the moment it reads UP, while a flat 30 s bench outlived a 17 s
+        // outage — held requests could not move back and new ones got 429 "cooldown".
         const link = account.remote?.link;
         let tunnelAlive = true;
-        if (linkKind === 'link_down' || link?.probeDown) tunnelAlive = false;
-        else if (typeof link?.probeNow === 'function') tunnelAlive = await link.probeNow();
+        if (linkKind !== 'link_down') {
+          if (link?.probeDown) tunnelAlive = false;
+          else if (typeof link?.probeNow === 'function') tunnelAlive = await link.probeNow();
+        }
         if (!tunnelAlive) {
           const cooled = accountManager.markLinkMirrorsCooldown(account, LINK_FAULT_COOLDOWN_MS, { includeProviders: true });
           for (const a of cooled) excludedIndexes.add(a.index);

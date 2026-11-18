@@ -305,6 +305,7 @@ export class PoolLink {
     this._probing = null;      // the in-flight probe promise (never stacked)
     this._probeOnChange = null;
     this._downListeners = new Set();
+    this._upListeners = new Set();
     this.probeMisses = 0;
     this.probeHits = 0;
     this.probeDown = false;
@@ -366,7 +367,7 @@ export class PoolLink {
 
   /** One probe. PROBE_MISSES_BEFORE_DOWN misses in a row → probeDown (onChange, then
    *  the onDown listeners, once); while down, PROBE_HITS_BEFORE_UP answers in a row →
-   *  up (onChange once). A single answer resets the miss streak. Never stacks: a call
+   *  up (onChange, then the onUp listeners, once). A single answer resets the miss streak. Never stacks: a call
    *  while a probe is in flight joins it. Resolves true when the cloud answered. */
   probe() {
     if (this._probing) return this._probing;
@@ -415,10 +416,8 @@ export class PoolLink {
         // Re-sync routing FIRST (mirrors leave), then cut in-flight waits — so a cut
         // request's failover already sees the link's rows out of routing.
         try { this._probeOnChange?.(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" probe onChange failed: ${err?.message || err}`); }
-        if (this.probeDown) {
-          for (const fn of this._downListeners) {
-            try { fn(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" down listener failed: ${err?.message || err}`); }
-          }
+        for (const fn of this.probeDown ? this._downListeners : this._upListeners) {
+          try { fn(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" ${this.probeDown ? 'down' : 'up'} listener failed: ${err?.message || err}`); }
         }
       }
       return alive;
@@ -437,6 +436,14 @@ export class PoolLink {
   onDown(fn) {
     this._downListeners.add(fn);
     return () => this._downListeners.delete(fn);
+  }
+
+  /** Register a callback run once per UP transition, after onChange revived the
+   *  mirrors (the account manager lifts any link-fault bench on them). Returns an
+   *  unsubscribe function. */
+  onUp(fn) {
+    this._upListeners.add(fn);
+    return () => this._upListeners.delete(fn);
   }
 
   startProbe(onChange, intervalMs = PROBE_INTERVAL_MS) {

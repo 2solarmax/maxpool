@@ -3428,14 +3428,37 @@ export class AccountManager {
    *  so those rows can still serve, and cooling them would black out GLM/'all'
    *  routing for up to 30 s.
    *  includeProviders: a LINK fault (dead tunnel) kills the cloud's z.ai/Kimi egress
-   *  path too, so that caller cools every mirror row of the link. */
+   *  path too, so that caller cools every mirror row of the link — and stamps the
+   *  bench (_linkFaultUntil) so the probe's UP can lift exactly it (liftLinkFaultCooldown). */
   markLinkMirrorsCooldown(fromAccount, ms, { includeProviders = false } = {}) {
     const linkName = fromAccount?.remote?.linkName;
     if (!linkName) return [];
     const until = Date.now() + Math.max(0, Number(ms) || 0);
     const cooled = this.accounts.filter(a => a.remote && a.remote.linkName === linkName && (includeProviders || a.type !== 'provider'));
-    for (const a of cooled) a.cooldownUntil = Math.max(a.cooldownUntil || 0, until);
+    for (const a of cooled) {
+      a.cooldownUntil = Math.max(a.cooldownUntil || 0, until);
+      if (includeProviders) a._linkFaultUntil = until;
+    }
     return cooled;
+  }
+
+  /** The probe declared `linkName` UP: the tunnel answers again, so a link-fault bench
+   *  on its mirrors has nothing left to protect — a flat 30 s outlived a 17 s outage
+   *  (2026-11-18 17:43Z: new requests got 429 "cooldown" for 13 s after UP). Clears
+   *  cooldownUntil ONLY where it is still exactly the link-fault stamp; a throttle /
+   *  unavailable / transient cooldown set or extended since is left alone. */
+  liftLinkFaultCooldown(linkName) {
+    const lifted = [];
+    for (const a of this.accounts) {
+      if (!a.remote || a.remote.linkName !== linkName || a._linkFaultUntil == null) continue;
+      if (a.cooldownUntil === a._linkFaultUntil && a.cooldownUntil > Date.now()) {
+        a.cooldownUntil = null;
+        lifted.push(a);
+      }
+      a._linkFaultUntil = null;
+    }
+    if (lifted.length) console.log(`[Maxpool] link "${linkName}" back UP — lifted the link-fault bench on ${lifted.length} cloud row(s)`);
+    return lifted;
   }
 
   /** Fresher depth for a cloud row from a refusal's x-maxpool-pin-* headers. */
@@ -6635,6 +6658,8 @@ export class AccountManager {
    *  status; duplicate benching is re-computed on every poll tick. */
   setPoolLinks(links, onPoll) {
     for (const l of this.poolLinks) l.stop?.();
+    for (const off of this._poolLinkUnsubs || []) off();
+    this._poolLinkUnsubs = [];
     this.poolLinks = Array.isArray(links) ? links : [];
     this._remoteIdentities = new Map();
     const recompute = () => this.applyPoolLinks();
@@ -6644,6 +6669,8 @@ export class AccountManager {
       // Dead-link probe (2026-11-18): a 5 s fresh-connection ping; its DOWN/UP
       // transitions re-sync the mirrors through the same callback. stop() clears both.
       l.startProbe?.(onChange);
+      // UP (after onChange revived the mirrors): drop any link-fault bench left on them.
+      if (typeof l.onUp === 'function') this._poolLinkUnsubs.push(l.onUp(() => this.liftLinkFaultCooldown(l.name)));
     }
     this.applyPoolLinks();
   }
