@@ -9,6 +9,9 @@ import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor, f
 import { writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
+const gzipAsync = promisify(gzip);
 import { modelFamily, organizationUnknownMatch, sameAccountIdentity, sameUser } from './oauth.js';
 import { resolveStickyBusyBudget } from './account-manager.js';
 
@@ -449,8 +452,21 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           rejectUnauthorized();
           return;
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        // Compact JSON (was pretty-printed: ~2x the bytes, ~1 MB per linked-laptop poll
+        // through the tunnel — 2026-11-18 false-outage fix). Same field set. Gzipped
+        // when the caller asks for it (every consumer is fetch(), which decodes it).
+        const body = JSON.stringify(accountManager.getStatus());
+        if (/\bgzip\b/i.test(String(req.headers['accept-encoding'] || ''))) {
+          let gz = null;
+          try { gz = await gzipAsync(body); } catch { gz = null; }
+          if (gz) {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'Vary': 'Accept-Encoding' });
+            res.end(gz);
+            return;
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Vary': 'Accept-Encoding' });
+        res.end(body);
         return;
       }
 

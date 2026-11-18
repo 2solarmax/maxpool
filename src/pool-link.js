@@ -144,7 +144,11 @@ export function nextHopCount(headerValue) {
 /** Fetch a remote pool's status. Returns { ok, status, json, error, at }.
  *  Never throws; a network failure is a normal condition (remote down),
  *  surfaced via ok:false so the caller can bench the link account. */
-export async function fetchRemoteStatus(url, key, { fetchFn = fetch, timeoutMs = 10_000, now = Date.now } = {}) {
+/** Status-poll timeout. The poll is NOT the liveness signal (the 5 s probe is) and it
+ *  carries 0.5-1 MB from a busy cloud, so it gets a generous budget (was 10 s). */
+export const STATUS_TIMEOUT_MS = 20_000;
+
+export async function fetchRemoteStatus(url, key, { fetchFn = fetch, timeoutMs = STATUS_TIMEOUT_MS, now = Date.now } = {}) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
@@ -311,6 +315,14 @@ export class PoolLink {
     this.probeDown = false;
     this.probeFirstMissAt = null;
     this.probeDownAt = null;
+    this.lastProbeOkAt = null; // last time the probe got ANY answer (liveness authority)
+  }
+
+  /** True while the dead-link probe vouches for the link: it has run, is not down,
+   *  and answered within the last two probe intervals. */
+  probeSaysAlive() {
+    return !this.probeDown && this.lastProbeOkAt != null
+      && this._now() - this.lastProbeOkAt <= 2 * PROBE_INTERVAL_MS;
   }
 
   /** Seed identities persisted from a previous run (state.json). Used until the
@@ -342,6 +354,7 @@ export class PoolLink {
         this.lastOkAt = r.at;
         this.lastError = null;
         this.failStreak = 0;
+        this._softFailLogged = false;
         this.downSince = null;
         this.identities = remoteIdentities(r.json);
         this.summary = summarizeRemote(r.json);
@@ -353,6 +366,19 @@ export class PoolLink {
         // status for display; down → routing benches it and the UI names the cause.
         this.failStreak = (this.failStreak || 0) + 1;
         this.lastPollError = r.error;
+        // Liveness authority (2026-11-18 false-outage fix): the ~1 MB status body can
+        // be slow through a busy tunnel while the link is fine. A timeout / network
+        // error (no HTTP answer) never marks the link down while the 5 s probe says it
+        // is alive — keep the last good status (stale-but-usable). A rejected key or
+        // an HTTP error from the cloud is a real answer and still marks down below.
+        const softFail = r.status == null && r.error !== 'key rejected';
+        if (softFail && this.lastOkAt != null && !this.lastError && this.probeSaysAlive()) {
+          if (!this._softFailLogged) {
+            this._softFailLogged = true;
+            console.log(`[Maxpool] link "${this.name}" status poll slow/failed (${r.error}) — link alive per probe; keeping last status`);
+          }
+          return r;
+        }
         if (this.failStreak >= FAILS_BEFORE_DOWN || r.error === 'key rejected' || this.lastOkAt == null) {
           if (!this.lastError) this.downSince = r.at;
           this.lastError = r.error;
@@ -378,6 +404,7 @@ export class PoolLink {
       const now = this._now();
       let changed = false;
       if (alive) {
+        this.lastProbeOkAt = now;
         this.probeMisses = 0;
         this.probeFirstMissAt = null;
         if (this.probeDown) {
