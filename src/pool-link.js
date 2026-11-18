@@ -19,6 +19,8 @@
  *    so a downstream pool can refuse a loop (A→B→A) instead of hanging.
  */
 import { createHash } from 'node:crypto';
+import http from 'node:http';
+import https from 'node:https';
 
 export const HOP_HEADER = 'x-maxpool-hops';
 export const MAX_HOPS = 2;
@@ -166,6 +168,44 @@ export async function fetchRemoteStatus(url, key, { fetchFn = fetch, timeoutMs =
   }
 }
 
+/** Dead-link probe (2026-11-18): GET <url>/maxpool/ping on a FRESH connection
+ *  (agent:false — a pooled socket can be half-dead behind a silently-dropped tunnel)
+ *  with a hard timeout. ANY HTTP status proves the tunnel and the cloud's event loop
+ *  (an older cloud's 404/401 included); only a timeout / socket error is a miss.
+ *  Resolves { status, error } — status null = miss. Never throws. */
+export function probeLink(url, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let req = null;
+    const done = (status, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { req?.destroy(); } catch { /* already gone */ }
+      resolve({ status, error });
+    };
+    const timer = setTimeout(() => done(null, 'timeout'), timeoutMs);
+    timer.unref?.();
+    try {
+      const target = new URL(`${String(url).replace(/\/+$/, '')}/maxpool/ping`);
+      const mod = target.protocol === 'https:' ? https : http;
+      req = mod.request(target, { method: 'GET', agent: false, headers: { connection: 'close' } }, (res) => {
+        res.resume();
+        done(res.statusCode, null);
+      });
+      req.on('error', (err) => done(null, err?.code || err?.message || 'network error'));
+      req.end();
+    } catch (err) {
+      done(null, err?.message || 'bad url');
+    }
+  });
+}
+
+export const PROBE_TIMEOUT_MS = 3_000;
+export const PROBE_INTERVAL_MS = 5_000;
+export const PROBE_MISSES_BEFORE_DOWN = 3;
+export const PROBE_HITS_BEFORE_UP = 2;
+
 /** Aggregate a remote status into link health + capacity, for scoring.
  *  conservative: counts an account as spent when its weekly window is ≥95%,
  *  needs-login rows as unusable, and unknown quota as usable-but-unknown. */
@@ -247,6 +287,7 @@ export class PoolLink {
     this.keySecret = def.keySecret || null;
     this.intervalMs = Math.max(5_000, Number(def.intervalMs) || 30_000);
     this._fetchRemoteStatus = deps.fetchRemoteStatus || fetchRemoteStatus;
+    this._probeFn = deps.probeFn || probeLink;
     this._now = deps.now || Date.now;
     this._timer = null;
     this._polling = false;
@@ -258,6 +299,17 @@ export class PoolLink {
     this.downSince = null;     // when lastError was first set (the outage start)
     this.identities = new Map();
     this.summary = null;
+    // Dead-link probe state (see probe()). probeDown takes the link's mirrors out of
+    // routing exactly like lastError, but within ~15 s instead of 40-70 s.
+    this._probeTimer = null;
+    this._probing = null;      // the in-flight probe promise (never stacked)
+    this._probeOnChange = null;
+    this._downListeners = new Set();
+    this.probeMisses = 0;
+    this.probeHits = 0;
+    this.probeDown = false;
+    this.probeFirstMissAt = null;
+    this.probeDownAt = null;
   }
 
   /** Seed identities persisted from a previous run (state.json). Used until the
@@ -312,6 +364,78 @@ export class PoolLink {
     }
   }
 
+  /** One probe. PROBE_MISSES_BEFORE_DOWN misses in a row → probeDown (onChange, then
+   *  the onDown listeners, once); while down, PROBE_HITS_BEFORE_UP answers in a row →
+   *  up (onChange once). A single answer resets the miss streak. Never stacks: a call
+   *  while a probe is in flight joins it. Resolves true when the cloud answered. */
+  probe() {
+    if (this._probing) return this._probing;
+    this._probing = (async () => {
+      let r;
+      try { r = await this._probeFn(this.url, { timeoutMs: PROBE_TIMEOUT_MS }); } catch (err) { r = { status: null, error: err?.message || 'probe failed' }; }
+      const alive = Number.isFinite(r?.status);
+      const now = this._now();
+      let changed = false;
+      if (alive) {
+        this.probeMisses = 0;
+        this.probeFirstMissAt = null;
+        if (this.probeDown) {
+          this.probeHits += 1;
+          if (this.probeHits >= PROBE_HITS_BEFORE_UP) {
+            const downS = this.probeDownAt != null ? Math.round((now - this.probeDownAt) / 1000) : 0;
+            this.probeDown = false;
+            this.probeDownAt = null;
+            this.probeHits = 0;
+            changed = true;
+            console.log(`[Maxpool] link "${this.name}" back UP after ${downS}s`);
+          }
+        }
+      } else {
+        this.probeHits = 0;
+        if (this.probeMisses === 0) this.probeFirstMissAt = now;
+        this.probeMisses += 1;
+        if (!this.probeDown && this.probeMisses >= PROBE_MISSES_BEFORE_DOWN) {
+          this.probeDown = true;
+          this.probeDownAt = now;
+          changed = true;
+          console.log(`[Maxpool] link "${this.name}" DOWN — no answer to ${this.probeMisses} probes (first miss ${new Date(this.probeFirstMissAt).toISOString()}, declared ${new Date(now).toISOString()})`);
+        }
+      }
+      if (changed) {
+        // Re-sync routing FIRST (mirrors leave), then cut in-flight waits — so a cut
+        // request's failover already sees the link's rows out of routing.
+        try { this._probeOnChange?.(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" probe onChange failed: ${err?.message || err}`); }
+        if (this.probeDown) {
+          for (const fn of this._downListeners) {
+            try { fn(this); } catch (err) { console.error(`[Maxpool] link "${this.name}" down listener failed: ${err?.message || err}`); }
+          }
+        }
+      }
+      return alive;
+    })().finally(() => { this._probing = null; });
+    return this._probing;
+  }
+
+  /** Fire one probe now (a request just hit a link fault). Non-blocking; joins an
+   *  in-flight probe instead of stacking. */
+  probeNow() {
+    this.probe().catch(() => {});
+  }
+
+  /** Register a callback run once per DOWN transition (the server cuts in-flight
+   *  link waits). Returns an unsubscribe function. */
+  onDown(fn) {
+    this._downListeners.add(fn);
+    return () => this._downListeners.delete(fn);
+  }
+
+  startProbe(onChange, intervalMs = PROBE_INTERVAL_MS) {
+    if (this._probeTimer) { clearInterval(this._probeTimer); this._probeTimer = null; }
+    this._probeOnChange = onChange || null;
+    this._probeTimer = setInterval(() => this.probeNow(), Math.max(1, Number(intervalMs) || PROBE_INTERVAL_MS));
+    this._probeTimer.unref?.();
+  }
+
   start(onPoll) {
     this.stop();
     const tick = async () => {
@@ -325,5 +449,6 @@ export class PoolLink {
 
   stop() {
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this._probeTimer) { clearInterval(this._probeTimer); this._probeTimer = null; }
   }
 }

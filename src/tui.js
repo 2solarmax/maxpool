@@ -2991,7 +2991,7 @@ export class TUI {
     // A mirror row whose link is down/stale is benched by syncRemoteMirrors with
     // enabled=false — show it as cloud-unreachable, never as "disabled" (which reads
     // as "I switched this off"). _cloud/_cloudOk were never set; key on a.remote.
-    const linkDown = a.remote && (a.remote.link?.lastError || a.remote.link?.lastOkAt == null);
+    const linkDown = a.remote && (a.remote.link?.lastError || a.remote.link?.probeDown || a.remote.link?.lastOkAt == null);
     let effectiveStatus = a.remote && (linkDown || a.enabled === false)
       ? (linkDown ? 'cloud-down' : 'disabled')
       : (a.poolBenchedBy ? 'pool-benched' : (a.enabled === false ? 'disabled' : a.status));

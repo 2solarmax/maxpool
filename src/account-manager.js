@@ -3426,12 +3426,14 @@ export class AccountManager {
    *  Provider (GLM/Kimi) mirrors are NEVER cooled by a Claude throttle — the cloud
    *  only refuses 'throttled' for account.type !== 'provider' (see _matchesRequest),
    *  so those rows can still serve, and cooling them would black out GLM/'all'
-   *  routing for up to 30 s. */
-  markLinkMirrorsCooldown(fromAccount, ms) {
+   *  routing for up to 30 s.
+   *  includeProviders: a LINK fault (dead tunnel) kills the cloud's z.ai/Kimi egress
+   *  path too, so that caller cools every mirror row of the link. */
+  markLinkMirrorsCooldown(fromAccount, ms, { includeProviders = false } = {}) {
     const linkName = fromAccount?.remote?.linkName;
     if (!linkName) return [];
     const until = Date.now() + Math.max(0, Number(ms) || 0);
-    const cooled = this.accounts.filter(a => a.remote && a.remote.linkName === linkName && a.type !== 'provider');
+    const cooled = this.accounts.filter(a => a.remote && a.remote.linkName === linkName && (includeProviders || a.type !== 'provider'));
     for (const a of cooled) a.cooldownUntil = Math.max(a.cooldownUntil || 0, until);
     return cooled;
   }
@@ -6636,7 +6638,13 @@ export class AccountManager {
     this.poolLinks = Array.isArray(links) ? links : [];
     this._remoteIdentities = new Map();
     const recompute = () => this.applyPoolLinks();
-    for (const l of this.poolLinks) l.start(() => { recompute(); onPoll?.(l); });
+    for (const l of this.poolLinks) {
+      const onChange = () => { recompute(); onPoll?.(l); };
+      l.start(onChange);
+      // Dead-link probe (2026-11-18): a 5 s fresh-connection ping; its DOWN/UP
+      // transitions re-sync the mirrors through the same callback. stop() clears both.
+      l.startProbe?.(onChange);
+    }
     this.applyPoolLinks();
   }
 
@@ -6734,7 +6742,8 @@ export class AccountManager {
    *  mirror row is forwarded to its pool PINNED to that remote account. */
   syncRemoteMirrors(link) {
     if (!link) return;
-    const rows = link.lastError || link.lastOkAt == null ? [] : (link.status?.accounts || []);
+    // probeDown (the 5 s dead-link probe) benches the link exactly like a failed poll.
+    const rows = link.lastError || link.probeDown || link.lastOkAt == null ? [] : (link.status?.accounts || []);
     const seen = new Set();
     for (const ra of rows) {
       if (ra.remote) continue;                 // never mirror a mirror (no chained hops)
