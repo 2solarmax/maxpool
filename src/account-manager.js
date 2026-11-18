@@ -5724,17 +5724,28 @@ export class AccountManager {
    *  present, else the local row). Rows with no resolvable identity stay separate and
    *  are marked `unresolved` (never merged by name alone). */
   capacityRows(order, { hideDisabled = false } = {}) {
-    const rows = [];
-    const seen = new Set();
+    // Pass 1: group by identity; the PRIMARY (live authority) anchors the row.
+    const groups = new Map();   // primary.index -> { primary, group, id }
+    const byMember = new Map(); // member.index -> primary.index
     for (const i of order) {
       const a = this.accounts[i];
-      if (!a || seen.has(a.index)) continue;
+      if (!a || byMember.has(a.index)) continue;
       const id = this.capacityIdentity(a);
       const group = id ? this.capacityGroupOf(a) : [a];
-      for (const x of group) seen.add(x.index);
-      const visible = group.filter(x => !(hideDisabled && x.enabled === false));
-      if (!visible.length) continue;
-      const primary = visible.find(x => x.remote && x.enabled !== false) || visible.find(x => !x.remote) || visible[0];
+      const visible = group.filter(x => !this.hiddenOnMainScreen(x, hideDisabled));
+      const primary = visible.length
+        ? (visible.find(x => x.remote && x.enabled !== false) || visible.find(x => !x.remote) || visible[0])
+        : null;
+      for (const x of group) byMember.set(x.index, primary ? primary.index : -1);
+      if (primary) groups.set(primary.index, { primary, group, id });
+    }
+    // Pass 2: emit each identity at its PRIMARY's position in the display order — the
+    // row the main screen shows — never at a hidden (benched) local copy's position.
+    const rows = [];
+    for (const i of order) {
+      const g = groups.get(i);
+      if (!g) continue;
+      const { primary, group, id } = g;
       const localRow = group.find(x => !x.remote);
       const withPrice = [primary, ...group].find(x => x && this.monthlyPriceFor(x) != null) || primary;
       const withPlan = [primary, ...group].find(x => x && (x.plan || x.remotePlan)) || null;
@@ -5747,6 +5758,13 @@ export class AccountManager {
       });
     }
     return rows;
+  }
+
+  /** The ONE visibility predicate shared by the main account table and the Capacity
+   *  page: with "hide disabled" on, disabled rows and local copies benched by the
+   *  duplicate guard (they live in the team pool) are hidden. */
+  hiddenOnMainScreen(a, hideDisabled) {
+    return Boolean(hideDisabled && a && (a.enabled === false || a.poolBenchedBy));
   }
 
   accrueCapacity(accountIndex, { input = 0, output = 0, cacheRead = 0, cacheCreation = 0, model = null } = {}) {

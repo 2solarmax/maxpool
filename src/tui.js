@@ -2779,11 +2779,11 @@ export class TUI {
       // SAME order via _selectableIndexes → _displayOrder.
       let hidden = 0;
       for (const i of this._displayOrder()) {
-        if (this.hideDisabled && this.am.accounts[i]?.enabled === false) { hidden++; continue; }
         // Same key also hides local copies guarded by the duplicate guard — they are
         // effectively off (owner 2026-10-29: "should it hide the local ones that are
         // in the cloud... they're effectively disabled as well"). No separate key.
-        if (this.hideDisabled && this.am.accounts[i]?.poolBenchedBy) { hidden++; continue; }
+        // One predicate shared with the Capacity page so the two row orders cannot drift.
+        if (this.am.hiddenOnMainScreen(this.am.accounts[i], this.hideDisabled)) { hidden++; continue; }
         lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession));
       }
       if (hidden > 0) {
