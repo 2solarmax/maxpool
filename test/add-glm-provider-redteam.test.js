@@ -79,6 +79,26 @@ test('F1 cloud: a failed disk write (507) rolls the new row back and keeps the o
   }, { providers: DISK, seed: SEED });
 });
 
+test('F1 cloud: a 507 whose rollback meets an in-flight request disables the row, and the retry replaces it', async () => {
+  await withCloud(async ({ am, post, dir }) => {
+    await chmod(dir, 0o500);
+    const realRemove = am.removeAccount.bind(am);
+    am.removeAccount = () => false;   // the new row is serving a request right now
+    const r = await post({ name: 'glm c', type: 'provider', provider: 'zai', apiKey: 'key-c.333' });
+    assert.equal(r.status, 507);
+    const left = am.accounts.find(a => a.name === 'glm c');
+    assert.ok(left && left.enabled === false && left.notPersisted === true, 'the unsaved row is out of routing and marked');
+    const busy = await post({ name: 'glm c', type: 'provider', provider: 'zai', apiKey: 'key-c.333' });
+    assert.equal(busy.status, 503, 'still busy: a retry is asked for, never a false exists');
+    am.removeAccount = realRemove;
+    await chmod(dir, 0o700);
+    const retry = await post({ name: 'glm c', type: 'provider', provider: 'zai', apiKey: 'key-c.333' });
+    assert.equal((await retry.json()).result, 'added', 'the retry replaces the unsaved row');
+    const row = am.accounts.find(a => a.name === 'glm c');
+    assert.ok(row && !row.notPersisted && row.enabled !== false, 'the replacement is a live row');
+  }, { providers: DISK, seed: SEED });
+});
+
 test('F1 laptop: adding one provider keeps every other provider and its learned state', async () => {
   const home = await mkdtemp(join(tmpdir(), 'mp-addglm-rt2-'));
   await mkdir(join(home, '.config'), { recursive: true });

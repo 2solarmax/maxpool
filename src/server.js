@@ -511,7 +511,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             res.end(JSON.stringify({ ok: false, error: 'bad_request', message: 'Expected {account: {type:"provider", provider:"zai"|"kimi", apiKey, name, secretName?}}' }));
             return;
           }
-          const sameName = accountManager.accounts.find(x => x.name === acct.name);
+          let sameName = accountManager.accounts.find(x => x.name === acct.name);
+          // A row left over from a failed disk write (its rollback met an in-flight request)
+          // never counts as "exists": drop it now, or ask for a retry while it is still busy.
+          if (sameName?.notPersisted) {
+            if (accountManager.removeAccount(sameName.index) === false) {
+              res.writeHead(503, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'busy', message: 'The pool is still finishing a request on the unsaved copy — try again in a moment' }));
+              return;
+            }
+            sameName = undefined;
+          }
           if (sameName && !(sameName.type === 'provider' && sameName.credential === acct.apiKey)) {
             // The name is taken by a DIFFERENT key: refuse, never report it as added. A
             // pasted key defaults to "glm primary", so a second key lands here.
@@ -550,8 +560,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             // Not on disk means not added: roll the in-memory row back so a retry adds it
             // for real instead of answering "exists".
             const idx = accountManager.accounts.findIndex(x => x.name === name);
-            if (idx >= 0) accountManager.removeAccount(idx);
-            console.error(`[Maxpool] Remote provider add NOT persisted for "${acct.name}" (rolled back): ${err?.message || err}`);
+            let rolledBack = idx < 0;
+            if (idx >= 0) {
+              rolledBack = accountManager.removeAccount(idx) !== false;
+              if (!rolledBack) {
+                // A request already took the new row: it cannot be removed mid-flight. Take
+                // it out of routing and mark it, so the next add replaces it.
+                const row = accountManager.accounts[idx];
+                row.enabled = false;
+                row.notPersisted = true;
+              }
+            }
+            console.error(`[Maxpool] Remote provider add NOT persisted for "${acct.name}" (${rolledBack ? 'rolled back' : 'in use — disabled, replaced on the next add'}): ${err?.message || err}`);
             res.writeHead(507, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'not_persisted', message: 'The pool could not save it to disk. Nothing was added; try again.' }));
             return;
