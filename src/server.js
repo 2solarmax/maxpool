@@ -393,6 +393,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (draining) {
         try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
       }
+      // Dead-link probe target (2026-11-18): a linked pool pings this every 5 s on a
+      // fresh connection to learn the tunnel + event loop are alive. Keyless and
+      // data-free on purpose — it must answer before auth, and must never be
+      // mistaken for a request to proxy upstream.
+      if (req.method === 'GET' && req.url === '/maxpool/ping') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end('{"ok":true}');
+        return;
+      }
+
       // Loop guard (owner D8): a request forwarded by another pool carries a hop
       // count. Refuse beyond MAX_HOPS with a clear error instead of cycling pools.
       const inboundHops = headerValue(req.headers, HOP_HEADER);
@@ -1211,6 +1221,11 @@ async function forwardRequest(
       }
       linkHeaders['x-maxpool-deadline-ms'] = String(linkHop.headerMs);
     }
+    // Dead-link cut (2026-11-18): this hop is registered on its link while it runs, so
+    // the probe declaring the link DOWN can abort it before any real byte reached the
+    // client (cutLinkInflight). Removed in the finally below.
+    const hopLink = account.remote?.link || null;
+    let linkEntry = null;
     try {
       // P4a: a blackholed link must not hang the request (and hold a lease) for
       // minutes — bound time-to-headers like the direct path's TTFB guard. GLM
@@ -1224,6 +1239,15 @@ async function forwardRequest(
       // big-prompt first-byte timeouts measured were all on the direct path.
       const linkTtfbMs = linkHop ? linkHop.linkWaitMs : Math.max(15_000, Number(process.env.MAXPOOL_LINK_TTFB_MS) || UPSTREAM_TTFB_MS);
       const linkCtl = new AbortController();
+      if (hopLink) {
+        linkEntry = { ctl: linkCtl, res, requestInfo, linkDown: false };
+        if (!hopLink._inflight) hopLink._inflight = new Set();
+        if (!hopLink._cutWired && typeof hopLink.onDown === 'function') {
+          hopLink.onDown(() => cutLinkInflight(hopLink));
+          hopLink._cutWired = true;
+        }
+        hopLink._inflight.add(linkEntry);
+      }
       const linkTtfb = setTimeout(() => linkCtl.abort(), linkTtfbMs);
       // P2: the link path had NO pre-headers keep-alive — a streaming client sat on a
       // silent socket for the whole link wait (up to the 120s floor). Arm the same
@@ -1476,7 +1500,7 @@ async function forwardRequest(
       // B12: the wait was cut by the CLIENT'S deadline (not the per-hop cap, not a dead link): neither an
       // account fault nor a link fault — release neutral, and answer a retryable 504 (nothing left to move on).
       // (A no-headers AbortError that is not a client leaving can only be this hop's timer.)
-      if (linkHop?.deadlineBound && err?.name === 'AbortError' && !linkClientGone && linkStatus == null && !clientHasRealBytes(res, requestInfo)) {
+      if (linkHop?.deadlineBound && err?.name === 'AbortError' && !linkClientGone && !linkEntry?.linkDown && linkStatus == null && !clientHasRealBytes(res, requestInfo)) {
         finishLink({ neutral: true, error: 'deadline', kind: 'deadline' });
         detachLinkClose();
         ctx.status = 504;
@@ -1489,6 +1513,7 @@ async function forwardRequest(
       // only a TTFB abort, a mid-stream cancel or an unknown link error lands here. It
       // must not release every other conversation held on this row.
       const linkKind = linkClientGone ? 'client_cancelled'
+        : linkEntry?.linkDown ? 'link_down'
         : err?.linkBody ? 'link_idle'
         : err?.name === 'AbortError' ? 'link_ttfb'
           : 'pool_link_unreachable';
@@ -1506,7 +1531,18 @@ async function forwardRequest(
       // A string code (UND_ERR_SOCKET, ECONNRESET) names the fault; DOMException
       // codes are numbers (AbortError = 20), so fall back to the cause, then the name.
       const errCode = (typeof err?.code === 'string' && err.code) || err?.cause?.code || err?.name || 'unknown';
-      const linkDetail = `${linkStatus == null ? 'no answer' : `HTTP ${linkStatus}`} after ${heldS}s (${err?.message || err}) [${errCode}, ${streamTag}]`;
+      const linkDetail = linkKind === 'link_down'
+        ? `link declared down by probe (${linkStatus == null ? 'no answer' : `HTTP ${linkStatus}`} after ${heldS}s) [${streamTag}]`
+        : `${linkStatus == null ? 'no answer' : `HTTP ${linkStatus}`} after ${heldS}s (${err?.message || err}) [${errCode}, ${streamTag}]`;
+      // A link-transport fault says the TUNNEL may be dead, and every mirror row of
+      // this link rides it (provider rows too — z.ai egress goes through the cloud):
+      // cool them all for 30 s and keep the retry off them, then probe at once so a
+      // truly dead link is declared down in seconds instead of on the next tick.
+      if (!linkClientGone && LINK_TRANSPORT_FAULTS.has(linkKind) && !clientHasRealBytes(res, requestInfo)) {
+        const cooled = accountManager.markLinkMirrorsCooldown(account, LINK_FAULT_COOLDOWN_MS, { includeProviders: true });
+        for (const a of cooled) excludedIndexes.add(a.index);
+        account.remote?.link?.probeNow?.();
+      }
       if (!clientHasRealBytes(res, requestInfo)) {
         if (retryCount + 1 < maxAttempts && hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
           logFailedAttempt(account.name, linkKind, linkDetail, 'moved');
@@ -1528,6 +1564,7 @@ async function forwardRequest(
       sendErrorResponse(res, requestInfo, 502, { type: 'error', error: { type: 'api_error', message: `Team pool "${account.name}" unreachable: ${err?.message || err}` } });
     } finally {
       detachLinkClose();
+      if (linkEntry) hopLink?._inflight?.delete(linkEntry);
     }
     return;
   }
@@ -3291,7 +3328,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { nextStickyBusyWaitMs, readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, parseSSEEvent, extractUsageFromBody, threadOwners: () => threadOwners, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { cutLinkInflight, nextStickyBusyWaitMs, readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, parseSSEEvent, extractUsageFromBody, threadOwners: () => threadOwners, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -3999,6 +4036,25 @@ function sendErrorBody(res, requestInfo, status, body, headers) {
  *  and failover stay safe until streamResponse stops the keep-alive. */
 function clientHasRealBytes(res, requestInfo) {
   return res.headersSent && !requestInfo.queueHeartbeatActive;
+}
+
+// Link faults that say the Mac↔cloud tunnel itself may be dead (not the cloud row).
+const LINK_TRANSPORT_FAULTS = new Set(['link_ttfb', 'link_idle', 'pool_link_unreachable', 'link_down']);
+const LINK_FAULT_COOLDOWN_MS = 30_000;
+
+/** The probe declared `link` DOWN: abort every hop still waiting on it whose client
+ *  has no real byte yet (marked linkDown so the catch books it 'link_down' and fails
+ *  over). A hop that already relayed real bytes is left alone — re-sending would
+ *  corrupt the client's reply. Returns how many were cut. */
+function cutLinkInflight(link) {
+  let cut = 0;
+  for (const entry of link?._inflight || []) {
+    if (entry.linkDown || clientHasRealBytes(entry.res, entry.requestInfo)) continue;
+    entry.linkDown = true;
+    cut++;
+    try { entry.ctl.abort(); } catch { /* already aborted */ }
+  }
+  return cut;
 }
 
 async function queueAndRetry(...args) {
