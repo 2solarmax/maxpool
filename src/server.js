@@ -517,7 +517,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           if (sameName?.notPersisted) {
             if (accountManager.removeAccount(sameName.index) === false) {
               res.writeHead(503, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: false, error: 'busy', message: 'The pool is still finishing a request on the unsaved copy — try again in a moment' }));
+              res.end(JSON.stringify({ ok: false, error: 'busy', message: 'That key is still finishing a request — try again in a moment' }));
               return;
             }
             sameName = undefined;
@@ -573,7 +573,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             }
             console.error(`[Maxpool] Remote provider add NOT persisted for "${acct.name}" (${rolledBack ? 'rolled back' : 'in use — disabled, replaced on the next add'}): ${err?.message || err}`);
             res.writeHead(507, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'not_persisted', message: 'The pool could not save it to disk. Nothing was added; try again.' }));
+            res.end(JSON.stringify({ ok: false, error: 'not_persisted', message: "Couldn't save the key to disk. Nothing was added — try again" }));
             return;
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
