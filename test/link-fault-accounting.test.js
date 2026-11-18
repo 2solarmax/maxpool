@@ -81,8 +81,12 @@ test('a link connection drop: cloud row not failed, counted as a link drop, line
         });
         status = r.status; await r.text();
       });
-      assert.equal(status, 200, 'moved off the link to the local route and answered');
-      assert.deepEqual(remote.hits, ['reports@gomokka.com'], 'never onto a sibling cloud row');
+      assert.equal(status, 200, 'the request was answered');
+      // Probe-first (2026-11-18): the fixture's ping answers, so the tunnel reads as
+      // alive and the retry MAY land on the sibling cloud row (it succeeds there) — the
+      // bench-everything path only applies when the ping gets no answer. What this test
+      // pins is the ACCOUNTING below: the faulted row is a link drop, not a failure.
+      assert.deepEqual(remote.hits, ['reports@gomokka.com', 'personal']);
       const a = attempts(lines);
       assert.equal(a.length, 1, a.join('\n'));
       assert.match(a[0], /\(pool_link_unreachable\) on "reports@gomokka\.com ☁"/);

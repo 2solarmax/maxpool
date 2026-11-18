@@ -24,6 +24,7 @@ export function remotePool(plan, { accounts = null } = {}) {
       ] }));
       return;
     }
+    if (req.url === '/maxpool/ping') { res.writeHead(200); res.end(); return; }   // the 5s link probe — not a hop, not a hit
     if (!req.url.startsWith('/v1/messages')) { res.writeHead(404); res.end('{}'); return; }
     req.resume();
     const pin = req.headers['x-maxpool-pin-account'] || '?';
