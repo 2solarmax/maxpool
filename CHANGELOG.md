@@ -5,11 +5,23 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.24.105] - 2026-11-18
+## [1.24.107] - 2026-11-18
+
+### Fixed
+
+- A probe DOWN no longer benches mirrors for 30s; UP lifts link-fault benches
+
+## [1.24.106] - 2026-11-18
 
 ### Added
 
 - The provider add flow asks cloud-or-laptop and can land the key on the team pool
+
+### Fixed
+
+- The GLM/Kimi add flow imports resolve again ('./config.js', not '../config.js')
+
+## [1.24.105] - 2026-11-18
 
 ### Changed
 
@@ -21,10 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Link probe: check the tunnel before benching (probe-first), veto DOWN while replies flow, never write after a cut; fake clouds answer pings outside the hop count
 - Fake clouds answer the 5s link probe; accounting pin moves to probe-first semantics
 - Restore main's original link-fault expectations — probe-first preserves the sibling move on a live tunnel
-
-### Fixed
-
-- The GLM/Kimi add flow imports resolve again ('./config.js', not '../config.js')
 
 ## [1.24.104] - 2026-11-18
 
