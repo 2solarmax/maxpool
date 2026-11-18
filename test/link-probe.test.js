@@ -234,3 +234,20 @@ test('TUI: a probe-down link reads "offline" on its cloud rows, never "disabled"
   assert.match(line, /⟐ offline/);
   assert.doesNotMatch(line, /disabled/);
 });
+
+// Red team F3 (2026-11-18): a ping that misses while live replies keep flowing on the same
+// link must NOT declare the tunnel dead (an event-loop stall or a new-connection limit can
+// starve the ping while existing streams are healthy).
+test('F3: 3 missed probes do NOT declare DOWN while an in-flight hop on the link received bytes recently', async () => {
+  const { PoolLink } = await import('../src/pool-link.js');
+  let changes = 0;
+  const link = new PoolLink({ name: 'team', url: 'http://127.0.0.1:9' }, { probeFn: async () => ({ status: null, error: 'timeout' }) });
+  link._probeOnChange = () => { changes++; };
+  link._inflight = new Set([{ lastByteAt: Date.now() }]);
+  for (let i = 0; i < 3; i++) await link.probe();
+  assert.equal(link.probeDown, false, 'live bytes veto the down verdict');
+  assert.equal(changes, 0);
+  link._inflight = new Set([{ lastByteAt: Date.now() - 60_000 }]);   // stale bytes do not veto
+  await link.probe();
+  assert.equal(link.probeDown, true, 'once bytes stop, the next miss declares down');
+});

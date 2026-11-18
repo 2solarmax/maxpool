@@ -1406,6 +1406,11 @@ async function forwardRequest(
       // once the link's own headers are written, a later stall can only SURFACE — the
       // idle guard below bounds the wait instead of undici's ~300s bodyTimeout. Failover
       // stays possible while only OUR keep-alive pings have been sent (no real chunk yet).
+      // Red team F4: a response whose headers arrived just before the probe cut must not
+      // commit them — throw so the cut request moves with nothing written.
+      if (linkEntry?.linkDown && !clientHasRealBytes(res, requestInfo)) {
+        throw Object.assign(new Error('link declared down by probe'), { name: 'AbortError' });
+      }
       if (!res.headersSent) res.writeHead(upRes.status, outHeaders);
       // r4: headers are committed but NO real byte has been written — keep the keep-alive
       // heartbeating through the link body wait and any failover hop (grace arm refuses
@@ -1452,6 +1457,11 @@ async function forwardRequest(
             const { done, value } = r;
             if (done) break;
             if (res.destroyed) { try { await reader.cancel(); } catch { } break; }
+            // Red team F4: a read that resolved just before the probe cut must not write —
+            // the cut promised the request zero client bytes so it can move cleanly.
+            if (linkEntry?.linkDown && !clientHasRealBytes(res, requestInfo)) {
+              throw Object.assign(new Error('link declared down by probe'), { name: 'AbortError' });
+            }
             // First REAL byte stops the keep-alive (review r2 D — UNCONDITIONAL, r4 M1:
             // a conditional clear let pings land inside the real stream when the grace
             // timer had already fired).
@@ -1464,6 +1474,7 @@ async function forwardRequest(
               tapLinkUsage(value, requestInfo);
             }
             if (refusalTap && refusalTapBytes < 4096) { refusalTap.push(Buffer.from(value)); refusalTapBytes += value.length; }
+            if (linkEntry) linkEntry.lastByteAt = Date.now();   // red team F3: proof the tunnel carries bytes
             res.write(Buffer.from(value));
           }
         } finally { try { await reader.cancel(); } catch { /* already done */ } }
@@ -1539,13 +1550,19 @@ async function forwardRequest(
       // cool them all for 30 s and keep the retry off them, then probe at once so a
       // truly dead link is declared down in seconds instead of on the next tick.
       if (!linkClientGone && LINK_TRANSPORT_FAULTS.has(linkKind) && !clientHasRealBytes(res, requestInfo)) {
-        const cooled = accountManager.markLinkMirrorsCooldown(account, LINK_FAULT_COOLDOWN_MS, { includeProviders: true });
-        for (const a of cooled) excludedIndexes.add(a.index);
-        // Probe-gated: if the immediate probe answers, the tunnel is alive and this was a
-        // one-request blip — lift the link-wide bench at once (THIS request still moves).
-        const probed = account.remote?.link?.probeNow?.();
-        if (probed && typeof probed.then === 'function') {
-          probed.then(alive => { if (alive) accountManager.liftLinkMirrorsCooldown?.(account, cooled.until); }).catch(() => {});
+        // PROBE FIRST (2026-11-18): ask the tunnel itself before benching anything. An
+        // answer (any HTTP status, ≤3 s, usually ms) means the tunnel is alive and this was
+        // a one-request blip — retry normally, sibling cloud rows included (the old path;
+        // a pool with no local route still recovers). No answer → treat the tunnel as dead:
+        // bench EVERY mirror of the link (providers too — z.ai egress rides it) for 30 s and
+        // keep the retry off them. A probe-declared down (link_down) skips the wait.
+        const link = account.remote?.link;
+        let tunnelAlive = true;
+        if (linkKind === 'link_down' || link?.probeDown) tunnelAlive = false;
+        else if (typeof link?.probeNow === 'function') tunnelAlive = await link.probeNow();
+        if (!tunnelAlive) {
+          const cooled = accountManager.markLinkMirrorsCooldown(account, LINK_FAULT_COOLDOWN_MS, { includeProviders: true });
+          for (const a of cooled) excludedIndexes.add(a.index);
         }
       }
       if (!clientHasRealBytes(res, requestInfo)) {

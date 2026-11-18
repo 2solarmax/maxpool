@@ -266,6 +266,7 @@ test('D (link): a held link stream keeps its keep-alive until the first real chu
   let n = 0;
   const remote = http.createServer((req, res) => {
     if (req.url === '/maxpool/status') return json(res, 200, STATUS);
+    if (req.url === '/maxpool/ping') { res.writeHead(200); return res.end(); }   // the 5s link probe is not a hop
     req.resume();
     n += 1;
     if (n <= 2) return json(res, 503, {}, { 'retry-after': '1' });
@@ -340,6 +341,7 @@ test('F: link hops detach their close listener — a 3-hop link chain leaves non
   let n = 0;
   const remote = http.createServer((req, res) => {
     if (req.url === '/maxpool/status') return json(res, 200, STATUS);
+    if (req.url === '/maxpool/ping') { res.writeHead(200); return res.end(); }   // the 5s link probe is not a hop
     req.resume();
     n += 1;
     if (n <= 2) { req.socket.destroy(); return; }
@@ -494,6 +496,7 @@ test('R3-3: a link that answers headers then goes silent is cut at the link idle
   let n = 0;
   const remote = http.createServer((req, res) => {
     if (req.url === '/maxpool/status') return json(res, 200, STATUS);
+    if (req.url === '/maxpool/ping') { res.writeHead(200); return res.end(); }   // the 5s link probe is not a hop
     req.resume();
     n += 1;
     if (n === 1) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders(); return; }   // headers, then silence
@@ -577,6 +580,7 @@ test('M1: link silent past the grace window, then a real chunk → zero pings af
     { name: 'reports@gomokka.com', type: 'oauth', accountUuid: 'U1', enabled: true, status: 'active', quota: { unified5h: 0.1, unified7d: 0.2 } }] };
   const remote = http.createServer((req, res) => {
     if (req.url === '/maxpool/status') return json(res, 200, STATUS);
+    if (req.url === '/maxpool/ping') { res.writeHead(200); return res.end(); }   // the 5s link probe is not a hop
     req.resume();
     res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders();
     const timers = [];

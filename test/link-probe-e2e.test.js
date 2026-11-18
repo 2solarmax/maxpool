@@ -102,6 +102,9 @@ test('a cloud reply that already streamed real bytes is NOT cut by the probe', a
       const reader = res.body.getReader();
       const first = await reader.read();
       assert.match(Buffer.from(first.value).toString(), /msg_cloud/, 'real bytes reached the client');
+      // Age the hop's byte stamp so the F3 live-bytes veto does not apply: this test is
+      // about the CUT skipping a hop that already sent real bytes once DOWN is declared.
+      for (const e of r.link._inflight || []) e.lastByteAt = 0;
       for (let i = 0; i < 3; i++) await r.link.probe();
       assert.equal(r.link.probeDown, true);
       let rest = '';
@@ -129,15 +132,13 @@ async function faultCase(onMsg, { probeFn = DEAD, expectLifted = false } = {}) {
     const lines = await captureLog(async () => { const res = await post(r.port); out = { status: res.status, text: await res.text() }; });
     assert.equal(out.status, 200, out.text.slice(0, 200));
     assert.match(out.text, /msg_local/);
-    assert.equal(r.hits.length, 1, `one link hop, then off the link: ${r.hits.join(', ')}`);
+    if (!expectLifted) assert.equal(r.hits.length, 1, `one link hop, then off the link: ${r.hits.join(', ')}`);
     assert.ok(probes >= 1, 'an immediate probe was fired');
-    await r.link._probing;                 // let the immediate probe settle
-    await new Promise(res => setImmediate(res));
     const now = Date.now();
     if (expectLifted) {
-      // Probe-gated (2026-11-18): the tunnel answered → the link-wide bench is lifted.
+      // Probe FIRST (2026-11-18): the tunnel answered → nothing is benched link-wide.
       for (const m of r.am.accounts.filter(a => a.remote)) {
-        assert.ok(!(m.cooldownUntil > now), `${m.name}: an answering probe lifts the link-fault bench`);
+        assert.ok(!(m.cooldownUntil > now + 20_000), `${m.name}: an answering probe means no link-wide bench`);
       }
     } else {
       for (const m of r.am.accounts.filter(a => a.remote)) {
@@ -153,23 +154,9 @@ test('request-level link fault (connection reset): every mirror on the link cool
   await faultCase((req) => { req.socket.destroy(); });
 });
 
-test('a one-request blip on a LIVE tunnel: the immediate probe answers, so the link-wide bench is lifted at once', async () => {
+test('a one-request blip on a LIVE tunnel: the immediate probe answers, so nothing is benched link-wide', async () => {
   await faultCase((req) => { req.socket.destroy(); }, { probeFn: ALIVE, expectLifted: true });
 });
-
-test('liftLinkMirrorsCooldown lifts only rows carrying THIS fault\'s exact stamp', () => {
-  const am = new AccountManager([
-    { name: 'c ☁', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
-    { name: 'd ☁', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
-  ], 0.9);
-  for (const a of am.accounts) a.remote = { linkName: 'team' };
-  const cooled = am.markLinkMirrorsCooldown(am.accounts[0], 30_000, { includeProviders: true });
-  am.accounts[1].cooldownUntil = cooled.until + 60_000;   // a longer, unrelated cooldown
-  am.liftLinkMirrorsCooldown(am.accounts[0], cooled.until);
-  assert.equal(am.accounts[0].cooldownUntil, null, 'this fault\'s bench lifted');
-  assert.equal(am.accounts[1].cooldownUntil, cooled.until + 60_000, 'a different cooldown is left alone');
-});
-
 test('request-level link fault (no-headers timeout): same — and the throttle cooldown default still spares providers', { timeout: 60_000 }, async () => {
   const saved = process.env.MAXPOOL_LINK_TTFB_MS;
   process.env.MAXPOOL_LINK_TTFB_MS = '15000';   // the floor; the 120 s default stays untouched

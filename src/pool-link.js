@@ -394,7 +394,17 @@ export class PoolLink {
         this.probeHits = 0;
         if (this.probeMisses === 0) this.probeFirstMissAt = now;
         this.probeMisses += 1;
-        if (!this.probeDown && this.probeMisses >= PROBE_MISSES_BEFORE_DOWN) {
+        // Red team F3: a near-miss streak is logged so the false-alarm rate is measurable.
+        if (this.probeMisses === PROBE_MISSES_BEFORE_DOWN - 1) {
+          console.log(`[Maxpool] link "${this.name}" ${this.probeMisses} probes unanswered (first miss ${new Date(this.probeFirstMissAt).toISOString()})`);
+        }
+        // Red team F3: VETO — bytes flowed on this link within one probe interval, so the
+        // tunnel is alive (a ping can miss on an event-loop stall or a new-connection limit
+        // while live streams keep flowing). Cutting those hops would re-bill their prefill.
+        const recentBytes = [...(this._inflight || [])].some(e => e?.lastByteAt != null && now - e.lastByteAt < PROBE_INTERVAL_MS);
+        if (!this.probeDown && this.probeMisses >= PROBE_MISSES_BEFORE_DOWN && recentBytes) {
+          console.log(`[Maxpool] link "${this.name}" — ${this.probeMisses} probes unanswered but replies are still flowing; NOT declaring down`);
+        } else if (!this.probeDown && this.probeMisses >= PROBE_MISSES_BEFORE_DOWN) {
           this.probeDown = true;
           this.probeDownAt = now;
           changed = true;

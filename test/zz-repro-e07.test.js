@@ -14,6 +14,7 @@ test('E07 repro', async () => {
   let n = 0;
   const remote = http.createServer((req, res) => {
     if (req.url === '/maxpool/status') { res.writeHead(200, {'content-type':'application/json'}); return res.end(JSON.stringify(STATUS)); }
+    if (req.url === '/maxpool/ping') { res.writeHead(200); return res.end(); }   // the 5s link probe is not a hop
     req.resume(); n += 1;
     if (n === 1) { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders(); setTimeout(() => res.socket.destroy(), 300); return; }
     setTimeout(() => { res.writeHead(200, { 'content-type': 'text/event-stream' });
