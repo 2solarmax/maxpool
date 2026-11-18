@@ -1477,7 +1477,7 @@ export class TUI {
     this._addLog(`Resolving GCP secret "${input}"…`);
     this.forceRender();
     try {
-      const { resolveSecret } = await import('../secret-resolver.js');
+      const { resolveSecret } = await import('./secret-resolver.js');
       const v = await resolveSecret(input);
       if (!v) {
         this._addLog(`✗ GCP secret "${input}" not found (or gcloud is not authenticated). ` +
@@ -1581,7 +1581,7 @@ export class TUI {
     try {
       let token = null;
       if (secretName) {
-        const { resolveSecret } = await import('../secret-resolver.js');
+        const { resolveSecret } = await import('./secret-resolver.js');
         token = await resolveSecret(secretName);
         if (!token) {
           this._addLog(`✗ Secret "${secretName}" not found in GCP — create it first: gcloud secrets create ${secretName} --data-file=-`);
@@ -1591,7 +1591,7 @@ export class TUI {
         token = apiKey;
       }
       // Add to config (persistence) and activate immediately.
-      const { atomicConfigUpdate } = await import('../config.js');
+      const { atomicConfigUpdate } = await import('./config.js');
       await atomicConfigUpdate(cfg => {
         if (!Array.isArray(cfg.providers)) cfg.providers = [];
         const entry = { name, provider };
