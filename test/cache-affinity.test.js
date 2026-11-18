@@ -28,8 +28,8 @@ test('balance: consecutive turns stay on the same account at comparable load', (
   release(second);
 });
 
-test('balance: a major load gap moves the session (two large turns of extra depth)', () => {
-  const m = am(); am_ref = m;
+test('balance: a major load gap moves the session (two large turns of extra depth; claudeWarmHold off)', () => {
+  const m = amHoldOff(); am_ref = m;
   const first = acquire(m); const name1 = first.account.name; release(first);
   const sibling = m.accounts.find(a => a.name !== name1);
   sibling.activeWeight = 0; sibling.inFlight = 0;
@@ -49,7 +49,7 @@ test('balance: exclusion of the last-used account fails over immediately', () =>
 });
 
 test('bonus is configurable: 0 restores pure balancing (turn can hop)', () => {
-  const m = am(2, { cacheAffinityBonus: 0 }); am_ref = m;
+  const m = amHoldOff(2, { cacheAffinityBonus: 0 }); am_ref = m;
   const first = acquire(m); const name1 = first.account.name; release(first);
   m.accounts.forEach(a => { a.activeWeight = 0; });
   // Without the bonus the sibling is now strictly lighter → pure balancing hops.
@@ -77,6 +77,12 @@ test('sticky mode: binding path unchanged (returns the bound account regardless 
 // prod) — below that the account is a normal candidate and the hold must survive.
 const am99 = (n = 2, opts = {}) => new AccountManager(
   Array.from({ length: n }, (_, i) => acct(`a${i + 1}`)), 0.99, { routingMode: 'balance', ...opts });
+// CLAUDE WARM HOLD (2026-11-18) pins the holder against ANY Claude pick, so the
+// load-gap escape tests below run with the hold off — their load-gap machinery
+// (bonus, anti-dogpile cap) is what claudeWarmHold=false still runs on.
+const amHoldOff = (n = 3, opts = {}) => new AccountManager(
+  Array.from({ length: n }, (_, i) => acct(`a${i + 1}`)), 0.9,
+  { routingMode: 'balance', claudeWarmHold: false, ...opts });
 const captureLogs = (fn) => {
   const logs = []; const orig = console.log;
   console.log = l => { if (typeof l === 'string' && l.startsWith('[Maxpool]')) logs.push(l); };
@@ -197,8 +203,8 @@ test('RELEASE: a cooldown on the bound account moves the conversation on the ver
   release(next);
 });
 
-test('LOAD GAP beats the hold: deep in-flight from OTHER conversations moves a bound conversation', () => {
-  const m = am(3); am_ref = m;
+test('LOAD GAP beats the bonus hold (claudeWarmHold off): deep in-flight from OTHER conversations moves a bound conversation', () => {
+  const m = amHoldOff(3); am_ref = m;
   const first = acquire(m); const name1 = first.account.name; release(first);
   // Other conversations (same terminal, distinct hashes) pile onto the bound account:
   const others = [];
@@ -213,8 +219,8 @@ test('LOAD GAP beats the hold: deep in-flight from OTHER conversations moves a b
   release(moved); others.forEach(release);
 });
 
-test('SPREAD: parallel conversations bound to ONE account fan out as depth grows (worst-case concentration)', () => {
-  const m = am(3); am_ref = m;
+test('SPREAD (claudeWarmHold off): parallel conversations bound to ONE account fan out as depth grows (worst-case concentration)', () => {
+  const m = amHoldOff(3); am_ref = m;
   const home = m.accounts[0];
   const N = 8; const keys = Array.from({ length: N }, (_, i) => `term-1:C${i}`);
   keys.forEach(k => noteServed(m, { affinityKey: k }, home)); // all bound to a1
@@ -292,8 +298,8 @@ test('why=: critical weekly → released:unavailable(weekly-critical)', () => {
   const m = am(2); am_ref = m; const a = bindFirst(m);
   assert.match(movedLine(m, a, undefined, x => { x.quota.unified7d = 0.96; x.quota.unified7dReset = FAR(); }), /why=released:unavailable\(weekly-critical\)$/);
 });
-test('why=: load gap → outscored:<delta>(dominant terms; bonus; depth)', () => {
-  const m = am(2); am_ref = m; const a = bindFirst(m);
+test('why=: load gap → outscored:<delta>(dominant terms; bonus; depth) (claudeWarmHold off)', () => {
+  const m = amHoldOff(2); am_ref = m; const a = bindFirst(m);
   const line = movedLine(m, a, undefined, x => { x.activeWeight = 1200; });
   assert.match(line, /why=outscored:\d+\.\d\((capPenalty|concurrency)\+[\d.]+,(capPenalty|concurrency)\+[\d.]+;bonus=400;depth=1200\/0\)$/, line);
 });
@@ -443,7 +449,8 @@ test('cap is tighter for an UNLOCKED critical account too (lowest-headroom tier)
 const SIZES = [0, 20_000, 450_000, 500_000];
 const TURN = 10; // weight of a ~450-500KB Claude Code turn (ceil(bytes/64KB) + thinking/max_tokens)
 const fleet = (n, opts = {}) => new AccountManager(
-  Array.from({ length: n }, (_, i) => acct(`a${i + 1}`)), 0.9, { routingMode: 'balance', ...opts });
+  Array.from({ length: n }, (_, i) => acct(`a${i + 1}`)), 0.9,
+  { routingMode: 'balance', claudeWarmHold: false, ...opts });
 const dist = (leases) => leases.reduce((o, l) => { o[l.account.name] = (o[l.account.name] || 0) + 1; return o; }, {});
 
 for (const bytes of SIZES) {

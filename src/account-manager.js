@@ -219,6 +219,14 @@ const DEFAULT_SCHEDULER = {
   // This is the 5-hour-window level at which the hold lets go (providers; Claude
   // benches at switchThreshold anyway). Weekly reserve/soft tiers do NOT release.
   cacheAffinityFiveHourWall: 0.97,
+  // CLAUDE WARM HOLD (owner 2026-11-18): a warm conversation (served within
+  // cacheAffinityReturnWindowMs) whose last account is a CLAUDE account that can still
+  // serve it — a candidate this pass and no hold-release gate — stays there when the
+  // pick is another Claude account, WHATEVER the score. Anthropic's cache is per
+  // account: measured 75 Claude→Claude moves in 2 h (why=outscored), 68% of Claude
+  // cache writes were those re-writes. Priority tiers, provider rows and cross-family
+  // picks are untouched. false = score-based moves (the 400-point bonus alone).
+  claudeWarmHold: true,
   // RETURN HOME after a provider detour (owner 2026-11-09): when a conversation's turn
   // went to GLM/Kimi and a later turn is routed back to Claude, it prefers the Claude
   // account it used last — that account still holds its stored copy. Only while the copy
@@ -817,6 +825,9 @@ export class AccountManager {
     // When that account last SERVED the conversation (first real upstream byte) —
     // holdsWarmConversation reads it. Same LRU bound, in-memory like the map above.
     this.conversationLastServedAt = new Map();
+    // CLAUDE WARM HOLD log memory: conversation key → the holder its one `warm-hold=…:kept`
+    // line was written for (one line per conversation per holder, not per turn).
+    this.conversationWarmHoldLogged = new Map();
     // Final client outcomes of POST /v1/messages at THIS (edge) pool, 1 h ring.
     this.clientOutcomes = [];
     // _homeKey (affinityKey, else sessionKey) → { name, at, detoured } of the last CLAUDE
@@ -3074,11 +3085,13 @@ export class AccountManager {
 
     const bestUnlockMap = new Map();
     const home = this._returnHome(requestInfo, now);
+    const warmHolder = this._claudeWarmHolder(requestInfo);
     for (const weeklyOptions of weeklyPasses) {
       best = null;
       bestScore = Infinity;
       bestPriority = Infinity;
       let homeCand = null;   // the home account as a candidate THIS pass, scored as holder
+      let holdCand = null;   // the warm Claude holder as a candidate THIS pass (CLAUDE WARM HOLD)
       let coolBest = null;   // best soft-cooled account (review r2 A): used only if nothing else fits
 
       for (let i = 0; i < this.accounts.length; i++) {
@@ -3099,6 +3112,9 @@ export class AccountManager {
           homeCand = { account, priority, critUnlock,
             score: this._scoreAccount(account, requestInfo, scoringCtx, critUnlock, home.name) };
         }
+        // Captured only here, past every availability gate of this pass: an unavailable
+        // holder (cooldown, 429, exclusion, in-flight cap, weekly bench) is never held.
+        if (warmHolder && account.name === warmHolder) holdCand = { account, priority, score, critUnlock };
         // REQUEST-SCOPED SOFT COOLDOWN (review r2 A): after a request-scoped first-byte
         // timeout the account is deprioritised for NEW placements only — a cold pick
         // takes it last. A conversation it HOLDS (_holdsRequest) is not touched:
@@ -3156,6 +3172,28 @@ export class AccountManager {
           homeNote = `home=${home.name}:skipped(${why})`;
         }
         if (best.name === home.name) requestInfo.returnedHome = { name: home.name, switched: homeSwitched };
+      }
+
+      // CLAUDE WARM HOLD (owner 2026-11-18): the warm Claude holder keeps the conversation
+      // against another CLAUDE pick, whatever the score — a move only re-writes the prefix
+      // on the new account. Not when the hold has let go (_affinityRelease), the holder sits
+      // in a worse priority tier, the pick is a provider row (cross-family is untouched),
+      // or return-home just chose home (that block owns the detour return).
+      if (best && holdCand && best !== holdCand.account
+        && isClaudeAccount(holdCand.account) && isClaudeAccount(best)
+        && !(home && best.name === home.name)
+        && holdCand.priority <= bestPriority
+        && !this._affinityRelease(holdCand.account, holdCand.critUnlock)) {
+        const outscoredBy = best;
+        best = holdCand.account;
+        bestPriority = holdCand.priority;
+        bestScore = holdCand.score;
+        if (holdCand.critUnlock) bestUnlockMap.set(best.name, holdCand.critUnlock); else bestUnlockMap.delete(best.name);
+        const hkey = this._affinityKey(requestInfo);
+        if (hkey && this.conversationWarmHoldLogged.get(hkey) !== best.name) {
+          lruSet(this.conversationWarmHoldLogged, hkey, best.name);
+          console.log(`[Maxpool] warm-hold=${best.name}:kept(pick ${outscoredBy.name}) (${requestInfo.bodyBytes ?? '?'}B)`);
+        }
       }
 
       if (best) {
@@ -4435,6 +4473,21 @@ export class AccountManager {
     const key = this._affinityKey(requestInfo);
     if (!key || this.conversationLastAccount.get(key) !== account.name) return false;
     return Date.now() - (this.conversationLastServedAt.get(key) || 0) <= this._cacheAffinityWindowMs();
+  }
+
+  /** CLAUDE WARM HOLD: the name of this conversation's last account when the hold may
+   *  apply to it — knob on, a scored mode (sticky has its own binding), and that account
+   *  holds the conversation's WARM Claude copy (holdsWarmConversation: a Claude account,
+   *  served within the cache window). A one-shot retry-same onto ANOTHER account (D3)
+   *  keeps its own scoring. Availability and release gates are checked per pass. */
+  _claudeWarmHolder(requestInfo = {}) {
+    if (!this.scheduler.claudeWarmHold || this.scheduler.routingMode === 'sticky') return null;
+    const key = this._affinityKey(requestInfo);
+    const name = key ? this.conversationLastAccount.get(key) : null;
+    if (!name) return null;
+    if (requestInfo.retrySameAccountName != null && requestInfo.retrySameAccountName !== name) return null;
+    const holder = this.accounts.find(a => a.name === name);
+    return holder && this.holdsWarmConversation(holder, requestInfo) ? name : null;
   }
 
   /** cacheAffinityReturnWindowMs, falling back to the default when unset/invalid. */
