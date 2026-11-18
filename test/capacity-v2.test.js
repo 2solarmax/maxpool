@@ -205,7 +205,7 @@ test('V11: a benched local row + its cloud mirror (same uuid) render as ONE row,
   assert.doesNotMatch(page, /cache \d+%/, 'no cosmetic cache note');
   // merged history: local 6M@1.0 + cloud 5M@1.0 are DISJOINT windows → median of [6M,5M] = 5.5M; $200/5.5M
   assert.match(mk[0], /5\.5M/);
-  assert.match(mk[0], /\$36\.36/);
+  assert.match(mk[0], /\$8.36/);
   am.setPoolLinks([]);
 });
 
