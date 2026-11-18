@@ -1598,7 +1598,19 @@ export class TUI {
       const link = this.am.poolLinks?.[0] || null;
       let team = toTeam;
       if (team == null && link && !this.am.accounts.some(a => a.type === 'provider' && a.credential === token)) {
-        const where = String(await this._ask(`\nAdd "${name}" to the team pool "${link.name}" (recommended) or this laptop only? [T/l]: `) || '').trim().toLowerCase();
+        // The screen's own key handler is live: hand the terminal off first (as the
+        // Claude login does), or the question draws over the screen and the answer
+        // keystroke ('l' = log in) also fires the screen's action.
+        const wasRunning = this.running;
+        setConsoleStdoutSuppressed(true);
+        let where;
+        try {
+          if (wasRunning) await this.handOff();
+          where = String(await this._ask(`\nAdd "${name}" to the team pool "${link.name}" (recommended) or this laptop only? [T/l]: `) || '').trim().toLowerCase();
+        } finally {
+          setConsoleStdoutSuppressed(false);
+          if (wasRunning) this.start();
+        }
         team = where !== 'l';
       }
       if (team && link) {
@@ -1607,6 +1619,8 @@ export class TUI {
         const r = await sendProviderToPool({ url: link.url, key: link.key, name, provider, apiKey: token, secretName });
         if (r.ok) {
           this._addLog(`✓ ${r.result === 'exists' ? `"${r.name}" already in` : `Added "${r.name}" to`} the team pool (${link.name}). Nothing saved on this laptop.`);
+        } else if (r.status === 409 && r.code === 'name_taken') {
+          this._addLog(`✗ The team pool already has a provider named "${name}" with a different key. Nothing was added${r.suggestedName ? ` — try the name "${r.suggestedName}"` : ' — choose another name'}`);
         } else {
           this._addLog(`✗ Team pool failed — ${r.error}. NOTHING saved locally; try again.`);
         }
@@ -1622,7 +1636,9 @@ export class TUI {
         cfg.providers.push(entry);
       });
       // Activate in the running process.
-      this.am.loadConfigProviders([{ name, provider, secretName, token }]);
+      // Whole list, not just the new entry: loadConfigProviders drops every idle config
+      // provider missing from what it is given, with its learned quota state.
+      this.am.loadConfigProviders([...this.am.configProviderEntries(), { name, provider, secretName, token }]);
       const a = this.am.accounts.find(a => a.name === name);
       if (a && secretName) a.secretName = secretName;
       this._addLog(`✓ Added "${name}" (${provider})${secretName ? ` — GCP secret "${secretName}"` : ' — direct key'}`);

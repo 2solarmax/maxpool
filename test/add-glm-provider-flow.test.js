@@ -152,7 +152,8 @@ test('the team-pool door accepts a provider key, activates it live, persists it'
     assert.equal(j2.name, 'glm remote', 'the duplicate names the row that already holds it');
     const r3 = await post(JSON.stringify({ account: { name: 'glm remote', type: 'provider', provider: 'zai', apiKey: 'zai-key.other' } }));
     const j3 = await r3.json();
-    assert.equal(j3.result, 'exists', 'the same NAME is not added twice either');
+    assert.equal(r3.status, 409, 'the same NAME with another key is refused, never shown as added');
+    assert.equal(j3.error, 'name_taken');
     const bad = await post(JSON.stringify({ account: { name: 'x', type: 'provider', provider: 'anthropic', apiKey: 'k' } }));
     assert.equal(bad.status, 400, 'only zai/kimi provider types are accepted');
   } finally {

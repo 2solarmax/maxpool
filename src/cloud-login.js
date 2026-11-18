@@ -153,7 +153,13 @@ export async function sendProviderToPool({ url, key, name, provider, apiKey, sec
     });
     const json = await res.json().catch(() => ({}));
     if (res.ok && json.ok) return { ok: true, result: json.result, name: json.name || name };
-    return { ok: false, error: `Team pool rejected the key (HTTP ${res.status}: ${json?.message || json?.error || 'unknown error'})` };
+    return {
+      ok: false,
+      status: res.status,
+      code: json?.error,
+      ...(typeof json?.suggestedName === 'string' ? { suggestedName: json.suggestedName } : {}),
+      error: `Team pool rejected the key (HTTP ${res.status}: ${json?.message || json?.error || 'unknown error'})`,
+    };
   } catch (e) {
     return { ok: false, error: `Could not reach the team pool (${e?.name === 'AbortError' ? 'timed out' : e?.message})` };
   } finally {

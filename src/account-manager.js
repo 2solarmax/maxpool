@@ -6583,6 +6583,28 @@ export class AccountManager {
   }
 
   /**
+   * The live config-sourced providers as `loadConfigProviders` entries (tokens included,
+   * in-process only). `loadConfigProviders` treats its list as the WHOLE config and drops
+   * every idle config provider missing from it, so adding ONE provider must pass this
+   * list plus the new entry — never the new entry alone.
+   */
+  configProviderEntries() {
+    return this.accounts
+      .filter(a => a.configSourced && a.type === 'provider' && !a.remote)
+      .map(a => ({
+        name: a.name,
+        provider: a.provider,
+        token: a.credential || null,
+        upstream: a.upstream,
+        priority: a.priority,
+        modelMap: a.modelMap,
+        model: a.model,
+        enabled: a.enabled !== false,
+        ...(a.secretName ? { secretName: a.secretName } : {}),
+      }));
+  }
+
+  /**
    * Return the config-sourced provider definitions (name + provider + secretName)
    * for the TUI and for config serialization. Tokens are NEVER included.
    */

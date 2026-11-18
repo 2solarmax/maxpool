@@ -505,30 +505,55 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // No tokens are logged; the key rides the same authenticated channel.
         if (acct?.type === 'provider') {
           const who = caller.name || 'legacy-key';
-          if ((acct.provider !== 'zai' && acct.provider !== 'kimi') || typeof acct.apiKey !== 'string' || !acct.apiKey) {
+          if ((acct.provider !== 'zai' && acct.provider !== 'kimi') || typeof acct.apiKey !== 'string' || !acct.apiKey
+              || typeof acct.name !== 'string' || !acct.name.trim()) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'bad_request', message: 'Expected {account: {type:"provider", provider:"zai"|"kimi", apiKey, name?, secretName?}}' }));
+            res.end(JSON.stringify({ ok: false, error: 'bad_request', message: 'Expected {account: {type:"provider", provider:"zai"|"kimi", apiKey, name, secretName?}}' }));
             return;
           }
-          const dup = accountManager.accounts.find(x => x.name === acct.name)
+          const sameName = accountManager.accounts.find(x => x.name === acct.name);
+          if (sameName && !(sameName.type === 'provider' && sameName.credential === acct.apiKey)) {
+            // The name is taken by a DIFFERENT key: refuse, never report it as added. A
+            // pasted key defaults to "glm primary", so a second key lands here.
+            const base = acct.name.replace(/\s+\d+$/, '');
+            let n = 2;
+            while (accountManager.accounts.some(x => x.name === `${base} ${n}`)) n++;
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'name_taken', message: `The team pool already has "${acct.name}" with a different key — choose another name`, suggestedName: `${base} ${n}` }));
+            return;
+          }
+          const dup = sameName
             || accountManager.accounts.find(x => x.type === 'provider' && x.credential === acct.apiKey);
           if (dup) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, result: 'exists', name: dup.name }));
             return;
           }
+          const { name, provider, apiKey, secretName, modelMap } = acct;
           try {
-            const { name, provider, apiKey, secretName, modelMap } = acct;
-            accountManager.loadConfigProviders([{ name, provider, token: apiKey, ...(modelMap ? { modelMap } : {}) }]);
+            // The new entry joins the FULL current list: loadConfigProviders drops every
+            // idle config provider that is not in what it is given.
+            accountManager.loadConfigProviders([
+              ...accountManager.configProviderEntries(),
+              { name, provider, token: apiKey, ...(modelMap ? { modelMap } : {}) },
+            ]);
+            const added = accountManager.accounts.find(x => x.name === name);
+            if (added && typeof secretName === 'string' && secretName) added.secretName = secretName;
             await atomicConfigUpdate(diskConfig => {
               if (!Array.isArray(diskConfig.providers)) diskConfig.providers = [];
-              diskConfig.providers.push(secretName ? { name, provider, secretName } : { name, provider, apiKey });
+              // The resolved key is saved too: a pool that cannot read the secret must
+              // still serve it. secretName stays as metadata.
+              diskConfig.providers.push({ name, provider, apiKey, ...(typeof secretName === 'string' && secretName ? { secretName } : {}) });
             });
             appendEventLog(`[Maxpool] Remote provider add: "${name}" (${provider}) by ${who}`);
           } catch (err) {
-            console.error(`[Maxpool] Remote provider add persisted to memory but NOT disk for "${acct.name}": ${err?.message || err}`);
+            // Not on disk means not added: roll the in-memory row back so a retry adds it
+            // for real instead of answering "exists".
+            const idx = accountManager.accounts.findIndex(x => x.name === name);
+            if (idx >= 0) accountManager.removeAccount(idx);
+            console.error(`[Maxpool] Remote provider add NOT persisted for "${acct.name}" (rolled back): ${err?.message || err}`);
             res.writeHead(507, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'not_persisted', message: 'Saved in memory only — the pool could not write it to disk. Try again.' }));
+            res.end(JSON.stringify({ ok: false, error: 'not_persisted', message: 'The pool could not save it to disk. Nothing was added; try again.' }));
             return;
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });

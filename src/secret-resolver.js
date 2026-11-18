@@ -237,3 +237,10 @@ export async function reresolveProviders(accounts, resolve = resolveSecrets) {
   }
   return fixed;
 }
+
+/** The key a config provider entry serves with: the resolved secret when there is one,
+ *  else the saved key. A team-pool add by secret name saves BOTH, so a pool whose VM
+ *  cannot read that secret still serves the key the laptop resolved. */
+export function providerTokenFromEntry(entry, resolved) {
+  return (entry.secretName ? resolved?.[entry.secretName] : null) || entry.apiKey || null;
+}

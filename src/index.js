@@ -718,14 +718,14 @@ async function serverWorkerCommand() {
   // on the next restart — no key to hunt down in config files.
   if (Array.isArray(config.providers) && config.providers.length > 0) {
     try {
-      const { resolveSecrets } = await import('./secret-resolver.js');
+      const { resolveSecrets, providerTokenFromEntry } = await import('./secret-resolver.js');
       // Split: GCP-sourced (secretName) vs direct (apiKey). Both produce a token
       // the same way — the resolution path is the only difference.
       const secretNames = config.providers.filter(p => p.secretName).map(p => p.secretName);
       const resolved = await resolveSecrets(secretNames);
       const entries = config.providers.map(p => ({
         ...p,
-        token: p.secretName ? (resolved[p.secretName] || null) : (p.apiKey || null),
+        token: providerTokenFromEntry(p, resolved),
       }));
       accountManager.loadConfigProviders(entries);
       const ok = entries.filter(e => e.token).length;
@@ -2722,12 +2722,12 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     const after = JSON.stringify(diskConfig.providers);
     if (before !== after) {
       try {
-        const { resolveSecrets } = await import('./secret-resolver.js');
+        const { resolveSecrets, providerTokenFromEntry } = await import('./secret-resolver.js');
         const names = diskConfig.providers.filter(p => p.secretName).map(p => p.secretName);
         const resolved = await resolveSecrets(names);
         const entries = diskConfig.providers.map(p => ({
           ...p,
-          token: p.secretName ? (resolved[p.secretName] || null) : (p.apiKey || null),
+          token: providerTokenFromEntry(p, resolved),
         }));
         accountManager.loadConfigProviders(entries);
         for (const p of diskConfig.providers) {
