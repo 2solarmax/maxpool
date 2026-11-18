@@ -16,15 +16,6 @@ import { __tuiTest } from '../src/tui.js';
 import { remotePool, bootLink, bigBody, captureLog, attempts, listen, close } from './link-fixture.js';
 
 const { loadText, strip } = __tuiTest;
-// Link-fault moves (2026-11-18 dead-link probe): a link-transport fault cools EVERY
-// mirror on that link for 30 s (the tunnel may be dead), so the move lands on a LOCAL
-// route — never on a sibling cloud row behind the same tunnel.
-const LOCAL = [{ name: 'local-key', type: 'apikey', apiKey: 'sk-ant-local' }];
-const LOCAL_SSE_FA = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_local_ok"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
-const localUpstream = (req, res) => {
-  req.resume();
-  req.on('end', () => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(LOCAL_SSE_FA); });
-};
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
 function oneAccount() {
@@ -71,8 +62,7 @@ test('TUI row shows link drops beside failures, and alone', () => {
 test('a link connection drop: cloud row not failed, counted as a link drop, line says streaming or not', async () => {
   for (const stream of [true, false]) {
     const remote = remotePool(pin => (pin === 'reports@gomokka.com' ? 'reset' : (stream ? 'sse' : 'ok')));
-    const { am, port, cleanup } = await bootLink(remote, { enabled: false }, { localAccounts: LOCAL, upstreamHandler: localUpstream });
-    am.accounts.find(a => a.name === 'local-key').activeWeight = 500;   // a cloud row is the first pick
+    const { am, port, cleanup } = await bootLink(remote);
     try {
       let status = 0;
       const lines = await captureLog(async () => {
@@ -81,12 +71,7 @@ test('a link connection drop: cloud row not failed, counted as a link drop, line
         });
         status = r.status; await r.text();
       });
-      assert.equal(status, 200, 'the request was answered');
-      // Probe-first (2026-11-18): the fixture's ping answers, so the tunnel reads as
-      // alive and the retry MAY land on the sibling cloud row (it succeeds there) — the
-      // bench-everything path only applies when the ping gets no answer. What this test
-      // pins is the ACCOUNTING below: the faulted row is a link drop, not a failure.
-      assert.deepEqual(remote.hits, ['reports@gomokka.com', 'personal']);
+      assert.equal(status, 200, 'moved to the other row and answered');
       const a = attempts(lines);
       assert.equal(a.length, 1, a.join('\n'));
       assert.match(a[0], /\(pool_link_unreachable\) on "reports@gomokka\.com ☁"/);

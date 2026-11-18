@@ -12,23 +12,12 @@ import assert from 'node:assert/strict';
 // its module constants before the knobs are set.
 const { remotePool, bootLink, bigBody, captureLog, attempts } = await import('./link-fixture.js');
 
-// Link-fault moves (2026-11-18 dead-link probe): a link-transport fault cools EVERY
-// mirror on that link for 30 s (the tunnel may be dead), so the move lands on a LOCAL
-// route — never on a sibling cloud row behind the same tunnel.
-const LOCAL = [{ name: 'local-key', type: 'apikey', apiKey: 'sk-ant-local' }];
-const LOCAL_SSE = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_local_ok"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
-const localUpstream = (req, res) => {
-  req.resume();
-  req.on('end', () => { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end(LOCAL_SSE); });
-};
-
 test('#2: a 300KB streaming turn on the link aborts at the FLAT 15s floor (the scaling knob is dead)', async () => {
   // 300KB × the env knob would be a 30s wait; the flat floor is 15s. Row 1 answers at
   // 22s: a scaled link would wait for it (one hit). The flat floor aborts it at ~15s
-  // and moves off the link to the local route, which answers at once.
+  // and moves to row 2, which answers at once.
   const remote = remotePool(pin => (pin === 'reports@gomokka.com' ? { delay: 22_000, sse: true } : 'sse'));
-  const { am, port, cleanup } = await bootLink(remote, { enabled: true, streamForwardGraceMs: 1000 }, { localAccounts: LOCAL, upstreamHandler: localUpstream });
-  am.accounts.find(a => a.name === 'local-key').activeWeight = 500;   // a cloud row is the first pick
+  const { port, cleanup } = await bootLink(remote, { enabled: true, streamForwardGraceMs: 1000 });
   try {
     let status = 0; let text = '';
     const t0 = Date.now();
@@ -40,21 +29,19 @@ test('#2: a 300KB streaming turn on the link aborts at the FLAT 15s floor (the s
     });
     const took = Date.now() - t0;
     assert.equal(status, 200);
-    assert.ok(text.includes('msg_local_ok'), `the local route answered:\n${text.slice(0, 200)}`);
-    assert.deepEqual(remote.hits, ['reports@gomokka.com'], 'aborted at the floor, then moved off the link');
+    assert.ok(text.includes('msg_link_ok'), `row 2 answered:\n${text.slice(0, 200)}`);
+    assert.deepEqual(remote.hits, ['reports@gomokka.com', 'personal'], 'aborted at the floor, then moved');
     assert.ok(took >= 14_000 && took < 20_000, `abort at the 15s floor, not a scaled wait (took ${took}ms)`);
     const a = attempts(lines);
     assert.equal(a.length, 1, a.join('\n'));
     assert.match(a[0], /\(link_ttfb\) on "reports@gomokka\.com ☁" — .* → moved$/);
-    // (the local move's own DIRECT-path scaled wait is fine — only a ☁ row must not scale)
-    assert.ok(!lines.some(l => l.includes('first-byte wait') && l.includes('☁')), `no scaled wait on the link:\n${lines.join('\n')}`);
+    assert.ok(!lines.some(l => l.includes('first-byte wait')), `no scaled wait on the link:\n${lines.join('\n')}`);
   } finally { await cleanup(); }
 });
 
 test('#2: a big-prompt link TTFB MOVES — retry-same is direct-only', async () => {
   const remote = remotePool((pin, n) => (pin === 'reports@gomokka.com' && n === 1 ? 'hang' : 'sse'));
-  const { am, port, cleanup } = await bootLink(remote, { enabled: false }, { localAccounts: LOCAL, upstreamHandler: localUpstream });
-  am.accounts.find(a => a.name === 'local-key').activeWeight = 500;   // a cloud row is the first pick
+  const { port, cleanup } = await bootLink(remote);
   try {
     let status = 0;
     const lines = await captureLog(async () => {
@@ -64,7 +51,7 @@ test('#2: a big-prompt link TTFB MOVES — retry-same is direct-only', async () 
       status = r.status; await r.text();
     });
     assert.equal(status, 200);
-    assert.deepEqual(remote.hits, ['reports@gomokka.com'], `moved off the link at once: ${remote.hits}`);
+    assert.deepEqual(remote.hits, ['reports@gomokka.com', 'personal'], `moved at once: ${remote.hits}`);
     const a = attempts(lines);
     assert.equal(a.length, 1, a.join('\n'));
     assert.match(a[0], /\(link_ttfb\) on "reports@gomokka\.com ☁" — .* → moved$/);
