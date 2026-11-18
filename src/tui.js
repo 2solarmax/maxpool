@@ -489,6 +489,28 @@ function pricePerMTokens(monthlyPrice, weeklyTankTokens) {
   return '$' + Number(perM.toPrecision(2)).toString();
 }
 
+/** Why a row has no finished, admitted cycle (audit D16, 2026-11-18): a plain '--'
+ *  collapsed several distinct causes. Returns a short word for the Prev cell:
+ *   '1st wk MM-DD' — no finished cycle yet; the first one closes on that date
+ *   'old count'    — finished cycles exist but all predate the 2026-11-06 token count
+ *   'too short'    — finished cycles exist but none was long/strong enough to measure
+ *  null when the row HAS admitted history (the numbers render instead). */
+function historyReason(am, a, win, nowOpen) {
+  const hist = am?.capacityHistory ? am.capacityHistory(a, win) : (am?.capacity?.closedCycles?.(a.name, win) || []);
+  if (!hist.length) {
+    const ws = nowOpen?.windowStartedAt ?? a?.remoteOpen?.[win]?.windowStartedAt ?? null;
+    const span = win === 'wk' ? 7 * 86400_000 : 5 * 3600_000;
+    if (Number.isFinite(ws)) {
+      const end = new Date(ws + span);
+      const mm = String(end.getUTCMonth() + 1).padStart(2, '0'), dd = String(end.getUTCDate()).padStart(2, '0');
+      return win === 'wk' ? `1st wk ${mm}-${dd}` : 'first 5h';
+    }
+    return 'no week yet';
+  }
+  if (hist.every(c => (c.axis ?? 'io') !== 'all')) return 'old count';
+  return 'too short';
+}
+
 function sessionFull(am, a) {
   const q = a?.quota || {};
   const now = Date.now();
@@ -3643,7 +3665,7 @@ export class TUI {
         // Prev = the newest FINISHED cycle (audit D4) — once Current is live, the
         // reader wants "what did last week hold", which is `last`, not the
         // second-newest (that comparison is Med-3's job).
-        Prev: (tank?.source === 'cycles' && tank.last != null ? formatTokens(tank.last) : '--'),
+        Prev: (tank?.source === 'cycles' && tank.last != null ? formatTokens(tank.last) : (historyReason(this.am, a, win, nowOpen) || '--')),
         'Med-3': (tank?.source === 'cycles' && tank.recent != null ? formatTokens(tank.recent) : '--'),
         'Med-all': (tank?.source === 'cycles' ? formatTokens(tank.avg) : '--'),
         // `n*` = at least one contributing cycle is a two-pool merge (no per-reading
@@ -3686,6 +3708,7 @@ export class TUI {
     out.push(' ' + dim('Tokens = processed tokens (provider-native): input + cached + output, counted in each provider\'s own tokenizer.'));
     out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise. Cycles before 2026-11-06 used a different token count and are never admitted (old count).'));
     out.push(' ' + dim('Current @% = the LIVE window, % full now. Prev = the newest finished cycle.'));
+    out.push(' ' + dim('No finished week yet? Prev says why: "1st wk MM-DD" = first week ends then · "old count" = only weeks counted before 2026-11-06 · "too short" = finished weeks too short to measure.'));
     out.push(' ' + dim('$/1M = monthly plan price ÷ (weekly tank × 4.35), so it is the price a month of subscription actually buys per 1M tokens.'));
     return out;
   }
