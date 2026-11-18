@@ -63,9 +63,11 @@ test('a blip that never reaches DOWN: the next probe ANSWER lifts the link-fault
       assert.ok(mirrors.length === 2 && mirrors.every(m => m.cooldownUntil > Date.now() + 20_000), 'the fault set the 30 s link-fault bench');
       // Throttle cooldown set later on one row must survive the lift.
       const throttled = mirrors[0]; throttled.cooldownUntil = Date.now() + 90_000;
-      await link.probe();   // the tunnel answers again (never went DOWN, so no UP event)
+      await link.probe();   // the tunnel answers once — one lucky ping is not recovery
+      assert.ok(mirrors[1].cooldownUntil > Date.now() + 15_000, 'ONE answer does not lift the bench (hysteresis)');
+      await link.probe();   // a second answer in a row (never went DOWN, so no UP event)
       const now = Date.now();
-      assert.ok(!(mirrors[1].cooldownUntil > now), 'link-fault bench lifted on the answering probe');
+      assert.ok(!(mirrors[1].cooldownUntil > now), 'link-fault bench lifted after two answers in a row');
       assert.ok(throttled.cooldownUntil > now + 60_000, 'a non-link cooldown survives');
       throttled.cooldownUntil = null;
       const second = await post();
@@ -73,6 +75,20 @@ test('a blip that never reaches DOWN: the next probe ANSWER lifts the link-fault
       assert.match(second.text, /msg_cloud/);
     });
   } finally { am.setPoolLinks([]); await close(proxy); await close(remote); await close(upstream); }
+});
+
+// ── 1b. lossy link (miss, answer, miss, answer): the bench never lifts on a single ping ──────
+test('a lossy link alternating miss/answer never lifts the link-fault bench (red team r3)', async () => {
+  const seq = [MISS, HIT, MISS, HIT, MISS, HIT, MISS];
+  let i = 0;
+  const link = new PoolLink({ name: 'team', url: 'http://127.0.0.1:1', key: 'mp-max' }, { probeFn: async () => seq[i++] });
+  let lifts = 0;
+  link.onAlive(() => { lifts++; });
+  await quiet(async () => { for (let k = 0; k < seq.length; k++) await link.probe(); });
+  assert.equal(link.probeDown, false, 'fixture: never 3 misses in a row, so never DOWN');
+  assert.equal(lifts, 0, 'no alive announcement while the link keeps dropping');
+  await quiet(async () => { i = 0; seq.length = 0; seq.push(HIT, HIT); await link.probe(); await link.probe(); });
+  assert.equal(lifts, 1, 'two answers in a row announce alive once');
 });
 
 // ── 2. soft poll failures while the probe answers ────────────────────────────────────────────
