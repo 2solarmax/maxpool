@@ -149,3 +149,16 @@ test('D11/D12: a weeklyAbsent provider labels its ceiling max, its N as 5h cycle
   assert.match(row, /max/i, 'the derived weekly figure is labelled as a ceiling (max)');
   assert.match(row, /5h/, 'N is labelled as 5h cycles');
 });
+
+// ── D13: the Plan column shows the live z.ai price when no plan object exists ──
+test('D13: a provider row with a live monthly price shows it in the Plan cell', () => {
+  const am = new AccountManager([{
+    name: 'glm priced', type: 'provider', provider: 'zai', authToken: 'k', upstream: 'http://x', profiles: ['all'],
+  }], 0.95);
+  am.accounts[0].monthlyPriceUSD = 111;
+  const tui = new TUI({ accountManager: am, config: {} });
+  tui.capacityWindow = 'wk';
+  const txt = tui._renderCapacityPage(160).join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  const row = txt.split('\n').find(l => l.includes('glm priced'));
+  assert.match(row, /\$111\/mo/, `live z.ai price in the Plan cell, row: ${row}`);
+});

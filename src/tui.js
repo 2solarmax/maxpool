@@ -674,9 +674,17 @@ function timestamp() {
 
 // ── TUI class ────────────────────────────────────────────────
 
-/** Compact plan cell: "Max Q $134/mo". '--' when no plan is configured (no guessing). */
-function planLabel(plan) {
-  if (!plan) return '--';
+/** Compact plan cell: "Max Q $134/mo". '--' when no plan is configured (no guessing).
+ *  D13 (audit 2026-11-18): when no plan OBJECT exists but the pool knows a live
+ *  monthly price (the z.ai prober's subscription reading), show the price so the
+ *  Plan cell and the row's $/1M agree — a '--' Plan next to a priced $/1M was a
+ *  contradiction on all 13 GLM rows. */
+function planLabel(plan, priceAccount = null, am = null) {
+  if (!plan) {
+    const p = am?.monthlyPriceFor?.(priceAccount);
+    if (p != null) return `--  $${Math.round(p)}/mo`;
+    return '--';
+  }
   const cad = { monthly: 'M', quarterly: 'Q', annual: 'A', annually: 'A', yearly: 'A' }[plan.cadence] || '';
   const tier = (plan.tier || '').replace(/^(claude|glm coding)\s+/i, '');
   const monthly = plan.priceUsd != null && plan.billingMonths ? plan.priceUsd / plan.billingMonths : null;
@@ -3651,16 +3659,19 @@ export class TUI {
     }
 
     out.push('');
-    out.push(' ' + dim('Capacity = median of tokens ÷ % full across readings in each cycle. Med-3 = median of last 3 cycles, Med-all = every cycle.'));
+    // Legend rewritten for truthfulness (audit D14/D15/D16, 2026-11-18): every line
+    // states what the code ACTUALLY does — the old "median of tokens ÷ % full across
+    // readings" described a formula the code never ran, and no line explained a dash.
+    out.push(' ' + dim('Capacity = tokens a FULL window holds. Per cycle: median of (tokens used ÷ rise in % full) over steps of ≥5 points. Med-3 = newest 3 cycles, Med-all = all admitted cycles.'));
     out.push(' ' + dim('One row per account. Where = which side holds its history: cloud, laptop or both. ? = identity unknown.'));
     // Axis honesty (audit 2026-11-17, finding 5): the figure counts processed tokens in
     // EACH provider's own tokenizer (GLM ≈ 0.6x Anthropic for the same prompt), and a
     // cache read (0.1x) weighs the same as a cache write (1.25x). So $/1M across a
     // Claude and a GLM row is not a like-for-like price per Claude-equivalent token.
     out.push(' ' + dim('Tokens = processed tokens (provider-native): input + cached + output, counted in each provider\'s own tokenizer.'));
-    out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise.'));
-    out.push(' ' + dim('Current @% = live window, % full now · no-weekly weekly = avg 5h × 33.6.'));
-    out.push(' ' + dim('$/1M = plan price ÷ measured weekly tank (monthly-normalized), per processed tokens (provider-native). -- = no price or tank yet.'));
+    out.push(' ' + dim('N = cycles in Med-all (Med-3 uses the newest 3). N* = includes a cycle both pools saw (merged) — estimated from close-time tokens, less precise. Cycles before 2026-11-06 used a different token count and are never admitted (old count).'));
+    out.push(' ' + dim('Current @% = the LIVE window, % full now. Prev = the newest finished cycle.'));
+    out.push(' ' + dim('$/1M = monthly plan price ÷ (weekly tank × 4.35), so it is the price a month of subscription actually buys per 1M tokens.'));
     return out;
   }
 

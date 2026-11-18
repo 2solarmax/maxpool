@@ -277,7 +277,7 @@ test('G1: the page shows a per-account row with the capacity columns once cycles
 test('G2: a fresh install says WHY the page is empty instead of showing zeros', () => {
   // Zeros would read as "this account delivers nothing", which is the opposite of true.
   const page = renderCapacity(amWithOauth());
-  assert.match(page, /Capacity = median of tokens/, 'the formula footer explains the table');
+  assert.match(page, /Capacity = tokens a FULL window holds/, 'the formula footer explains the table');
   assert.doesNotMatch(page, /no completed cycle yet/,
     'never the old jargon — it was true and told the reader nothing (2026-08-25)');
   assert.match(page,/--\s+--\s+--\s+--/, 'a fresh install shows dashes, never zeros');
