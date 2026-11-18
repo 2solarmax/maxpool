@@ -189,3 +189,24 @@ test('F1: a late-joined open week does NOT render a low Current — history show
   assert.match(row, /10M/, 'history shows; a 2M lower-bound is not the tank');
   assert.doesNotMatch(row, /2\.0M/, 'no understated 2.0M from a late-joined divide');
 });
+
+// ── D16 (audit 2026-11-18): a row with no finished week says WHY instead of a bare dash ──
+test('D16: a brand-new account shows "1st wk <date>" in Prev — the dash is explained', () => {
+  const am = amWith('newbie');
+  const now = Date.now();
+  am.capacity.accrue('newbie', { input: 1_000_000, output: 0 }, now);
+  const o = am.capacity.openCycle('newbie', 'wk');
+  o.windowStartedAt = Date.UTC(2026, 10, 17);   // window ends 2026-11-24
+  const row = renderWk(am).split('\n').find(l => l.includes('newbie'));
+  assert.match(row, /1st wk 11-24/, `the reason word names when the first week finishes, row: ${row}`);
+});
+test('D16: an account whose only finished weeks predate the 2026-11-06 count says "old count"', () => {
+  const am = amWith('oldie');
+  const end = Date.now();
+  am.capacity.accrue('oldie', { input: 5_000_000, output: 0 }, end - SEVEN_D);
+  const o = am.capacity.openCycle('oldie', 'wk');
+  o.windowStartedAt = end - SEVEN_D; o.axis = 'io';
+  am.capacity.closeCycle('oldie', 'wk', end, { resetAt: end, finalUtilization: 0.5 });
+  const row = renderWk(am).split('\n').find(l => l.includes('oldie'));
+  assert.match(row, /old count/, `row: ${row}`);
+});
