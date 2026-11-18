@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.108] - 2026-11-18
+
+### Fixed
+
+- Slow status poll no longer declares the cloud link down while the probe answers
+
 ## [1.24.107] - 2026-11-18
 
 ### Fixed
