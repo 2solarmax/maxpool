@@ -5622,6 +5622,14 @@ export class AccountManager {
       const t = tankStatsFromCycles(merged, window, {
         readFloor: this.capacity._readFloorOverride, ignoreCeiling: this.capacity._readFloorOverride != null });
       if (t) return { ...t, source: 'cycles' };
+      // D3 (audit 2026-11-18): no admitted history — fall back to the exported OPEN
+      // cycle's live estimate so the row shows the running week instead of '--'.
+      const op = a.remoteOpen?.[window];
+      if (op && Number.isFinite(op.est) && op.est > 0) {
+        return { avg: Math.round(op.est), last: Math.round(op.est), prev: null, recent: Math.round(op.est),
+          recentN: 1, n: 0, exact: 1, bounded: 0, lowerBound: false,
+          source: 'live', utilization: op.peakUtilization ?? null, method: 'exported-open', fresh: true };
+      }
       // An older cloud's exported aggregate (remoteTank) is on the legacy input+output
       // axis: never shown, never blended.
       return null;
@@ -6758,6 +6766,7 @@ export class AccountManager {
       a.remoteTank = ra.tank || null;
       a.remoteKeyFp = ra.keyFingerprint || null;
       a.remoteCycles = ra.cycles || null;
+      a.remoteOpen = ra.open || null;
       a.remotePlan = sanitizePlan(ra.plan);
       // Other teammates' live load on this cloud account (remote inFlight minus our
       // own leases) — so the balancer sees the account as busy as it really is.
@@ -7071,6 +7080,13 @@ export class AccountManager {
         cycles: a.remote ? null : {
           wk: this.capacity?.exportCycles(a.name, 'wk', 12) || [],
           ses: this.capacity?.exportCycles(a.name, 'ses', 60) || [],
+        },
+        // D3 (audit 2026-11-18): the OPEN window rides beside the closed ones so a
+        // linked pool can show a LIVE Current for mirror rows — closed-only export
+        // meant every cloud row could never show the running week.
+        open: a.remote ? null : {
+          wk: this.capacity?.exportOpenCycle(a.name, 'wk') || null,
+          ses: this.capacity?.exportOpenCycle(a.name, 'ses') || null,
         },
         upstream: a.upstream,
         profiles: a.profiles,

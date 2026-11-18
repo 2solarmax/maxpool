@@ -262,3 +262,101 @@ test('R3: the floor is per-window — a 4.5h ses cycle passes, a 5.5-day wk cycl
   assert.equal(l.windowStats('a', 'ses').last, 700_000, '90% of a 5h window is real');
   assert.equal(l.windowStats('a', 'wk').last, 3_000_000, '79% of a weekly window is real');
 });
+
+// ── 2026-11-18 capacity-screen audit: admission + estimate defects D1/D5/D6/D7/D16 ──
+// Basis: research/2026-11-18-capacity-audit.md (both pools' snapshots, 52-agent audit).
+import { segmentSlopes, cycleEstimate, tankStatsFromCycles } from '../src/capacity-ledger.js';
+
+const WK = 'wk';
+const day = 86400_000;
+const cycle = (over = {}) => ({
+  axis: 'all', startedAt: 0, endedAt: 7 * day, windowStartedAt: 0, complete: true,
+  finalUtilization: 0.9, tokens: 3_000_000_000, samples: [], ...over,
+});
+// A slope-built sample set: util climbs 0.10→0.90, tokens proportional → slope 3.0B per full window.
+const slopeSamples = (b = 3_000_000_000) => [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.9].map((u, i) => ({
+  t: i * day, util: u, tokens: Math.round(b * (u - 0.1)),
+}));
+
+test('D1: a spansRefill cycle estimated by SLOPES is admitted (the refill wiped its pre-refill samples)', () => {
+  const refillSlope = cycle({ spansRefill: true, samples: slopeSamples(), finalUtilization: 0.9 });
+  const clean = cycle({ samples: slopeSamples(), startedAt: 8 * day, endedAt: 15 * day, resetAt: 15 * day + day });
+  const t = tankStatsFromCycles([clean, refillSlope], WK);
+  assert.equal(t.n, 2, 'both cycles must count — the slope estimator is refill-safe by construction');
+  assert.equal(t.avg, 3_000_000_000);
+});
+test('D1: a spansRefill cycle estimable only by CLOSE-time division stays excluded (the unsafe method)', () => {
+  const refillClose = cycle({ spansRefill: true, samples: [], finalUtilization: 0.9, tokens: 2_000_000_000 });
+  const clean = cycle({ samples: slopeSamples() });
+  const t = tankStatsFromCycles([clean, refillClose], WK);
+  assert.equal(t.n, 1, 'close-method refill cycles keep the overcounting hazard — still excluded');
+});
+
+test('D6: a SHORT cycle with a single slope segment is rejected (kira: one 5-point slice read 3x low)', () => {
+  const oneSeg = cycle({
+    startedAt: 6 * day, endedAt: 7 * day,   // 1-day span, under the 80% floor
+    samples: [{ t: 6 * day, util: 0.72, tokens: 0 }, { t: 7 * day, util: 0.77, tokens: 53_377_028 }],
+    finalUtilization: 0.77,
+  });
+  const t = tankStatsFromCycles([oneSeg], WK);
+  assert.equal(t, null, 'one segment is one slice, not a capacity observation');
+});
+test('D6: a short cycle with 3 segments and a util span >= 0.20 is admitted', () => {
+  const three = cycle({
+    startedAt: 5 * day, endedAt: 7 * day,
+    samples: [{ t: 5 * day, util: 0.50, tokens: 0 }, { t: 6 * day, util: 0.60, tokens: 300_000_000 }, { t: 6.5 * day, util: 0.75, tokens: 750_000_000 }, { t: 7 * day, util: 0.80, tokens: 900_000_000 }],
+    finalUtilization: 0.80,
+  });
+  const t = tankStatsFromCycles([three], WK);
+  assert.ok(t && t.n === 1, '3 segments over a 0.30 util span is a real observation');
+});
+
+test('D7: an EXPORTED cycle\'s own est is preferred over slopes recomputed from thinned samples', () => {
+  const est = cycle({ samples: [], est: 2_639_000_000, merged: false, finalUtilization: 0 });
+  const t = tankStatsFromCycles([est], WK);
+  assert.equal(t.avg, 2_639_000_000, 'the exporter saw up to 64 samples; the importer sees 16');
+});
+test('D7: a SHORT exported cycle (est present, below the read floor) is admitted as realShort', () => {
+  const shortExport = cycle({ startedAt: 5 * day, endedAt: 7 * day, samples: [], est: 2_226_000_000, merged: false, finalUtilization: 0.9 });
+  const t = tankStatsFromCycles([shortExport], WK);
+  assert.ok(t && t.n === 1, 'mk@gomokka 1.01d / security 2.24d / continuity 0.73d exports must not blank');
+});
+
+test('D5: estimateFromUtilization prefers the WHOLE-WINDOW absolute over an in-memory delta mark', () => {
+  const T0 = Date.UTC(2026, 10, 11, 0, 0);   // a Wednesday 00:00 — windowStartedAt = T0 via open.windowStartedAt below
+  const l = new CapacityLedger({ now: () => T0 + 6 * day });
+  // Accrue from the very start of the window (wholeWindow true), util rising 0.10→0.83.
+  l.accrue('d5', { input: 500_000_000, output: 0 }, T0);
+  l.noteUtilizationObserved(T0, [{ name: 'd5', window: 'wk', utilization: 0.10 }]);
+  l.accrue('d5', { input: 2_213_145_801, output: 0 }, T0 + 6 * day);
+  l.noteUtilizationObserved(T0 + 6 * day, [{ name: 'd5', window: 'wk', utilization: 0.83 }]);
+  const o = l.openCycle('d5', 'wk');
+  o.windowStartedAt = T0;   // the caller learns it from the quota reset stamp
+  const est = l.estimateFromUtilization('d5', 'wk', 0.83);
+  assert.ok(est && Math.abs(est.tokens - 3_268_850_363) < 1e6,
+    `whole-window absolute must win over the delta mark, got ${est && est.tokens}`);
+});
+
+// ── D3: the cloud's OPEN week is exported so mirror rows can show a live number ──
+test('D3: exportOpenCycle returns the open window with a thinned sample list and an est', () => {
+  const T0 = Date.UTC(2026, 10, 11);
+  const l = new CapacityLedger({ now: () => T0 + 6 * day });
+  l.accrue('x', { input: 1_000_000_000, output: 0 }, T0);
+  l.noteUtilizationObserved(T0, [{ name: 'x', window: 'wk', utilization: 0.2 }]);
+  l.accrue('x', { input: 1_500_000_000, output: 0 }, T0 + 2 * day);
+  l.noteUtilizationObserved(T0 + 2 * day, [{ name: 'x', window: 'wk', utilization: 0.6 }]);
+  l.accrue('x', { input: 1_500_000_000, output: 0 }, T0 + 3 * day);
+  l.noteUtilizationObserved(T0 + 3 * day, [{ name: 'x', window: 'wk', utilization: 0.9 }]);
+  const o = l.openCycle('x', 'wk');
+  o.windowStartedAt = T0;
+  const e = l.exportOpenCycle('x', 'wk');
+  assert.ok(e, 'the open cycle exports');
+  assert.equal(e.tokensSoFar, 4_000_000_000);
+  assert.equal(e.windowStartedAt, T0);
+  assert.ok(e.samples.length >= 3, 'samples ride along for slope estimation');
+  assert.ok(Number.isFinite(e.est) && e.est > 0, 'the exporter\'s own est rides along');
+});
+test('D3: exportOpenCycle returns null when no cycle is open', () => {
+  const l = new CapacityLedger({ now: () => Date.now() });
+  assert.equal(l.exportOpenCycle('nobody', 'wk'), null);
+});

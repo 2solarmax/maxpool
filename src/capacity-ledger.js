@@ -174,7 +174,6 @@ export function tankStatsFromCycles(cycles, window, { readFloor = null, ignoreCe
     && !c.disabledDuring
     && c.partialReason !== 'pre-v3-unverified'
     && c.partialReason !== 'no-weekly-plan'
-    && !c.spansRefill
     && (ignoreCeiling || (c.endedAt - c.startedAt) <= WINDOW_MS[window] * WINDOW_CEIL_FACTOR));
   const ests = [];
   let tooLittle = 0;
@@ -186,7 +185,23 @@ export function tankStatsFromCycles(cycles, window, { readFloor = null, ignoreCe
     // joined mid-week: a 4.3-day weekly tail at util 1.0 is a true reading, and the
     // slope method does not care that we joined late).
     const short = span < floor - 1_000;
-    const realShort = est?.method === 'slopes' && c.finalUtilization >= CLOSE_FALLBACK_MIN_UTIL;
+    // A short cycle is a real observation when the estimate is refill-safe AND the
+    // observation is STRONG: >=3 slope segments, or a util span >=0.20 (audit D6 —
+    // kira's admitted cycle was ONE 5-point slice reading 3x low). Exported cycles
+    // carry no samples; their est is trusted as exported (audit D7 — without this,
+    // short cloud exports like mk@gomokka 1.01d / security 2.24d blank the row).
+    const utilSpan = Math.max(...(c.samples || []).map(x => x?.util ?? 0), c.finalUtilization ?? 0)
+      - Math.min(...(c.samples || []).map(x => x?.util ?? 1), ...(c.samples?.length ? [] : [c.finalUtilization ?? 1]));
+    const strong = est?.method === 'exported'
+      || (est?.method === 'slopes' && (est.segments >= 3 || utilSpan >= 0.20 - 1e-9));
+    const realShort = strong && c.finalUtilization >= CLOSE_FALLBACK_MIN_UTIL;
+    // SPANS-REFILL (audit D1, 2026-11-18): excluded only when the estimate would use
+    // close-time division, which a refill genuinely breaks (pre-refill tokens inflate
+    // tokens÷util at close). Slope/exported estimates are refill-safe: the refill WIPES
+    // the sample list (noteRefill) and slopes re-anchor on any util drop, so what
+    // survives measures exactly the post-refill tank. The blanket pre-filter dashed
+    // 9 of 25 rows on the 2026-11-18 screen.
+    if (c.spansRefill && est?.method === 'close') { tooLittle++; continue; }
     if (!est || (short && !realShort)) { tooLittle++; continue; }
     ests.push({ c, est });
   }
@@ -557,7 +572,14 @@ export class CapacityLedger {
     // utilization AND tokens accrued across the same span; falls back to absolute when
     // we genuinely did watch from the start.
     const mark = this._utilMarks?.get(`${name}:${window}`);
-    if (mark && utilization > mark.utilization) {
+    // WHOLE-WINDOW FIRST (audit D5, 2026-11-18): when the open cycle provably starts at
+    // the window boundary, tokens/util is the EXACT observation — the delta form only
+    // exists to cancel pre-join usage a late-joined ledger cannot see, and it amplifies
+    // vendor whole-percent rounding (a 0.73->0.80 span ranged 1.42-2.08B on the same
+    // account). Delta stays the fallback for late-joined windows.
+    const wholeNow = open.startedAt != null && open.windowStartedAt != null
+      && open.startedAt <= open.windowStartedAt + 60_000;
+    if (!wholeNow && mark && utilization > mark.utilization) {
       const deltaTokens = open.tokensSoFar - mark.tokensSoFar;
       const deltaUtil = utilization - mark.utilization;
       // A meaningful denominator only: a 0.5pp move on a coarse-rounded percentage
@@ -577,11 +599,9 @@ export class CapacityLedger {
     const fresh = this._utilObservedAt > 0 && open.startedAt != null && this._utilObservedAt >= open.startedAt;
     // ABSOLUTE fallback. Only a LOWER BOUND unless we observed the window from its very
     // start — flagged so the UI can say "≥" rather than present a floor as the answer.
-    const wholeWindow = open.startedAt != null && open.windowStartedAt != null
-      && open.startedAt <= open.windowStartedAt + 60_000;
     return {
       tokens: Math.round(open.tokensSoFar / utilization),
-      utilization, fresh, method: 'absolute', lowerBound: !wholeWindow,
+      utilization, fresh, method: 'absolute', lowerBound: !wholeNow,
     };
   }
 
@@ -731,6 +751,28 @@ export class CapacityLedger {
       if (c.samples?.length) o.samples = thin(c.samples, EXPORT_SAMPLES).map(({ t, tokens, util }) => ({ t, tokens, util }));
       return o;
     });
+  }
+
+  /** The OPEN cycle of one window, export-shaped (audit D3, 2026-11-18): mirror rows
+   *  need the running week to show a live Current, and today the export carries closed
+   *  cycles only — so every cloud row could only ever show history, never the live
+   *  number. Shape mirrors exportCycles plus { tokensSoFar, peakUtilization, est } so
+   *  the consumer can compute its own slope or trust the exporter's estimate. */
+  exportOpenCycle(name, window) {
+    const o = this.openCycle(name, window);
+    if (!o || !(o.tokensSoFar > 0)) return null;
+    // TWO qualifying segments already agree on the tank to within vendor rounding;
+    // demanding three drops a 2-segment open week (the exporter's own live estimate
+    // would be withheld for no reason — the consumer falls back to absolute anyway).
+    const est = segmentSlopes(o.samples || []);
+    return {
+      startedAt: o.startedAt,
+      ...(o.windowStartedAt != null ? { windowStartedAt: o.windowStartedAt } : {}),
+      tokensSoFar: o.tokensSoFar,
+      ...(Number.isFinite(o.peakUtilization) ? { peakUtilization: o.peakUtilization } : {}),
+      ...(est.length >= 2 ? { est: Math.round(median(est)) } : {}),
+      ...(o.samples?.length ? { samples: thin(o.samples, EXPORT_SAMPLES).map(({ t, tokens, util }) => ({ t, tokens, util })) } : {}),
+    };
   }
 
   rollingThroughput(name, days = 7) {
