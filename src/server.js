@@ -484,6 +484,41 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         const acct = body?.account;
         if (acct && typeof acct.name === 'string') acct.name = safeText(acct.name);
         if (acct && typeof acct.organizationUuid !== 'string') delete acct.organizationUuid;
+        // PROVIDER (z.ai/Kimi) adds share this door (2026-11-18): a linked laptop's
+        // add-key flow can land the key on the cloud exactly like a browser login.
+        // No tokens are logged; the key rides the same authenticated channel.
+        if (acct?.type === 'provider') {
+          const who = caller.name || 'legacy-key';
+          if ((acct.provider !== 'zai' && acct.provider !== 'kimi') || typeof acct.apiKey !== 'string' || !acct.apiKey) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'bad_request', message: 'Expected {account: {type:"provider", provider:"zai"|"kimi", apiKey, name?, secretName?}}' }));
+            return;
+          }
+          const dup = accountManager.accounts.find(x => x.name === acct.name)
+            || accountManager.accounts.find(x => x.type === 'provider' && x.credential === acct.apiKey);
+          if (dup) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, result: 'exists', name: dup.name }));
+            return;
+          }
+          try {
+            const { name, provider, apiKey, secretName, modelMap } = acct;
+            accountManager.loadConfigProviders([{ name, provider, token: apiKey, ...(modelMap ? { modelMap } : {}) }]);
+            await atomicConfigUpdate(diskConfig => {
+              if (!Array.isArray(diskConfig.providers)) diskConfig.providers = [];
+              diskConfig.providers.push(secretName ? { name, provider, secretName } : { name, provider, apiKey });
+            });
+            appendEventLog(`[Maxpool] Remote provider add: "${name}" (${provider}) by ${who}`);
+          } catch (err) {
+            console.error(`[Maxpool] Remote provider add persisted to memory but NOT disk for "${acct.name}": ${err?.message || err}`);
+            res.writeHead(507, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'not_persisted', message: 'Saved in memory only — the pool could not write it to disk. Try again.' }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, result: 'added', name: acct.name }));
+          return;
+        }
         if (!acct || acct.type !== 'oauth' || typeof acct.accountUuid !== 'string' || !acct.accountUuid ||
             typeof acct.refreshToken !== 'string' || !acct.refreshToken || typeof acct.accessToken !== 'string' || !acct.accessToken) {
           res.writeHead(400, { 'Content-Type': 'application/json' });

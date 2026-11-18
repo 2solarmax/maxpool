@@ -125,3 +125,38 @@ export function planCliLogin({ usable = [], unresolved = [], error, localMatch =
   if (t === 'ask') return { action: 'ask-target', pool };
   return t === 'local' ? { action: 'local' } : { action: 'cloud', pool };
 }
+
+/**
+ * POST a provider key (z.ai/Kimi) to the team pool — the add-key twin of
+ * sendLoginToPool (2026-11-18: the TUI's add flow asks cloud-or-laptop exactly like the
+ * Claude login). Never throws; single-writer rule — a failure NEVER falls back to a
+ * local save.
+ * @returns {Promise<{ok:boolean, result?:string, name?:string, error?:string}>}
+ */
+export async function sendProviderToPool({ url, key, name, provider, apiKey, secretName, fetchImpl = fetch, timeoutMs = TIMEOUT_MS }) {
+  if (!apiKey || (provider !== 'zai' && provider !== 'kimi')) {
+    return { ok: false, error: 'A provider key and type are required' };
+  }
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(`${String(url).replace(/\/+$/, '')}/maxpool/accounts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key || '' },
+      body: JSON.stringify({
+        account: {
+          name, type: 'provider', provider, apiKey,
+          ...(secretName ? { secretName } : {}),
+        },
+      }),
+      signal: ctl.signal,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (res.ok && json.ok) return { ok: true, result: json.result, name: json.name || name };
+    return { ok: false, error: `Team pool rejected the key (HTTP ${res.status}: ${json?.message || json?.error || 'unknown error'})` };
+  } catch (e) {
+    return { ok: false, error: `Could not reach the team pool (${e?.name === 'AbortError' ? 'timed out' : e?.message})` };
+  } finally {
+    clearTimeout(t);
+  }
+}

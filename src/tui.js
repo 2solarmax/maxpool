@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
+import { sendProviderToPool } from './cloud-login.js';
 import { describeLinkError } from './pool-link.js';
 import { normalizeRemoteResets, resolveStickyBusyBudget } from './account-manager.js';
 import { appliesTo } from './claude-reset-grants.js';
@@ -1573,7 +1574,7 @@ export class TUI {
     }
   }
 
-  async _doAddProvider({ name, provider, secretName, apiKey }) {
+  async _doAddProvider({ name, provider, secretName, apiKey }, { toTeam = null } = {}) {
     this.mode = 'accounts';
     if (secretName) this._addLog(`Resolving secret "${secretName}" from GCP…`);
     else this._addLog(`Adding "${name}" with direct API key…`);
@@ -1589,6 +1590,27 @@ export class TUI {
         }
       } else {
         token = apiKey;
+      }
+      // TEAM-POOL CHOICE (2026-11-18, parity with the Claude login flow): when a linked
+      // pool exists and the caller did not already decide, ask once — cloud recommended
+      // (the key serves the whole team there), laptop on 'l'. A chosen team target sends
+      // the key over the link's authenticated channel and saves NOTHING locally.
+      const link = this.am.poolLinks?.[0] || null;
+      let team = toTeam;
+      if (team == null && link && !this.am.accounts.some(a => a.type === 'provider' && a.credential === token)) {
+        const where = String(await this._ask(`\nAdd "${name}" to the team pool "${link.name}" (recommended) or this laptop only? [T/l]: `) || '').trim().toLowerCase();
+        team = where !== 'l';
+      }
+      if (team && link) {
+        this._addLog(`Sending "${name}" to the team pool (${link.name})…`);
+        this.forceRender();
+        const r = await sendProviderToPool({ url: link.url, key: link.key, name, provider, apiKey: token, secretName });
+        if (r.ok) {
+          this._addLog(`✓ ${r.result === 'exists' ? `"${r.name}" already in` : `Added "${r.name}" to`} the team pool (${link.name}). Nothing saved on this laptop.`);
+        } else {
+          this._addLog(`✗ Team pool failed — ${r.error}. NOTHING saved locally; try again.`);
+        }
+        return;
       }
       // Add to config (persistence) and activate immediately.
       const { atomicConfigUpdate } = await import('./config.js');
