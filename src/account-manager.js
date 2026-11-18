@@ -6742,7 +6742,16 @@ export class AccountManager {
       // transitions re-sync the mirrors through the same callback. stop() clears both.
       l.startProbe?.(onChange);
       // UP (after onChange revived the mirrors): drop any link-fault bench left on them.
-      if (typeof l.onUp === 'function') this._poolLinkUnsubs.push(l.onUp(() => this.liftLinkFaultCooldown(l.name)));
+      // Also lift on any answer while the link never went down (a blip: fault -> one miss ->
+      // answer has no UP event), and poll at once on UP so a lastError left by a long outage
+      // doesn't keep the mirrors out until the next 30 s tick.
+      if (typeof l.onUp === 'function') {
+        this._poolLinkUnsubs.push(l.onUp(() => {
+          this.liftLinkFaultCooldown(l.name);
+          Promise.resolve(l.poll?.()).then(() => onChange()).catch(() => {});
+        }));
+      }
+      if (typeof l.onAlive === 'function') this._poolLinkUnsubs.push(l.onAlive(() => this.liftLinkFaultCooldown(l.name)));
     }
     this.applyPoolLinks();
   }
