@@ -43,7 +43,7 @@ function hostedWebSearch(tools, native) {
   if (allowed) tool.filters = { allowed_domains: allowed };
   if (search.user_location) tool.user_location = search.user_location;
   const bounded = native && (search.max_uses || blocked) ? {
-    maxUses: search.max_uses ?? 8,
+    maxUses: search.max_uses ?? Infinity,
     settings: { ...tool, allowed_callers: ['direct'] },
   } : null;
   if (bounded) {
@@ -61,6 +61,30 @@ function claudeSearchQuery(json, instructions) {
   const parts = blocks(messages[0].content);
   return parts.length === 1 && parts[0]?.type === 'text'
     ? /^Perform a web search for the query:\s*([\s\S]+)$/.exec(parts[0].text)?.[1]?.trim() || null : null;
+}
+
+export function webSearchesInTurn({ messages = [], tools = [] }) {
+  if (!Array.isArray(tools) || !Array.isArray(messages)) return 0;
+  const search = tools.find(tool => searchVersions.has(tool?.type) && tool.max_uses);
+  if (!search) return 0;
+  const name = search.name || 'web_search';
+  const calls = new Set();
+  const refused = new Set();
+  // Claude Messages continues a turn when the newest user message contains
+  // tool results only. The transcript already holds the earlier search receipts.
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    const parts = blocks(message?.content);
+    if (message?.role === 'user' && !parts.every(part => part?.type === 'tool_result')) break;
+    if (message?.role !== 'assistant') continue;
+    for (const part of parts) {
+      if (part?.type === 'server_tool_use' && part.name === name && part.id) calls.add(part.id);
+      if (part?.type === 'web_search_tool_result' && part.content?.error_code === 'max_uses_exceeded') {
+        refused.add(part.tool_use_id);
+      }
+    }
+  }
+  return Array.from(calls).filter(id => !refused.has(id)).length;
 }
 
 function wireName(name) {
@@ -89,7 +113,7 @@ function inputPart(block) {
  * calls and outputs as matching Responses items. Provider-owned state can travel
  * as visible context, and opaque thinking is kept out of the request.
  */
-export function toOpenAIRequest(json, model, { native = false } = {}) {
+export function toOpenAIRequest(json, model, { native = false, priorSearches = webSearchesInTurn(json) } = {}) {
   const toolNames = new Map();
   const functionScope = native ? {} : { namespace: scope };
   const webSearch = hostedWebSearch(json.tools || [], native);
@@ -163,6 +187,7 @@ export function toOpenAIRequest(json, model, { native = false } = {}) {
   if (json.tool_choice?.disable_parallel_tool_use) body.parallel_tool_calls = false;
   const boundedSearch = webSearch?.bounded && body.tool_choice !== 'none' ? {
     ...webSearch.bounded,
+    maxUses: Math.max(0, webSearch.bounded.maxUses - priorSearches),
     directQuery: claudeSearchQuery(json, instructions),
   } : null;
   return { body, toolNames, webSearch: webSearch?.name, boundedSearch };
@@ -322,7 +347,9 @@ export async function fetchBoundedOpenAIResponse({ body, boundedSearch }, { fetc
   for (;;) {
     const response = await fetchResponses(next);
     if (!usableResponse(response)) return response;
-    if (remaining <= 0) return searchStream(response, readEvents(response.body), receipts, planningUsage);
+    if (!next.tools?.some(tool => tool.name === searchFunction.name)) {
+      return searchStream(response, readEvents(response.body), receipts, planningUsage);
+    }
     const events = [];
     const output = [];
     for await (const event of readEvents(response.body)) {

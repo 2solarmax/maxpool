@@ -1,4 +1,4 @@
-import { fetchBoundedOpenAIResponse, fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest } from './openai-responses.js';
+import { fetchBoundedOpenAIResponse, fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest, webSearchesInTurn } from './openai-responses.js';
 import { nativeCodexHeaders, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
 import { codexModelFor, validCodexCatalog } from './codex-model-routing.js';
 import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
@@ -1841,7 +1841,9 @@ async function forwardRequest(
   let openAIRequest;
   if (openAI) {
     try {
-      openAIRequest = toOpenAIRequest(JSON.parse(body.toString()), openAIModel, { native: nativeCodex });
+      openAIRequest = toOpenAIRequest(JSON.parse(body.toString()), openAIModel, {
+        native: nativeCodex, priorSearches: requestInfo.webSearchesInTurn,
+      });
     } catch (error) {
       res.off('close', onClientClose);
       accountManager.releaseAccount(lease, { neutral: true });
@@ -4817,6 +4819,7 @@ function describeRequest(req, body) {
     const json = JSON.parse(body.toString());
     if (json.model) info.model = json.model;
     info.hasTools = Array.isArray(json.tools) && json.tools.some(tool => tool?.input_schema || /^web_search_\d{8}$/.test(tool?.type));
+    info.webSearchesInTurn = webSearchesInTurn(json);
     if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(json.output_config?.effort)) {
       info.reasoningEffort = json.output_config.effort;
     }

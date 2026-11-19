@@ -176,6 +176,17 @@ test('native standalone search enforces the request cap and domain exclusions', 
   assert.equal(message.stop_reason, 'end_turn');
   assert.equal(message.usage.output_tokens, 26, 'account usage includes model work to plan the search');
 
+  const continued = await post({ system: 'Continue after the client tool.', messages: [
+    ...searchRequest.messages,
+    { role: 'assistant', content: [message.content[0], message.content[1], {
+      id: 'toolu_fixture', type: 'tool_use', name: 'Read', input: { file_path: 'fixture' },
+    }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_fixture', content: 'Fixture read result' }] },
+  ] });
+  assert.equal(continued.status, 200);
+  assert.equal(searches.length, 2, 'earlier searches in the same turn count after an ordinary tool result');
+  assert.equal((await continued.json()).content[1].content.error_code, 'max_uses_exceeded');
+
   searchAvailable = false;
   const unavailable = await post({});
   assert.ok(unavailable.status >= 400);
