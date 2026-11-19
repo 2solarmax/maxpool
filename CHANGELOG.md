@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cap client requests for a selected local terminal
 - Route Claude Code through ChatGPT subscriptions
 - Route Claude Code through native Codex subscriptions
 - Show automatic reset preference in MaxPool account details
@@ -17,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Verify named and legacy cap scope across retries
+- Fix the four baseline lint fixtures that block the terminal-cap checks
 - Align release checks with supported Node versions
 - Cover Codex quota ownership and banked reset routing
 - Support Claude Code web tools on native Codex accounts
@@ -52,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Disarm a terminal cap with a missing run directory
 - Handle ChatGPT plan streams in the isolated provider pilot
 - Report unavailable Codex routes accurately
 - Follow stable Codex clients for model discovery
