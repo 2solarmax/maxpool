@@ -227,3 +227,54 @@ test('linked pool accepts a native grant and advertises routing and reset metada
   assert.equal(mirror.quota.unified7d, 0.24);
   assert.equal(codexModelFor({ model: 'claude-fable-5-2' }, mirror), 'gpt-6.2-astra');
 });
+
+test('an opted-in banked reset can release a dry Codex-only request without rerouting it', async t => {
+  const upstream = await listen(t, http.createServer(async (req, res) => {
+    for await (const _ of req) { /* drain input */ }
+    res.writeHead(200);
+    res.end('data: {"type":"response.output_text.delta","item_id":"m1","delta":"after the reset"}\n\n' +
+      'data: {"type":"response.completed","response":{}}\n\n');
+  }));
+  const am = new AccountManager([native('dry', upstream), { name: 'other-provider', type: 'apikey', apiKey: 'fake' }]);
+  const resetAt = Date.now() + 3600000;
+  am.applyCodexUsageData(0, { sevenDay: { utilization: 1, resetAt }, modelBuckets: [] });
+  let redeemed = 0;
+  const hooks = { redeemCodexForRequest(info) {
+    assert.equal(info.onlyProvider, 'codex');
+    redeemed++;
+    am.applyCodexUsageData(0, { sevenDay: { utilization: 0, resetAt: resetAt + 3600000 }, modelBuckets: [] });
+    return { redeemed: true };
+  } };
+  const url = await listen(t, createProxyServer(am, { proxy: { apiKey: 'fixture' }, queue: { enabled: false } }, hooks));
+  const result = await request(url, 'claude-sonnet-5-2', 'thread-reset-1', 'use the eligible account',
+    {}, { 'x-maxpool-provider': 'codex' });
+  assert.equal(result.status, 200);
+  assert.match(await result.text(), /after the reset/);
+  assert.equal(redeemed, 1);
+  assert.equal(am.accounts[0].completedRequests, 1);
+  assert.equal(am.accounts[1].completedRequests, 0);
+});
+
+test('a running quota probe cannot apply an old grant’s response to another account', async () => {
+  const am = new AccountManager([native('old', null), native('replacement', null)]);
+  const [old, replacement] = am.accounts;
+  let start;
+  const started = new Promise(resolve => { start = resolve; });
+  let answer;
+  const pending = new Promise(resolve => { answer = resolve; });
+  const probe = new Prober(am, { usageGapMs: 0,
+    codexProbeFn: account => {
+      if (account === old) { start(); return pending; }
+      return { modelBuckets: [] };
+    },
+    codexCatalogFn: () => ({ notModified: true }),
+  });
+  const sweep = probe.probeAll();
+  await started;
+  am.removeAccount(old.index);
+  assert.equal(replacement.index, 0);
+  answer({ sevenDay: { utilization: 0.9, resetAt: Date.now() + 3000000 }, resetCredits: { available: 5 } });
+  await sweep;
+  assert.equal(replacement.quota.unified7d, null);
+  assert.equal(replacement.quota.codexResetCredits, undefined);
+});
