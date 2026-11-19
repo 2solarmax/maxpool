@@ -64,8 +64,8 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     if (Number.isFinite(q.unified5hReset)) items.push('Session reset ' + new Date(q.unified5hReset).toLocaleString());
     if (Number.isFinite(q.unified7dReset)) items.push('Weekly reset ' + new Date(q.unified7dReset).toLocaleString());
     var credits = a.codexResetCredits;
-    if (credits && Number.isFinite(credits.available)) items.push(credits.available + ' banked' +
-      (Number.isFinite(credits.applicable) ? ' · ' + credits.applicable + ' eligible' : ''));
+    if (credits && Number.isFinite(credits.available)) items.push(credits.available +
+      (credits.available === 1 ? ' banked reset' : ' banked resets'));
     if (typeof a.autoRedeemReset === 'boolean') items.push('Automatic resets ' + (a.autoRedeemReset ? 'on' : 'off'));
     return items.map(function (item) { return '<div class="sub">' + esc(item) + '</div>'; }).join('');
   }

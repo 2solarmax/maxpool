@@ -165,7 +165,7 @@ test('browser account screen shows native quota and banked reset inventory', asy
   assert.match(app.innerHTML, /class="sub">Codex/);
   assert.match(app.innerHTML, /45%/);
   assert.match(app.innerHTML, /Weekly reset/);
-  assert.match(app.innerHTML, /3 banked · 0 eligible/);
+  assert.match(app.innerHTML, /3 banked resets/);
   assert.match(app.innerHTML, /Automatic resets off/);
 });
 

@@ -305,12 +305,12 @@ function resetSummary(account) {
 function codexResetCells(account, now = Date.now()) {
   const reset = resetSummary(account);
   let label = '-';
-  if (account.enabled !== false && Number.isInteger(reset?.applicable) && reset.applicable >= 0) {
-    label = String(reset.applicable);
+  if (account.enabled !== false && Number.isInteger(reset?.available) && reset.available >= 0) {
+    label = String(reset.available);
     const stale = reset.stale || account.refreshDead || account.subscriptionGone
       || (reset.checkedAt != null && now - reset.checkedAt > LISTING_FRESH_MS);
     if (stale) label += '?';
-    else label = reset.applicable > 0 ? green(label) : gray(label);
+    else label = reset.available > 0 ? green(label) : gray(label);
   }
   return rpad(gray('-'), MRST_W) + ' ' + rpad(label, ARST_W);
 }
@@ -2224,8 +2224,10 @@ export class TUI {
     const state = this.codexResets;
     const out = ['', ` ${bold('Codex resets')}  ${state.account.name}`];
     const summary = resetSummary(state.account);
-    if (Number.isInteger(summary?.available) && Number.isInteger(summary?.applicable)) {
-      out.push(` ${summary.available} banked · ${summary.applicable} redeemable now`);
+    if (Number.isInteger(summary?.available)) {
+      const balance = summary.available + (summary.available === 1 ? ' banked reset' : ' banked resets');
+      const timing = summary.available > 0 && summary.applicable === 0 ? ' · Saved for later' : '';
+      out.push(' ' + balance + timing);
     }
     const quota = state.account.quota;
     const windows = [];
