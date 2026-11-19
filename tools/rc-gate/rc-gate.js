@@ -154,7 +154,9 @@ const MAXPOOL_KEY = process.env.RC_GATE_MAXPOOL_KEY || '';
 // Message bodies are tens of KB to a few MB; 10 min is far above any real upload.
 const MITM_BODY_DEADLINE_MS = Number(process.env.RC_GATE_MITM_BODY_DEADLINE_MS) || 600_000;
 const MITM_HOSTS = new Set((process.env.RC_GATE_MITM_HOSTS || 'api.anthropic.com').split(',').map(s => s.trim()).filter(Boolean));
-const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
+// Desktop pool mode uses all local providers. An explicit client or operator profile wins.
+const localPool = ['127.0.0.1', 'localhost', '::1'].includes(MAXPOOL_HOST);
+const PROFILE = process.env.RC_GATE_PROFILE || (localPool ? 'all' : 'claude');
 
 // LIVE ROUTING SWITCH (owner 2026-11-01: "make the routing switch without having to
 // restart the app"). A running Claude session pins its proxy env at launch, but every

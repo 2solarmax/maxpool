@@ -298,15 +298,19 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+function resetSummary(account) {
+  return account.quota?.codexResetCredits ?? account.codexResetCredits;
+}
+
 function codexResetCells(account, now = Date.now()) {
-  const reset = account.quota?.codexResetCredits ?? account.codexResetCredits;
+  const reset = resetSummary(account);
   let label = '-';
-  if (account.enabled !== false && Number.isInteger(reset?.available) && reset.available >= 0) {
-    label = String(reset.available);
+  if (account.enabled !== false && Number.isInteger(reset?.applicable) && reset.applicable >= 0) {
+    label = String(reset.applicable);
     const stale = reset.stale || account.refreshDead || account.subscriptionGone
       || (reset.checkedAt != null && now - reset.checkedAt > LISTING_FRESH_MS);
     if (stale) label += '?';
-    else if (reset.available > 0) label = reset.applicable === 0 ? yellow(label) : green(label);
+    else label = reset.applicable > 0 ? green(label) : gray(label);
   }
   return rpad(gray('-'), MRST_W) + ' ' + rpad(label, ARST_W);
 }
@@ -2160,7 +2164,7 @@ export class TUI {
     try {
       const result = await this.codexResetDetails(account.name);
       if (result.error) state.notice = `Could not read resets: ${result.error}`;
-      else state.credits = result.credits || [];
+      else state.credits = (result.credits || []).filter(credit => canRedeemCodexCredit(credit));
     } catch (error) {
       state.notice = `Could not read resets: ${error.message}`;
     } finally {
@@ -2183,7 +2187,7 @@ export class TUI {
       this._showCodexResets(state.account).catch(error => this._addLog(`Could not read resets: ${error.message}`));
     } else if (k === 'enter' && this.redeemCodexReset) {
       const credit = state.credits[state.selected];
-      if (state.account.enabled === false || !canRedeemCodexCredit(credit)) {
+      if (state.account.enabled === false || resetSummary(state.account)?.applicable === 0 || !canRedeemCodexCredit(credit)) {
         state.notice = 'This reset cannot be redeemed.';
         return;
       }
@@ -2219,7 +2223,7 @@ export class TUI {
   _renderCodexResets(maxRows) {
     const state = this.codexResets;
     const out = ['', ` ${bold('Codex resets')}  ${state.account.name}`];
-    const summary = state.account.quota?.codexResetCredits ?? state.account.codexResetCredits;
+    const summary = resetSummary(state.account);
     if (Number.isInteger(summary?.available) && Number.isInteger(summary?.applicable)) {
       out.push(` ${summary.available} banked · ${summary.applicable} redeemable now`);
     }
@@ -2236,7 +2240,7 @@ export class TUI {
     for (const [offset, credit] of state.credits.slice(start, start + visible).entries()) {
       const title = String(credit.title || 'Usage reset').replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 34);
       const expiry = credit.expiresAt == null ? '' : formatReset(credit.expiresAt);
-      const status = canRedeemCodexCredit(credit) ? 'Available' : 'Unavailable';
+      const status = 'Banked';
       out.push(` ${start + offset === state.selected ? '›' : ' '} ${title}  ${dim(status + (expiry ? ' · expires in ' + expiry : ''))}`);
     }
     return out;
@@ -4034,7 +4038,10 @@ export class TUI {
         return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'codexResets': {
         const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset ? 'on' : 'off'}` : '';
-        const redeem = this.redeemCodexReset ? `  ${bold('Enter')} Redeem` : '';
+        const state = this.codexResets;
+        const selectable = state.account.enabled !== false && resetSummary(state.account)?.applicable !== 0
+          && canRedeemCodexCredit(state.credits[state.selected]);
+        const redeem = this.redeemCodexReset && selectable ? `  ${bold('Enter')} Redeem` : '';
         return ` ${dim('↑↓')} Select${redeem}  ${bold('r')} Refresh${auto}  ${bold('Esc')} Back`;
       }
       case 'addtype':

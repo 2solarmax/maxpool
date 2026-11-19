@@ -305,7 +305,7 @@ gateDescribe('rc-gate: /v1/messages routes to maxpool with profile header', asyn
   const gate = await startGate({
     RC_GATE_PORT: '0',
     RC_GATE_MAXPOOL_PORT: String(mp.server.address().port),
-    RC_GATE_PROFILE: 'all',
+    RC_GATE_PROFILE: '',
   });
   try {
     const { tls: t } = await mitmConnect(gate.port);
@@ -315,6 +315,12 @@ gateDescribe('rc-gate: /v1/messages routes to maxpool with profile header', asyn
     assert.ok(msg, 'inference reached maxpool');
     assert.equal(msg.headers['x-maxpool-profile'], 'all', 'profile header applied');
     assert.ok(!('authorization' in msg.headers), 'client authorization stripped for pool auth');
+    const { tls: explicit } = await mitmConnect(gate.port);
+    await httpOverTLS(explicit, 'POST', '/v1/messages', {
+      'content-type': 'application/json', 'x-maxpool-profile': 'glm', 'x-maxpool-session': 'fixture',
+    }, JSON.stringify({ model: 'claude-sonnet', messages: [] }));
+    assert.equal(mp.state.requests.at(-1).headers['x-maxpool-profile'], 'glm');
+    assert.equal(mp.state.requests.at(-1).headers['x-maxpool-session'], 'fixture');
   } finally {
     gate.kill(); await new Promise(r => mp.server.close(r));
   }

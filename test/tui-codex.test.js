@@ -60,13 +60,15 @@ test('Codex account rows show native quota and distinguish unknown and banked re
   tui.am._isUpstreamThrottleBlocking = () => true;
   account.quota.unified7d = 0.45;
   account.quota.codexResetCredits = { available: 3, applicable: 0, checkedAt: Date.now() };
-  assert.equal(row().slice(col, col + 1), '3');
+  assert.equal(row().slice(col, col + 1), '0');
   assert.match(row(), /Codex\s+active.*Wk\s+45%/);
   const screenRow = strip(fitLine(tui._renderAcct(1, bw, showBoth, showFable, showSession, 80), 80));
   assert.equal(screenRow.length, 80);
   assert.match(screenRow, /Wk45%$/);
   account.quota.codexResetCredits.checkedAt -= 60 * 60 * 1000;
-  assert.equal(row().slice(col, col + 2), '3?');
+  assert.equal(row().slice(col, col + 2), '0?');
+  account.quota.codexResetCredits.applicable = null;
+  assert.equal(row().slice(col, col + 1), '-');
 });
 
 test('free reset inventory requires confirmation and refreshes after manual redemption', async () => {
@@ -76,6 +78,7 @@ test('free reset inventory requires confirmation and refreshes after manual rede
     async codexResetDetails(name) {
       calls.push(['read', name]);
       return { credits: [
+        { id: 'spent', title: 'Spent reset', status: 'redeemed' },
         { id: 'expired', title: 'Expired reset', status: 'available', expiresAt: Date.now() - 1000 },
         { id: 'available', title: 'One free reset', status: 'available', expiresAt: Date.now() + 60_000 },
       ] };
@@ -93,9 +96,12 @@ test('free reset inventory requires confirmation and refreshes after manual rede
   assert.ok(strip(tui._renderFooter()).length <= 80);
   assert.match(strip(tui._renderFooter()), /Auto: off/);
 
+  assert.doesNotMatch(tui._renderCodexResets(10).map(strip).join(' '), /Expired reset|Spent reset/);
+  account.codexResetCredits.applicable = 0;
+  assert.doesNotMatch(strip(tui._renderFooter()), /Redeem/);
   tui._key('enter');
-  assert.equal(tui.mode, 'codexResets', 'expired credit is never redeemable');
-  tui._key('down');
+  assert.equal(tui.mode, 'codexResets');
+  account.codexResetCredits.applicable = 1;
   tui._key('enter');
   assert.equal(tui.mode, 'confirm');
   tui._key('n');

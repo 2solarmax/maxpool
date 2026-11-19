@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Codex reset inventory
+
+OpenAI reports separate counts for unused and currently applicable credits. Accounts shows the applicable count, matching the other providers. Reset details lists unspent, unexpired credits supported by the plan and keeps both counts. Free-credit policy and local opt-in are independent of this display.
+
 ### 2026-11-19 · Codex account display
 
 Use the signed-in email as the default local account name. Reserve the Fable quota column for Anthropic rows. The dashboard summarizes cache hits by provider, with detailed counters available in Routing and `maxpool status`.

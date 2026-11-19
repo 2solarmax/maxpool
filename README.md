@@ -253,7 +253,7 @@ to extract information. Standalone Anthropic-hosted `web_fetch` and
 ChatGPT-hosted connectors use separate APIs.
 
 Codex quota and reset times appear in the account views whenever OpenAI
-reports the corresponding window. Use **Accounts → r** on a local Codex
+reports the corresponding window. The account reset column shows how many credits OpenAI currently marks applicable. Use **Accounts → r** on a local Codex
 account to inspect its free banked resets or confirm a redemption. Press
 **a** in that reset inventory to opt that account into automatic redemption,
 or set `autoRedeemReset: true` on its account entry. Newly added accounts start
