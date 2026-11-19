@@ -462,8 +462,9 @@ maxpool session-cap status "$terminal_uuid"
 maxpool session-cap disarm "$terminal_uuid"
 ```
 
-A named pool client adds `--caller NAME` to each command. Local anonymous and
-legacy-key callers omit it. Status includes the number of admitted client
+A named pool client adds `--caller NAME` to each command. A shared proxy key
+in strict-client mode uses `--caller legacy-key`. The default local anonymous
+caller omits it. Status includes the number of admitted client
 requests and whether an over-limit request was blocked. The cap takes effect
 on the next local `POST /v1/messages`. It persists through restarts until
 disarmed. Any in-flight requests admitted before arming run to completion.

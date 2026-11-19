@@ -677,7 +677,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         const session = headerValue(req.headers, 'x-maxpool-session');
         let message;
         try {
-          if (!await admitSessionRequest(capRoot, session, caller.name)) {
+          if (!await admitSessionRequest(capRoot, session, req.callerName)) {
             message = 'Local terminal request cap reached. Disarm the session cap to continue.';
           }
         } catch (err) {

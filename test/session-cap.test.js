@@ -30,16 +30,29 @@ test('authenticated admission is bounded across overlapping workers, retries and
     return 'http://127.0.0.1:' + server.address().port;
   }
   const seen = [];
+  let retryNext = false;
   const upstream = await listen(http.createServer((req, res) => {
     seen.push(req.url);
     req.resume();
+    if (retryNext) {
+      retryNext = false;
+      res.writeHead(429, { 'retry-after': '60', 'content-type': 'application/json' });
+      res.end('{"type":"error","error":{"type":"rate_limit_error"}}');
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"usage":{"input_tokens":1,"output_tokens":1}}');
   }));
   const config = {
-    upstream, proxy: { clients: [{ name: 'pilot', key: 'test-one' }, { name: 'peer', key: 'test-two' }] },
+    upstream, proxy: { apiKey: 'test-legacy', clients: [{ name: 'pilot', key: 'test-one' }, { name: 'peer', key: 'test-two' }] },
   };
-  const worker = () => listen(createProxyServer(new AccountManager([{ name: 'fake', type: 'apikey', apiKey: 'fixture' }], 0.9), config));
+  const worker = () => {
+    const accounts = [
+      { name: 'first', type: 'apikey', apiKey: 'fixture-one' },
+      { name: 'second', type: 'apikey', apiKey: 'fixture-two' },
+    ];
+    return listen(createProxyServer(new AccountManager(accounts, 0.9), config));
+  };
   const first = await worker();
   const second = await worker();
   const pilot = randomUUID();
@@ -83,6 +96,18 @@ test('authenticated admission is bounded across overlapping workers, retries and
   assert.equal(await call(replacement, peerSession), 200);
   await cap('disarm');
   assert.deepEqual(await cap('disarm'), { armed: false });
+
+  const legacy = (op, ...rest) => sessionCapCommand([op, pilot, ...rest, '--caller', 'legacy-key']);
+  await legacy('arm', '1');
+  retryNext = true;
+  const retryStart = seen.length;
+  assert.equal(await call(replacement, pilot, 'test-legacy'), 200);
+  assert.equal(seen.length - retryStart, 2, 'one client admission can include an internal retry');
+  assert.equal(await call(replacement, pilot, 'test-legacy'), 403);
+  assert.equal(seen.length - retryStart, 2, 'a new client attempt cannot cross the spent cap');
+  assert.deepEqual(await legacy('status'), { armed: true, limit: 1, admitted: 1, remaining: 0, blocked: true });
+  assert.equal(await call(replacement, pilot, 'test-two'), 200);
+  await legacy('disarm');
 });
 
 test('a fresh process cannot replenish the shared cap', async t => {
