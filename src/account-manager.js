@@ -227,6 +227,11 @@ const DEFAULT_SCHEDULER = {
   // cache writes were those re-writes. Priority tiers, provider rows and cross-family
   // picks are untouched. false = score-based moves (the 400-point bonus alone).
   claudeWarmHold: true,
+  // The hold lets go once its holder has this many requests in flight (this turn
+  // included; reserve/critical-unlock holders get the tightened share, 4 of 6).
+  // Measured 2026-11-19 on the live log: first-byte median 2.5 s at 4 in flight,
+  // 3.1 s at 5-6, 5.2 s at 7-9, while a move costs ~+1.6 s plus a full cache re-write.
+  claudeWarmHoldMaxInFlight: 6,
   // RETURN HOME after a provider detour (owner 2026-11-09): when a conversation's turn
   // went to GLM/Kimi and a later turn is routed back to Claude, it prefers the Claude
   // account it used last — that account still holds its stored copy. Only while the copy
@@ -3179,17 +3184,18 @@ export class AccountManager {
       // on the new account. Not when the hold has let go (_affinityRelease), the holder sits
       // in a worse priority tier, the pick is a provider row (cross-family is untouched),
       // or return-home just chose home (that block owns the detour return).
-      const holdCeiling = !holdCand ? Infinity
-        : (Number(this.scheduler.perAccountConcurrencyTarget) || 3)
-          + 2 * (Number(this.scheduler.cacheAffinityMaxExtraDepth) || 40) * this._reserveTightening(holdCand.account, holdCand.critUnlock);
+      const holdMaxInFlight = !holdCand ? Infinity
+        : Math.max(1, Math.round((Number(this.scheduler.claudeWarmHoldMaxInFlight) || 6)
+          * this._reserveTightening(holdCand.account, holdCand.critUnlock)));
       if (best && holdCand && best !== holdCand.account
         && isClaudeAccount(holdCand.account) && isClaudeAccount(best)
         && !(home && best.name === home.name)
         && holdCand.priority <= bestPriority
-        // DEPTH CEILING (red team F1): the hold never stacks a holder past its target +
-        // 2x the anti-dogpile allowance, counting THIS turn's weight — "regardless of
-        // score", not "regardless of depth". Past the ceiling the conversation moves as today.
-        && (holdCand.account.activeWeight ?? 0) + Math.max(1, requestInfo.weight || 1) <= holdCeiling
+        // DEPTH CEILING (red team F1): the hold never stacks a holder past a ceiling —
+        // "regardless of score", not "regardless of depth". The ceiling counts in-flight
+        // REQUESTS (this pool's own leases, this turn included), not conversation size:
+        // latency follows the number of requests in flight. Past it the conversation moves.
+        && (holdCand.account.inFlight || 0) + 1 <= holdMaxInFlight
         && !this._affinityRelease(holdCand.account, holdCand.critUnlock)) {
         const outscoredBy = best;
         best = holdCand.account;

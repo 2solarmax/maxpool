@@ -32,10 +32,11 @@ const pick = (m, excluded, over) => {
 };
 // The holder a1 carries 60 weight units from OTHER conversations: past the 400-point
 // affinity bonus (~33 units), so today's score loop moves the conversation to an idle
-// Claude sibling. With this turn's 10 units it sits UNDER the F1 depth ceiling (target 3 +
-// 2x40 = 83 units), so the hold keeps this conversation; past the ceiling it moves as today.
-const loadHolder = (a) => { a.activeWeight = 60; a.inFlight = 6; };
-const loadHolderPastCeiling = (a) => { a.activeWeight = 74; a.inFlight = 8; };   // 74 + 10 = 84
+// Claude sibling. The hold's depth ceiling counts in-flight REQUESTS (this turn included):
+// 5 in flight + this turn = 6 holds; 6 + 1 = 7 moves. Weight (60/74, past the old
+// 83-unit weight ceiling's neighbourhood) no longer decides the release.
+const loadHolder = (a) => { a.activeWeight = 60; a.inFlight = 5; };
+const loadHolderPastCeiling = (a) => { a.activeWeight = 60; a.inFlight = 6; };
 
 test('knob: scheduler.claudeWarmHold defaults to true', () => {
   assert.equal(claude3().scheduler.claudeWarmHold, true);
@@ -186,10 +187,10 @@ test('KNOB: claudeWarmHold=false restores score-based moves', () => {
 test('BUSY holder: the warm conversation keeps landing on its busy holder (no sibling re-write) while NEW conversations spread', () => {
   const m = claude3(); const a1 = byName(m, 'a1');
   served(m, a1);
-  // a1 is deep with other conversations' turns (6 x 10 = 60 units, under the 83-unit
-  // depth ceiling) and just refused busy for new placements.
+  // a1 is deep with other conversations' turns (5 in-flight leases, one under the
+  // 6-request in-flight ceiling) and just refused busy for new placements.
   const others = [];
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 5; i++) {
     others.push(m.acquireAccount(ri({ affinityKey: `s:other-${i}` }), new Set([byName(m, 'a2').index, byName(m, 'a3').index])));
   }
   assert.ok(others.every(l => l.account.name === 'a1'));
@@ -226,18 +227,40 @@ test('RT-F1: past the depth ceiling the warm conversation moves as today', () =>
   assert.notEqual(name, 'a1', `moved off an over-ceiling holder: ${logs.join(' | ')}`);
   assert.ok(!logs.some(l => l.includes('warm-hold=a1:kept')), 'no kept line past the ceiling');
 });
-test('RT-F1: the ceiling edge — 73 units + this 10-unit turn = exactly 83 still holds', () => {
+test('RT-F1: the ceiling edge — 5 in flight + this turn = 6 holds, 6 in flight moves', () => {
   const m = claude3(); const a1 = byName(m, 'a1');
-  served(m, a1); a1.activeWeight = 73; a1.inFlight = 8;
+  served(m, a1); a1.activeWeight = 60; a1.inFlight = 5;
   assert.equal(pick(m).name, 'a1', 'at the ceiling (counting this turn) the hold keeps the conversation');
+  const m2 = claude3(); const b1 = byName(m2, 'a1');
+  served(m2, b1); b1.activeWeight = 60; b1.inFlight = 6;
+  assert.notEqual(pick(m2).name, 'a1', 'one request past the ceiling moves');
 });
-test('RT-F1: the ceiling is tighter on a reserve holder (scaled by reserve/target)', () => {
+test('RT-F1: conversation size does not decide — a huge turn on a 5-in-flight holder still holds', () => {
   const m = claude3(); const a1 = byName(m, 'a1');
-  served(m, a1); loadHolder(a1);
+  served(m, a1, { weight: 44, bodyBytes: 2_800_000 }); a1.activeWeight = 90; a1.inFlight = 5;
+  assert.equal(pick(m, undefined, { weight: 44, bodyBytes: 2_800_000 }).name, 'a1');
+});
+const reserveHolder = () => {
+  const m = claude3(); const a1 = byName(m, 'a1');
+  served(m, a1);
   const orig = m._weeklyRawState.bind(m);
   m._weeklyRawState = (a) => (a === a1 ? 'reserve' : orig(a));
-  const r = m.scheduler.reserveConcurrencyTarget / m.scheduler.perAccountConcurrencyTarget;
-  const ceiling = m.scheduler.perAccountConcurrencyTarget + 2 * m.scheduler.cacheAffinityMaxExtraDepth * Math.min(1, r);
-  assert.ok(a1.activeWeight > ceiling, `fixture: 60 units sits past the reserve ceiling ${ceiling}`);
-  assert.notEqual(pick(m).name, 'a1', 'reserve holder past its tighter ceiling lets go');
+  return { m, a1 };
+};
+test('RT-F1: the ceiling is tighter on a reserve holder — holds at 3 in flight, moves at 4', () => {
+  const { m, a1 } = reserveHolder();
+  a1.activeWeight = 60; a1.inFlight = 3;
+  assert.equal(pick(m).name, 'a1', '3 + this turn = 4 holds under the reserve ceiling');
+  const r2 = reserveHolder();
+  r2.a1.activeWeight = 60; r2.a1.inFlight = 4;
+  assert.notEqual(pick(r2.m).name, 'a1', 'reserve holder past its tighter ceiling lets go');
+});
+test('KNOB: claudeWarmHoldMaxInFlight is settable and defaults to 6', () => {
+  assert.equal(claude3().scheduler.claudeWarmHoldMaxInFlight, 6);
+  const m = claude3({ claudeWarmHoldMaxInFlight: 3 }); const a1 = byName(m, 'a1');
+  served(m, a1); a1.activeWeight = 60; a1.inFlight = 3;
+  assert.notEqual(pick(m).name, 'a1', 'max 3: 3 in flight + this turn moves');
+  const m2 = claude3({ claudeWarmHoldMaxInFlight: 3 }); const b1 = byName(m2, 'a1');
+  served(m2, b1); b1.activeWeight = 60; b1.inFlight = 2;
+  assert.equal(pick(m2).name, 'a1', 'max 3: 2 in flight + this turn holds');
 });
