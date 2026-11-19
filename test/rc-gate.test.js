@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
-import { readFileSync, mkdtempSync, existsSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, mkdtempSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +20,7 @@ import * as nodeChildProcess from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GATE_DIR = join(__dirname, '..', 'tools', 'rc-gate');
+const CLAUDE_ROUTING_HELPER = join(__dirname, '..', 'tools', 'maxbar', 'claude-routing.py');
 const CA = join(process.env.HOME, 'Library', 'Application Support', 'mkcert', 'rootCA.pem');
 
 // CI has neither the locally-minted MITM fixture (gitignored — it is a private
@@ -299,32 +300,104 @@ gateDescribe('rc-gate: /v1/sessions/<id> routes DIRECT (identity), not through t
   }
 });
 
-gateDescribe('rc-gate: /v1/messages routes to maxpool with profile header', async () => {
+gateDescribe('rc-gate: local Maxbar Pool opts unprofiled inference into all until Direct', async () => {
   const mp = fakeMaxpool();
   await new Promise(r => mp.server.listen(0, r));
+  const home = mkdtempSync(join(tmpdir(), 'rc-gate-maxbar-'));
+  const settings = join(home, '.claude', 'settings.json');
+  mkdirSync(dirname(settings));
+  const original = { env: { KEEP_THIS: 'yes' }, permissions: { deny: ['fixture'] } };
+  writeFileSync(settings, JSON.stringify(original) + '\n');
   const gate = await startGate({
+    HOME: home,
     RC_GATE_PORT: '0',
+    RC_GATE_HOST: '127.0.0.1',
+    RC_GATE_MAXPOOL_HOST: '127.0.0.1',
     RC_GATE_MAXPOOL_PORT: String(mp.server.address().port),
     RC_GATE_PROFILE: '',
   });
+  const proxy = `http://127.0.0.1:${gate.port}`;
+  const send = async (headers = {}) => {
+    const { tls: connection } = await mitmConnect(gate.port);
+    const response = await httpOverTLS(connection, 'POST', '/v1/messages?beta=true',
+      { 'content-type': 'application/json', ...headers }, JSON.stringify({ model: 'claude-opus-5', messages: [] }));
+    assert.match(response, /HTTP\/1\.1 200/);
+    return mp.state.requests.at(-1).headers;
+  };
+  const selectRouting = (mode, address = proxy) => {
+    const result = nodeChildProcess.spawnSync('/usr/bin/python3',
+      [CLAUDE_ROUTING_HELPER, settings, mode, address, CA], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  const waitForProfile = async expected => {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const actual = (await send())['x-maxpool-profile'];
+      if (actual === expected) return;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.fail(`the running gate did not pick up profile ${expected}`);
+  };
   try {
-    const { tls: t } = await mitmConnect(gate.port);
-    const res = await httpOverTLS(t, 'POST', '/v1/messages?beta=true', { 'content-type': 'application/json' }, JSON.stringify({ model: 'claude-opus-5', messages: [] }));
-    assert.match(res, /HTTP\/1\.1 200/);
-    const msg = mp.state.requests.find(r => r.url.startsWith('/v1/messages'));
-    assert.ok(msg, 'inference reached maxpool');
-    assert.equal(msg.headers['x-maxpool-profile'], 'all', 'profile header applied');
-    assert.ok(!('authorization' in msg.headers), 'client authorization stripped for pool auth');
-    const { tls: explicit } = await mitmConnect(gate.port);
-    await httpOverTLS(explicit, 'POST', '/v1/messages', {
-      'content-type': 'application/json', 'x-maxpool-profile': 'glm', 'x-maxpool-session': 'fixture',
-    }, JSON.stringify({ model: 'claude-sonnet', messages: [] }));
-    assert.equal(mp.state.requests.at(-1).headers['x-maxpool-profile'], 'glm');
-    assert.equal(mp.state.requests.at(-1).headers['x-maxpool-session'], 'fixture');
+    // An existing client can already use the proxy without selecting the new Maxbar mode.
+    writeFileSync(settings, JSON.stringify({ ...original, env: { ...original.env, HTTPS_PROXY: proxy } }) + '\n');
+    const legacy = await send({ authorization: 'Bearer client-fixture-auth' });
+    assert.equal(legacy['x-maxpool-profile'], 'claude', 'legacy unprofiled traffic keeps Claude');
+    assert.ok(!('authorization' in legacy), 'client authorization stripped for pool auth');
+    selectRouting('pool');
+    await waitForProfile('all');
+    const explicit = await send({ 'x-maxpool-profile': 'glm', 'x-maxpool-session': 'fixture' });
+    assert.equal(explicit['x-maxpool-profile'], 'glm');
+    assert.equal(explicit['x-maxpool-session'], 'fixture');
+    selectRouting('pool', 'http://127.0.0.1:1');
+    await waitForProfile('claude');
+    selectRouting('pool');
+    await waitForProfile('all');
+    writeFileSync(settings, '{not settings');
+    await waitForProfile('claude');
+    writeFileSync(settings, JSON.stringify(original) + '\n');
+    selectRouting('pool');
+    await waitForProfile('all');
+    selectRouting('direct');
+    await waitForProfile('claude');
+    assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')), original);
   } finally {
-    gate.kill(); await new Promise(r => mp.server.close(r));
+    gate.kill();
+    await new Promise(r => mp.server.close(r));
+    rmSync(home, { recursive: true, force: true });
   }
 });
+
+for (const { name, host, operator, expected } of [
+  { name: 'operator profile', host: '127.0.0.1', operator: 'kimi', expected: 'kimi' },
+  { name: 'shared listener', host: '0.0.0.0', operator: '', expected: 'claude' },
+]) {
+  gateDescribe(`rc-gate: desktop Pool leaves the ${name} unchanged`, async () => {
+    const mp = fakeMaxpool();
+    await new Promise(resolve => mp.server.listen(0, resolve));
+    const home = mkdtempSync(join(tmpdir(), 'rc-gate-maxbar-scope-'));
+    const settings = join(home, '.claude', 'settings.json');
+    const gate = await startGate({ HOME: home, RC_GATE_PORT: '0', RC_GATE_HOST: host,
+      RC_GATE_MAXPOOL_HOST: '127.0.0.1', RC_GATE_MAXPOOL_PORT: String(mp.server.address().port),
+      RC_GATE_PROFILE: operator });
+    try {
+      const command = nodeChildProcess.spawnSync('/usr/bin/python3',
+        [CLAUDE_ROUTING_HELPER, settings, 'pool', `http://127.0.0.1:${gate.port}`, CA], { encoding: 'utf8' });
+      assert.equal(command.status, 0, command.stderr);
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      for (const profile of [null, 'glm']) {
+        const { tls: connection } = await mitmConnect(gate.port);
+        const headers = { 'content-type': 'application/json', ...(profile && { 'x-maxpool-profile': profile }) };
+        const response = await httpOverTLS(connection, 'POST', '/v1/messages', headers, '{}');
+        assert.match(response, /HTTP\/1\.1 200/);
+        assert.equal(mp.state.requests.at(-1).headers['x-maxpool-profile'], profile || expected);
+      }
+    } finally {
+      gate.kill();
+      await new Promise(resolve => mp.server.close(resolve));
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
 
 gateDescribe('rc-gate: a failed /bridge POST is NOT replayed (4090 regression)', async () => {
   let bridgeCalls = 0;

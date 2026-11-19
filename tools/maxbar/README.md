@@ -19,7 +19,7 @@ Ported from Max's personal SleepMenu; the hotspot name is now per-user configura
 | Radio refresh | After ~2 min of failed dials, Wi-Fi is switched off/on for a fresh scan |
 | Battery: lid closed in sleep-on | If the Mac rides the phone hotspot with sleep ON and the lid closes, Wi-Fi is switched off (maintenance wakes would keep re-waking the phone's hotspot all night); switched back on when the lid opens |
 | Lock when lid closes | With sleep OFF, macOS no longer locks on lid close (its lock is tied to sleep). The app watches the lid every 2s and locks with the same call as Apple menu → Lock Screen. Skipped when an external monitor is connected. Checkbox, on by default |
-| Claude routing | "Claude routing: Pool / Direct" flips `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` in the `env` block of `~/.claude/settings.json` (Pool = maxpool rc-gate proxy `127.0.0.1:3457` + mkcert CA; Direct = both keys removed). Read-modify-write that keeps every other key and its order, atomic temp-file + rename. Only affects the Claude Mac app, and only after it restarts; terminal sessions set their own proxy in ~/.zshrc. Pool mode requires the rc-gate proxy on that machine (see `tools/rc-gate/`): the switch to Pool is refused, with the reason shown in the menu, when the mkcert root CA is missing or nothing listens on `127.0.0.1:3457`. A missing `settings.json` counts as Direct and is created on first switch |
+| Claude routing | Pool writes the local proxy, mkcert CA, and an opt-in for the gate's `all` profile to `~/.claude/settings.json`. Direct removes those settings. The gate updates its default without restarting. Explicit client profiles and `RC_GATE_PROFILE` take precedence. Restart the Claude Mac app to apply changed proxy settings |
 | Codex routing | Pool selects MaxPool's authenticated loopback Codex listener. Direct restores the previous provider setting. The switch uses Codex's configuration writer and preserves other settings. Restart the ChatGPT app's Codex client or open a new CLI process, then start a new chat |
 | Launch at Login | Toggle in the menu (SMAppService) |
 
@@ -65,7 +65,8 @@ repo IS the distribution for this tool; the npm package continues to ship the pr
 4. **Claude routing (optional).** Works only on machines where the maxpool rc-gate
    proxy is installed (`tools/rc-gate/`, incl. its mkcert root CA and LaunchAgent).
    Toggle "Claude routing" in the menu, then **restart the Claude app** — running
-   sessions keep the env they started with.
+   sessions keep the env they started with. If Pool was already selected before
+   upgrading Maxbar, switch to Direct and back to Pool once to opt into `all`.
 
 5. **Codex routing (optional).** Start a MaxPool build that supports the loopback
    Codex route and add a ChatGPT account locally. Choose Pool in the Codex routing

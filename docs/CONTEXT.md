@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Desktop Claude Pool opt-in
+
+Maxbar writes the Claude desktop Pool selection alongside its proxy settings. The loopback gate uses it to default unprofiled requests to `all`. Direct removes the opt-in. Explicit client and operator profiles keep precedence, and other gates retain the Claude default.
+
 ### 2026-11-19 · Provider cache and move summaries
 
 The terminal displays separate Cache and Moves lines. Cache pairs each provider's 15-minute and 24-hour hit rates, including Codex. The 24-hour readings survive a restart. Routing and `maxpool status` show per-provider miss tokens. Move totals include Codex and preserve held-session release reasons from linked accounts.

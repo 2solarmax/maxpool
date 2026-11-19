@@ -273,37 +273,11 @@ func claudeRoutingIsPool() -> Bool? {
 /// (the file round-trips byte-exact through json indent=2, ensure_ascii=False).
 /// Atomic: write a sibling temp file with the same mode, then rename over.
 func setClaudeRouting(pool: Bool) -> String? {
-    let script = """
-    import json, os, sys, tempfile
-    path, mode, proxy, ca = sys.argv[1:5]
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            raw = f.read()
-        perm = os.stat(path).st_mode & 0o777
-    else:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        raw, perm = "{}\\n", 0o600
-    d = json.loads(raw)
-    env = d.setdefault("env", {})
-    if mode == "pool":
-        env["HTTPS_PROXY"] = proxy
-        env["NODE_EXTRA_CA_CERTS"] = ca
-    else:
-        env.pop("HTTPS_PROXY", None)
-        env.pop("NODE_EXTRA_CA_CERTS", None)
-    out = json.dumps(d, indent=2, ensure_ascii=False) + ("\\n" if raw.endswith("\\n") else "")
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings.json.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(out)
-        os.chmod(tmp, perm)
-        os.replace(tmp, path)
-    except BaseException:
-        os.unlink(tmp)
-        raise
-    """
+    guard let helper = Bundle.main.path(forResource: "claude-routing", ofType: "py") else {
+        return "Claude routing helper is missing"
+    }
     let (code, out) = run("/usr/bin/python3",
-                          ["-c", script, kClaudeSettings, pool ? "pool" : "direct", kPoolProxy, kPoolCA],
+                          [helper, kClaudeSettings, pool ? "pool" : "direct", kPoolProxy, kPoolCA],
                           timeout: 10)
     return code == 0 ? nil : (out.isEmpty ? "exit \(code)" : out)
 }

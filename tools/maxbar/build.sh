@@ -23,6 +23,7 @@ swiftc -O -parse-as-library -swift-version 6 -target arm64-apple-macos13.0 \
   -framework SwiftUI -framework AppKit
 
 cp Info.plist "$CONTENTS/Info.plist"
+cp claude-routing.py "$RESOURCES/claude-routing.py"
 cp codex-routing.py "$RESOURCES/codex-routing.py"
 
 codesign --force --sign - "$APP"
