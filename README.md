@@ -243,10 +243,11 @@ transcript and request compatibility.
 
 Local shell, editing, and MCP tools are executed by Claude Code. Provider
 reasoning blocks are omitted when translating the transcript for OpenAI.
-Claude Code WebSearch uses OpenAI's hosted search and returns source links.
-Use `allowed_domains` to scope searches. Search requests with
-`blocked_domains` return an error. On the ChatGPT subscription route,
-`max_uses` is best-effort guidance to the model.
+Claude Code WebSearch uses OpenAI search and returns source links.
+ChatGPT subscription requests with `max_uses` or `blocked_domains` use
+Codex's standalone search. MaxPool enforces the search count and forwards
+the domain filter. If standalone search is unavailable, the client receives
+an error. Use `allowed_domains` to restrict the search to approved sites.
 Claude Code WebFetch downloads the page locally and uses the routed model
 to extract information. Standalone Anthropic-hosted `web_fetch` and
 ChatGPT-hosted connectors use separate APIs.

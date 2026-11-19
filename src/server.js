@@ -1,4 +1,4 @@
-import { fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest } from './openai-responses.js';
+import { fetchBoundedOpenAIResponse, fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest } from './openai-responses.js';
 import { nativeCodexHeaders, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
 import { codexModelFor, validCodexCatalog } from './codex-model-routing.js';
 import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
@@ -1934,13 +1934,24 @@ async function forwardRequest(
     const upstreamForwardStartAt = Date.now();
     try {
       const signal = AbortSignal.any([clientGone.signal, ttfbController.signal]);
-      const fetchUpstream = () => fetch(upstreamUrl, {
+      const fetchResponses = (requestBody = upstreamBody) => fetch(upstreamUrl, {
         method,
         headers: upstreamHeaders,
-        body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
+        body: ['GET', 'HEAD'].includes(method) ? undefined : requestBody,
         redirect: 'manual',
         signal,
       });
+      const fetchUpstream = () => {
+        if (!openAIRequest?.boundedSearch) return fetchResponses();
+        const searchUrl = new URL('alpha/search', upstreamUrl);
+        requestInfo.codexSearchBudget ??= { used: 0, results: new Map() };
+        return fetchBoundedOpenAIResponse(openAIRequest, {
+          fetchResponses: requestBody => fetchResponses(JSON.stringify(requestBody)),
+          fetchSearch: searchBody => fetch(searchUrl, { method: 'POST', headers: { ...upstreamHeaders, accept: 'application/json' },
+            body: JSON.stringify(searchBody), redirect: 'manual', signal }),
+          budget: requestInfo.codexSearchBudget,
+        });
+      };
       const attemptedCredential = account.credential;
       upstreamRes = await fetchUpstream();
       if (openAI && upstreamRes.status === 401 && !signal.aborted) {
@@ -1960,6 +1971,12 @@ async function forwardRequest(
       });
     } finally {
       clearTimeout(ttfbTimer);
+      if (openAIRequest?.boundedSearch && requestInfo.codexSearchBudget?.used > 0) {
+        // The search may have already run even though its answer is not visible.
+        // Another pool has no copy of this request's remaining search budget.
+        canRetryBufferedBody = false;
+        canQueueBufferedBody = false;
+      }
       // Stop the grace timer for THIS attempt — but LEAVE streamGraceDeadline set so
       // a re-forward (failover) re-arms for the REMAINING time to the shared deadline.
       if (streamGraceTimer) clearTimeout(streamGraceTimer);
@@ -2002,6 +2019,16 @@ async function forwardRequest(
     // while accounts sat at 2%/11%/25% weekly). confirmUpstreamProbe also clears
     // lease.upstreamThrottleProbe, so the releaseAccount probe branch below no-ops.
     if (!openAI && !isCapacitySignalStatus(upstreamRes.status)) accountManager.confirmUpstreamProbe?.(lease);
+
+    if (nativeCodex && upstreamRes.headers.get('x-maxpool-openai-error-code') === 'codex_web_search_unavailable'
+      && ![401, 429].includes(upstreamRes.status)) {
+      // A standalone search failure says nothing about this account's ability to
+      // answer normal model requests. Preserve the specific error without benching it.
+      ctx.status = upstreamRes.status;
+      accountManager.releaseAccount(lease, { status: ctx.status, neutral: true, error: 'codex_web_search_unavailable' });
+      sendErrorResponse(res, requestInfo, ctx.status, await upstreamRes.json());
+      return;
+    }
 
     if (nativeCodex && ['model_not_found', 'model_not_supported', 'model_not_available'].includes(
       upstreamRes.headers.get('x-maxpool-openai-error-code'))
@@ -4789,7 +4816,7 @@ function describeRequest(req, body) {
   try {
     const json = JSON.parse(body.toString());
     if (json.model) info.model = json.model;
-    info.hasTools = Array.isArray(json.tools) && json.tools.some(tool => tool?.input_schema);
+    info.hasTools = Array.isArray(json.tools) && json.tools.some(tool => tool?.input_schema || /^web_search_\d{8}$/.test(tool?.type));
     if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(json.output_config?.effort)) {
       info.reasoningEffort = json.output_config.effort;
     }

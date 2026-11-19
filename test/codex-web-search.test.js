@@ -8,9 +8,9 @@ import { toOpenAIRequest } from '../src/openai-responses.js';
 
 const searchRequest = {
   model: 'claude-sonnet-5-5',
-  system: 'Search once, then reply with a brief summary of the results.',
+  system: 'You run a web search for another Claude model. Search once, then reply with a brief summary of the results.',
   messages: [{ role: 'user', content: 'Perform a web search for the query: IANA reserved example domains' }],
-  tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }],
+  tools: [{ type: 'web_search_20250305', name: 'web_search' }],
   tool_choice: { type: 'auto' },
 };
 
@@ -28,10 +28,15 @@ test('hosted search maps filters, location, explicit choice and search budget by
     filters: { allowed_domains: ['iana.org'] }, user_location: { type: 'approximate', country: 'US' } }]);
   assert.deepEqual(native.body.include, ['web_search_call.action.sources']);
   assert.deepEqual(native.body.tool_choice, { type: 'web_search' });
-  assert.match(native.body.instructions, /Use web search at most 8 times/);
   assert.equal(native.body.max_tool_calls, undefined);
   assert.equal(native.webSearch, 'docs_search');
-  assert.equal(toOpenAIRequest(request, 'gpt-6.2-sol').body.max_tool_calls, 8);
+  const capped = { ...request, tools: [{ ...search, max_uses: 1 }] };
+  assert.equal(toOpenAIRequest(capped, 'gpt-6.2-sol').body.max_tool_calls, 1);
+  const bounded = toOpenAIRequest(capped, 'gpt-6.2-sol', { native: true });
+  assert.equal(bounded.body.tools[0].type, 'function');
+  assert.equal(bounded.boundedSearch.maxUses, 1);
+  assert.equal(bounded.boundedSearch.directQuery, 'IANA reserved example domains');
+  assert.deepEqual(bounded.boundedSearch.settings.filters, { allowed_domains: ['iana.org'] });
 
   const fn = toOpenAIRequest({ ...searchRequest, tools: [{ name: 'WebFetch', input_schema: { type: 'object' } }],
     tool_choice: { type: 'tool', name: 'WebFetch' } }, 'gpt-6.2-sol', { native: true });
@@ -101,13 +106,79 @@ test('Claude Code hosted search helper receives sources and an end turn through 
   assert.equal(message.usage.output_tokens, 13);
   assert.equal(requests[0].tools[0].type, 'web_search');
 
-  const blocked = await post({ ...searchRequest, tools: [{ ...searchRequest.tools[0], blocked_domains: ['example.com'] }] });
-  assert.equal(blocked.status, 400);
-  assert.match((await blocked.json()).error.message, /blocked_domains/);
-  assert.equal(requests.length, 2, 'unsupported domain restrictions must not trigger an unfiltered search');
-
   const hostedFetch = await post({ ...searchRequest, tools: [{ type: 'web_fetch_20260318', name: 'web_fetch' }] });
   assert.equal(hostedFetch.status, 400);
   assert.match((await hostedFetch.json()).error.message, /Anthropic-hosted web_fetch/);
   assert.equal(requests.length, 2);
+});
+
+test('native standalone search enforces the request cap and domain exclusions', async t => {
+  const searches = [];
+  const modelCalls = [];
+  let searchAvailable = true;
+  const upstream = await listen(t, createServer(async (request, response) => {
+    let data = '';
+    for await (const chunk of request) data += chunk;
+    const body = JSON.parse(data);
+    if (request.url === '/alpha/search') {
+      searches.push(body);
+      response.writeHead(searchAvailable ? 200 : 404, { 'content-type': 'application/json' });
+      return response.end(JSON.stringify({ output: 'Reserved examples', results: [
+        { url: 'https://www.rfc-editor.org/info/rfc6761/', title: 'RFC 6761' },
+      ] }));
+    }
+    modelCalls.push(body);
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    const events = [{ type: 'response.created', response: { id: 'resp_bounded_fixture', model: body.model } }];
+    const searchTool = body.tools?.find(tool => tool.name === 'maxpool_tool_hosted_web_search');
+    if (searchTool) {
+      for (const [index, query] of ['reserved domains', 'second search'].entries()) {
+        events.push({ type: 'response.output_item.done', output_index: index, item: {
+          id: 'fc_' + index, type: 'function_call', name: searchTool.name, call_id: 'call_' + index,
+          arguments: JSON.stringify({ query }),
+        } });
+      }
+    } else {
+      events.push({ type: 'response.output_text.delta', item_id: 'final', delta: 'See [RFC 6761](https://www.rfc-editor.org/info/rfc6761/).' });
+    }
+    events.push({ type: 'response.completed', response: { usage: { input_tokens: 20, output_tokens: 13 } } });
+    response.end(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join(''));
+  }));
+  const manager = new AccountManager([{
+    name: 'Codex test', type: 'oauth', provider: 'codex', codexAuth: 'native',
+    accessToken: 'test-access', codexAccountId: 'test-workspace', upstream: upstream + '/responses',
+    codexModels: [{ slug: 'gpt-6.2-sol' }],
+  }]);
+  const proxy = await listen(t, createProxyServer(manager, { proxy: { apiKey: 'test-token' },
+    queue: { enabled: false }, retry: { maxAttempts: 1 } }));
+  const post = (overrides) => fetch(proxy + '/v1/messages?beta=true', { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'test-token',
+      'x-maxpool-provider': 'codex', 'x-maxpool-profile': 'all' },
+    body: JSON.stringify({ ...searchRequest, tools: [{ ...searchRequest.tools[0], max_uses: 1, blocked_domains: ['iana.org'] }],
+      stream: false, ...overrides }) });
+
+  const direct = await post({});
+  assert.equal(direct.status, 200);
+  assert.deepEqual(searches.map(search => search.commands), [{ search_query: [{ q: 'IANA reserved example domains' }] }]);
+  assert.deepEqual(searches[0].settings.filters, { blocked_domains: ['iana.org'] });
+  assert.equal(modelCalls.length, 1, 'Claude Code supplies the query and needs only the summarization request');
+  assert.equal(modelCalls[0].tools, undefined);
+  assert.match((await direct.json()).content[1].content[0].url, /rfc-editor.org/);
+
+  const generic = await post({ system: 'Search for the requested facts.' });
+  assert.equal(generic.status, 200);
+  const message = await generic.json();
+  assert.equal(searches.length, 2, 'only one search may execute per request');
+  assert.deepEqual(searches[1].commands, { search_query: [{ q: 'reserved domains' }] });
+  assert.equal(message.content[3].content.error_code, 'max_uses_exceeded');
+  assert.equal(modelCalls[2].tools, undefined);
+  assert.match(message.content.at(-1).text, /RFC 6761/);
+  assert.equal(message.stop_reason, 'end_turn');
+  assert.equal(message.usage.output_tokens, 26, 'account usage includes model work to plan the search');
+
+  searchAvailable = false;
+  const unavailable = await post({});
+  assert.ok(unavailable.status >= 400);
+  assert.match((await unavailable.json()).error.message, /standalone web search is unavailable/);
+  assert.equal(searches.length, 3, 'a failed standalone search must not fall back to an unfiltered search');
 });
