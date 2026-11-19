@@ -92,7 +92,7 @@ export async function sessionCapCommand(args, root = sessionCapRoot()) {
       throw err;
     }
     const run = await current(retired);
-    await rm(join(root, run.name), { recursive: true });
+    await rm(join(root, run.name), { recursive: true, force: true });
     await unlink(retired);
     return { armed: false };
   }

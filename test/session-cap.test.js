@@ -4,7 +4,7 @@ import http from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
@@ -108,6 +108,22 @@ test('authenticated admission is bounded across overlapping workers, retries and
   assert.deepEqual(await legacy('status'), { armed: true, limit: 1, admitted: 1, remaining: 0, blocked: true });
   assert.equal(await call(replacement, pilot, 'test-two'), 200);
   await legacy('disarm');
+
+  await t.test('a missing run directory blocks the terminal until normal disarm', async () => {
+    await cap('arm', '1');
+    const root = process.env.MAXPOOL_CONFIG + '.session-caps';
+    const entries = await readdir(root, { withFileTypes: true });
+    const [run] = entries.filter(entry => entry.isDirectory());
+    await rm(join(root, run.name), { recursive: true });
+
+    const beforeDamageProbe = seen.length;
+    assert.equal(await call(replacement), 403);
+    assert.equal(seen.length, beforeDamageProbe);
+    assert.equal(await call(replacement, peerSession), 200);
+    assert.deepEqual(await cap('disarm'), { armed: false });
+    assert.deepEqual(await readdir(root), []);
+    assert.equal(await call(replacement), 200);
+  });
 });
 
 test('a fresh process cannot replenish the shared cap', async t => {

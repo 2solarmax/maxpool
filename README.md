@@ -472,6 +472,7 @@ A fresh client retry consumes a slot. Requests past the cap receive a
 non-retryable 403 before forwarding. Internal upstream retries, token counts
 and account quota are separate. Terminals using a direct provider route bypass
 this local control.
+If an armed cap’s run directory goes missing, that terminal receives 403 until you disarm its cap.
 
 ## License
 
