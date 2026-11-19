@@ -1156,8 +1156,7 @@ export class AccountManager {
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
-    const upstreamThrottleProbe = !requestInfo.nativeCodexClient
-      && account.type !== 'provider' && !account.remote && this._claimUpstreamThrottleProbe();
+    const upstreamThrottleProbe = isClaudeAccount(account) && !account.remote && this._claimUpstreamThrottleProbe();
     if (requestInfo.sessionKey) {
       // Same clock the selection above used, so the peak-failover guard can never
       // disagree with the peak tier that caused the move (defaults to real time).
