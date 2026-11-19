@@ -107,6 +107,7 @@ test('native requests, quota, attribution and provider affinity survive compacti
   am.accounts.filter(account => account.provider === 'codex').forEach(account => { account.enabled = false; });
   const blocked = await request(url, 'claude-haiku-5', session, 'another turn');
   assert.equal(blocked.status, 429);
+  assert.match(await blocked.text(), /No Codex account can serve this request/);
   assert.equal(hits.length, 2, 'the healthy Claude account must not serve an OpenAI-origin session');
   const newThread = await request(url, 'claude-sonnet-5-2', 'thread-0002', 'new session');
   assert.equal(newThread.status, 200);

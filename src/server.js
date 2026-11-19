@@ -3508,7 +3508,16 @@ function computeQueueWindowMs({
   return windowMs;
 }
 
+function isCodexOnlyRequest(accountManager, requestInfo) {
+  return requestInfo.onlyProvider === 'codex' || accountManager.pinnedSessionProvider?.(requestInfo) === 'codex';
+}
+
 function unavailableMessage(accountManager, requestInfo = {}, retryAfter, willRecoverSoon = true) {
+  if (isCodexOnlyRequest(accountManager, requestInfo)) {
+    const wait = willRecoverSoon && retryAfter > 0 ? ` Try again in about ${formatRetryDuration(retryAfter)}.` : '';
+    return `No Codex account can serve this request right now.${wait}`;
+  }
+
   const incompat = accountManager._effectiveIncompatible?.(requestInfo) || { incompatible: false, homeProvider: null };
 
   // An Anthropic-incompatible session is pinned to provider accounts — Anthropic
@@ -4483,7 +4492,7 @@ async function queueAndRetryInner(
   // back within the window — say THAT (check your internet), not the misleading
   // "all accounts at their quota limit" (the accounts are fine; the network isn't).
   const honestMessage = cause === 'network'
-    ? 'Could not connect to Claude (network error) and connectivity did not return in time. Check your internet connection and try again. This is not an account quota issue.'
+    ? `Could not connect to ${isCodexOnlyRequest(accountManager, requestInfo) ? 'Codex' : 'Claude'} (network error) and connectivity did not return in time. Check your internet connection and try again. This is not an account quota issue.`
     : unavailableMessage(
       accountManager, requestInfo,
       Math.ceil((Number.isFinite(retryPlan.retryAfterMs) ? retryPlan.retryAfterMs : 0) / 1000),
