@@ -113,7 +113,7 @@ function inputPart(block) {
  * calls and outputs as matching Responses items. Provider-owned state can travel
  * as visible context, and opaque thinking is kept out of the request.
  */
-export function toOpenAIRequest(json, model, { native = false, priorSearches = webSearchesInTurn(json) } = {}) {
+export function toOpenAIRequest(json, model, { native = false, priorSearches = webSearchesInTurn(json), promptCacheKey } = {}) {
   const toolNames = new Map();
   const functionScope = native ? {} : { namespace: scope };
   const webSearch = hostedWebSearch(json.tools || [], native);
@@ -123,8 +123,13 @@ export function toOpenAIRequest(json, model, { native = false, priorSearches = w
     return { type: 'function', name, description: tool.description || '', parameters: tool.input_schema, strict: false };
   });
   const input = [];
-  const instructions = blocks(json.system).filter(b => b.type === 'text' && !String(b.text).startsWith('x-anthropic-billing-header:'))
-    .map(b => b.text).filter(Boolean).join('\n\n');
+  const system = blocks(json.system).filter(b => b.type === 'text' && b.text && !String(b.text).startsWith('x-anthropic-billing-header:'));
+  const instructions = system.map(b => b.text).join('\n\n');
+  // Like CLIProxyAPI, replay system text as developer input on the Codex wire.
+  // GPT-6.2 appends top-level instructions after input, outside cacheable prefixes.
+  if (native && system.length) {
+    input.push({ role: 'developer', content: system.map(b => ({ type: 'input_text', text: b.text })) });
+  }
   for (const message of json.messages || []) {
     let content = [];
     const flush = () => {
@@ -163,6 +168,7 @@ export function toOpenAIRequest(json, model, { native = false, priorSearches = w
     flush();
   }
   const body = { model, input, store: false, stream: true };
+  if (promptCacheKey) body.prompt_cache_key = promptCacheKey;
   // Native Codex uses flat function declarations, as in CLIProxyAPI's translator.
   if (tools.length || webSearch) {
     body.tools = tools.length && !native ? [{ type: 'namespace', name: scope, description: 'Tools executed by Claude Code.', tools }] : tools;
@@ -172,7 +178,8 @@ export function toOpenAIRequest(json, model, { native = false, priorSearches = w
     body.include = ['web_search_call.action.sources'];
     if (webSearch.maxUses) body.max_tool_calls = webSearch.maxUses;
   }
-  if (instructions || native) body.instructions = instructions || 'You are a helpful coding assistant.';
+  if (native) body.instructions = system.length ? '' : 'You are a helpful coding assistant.';
+  else if (instructions) body.instructions = instructions;
   const effort = json.output_config?.effort;
   if (explicitEfforts.has(effort)) body.reasoning = { effort };
   if (body.tools && json.tool_choice?.type === 'none') body.tool_choice = 'none';

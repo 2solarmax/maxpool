@@ -71,21 +71,26 @@ test('native client routes require the owner bearer and a dedicated loopback lis
 
 test('native Responses preserve the wire and report cache-aware usage to the serving account', async t => {
   const { url, calls, am } = await createFixture(t, { upstream: () => streamed() });
-  const responseBody = await response(url, body, { 'x-api-key': 'never-forward', 'chatgpt-account-id': 'spoofed' });
+  const requestBody = { ...body, prompt_cache_key: 'native-cache-scope' };
+  const responseBody = await response(url, requestBody, { 'x-api-key': 'never-forward',
+    'chatgpt-account-id': 'spoofed', 'session-id': 'native-cache-scope' });
   assert.equal(responseBody.status, 200);
   assert.match(await responseBody.text(), /"response.completed"/);
   assert.equal(responseBody.headers.get('set-cookie'), null);
   assert.equal(responseBody.headers.get('x-codex-turn-state'), 'continuation-state');
   assert.equal(calls[0].url, 'https://chatgpt.com/backend-api/codex/responses');
-  assert.deepEqual(JSON.parse(calls[0].body), body);
+  assert.deepEqual(JSON.parse(calls[0].body), requestBody);
   assert.equal(calls[0].headers.authorization, 'Bearer upstream-grant-a');
   assert.equal(calls[0].headers['chatgpt-account-id'], 'workspace-a');
   assert.equal(calls[0].headers['x-api-key'], undefined);
+  assert.equal(calls[0].headers['session-id'], 'native-cache-scope');
   assert.equal(am.accounts[0].quota.unified7d, 0.42);
   assert.equal(am.accounts[0].completedRequests, 1);
   assert.equal(am.accounts[0].usage.totalRequests, 1);
   assert.ok(Number.isFinite(Date.parse(am.accounts[0].usage.lastUsed)));
   assert.equal(am.callerStats.get('local-codex').total.tok, 12);
+  const { cr, cc, promptTokens, hit } = am.efficiencyOverall().codex;
+  assert.deepEqual({ cr, cc, promptTokens, hit }, { cr: 3, cc: 2, promptTokens: 8, hit: 0.375 });
   const saved = am.exportNativeCodexConversationOwners();
   const restored = new AccountManager([native('a'), native('b')]);
   restored.restoreNativeCodexConversationOwners(saved);

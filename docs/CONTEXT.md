@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Codex prompt cache from Claude Code
+
+The Codex Messages adapter sends stable Claude Code system text as the first developer input and drops the per-request Anthropic billing header. The native transport gives OpenAI matching prompt and session cache keys scoped to the authenticated caller, Claude Code thread and agent, serving account and resolved model. The dashboard continues to measure upstream cache-read tokens over total input tokens.
+
 ### 2026-11-19 · Desktop Claude Pool opt-in
 
 Maxbar writes the Claude desktop Pool selection alongside its proxy settings. The loopback gate uses it to default unprofiled requests to `all`. Direct removes the opt-in. Explicit client and operator profiles keep precedence, and other gates retain the Claude default.

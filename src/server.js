@@ -1849,10 +1849,19 @@ async function forwardRequest(
   }
 
   let openAIRequest;
+  let codexCacheKey;
   if (openAI) {
     try {
+      if (nativeCodex && requestInfo.codexCacheThreadId) {
+        // This is an upstream cache hint, independent of MaxPool's routing
+        // affinity. Do not send raw Claude IDs, caller names or credentials.
+        codexCacheKey = createHash('sha256').update(JSON.stringify([
+          'maxpool-claude-to-codex', requestInfo.caller, requestInfo.codexCacheThreadId,
+          account.accountUuid || account.name, account.codexAccountId, openAIModel,
+        ])).digest('hex');
+      }
       openAIRequest = toOpenAIRequest(JSON.parse(body.toString()), openAIModel, {
-        native: nativeCodex, priorSearches: requestInfo.webSearchesInTurn,
+        native: nativeCodex, priorSearches: requestInfo.webSearchesInTurn, promptCacheKey: codexCacheKey,
       });
     } catch (error) {
       res.off('close', onClientClose);
@@ -1870,6 +1879,7 @@ async function forwardRequest(
   const upstreamHeaders = openAI ? {
     authorization: `Bearer ${account.credential}`,
     ...(nativeCodex ? nativeCodexHeaders(account) : {}),
+    ...(codexCacheKey ? { 'session-id': codexCacheKey } : {}),
     'content-type': 'application/json', accept: 'text/event-stream',
   } : headers;
 
@@ -4803,6 +4813,10 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function claudeCodeId(value) {
+  return typeof value === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(value) ? value : null;
+}
+
 function describeRequest(req, body) {
   let weight = Math.max(1, Math.ceil(body.length / 64_000));
   const info = {
@@ -4831,16 +4845,22 @@ function describeRequest(req, body) {
       && Array.isArray(json.messages) && json.messages.length > 0;
     if (json.stream) info.stream = true;
     const clientIdentity = json.metadata?.user_id;
+    let sessionId;
+    let agentId;
     if (typeof clientIdentity === 'string' && clientIdentity.length < 2048) {
       try {
-        const sessionId = JSON.parse(clientIdentity)?.session_id;
-        if (typeof sessionId === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(sessionId)) {
-          const agentId = JSON.parse(clientIdentity)?.agent_id;
-          info.clientThreadId = typeof agentId === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(agentId)
-            ? sessionId + ':' + agentId : sessionId;
-        }
+        const identity = JSON.parse(clientIdentity);
+        sessionId = claudeCodeId(identity?.session_id);
+        agentId = claudeCodeId(identity?.agent_id);
+        if (sessionId) info.clientThreadId = agentId ? sessionId + ':' + agentId : sessionId;
       } catch { /* legacy metadata is not a JSON string */ }
     }
+    const cacheSession = claudeCodeId(req.headers['x-claude-code-session-id']) || sessionId
+      || (typeof clientIdentity === 'string' && clientIdentity.length < 2048
+        ? /_session_([a-f0-9-]{8,80})$/i.exec(clientIdentity)?.[1] : null);
+    const agentHeader = req.headers['x-claude-code-agent-id'];
+    const cacheAgent = agentHeader === 'main' ? null : claudeCodeId(agentHeader) || agentId;
+    if (cacheSession) info.codexCacheThreadId = cacheAgent ? cacheSession + ':' + cacheAgent : cacheSession;
     // CONVERSATION identity for cache affinity (red-team 2026-11-08): the
     // x-maxpool-session header names a TERMINAL, and a main thread plus its parallel
     // subagents share it — so "last account used by this session" chased whichever

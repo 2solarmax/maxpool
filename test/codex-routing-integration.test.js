@@ -117,6 +117,77 @@ test('native requests, quota, attribution and provider affinity survive compacti
   assert.equal(hits[2].provider, 'claude');
 });
 
+test('Claude Code uses a cacheable Codex prefix and scopes the cache key to the caller, thread, model and account', async t => {
+  const calls = [];
+  const upstream = await listen(t, http.createServer(async (req, res) => {
+    let payload = '';
+    for await (const chunk of req) payload += chunk;
+    const body = JSON.parse(payload);
+    calls.push({ body, session: req.headers['session-id'] });
+    const usage = { input_tokens: 2000, output_tokens: 5, input_tokens_details: {
+      cached_tokens: calls.length === 2 ? 1500 : 0, cache_write_tokens: 200,
+    } };
+    const completed = { type: 'response.completed', response: { id: 'resp_' + calls.length, usage } };
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end('data: ' + JSON.stringify(completed) + '\n\n');
+  }));
+  const am = new AccountManager([native('one', upstream), { ...native('two', upstream), enabled: false }]);
+  const url = await listen(t, createProxyServer(am, { proxy: { clients: [
+    { name: 'owner', key: 'fixture' }, { name: 'peer', key: 'peer-fixture' },
+  ] }, queue: { enabled: false } }));
+  const thread = '11bb22cc-3333-4444-5555-aaaabbbbcccc';
+  const base = { system: [
+    { type: 'text', text: 'x-anthropic-billing-header: turn=1' },
+    { type: 'text', text: 'Stable developer instructions.', cache_control: { type: 'ephemeral' } },
+  ], stream: false };
+  const ask = async ({ session = thread, modelName = 'gpt-6.2-sol', extra = {}, headers = {} } = {}) => {
+    const result = await request(url, modelName, session, 'Original question', { ...base, ...extra }, headers);
+    assert.equal(result.status, 200);
+    return result.json();
+  };
+  await ask();
+  const reply = await ask({ session: 'different-metadata', extra: {
+    system: [{ type: 'text', text: 'x-anthropic-billing-header: turn=2' }, { type: 'text', text: 'Stable developer instructions.' }],
+    messages: [{ role: 'user', content: 'Compacted history and follow-up question' }],
+  }, headers: { 'x-claude-code-session-id': thread } });
+  assert.deepEqual(calls[0].body.input[0], { role: 'developer', content: [{ type: 'input_text', text: 'Stable developer instructions.' }] });
+  assert.deepEqual(calls[1].body.input[0], calls[0].body.input[0]);
+  assert.equal(calls[0].body.instructions, '');
+  assert.notEqual(calls[1].body.input[1].content[0].text, calls[0].body.input[1].content[0].text);
+  const cacheKey = calls[0].body.prompt_cache_key;
+  assert.match(cacheKey, /^[a-f0-9]{64}$/);
+  assert.equal(calls[0].session, cacheKey);
+  assert.equal(calls[1].session, cacheKey);
+  assert.equal(calls[1].body.prompt_cache_key, cacheKey);
+  assert.deepEqual(reply.usage, { input_tokens: 300, cache_read_input_tokens: 1500,
+    cache_creation_input_tokens: 200, output_tokens: 5 });
+  const { cr, cc, promptTokens, hit } = am.efficiencyOverall().codex;
+  assert.deepEqual({ cr, cc, promptTokens, hit }, { cr: 1500, cc: 400, promptTokens: 4000, hit: 0.375 });
+
+  await ask({ extra: { metadata: { user_id: 'legacy_user_account_session_' + thread } } });
+  assert.equal(calls.at(-1).session, cacheKey);
+  for (const selection of [
+    { session: 'another-thread' },
+    { headers: { 'x-claude-code-agent-id': 'subagent-1' } },
+    { extra: { metadata: { user_id: JSON.stringify({ session_id: thread, agent_id: 'subagent-2' }) } } },
+    { headers: { 'x-api-key': 'peer-fixture' } },
+    { modelName: 'gpt-6.2-astra' },
+  ]) await ask(selection);
+  am.accounts[0].enabled = false;
+  am.accounts[1].enabled = true;
+  await ask();
+  const otherKeys = calls.slice(3).map(({ body, session }) => {
+    assert.equal(session, body.prompt_cache_key);
+    assert.notEqual(session, cacheKey);
+    return session;
+  });
+  assert.equal(new Set(otherKeys).size, otherKeys.length);
+  await ask({ extra: { metadata: {}, system: undefined } });
+  assert.equal(calls.at(-1).session, undefined);
+  assert.equal(calls.at(-1).body.prompt_cache_key, undefined);
+  assert.equal(calls.at(-1).body.instructions, 'You are a helpful coding assistant.');
+});
+
 test('Codex quota sweep refreshes ETag catalog without trying Anthropic endpoints', async () => {
   const am = new AccountManager([native('one', null)]);
   const original = am.accounts[0];
