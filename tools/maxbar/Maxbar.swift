@@ -255,7 +255,11 @@ func setWifiRadio(_ on: Bool) {
 // MARK: - Claude routing (~/.claude/settings.json env)
 
 let kClaudeSettings = NSHomeDirectory() + "/.claude/settings.json"
-let kPoolProxy = "http://127.0.0.1:3457"
+var kPoolProxy: String {
+    let configured = UserDefaults.standard.object(forKey: "claudeGatePort") as? Int
+    let port = configured.flatMap { (1024...65535).contains($0) ? $0 : nil } ?? 3457
+    return "http://127.0.0.1:\(port)"
+}
 let kPoolCA = NSHomeDirectory() + "/Library/Application Support/mkcert/rootCA.pem"
 
 /// Pool = settings.json env carries the maxpool proxy; Direct = neither key present.

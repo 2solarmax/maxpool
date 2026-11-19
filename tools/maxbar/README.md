@@ -94,3 +94,26 @@ repo IS the distribution for this tool; the npm package continues to ship the pr
 Delete `/Applications/Maxbar.app` and, if you made it,
 `/etc/sudoers.d/sleep-control`. Nothing else is touched (pmset, sudoers, Wi-Fi
 config are unchanged by this app — it only calls existing commands).
+
+### Separate Claude gateway on one Mac
+
+Maxbar looks for the Claude gateway on loopback port 3457 by default. To give
+new Claude Desktop sessions their own gateway, start another rc-gate LaunchAgent
+on an unused loopback port with its own label and log. Point it at the same local
+MaxPool backend. Set `RC_GATE_TITLE_SYNC=0` on the second process to keep a single
+title-sync writer. Omit `RC_GATE_PROFILE` so the explicit Maxbar Pool choice and
+client profile determine routing. Give the second gate its own route switch file
+if the original gate uses a separate Direct/Pool control.
+
+With Claude routing set to Direct, select the new port for Maxbar. For example:
+
+```sh
+defaults write com.maxpool.maxbar claudeGatePort -int 3458
+```
+
+The accepted range is 1024–65535. An absent or invalid preference uses 3457.
+Changing this preference does not edit Claude settings. Choosing **Claude routing
+→ Pool** writes the selected gateway for new Claude processes. To return to the
+original gateway, choose **Direct** first, then remove the preference with
+`defaults delete com.maxpool.maxbar claudeGatePort`. Stop the extra LaunchAgent
+after clients using its port have exited.
