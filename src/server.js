@@ -511,17 +511,19 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             res.end(JSON.stringify({ ok: false, error: 'bad_request', message: 'Expected {account: {type:"provider", provider:"zai"|"kimi", apiKey, name, secretName?}}' }));
             return;
           }
-          let sameName = accountManager.accounts.find(x => x.name === acct.name);
           // A row left over from a failed disk write (its rollback met an in-flight request)
-          // never counts as "exists": drop it now, or ask for a retry while it is still busy.
-          if (sameName?.notPersisted) {
-            if (accountManager.removeAccount(sameName.index) === false) {
+          // never counts as "exists" — by name OR by key: drop it now, or ask for a retry
+          // while it is still busy.
+          const unsaved = accountManager.accounts.filter(x => x.notPersisted
+            && (x.name === acct.name || (x.type === 'provider' && x.credential === acct.apiKey)));
+          for (const row of unsaved) {
+            if (accountManager.removeAccount(row.index) === false) {
               res.writeHead(503, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ ok: false, error: 'busy', message: 'That key is still finishing a request — try again in a moment' }));
               return;
             }
-            sameName = undefined;
           }
+          const sameName = accountManager.accounts.find(x => x.name === acct.name);
           if (sameName && !(sameName.type === 'provider' && sameName.credential === acct.apiKey)) {
             // The name is taken by a DIFFERENT key: refuse, never report it as added. A
             // pasted key defaults to "glm primary", so a second key lands here.

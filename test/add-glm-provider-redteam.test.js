@@ -99,6 +99,23 @@ test('F1 cloud: a 507 whose rollback meets an in-flight request disables the row
   }, { providers: DISK, seed: SEED });
 });
 
+test('F1 cloud: the same key retried under a DIFFERENT name after a busy 507 is added, never a false exists', async () => {
+  await withCloud(async ({ am, post, dir }) => {
+    await chmod(dir, 0o500);
+    const realRemove = am.removeAccount.bind(am);
+    am.removeAccount = () => false;   // the new row is serving a request right now
+    assert.equal((await post({ name: 'glm c', type: 'provider', provider: 'zai', apiKey: 'key-c.333' })).status, 507);
+    assert.ok(am.accounts.find(a => a.name === 'glm c')?.notPersisted, 'fixture: unsaved row left behind');
+    am.removeAccount = realRemove;
+    await chmod(dir, 0o700);
+    const r = await post({ name: 'glm other', type: 'provider', provider: 'zai', apiKey: 'key-c.333' });
+    const body = await r.json();
+    assert.equal(body.result, 'added', `same key, new name: really added, not "exists" on the unsaved row: ${JSON.stringify(body)}`);
+    assert.ok(!am.accounts.some(a => a.notPersisted), 'the unsaved row is gone');
+    assert.ok(am.accounts.some(a => a.name === 'glm other' && a.enabled !== false), 'the new row is live');
+  }, { providers: DISK, seed: SEED });
+});
+
 test('F1 laptop: adding one provider keeps every other provider and its learned state', async () => {
   const home = await mkdtemp(join(tmpdir(), 'mp-addglm-rt2-'));
   await mkdir(join(home, '.config'), { recursive: true });
