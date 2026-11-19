@@ -285,3 +285,30 @@ test('a running quota probe cannot apply an old grant’s response to another ac
   assert.equal(replacement.quota.unified7d, null);
   assert.equal(replacement.quota.codexResetCredits, undefined);
 });
+
+test('a quota probe 401 from a removed account never refreshes the replacement', async () => {
+  let rotations = 0;
+  const am = new AccountManager([native('old', null),
+    { ...native('replacement', null), refreshToken: 'refresh-replacement', expiresAt: Date.now() + 3600000 }], 0.9, {},
+  { refreshNativeCodexToken: async () => { rotations++; throw new Error('replacement grant was called'); } });
+  const [old, replacement] = am.accounts;
+  let start;
+  const started = new Promise(resolve => { start = resolve; });
+  let answer;
+  const pending = new Promise(resolve => { answer = resolve; });
+  const probe = new Prober(am, { usageGapMs: 0,
+    codexProbeFn: account => {
+      if (account === old) { start(); return pending; }
+      return { modelBuckets: [] };
+    },
+    codexCatalogFn: () => ({ notModified: true }),
+  });
+  const sweep = probe.probeAll();
+  await started;
+  am.removeAccount(old.index);
+  assert.equal(replacement.index, 0);
+  answer({ status: 401, error: 'fixture expired' });
+  await sweep;
+  assert.equal(rotations, 0);
+  assert.equal(replacement.refreshToken, 'refresh-replacement');
+});

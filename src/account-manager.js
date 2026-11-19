@@ -6420,6 +6420,9 @@ export class AccountManager {
   async ensureTokenFresh(accountIndex, force = false) {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return true;
+    // The in-memory token changes before the disk write finishes. A concurrent
+    // request must still await persistence even if that token is already fresh.
+    if (account._refreshPromise) return account._refreshPromise;
 
     // Single-writer baton: a worker without the lease NEVER rotates a single-use
     // refresh token (doing so would invalidate the lease holder's token →
@@ -6449,19 +6452,27 @@ export class AccountManager {
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return true;
 
-    // Coalesce concurrent refreshes
-    if (account._refreshPromise) return account._refreshPromise;
-
+    const target = {
+      name: account.name, provider: account.provider, codexAuth: account.codexAuth,
+      accountUuid: account.accountUuid, organizationUuid: account.organizationUuid, codexAccountId: account.codexAccountId,
+      oauthClientId: account.oauthClientId, credential: account.credential, refreshToken: account.refreshToken,
+    };
+    const currentAccount = () => this.accounts[account.index] === account && account.provider === target.provider
+      && account.codexAuth === target.codexAuth && account.accountUuid === target.accountUuid
+      && account.organizationUuid === target.organizationUuid && account.codexAccountId === target.codexAccountId;
+    const sameGrant = () => account.credential === target.credential && account.refreshToken === target.refreshToken;
     account._refreshPromise = (async () => {
       console.log(`[Maxpool] Refreshing token for account "${account.name}"...`);
       // Record the token we're rotating FROM so the persistence layer's
       // generation guard can detect another writer having already advanced it.
-      account._refreshedFrom = account.refreshToken;
+      account._refreshedFrom = target.refreshToken;
+      account._refreshedAccessFrom = target.credential;
       try {
-        const newTokens = account.codexAuth === 'native' ? await this._refreshNativeCodexToken(account)
-          : account.provider === 'codex' ? await this._refreshOpenAIToken(account)
-            : await this._refreshAccessToken(account.refreshToken);
-        if (account.provider === 'codex' && account.refreshToken !== account._refreshedFrom) return true;
+        const newTokens = target.codexAuth === 'native' ? await this._refreshNativeCodexToken(target)
+          : target.provider === 'codex' ? await this._refreshOpenAIToken(target)
+            : await this._refreshAccessToken(target.refreshToken);
+        if (!currentAccount()) return false;
+        if (!sameGrant()) return true;
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
@@ -6481,12 +6492,14 @@ export class AccountManager {
         // refresh failure (which would latch refreshDead on a working account), so
         // guard the await too.
         try {
-          await this._onTokenRefresh?.(accountIndex, newTokens);
+          await this._onTokenRefresh?.(account.index, newTokens, { account, target, refreshedFrom: target.refreshToken });
         } catch (persistErr) {
           console.error(`[Maxpool] Token persist raised unexpectedly for "${account.name}": ${persistErr?.message || persistErr}`);
         }
-        return true;
+        return currentAccount();
       } catch (err) {
+        if (!currentAccount()) return false;
+        if (!sameGrant()) return true;
         console.error(`[Maxpool] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token
@@ -6496,9 +6509,9 @@ export class AccountManager {
             // failure (fetch failed / timeout) → short fixed cooldown so it auto-recovers
             // when the network returns. A retryable HTTP status (429 / 5xx from the OAuth
             // endpoint) is server-side → keep the exponential backoff.
-            this.markTransientFailure(accountIndex, `token_refresh_${err.status || 'network'}`, { network: !err.status });
+            this.markTransientFailure(account.index, `token_refresh_${err.status || 'network'}`, { network: !err.status });
           } else {
-            this.markAuthFailed(accountIndex, err.status || 401, 'token_refresh_failed');
+            this.markAuthFailed(account.index, err.status || 401, 'token_refresh_failed');
             // The refresh TOKEN itself was rejected (invalid_grant) — permanent until
             // browser re-auth. Latch so ensureTokenFresh + the prober stop retrying a
             // dead token. Set ONLY here (a rejected refresh), never in markAuthFailed
@@ -6543,10 +6556,11 @@ export class AccountManager {
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
-  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
+  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }, { persist = true } = {}) {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth') return;
 
+    const target = { ...account };
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
@@ -6557,11 +6571,11 @@ export class AccountManager {
     // claim org and the claim backoff (finding 10).
     this._forgetClaimState(account.name);
     console.log(`[Maxpool] Updated tokens for account "${account.name}"`);
-    this._onTokenRefresh?.(accountIndex, {
+    if (persist) this._onTokenRefresh?.(accountIndex, {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
-    });
+    }, { account, target, refreshedFrom: target.refreshToken });
   }
 
   /**

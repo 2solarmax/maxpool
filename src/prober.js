@@ -164,26 +164,29 @@ export class Prober {
   async _probeCodexAccounts(accounts) {
     for (const account of accounts) {
       if (this._stopping) break;
+      const present = () => this.am.accounts[account.index] === account && !account.poolBenchedBy;
       try {
-        if (!await this.am.ensureTokenFresh(account.index)) continue;
+        if (!present() || !await this.am.ensureTokenFresh(account.index) || !present()) continue;
         let sentAt = this._now();
         let credential = account.credential;
         let usage = await this._withTimeout(this.codexProbeFn(account));
-        if (usage?.status === 401 && account.enabled !== false && !this._stopping) {
-          if (await this.am.ensureTokenFresh(account.index, true)) {
+        if (usage?.status === 401 && present() && account.enabled !== false && !this._stopping) {
+          if (account.credential === credential) await this.am.ensureTokenFresh(account.index, true);
+          if (present() && account.credential !== credential && !this._stopping) {
             sentAt = this._now();
             credential = account.credential;
             usage = await this._withTimeout(this.codexProbeFn(account));
           }
         }
-        if (this.am.accounts[account.index] !== account || account.credential !== credential) continue;
+        if (!present() || account.credential !== credential) continue;
         if (usage && !usage.error) {
           this.am.applyCodexUsageData(account.index, usage, { sentAt });
           if (!this._stopping && account.autoRedeemReset === true) await this.onCodexQuota?.(account);
         } else this.am.recordProbeError?.(account.index, usage?.error || 'probe timed out', usage?.status ?? null);
-        if (!this._stopping && this._now() - (account.quota.codexCatalogCheckedAt || 0) >= 5 * 60_000) {
+        if (present() && !this._stopping && !account.refreshDead
+          && this._now() - (account.quota.codexCatalogCheckedAt || 0) >= 5 * 60_000) {
           const catalog = await this._withTimeout(this.codexCatalogFn(account, { etag: account.quota.codexCatalogEtag }));
-          if (catalog && this.am.accounts[account.index] === account && account.credential === credential) {
+          if (catalog && present() && account.credential === credential) {
             if (!catalog.notModified) account.quota.codexModels = catalog.models;
             account.quota.codexCatalogEtag = catalog.etag;
             account.quota.codexCatalogVersion = catalog.version;

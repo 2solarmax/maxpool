@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import net from 'node:net';
-import { listNativeCodexModels, loginNativeCodex } from './codex-native.js';
+import { listNativeCodexModels, loginNativeCodex, nativeCodexOwnerIdentity } from './codex-native.js';
 import { validCodexCatalog } from './codex-model-routing.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 
@@ -47,11 +47,11 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 );
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
 import { TUI, writeTerminalSync, reclaimRawModeLogged, whenTerminalCaughtUp } from './tui.js';
 import { createTerminalModeSwitcher } from './terminal-mode.js';
 import { RestartController } from './restart-controller.js';
-import { oauthTokensForDiskSync, resolveAccounts } from './account-config.js';
+import { findAccountConfigIndex, oauthTokensForDiskSync, resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
@@ -950,48 +950,47 @@ async function serverWorkerCommand() {
   //
   // BULLETPROOF CONTRACT: ensureTokenFresh now AWAITs this (persist-before-serve),
   // so it must NEVER throw or reject. A throw here — including from the synchronous
-  // prologue (findConfigAccount / addAccount) — would land in ensureTokenFresh's
+  // prologue (account lookup / addAccount) — would land in ensureTokenFresh's
   // refresh-FAILURE catch and latch `refreshDead` on an account whose refresh POST
   // actually SUCCEEDED (bricking a working account — strictly worse than the window
   // this fix closes). So the ENTIRE body is wrapped, prologue included, and every
   // exit resolves. Returns the awaitable persist promise.
-  const persistTokenRefresh = async (idx, newTokens) => {
-    const account = accountManager.accounts[idx];
-    if (!account) return;
+  const persistTokenRefresh = async (_idx, newTokens, { account, target, refreshedFrom }) => {
     try {
-      // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-      const memIdx = findConfigAccount(config, account);
-      if (memIdx >= 0) {
-        config.accounts[memIdx].accessToken = newTokens.accessToken;
-        config.accounts[memIdx].refreshToken = newTokens.refreshToken;
-        config.accounts[memIdx].expiresAt = newTokens.expiresAt;
-      }
+      const native = target.codexAuth === 'native';
+      const owner = native ? nativeCodexOwnerIdentity(target) : null;
+      const stillCurrent = () => accountManager.accounts[account.index] === account
+        && account.refreshToken === newTokens.refreshToken && account.credential === newTokens.accessToken
+        && (!native || (owner && nativeCodexOwnerIdentity(account) === owner));
+      if (!stillCurrent()) return;
       let skipped = false; // guard-skip or account-not-on-disk → nothing was persisted
       await atomicConfigUpdate(diskConfig => {
+        if (!stillCurrent()) { skipped = true; return; }
+        const record = native ? target : account;
+        const cfgIdx = findAccountConfigIndex(diskConfig.accounts, record);
+        if (cfgIdx < 0) { skipped = true; return; }
+        const onDisk = diskConfig.accounts[cfgIdx];
+        // Compare with the grant sent when OAuth started, even if a config
+        // change has moved or reauthorized the same account since then.
+        const sourceMatches = onDisk.refreshToken === refreshedFrom && (!native || onDisk.accessToken === target.credential);
+        const resultMatches = onDisk.refreshToken === newTokens.refreshToken && (!native || onDisk.accessToken === newTokens.accessToken);
+        if ((native || onDisk.refreshToken) && !sourceMatches && !resultMatches) {
+          skipped = true;
+          return;
+        }
         // Pick up any new accounts from disk so index matching stays correct
         // (only add, don't refresh credentials — we're about to write the authoritative tokens)
         for (const diskAcct of diskConfig.accounts) {
-          const known = config.accounts.some(a => sameAccountIdentity(a, diskAcct) || nameMatches(a, diskAcct));
+          const known = findAccountConfigIndex(config.accounts, diskAcct) >= 0
+            || accountManager.accounts.some(a => a.name === diskAcct.name);
           if (!known) {
             config.accounts.push(diskAcct);
             accountManager.addAccount(diskAcct);
           }
         }
-        // Match by UUID first, then by name — index may have shifted
-        const cfgIdx = findConfigAccount(diskConfig, account);
-        if (cfgIdx < 0) { skipped = true; return; }
-        const onDisk = diskConfig.accounts[cfgIdx];
-        // Generation guard: if the on-disk refresh token already advanced past
-        // the token we rotated FROM, another writer beat us — skip the write so
-        // we don't revert a fresher single-use token (the brick-the-account case).
-        if (onDisk.refreshToken && onDisk.refreshToken !== account._refreshedFrom &&
-            onDisk.refreshToken !== newTokens.refreshToken) {
-          skipped = true;
-          return;
-        }
-        onDisk.accessToken = newTokens.accessToken;
-        onDisk.refreshToken = newTokens.refreshToken;
-        onDisk.expiresAt = newTokens.expiresAt;
+        const memIdx = findAccountConfigIndex(config.accounts, record);
+        if (memIdx >= 0) Object.assign(config.accounts[memIdx], newTokens);
+        Object.assign(onDisk, newTokens);
       });
       // Monitoring: the rotated token is now DURABLE on disk. Correlate this fp
       // with a later "REJECTED sent fp=" line to tell a lost-rotation double-spend
@@ -1432,12 +1431,12 @@ async function serverWorkerCommand() {
         const autoRedeemReset = enabled === true;
         await atomicConfigUpdate(disk => {
           if (!hasLease || owningCodex(name) !== account) throw new Error('Account ownership changed');
-          const entry = disk.accounts.find(candidate => candidate.codexAuth === 'native' && sameAccountIdentity(candidate, account));
+          const entry = disk.accounts[findAccountConfigIndex(disk.accounts, account)];
           if (!entry) throw new Error('The account is missing from the pool config');
           entry.autoRedeemReset = autoRedeemReset;
         });
         account.autoRedeemReset = autoRedeemReset;
-        const entry = config.accounts.find(candidate => candidate.codexAuth === 'native' && sameAccountIdentity(candidate, account));
+        const entry = config.accounts[findAccountConfigIndex(config.accounts, account)];
         if (entry) entry.autoRedeemReset = autoRedeemReset;
       },
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
@@ -1480,19 +1479,21 @@ async function serverWorkerCommand() {
         // extra disk-only fields (e.g. importFrom) where the account still exists.
         // Use live tokens from AccountManager (not the stale config.accounts copy).
         diskConfig.accounts = config.accounts.map(a => {
-          const am = accountManager.accounts.find(candidate =>
-            sameAccountIdentity(candidate, a) || nameMatches(candidate, a)
-          );
-          const live = am ? {
-            ...a,
+          const am = accountManager.accounts[findAccountConfigIndex(accountManager.accounts, a)];
+          const diskAcct = diskConfig.accounts[findAccountConfigIndex(diskConfig.accounts, a)];
+          if (!diskAcct) {
+            const replacement = diskConfig.accounts.find(d => d.name === a.name
+              && (d.codexAuth === 'native' || a.codexAuth === 'native'));
+            if (replacement) return replacement;
+          }
+          const liveTokens = am ? {
             accessToken: am.credential,
             refreshToken: am.refreshToken,
             expiresAt: am.expiresAt,
-          } : a;
-          const diskAcct = diskConfig.accounts.find(
-            d => sameAccountIdentity(d, a) || nameMatches(d, a)
-          );
-          return diskAcct ? { ...diskAcct, ...live } : live;
+          } : {};
+          const tokens = am?.codexAuth === 'native' && diskAcct?.accessToken && diskAcct?.refreshToken
+            ? oauthTokensForDiskSync(am, diskAcct) : liveTokens;
+          return { ...diskAcct, ...a, ...tokens };
         });
       }),
       syncAccounts: async () => {
@@ -2737,21 +2738,6 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown', prefe
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find a config account entry matching an in-memory account (by user + organization,
- * then name).
- */
-// Name fallback must never cross organizations: a same-user row with a KNOWN,
-// DIFFERENT organization owns its name and its tokens.
-function nameMatches(a, diskAcct) {
-  return a.name === diskAcct.name && !knownDifferentOrg(a, diskAcct);
-}
-function findConfigAccount(diskConfig, account) {
-  const idx = diskConfig.accounts.findIndex(a => sameAccountIdentity(a, account));
-  if (idx >= 0) return idx;
-  return diskConfig.accounts.findIndex(a => a.name === account.name);
-}
-
-/**
  * Sync accounts from disk config: add new accounts and refresh credentials
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
  * Returns the number of new accounts added.
@@ -2759,11 +2745,12 @@ function findConfigAccount(diskConfig, account) {
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
   for (const diskAcct of diskConfig.accounts) {
-    const matchByUuid = memConfig.accounts.findIndex(a => sameAccountIdentity(a, diskAcct));
-    const matchByName = memConfig.accounts.findIndex(a => a.name === diskAcct.name);
-    const memIdx = (matchByUuid >= 0 ? matchByUuid : null) ?? (matchByName >= 0 ? matchByName : -1);
+    const memIdx = findAccountConfigIndex(memConfig.accounts, diskAcct);
 
     if (memIdx < 0) {
+      // The normal enrollment path gives new owners distinct names. A hand-edited
+      // collision must not turn a live account into another workspace.
+      if (accountManager.accounts.some(a => a.name === diskAcct.name)) continue;
       // New account discovered on disk — add to running server
       memConfig.accounts.push(diskAcct);
       accountManager.addAccount(diskAcct);
@@ -2785,9 +2772,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     if (!freshCred) continue;
 
     // Find the corresponding AccountManager entry and update credentials
-    const mgr = accountManager.accounts.find(a =>
-      sameAccountIdentity(a, diskAcct) || nameMatches(a, diskAcct)
-    );
+    const mgr = accountManager.accounts[findAccountConfigIndex(accountManager.accounts, diskAcct)];
     if (!mgr) continue;
     if (diskAcct.provider === 'codex') {
       mgr.oauthClientId = diskAcct.oauthClientId;
@@ -2835,7 +2820,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       const changed = mgr.credential !== freshCred.accessToken ||
         mgr.refreshToken !== freshCred.refreshToken;
       if (changed) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
+        accountManager.updateAccountTokens(mgr.index, freshCred, { persist: false });
         console.log(`[Maxpool] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {

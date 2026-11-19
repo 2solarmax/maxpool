@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { oauthTokensForDiskSync } from '../src/account-config.js';
+import { findAccountConfigIndex, oauthTokensForDiskSync } from '../src/account-config.js';
 import {
   listNativeCodexModels, loginNativeCodex, nativeCodexHeaders, parseNativeCodexCallback, refreshNativeCodexToken,
 } from '../src/codex-native.js';
@@ -75,6 +75,12 @@ test('native refresh keeps an unrotated refresh grant and rejects a different wo
   await assert.rejects(refreshNativeCodexToken(start, {
     fetchImpl: async () => json(grants('workspace-b')),
   }), /different ChatGPT workspace/);
+  await assert.rejects(refreshNativeCodexToken(start, {
+    fetchImpl: async () => json({
+      ...grants(),
+      id_token: jwt({ [authKey]: { chatgpt_account_id: 'workspace-a', chatgpt_user_id: 'user-b' } }),
+    }),
+  }), /different ChatGPT user/);
   await assert.rejects(refreshNativeCodexToken(start, {
     fetchImpl: async () => json({ error: 'invalid_grant' }, { status: 400 }),
   }), { status: 400, retryable: false });
@@ -383,14 +389,70 @@ test('disk sync racing a Codex refresh keeps the replacement and accepts a separ
   am.onTokenRefresh(() => { started(); return persisted; });
   const refresh = am.ensureTokenFresh(0);
   await saving;
+  let served = false;
+  const concurrent = am.ensureTokenFresh(0).then(() => { served = true; });
   try {
+    await Promise.resolve();
+    assert.equal(served, false, 'another request must await the ongoing durable write');
     // Capture the race independent of which token has the longer lifetime.
     assert.deepEqual(oauthTokensForDiskSync(am.accounts[0], old), fresh);
     assert.deepEqual(oauthTokensForDiskSync(am.accounts[0], { ...old, expiresAt: fresh.expiresAt + 1000 }), fresh);
+    const unrotated = { ...am.accounts[0], refreshToken: old.refreshToken };
+    assert.deepEqual(oauthTokensForDiskSync(unrotated, { ...old, expiresAt: fresh.expiresAt + 1000 }),
+      { ...fresh, refreshToken: old.refreshToken });
     const reauthorized = { ...old, accessToken: 'reauthorized-access', refreshToken: 'different-grant', expiresAt: fresh.expiresAt - 1000 };
     assert.deepEqual(oauthTokensForDiskSync(am.accounts[0], reauthorized), reauthorized);
   } finally {
     release();
     assert.equal(await refresh, true);
+    await concurrent;
   }
+});
+
+test('native config lookup follows an owner rename and ignores other accounts with its old name', () => {
+  const owner = account();
+  const differentUser = account({ accountUuid: 'unrelated-user' });
+  const differentWorkspace = account({ codexAccountId: 'different-workspace' });
+  const legacy = { ...owner, codexAuth: null };
+  const renamed = { ...owner, name: 'renamed' };
+  assert.equal(findAccountConfigIndex([differentUser, differentWorkspace, legacy, renamed], owner), 3);
+  assert.equal(findAccountConfigIndex([differentUser, differentWorkspace, legacy], owner), -1);
+  assert.equal(findAccountConfigIndex([owner], legacy), -1);
+});
+
+test('native refresh persists to the original owner after an earlier row is removed', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const fresh = { accessToken: 'fresh-owner-access', refreshToken: 'fresh-owner-refresh', expiresAt: Date.now() + 3600000 };
+  const am = new AccountManager([
+    { name: 'removed', type: 'apikey', apiKey: 'removed-key' },
+    account({ type: 'oauth', accessToken: 'expired-owner', refreshToken: 'old-owner', expiresAt: 1 }),
+    { name: 'other', type: 'apikey', apiKey: 'unrelated-key' },
+  ], 0.9, {}, { refreshNativeCodexToken: () => pending });
+  const owner = am.accounts[1];
+  const saved = [];
+  am.onTokenRefresh((index, tokens) => saved.push([am.accounts[index], tokens]));
+  const refresh = am.ensureTokenFresh(owner.index);
+  am.removeAccount(0);
+  finish(fresh);
+  assert.equal(await refresh, true);
+  assert.equal(saved[0]?.[0], owner);
+  assert.deepEqual(saved[0]?.[1], fresh);
+  assert.equal(owner.refreshToken, fresh.refreshToken);
+  assert.equal(am.accounts[1].credential, 'unrelated-key');
+});
+
+test('a refresh rejection cannot bench the replacement occupying a deleted account’s index', async () => {
+  let fail;
+  const pending = new Promise((_resolve, reject) => { fail = reject; });
+  const am = new AccountManager([
+    account({ type: 'oauth', accessToken: 'expired-owner', refreshToken: 'old-owner', expiresAt: 1 }),
+    { name: 'other', type: 'apikey', apiKey: 'unrelated-key' },
+  ], 0.9, {}, { refreshNativeCodexToken: () => pending });
+  const refresh = am.ensureTokenFresh(0);
+  assert.equal(am.removeAccount(0), true);
+  fail(Object.assign(new Error('Rejected fixture grant'), { status: 401 }));
+  assert.equal(await refresh, false);
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[0].lastError, null);
 });

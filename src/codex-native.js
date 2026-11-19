@@ -129,11 +129,19 @@ async function requestToken(fields, { fetchImpl = fetch, signal } = {}) {
 export async function refreshNativeCodexToken(account, options = {}) {
   const previous = field(account?.refreshToken);
   if (!previous) throw new Error('Codex refresh token is missing');
-  const data = await requestToken({ grant_type: 'refresh_token', refresh_token: previous }, options);
   const workspace = field(account.codexAccountId) || field(account.accountId) || field(account.organizationUuid);
-  const returnedWorkspace = field(jwtClaims(data.access_token)[AUTH_CLAIM]?.chatgpt_account_id);
-  if (workspace && returnedWorkspace && returnedWorkspace !== workspace) {
-    throw new Error('Codex renewed a different ChatGPT workspace');
+  const user = field(account.accountUuid);
+  const data = await requestToken({ grant_type: 'refresh_token', refresh_token: previous }, options);
+  for (const token of [data.access_token, data.id_token]) {
+    const auth = jwtClaims(token)[AUTH_CLAIM];
+    const returnedWorkspace = field(auth?.chatgpt_account_id);
+    const returnedUser = field(auth?.chatgpt_user_id) || field(auth?.user_id);
+    if (workspace && returnedWorkspace && returnedWorkspace !== workspace) {
+      throw new Error('Codex renewed a different ChatGPT workspace');
+    }
+    if (user && returnedUser && returnedUser !== user) {
+      throw new Error('Codex renewed a different ChatGPT user');
+    }
   }
   return tokenFields(data, previous);
 }

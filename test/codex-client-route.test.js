@@ -354,3 +354,37 @@ test('an uncertain first response keeps retries with the account that may have a
   await retry.text();
   assert.deepEqual(calls.map(call => call.headers.authorization), ['Bearer upstream-grant-a', 'Bearer upstream-grant-a']);
 });
+
+test('a delayed 401 retries the new authorization without refreshing its grant', async t => {
+  let rejectOld;
+  const oldResponse = new Promise(resolve => { rejectOld = resolve; });
+  let started;
+  const attempted = new Promise(resolve => { started = resolve; });
+  let rotations = 0;
+  const { url, calls, am } = await createFixture(t, {
+    accounts: [{ ...native('a'), refreshToken: 'old-refresh', expiresAt: Date.now() + 3600000 }],
+    async upstream(_target, _options, observed) {
+      if (observed.length !== 1) return streamed();
+      started();
+      return oldResponse;
+    },
+  });
+  am._refreshNativeCodexToken = async () => {
+    rotations++;
+    throw new Error('the new grant must not be refreshed by an old response');
+  };
+  const turn = response(url);
+  await attempted;
+  try {
+    am.updateAccountTokens(0, {
+      accessToken: 'browser-reauthorized', refreshToken: 'browser-refresh', expiresAt: Date.now() + 3600000,
+    }, { persist: false });
+  } finally {
+    rejectOld(new Response(null, { status: 401 }));
+  }
+  const accepted = await turn;
+  assert.equal(accepted.status, 200);
+  await accepted.text();
+  assert.equal(rotations, 0);
+  assert.deepEqual(calls.map(call => call.headers.authorization), ['Bearer upstream-grant-a', 'Bearer browser-reauthorized']);
+});

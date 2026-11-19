@@ -321,30 +321,40 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
           }
           if (draining) return handoff(res);
           const url = NATIVE_POST_URLS.get(path);
-          const send = () => forwardNative(fetchImpl, url, { method: 'POST', body, headers: outboundHeaders(req, account) }, controller);
+          let sentAt;
+          let sentCredential;
+          const send = () => {
+            sentAt = Date.now();
+            sentCredential = account.credential;
+            return forwardNative(fetchImpl, url, { method: 'POST', body, headers: outboundHeaders(req, account) }, controller);
+          };
+          const sameAttemptGrant = () => isCurrent() && account.credential === sentCredential;
           // Once bytes can go upstream, a missing response does not prove they
           // were rejected. Persist this prospective owner in the same snapshot
           // even if the old worker has yet to receive upstream headers.
           if (key) manager.rememberNativeCodexOwner(key, identity);
-          const sentAt = Date.now();
           upstream = await send();
           if (upstream.status === 401 && !draining && !controller.signal.aborted && isCurrent()) {
-            const credential = account.credential;
-            if (await manager.ensureTokenFresh(account.index, true) && account.credential !== credential
-              && !draining && !controller.signal.aborted && isCurrent() && account.enabled !== false && !account.poolBenchedBy) {
+            if (sameAttemptGrant()) await manager.ensureTokenFresh(account.index, true);
+            if (account.credential !== sentCredential && !draining && !controller.signal.aborted
+              && isCurrent() && account.enabled !== false && !account.poolBenchedBy) {
               await upstream.body?.cancel();
               if (draining) return handoff(res);
+              if (controller.signal.aborted) return null;
+              if (!isCurrent() || account.enabled === false || account.poolBenchedBy) {
+                return routeError(res, 409, 'conversation_owner_unavailable', 'The owning Codex account changed while retrying.');
+              }
               upstream = await send();
             }
           }
-          if (isCurrent()) manager.applyCodexQuotaHeaders(account.index, upstream.headers, sentAt, data.model);
+          if (sameAttemptGrant()) manager.applyCodexQuotaHeaders(account.index, upstream.headers, sentAt, data.model);
           if (!upstream.ok) {
             const buffer = await boundedBody(upstream, controller);
             const error = withJsonBody(buffer);
             const limit = upstream.status === 429 ? codexRateLimit(upstream.headers, data.model) : null;
             const retry = limit ? retryAfter(upstream, limit.retryAfter) : null;
-            if (isCurrent() && limit) manager.markRateLimited(account.index, retry, { recordFailure: false, modelScope: limit.modelScope });
-            else if (isCurrent() && upstream.status === 401) manager.markAuthFailed(account.index, 401, 'native_codex_unauthorized');
+            if (sameAttemptGrant() && limit) manager.markRateLimited(account.index, retry, { recordFailure: false, modelScope: limit.modelScope });
+            else if (sameAttemptGrant() && upstream.status === 401) manager.markAuthFailed(account.index, 401, 'native_codex_unauthorized');
             outcome.status = upstream.status;
             if (!draining && !owner && shouldRetry(upstream.status, error)) {
               // No response was accepted on an explicit auth/quota/model
