@@ -281,6 +281,33 @@ test('Codex credits use the subscription weekly wall, expiry, and natural-refill
   assert.equal(decideCodexWithReason(owner, [expiring], resetNow).reason, 'probe not fresh');
 });
 
+test('banked Pro resets are held during low usage and claimed when the weekly policy calls for one', async () => {
+  const summary = { available: 3, applicable: 0, checkedAt: resetNow };
+  const owner = account({ autoRedeemReset: true, quota: {
+    unified7d: 0.15, unified7dReset: resetNow + 48 * 60 * minutes,
+    codexWeeklyReadingAt: resetNow, codexResetCredits: summary,
+  } });
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  const attempts = [];
+  const redeemer = new ResetCreditRedeemer(manager, {
+    now: () => resetNow, log() {}, transactState: resetFixture().transactState,
+    detailsFn: async () => ({ credits: [availableCredit] }),
+    usageFn: async () => ({ sevenDay: { utilization: 0, resetAt: owner.quota.unified7dReset } }),
+    consumeFn: async (_account, attempt) => {
+      attempts.push(attempt.creditId);
+      return { code: 'reset', windowsReset: 1 };
+    },
+  });
+  assert.equal((await redeemer.maybeRedeemForPool([owner])).redeemed, false);
+  owner.quota.unified7d = 0.99;
+  assert.equal((await redeemer.maybeRedeemForPool([owner])).redeemed, false);
+  assert.equal(summary.available, 3);
+  assert.deepEqual(attempts, []);
+  summary.applicable = 3;
+  assert.equal((await redeemer.maybeRedeemForPool([owner])).redeemed, true);
+  assert.deepEqual(attempts, [availableCredit.id]);
+});
+
 test('Codex automatic expiry redemption uses the sweep while a request only reacts to the weekly wall', async () => {
   const owner = account({ autoRedeemReset: true, quota: { unified7d: 0.4,
     unified7dReset: resetNow + 30 * 60 * minutes, codexWeeklyReadingAt: resetNow } });
