@@ -305,11 +305,9 @@ test('banked Pro resets are held during low usage and claimed when the weekly po
     },
   });
   assert.equal((await redeemer.maybeRedeemForPool([owner])).redeemed, false);
-  owner.quota.unified7d = 0.99;
-  assert.equal((await redeemer.maybeRedeemForPool([owner])).redeemed, false);
   assert.equal(summary.available, 3);
   assert.deepEqual(attempts, []);
-  summary.applicable = 3;
+  owner.quota.unified7d = 0.99;
   assert.equal((await redeemer.maybeRedeemForPool([owner])).redeemed, true);
   assert.deepEqual(attempts, [availableCredit.id]);
 });

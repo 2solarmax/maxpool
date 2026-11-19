@@ -33,7 +33,7 @@ The independent Codex routing switch uses the client's version-checked configura
 
 ### 2026-11-19 · Codex reset inventory
 
-OpenAI reports separate counts for unused and currently applicable credits. Accounts shows the balance of unused credits, following the Codex CLI. Reset details lists unspent, unexpired credits supported by the plan. When usage is low the credits remain saved for later. Free-credit policy and local opt-in are independent of this display.
+OpenAI reports separate counts for unused and currently applicable credits. Accounts shows the balance of unused credits, following the Codex CLI. Reset details lists unspent, unexpired credits supported by the plan. The optional usage-summary applicability count can stay zero as usage rises. At the weekly policy threshold, check the individual credit and use OpenAI’s redemption verdict. A decline leaves the credit banked. Free-credit policy and local opt-in are independent of this display.
 
 ### 2026-11-19 · Codex account display
 

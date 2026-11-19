@@ -100,10 +100,7 @@ test('free reset inventory requires confirmation and refreshes after manual rede
 
   assert.doesNotMatch(tui._renderCodexResets(10).map(strip).join(' '), /Expired reset|Spent reset/);
   account.codexResetCredits.applicable = 0;
-  assert.doesNotMatch(strip(tui._renderFooter()), /Redeem/);
-  tui._key('enter');
-  assert.equal(tui.mode, 'codexResets');
-  account.codexResetCredits.applicable = 1;
+  assert.match(strip(tui._renderFooter()), /Redeem/);
   tui._key('enter');
   assert.equal(tui.mode, 'confirm');
   tui._key('n');

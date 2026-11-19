@@ -78,8 +78,8 @@ function additionalLimits(additional) {
  *
  *  - `available` is what the account HOLDS, and is the number every display
  *    surface reports. It says nothing about whether this plan may spend one.
- *  - `applicable` is upstream's own view of how many would reset something
- *    right now — 0 whenever no window is currently eligible.
+ *  - `applicable` preserves an optional usage-summary field for diagnostics.
+ *    The Codex client uses the detail rows and the redemption result.
  *
  * Neither decides a redemption: only the detail rows say whether a specific
  * credit is both available and supported by the plan, and spending one is not

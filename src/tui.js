@@ -2187,7 +2187,7 @@ export class TUI {
       this._showCodexResets(state.account).catch(error => this._addLog(`Could not read resets: ${error.message}`));
     } else if (k === 'enter' && this.redeemCodexReset) {
       const credit = state.credits[state.selected];
-      if (state.account.enabled === false || resetSummary(state.account)?.applicable === 0 || !canRedeemCodexCredit(credit)) {
+      if (state.account.enabled === false || !canRedeemCodexCredit(credit)) {
         state.notice = 'This reset cannot be redeemed.';
         return;
       }
@@ -2226,8 +2226,7 @@ export class TUI {
     const summary = resetSummary(state.account);
     if (Number.isInteger(summary?.available)) {
       const balance = summary.available + (summary.available === 1 ? ' banked reset' : ' banked resets');
-      const timing = summary.available > 0 && summary.applicable === 0 ? ' · Saved for later' : '';
-      out.push(' ' + balance + timing);
+      out.push(' ' + balance);
     }
     const quota = state.account.quota;
     const windows = [];
@@ -4041,7 +4040,7 @@ export class TUI {
       case 'codexResets': {
         const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset ? 'on' : 'off'}` : '';
         const state = this.codexResets;
-        const selectable = state.account.enabled !== false && resetSummary(state.account)?.applicable !== 0
+        const selectable = state.account.enabled !== false
           && canRedeemCodexCredit(state.credits[state.selected]);
         const redeem = this.redeemCodexReset && selectable ? `  ${bold('Enter')} Redeem` : '';
         return ` ${dim('↑↓')} Select${redeem}  ${bold('r')} Refresh${auto}  ${bold('Esc')} Back`;

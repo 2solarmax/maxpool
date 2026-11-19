@@ -395,7 +395,7 @@ export class ResetCreditRedeemer {
         || !(now - q.codexWeeklyReadingAt <= CLAIM_FRESH_MS)) continue;
       const summary = q.codexResetCredits;
       if (summary && now - summary.checkedAt <= CLAIM_FRESH_MS
-        && (summary.available === 0 || summary.applicable === 0)) continue;
+        && summary.available === 0) continue;
       const state = this._stateFor(account);
       if (now < state.cooldownUntil) continue;
       const result = await this._credits(account, state, now, deadline);
@@ -425,8 +425,8 @@ export class ResetCreditRedeemer {
     }
     const summary = account.quota?.codexResetCredits;
     if (summary && now - summary.checkedAt <= CLAIM_FRESH_MS
-      && (summary.available === 0 || summary.applicable === 0)) {
-      return { action: null, reason: 'no banked reset is applicable' };
+      && summary.available === 0) {
+      return { action: null, reason: 'no banked resets remaining' };
     }
     return decideCodexWithReason(account, state.credits, now, {
       listingCheckedAt: state.creditsAt,
