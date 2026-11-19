@@ -20,7 +20,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setConsoleNonBlocking, reassertConsoleNonBlocking, appendEventLog, printFatal } from './event-log.js';
-import { sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
+import { codexPoolEndpoint, sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
 import { fetchRemoteStatus } from './pool-link.js';
 import { SleepGuard } from './sleep-guard.js';
 import { controllingTerminalAlive } from './terminal-alive.js';
@@ -1045,6 +1045,7 @@ async function serverWorkerCommand() {
   // MSG_ROLLED_BACK.
   let reloadSeq = 0;
   let openReload = null;
+  let preparingNativeReload = false;
 
   // Best-effort terminal restore on ANY abnormal exit path (uncaughtException,
   // a bare process.exit, a crash) so the user's shell is never left in raw mode
@@ -1223,6 +1224,11 @@ async function serverWorkerCommand() {
     if (draining) return; // MSG_RELEASE already arrived → a real reload, not a rollback
     // An update that asked while this reload was already open was folded into it.
     const forUpdate = reloadIsForUpdate;
+    if (preparingNativeReload && hasLease) {
+      preparingNativeReload = false;
+      accountManager.setWriterLease(true);
+      prober.start();
+    }
     openReload = null;
     reloadIsForUpdate = false;
     const why = !answered ? 'the supervisor did not answer'
@@ -1335,6 +1341,22 @@ async function serverWorkerCommand() {
     ...(Number.isFinite(config.restartDrainTimeoutMs) ? { drainTimeoutMs: config.restartDrainTimeoutMs } : {}),
   });
 
+  // The installed supervisor can outlive several package upgrades. Its release
+  // acknowledgement deadline is 20s, while a native refresh alone can take 30s.
+  // Finish rotations with admission still open, before starting its baton clock.
+  const requestManagedRestart = async (headlessSignal = false) => {
+    if (draining || openReload || preparingNativeReload) return;
+    if (hasLease && restartController.isSeamless()
+      && accountManager.accounts.some(a => a.codexAuth === 'native' && !a.remote)) {
+      preparingNativeReload = true;
+      accountManager.setWriterLease(false);
+      await Promise.all([prober.stop(), accountManager.drainRefreshes()]);
+      if (draining) return;
+    }
+    if (headlessSignal) requestReload();
+    else restartController.requestRestart();
+  };
+
   // Test-only: drive the real interactive restart path (the TUI `r` key) headless,
   // so the end-to-end "restart while requests are in flight completes bounded and
   // the server comes back" is provable without allocating a pty. Gated — never
@@ -1343,7 +1365,7 @@ async function serverWorkerCommand() {
     process.on('SIGUSR2', () => {
       if (testHookFires('MAXPOOL_TEST_SIGNAL_COLD_RESTART')) { restartWorkerNow(); return; }   // test seam: the abrupt restart
       if (testHookFires('MAXPOOL_TEST_RELOAD_IS_UPDATE')) reloadIsForUpdate = true;   // test seam: an update-driven reload
-      restartController?.requestRestart();
+      requestManagedRestart();
     });
   }
 
@@ -1507,7 +1529,7 @@ async function serverWorkerCommand() {
       },
       onRestart: () => {
         if (testHookFires('MAXPOOL_TEST_RELOAD_IS_UPDATE')) reloadIsForUpdate = true;   // test seam: an update-driven reload
-        restartController.requestRestart();
+        requestManagedRestart();
       },
     });
   }
@@ -1553,7 +1575,7 @@ async function serverWorkerCommand() {
       // silently resuming the old build. A plain 'r' restart never does that — there a
       // rollback should leave the healthy worker serving.
       reloadIsForUpdate = true;
-      restartController.requestRestart();
+      requestManagedRestart();
     }
   };
   // Manual apply (the TUI 'u' → check & apply now): reload into a freshly-installed
@@ -1569,7 +1591,7 @@ async function serverWorkerCommand() {
       // silently resuming the old build. A plain 'r' restart never does that — there a
       // rollback should leave the healthy worker serving.
       reloadIsForUpdate = true;
-      restartController.requestRestart();
+      requestManagedRestart();
     }
   };
   // ONE in-flight latch shared by the periodic timer, the cold-start probe, AND the
@@ -1657,27 +1679,27 @@ async function serverWorkerCommand() {
     }
   };
 
-  const becomePrimary = async ({ viaTakeover }) => {
-    // Cold start: the terminal first, as always (nothing else to hand over). A reload
-    // TAKEOVER serves and announces primacy FIRST and takes the terminal last (below):
-    // whatever the terminal does, the baton completes and the port keeps answering.
-    if (!viaTakeover) takeTerminal({ viaTakeover });
+  const restoreTakeoverState = async () => {
     // On a reload TAKEOVER, adopt the latest tokens from disk. The headless
     // reload worker loaded config at spawn time; the OLD worker may have rotated
     // a single-use refresh token DURING the handoff (and flushed it before
     // MSG_RELEASED). Without this re-sync the new worker would present the now-
     // invalidated token on its first refresh → invalid_grant → bricked account.
-    if (viaTakeover) {
-      try {
-        const diskConfig = await loadConfig();
-        if (diskConfig) await syncAccountsFromDisk(diskConfig, config, accountManager);
-      } catch (err) {
-        console.error(`[Maxpool] Token re-sync at takeover failed: ${err.message}`);
-      }
-      const finalState = await loadState();
-      accountManager.restoreNativeCodexConversationOwners(finalState?.nativeCodexConversationOwners);
+    try {
+      const diskConfig = await loadConfig();
+      if (diskConfig) await syncAccountsFromDisk(diskConfig, config, accountManager);
+    } catch (err) {
+      console.error(`[Maxpool] Token re-sync at takeover failed: ${err.message}`);
     }
+    const finalState = await loadState();
+    accountManager.restoreNativeCodexConversationOwners(finalState?.nativeCodexConversationOwners);
+  };
 
+  const becomePrimary = async ({ viaTakeover }) => {
+    // Cold start: the terminal first, as always (nothing else to hand over). A reload
+    // TAKEOVER serves and announces primacy FIRST and takes the terminal last (below):
+    // whatever the terminal does, the baton completes and the port keeps answering.
+    if (!viaTakeover) takeTerminal({ viaTakeover });
     // Acquire the lease (re-syncs state generation + enables writes) BEFORE we
     // announce primacy, so the moment the supervisor reaps the old worker we are
     // a fully-functional sole writer.
@@ -1857,6 +1879,10 @@ async function serverWorkerCommand() {
           // Baton acquire: the old worker already released, so we're the SOLE
           // acceptor. Start accepting + take the writer lease + TUI. becomePrimary
           // sends MSG_PRIMARY (the baton waits on it).
+          // The supervisor holds the listening socket during this short disk read.
+          // An encrypted continuation accepted early cannot recover its issuing
+          // account from the incoming worker's boot snapshot.
+          await restoreTakeoverState();
           await listenOnHandle(handle);
           await becomePrimary({ viaTakeover: true });
         } else if (msg?.type === MSG_TTY_REASSERT) {
@@ -1935,7 +1961,7 @@ async function serverWorkerCommand() {
   // the pool. Re-check shortly after, in case the signal raced the terminal revoke.
   const hangupShutdown = () => shutdownGracefully('SIGHUP', { terminalClose: true });
   process.on('SIGHUP', () => {
-    if (!isInteractiveTerminal()) return requestReload();
+    if (!isInteractiveTerminal()) return requestManagedRestart(true);
     if (!controllingTerminalAlive()) return hangupShutdown();
     console.log('[Maxpool] Ignored SIGHUP: this terminal is still open, so another program sent it (not a closed window). Maxpool keeps running — press r to restart it.');
     for (const ms of [500, 2000]) {
@@ -2134,7 +2160,7 @@ async function loginChatGPTCommand() {
     let prior = localPrior;
     if (plan.action === 'cloud') {
       const pool = plan.pool;
-      const route = new URL(String(pool.url).replace(/\/+$/, '') + '/maxpool/chatgpt-login');
+      const route = codexPoolEndpoint(pool.url, '/maxpool/chatgpt-login');
       route.searchParams.set('native', '1');
       if (requestedName) route.searchParams.set('name', requestedName);
       const result = await fetch(route, {

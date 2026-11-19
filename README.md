@@ -219,7 +219,9 @@ maxpool login --codex --local --name "ChatGPT laptop"
 
 Use `--pool <name>` for a specific linked team pool or `--model <slug>` to
 select the account's default model. Upgrade both MaxPool endpoints before
-adding accounts to a linked cloud pool. The chosen pool owns token renewal.
+adding accounts to a linked cloud pool. For Codex sign-in, connect to the
+team pool over HTTPS or use a tunnel with a loopback address. The chosen
+pool owns token renewal.
 MaxPool lists the account as Codex. Clients continue to send Claude Code's
 Messages API, and MaxPool translates requests and tool results to OpenAI
 Responses when it picks a ChatGPT account. The `all` profile considers
