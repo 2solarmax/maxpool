@@ -23,13 +23,13 @@ test('24h: the Cache line shows the 24h hit beside the 15m one, and it survives 
   for (let i = 0; i < 30; i++) served(m, m.accounts[0], { in: 100, cr: 9900, cc: 100, out: 10 });
   const line = strip(tui(m)._cacheLine(200));
   assert.match(line, /\[15m\/24h\].*Claude 98%\/98%/, `Claude's two measured windows stay together: ${line}`);
-  assert.doesNotMatch(line, /GLM/, 'idle providers do not add unlabeled placeholders');
+  assert.match(line, /GLM —\/—/, 'idle providers retain named placeholders');
   // Export → a fresh manager (restart) → same 24h figure from the restored buckets.
   const saved = m.exportEfficiencyHours();
   assert.ok(saved && saved.c1, 'export carries the account buckets');
   const m2 = new AccountManager([acct('c1'), glmAcct('g1')], 0.9);
   m2.restoreEfficiencyHours(saved);
-  assert.match(strip(tui(m2)._cacheLine(200)), /Claude —\/98%/, 'restored history is visible before the first new request');
+  assert.match(strip(tui(m2)._cacheLine(200)), /Claude —\/98% · GLM —\/—/, 'restored history is visible before the first new request');
   served(m2, m2.accounts[0], { in: 100, cr: 9900, cc: 100, out: 10 });
   assert.equal(m2.efficiency24h().claude.served, 31, 'restored 30 + 1 live');
   assert.match(strip(tui(m2)._cacheLine(200)), /Claude 98%\/98%/, 'a live reading sits beside the restored history');
@@ -60,7 +60,7 @@ test('24h: the figure renders with real volume and hides when there is none', ()
   // Wipe the buckets: 15m still has traffic, 24h has none → the dash family.
   m.accounts[0].efficiencyHours = {};
   const line2 = strip(tui(m)._cacheLine(200));
-  assert.match(line2, /Claude 90%\/—/, `an unmeasured 24h has no percentage: ${line2}`);
+  assert.match(line2, /Claude 90%\/— · GLM —\/—/, `an unmeasured 24h has no percentage: ${line2}`);
 });
 
 // ── movedWhy plumbing ────────────────────────────────────────────────────────

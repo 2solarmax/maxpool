@@ -2984,7 +2984,7 @@ function efficiencyLines(data, key = 'last15m') {
   const cache = families.map(({ provider, label, block }) => {
     const miss = (block.missTokens / 1e6).toFixed(1);
     const writes = provider === 'claude' && block.writeShare != null
-      ? ` · writes ${pctOrDash(block.writeShare)} of estimated quota use` : '';
+      ? ` · writes ${pctOrDash(block.writeShare)} of cost (quota-burn proxy, not money)` : '';
     return `${label} ${pctOrDash(block.hit)} (miss ${miss}M tok${writes})`;
   }).join(' · ');
   const cache24h = day ? families.map(({ provider, label }) => {

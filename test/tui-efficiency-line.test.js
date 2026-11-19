@@ -45,7 +45,30 @@ test('renders Cache then Moves directly under the Routing line, and not at all w
   assert.match(frame[cache], /\[15m\/24h\] .*Claude 99%\/99%/, 'the two windows stay beside the provider');
   assert.match(frame[moves], /cross 0\/100/, 'the Moves line carries the move figures');
   tui.mode = 'routing';
-  assert.match(frameAt(tui, 160).find(l => l.trim().startsWith('Cache')), /Claude miss 25k tok/, 'Routing includes detailed cache figures');
+  assert.match(frameAt(tui, 80).find(l => l.trim().startsWith('Cache misses')), /Claude 25k tok/, 'Routing includes detailed cache figures at terminal width');
+});
+
+test('80-column Cache keeps every provider visible and Routing shows all three miss counts', () => {
+  const m = new AccountManager([
+    acct('Claude fixture'), acct('GLM fixture', 'provider', { provider: 'zai', apiKey: 'test' }),
+    acct('Codex fixture', 'oauth', { provider: 'codex' }),
+  ]);
+  const now = Date.now();
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  for (let i = 0; i < 25; i++) served(m, m.accounts[0], { in: 6000, cr: 4000, cc: 0, out: 1 });
+  assert.match(strip(tui._cacheLine(80, now)), /Claude 40%\/40% · GLM —\/— · Codex —\/—/);
+  for (let i = 0; i < 25; i++) {
+    served(m, m.accounts[1], { in: 1000, cr: 9000, cc: 0, out: 1 });
+    served(m, m.accounts[2], { in: 2000, cr: 8000, cc: 0, out: 1 });
+  }
+  const cache = strip(tui._cacheLine(80));
+  assert.ok(cache.length <= 80, cache);
+  assert.match(cache, /Claude 40%\/40% · GLM 90%\/90% · Codex 80%\/80%/, cache);
+  assert.match(cache, /⚠/, 'the cache alert remains visible alongside all three providers');
+  assert.doesNotMatch(cache, /miss|of cost/);
+  tui.mode = 'routing';
+  const detail = frameAt(tui, 80).find(row => row.trim().startsWith('Cache misses'));
+  assert.match(detail, /\[15m\]  Claude 150k tok · GLM 25k tok · Codex 50k tok/, detail);
 });
 
 test('a red line names the cause and the account behind it — on its OWN line', () => {

@@ -152,10 +152,10 @@ test('D: miss is shown per provider, never a blended cross-tokenizer sum', () =>
   // Enough volume that neither side is lowVolume (the line renders numbers).
   for (let i = 0; i < 30; i++) served(m, m.accounts[0], { in: 500, cr: 100_000, cc: 1500, out: 10 });
   for (let i = 0; i < 30; i++) served(m, m.accounts[1], { in: 300, cr: 100_000, cc: 0, out: 10 });
-  const line = strip(tui(m)._cacheLine(200, Date.now(), true));
+  const line = tui(m)._renderRoutingDetail().map(strip).find(row => row.includes('Cache misses'));
   assert.doesNotMatch(line, /(?:^|· )miss \d+k tok/, `no blended miss figure: ${line}`);
-  assert.match(line, /Claude miss 60k tok/, line);
-  assert.match(line, /GLM miss 9k tok/, line);
+  assert.match(line, /Claude 60k tok/, line);
+  assert.match(line, /GLM 9k tok/, line);
 });
 
 test('D: the capacity page axis says provider-native tokens', () => {

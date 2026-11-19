@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Cache dashboard at terminal width
+
+Show a named pair of 15-minute and 24-hour cache hit rates for Claude, GLM, and Codex when provisioned. A dash marks an idle or unmeasured window. Routing details show per-provider misses on their own line, and `maxpool status` keeps the existing quota-burn wording.
+
 ### 2026-11-19 · Codex prompt cache from Claude Code
 
 The Codex Messages adapter sends stable Claude Code system text as the first developer input and drops the per-request Anthropic billing header. The native transport gives OpenAI matching prompt and session cache keys scoped to the authenticated caller, Claude Code thread and agent, serving account and resolved model. The dashboard continues to measure upstream cache-read tokens over total input tokens.

@@ -1276,16 +1276,15 @@ export class TUI {
     return ` Routing  ${cyan(routing)}${xpText}`;
   }
 
-  /** Cache health at two horizons. Pair the windows per provider so idle providers
-   *  cannot shift the meaning of the percentages. Token counts belong in Routing. */
-  _cacheLine(W = 80, now = Date.now(), detailed = false) {
+  /** Keep the two cache windows paired with each provider in the overview. */
+  _cacheLine(W = 80, now = Date.now()) {
     const recent = this.am.efficiencyOverall?.('last15m', now);
     if (!recent) return null;
     const day = this.am.efficiency24h?.(now) || {};
     const dayHit = group => group?.hit != null && group.served >= 20 ? group.hit : null;
-    const groups = [['claude', 'Claude'], ['glm', 'GLM'], ['codex', 'Codex']];
-    const active = groups.filter(([key]) => recent[key]?.hit != null || dayHit(day[key]) != null);
-    const hasDay = active.some(([key]) => dayHit(day[key]) != null);
+    const groups = [['claude', 'Claude'], ['glm', 'GLM']];
+    if (recent.codex || day.codex) groups.push(['codex', 'Codex']);
+    const hasDay = groups.some(([key]) => dayHit(day[key]) != null);
     if (!hasDay && groups.every(([key]) => !(recent[key]?.served || recent[key]?.bounced))) return null;
     const sinceMs = now - (this._startedAt ?? now);
     const since = sinceMs < 15 * 60_000 ? dim(`  since restart ${Math.max(1, Math.round(sinceMs / 60_000))}m`) : '';
@@ -1293,24 +1292,23 @@ export class TUI {
       return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
     }
     const pct = hit => hit == null ? dim('—') : `${Math.round(hit * 100)}%`;
-    const parts = active.map(([key, label]) => {
+    const parts = groups.map(([key, label]) => {
       const period = recent[key];
       const short = pct(period?.hit);
       return `${label} ${period?.lowVolume && period.hit != null ? dim(short) : short}/${pct(dayHit(day[key]))}`;
     });
-    const health = `${dim('[15m/24h]')}  ${parts.join(' · ') || dim('—')}`;
-    const misses = detailed ? active.filter(([key]) => recent[key]?.hit != null)
-      .map(([key, label]) => `${label} miss ${this._missTxt(recent[key].missTokens)}`) : [];
-    const figures = misses.length ? `${health} · ${misses.join(' · ')}` : health;
+    const figures = `${dim('[15m/24h]')}  ${parts.join(' · ')}`;
 
     const claude = recent.claude;
     const hour = this.am.efficiencyOverall('last1h', now).claude;
     const drift = !claude.lowVolume && !hour.lowVolume && claude.hit != null && hour.hit != null && hour.hit - claude.hit >= 0.15;
     const severe = !claude.lowVolume && claude.hit != null && claude.hit < 0.5;
     if (severe) {
-      const warning = red(`⚠ Claude ${pct(claude.hit)} on ${this._worstCacheAccount() || '?'}`);
-      const line = ` ${red('Cache')}    ${warning} · ${figures}`;
-      return truncLine(vw(line) <= W ? line + since : ` ${red('Cache')}    ${figures} · ${warning}${since}`, W);
+      const account = this._worstCacheAccount() || '?';
+      const prefix = ` ${red('Cache')}    `;
+      const line = `${prefix}${red(`⚠ Claude ${pct(claude.hit)} on ${account}`)} · ${figures}`;
+      if (vw(line) <= W) return truncLine(line + since, W);
+      return truncLine(`${prefix}${figures} · ${red(`⚠ ${account}`)}`, W);
     }
     const warn = (!claude.lowVolume && claude.hit != null && claude.hit < 0.7) || drift;
     return truncLine(` ${warn ? yellow('Cache') : green('Cache')}    ${figures}${since}`, W);
@@ -2998,7 +2996,7 @@ export class TUI {
     }
     lines.push(this._routingLine(routing, xpText));
     const efficiencyNow = Date.now();
-    const cacheLine = this._cacheLine(W, efficiencyNow, this.mode === 'routing');
+    const cacheLine = this._cacheLine(W, efficiencyNow);
     if (cacheLine != null) lines.push(cacheLine);
     const movesLine = this._movesLine(W, efficiencyNow);
     if (movesLine != null) lines.push(movesLine);
@@ -3151,9 +3149,10 @@ export class TUI {
     // Completed log
     // 2 = separator + footer; confirm adds its detail line; updates adds its detail block.
     const codexAccountActions = this.mode === 'accounts' && this.am.accounts.some(a => a.provider === 'codex');
+    const routingDetail = this.mode === 'routing' ? this._renderRoutingDetail(W, efficiencyNow) : null;
     const footerH = this.mode === 'confirm' || codexAccountActions ? 3
       : this.mode === 'updates' ? 2 + this._renderUpdatesDetail().length
-      : this.mode === 'routing' ? 2 + this._renderRoutingDetail().length
+      : routingDetail ? 2 + routingDetail.length
       : 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
@@ -3183,7 +3182,7 @@ export class TUI {
     // very bottom of a busy screen, which reads as "nothing happened" (reported twice).
     // Every other mode draws something visible; this one must too.
     if (this.mode === 'updates') lines.push(...this._renderUpdatesDetail());
-    if (this.mode === 'routing') lines.push(...this._renderRoutingDetail());
+    if (routingDetail) lines.push(...routingDetail);
     lines.push(this._renderFooter());
 
     this._writeScreen(lines, W, H);
@@ -4024,9 +4023,16 @@ export class TUI {
    * (2026-10-13: "the cap setting only changes GLM", "I pinned an account and have no
    * idea how to switch it back", "where is the cap for individual accounts?")
    */
-  _renderRoutingDetail() {
+  _renderRoutingDetail(W = 80, now = Date.now()) {
     // Every line fits 80 columns: a truncated explanation is no explanation.
     const out = [];
+    const recent = this.am.efficiencyOverall?.('last15m', now);
+    const misses = [['claude', 'Claude'], ['glm', 'GLM'], ['codex', 'Codex']]
+      .filter(([key]) => recent?.[key]?.hit != null)
+      .map(([key, label]) => `${label} ${this._missTxt(recent[key].missTokens)}`);
+    if (misses.length) {
+      out.push(truncLine(` Cache misses ${dim('[15m]')}  ${misses.join(' · ')}`, W));
+    }
     const pinned = this.am.routingMode === 'preferred' && this.am.preferredAccountName;
     // The manual pin: state, what it does, and the way out — always visible.
     if (pinned) {
