@@ -92,6 +92,8 @@ test('native requests, quota, attribution and provider affinity survive compacti
   const firstAccount = am.accounts.find(account => 'workspace-' + account.name === hits[0].workspace);
   assert.equal(firstAccount.quota.unified7d, 0.52);
   assert.equal(firstAccount.quota.unified7dReset, reset * 1000);
+  assert.equal(firstAccount.usage.totalRequests, 1, 'Claude Code receives one response from the native Codex account');
+  assert.ok(Number.isFinite(Date.parse(firstAccount.usage.lastUsed)));
   assert.deepEqual(hits[0].body.reasoning, { effort: 'high' });
   assert.equal(hits[0].body.tools[0].type, 'function');
   const saved = am.exportSessionProviders();

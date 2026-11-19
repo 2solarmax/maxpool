@@ -308,3 +308,20 @@ export function parseCodexActiveLimit(headers) {
   const value = typeof headers?.get === 'function' ? headers.get('x-codex-active-limit') : headers?.['x-codex-active-limit'];
   return value ? String(value).trim().toLowerCase() || null : null;
 }
+
+/** A 429 can exhaust one model while other models still have headroom. */
+export function codexRateLimit(headers, model, now = Date.now()) {
+  const quota = parseCodexQuota(headers);
+  const sessionSpent = quota.unified5h >= 1;
+  const weeklySpent = quota.unified7d >= 1;
+  const activeLimit = parseCodexActiveLimit(headers);
+  const scoped = quota.modelBuckets?.find(bucket => bucket.utilization >= 1
+    && (bucket.normalModelSlug === model || bucket.slug === model || bucket.slug === activeLimit));
+  const resetAt = Math.max(sessionSpent ? quota.unified5hReset || 0 : 0,
+    weeklySpent ? quota.unified7dReset || 0 : 0, scoped?.resetAt || 0);
+  return {
+    scope: 'account',
+    modelScope: !sessionSpent && !weeklySpent && scoped ? (scoped.normalModelSlug || scoped.slug) : null,
+    retryAfter: resetAt > now ? Math.ceil((resetAt - now) / 1000) : 0,
+  };
+}

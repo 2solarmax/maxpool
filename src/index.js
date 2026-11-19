@@ -691,6 +691,7 @@ async function serverWorkerCommand() {
   const savedState = await loadState();
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
   accountManager.restoreSessionProviders(savedState?.sessionProviders);
+  accountManager.restoreNativeCodexConversationOwners(savedState?.nativeCodexConversationOwners);
   if (savedState?.capacity) {
     // Measured maxpool downtime = state-file last write → boot. A seamless reload
     // worker's state was handed over live (no gap) → null skips the partial check.
@@ -805,6 +806,7 @@ async function serverWorkerCommand() {
       {
         quota: accountManager.exportQuotaState(),
         sessionProviders: accountManager.exportSessionProviders(),
+        nativeCodexConversationOwners: accountManager.exportNativeCodexConversationOwners(),
         // Runtime providers so glm-fallback/kimi-fallback survive a restart (they're
         // header-derived, not in config). Empty [] when none — harmless.
         runtimeProviders: accountManager.exportRuntimeProviders(),
@@ -1670,6 +1672,8 @@ async function serverWorkerCommand() {
       } catch (err) {
         console.error(`[Maxpool] Token re-sync at takeover failed: ${err.message}`);
       }
+      const finalState = await loadState();
+      accountManager.restoreNativeCodexConversationOwners(finalState?.nativeCodexConversationOwners);
     }
 
     // Acquire the lease (re-syncs state generation + enables writes) BEFORE we

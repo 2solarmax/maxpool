@@ -59,6 +59,12 @@ export function nativeCodexHeaders(account) {
   return { authorization: `Bearer ${credential}`, 'chatgpt-account-id': workspace };
 }
 
+export function nativeCodexOwnerIdentity(account) {
+  if (account?.provider !== 'codex' || account.codexAuth !== 'native' || account.remote
+    || !account.accountUuid || !account.codexAccountId) return null;
+  return createHash('sha256').update(JSON.stringify([account.accountUuid, account.codexAccountId])).digest('hex');
+}
+
 function identityFromTokens(data) {
   // Claims from the just-completed HTTPS OAuth exchange are used to bind the
   // grant to a local user/workspace. They never authorize a callback by itself.
@@ -233,7 +239,7 @@ export async function loginNativeCodex({
   }
 }
 
-function normalizeModel(model) {
+export function normalizeNativeCodexModel(model) {
   const slug = field(model?.slug);
   if (!slug || !/^[a-z0-9][a-z0-9._-]{0,100}$/i.test(slug) || model.visibility !== 'list') return null;
   const modalities = Array.isArray(model.input_modalities) ? model.input_modalities : [];
@@ -268,7 +274,7 @@ export async function listNativeCodexModels(account, { etag, fetchImpl = fetch }
     throw Object.assign(new Error(`Could not read the native Codex model catalog (HTTP ${response.status})`), { status: response.status });
   }
   const data = await response.json();
-  const models = Array.isArray(data?.models) ? data.models.map(normalizeModel).filter(Boolean) : null;
+  const models = Array.isArray(data?.models) ? data.models.map(normalizeNativeCodexModel).filter(Boolean) : null;
   if (!validCodexCatalog(models)) throw new Error('Native Codex returned an invalid model catalog');
   return { models, etag: response.headers.get('etag'), version, notModified: false };
 }

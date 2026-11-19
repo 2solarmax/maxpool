@@ -15,7 +15,7 @@ export function validCodexCatalog(models) {
 
 export function codexModelFor(request, account) {
   const { openAIModel, model, reasoningEffort } = request;
-  const models = account.quota?.codexModels ?? account.codexModels;
+  const models = request.nativeCodexCatalog?.(account) ?? account.quota?.codexModels ?? account.codexModels;
   if (account.codexAuth !== 'native' && !models) {
     return openAIModel || account.model || 'gpt-6.2-sol';
   }

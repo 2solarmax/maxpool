@@ -1,5 +1,5 @@
 import { refreshOpenAIToken } from './openai-login.js';
-import { refreshNativeCodexToken } from './codex-native.js';
+import { nativeCodexOwnerIdentity, refreshNativeCodexToken } from './codex-native.js';
 import { codexModelFor } from './codex-model-routing.js';
 import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint, sameUser, sameAccountIdentity } from './oauth.js';
@@ -848,6 +848,7 @@ export class AccountManager {
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
     this.conversationProvider = new Map();
+    this.nativeCodexConversationOwners = new Map();
     // When that account last SERVED the conversation (first real upstream byte) —
     // holdsWarmConversation reads it. Same LRU bound, in-memory like the map above.
     this.conversationLastServedAt = new Map();
@@ -1155,7 +1156,8 @@ export class AccountManager {
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
-    const upstreamThrottleProbe = account.type !== 'provider' && !account.remote && this._claimUpstreamThrottleProbe();
+    const upstreamThrottleProbe = !requestInfo.nativeCodexClient
+      && account.type !== 'provider' && !account.remote && this._claimUpstreamThrottleProbe();
     if (requestInfo.sessionKey) {
       // Same clock the selection above used, so the peak-failover guard can never
       // disagree with the peak tier that caused the move (defaults to real time).
@@ -1717,8 +1719,10 @@ export class AccountManager {
   }
 
   _scopedExhausted(account, model) {
+    const existingScope = account.quota.codexLimitByModel?.[model];
+    const exactCodexModel = existingScope || account.quota.scopedWeekly?.[model] ? model : null;
     const fam = account.provider === 'codex'
-      ? codexModelFor({ model, ...(/^gpt-|^o[1-9]/i.test(model) ? { openAIModel: model } : {}) }, account)
+      ? exactCodexModel ?? codexModelFor({ model, ...(/^gpt-|^o[1-9]/i.test(model) ? { openAIModel: model } : {}) }, account)
       : modelFamily(model);
     if (!fam) return null;
     const scope = account.provider === 'codex' && account.quota.codexLimitByModel?.[fam];
@@ -3935,6 +3939,11 @@ export class AccountManager {
     const only = pinnedFamily === 'codex' ? pinnedFamily : requestInfo.onlyProvider || (requestInfo.pinAccount ? null : pinnedFamily);
     if (only && family !== only) return false;
     if (family === 'codex') {
+      if (requestInfo.nativeCodexClient) {
+        if (account.codexAuth !== 'native' || account.remote || account.poolBenchedBy
+          || !account.accountUuid || !account.codexAccountId) return false;
+        if (requestInfo.nativeCodexOwner && nativeCodexOwnerIdentity(account) !== requestInfo.nativeCodexOwner) return false;
+      }
       if ((!['all', 'codex'].includes(profile) && only !== 'codex') || requestInfo.codexCompatible !== true) return false;
       if (!codexModelFor(requestInfo, account)) return false;
       return !account.remote || String(requestInfo.path || '').startsWith('/v1/');
@@ -4598,6 +4607,32 @@ export class AccountManager {
   pinnedSessionProvider(requestInfo) {
     const provider = this.conversationProvider.get(this._providerConversationKey(requestInfo));
     return provider && this._sessionRoutingFor(provider) === 'same-provider' ? provider : null;
+  }
+
+  nativeCodexOwner(key) {
+    return this.nativeCodexConversationOwners.get(key) || null;
+  }
+
+  rememberNativeCodexOwner(key, identity) {
+    if (/^codex-wire:[a-f0-9]{64}$/.test(key) && /^[a-f0-9]{64}$/.test(identity)) {
+      lruSet(this.nativeCodexConversationOwners, key, identity);
+    }
+  }
+
+  forgetNativeCodexOwner(key, identity) {
+    if (this.nativeCodexConversationOwners.get(key) === identity) this.nativeCodexConversationOwners.delete(key);
+  }
+
+  exportNativeCodexConversationOwners() {
+    return [...this.nativeCodexConversationOwners];
+  }
+
+  restoreNativeCodexConversationOwners(entries) {
+    if (!Array.isArray(entries)) return;
+    this.nativeCodexConversationOwners.clear();
+    for (const entry of entries) {
+      if (Array.isArray(entry)) this.rememberNativeCodexOwner(entry[0], entry[1]);
+    }
   }
 
   exportSessionProviders() {
@@ -5372,6 +5407,18 @@ export class AccountManager {
   applyCodexUsageData(accountIndex, usage, { sentAt = Date.now(), partial = false } = {}) {
     const account = this.accounts[accountIndex];
     if (!account || !usage || usage.error || sentAt < (account.codexQuotaSentAt || 0)) return;
+    // A positive reset must be followed by a full, newer quota read showing
+    // the weekly wall cleared before dropping its last observed 429 bench.
+    const wall = this.scheduler.weeklyExhaustedThreshold;
+    if (!partial && account.lastClaimAt && sentAt >= account.lastClaimAt
+      && account.status === 'throttled' && account.lastError === 'rate_limited'
+      && account.lastErrorAt <= account.lastClaimAt && account.quota.unified7d >= wall
+      && usage.sevenDay?.utilization < wall && usage.sevenDay.resetAt > sentAt) {
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+      account.lastError = null;
+      account.lastErrorAt = null;
+    }
     account.codexQuotaSentAt = sentAt;
     if (!partial && usage.sevenDay) account.quota.codexFiveHourAbsent = !usage.fiveHour;
     if (Number.isFinite(usage.sevenDay?.utilization) && Number.isFinite(usage.sevenDay?.resetAt)) {
@@ -5399,13 +5446,17 @@ export class AccountManager {
   }
 
   applyCodexQuotaHeaders(accountIndex, headers, sentAt, model) {
-    const parsed = parseCodexQuota(headers);
     const account = this.accounts[accountIndex];
+    if (!account) return;
+    this._noteAccountResponse(account);
+    if (sentAt < (account.codexQuotaSentAt || 0)) return;
+    const parsed = parseCodexQuota(headers);
     const activeLimit = parseCodexActiveLimit(headers);
-    if (model && activeLimit && account) {
+    if (model && activeLimit) {
       account.quota.codexLimitByModel = { ...account.quota.codexLimitByModel, [model]: activeLimit };
     }
     if (!Object.keys(parsed).length) return;
+    account.quota.lastHeaderQuotaAt = Date.now();
     const window = (utilization, resetAt) => utilization == null ? null : { utilization, resetAt };
     this.applyCodexUsageData(accountIndex, {
       fiveHour: window(parsed.unified5h, parsed.unified5hReset),
@@ -5688,6 +5739,11 @@ export class AccountManager {
     return (now - last) > Math.max(3 * interval, 180_000);
   }
 
+  _noteAccountResponse(account) {
+    account.usage.totalRequests++;
+    account.usage.lastUsed = new Date().toISOString();
+  }
+
   /**
    * Update an account's quota tracking from upstream response headers.
    */
@@ -5796,8 +5852,7 @@ export class AccountManager {
       || genericLimit != null || genericRemaining != null;
     if (gotQuotaHeader) account.quota.lastHeaderQuotaAt = Date.now();
 
-    account.usage.totalRequests++;
-    account.usage.lastUsed = new Date().toISOString();
+    this._noteAccountResponse(account);
 
     // Log when approaching quota
     if (this._isNearQuota(account)) {

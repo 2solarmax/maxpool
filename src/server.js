@@ -1,7 +1,8 @@
+import { createCodexClientRoute, isCodexClientPath } from './codex-client-route.js';
 import { fetchBoundedOpenAIResponse, fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest, webSearchesInTurn } from './openai-responses.js';
 import { nativeCodexHeaders, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
 import { codexModelFor, validCodexCatalog } from './codex-model-routing.js';
-import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
+import { codexRateLimit } from './codex-quota.js';
 import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { normalizeClientHeaders, rewriteMetadataUserIdRaw } from './client-identity.js';
@@ -319,6 +320,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   let requestCounter = 0;
+  const serveNativeCodex = createCodexClientRoute(accountManager, config, hooks,
+    (req, res, info) => redeemCodexForRequest(req, res, info, hooks));
 
   // ── team clients (per-person keys + caller identity) ──
   // `clients: [{name, key}]` opts into strict auth: EVERY request (proxy traffic,
@@ -399,6 +402,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       try { res.setHeader('x-maxpool-worker', workerStamp); } catch { /* headers sent */ }
       if (draining) {
         try { res.setHeader('Connection', 'close'); } catch { /* headers may be sent */ }
+      }
+      if (isCodexClientPath(req.url)) {
+        await serveNativeCodex(req, res, ++requestCounter);
+        return;
       }
       // Dead-link probe target (2026-11-18): a linked pool pings this every 5 s on a
       // fresh connection to learn the tunnel + event loop are alive. Keyless and
@@ -971,7 +978,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Begin reload drain: every subsequent response gets `Connection: close` so
   // keep-alive clients retire their socket and don't pipeline a new request onto
   // this releasing worker.
-  server.maxpoolBeginDrain = () => { draining = true; };
+  server.maxpoolBeginDrain = () => {
+    draining = true;
+    serveNativeCodex.beginDrain();
+  };
 
   // STALLED-UPLOAD ANSWER (2026-10-11 outage). When a request body never finishes
   // arriving, Node's requestTimeout fires and its default handler writes a BODY-LESS
@@ -2050,16 +2060,8 @@ async function forwardRequest(
       const errorBody = await readErrorBody(upstreamRes);
       let retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
-      const nativeQuota = nativeCodex ? parseCodexQuota(rateLimitHeaders) : null;
-      const accountWindowSpent = nativeQuota && (nativeQuota.unified5h >= 1 || nativeQuota.unified7d >= 1);
-      const scopedWindow = nativeQuota?.modelBuckets?.find(bucket => bucket.utilization >= 1
-        && (bucket.normalModelSlug === openAIModel || bucket.slug === openAIModel
-          || bucket.slug === parseCodexActiveLimit(rateLimitHeaders)));
-      if (nativeQuota) {
-        const reset = Math.max(nativeQuota.unified5h >= 1 ? nativeQuota.unified5hReset || 0 : 0,
-          nativeQuota.unified7d >= 1 ? nativeQuota.unified7dReset || 0 : 0, scopedWindow?.resetAt || 0);
-        if (reset > Date.now()) retryAfter = Math.max(retryAfter || 0, Math.ceil((reset - Date.now()) / 1000));
-      }
+      const nativeLimit = nativeCodex ? codexRateLimit(rateLimitHeaders, openAIModel) : null;
+      if (nativeLimit?.retryAfter) retryAfter = Math.max(retryAfter || 0, nativeLimit.retryAfter);
       // REQUEST-SHAPE refusal (2026-11-08): on a subscription login Anthropic serves
       // Opus/Sonnet only to Claude-Code-shaped requests; anything else gets a bare 429
       // ("Error", no quota headers) while Haiku on the same account is served —
@@ -2110,8 +2112,7 @@ async function forwardRequest(
         return;
       }
 
-      const rateLimit = nativeQuota ? { scope: 'account', modelScope: !accountWindowSpent && scopedWindow ? (scopedWindow.normalModelSlug || scopedWindow.slug) : null }
-        : classifyRateLimit(account, rateLimitHeaders, errorBody, { model: requestInfo.model, retryAfter });
+      const rateLimit = nativeLimit || classifyRateLimit(account, rateLimitHeaders, errorBody, { model: requestInfo.model, retryAfter });
       if (rateLimit.scope === 'upstream') {
         const parsedError = parseJsonError(errorBody);
         const fingerprint = `429:${rateLimit.fingerprint || overloadFingerprint(errorBody, body)}`;
