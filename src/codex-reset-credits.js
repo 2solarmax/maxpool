@@ -597,6 +597,11 @@ export class ResetCreditRedeemer {
     if (redeemed) {
       account.lastClaimAt = this.now();
       account.lastFullGeneralClaimAt = account.lastClaimAt;
+      // A replay may confirm a spend that a previous usage read already counted.
+      // Invalidate the old balance until OpenAI reports the post-reset inventory.
+      account.codexResetCredits = null;
+      if (account.quota) account.quota.codexResetCredits = null;
+      account.codexQuotaSentAt = Math.max(account.codexQuotaSentAt || 0, account.lastClaimAt);
       const windowsReset = result.windowsReset || 0;
       this.log(`[MaxPool] Redeemed a free Codex reset on "${name}" — ${windowsReset} window(s) reset (${result.code})`);
       try { await this._refresh(account, name, deadline); } catch {

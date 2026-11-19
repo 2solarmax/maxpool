@@ -310,6 +310,9 @@ test('banked Pro resets are held during low usage and claimed when the weekly po
   owner.quota.unified7d = 0.99;
   assert.equal((await redeemer.maybeRedeemForPool([owner])).redeemed, true);
   assert.deepEqual(attempts, [availableCredit.id]);
+  assert.equal(owner.quota.codexResetCredits, null);
+  assert.equal(owner.codexResetCredits, null);
+  assert.equal(owner.codexQuotaSentAt, owner.lastClaimAt);
 });
 
 test('Codex automatic expiry redemption uses the sweep while a request only reacts to the weekly wall', async () => {
