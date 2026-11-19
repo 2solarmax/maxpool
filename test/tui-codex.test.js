@@ -144,7 +144,8 @@ test('Cache and Moves keep separate Codex health and include its hold reasons', 
   const cache = strip(tui._cacheLine(80));
   assert.match(cache, /\[15m\/24h\].*Claude 90%\/90% · GLM 95%\/95% · Codex 80%\/80%/);
   assert.doesNotMatch(cache, /miss|cost|same/);
-  assert.match(strip(tui._cacheLine(170, Date.now(), true)), /Codex miss 50k tok/);
+  const detail = tui._renderRoutingDetail(80).map(strip).find(line => line.includes('Cache misses'));
+  assert.match(detail, /Codex 50k tok/);
   assert.match(strip(tui._movesLine(80)), /cross 0\/100 · same 2 \(hold-ceiling 2\) · busy 2/);
   assert.equal(tui.am.efficiency24h().codex.served, 25);
   assert.equal(tui.am.efficiency24h().glm.served, 25);
