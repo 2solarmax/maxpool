@@ -36,7 +36,9 @@ test('renders directly under the Routing line, and not at all without traffic', 
   assert.ok(routing >= 0, 'Routing line present');
   assert.ok(cache === routing + 1, `directly under Routing (routing=${routing}, cache=${cache})`);
   assert.match(frame[cache], /Claude 99%/, 'per-provider share');
-  assert.match(frame[cache], /Claude miss 25k tok/, 'miss tokens, labelled per provider');
+  assert.doesNotMatch(frame[cache], /miss|moves|of cost/, 'the overview shows cache hits only');
+  tui.mode = 'routing';
+  assert.match(frameAt(tui, 160).find(l => l.trim().startsWith('Cache')), /Claude miss 25k tok/, 'routing retains detailed metrics');
   assert.match(frame[cache], /\[15m\]/, 'window');
 });
 

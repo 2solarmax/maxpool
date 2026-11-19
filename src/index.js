@@ -2149,7 +2149,7 @@ async function loginChatGPTCommand() {
       throw new Error('This Codex account does not list ' + requestedModel + '.');
     }
     if (requestedModel) creds.model = requestedModel;
-    let name = (requestedName || 'ChatGPT ' + (profile.email || profile.accountUuid.slice(0, 8)))
+    let name = (requestedName || profile.email || 'ChatGPT ' + profile.accountUuid.slice(0, 8))
       .replace(/[\x00-\x1f\x7f]/g, '').slice(0, 120);
     if (plan.action === 'cloud') {
       if (config.accounts.some(account => sameAccountIdentity(account, profile))) {

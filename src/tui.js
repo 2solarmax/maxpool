@@ -1285,7 +1285,7 @@ export class TUI {
    *  - miss is per provider — GLM and Claude tokenizers differ ~1.6x, a blended sum is
    *    unit-inconsistent.
    *  - waits say what they count: busy-bounce waits only (queue holds book 0 here). */
-  _efficiencyLine(W = 80, now = Date.now()) {
+  _efficiencyLine(W = 80, now = Date.now(), detailed = true) {
     const eff = this.am.efficiencyOverall?.('last15m', now);
     if (!eff) return null;
     const { claude: c, glm: g, codex } = eff;
@@ -1299,9 +1299,10 @@ export class TUI {
     if (groups.every(group => group.lowVolume)) return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
     const pctTxt = x => `${Math.round(x * 100)}%`;
     const parts = [];
-    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}${c.writeShare != null ? ` (w/ ${pctTxt(c.writeShare)} of cost)` : ''}`);
+    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}${detailed && c.writeShare != null ? ` (writes ≈${pctTxt(c.writeShare)} of input cost)` : ''}`);
     if (g.hit != null) parts.push(`GLM ${g.lowVolume ? dim(pctTxt(g.hit)) : pctTxt(g.hit)}`);
     if (codex?.hit != null) parts.push(`Codex ${codex.lowVolume ? dim(pctTxt(codex.hit)) : pctTxt(codex.hit)}`);
+    const hitSummary = parts.join(' · ');
     const missTxt = t => t >= 1e6 ? `${(t / 1e6).toFixed(1)}M` : `${Math.round(t / 1000)}k`;
     if (c.hit != null || c.missTokens) parts.push(`Claude miss ${missTxt(c.missTokens)} tok`);
     if (g.hit != null || g.missTokens) parts.push(`GLM miss ${missTxt(g.missTokens)} tok`);
@@ -1313,7 +1314,7 @@ export class TUI {
     const causeTxt = ['busy', 'balance', 'wall', 'link', 'other'].filter(k => cause(k) > 0).map(k => ` · ${k} ${cause(k)}`).join('');
     parts.push(`cross-moves ${per100(cross)}/100 (same ${total('movedSame')}${causeTxt})`);
     const bounceShare = bounced / (served + bounced);
-    if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}`);
+    if (bounced) parts.push(`bounced ${bounced} (${bounceShare < 0.01 ? '<1%' : pctTxt(bounceShare)})`);
     const glmBusy = g.movedByCause.busy || 0;
     if (glmBusy) parts.push(`glm busy-bounced ${glmBusy}`);
     const waited = total('waited');
@@ -1327,7 +1328,8 @@ export class TUI {
     else if (per100(cross) > 2) red_ = `cross moves ${per100(cross)}/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
     else if (bounceShare > 0.1) red_ = `${pctTxt(bounceShare)} bounced — most on ${this._mostBouncedAccount(now) || '?'}`;
     else if (wtm * 100 / Math.max(1, served) > 0.5) red_ = `${wtm} waits still moved — on ${this._mostBouncedAccount(now) || '?'}`;
-    if (red_) return truncLine(` ${red('Cache')}    ${red(`⚠ ${red_}`)} ${dim('·')} ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+    const metrics = detailed ? parts.join(' · ') : hitSummary;
+    if (red_) return truncLine(` ${red('Cache hits')}    ${red(`⚠ ${red_}`)} ${dim('·')} ${metrics}  ${dim('[15m]')}${since}`, W);
     // YELLOW — Claude below 70%, write share over 40% of cost, drifting 15+ points
     // under its hour, or waits are common.
     const hour = this.am.efficiencyOverall('last1h', now).claude;
@@ -1335,7 +1337,7 @@ export class TUI {
     const warn = (!c.lowVolume && c.hit != null && c.hit < 0.7)
       || (!c.lowVolume && c.writeShare != null && c.writeShare > 0.4)
       || drift || waited > 0.25 * served;
-    return truncLine(` ${warn ? yellow('Cache') : green('Cache')}    ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+    return truncLine(` ${warn ? yellow('Cache hits') : green('Cache hits')}    ${metrics}  ${dim('[15m]')}${since}`, W);
   }
 
   /** The Claude row with the lowest cache share in the window (enough volume only). */
@@ -2959,7 +2961,7 @@ export class TUI {
       if (provReq > 0) xpText += `  ${dim('·')}  ${yellow(`providers: ${provReq} req/15m`)}`;
     }
     lines.push(this._routingLine(routing, xpText));
-    const effLine = this._efficiencyLine(W);
+    const effLine = this._efficiencyLine(W, Date.now(), this.mode === 'routing');
     if (effLine != null) lines.push(effLine);
     lines.push(...this._cloudLinkLines(W));
     const queuedCount = this.am.queueState?.waiting?.length || 0;
@@ -3498,7 +3500,7 @@ export class TUI {
         bars.push(space >= pct.length + label.length ? label + pct : pct);
       } else bars.push(dim('—'));
     } else {
-      if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+      if (showFable) bars.push(a.provider === 'codex' ? ' '.repeat(4 + bw) : `Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
       if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
       if (showBoth) {
         // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and

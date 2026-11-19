@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Codex account display
+
+Use the signed-in email as the default local account name. Reserve the Fable quota column for Anthropic rows. The dashboard summarizes cache hits by provider, with detailed counters available in Routing and `maxpool status`.
+
 ### 2026-11-19 · #10 — Native Codex provider behind Claude Code
 
 **Context.** The first pilot used the app-scoped ChatGPT plan grant. Native

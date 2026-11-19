@@ -63,10 +63,10 @@ test('the TUI Cache line turns red on a cloud-only Mac with a high bounce share'
   const { am, row } = macWithMirror();
   bookEdgeEvents(am, row);
   const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } } });
-  const line = strip(tui._efficiencyLine(200) || '');
+  const line = strip(tui._efficiencyLine(260) || '');
   // RED (⚠) with the account behind it — not just the always-present "busy 0" label.
   assert.match(line, /⚠ cross moves \d+\/100 — most refusals on cloud-a ☁/, `red names cause + account: ${line}`);
-  assert.match(line, /bounced 25%/, `the bounce share is shown: ${line}`);
+  assert.match(line, /bounced 10 \(25%\)/, `the bounce share is shown: ${line}`);
   assert.match(line, /busy-bounce waits 30 \(avg 8\.0s\)/, `the waits are shown: ${line}`);
 });
 

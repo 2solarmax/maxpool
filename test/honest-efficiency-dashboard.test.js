@@ -44,12 +44,12 @@ test('A: the TUI cache line shows the write share beside hit%, and it colours on
   // (hit .9 needs cr=9(cc+in); share .55 then needs cc/in ≈ 15.5.)
   for (let i = 0; i < 30; i++) served(m, m.accounts[0], { in: 100, cr: 14_850, cc: 1_550, out: 10 });
   const line = strip(tui(m)._efficiencyLine(160));
-  assert.match(line, /Claude 90% \(w\/ 55% of cost\)/, `write share beside hit: ${line}`);
+  assert.match(line, /Claude 90% \(writes ≈55% of input cost\)/, `write share beside hit: ${line}`);
   // And a genuinely healthy window stays green with the figure present.
   const ok = new AccountManager([acct('c1')], 0.9);
   for (let i = 0; i < 30; i++) served(ok, ok.accounts[0], { in: 100, cr: 9900, cc: 100, out: 10 });
   const okLine = strip(tui(ok)._efficiencyLine(160));
-  assert.match(okLine, /Claude 98% \(w\/ 10% of cost\)/, okLine);
+  assert.match(okLine, /Claude 98% \(writes ≈10% of input cost\)/, okLine);
   assert.doesNotMatch(okLine, /⚠/);
 });
 
@@ -61,7 +61,7 @@ test('A: yellow at write share > 40%, red > 60% (Claude, real volume)', () => {
   };
   // hit 90%, write share 47%: above the 40% yellow line, below the 60% red line.
   const y = line({ in: 1000, cr: 9 * 4630, cc: 3630 });
-  assert.match(y, /Claude 90% \(w\/ 47% of cost\)/, y);
+  assert.match(y, /Claude 90% \(writes ≈47% of input cost\)/, y);
   assert.doesNotMatch(y, /⚠/, `47% is yellow, not red: ${y}`);
   // hit 51%, write share 70%: above the 60% red line (hit still over the 50% red floor).
   const r = line({ in: 10_000, cr: 37_000, cc: 25_300 });
