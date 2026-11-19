@@ -1,5 +1,41 @@
+import { createHash } from 'node:crypto';
 import { nativeCodexOwnerIdentity } from './codex-native.js';
-import { knownDifferentOrg, sameAccountIdentity } from './oauth.js';
+import { knownDifferentOrg, sameAccountIdentity, sameUser } from './oauth.js';
+
+const nativeRefreshLineages = new WeakMap();
+
+function grantPair(accessToken, refreshToken) {
+  return createHash('sha256').update(JSON.stringify([accessToken, refreshToken])).digest('hex');
+}
+
+function nativeRefreshLineage(account) {
+  const lineage = nativeRefreshLineages.get(account);
+  return lineage?.owner === nativeCodexOwnerIdentity(account)
+    && lineage?.head === grantPair(account.credential, account.refreshToken) ? lineage : null;
+}
+
+/** Keep predecessors across write failures, scoped to the exact current grant and owner. */
+export function rememberNativeRefresh(account, tokens) {
+  const owner = nativeCodexOwnerIdentity(account);
+  if (!owner) return;
+  const predecessors = nativeRefreshLineage(account)?.predecessors || new Set();
+  predecessors.add(grantPair(account.credential, account.refreshToken));
+  nativeRefreshLineages.set(account, { owner, predecessors, head: grantPair(tokens.accessToken, tokens.refreshToken) });
+}
+
+/** Only replace an observed refresh predecessor or the result of this same write. */
+export function canPersistOAuthRefresh(disk, tokens, { account, target, refreshedFrom }) {
+  if (target.codexAuth !== 'native') {
+    if (disk.codexAuth === 'native' || (disk.accountUuid && target.accountUuid && !sameUser(disk, target))
+      || knownDifferentOrg(disk, target)) return false;
+    return !disk.refreshToken || disk.refreshToken === refreshedFrom || disk.refreshToken === tokens.refreshToken;
+  }
+  const owner = nativeCodexOwnerIdentity(target);
+  if (!owner || owner !== nativeCodexOwnerIdentity(disk)) return false;
+  const diskPair = grantPair(disk.accessToken, disk.refreshToken);
+  return diskPair === grantPair(target.credential, refreshedFrom) || diskPair === grantPair(tokens.accessToken, tokens.refreshToken)
+    || nativeRefreshLineage(account)?.predecessors.has(diskPair) === true;
+}
 
 export async function resolveAccounts(config) {
   const accounts = [];
@@ -30,9 +66,10 @@ export function oauthTokensForDiskSync(account, disk) {
   const consumedGrant = differentGrant && disk.refreshToken === account._refreshedFrom;
   const replacedAccess = disk.refreshToken === account._refreshedFrom
     && disk.accessToken === account._refreshedAccessFrom && disk.accessToken !== account.credential;
+  const nativePredecessor = nativeRefreshLineage(account)?.predecessors.has(grantPair(disk.accessToken, disk.refreshToken));
   const olderExpiry = disk.expiresAt && account.expiresAt && disk.expiresAt < account.expiresAt;
   // A separately authorized ChatGPT grant can have a shorter lifetime.
-  if (consumedGrant || replacedAccess || (olderExpiry && !(account.provider === 'codex' && differentGrant))) {
+  if (consumedGrant || replacedAccess || nativePredecessor || (olderExpiry && !(account.provider === 'codex' && differentGrant))) {
     return { accessToken: account.credential, refreshToken: account.refreshToken, expiresAt: account.expiresAt };
   }
   return { accessToken: disk.accessToken, refreshToken: disk.refreshToken, expiresAt: disk.expiresAt };
@@ -47,5 +84,7 @@ export function findAccountConfigIndex(accounts, account) {
   const exact = accounts.findIndex(candidate => candidate.codexAuth !== 'native' && sameAccountIdentity(candidate, account));
   if (exact >= 0) return exact;
   return accounts.findIndex(candidate => candidate.codexAuth !== 'native' && candidate.name === account.name
+    && (candidate.provider === 'codex') === (account.provider === 'codex')
+    && (!candidate.accountUuid || !account.accountUuid || sameUser(candidate, account))
     && !knownDifferentOrg(candidate, account));
 }

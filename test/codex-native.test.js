@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { findAccountConfigIndex, oauthTokensForDiskSync } from '../src/account-config.js';
+import { canPersistOAuthRefresh, findAccountConfigIndex, oauthTokensForDiskSync } from '../src/account-config.js';
 import {
   listNativeCodexModels, loginNativeCodex, nativeCodexHeaders, parseNativeCodexCallback, refreshNativeCodexToken,
 } from '../src/codex-native.js';
@@ -416,6 +416,9 @@ test('native config lookup follows an owner rename and ignores other accounts wi
   assert.equal(findAccountConfigIndex([differentUser, differentWorkspace, legacy, renamed], owner), 3);
   assert.equal(findAccountConfigIndex([differentUser, differentWorkspace, legacy], owner), -1);
   assert.equal(findAccountConfigIndex([owner], legacy), -1);
+  const claude = { name: 'same display name', provider: 'anthropic', accountUuid: 'claude-owner' };
+  assert.equal(findAccountConfigIndex([{ ...claude, accountUuid: 'different-user' }], claude), -1);
+  assert.equal(findAccountConfigIndex([{ ...claude, organizationUuid: 'learned-org' }], claude), 0);
 });
 
 test('native refresh persists to the original owner after an earlier row is removed', async () => {
@@ -453,4 +456,41 @@ test('a refresh rejection cannot bench the replacement occupying a deleted accou
   assert.equal(await refresh, false);
   assert.equal(am.accounts[0].status, 'active');
   assert.equal(am.accounts[0].lastError, null);
+});
+
+test('a failed persist followed by another native rotation keeps the older disk grant from becoming live', async () => {
+  const old = { accessToken: 'access-a', refreshToken: 'refresh-a', expiresAt: 1 };
+  const intermediate = { accessToken: 'access-b', refreshToken: 'refresh-b', expiresAt: Date.now() + 3600000 };
+  const latest = { accessToken: 'access-c', refreshToken: 'refresh-c', expiresAt: Date.now() + 3600000 };
+  const newAuth = { accessToken: 'browser-access', refreshToken: 'browser-refresh', expiresAt: latest.expiresAt - 1000 };
+  const afterBrowser = { accessToken: 'access-d', refreshToken: 'refresh-d', expiresAt: Date.now() + 3600000 };
+  const am = new AccountManager([account({ type: 'oauth', ...old })], 0.9, {}, {
+    refreshNativeCodexToken: async target => ({
+      [old.refreshToken]: intermediate, [intermediate.refreshToken]: latest, [newAuth.refreshToken]: afterBrowser,
+    })[target.refreshToken],
+  });
+  let disk = account(old);
+  let latestRotation;
+  am.onTokenRefresh(async (_index, tokens, rotation) => {
+    if (tokens === intermediate) throw new Error('fixture disk temporarily unavailable');
+    if (canPersistOAuthRefresh(disk, tokens, rotation)) disk = { ...disk, ...tokens };
+    latestRotation = rotation;
+  });
+  assert.equal(await am.ensureTokenFresh(0), true);
+  assert.equal(disk.refreshToken, old.refreshToken);
+  assert.equal(await am.ensureTokenFresh(0, true), true);
+  assert.equal(disk.refreshToken, latest.refreshToken);
+  assert.deepEqual(oauthTokensForDiskSync(am.accounts[0], old), latest);
+  const wrongWorkspace = account({ ...old, codexAccountId: 'other-workspace', organizationUuid: 'other-workspace' });
+  assert.equal(canPersistOAuthRefresh(wrongWorkspace, latest, latestRotation), false);
+  assert.equal(canPersistOAuthRefresh(account({ ...old, accountUuid: 'other-owner' }), latest, latestRotation), false);
+  assert.equal(canPersistOAuthRefresh(account({ ...old, accessToken: 'another-access' }), latest, latestRotation), false);
+  assert.equal(canPersistOAuthRefresh(account(newAuth), latest, latestRotation), false);
+  assert.deepEqual(oauthTokensForDiskSync(am.accounts[0], newAuth), newAuth);
+
+  am.updateAccountTokens(0, newAuth, { persist: false });
+  disk = account(newAuth);
+  assert.equal(await am.ensureTokenFresh(0, true), true);
+  assert.equal(disk.refreshToken, afterBrowser.refreshToken);
+  assert.equal(canPersistOAuthRefresh(account(old), afterBrowser, latestRotation), false, 'browser authorization starts a new lineage');
 });

@@ -1,4 +1,5 @@
 import { refreshOpenAIToken } from './openai-login.js';
+import { rememberNativeRefresh } from './account-config.js';
 import { nativeCodexOwnerIdentity, refreshNativeCodexToken } from './codex-native.js';
 import { codexModelFor } from './codex-model-routing.js';
 import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
@@ -6457,10 +6458,16 @@ export class AccountManager {
       accountUuid: account.accountUuid, organizationUuid: account.organizationUuid, codexAccountId: account.codexAccountId,
       oauthClientId: account.oauthClientId, credential: account.credential, refreshToken: account.refreshToken,
     };
+    // Profile reads can fill missing Claude metadata while the same grant is
+    // rotating. Known identity fields must remain stable, and the grant must
+    // still match before writing the returned tokens.
+    const matchesClaudeIdentity = () => target.provider === 'anthropic'
+      && (!target.accountUuid || sameUser(account, target))
+      && (!target.organizationUuid || account.organizationUuid === target.organizationUuid);
     const currentAccount = () => this.accounts[account.index] === account && account.provider === target.provider
       && account.codexAuth === target.codexAuth && account.codexAccountId === target.codexAccountId
-      && (target.accountUuid ? sameAccountIdentity(account, target)
-        : !account.accountUuid && account.organizationUuid === target.organizationUuid);
+      && (matchesClaudeIdentity() || (target.accountUuid ? sameAccountIdentity(account, target)
+        : !account.accountUuid && account.organizationUuid === target.organizationUuid));
     const sameGrant = () => account.credential === target.credential && account.refreshToken === target.refreshToken;
     account._refreshPromise = (async () => {
       console.log(`[Maxpool] Refreshing token for account "${account.name}"...`);
@@ -6474,6 +6481,7 @@ export class AccountManager {
             : await this._refreshAccessToken(target.refreshToken);
         if (!currentAccount()) return false;
         if (!sameGrant()) return true;
+        if (target.codexAuth === 'native') rememberNativeRefresh(account, newTokens);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;

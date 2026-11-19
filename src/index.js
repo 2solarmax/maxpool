@@ -51,7 +51,7 @@ import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, toke
 import { TUI, writeTerminalSync, reclaimRawModeLogged, whenTerminalCaughtUp } from './tui.js';
 import { createTerminalModeSwitcher } from './terminal-mode.js';
 import { RestartController } from './restart-controller.js';
-import { findAccountConfigIndex, oauthTokensForDiskSync, resolveAccounts } from './account-config.js';
+import { canPersistOAuthRefresh, findAccountConfigIndex, oauthTokensForDiskSync, resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
@@ -955,7 +955,8 @@ async function serverWorkerCommand() {
   // actually SUCCEEDED (bricking a working account — strictly worse than the window
   // this fix closes). So the ENTIRE body is wrapped, prologue included, and every
   // exit resolves. Returns the awaitable persist promise.
-  const persistTokenRefresh = async (_idx, newTokens, { account, target, refreshedFrom }) => {
+  const persistTokenRefresh = async (_idx, newTokens, rotation) => {
+    const { account, target } = rotation;
     try {
       const native = target.codexAuth === 'native';
       const owner = native ? nativeCodexOwnerIdentity(target) : null;
@@ -970,11 +971,7 @@ async function serverWorkerCommand() {
         const cfgIdx = findAccountConfigIndex(diskConfig.accounts, record);
         if (cfgIdx < 0) { skipped = true; return; }
         const onDisk = diskConfig.accounts[cfgIdx];
-        // Compare with the grant sent when OAuth started, even if a config
-        // change has moved or reauthorized the same account since then.
-        const sourceMatches = onDisk.refreshToken === refreshedFrom && (!native || onDisk.accessToken === target.credential);
-        const resultMatches = onDisk.refreshToken === newTokens.refreshToken && (!native || onDisk.accessToken === newTokens.accessToken);
-        if ((native || onDisk.refreshToken) && !sourceMatches && !resultMatches) {
+        if (!canPersistOAuthRefresh(onDisk, newTokens, rotation)) {
           skipped = true;
           return;
         }
@@ -2814,6 +2811,8 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       console.log(`[Maxpool] Usage cap for "${mgr.name}" ${diskCap ? `set to ${Math.round(diskCap * 100)}% (${diskMode})` : 'removed'} from config`);
     }
     if (freshCred.accessToken) freshCred = oauthTokensForDiskSync(mgr, freshCred);
+    if (!mgr.accountUuid && diskAcct.accountUuid && freshCred.accessToken === mgr.credential
+      && freshCred.refreshToken === mgr.refreshToken) mgr.accountUuid = diskAcct.accountUuid;
     memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct, ...(freshCred.accessToken ? freshCred : {}) };
 
     if (freshCred.accessToken) {
