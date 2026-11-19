@@ -167,7 +167,7 @@ export function parseNativeCodexCallback(input, expectedState) {
 
 export async function loginNativeCodex({
   prior, open = browser, report = console.log, fetchImpl = fetch,
-  input = process.stdin, output = process.stderr, timeoutMs = 5 * 60_000, port = CALLBACK_PORT,
+  input = process.stdin, output = process.stderr, timeoutMs = 20 * 60_000, port = CALLBACK_PORT,
 } = {}) {
   const state = randomBytes(32).toString('base64url');
   const verifier = randomBytes(32).toString('base64url');
