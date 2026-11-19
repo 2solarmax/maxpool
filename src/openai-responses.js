@@ -450,7 +450,7 @@ function jsonResponse(body, status, headers) {
  * meaningful event before releasing the response to the existing retry layer,
  * so early structured quota failures can take the same failover path as HTTP 429.
  */
-export async function fromOpenAIResponse(response, { model, stream, toolNames, webSearch, upstreamModel }) {
+export async function fromOpenAIResponse(response, { model, stream, toolNames, webSearch, upstreamModel, upstreamEffort, defaultEffort }) {
   const headers = normalizedHeaders(response.headers);
   if (!response.ok) {
     const error = (await response.json().catch(() => null))?.error;
@@ -469,6 +469,7 @@ export async function fromOpenAIResponse(response, { model, stream, toolNames, w
   const events = readEvents(response.body);
   let id;
   let servedModel;
+  let servedEffort;
   let first;
   for (;;) {
     const next = await events.next();
@@ -476,6 +477,7 @@ export async function fromOpenAIResponse(response, { model, stream, toolNames, w
     first = next.value;
     id ||= first.response?.id;
     servedModel ||= first.response?.model;
+    if (explicitEfforts.has(first.response?.reasoning?.effort)) servedEffort = first.response.reasoning.effort;
     if (first.type === 'error' || first.type === 'response.failed') {
       await events.return();
       const error = first.response?.error || first;
@@ -493,7 +495,9 @@ export async function fromOpenAIResponse(response, { model, stream, toolNames, w
   const actualModel = servedModel || upstreamModel;
   const tagged = typeof actualModel === 'string' && /^[a-zA-Z0-9._-]{1,100}$/.test(actualModel);
   const upstreamId = String(id || 'openai').replace(/^resp_/, '');
-  const messageId = tagged ? 'msg_maxpool_codex_' + Buffer.from(actualModel).toString('hex') + '_' + upstreamId : 'msg_' + upstreamId;
+  const selectedEffort = servedEffort || upstreamEffort || (actualModel === upstreamModel ? defaultEffort : null);
+  const effort = explicitEfforts.has(selectedEffort) ? selectedEffort : 'default';
+  const messageId = tagged ? 'msg_maxpool_codex_' + Buffer.from(actualModel).toString('hex') + '_effort-' + effort + '_' + upstreamId : 'msg_' + upstreamId;
   const message = { id: messageId, type: 'message',
     role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: usageOf() };
   if (tagged) headers.set('x-maxpool-served-model', actualModel);

@@ -10,12 +10,12 @@ const os = require('node:os');
 const path = require('node:path');
 const id = process.argv[2];
 if (!/^[A-Za-z0-9_-]{1,512}$/.test(id)) process.exit(0);
-const codex = /^msg_maxpool_codex_((?:[a-fA-F0-9]{2}){1,128})_/.exec(id);
+const codex = /^msg_maxpool_codex_((?:[a-fA-F0-9]{2}){1,128})_(?:effort-(low|medium|high|xhigh|max|ultra|default)_)?/.exec(id);
 const validModel = /^[A-Za-z0-9._:/-]{1,128}$/;
 if (codex) {
   const model = Buffer.from(codex[1], 'hex').toString();
   if (validModel.test(model)) {
-    process.stdout.write('codex|' + model);
+    process.stdout.write('codex|' + model + (codex[2] ? '|' + codex[2] : ''));
     process.exit(0);
   }
 }
@@ -70,6 +70,7 @@ esac
 
 model=$(printf '%s' "$input" | jq -r '.model.display_name // .model.id // "unknown"')
 lane=''
+served_effort=''
 transcript=$(printf '%s' "$input" | jq -r '.transcript_path // empty | strings')
 if [ -z "$transcript" ]; then
   sid=$(printf '%s' "$input" | jq -r '.session_id // empty | strings')
@@ -102,12 +103,23 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
              *) lane=glm ;;
            esac ;;
       esac
-      if [ -n "$route" ] && [ "$lane" != claude ]; then model=${route#*|}; fi
+      if [ -n "$route" ] && [ "$lane" != claude ]; then
+        served=${route#*|}
+        model=${served%%|*}
+        case "$served" in *'|'*) served_effort=${served#*|} ;; esac
+      fi
       ;;
   esac
 fi
 
 effort=$(printf '%s' "$input" | jq -r '.effort.level // empty')
+if [ -n "$served_effort" ]; then
+  if [ -n "$effort" ] && [ "$effort" != "$served_effort" ]; then
+    effort="$effort → $served_effort"
+  else
+    effort=$served_effort
+  fi
+fi
 if [ -n "$effort" ]; then effort_str="effort:$effort"; else effort_str=''; fi
 
 used=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty')

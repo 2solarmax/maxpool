@@ -1989,6 +1989,8 @@ async function forwardRequest(
       }
       if (openAI) upstreamRes = await fromOpenAIResponse(upstreamRes, {
         model: requestInfo.model, stream: requestInfo.stream, upstreamModel: openAIModel,
+        upstreamEffort: openAIRequest.body.reasoning?.effort,
+        defaultEffort: (account.quota?.codexModels ?? account.codexModels)?.find(m => m.slug === openAIModel)?.defaultEffort,
         toolNames: openAIRequest.toolNames, webSearch: openAIRequest.webSearch,
       });
     } finally {

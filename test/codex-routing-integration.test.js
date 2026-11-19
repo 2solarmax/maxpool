@@ -85,6 +85,7 @@ test('native requests, quota, attribution and provider affinity survive compacti
   assert.match(firstText, /"model":"claude-fable-5-2"/);
   const id = /"id":"(msg_maxpool_codex_[^"]+)"/.exec(firstText)?.[1];
   assert.ok(id);
+  assert.match(id, /_effort-high_/);
   const routeURL = url + '/maxpool/last-route?messageId=' + encodeURIComponent(id);
   assert.deepEqual(await (await fetch(routeURL, { headers: { 'x-api-key': 'fixture' } })).json(),
     { provider: 'codex', model: 'gpt-6.2-astra' });

@@ -232,7 +232,11 @@ model for that class from the serving account's live Codex catalog. Fable and
 Opus use Astra, Sonnet uses Sol, and Haiku uses Luna. These names specify
 families, so compatible updates can roll in as the catalog refreshes. The
 catalog refresh follows the current stable Codex client version without
-requiring a Codex installation. The client's effort is selected separately.
+requiring a Codex installation. A newly named family stays available by exact
+model ID. Automatic class routing skips it until it has a class mapping. If
+no eligible class match exists, the configured routing policy selects another
+eligible account or reports that none is available. Claude Code's status line
+shows the serving model and effort. An omitted effort uses the model default.
 
 **Session routing.** A session that starts on Codex stays on that provider
 by default and can move to another eligible Codex account. Other
