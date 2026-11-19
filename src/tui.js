@@ -1237,20 +1237,19 @@ export class TUI {
     return ` Routing  ${cyan(routing)}${xpText}`;
   }
 
-  /** EFFICIENCY line (2026-11-15), directly under Routing: is the prompt cache holding,
-   *  and what are moves costing — Claude and GLM never blended. null with no traffic.
-   *  Colours are WARN-only proposals until a one-day baseline exists; a red names the
-   *  cause and the account.
-   *  Honest-efficiency rework (2026-11-17, audit findings 2-6):
-   *  - hit% never travels alone: writeShare (1.25·cc / 0.1·cr+1.25·cc+in) rides beside
-   *    it — a 91% hit line can carry writes worth half the spend, and that is the number
-   *    that hid the cold-hop waste. Yellow >40%, red >60% (Claude).
-   *  - moves split cross-family (the prompt re-wrote wholesale; drives the red alarm)
-   *    vs same-family (near-free: z.ai's cache is shared across its accounts).
-   *  - miss is per provider — GLM and Claude tokenizers differ ~1.6x, a blended sum is
-   *    unit-inconsistent.
-   *  - waits say what they count: busy-bounce waits only (queue holds book 0 here). */
-  _efficiencyLine(W = 80, now = Date.now()) {
+  /** CACHE + MOVES lines (two-line rework, owner question 2026-11-19: the single
+   *  line answered three questions in one breath with mixed denominators and the
+   *  owner could not parse it). One line, one decision:
+   *  - Cache = cache health only, 15m beside a 24h figure (a heavy-moving slice read
+   *    28% while the 24h truth was 92% — the slice alone alarmed without cause).
+   *  - Moves = causes only: cross per 100 served, the hold-reason split behind the
+   *    same-family count, bounce share. No duplicated counts, no cost proxy.
+   *  - The write-share cost proxy (1.25·cc / 0.1·cr+1.25·cc+in) is a quota-burn
+   *    proxy, not money — it reads as money on the line, so it moved to `maxpool
+   *    status` detail (writes N% of cost) and off the screen.
+   *  Colours are WARN-only proposals until a one-day baseline exists; a red names
+   *  the cause and the account. */
+  _cacheLine(W = 80, now = Date.now()) {
     const eff = this.am.efficiencyOverall?.('last15m', now);
     if (!eff) return null;
     const { claude: c, glm: g } = eff;
@@ -1261,42 +1260,76 @@ export class TUI {
     const since = sinceMs < 15 * 60_000 ? dim(`  since restart ${Math.max(1, Math.round(sinceMs / 60_000))}m`) : '';
     if (c.lowVolume && g.lowVolume) return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
     const pctTxt = x => `${Math.round(x * 100)}%`;
+    const day = this.am.efficiency24h?.(now) || {};
+    const dTxt = p => (p && p.hit != null && p.served >= 20) ? pctTxt(p.hit) : dim('—');
     const parts = [];
-    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}${c.writeShare != null ? ` (w/ ${pctTxt(c.writeShare)} of cost)` : ''}`);
-    if (g.hit != null) parts.push(`GLM ${g.lowVolume ? dim(pctTxt(g.hit)) : pctTxt(g.hit)}`);
-    const missTxt = t => t >= 1e6 ? `${(t / 1e6).toFixed(1)}M` : `${Math.round(t / 1000)}k`;
-    if (c.hit != null || c.missTokens) parts.push(`Claude miss ${missTxt(c.missTokens)} tok`);
-    if (g.hit != null || g.missTokens) parts.push(`GLM miss ${missTxt(g.missTokens)} tok`);
-    const cause = k => c.movedByCause[k] + g.movedByCause[k];
-    const per100 = n => (served ? Math.round(n * 100 / served) : 0);
-    const cross = (c.movedCross || 0) + (g.movedCross || 0);
-    // Causes list only what happened — a row of zeros is width the line cannot spare.
-    const causeTxt = ['busy', 'balance', 'wall', 'link', 'other'].filter(k => cause(k) > 0).map(k => ` · ${k} ${cause(k)}`).join('');
-    parts.push(`cross-moves ${per100(cross)}/100 (same ${(c.movedSame || 0) + (g.movedSame || 0)}${causeTxt})`);
-    const bounceShare = bounced / (served + bounced);
-    if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}`);
-    const glmBusy = g.movedByCause.busy || 0;
-    if (glmBusy) parts.push(`glm busy-bounced ${glmBusy}`);
-    const waited = c.waited + g.waited;
-    if (waited) parts.push(`busy-bounce waits ${waited} (avg ${((c.waitMs + g.waitMs) / waited / 1000).toFixed(1)}s)`);
+    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)} (miss ${this._missTxt(c.missTokens)})`);
+    if (g.hit != null) parts.push(`GLM ${g.lowVolume ? dim(pctTxt(g.hit)) : pctTxt(g.hit)} (miss ${this._missTxt(g.missTokens)})`);
+    parts.push(`${dim('24h:')} ${dTxt(day.claude)} / ${dTxt(day.glm)}`);
 
-    // RED — the first cause that applies, named with the account behind it.
-    const wtm = c.waitThenMoved + g.waitThenMoved;
+    // RED — cache health only: Claude's 15m collapsed under 50% with real volume.
+    // (writeShare red moved to the detail screen with the proxy itself.)
     let red_ = null;
     if (!c.lowVolume && c.hit != null && c.hit < 0.5) red_ = `Claude ${pctTxt(c.hit)} on ${this._worstCacheAccount() || '?'}`;
-    else if (!c.lowVolume && c.writeShare != null && c.writeShare > 0.6) red_ = `write share ${pctTxt(c.writeShare)} of cost on ${this._worstCacheAccount() || '?'}`;
-    else if (per100(cross) > 2) red_ = `cross moves ${per100(cross)}/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
-    else if (bounceShare > 0.1) red_ = `${pctTxt(bounceShare)} bounced — most on ${this._mostBouncedAccount(now) || '?'}`;
-    else if (wtm * 100 / Math.max(1, served) > 0.5) red_ = `${wtm} waits still moved — on ${this._mostBouncedAccount(now) || '?'}`;
-    if (red_) return truncLine(` ${red('Cache')}    ${red(`⚠ ${red_}`)} ${dim('·')} ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
-    // YELLOW — Claude below 70%, write share over 40% of cost, drifting 15+ points
-    // under its hour, or waits are common.
+    if (red_) return truncLine(` ${red('Cache')}    ${red(`⚠ ${red_}`)}  ${dim('·')}  ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+    // YELLOW — Claude below 70%, or drifting 15+ points under its hour (the 24h
+    // figure beside it says whether the slice is a blip or the day's shape).
     const hour = this.am.efficiencyOverall('last1h', now).claude;
     const drift = !c.lowVolume && !hour.lowVolume && c.hit != null && hour.hit != null && hour.hit - c.hit >= 0.15;
-    const warn = (!c.lowVolume && c.hit != null && c.hit < 0.7)
-      || (!c.lowVolume && c.writeShare != null && c.writeShare > 0.4)
-      || drift || waited > 0.25 * served;
+    const warn = (!c.lowVolume && c.hit != null && c.hit < 0.7) || drift;
     return truncLine(` ${warn ? yellow('Cache') : green('Cache')}    ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+  }
+
+  _missTxt(t) {
+    if (t == null) return '—';
+    return t >= 1e6 ? `${(t / 1e6).toFixed(1)}M tok` : `${Math.round(t / 1000)}k tok`;
+  }
+
+  /** The moves half of the old efficiency line: causes only, no cache figures.
+   *  cross/100 is the costly signal (the prompt re-wrote wholesale on the new
+   *  family). same-family moves split by WHY they left the holder — outscored (the
+   *  sibling won on load), hold-ceiling (the depth cap released it), released (a
+   *  hold gate let go) — so a wave of moves names its driver instead of a bare
+   *  count. "glm moved-busy" (renamed from the mislabeled "busy-bounced": these
+   *  are moves, not bounces) stays as the GLM capacity note. */
+  _movesLine(W = 80, now = Date.now()) {
+    const eff = this.am.efficiencyOverall?.('last15m', now);
+    if (!eff) return null;
+    const { claude: c, glm: g } = eff;
+    const served = c.served + g.served;
+    const bounced = c.bounced + g.bounced;
+    if (served + bounced === 0) return null;
+    if (served === 0) return truncLine(` Moves   ${dim('— (no served traffic)')}`, W);
+    const pctTxt = x => `${Math.round(x * 100)}%`;
+    const per100 = n => Math.round(n * 100 / served);
+    const cross = (c.movedCross || 0) + (g.movedCross || 0);
+    const same = (c.movedSame || 0) + (g.movedSame || 0);
+    const why = k => (c.movedByWhy?.[k] || 0) + (g.movedByWhy?.[k] || 0);
+    const parts = [`cross ${per100(cross)}/100`];
+    if (same) {
+      const whyTxt = ['outscored', 'holdCeiling', 'released', 'other'].filter(k => why(k) > 0)
+        .map(k => `${k === 'holdCeiling' ? 'hold-ceiling' : k} ${why(k)}`).join(' · ');
+      parts.push(`same ${same}${whyTxt ? ` (${whyTxt})` : ''}`);
+    }
+    const cause = k => (c.movedByCause?.[k] || 0) + (g.movedByCause?.[k] || 0);
+    const causeTxt = ['busy', 'balance', 'wall', 'link'].filter(k => cause(k) > 0).map(k => `${k} ${cause(k)}`).join(' · ');
+    if (causeTxt) parts.push(causeTxt);
+    const bounceShare = bounced / (served + bounced);
+    if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}${bounceShare > 0.05 ? dim(` (worst: ${this._mostBouncedAccount(now) || '?'})`) : ''}`);
+    const glmBusy = g.movedByCause?.busy || 0;
+    if (glmBusy) parts.push(`glm moved-busy ${glmBusy}`);
+    const waited = c.waited + g.waited;
+    if (waited) parts.push(`busy-waits ${waited} (avg ${((c.waitMs + g.waitMs) / waited / 1000).toFixed(1)}s)`);
+
+    // RED — moves/bounces only (cache health lives on the Cache line).
+    const wtm = c.waitThenMoved + g.waitThenMoved;
+    let red_ = null;
+    if (per100(cross) > 2) red_ = `cross moves ${per100(cross)}/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
+    else if (bounceShare > 0.1) red_ = `${pctTxt(bounceShare)} bounced — most on ${this._mostBouncedAccount(now) || '?'}`;
+    else if (wtm * 100 / Math.max(1, served) > 0.5) red_ = `${wtm} waits still moved — on ${this._mostBouncedAccount(now) || '?'}`;
+    if (red_) return truncLine(` ${red('Moves')}   ${red(`⚠ ${red_}`)} ${dim('·')} ${parts.join(' · ')}  ${dim('[15m]')}`, W);
+    const warn = per100(cross) > 1 || bounceShare > 0.05;
+    return truncLine(` ${warn ? yellow('Moves') : green('Moves')}   ${parts.join(' · ')}  ${dim('[15m]')}`, W);
   }
 
   /** The Claude row with the lowest cache share in the window (enough volume only). */
@@ -2770,8 +2803,10 @@ export class TUI {
       if (provReq > 0) xpText += `  ${dim('·')}  ${yellow(`providers: ${provReq} req/15m`)}`;
     }
     lines.push(this._routingLine(routing, xpText));
-    const effLine = this._efficiencyLine(W);
-    if (effLine != null) lines.push(effLine);
+    const cacheLine = this._cacheLine(W);
+    if (cacheLine != null) lines.push(cacheLine);
+    const movesLine = this._movesLine(W);
+    if (movesLine != null) lines.push(movesLine);
     lines.push(...this._cloudLinkLines(W));
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     // Throttle and WAITING are different things and used to share one line labelled

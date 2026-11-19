@@ -708,6 +708,8 @@ async function serverWorkerCommand() {
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
   if (savedState?.callerStats) accountManager.restoreCallerStats?.(savedState.callerStats);
+  // 24h cache rollup: additive restore into the running buckets (see exportEfficiencyHours).
+  if (savedState?.efficiencyHours) accountManager.restoreEfficiencyHours?.(savedState.efficiencyHours);
 
   // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
   // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
@@ -811,6 +813,8 @@ async function serverWorkerCommand() {
         // SC22 per-person analytics — same generation-guarded payload, survives
         // restarts and seamless reloads.
         callerStats: accountManager.exportCallerStats?.() || {},
+        // 24h efficiency rollup (hourly buckets) — the Cache line's long window.
+        efficiencyHours: accountManager.exportEfficiencyHours?.() || null,
         // Last-good remote identity maps — the boot-time single-writer guard reads
         // these (see restore above). Rides the same generation-guarded payload.
         poolIdentities: accountManager.exportPoolIdentities?.() || null,
@@ -2802,6 +2806,7 @@ function efficiencyLines(data, key = 'last15m') {
   const served = claude.served + glm.served;
   const sum = (f) => (claude[f] || 0) + (glm[f] || 0);
   const cause = (c) => (claude.movedByCause?.[c] || 0) + (glm.movedByCause?.[c] || 0);
+  const whySum = (cl, gm, k) => (cl.movedByWhy?.[k] || 0) + (gm.movedByWhy?.[k] || 0);
   const anyData = served + sum('bounced') > 0;
   const n = (x) => (anyData ? String(x) : '—');
   const failed = accts.reduce((t, a) => t + (a.load?.[key]?.failed || 0), 0);
@@ -2810,8 +2815,10 @@ function efficiencyLines(data, key = 'last15m') {
   const s = (ms) => (ms == null ? '—' : `${(ms / 1000).toFixed(1)}s`);
   return [
     `Efficiency (${key === 'last1h' ? '1h' : '15m'}):`,
-    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok${claude.writeShare != null ? ` · writes ${pctOrDash(claude.writeShare)} of cost` : ''}) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)`,
-    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))})`,
+    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok${claude.writeShare != null ? ` · writes ${pctOrDash(claude.writeShare)} of cost (quota-burn proxy, not money)` : ''}) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)`,
+    `  24h cache:    ${(() => { const d = data.efficiency?.last24h; const t = p => p && p.hit != null && p.served >= 20 ? `${Math.round(p.hit * 100)}% (${p.served} served)` : '—'; return d ? `Claude ${t(d.claude)} · GLM ${t(d.glm)}` : '—'; })()}`,
+    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · why: outscored ${n(whySum(claude, glm, 'outscored'))} · hold-ceiling ${n(whySum(claude, glm, 'holdCeiling'))} · released ${n(whySum(claude, glm, 'released'))} · other ${n(whySum(claude, glm, 'other'))})`,
+    `  Move causes:  busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))}`,
     `  Bounced:      ${n(sum('bounced'))} (refused ${n(sum('refused'))}) · failed ${failed} · link drops ${linkDrops}`,
     `  Busy waits:   ${n(sum('waited'))}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${n(sum('waitThenMoved'))} (busy-bounce waits only; queue holds show in first-byte p95)`,
     `  Client errors: ${co ? `${co.poolErrors + co.requestErrors} of ${co.total} (pool ${co.poolErrors} · request ${co.requestErrors})` : '—'}`,
