@@ -424,7 +424,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
   'providerQuotaSource', 'lastProbeOkAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogVersion',
-  'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel',
+  'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel', 'codexFiveHourAbsent', 'codexWeeklyReadingAt',
 ];
 
 /** The sticky busy-wait budget actually in force, and where it comes from — ONE resolver
@@ -4205,13 +4205,22 @@ export class AccountManager {
     // of the same subscription (uuid:U vs uuid:U:org) groups with self and must
     // never count as a second roomy member of the pool.
     const selfGroup = new Set(this.capacityGroupOf(self));
+    const family = self?.provider === 'codex' ? 'codex' : 'claude';
     const selfProfiles = self?.profiles || ['claude', 'all'];
+    const ownModels = family === 'codex' ? self.quota?.codexModels ?? self.codexModels : null;
     const roomLeft = (util, ceiling, room) => Number.isFinite(util) && util <= ceiling - room;
     const roomy = [];
     for (const p of this.accounts) {
       const id = this.capacityIdentity(p);
       if (id == null || selfGroup.has(p)) continue;
-      if (p.type !== 'oauth' || p.enabled === false) continue;
+      if (p.type !== 'oauth' || p.enabled === false || accountFamily(p) !== family) continue;
+      if (family === 'codex') {
+        const peerModels = p.quota?.codexModels ?? p.codexModels;
+        // Codex threads stay on this provider, and accounts can have different
+        // entitlements. An unknown or incomplete model set cannot cover a hold.
+        if (!ownModels?.length || !peerModels?.length
+          || ownModels.some(model => !peerModels.some(peer => peer.slug === model.slug))) continue;
+      }
       // A benched local copy is skipped; its identity is counted through the cloud
       // MIRROR of the same account (one peer per capacity group, below).
       if (p.poolBenchedBy) continue;
@@ -4225,11 +4234,13 @@ export class AccountManager {
       const q = p.quota || {};
       // Probe-fresh only: a peer whose reading predates this sweep's decision is
       // unknown capacity, and unknown capacity must not hold a claim.
-      const fresh = q.lastProbeOkAt != null && now - q.lastProbeOkAt <= CLAIM_FRESH_MS;
+      const readingAt = family === 'codex' ? q.codexWeeklyReadingAt : q.lastProbeOkAt;
+      const fresh = readingAt != null && now - readingAt <= CLAIM_FRESH_MS;
       if (!fresh) continue;
       const wkCeiling = this._effectiveCap(p, 'wk', now) ?? 1;
       if (!roomLeft(q.unified7d, wkCeiling, POLICY.holdPeerWeeklyRoom)) continue;
-      if (!roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
+      if (!(family === 'codex' && q.codexFiveHourAbsent === true)
+        && !roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
       const buckets = Object.values(q.scopedWeekly || {}).filter(e => e && e.isActive !== false);
       if (buckets.some(e => !roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom))) continue;
       // One peer per capacity GROUP (lowest member index as its key): an org-less twin
@@ -4238,7 +4249,7 @@ export class AccountManager {
     }
     if (!selfProfiles.length) return 0;
     return Math.min(...selfProfiles.map(pr =>
-      new Set(roomy.filter(({ p }) => this._matchesProfile(p, pr)).map(({ key }) => key)).size));
+      new Set(roomy.filter(({ p }) => family === 'codex' || this._matchesProfile(p, pr)).map(({ key }) => key)).size));
   }
 
   // ── R7 hold register (red-team r2 #1/#2) ──────────────────────────────────
@@ -4280,9 +4291,10 @@ export class AccountManager {
     // capacity group is self, never a second holder. An older cloud exports no
     // wallHolding, so it adds none (the previous behaviour).
     const selfGroup = new Set(this.capacityGroupOf(self).map(x => x.index));
-    const remoteHolders = this.accounts.filter(a => a !== self && a.remote && a.enabled !== false
+    const family = accountFamily(self);
+    const remoteHolders = this.accounts.filter(a => a !== self && accountFamily(a) === family && a.remote && a.enabled !== false
       && a._remoteWallHolding === true && !selfGroup.has(a.index)).length;
-    return 1 + this.accounts.filter(a => a !== self && this.isHoldingWall(a, now)).length + remoteHolders;
+    return 1 + this.accounts.filter(a => a !== self && accountFamily(a) === family && this.isHoldingWall(a, now)).length + remoteHolders;
   }
 
   /**
@@ -5361,6 +5373,10 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !usage || usage.error || sentAt < (account.codexQuotaSentAt || 0)) return;
     account.codexQuotaSentAt = sentAt;
+    if (!partial && usage.sevenDay) account.quota.codexFiveHourAbsent = !usage.fiveHour;
+    if (Number.isFinite(usage.sevenDay?.utilization) && Number.isFinite(usage.sevenDay?.resetAt)) {
+      account.quota.codexWeeklyReadingAt = sentAt;
+    }
     const scopedWeekly = partial ? { ...account.quota.scopedWeekly } : {};
     for (const bucket of usage.modelBuckets || []) {
       const key = bucket.normalModelSlug || bucket.slug;

@@ -8,6 +8,8 @@ import {
 import { codexSpentWindows, parseCodexPlanType, parseCodexQuota } from '../src/codex-quota.js';
 import { fetchCodexUsage, normalizeCodexUsagePayload } from '../src/codex-usage.js';
 import { ResetCreditRedeemer, fetchResetCreditDetails, redeemableCredit } from '../src/codex-reset-credits.js';
+import { decideClaudeWithReason, decideCodexWithReason, HOLD_POOL_HAS_ROOM } from '../src/reset-policy.js';
+import { AccountManager } from '../src/account-manager.js';
 
 const authKey = 'https://api.openai.com/auth';
 const jwt = body => ['test', Buffer.from(JSON.stringify(body)).toString('base64url'), 'test'].join('.');
@@ -180,7 +182,8 @@ function resetFixture() {
 
 test('reset redemption is opt-in and a race or reload cannot consume a second credit', async () => {
   let now = resetNow;
-  const owner = account({ quota: { unified7d: 1, unified7dReset: now + 1440 * minutes } });
+  const owner = account({ quota: { unified7d: 1, unified7dReset: now + 1440 * minutes,
+    codexWeeklyReadingAt: now } });
   const manager = { accounts: [owner], ensureTokenFresh: async () => true };
   const fixture = resetFixture();
   const requests = [];
@@ -197,7 +200,8 @@ test('reset redemption is opt-in and a race or reload cannot consume a second cr
   assert.equal((await disarmed.maybeRedeemForPool([owner])).redeemed, false);
   assert.equal(requests.length, 0);
 
-  const armed = { ...options, config: { codexAutoRedeemResets: true } };
+  owner.autoRedeemReset = true;
+  const armed = options;
   const first = new ResetCreditRedeemer(manager, armed);
   const concurrently = new ResetCreditRedeemer(manager, armed);
   const outcomes = await Promise.all([first.maybeRedeemForPool([owner]), concurrently.manualRedeem(owner, creditId)]);
@@ -247,4 +251,94 @@ test('banked-reset reads distinguish unavailable, expired, and malformed credits
   ] }) });
   assert.equal(actual.availableCount, 3);
   assert.equal(redeemableCredit(actual.credits, resetNow).id, 'next');
+});
+
+
+test('Codex credits use the subscription weekly wall, expiry, and natural-refill holds', () => {
+  const quota = { unified7d: 0.99, unified7dReset: resetNow + 23 * 60 * minutes,
+    codexWeeklyReadingAt: resetNow, lastProbeOkAt: resetNow };
+  const owner = account({ quota });
+  const heldCredit = { ...availableCredit, expiresAt: resetNow + 60 * 60 * minutes };
+  const sharedRoom = { listingCheckedAt: resetNow, peersWithRoom: () => 2, holdersInPool: () => 1 };
+  const expected = decideClaudeWithReason(owner, { grants: [{ id: heldCredit.id,
+    endsAt: heldCredit.expiresAt, clears: ['seven_day'] }], checkedAt: resetNow }, resetNow, sharedRoom);
+  const held = decideCodexWithReason(owner, [heldCredit], resetNow, sharedRoom);
+  assert.equal(held.action, null);
+  assert.equal(held.reason, HOLD_POOL_HAS_ROOM);
+  assert.equal(held.reason, expected.reason);
+  assert.equal(decideCodexWithReason(owner, [heldCredit], resetNow, {
+    ...sharedRoom, peersWithRoom: () => 1,
+  }).action.reason, 'weekly at wall');
+
+  owner.quota.unified7d = 0.3;
+  const expiring = { ...availableCredit, expiresAt: resetNow + 2 * 60 * minutes };
+  assert.equal(decideCodexWithReason(owner, [expiring], resetNow).reason, 'free refill <24h away');
+  owner.quota.unified7dReset = resetNow + 28 * 60 * minutes;
+  assert.equal(decideCodexWithReason(owner, [expiring], resetNow).action.reason, 'dying value');
+  assert.equal(decideCodexWithReason(owner, [heldCredit], resetNow).action, null);
+  owner.quota.codexWeeklyReadingAt = resetNow - 6 * minutes;
+  assert.equal(decideCodexWithReason(owner, [expiring], resetNow).reason, 'probe not fresh');
+});
+
+test('Codex automatic expiry redemption uses the sweep while a request only reacts to the weekly wall', async () => {
+  const owner = account({ autoRedeemReset: true, quota: { unified7d: 0.4,
+    unified7dReset: resetNow + 30 * 60 * minutes, codexWeeklyReadingAt: resetNow } });
+  const expiring = { ...availableCredit, expiresAt: resetNow + 60 * minutes };
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  let consumed = 0;
+  let listed = 0;
+  const redeemer = new ResetCreditRedeemer(manager, {
+    now: () => resetNow, log() {}, usageFn: async () => ({}),
+    detailsFn: async () => { listed++; return { credits: [expiring] }; },
+    consumeFn: async () => { consumed++; return { code: 'reset', windowsReset: 1 }; },
+  });
+  assert.equal((await redeemer.maybeRedeemForPool([owner], { reactive: true })).redeemed, false);
+  assert.equal(listed, 0);
+  assert.equal((await redeemer.maybeRedeemForPool([owner])).redeemed, true);
+  assert.equal(listed, 1);
+  assert.equal(consumed, 1);
+});
+
+
+test('Codex revalidates weekly usage after reserving and before consuming a credit', async () => {
+  const owner = account({ autoRedeemReset: true, quota: { unified7d: 1,
+    unified7dReset: resetNow + 30 * 60 * minutes, codexWeeklyReadingAt: resetNow } });
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  const fixture = resetFixture();
+  let consumed = 0;
+  const redeemer = new ResetCreditRedeemer(manager, {
+    now: () => resetNow, log() {},
+    detailsFn: async () => ({ credits: [availableCredit] }),
+    transactState: async update => {
+      const value = await fixture.transactState(update);
+      if (fixture.value.pending) {
+        // A concurrent probe observed that the provider had already refilled.
+        owner.quota.unified7d = 0;
+      }
+      return value;
+    },
+    consumeFn: async () => { consumed++; return { code: 'reset', windowsReset: 1 }; },
+  });
+  const result = await redeemer.maybeRedeemForPool([owner], { reactive: true });
+  assert.equal(result.redeemed, false);
+  assert.match(result.reason, /eligibility changed/);
+  assert.equal(consumed, 0);
+  assert.equal(fixture.value.pending, null);
+});
+
+test('Codex can hold for natural refill only when a fresh, entitled Codex peer has room', () => {
+  const plan = slug => [{ slug }];
+  const accounts = ['self', 'same', 'other-model'].map((name, index) => account({
+    name, accountUuid: name, organizationUuid: name, codexAccountId: name,
+    type: 'oauth', accessToken: `fixture-grant-${name}`, codexModels: plan(index === 2 ? 'gpt-6.2-sol' : 'gpt-6.2-astra'),
+  }));
+  accounts.push({ name: 'claude-peer', accountUuid: 'claude-peer', type: 'oauth', accessToken: 'other-provider' });
+  const manager = new AccountManager(accounts);
+  const weekly = { sevenDay: { utilization: 0.15, resetAt: resetNow + 25 * 60 * minutes } };
+  for (let index = 0; index < 3; index++) manager.applyCodexUsageData(index, weekly, { sentAt: resetNow });
+  manager.applyUsageData(3, { fiveHour: { utilization: 0.1 }, ...weekly });
+  const [self, same] = manager.accounts;
+  assert.equal(manager.countPeersWithRoom(self, resetNow), 1);
+  same.quota.codexWeeklyReadingAt = resetNow - 6 * minutes;
+  assert.equal(manager.countPeersWithRoom(self, resetNow), 0);
 });

@@ -27,7 +27,7 @@ export const SUB_RECHECK_MS = 30 * 60_000;
 const STALE_LISTING_SKIPS = new Set(['listing stale', 'listing failed']);
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null, zaiUsageFn = fetchZaiModelUsage, cardsFn = listResetCards, now = Date.now, codexProbeFn = fetchCodexUsage, codexCatalogFn = listNativeCodexModels } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null, zaiUsageFn = fetchZaiModelUsage, cardsFn = listResetCards, now = Date.now, codexProbeFn = fetchCodexUsage, codexCatalogFn = listNativeCodexModels, onCodexQuota } = {}) {
     this.am = accountManager;
     // Injectable like probeFn: the default hits api.anthropic.com, so a harness that
     // doesn't stub it makes a REAL network call per oauth sweep (a test then passes
@@ -37,6 +37,7 @@ export class Prober {
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
     this.codexCatalogFn = codexCatalogFn;
+    this.onCodexQuota = onCodexQuota;
     this.providerProbeFn = providerProbeFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
@@ -176,8 +177,10 @@ export class Prober {
           }
         }
         if (this.am.accounts[account.index] !== account || account.credential !== credential) continue;
-        if (usage && !usage.error) this.am.applyCodexUsageData(account.index, usage, { sentAt });
-        else this.am.recordProbeError?.(account.index, usage?.error || 'probe timed out', usage?.status ?? null);
+        if (usage && !usage.error) {
+          this.am.applyCodexUsageData(account.index, usage, { sentAt });
+          if (!this._stopping && account.autoRedeemReset === true) await this.onCodexQuota?.(account);
+        } else this.am.recordProbeError?.(account.index, usage?.error || 'probe timed out', usage?.status ?? null);
         if (!this._stopping && this._now() - (account.quota.codexCatalogCheckedAt || 0) >= 5 * 60_000) {
           const catalog = await this._withTimeout(this.codexCatalogFn(account, { etag: account.quota.codexCatalogEtag }));
           if (catalog && this.am.accounts[account.index] === account && account.credential === credential) {

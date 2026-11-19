@@ -246,12 +246,12 @@ reasoning blocks are omitted when translating the transcript for OpenAI.
 Anthropic-hosted tools and ChatGPT-hosted connectors have separate APIs.
 Codex quota and reset times appear in the account views whenever OpenAI
 reports the corresponding window. Use **Accounts → r** on a local Codex
-account to inspect its free banked resets or confirm a redemption. Automatic
-redemption is opt-in using the Codex reset inventory or
-`codexAutoRedeemResets`. The policy can wait for a dry pool and limit
-redemptions by time to the natural reset, reset cohort and daily cap with
-`codexAutoRedeemMinDaysToReset`, `codexAutoRedeemMaxShare` and
-`codexAutoRedeemMaxPerDay`.
+account to inspect its free banked resets or confirm a redemption. Press
+**a** in that reset inventory to opt that account into automatic redemption,
+or set `autoRedeemReset: true` on its account entry. Newly added accounts start
+with automatic redemption off. MaxPool applies its shared weekly reset policy
+after a fresh quota reading, including its rules for expiring banked resets and
+an approaching natural refill.
 
 Token counts requested on the ChatGPT route are estimates. Claude Code
 Remote Control can steer the same running terminal session from a browser

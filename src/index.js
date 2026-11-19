@@ -868,13 +868,12 @@ async function serverWorkerCommand() {
   // Late-bound: routes probe lines through the TUI once it owns the console (a TUI
   // render must be the only writer to the terminal, 2026-11-12).
   const uiLog = (...a) => console.log(...a);
-  const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000, log: uiLog });
   const codexReset = new ResetCreditRedeemer(accountManager, {
     config,
-    isAvailable: (account, info) => accountManager._isRequestCompatible(account, info.profile, info)
-      && accountManager._isAvailable(account, { model: accountManager._availabilityModel(account, info), allowWeeklyReserve: true, allowWeeklyCritical: true }),
-    applyUsage: (account, usage) => {
-      if (accountManager.accounts[account.index] === account) accountManager.applyCodexUsageData(account.index, usage);
+    applyUsage: (account, usage, timing) => {
+      if (hasLease && accountManager.accounts[account.index] === account) {
+        accountManager.applyCodexUsageData(account.index, usage, timing);
+      }
     },
     transactState: async update => {
       if (!hasLease) throw new Error('Codex resets run on the primary worker');
@@ -887,6 +886,10 @@ async function serverWorkerCommand() {
       });
       return value;
     },
+  });
+  const prober = new Prober(accountManager, {
+    intervalMs: probeSeconds * 1000, log: uiLog,
+    onCodexQuota: account => hasLease ? codexReset.maybeRedeemForPool([account]) : null,
   });
   const owningCodex = name => accountManager.accounts.find(a => a.name === name && a.codexAuth === 'native' && !a.remote && !a.poolBenchedBy);
   // Tell the AM the probe cadence so the TUI can flag a scoped/provider tag whose
@@ -1099,10 +1102,10 @@ async function serverWorkerCommand() {
   const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
   const hooks = {
     redeemCodexForRequest: info => {
-      if (!hasLease || config.codexAutoRedeemResets !== true) return null;
+      if (!hasLease) return null;
       const candidates = accountManager.accounts.filter(account => account.codexAuth === 'native' && !account.remote
         && accountManager._isRequestCompatible(account, info.profile, info));
-      return codexReset.maybeRedeemForPool(candidates, info);
+      return codexReset.maybeRedeemForPool(candidates, { reactive: true });
     },
     onRequestStart: (id, info) => {
       const accepted = restartController.requestStarted(id);
@@ -1421,10 +1424,19 @@ async function serverWorkerCommand() {
       accountManager, config,
       codexResetDetails: name => codexReset.readDetails(owningCodex(name)),
       redeemCodexReset: (name, creditId) => codexReset.manualRedeem(owningCodex(name), creditId),
-      onSetCodexAutoRedeem: async enabled => {
-        if (!hasLease) throw new Error('Codex resets run on the primary worker');
-        await atomicConfigUpdate(disk => { disk.codexAutoRedeemResets = enabled === true; });
-        config.codexAutoRedeemResets = enabled === true;
+      onSetCodexAutoRedeem: async (name, enabled) => {
+        const account = owningCodex(name);
+        if (!hasLease || !account) throw new Error('Only the owning pool can set automatic resets');
+        const autoRedeemReset = enabled === true;
+        await atomicConfigUpdate(disk => {
+          if (!hasLease || owningCodex(name) !== account) throw new Error('Account ownership changed');
+          const entry = disk.accounts.find(candidate => candidate.codexAuth === 'native' && sameAccountIdentity(candidate, account));
+          if (!entry) throw new Error('The account is missing from the pool config');
+          entry.autoRedeemReset = autoRedeemReset;
+        });
+        account.autoRedeemReset = autoRedeemReset;
+        const entry = config.accounts.find(candidate => candidate.codexAuth === 'native' && sameAccountIdentity(candidate, account));
+        if (entry) entry.autoRedeemReset = autoRedeemReset;
       },
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         diskConfig.routing = {
