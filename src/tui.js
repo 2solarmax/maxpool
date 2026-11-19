@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { readFileSync, writeSync } from 'node:fs';
 import { isatty } from 'node:tty';
 import { homedir } from 'node:os';
-import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
+import { configuredAccountProvider, findAccountConfigIndex, findClaudeOAuthLoginIndex, isClaudeOAuthAccount, planClaudeOAuthLogin } from './account-config.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
 import { sendProviderToPool } from './cloud-login.js';
@@ -2359,10 +2360,10 @@ export class TUI {
     // Message honors the ACTUAL result: if a manually-typed name collided with a
     // different existing account, upsert updates in place → "Re-authenticated", never
     // a false "Added new account".
-    const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
+    const { updated, name: savedName = name } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
     process.stdout.write(updated
-      ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
-      : `\nAdded new account "${name}". Returning to maxpool…\n`);
+      ? `\nRe-authenticated "${savedName}". Returning to maxpool…\n`
+      : `\nAdded new account "${savedName}". Returning to maxpool…\n`);
   }
 
   // One readline question → answer string.
@@ -2382,7 +2383,8 @@ export class TUI {
     // pool saved the account before organizations were recorded) still owns the
     // login when it is the only same-user mirror: re-authenticate it rather than
     // add a second row. Two known orgs never alias.
-    const mirrors = this.am.accounts.filter(a => a.remote && a.enabled !== false && sameUser({ accountUuid: a.remoteUuid }, profile));
+    const mirrors = this.am.accounts.filter(a => a.remote && a.enabled !== false
+      && configuredAccountProvider(a) === 'anthropic' && sameUser({ accountUuid: a.remoteUuid }, profile));
     return mirrors.find(a => sameAccountIdentity({ accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid }, profile))
       || (profile.organizationUuid && mirrors.filter(a => !a.remoteOrganizationUuid).length === 1
         ? mirrors.find(a => !a.remoteOrganizationUuid) : null);
@@ -2446,20 +2448,17 @@ export class TUI {
 
     const loc = this._configLocation(account);
     if (loc) {
-      const prev = this.config[loc.array][loc.index].capUtilization ?? null;
-      const prevMode = this.config[loc.array][loc.index].capMode ?? null;
-      if (cap == null) delete this.config[loc.array][loc.index].capUtilization;
-      else this.config[loc.array][loc.index].capUtilization = cap;
-      if (mode == null) delete this.config[loc.array][loc.index].capMode;
-      else this.config[loc.array][loc.index].capMode = mode;
+      const before = this.config[loc.array][loc.index];
+      const entry = { ...before };
+      if (cap == null) delete entry.capUtilization;
+      else entry.capUtilization = cap;
+      if (mode == null) delete entry.capMode;
+      else entry.capMode = mode;
+      this.config[loc.array][loc.index] = entry;
       try {
-        await this.saveConfig(this.config);
+        await this.saveConfig(this.config, { collection: loc.array, before, after: entry, fields: ['capUtilization', 'capMode'] });
       } catch (error) {
-        // rollback both config and (below) skip the live apply
-        if (prev == null) delete this.config[loc.array][loc.index].capUtilization;
-        else this.config[loc.array][loc.index].capUtilization = prev;
-        if (prevMode == null) delete this.config[loc.array][loc.index].capMode;
-        else this.config[loc.array][loc.index].capMode = prevMode;
+        this.config[loc.array][loc.index] = before;
         throw error;
       }
     }
@@ -2491,53 +2490,33 @@ export class TUI {
     const cfgIdx = loc.index;
     const cfgArray = loc.array;
     const old = account.name;
-    const prev = this.config[cfgArray][cfgIdx].name;
-    this.config[cfgArray][cfgIdx].name = newName;
-    if (this.config.routing?.preferredAccount === old) this.config.routing.preferredAccount = newName;
+    const before = this.config[cfgArray][cfgIdx];
+    const entry = { ...before, name: newName };
+    const wasPreferred = this.config.routing?.preferredAccount === old;
+    this.config[cfgArray][cfgIdx] = entry;
+    if (wasPreferred) this.config.routing.preferredAccount = newName;
     try {
-      await this.saveConfig(this.config);
+      await this.saveConfig(this.config, { collection: cfgArray, before, after: entry, fields: ['name'] });
     } catch (error) {
-      this.config[cfgArray][cfgIdx].name = prev;
+      this.config[cfgArray][cfgIdx] = before;
+      if (wasPreferred) this.config.routing.preferredAccount = old;
       throw error;
     }
     account.name = newName; // update the running account manager
     this._addLog(`Renamed "${old}" → "${newName}"`);
   }
 
-  // Upsert an OAuth account into config + the running manager. Dedupes by
-  // user + organization, then name. Shared by import and browser login.
+  // Upsert Claude OAuth into config and the running manager.
   async _upsertOAuthAccount({ creds, profile, name, source, verb = 'Added' }) {
-    if (!name) name = suggestAccountName(this.config.accounts, profile);
-    const entry = {
-      name, type: 'oauth', source,
-      accountUuid: profile?.accountUuid || null,
-      organizationUuid: profile?.organizationUuid || null,
-      accessToken: creds.accessToken,
-      refreshToken: creds.refreshToken,
-      expiresAt: creds.expiresAt,
-    };
-
-    // Identity first; the name only picks up rows that cannot carry an identity
-    // (saved before uuids were stored). A row of the SAME USER with a KNOWN,
-    // DIFFERENT organization never matches by name: its tokens are its own.
-    let idx = this.config.accounts.findIndex(a => sameAccountIdentity(a, entry));
-    if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name && !knownDifferentOrg(a, entry));
+    const { index: idx, entry } = planClaudeOAuthLogin(this.config.accounts, { creds, profile, name, source },
+      [...(this.config.providers || []), ...this.am.accounts]);
+    name = entry.name;
 
     if (idx >= 0) {
       const previous = this.config.accounts[idx];
-      entry.enabled = previous.enabled;
       this.config.accounts[idx] = entry;
-      // Update the AccountManager to the FRESH tokens BEFORE persisting. The
-      // saveConfig writer (index.js) derives the ON-DISK tokens from the
-      // AccountManager, not from config.accounts — so persisting first writes the
-      // STALE pre-re-auth token (typically the dead one we're re-authing away from)
-      // to disk. The account then works in memory but boots DEAD on the next restart
-      // (a just-re-authed token rejected as invalid_grant). A later refresh does NOT
-      // heal disk (persistTokenRefresh's generation guard skips a disk token that
-      // != _refreshedFrom), so disk must be made correct right here.
-      const amAcct = this.am.accounts.find(account =>
-        sameAccountIdentity(account, entry) || (account.name === name && !knownDifferentOrg(account, entry))
-      );
+      // Revive the account in memory even if the disk write fails.
+      const amAcct = this._runningAccount(previous);
       if (amAcct) {
         amAcct.credential = creds.accessToken;
         amAcct.refreshToken = creds.refreshToken;
@@ -2552,36 +2531,33 @@ export class TUI {
         if (amAcct.status === 'error') amAcct.status = 'active';
       }
       try {
-        await this.saveConfig(this.config);
+        await this.saveConfig(this.config, { before: previous, after: entry,
+          fields: ['source', 'accountUuid', 'organizationUuid', 'accessToken', 'refreshToken', 'expiresAt'] });
       } catch (error) {
         // Persist failed (e.g. disk full). The browser re-auth genuinely SUCCEEDED,
         // so KEEP the AccountManager on the fresh tokens — reverting it to the dead
         // token would brick a working in-memory account. Roll back only the
-        // config.accounts mirror and surface the error; disk self-heals on the next
-        // saveConfig (the AM-derived writer re-writes the fresh token).
+        // config.accounts mirror and surface the error.
         this.config.accounts[idx] = previous;
         throw error;
       }
       this._addLog(`Updated account "${name}"`);
-      // Confirm the fresh token actually reached DISK (saveConfig awaited above +
-      // the AM was updated before it, so disk now holds creds.refreshToken). This
-      // is the verifiable proof a re-auth "stuck" — its fp must match the on-disk
-      // token; a later "REJECTED sent fp=<other>" then means an upstream revocation,
-      // not a lost persist. console.log (not _addLog) so it's VISIBLE during the
-      // stopped-TUI login flow, mirroring the sibling "Persisted rotated token" line.
+      // The fingerprint matches the persisted grant and stays visible while the TUI is stopped.
       console.log(`[Maxpool] Re-authenticated "${name}" — fresh token persisted (fp=${tokenFingerprint(creds.refreshToken)})`);
       return { updated: true, name };
     } else {
       this.config.accounts.push(entry);
       try {
-        await this.saveConfig(this.config);
+        const saved = await this.saveConfig(this.config, { after: entry });
+        if (saved?.name) entry.name = saved.name;
       } catch (error) {
-        this.config.accounts.pop();
+        const failed = this.config.accounts.indexOf(entry);
+        if (failed >= 0) this.config.accounts.splice(failed, 1);
         throw error;
       }
       this.am.addAccount(entry);
-      this._addLog(`${verb} account "${name}"`);
-      return { updated: false, name };
+      this._addLog(`${verb} account "${entry.name}"`);
+      return { updated: false, name: entry.name };
     }
   }
 
@@ -2620,11 +2596,12 @@ export class TUI {
   }
 
   _runningAccount(entry) {
-    return this.am.accounts.find(a => a.name === entry.name);
+    const local = this.am.accounts.filter(account => !account.remote);
+    return local[findClaudeOAuthLoginIndex(local, entry)];
   }
 
   _oauthAccounts() {
-    return this.config.accounts.filter(a => a.type === 'oauth' && a.provider !== 'codex');
+    return this.config.accounts.filter(isClaudeOAuthAccount);
   }
 
   // Find an already-configured OAuth account matching a fresh browser-login profile —
@@ -2673,13 +2650,14 @@ export class TUI {
     const entry = { name, type: 'apikey', apiKey: key };
     this.config.accounts.push(entry);
     try {
-      await this.saveConfig(this.config);
+      const saved = await this.saveConfig(this.config, { after: entry });
+      if (saved?.name) entry.name = saved.name;
     } catch (error) {
       this.config.accounts.pop();
       throw error;
     }
     this.am.addAccount(entry);
-    this._addLog(`Added API key account "${name}"`);
+    this._addLog(`Added API key account "${entry.name}"`);
   }
 
   async _setAutomaticRouting() {
@@ -2714,11 +2692,9 @@ export class TUI {
 
   _configAccountIndex(account) {
     if (!account) return -1;
-    if (account.accountUuid) {
-      const byUuid = this.config.accounts.findIndex(candidate => sameAccountIdentity(candidate, account));
-      if (byUuid >= 0) return byUuid;
-    }
-    return this.config.accounts.findIndex(candidate => candidate.name === account.name);
+    const local = this.config.accounts.filter(candidate => candidate.type === account.type
+      && configuredAccountProvider(candidate) === configuredAccountProvider(account));
+    return this.config.accounts.indexOf(local[findAccountConfigIndex(local, account)]);
   }
 
   /** Where does this account live in config — `accounts` or `providers`?
@@ -2732,7 +2708,7 @@ export class TUI {
     if (accIdx >= 0) return { array: 'accounts', index: accIdx };
     const provs = this.config.providers;
     if (Array.isArray(provs)) {
-      const pIdx = provs.findIndex(p => p.name === account.name);
+      const pIdx = provs.findIndex(p => p.name === account.name && (!account.provider || p.provider === account.provider));
       if (pIdx >= 0) return { array: 'providers', index: pIdx };
     }
     return null;
@@ -2766,7 +2742,8 @@ export class TUI {
         const applied = applyProviderEnabledToConfig(this.config, account.name, enabled);
         if (applied.changed) {
           try {
-            await this.saveConfig(this.config);
+            const entry = this.config.providers.find(provider => provider.name === account.name);
+            await this.saveConfig(this.config, { collection: 'providers', before: entry, after: entry, fields: ['enabled'] });
           } catch (error) {
             applyProviderEnabledToConfig(this.config, account.name, applied.previous);
             throw error;
@@ -2780,17 +2757,18 @@ export class TUI {
       this._addLog(`Cannot ${enabled ? 'enable' : 'disable'} "${account.name}" here (not in config)`);
       return;
     }
-    const previous = this.config.accounts[configIndex].enabled;
-    this.config.accounts[configIndex].enabled = enabled;
+    const entry = this.config.accounts[configIndex];
+    const previous = entry.enabled;
+    entry.enabled = enabled;
     const previousRouting = this.config.routing;
     const resetsRouting = !enabled && this.config.routing?.preferredAccount === account.name;
     if (resetsRouting) {
       this.config.routing = { mode: 'automatic', preferredAccount: null };
     }
     try {
-      await this.saveConfig(this.config);
+      await this.saveConfig(this.config, { before: entry, after: entry, fields: ['enabled'] });
     } catch (error) {
-      this.config.accounts[configIndex].enabled = previous;
+      entry.enabled = previous;
       this.config.routing = previousRouting;
       throw error;
     }
@@ -2829,8 +2807,9 @@ export class TUI {
     if (this.config.routing?.preferredAccount === name) {
       this.config.routing = { mode: 'automatic', preferredAccount: null };
     }
+    let removedOnDisk;
     try {
-      await this.saveConfig(this.config);
+      removedOnDisk = await this.saveConfig(this.config, { collection: configArray, before: removedConfig });
     } catch (error) {
       this.config[configArray].splice(configIndex, 0, removedConfig);
       this.config.routing = previousRouting;
@@ -2841,7 +2820,9 @@ export class TUI {
       this.config[configArray].splice(configIndex, 0, removedConfig);
       this.config.routing = previousRouting;
       this.am.setAccountEnabled(idx, wasEnabled);
-      await this.saveConfig(this.config);
+      if (removedOnDisk !== null) {
+        await this.saveConfig(this.config, { collection: configArray, after: removedOnDisk || removedConfig });
+      }
       throw new Error(`Account "${name}" became active before deletion completed`);
     }
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);

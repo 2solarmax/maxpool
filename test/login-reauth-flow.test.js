@@ -57,6 +57,27 @@ test('_upsertOAuthAccount adds a genuinely new account → updated:false', async
   assert.ok(am.accounts.some(a => a.name === 'brand-new@x'));
 });
 
+test('a Claude login keeps a same-name Codex grant and allocates a separate account', async () => {
+  const name = 'shared@example.test';
+  const profile = { accountUuid: 'same-user', organizationUuid: 'same-org', email: name };
+  const codex = {
+    name, type: 'oauth', provider: 'codex', codexAuth: 'native', codexAccountId: 'workspace',
+    accountUuid: profile.accountUuid, organizationUuid: profile.organizationUuid,
+    accessToken: 'codex-access', refreshToken: 'codex-rotated', expiresAt: Date.now() + 3600_000,
+  };
+  const glm = { name: name + ' 2', type: 'provider', provider: 'zai', apiKey: 'glm-fixture' };
+  const { tui, am } = setup([codex, glm]);
+  const creds = { accessToken: 'claude-access', refreshToken: 'claude-refresh', expiresAt: codex.expiresAt };
+  const result = await tui._upsertOAuthAccount({ creds, profile, name, source: 'login' });
+  assert.deepEqual(result, { updated: false, name: name + ' 3' });
+  assert.deepEqual(tui.config.accounts.slice(0, 2), [codex, glm]);
+  assert.equal(am.accounts[0].refreshToken, 'codex-rotated');
+  const again = await tui._upsertOAuthAccount({ creds: { ...creds, refreshToken: 'claude-new' }, profile, name, source: 'login' });
+  assert.deepEqual(again, { updated: true, name: name + ' 3' });
+  assert.equal(am.accounts[0].refreshToken, 'codex-rotated');
+  assert.equal(am.accounts[2].refreshToken, 'claude-new');
+});
+
 test('a manually-typed name colliding with a DIFFERENT existing account still returns updated:true (message never lies "Added")', async () => {
   // Two existing accounts; a login for a 3rd Claude account, but the user types an
   // existing name → upsert matches by name → in-place overwrite → updated:true.

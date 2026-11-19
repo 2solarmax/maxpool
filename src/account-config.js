@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { nativeCodexOwnerIdentity } from './codex-native.js';
-import { knownDifferentOrg, sameAccountIdentity, sameUser } from './oauth.js';
+import { knownDifferentOrg, sameAccountIdentity, sameUser, suggestAccountName } from './oauth.js';
 
 const nativeRefreshLineages = new WeakMap();
 
@@ -87,4 +87,72 @@ export function findAccountConfigIndex(accounts, account) {
     && (candidate.provider === 'codex') === (account.provider === 'codex')
     && (!candidate.accountUuid || !account.accountUuid || sameUser(candidate, account))
     && !knownDifferentOrg(candidate, account));
+}
+
+export function configuredAccountProvider(account) {
+  return !account.provider || account.provider === 'claude' ? 'anthropic' : account.provider;
+}
+
+export function isClaudeOAuthAccount(account) {
+  return account.type === 'oauth' && configuredAccountProvider(account) === 'anthropic';
+}
+
+/** Claude's legacy name fallback is only valid for another Claude OAuth row. */
+export function findClaudeOAuthLoginIndex(accounts, login) {
+  const exact = accounts.findIndex(account => isClaudeOAuthAccount(account) && sameAccountIdentity(account, login));
+  if (exact >= 0) return exact;
+  return accounts.findIndex(account => isClaudeOAuthAccount(account)
+    && account.name === login.name && !knownDifferentOrg(account, login));
+}
+
+function availableAccountName(accounts, base) {
+  let name = base;
+  for (let suffix = 2; accounts.some(account => account.name === name); suffix++) name = base + ' ' + suffix;
+  return name;
+}
+
+export function planClaudeOAuthLogin(accounts, { creds, profile, name, source }, reservedAccounts = []) {
+  const reserved = [...accounts, ...reservedAccounts];
+  const base = name || suggestAccountName(reserved, profile);
+  const identity = { name: base, accountUuid: profile?.accountUuid, organizationUuid: profile?.organizationUuid };
+  const index = findClaudeOAuthLoginIndex(accounts, identity);
+  const existing = accounts[index];
+  const chosen = existing?.name || availableAccountName(reserved, base);
+  const entry = {
+    ...existing, name: chosen, type: 'oauth', source,
+    accountUuid: identity.accountUuid || existing?.accountUuid || null,
+    organizationUuid: identity.organizationUuid || existing?.organizationUuid || null,
+    accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt,
+  };
+  return { index, entry };
+}
+
+/** Apply only the account fields changed by one terminal action. */
+export function applyTuiAccountChange(config, { collection = 'accounts', before, after, fields = [] }) {
+  const entries = config[collection] ||= [];
+  const all = [...config.accounts, ...(config.providers || [])];
+  if (!before) {
+    if (after.type === 'oauth' && config.accounts.some(account => account.type === 'oauth' && sameAccountIdentity(account, after))) {
+      throw new Error('This account is already in the pool config. Refresh the account list and reconnect it.');
+    }
+    const added = { ...after, name: availableAccountName(all, after.name) };
+    entries.push(added);
+    return added;
+  }
+  const candidates = entries.filter(account => account.type === before.type
+    && configuredAccountProvider(account) === configuredAccountProvider(before));
+  const current = candidates[findAccountConfigIndex(candidates, before)];
+  if (!after) {
+    if (current) entries.splice(entries.indexOf(current), 1);
+    return current || null;
+  }
+  if (!current) throw new Error(`Account "${before.name}" changed on disk. Refresh the account list and try again.`);
+  if (fields.includes('name') && all.some(account => account !== current && account.name === after.name)) {
+    throw new Error(`An account named "${after.name}" already exists`);
+  }
+  for (const field of fields) {
+    if (after[field] === undefined) delete current[field];
+    else current[field] = after[field];
+  }
+  return current;
 }

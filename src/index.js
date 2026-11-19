@@ -47,11 +47,11 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 );
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations } from './oauth.js';
 import { TUI, writeTerminalSync, reclaimRawModeLogged, whenTerminalCaughtUp } from './tui.js';
 import { createTerminalModeSwitcher } from './terminal-mode.js';
 import { RestartController } from './restart-controller.js';
-import { canPersistOAuthRefresh, findAccountConfigIndex, oauthTokensForDiskSync, resolveAccounts } from './account-config.js';
+import { applyTuiAccountChange, canPersistOAuthRefresh, findAccountConfigIndex, isClaudeOAuthAccount, oauthTokensForDiskSync, planClaudeOAuthLogin, resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
@@ -1462,7 +1462,7 @@ async function serverWorkerCommand() {
         const entry = config.accounts[findAccountConfigIndex(config.accounts, account)];
         if (entry) entry.autoRedeemReset = autoRedeemReset;
       },
-      saveConfig: () => atomicConfigUpdate(async diskConfig => {
+      saveConfig: (_config, accountChange) => atomicConfigUpdate(diskConfig => {
         diskConfig.routing = {
           mode: config.routing?.mode || 'automatic',
           preferredAccount: config.routing?.preferredAccount || null,
@@ -1498,26 +1498,7 @@ async function serverWorkerCommand() {
         for (const key of ['updateCheck', 'autoUpdate', 'autoApply']) {
           if (config[key] !== undefined) diskConfig[key] = config[key];
         }
-        // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists.
-        // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map(a => {
-          const am = accountManager.accounts[findAccountConfigIndex(accountManager.accounts, a)];
-          const diskAcct = diskConfig.accounts[findAccountConfigIndex(diskConfig.accounts, a)];
-          if (!diskAcct) {
-            const replacement = diskConfig.accounts.find(d => d.name === a.name
-              && (d.codexAuth === 'native' || a.codexAuth === 'native'));
-            if (replacement) return replacement;
-          }
-          const liveTokens = am ? {
-            accessToken: am.credential,
-            refreshToken: am.refreshToken,
-            expiresAt: am.expiresAt,
-          } : {};
-          const tokens = am?.codexAuth === 'native' && diskAcct?.accessToken && diskAcct?.refreshToken
-            ? oauthTokensForDiskSync(am, diskAcct) : liveTokens;
-          return { ...diskAcct, ...a, ...tokens };
-        });
+        if (accountChange) return applyTuiAccountChange(diskConfig, accountChange);
       }),
       syncAccounts: async () => {
         const diskConfig = await loadConfig();
@@ -2132,9 +2113,10 @@ async function loginOAuthCommand() {
   // Cloud-aware: a linked team pool with a usable key may receive the login instead.
   // Profile FIRST (once): a local match must win over the cloud default.
   const profile = await fetchProfile(creds.accessToken);
-  const localMatch = (profile?.accountUuid && config.accounts.find(a => a.type === 'oauth' && sameAccountIdentity(a, profile)))
-    || (profile?.accountUuid && organizationUnknownMatch(config.accounts, profile))
-    || (profile?.email && config.accounts.find(a => a.type === 'oauth' && a.provider !== 'codex' && a.name === profile.email))
+  const claudeAccounts = config.accounts.filter(isClaudeOAuthAccount);
+  const localMatch = (profile?.accountUuid && claudeAccounts.find(a => sameAccountIdentity(a, profile)))
+    || (profile?.accountUuid && organizationUnknownMatch(claudeAccounts, profile))
+    || (profile?.email && claudeAccounts.find(a => a.name === profile.email))
     || null;
   const plan = await chooseCliLoginPlan(config, localMatch);
   if (plan.action === 'fail') {
@@ -2142,7 +2124,7 @@ async function loginOAuthCommand() {
     process.exit(1);
   }
   if (plan.action === 'local') {
-    await upsertOAuthAccount(config, name, creds, 'login', profile);
+    await upsertOAuthAccount(name, creds, profile);
     return;
   }
 
@@ -2731,50 +2713,38 @@ Config: ${getConfigPath()}
 
 // ── shared account upsert ────────────────────────────────────
 
-async function upsertOAuthAccount(config, name, creds, source = 'unknown', prefetchedProfile = null) {
-  // Fetch profile to auto-name and deduplicate by account UUID (reuse one already fetched)
-  const profile = prefetchedProfile || await fetchProfile(creds.accessToken);
+async function upsertOAuthAccount(name, creds, profile) {
   const profileOk = profile && !profile.error;
-
   if (!profileOk) {
     console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
   }
-  if (profileOk) await resolveOrganizations(config.accounts.filter(a => a.type === 'oauth'), profile.accountUuid);
-  const uncertain = profileOk && !name ? organizationUnknownMatch(config.accounts, profile) : null;
+  // Do the legacy profile reads before taking the write lock. Only carry an org
+  // back to the exact Claude grant it was read from.
+  const resolved = ((await loadConfig())?.accounts || []).filter(a => isClaudeOAuthAccount(a) && !a.organizationUuid);
+  if (profileOk) await resolveOrganizations(resolved, profile.accountUuid);
+  const { entry, index, uncertain } = await atomicConfigUpdate(disk => {
+    const claudeAccounts = disk.accounts.filter(isClaudeOAuthAccount);
+    for (const a of claudeAccounts) {
+      if (a.organizationUuid) continue;
+      const match = resolved.find(candidate => candidate.organizationUuid && candidate.name === a.name
+        && candidate.accountUuid === a.accountUuid && candidate.accessToken === a.accessToken);
+      if (match) a.organizationUuid = match.organizationUuid;
+    }
+    const uncertain = profileOk && !name ? organizationUnknownMatch(claudeAccounts, profile) : null;
+    const { index, entry } = planClaudeOAuthLogin(disk.accounts, {
+      creds, profile, name: name || uncertain?.name, source: 'login',
+    }, disk.providers || []);
+    if (index < 0) disk.accounts.push(entry);
+    else disk.accounts[index] = entry;
+    return { entry, index, uncertain };
+  });
   if (uncertain) {
-    name = uncertain.name;
-    console.log(`Same Claude user as "${name}", and its organization could not be checked: re-authenticating it in place. To add this login as a second account, run again with --name <new name>.`);
-  }
-  if (!name && profile?.email) {
+    console.log(`Same Claude user as "${entry.name}", and its organization could not be checked: re-authenticating it in place. To add this login as a second account, run again with --name <new name>.`);
+  } else if (!name && profile?.email) {
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  if (!name) name = suggestAccountName(config.accounts, profile);
-
-  const account = {
-    name,
-    type: 'oauth',
-    source,
-    accountUuid: profile?.accountUuid || null,
-    organizationUuid: profile?.organizationUuid || null,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Deduplicate: match by user + organization first, then by name
-  let idx = config.accounts.findIndex(a => sameAccountIdentity(a, account));
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
-
-  if (idx >= 0) {
-    config.accounts[idx] = account;
-    console.log(`Updated account "${name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added account "${name}"`);
-  }
-
-  await saveConfig(config);
+  console.log(`${index >= 0 ? 'Updated' : 'Added'} account "${entry.name}"`);
   console.log(`Saved to ${getConfigPath()}`);
 }
 

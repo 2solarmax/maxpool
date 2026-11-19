@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Account configuration writes
+
+Claude browser login matches only Claude OAuth accounts. Another provider can keep the requested name and grant while the new Claude account gets a distinct label. Local CLI enrollment updates the latest locked config, and terminal account actions apply the selected row and fields so concurrent enrollment, credential rotation, and deletion survive.
+
 ### 2026-11-19 · Cache dashboard at terminal width
 
 Show a named pair of 15-minute and 24-hour cache hit rates for Claude, GLM, and Codex when provisioned. A dash marks an idle or unmeasured window. Routing details show per-provider misses on their own line, and `maxpool status` keeps the existing quota-burn wording.

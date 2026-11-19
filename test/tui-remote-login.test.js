@@ -57,6 +57,12 @@ test('mirror match: uuid on a mirror row routes remote; local uuid and no-uuid d
   assert.equal(t._findRemoteMirrorFor({}), null, 'no uuid → local path (existing behavior)');
 });
 
+test('a same-identity Codex mirror does not receive a Claude login', () => {
+  const mirror = { ...makeMirror(), provider: 'codex', remoteOrganizationUuid: 'workspace' };
+  const t = stubTui([mirror]);
+  assert.equal(t._findRemoteMirrorFor({ accountUuid: mirror.remoteUuid, organizationUuid: mirror.remoteOrganizationUuid }), null);
+});
+
 test('remote login is POSTed with the remote name, dead row implies replace, nothing local', async () => {
   const MIRROR = makeMirror();
   const t = stubTui([MIRROR]);
