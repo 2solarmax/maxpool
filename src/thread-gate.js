@@ -23,7 +23,7 @@ export const THREAD_UNSUPPORTED_CODE = 'thread_unsupported_request';
  *  Anthropic-side thread. The ONE place this is decided, so the call site and the
  *  tests cannot disagree about it. */
 export function isThreadlessAccount(account) {
-  return account?.type === 'provider';
+  return account?.type === 'provider' || account?.provider === 'codex';
 }
 
 /** What kind of thread intent a request body carries. Cheap: only the head of the body

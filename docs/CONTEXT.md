@@ -18,36 +18,28 @@
 
 ## Current focus
 
-Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
-load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
-routing modes. Current version: **v1.5.83** (installed as a global symlink to
-`~/maxpool`, so `git pull` updates the running install).
-
-**Recently shipped (2026-08-10/11):**
-- v1.5.80: routing modes (`balance`, `prefer-claude`, `prefer-zai`, `prefer-kimi`,
-  `sticky`) replacing the opaque 3-policy knob. Utilisation-weighted scoring in
-  `balance` mode. Session binding only under `sticky`.
-- v1.5.81: restart UX fix — seamless path skips the 10s pre-drain (it was pure cost:
-  30-60s requests never finish in 10s, so it was always 10s of guaranteed 503s for
-  zero drained requests). Progress ticks during cold-path drain. Honest confirm text.
-- v1.5.82: cache-first secret resolution (reads `~/.claude/.credentials-cache` before
-  `gcloud`, fixing `secret-unresolved` rows that spawned duplicate `-fallback`
-  entries). Routing modes exposed in TUI (`f`/`m` key cycle).
-- v1.5.83: hide inert "Cross-provider: always" text under non-sticky modes (it
-  looked like two conflicting controls when only the mode governed routing).
-
-**Open items:**
-- `glm max@gomokka.com` (legacy TOKENS_LIMIT plan) has no weekly limit — confirmed
-  real (not a parse gap), but z.ai is sunsetting legacy plans (migration notice
-  April 2026). Don't rely on this long-term.
-- Ahmed's RESTRICTED_AL_MAXPOOL_ZAI key is absent from Max's credentials cache
-  (~17s gcloud resolution at boot on Max's machine; instant on Ahmed's).
-- `crossProviderFallbackPolicy: when-exhausted` still in config.json — inert
-  (routingMode takes precedence), cleaned up on next `f` key cycle.
+MaxPool v1.24.112 serves Claude Code with Anthropic, GLM, and Kimi. On
+`codex/maxpool-openai`, ChatGPT plan usage is added as another inference
+provider behind the same Claude Code Messages API. Browser sign-in and
+routing are in local verification before release.
 
 ---
 
 ## Decisions
+
+### 2026-11-19 · #9 — ChatGPT plan usage behind Claude Code
+
+**Context.** Quota exhaustion needs a new provider on the existing `cc` path,
+including cloud account onboarding and Remote Control sessions.
+
+**Decision.** Add Sign in with ChatGPT to MaxPool and stream OpenAI Responses
+as Claude Messages. Use the existing linked-pool account handoff. Set the
+default session policy for ChatGPT to same provider, configurable per provider
+or pool-wide. Preserve the client-owned tool loop and the original transcript.
+
+**Consequences.** ChatGPT accounts can serve `cc all` traffic and rotate among
+eligible accounts. Verification needs both the Claude Code tool round trip
+and a real ChatGPT plan authorization before enabling it on the live pool.
 
 ### 2026-11-13 · release B red-team round 1 — first-byte floor vs client patience, mixed-version 504
 

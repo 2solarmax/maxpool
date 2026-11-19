@@ -204,7 +204,46 @@ When GLM/Kimi return 429 without standard retry headers, Maxpool also parses pro
 
 Every account/provider row also includes load telemetry: `Load current/weight`, `15m <requests> <avg latency>`, and `1h <requests>`. This is based on completed requests retained in memory for the last hour, plus current in-flight requests.
 
-### Restart behavior
+### ChatGPT subscriptions in Claude Code
+
+Connect each account with a distinct name. The sign-in opens ChatGPT and asks
+permission to use the selected workspace's plan. Enter the same name when
+reconnecting. You can also choose **Accounts → Add account → ChatGPT
+subscription** from the dashboard.
+
+```sh
+maxpool login --codex --cloud --name "ChatGPT work"
+maxpool login --codex --local --name "ChatGPT laptop"
+```
+
+Use `--pool <name>` for a specific linked team pool or `--model <slug>` to
+select the account's default model. Upgrade both MaxPool endpoints before
+adding accounts to a linked cloud pool. The chosen pool owns token renewal.
+MaxPool lists the account as Codex. Clients continue to send Claude Code's
+Messages API, and MaxPool translates requests and tool results to OpenAI
+Responses when it picks a ChatGPT account. The `all` profile considers
+ChatGPT along with the configured Claude, GLM, and Kimi accounts.
+`cc --model <OpenAI model slug>` selects OpenAI explicitly. An Anthropic model
+name on a request using automatic routing lets MaxPool select the OpenAI
+account's configured model.
+
+**Session routing.** A conversation served by ChatGPT stays in that provider
+family by default and can move to another eligible ChatGPT account. Other
+providers keep their configured fallback behavior. In the Routing menu,
+press **o** to toggle the ChatGPT policy. Set `scheduler.sessionRouting` to
+`same-provider` or `cross-provider` for a pool-wide default, or override that
+default in `scheduler.providers.<name>.sessionRouting`. Provider names are
+`claude`, `zai`, `kimi`, and `codex`. Cross-provider routing still checks
+transcript and request compatibility.
+
+Local shell, editing, and MCP tools are executed by Claude Code. Provider
+reasoning blocks are omitted when translating the transcript for OpenAI.
+Anthropic-hosted tools and ChatGPT-hosted connectors have separate APIs.
+Token counts requested on the ChatGPT route are estimates. Claude Code
+Remote Control can steer the same running terminal session from a browser
+or app. Sessions launched on Anthropic's hosted workers use their own runtime.
+
+## Restart behavior
 
 When you confirm Restart, confirm Stop, press Ctrl-C, or send SIGTERM, Maxpool enters draining shutdown:
 
@@ -438,7 +477,7 @@ No. The bars show how *full* an account is toward its limit, so an empty bar mea
 Set `"autoUpdate": true` in your config and maxpool installs new versions itself (applied on the next restart; running sessions are never interrupted). Otherwise `npm i -g maxpool` updates it.
 
 **Where do my tokens go?**
-They're stored locally in your config (file mode `0600`) and sent only to Anthropic — or, in the optional `all` profile, to GLM/Kimi if you supply those. Nothing else leaves your machine. Zero third-party dependencies.
+MaxPool stores credentials in the account's chosen pool config (file mode `0600`). Inference uses the selected provider's credential. A cloud login transfers the new credential to the authenticated linked pool, which handles renewal. MaxPool has zero third-party runtime dependencies.
 
 **How do I stop it?**
 Press `q` in the TUI (or Ctrl-C). It drains briefly, then exits.

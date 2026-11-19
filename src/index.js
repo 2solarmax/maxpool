@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import net from 'node:net';
+import { randomUUID } from 'node:crypto';
+import { DEFAULT_OPENAI_MODEL, listOpenAIModels, loginOpenAI } from './openai-login.js';
 
 // DUAL-STACK TUNING (2026-10-08). Node ≥20 enables happy-eyeballs with a 250ms
 // per-family attempt timeout. On networks where IPv6 is degraded-but-not-dead and the
@@ -135,7 +137,7 @@ switch (command) {
     break;
   case 'login':
     await loginCommand();
-    process.exit(0);
+    process.exit(process.exitCode ?? 0);
     break;
   case 'env':
     await envCommand();
@@ -686,6 +688,7 @@ async function serverWorkerCommand() {
   // lease holder); a cold/direct worker reads the on-disk state file.
   const savedState = await loadState();
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  accountManager.restoreSessionProviders(savedState?.sessionProviders);
   if (savedState?.capacity) {
     // Measured maxpool downtime = state-file last write → boot. A seamless reload
     // worker's state was handed over live (no gap) → null skips the partial check.
@@ -799,6 +802,7 @@ async function serverWorkerCommand() {
     return saveState(
       {
         quota: accountManager.exportQuotaState(),
+        sessionProviders: accountManager.exportSessionProviders(),
         // Runtime providers so glm-fallback/kimi-fallback survive a restart (they're
         // header-derived, not in config). Empty [] when none — harmless.
         runtimeProviders: accountManager.exportRuntimeProviders(),
@@ -1912,6 +1916,10 @@ function logPlainServerStart({ host, port, accounts, threshold, config }) {
 // ── login ───────────────────────────────────────────────────
 
 async function loginCommand() {
+  if (args.includes('--codex') || args.includes('--chatgpt')) {
+    await loginChatGPTCommand();
+    return;
+  }
   if (args.includes('--api')) {
     await loginApiCommand();
     return;
@@ -1932,6 +1940,7 @@ async function loginCommand() {
   console.log('Select login method:\n');
   console.log('  1. Claude subscription  (Pro, Max, Team, Enterprise)');
   console.log('  2. Anthropic API key    (Console API billing)');
+  console.log('  3. ChatGPT subscription');
   console.log('');
   const choice = await new Promise(resolve => rl.question('Choice [1]: ', resolve));
   rl.close();
@@ -1939,6 +1948,7 @@ async function loginCommand() {
   switch (choice.trim() || '1') {
     case '1': await loginOAuthCommand(); break;
     case '2': await loginApiCommand(); break;
+    case '3': await loginChatGPTCommand(); break;
     default:
       console.error(`Invalid choice: ${choice.trim()}`);
       process.exit(1);
@@ -1969,36 +1979,7 @@ async function loginApiCommand() {
   console.log(`Saved to ${getConfigPath()}`);
 }
 
-async function loginOAuthCommand() {
-  const config = await loadOrCreateConfig();
-  let name = argValue('--name');
-
-  console.log('Starting OAuth login...');
-  console.log('Note: this adds whatever account you are currently signed into at claude.ai —');
-  console.log('there is no account picker. To add a DIFFERENT account, sign into THAT account at');
-  console.log('claude.ai first (or use a logged-out / incognito browser window), then continue.');
-  let creds;
-  try {
-    creds = await loginOAuth();
-  } catch (err) {
-    if (isLoginCancelled(err)) {
-      console.error('Login cancelled.');
-      process.exit(0);
-    }
-    console.error(`OAuth login failed: ${err.message}`);
-    console.error('');
-    console.error('Alternatives:');
-    console.error('  maxpool login --api   Add an API key instead');
-    process.exit(1);
-  }
-
-  // Cloud-aware: a linked team pool with a usable key may receive the login instead.
-  // Profile FIRST (once): a local match must win over the cloud default.
-  const profile = await fetchProfile(creds.accessToken);
-  const localMatch = (profile?.accountUuid && config.accounts.find(a => a.type === 'oauth' && sameAccountIdentity(a, profile)))
-    || (profile?.accountUuid && organizationUnknownMatch(config.accounts, profile))
-    || (profile?.email && config.accounts.find(a => a.type === 'oauth' && a.name === profile.email))
-    || null;
+async function chooseCliLoginPlan(config, localMatch) {
   const { usable, unresolved, error } = await resolveUsablePools(config.pools, async (names) => {
     const { resolveSecrets } = await import('./secret-resolver.js');
     return resolveSecrets(names);
@@ -2027,6 +2008,40 @@ async function loginOAuthCommand() {
     input.answer = await ask(`Add/update this account in the team pool "${plan.pool.name}" (recommended) or this laptop only? [T/l]: `);
     plan = planCliLogin(input);
   }
+  return plan;
+}
+
+async function loginOAuthCommand() {
+  const config = await loadOrCreateConfig();
+  let name = argValue('--name');
+
+  console.log('Starting OAuth login...');
+  console.log('Note: this adds whatever account you are currently signed into at claude.ai —');
+  console.log('there is no account picker. To add a DIFFERENT account, sign into THAT account at');
+  console.log('claude.ai first (or use a logged-out / incognito browser window), then continue.');
+  let creds;
+  try {
+    creds = await loginOAuth();
+  } catch (err) {
+    if (isLoginCancelled(err)) {
+      console.error('Login cancelled.');
+      process.exit(0);
+    }
+    console.error(`OAuth login failed: ${err.message}`);
+    console.error('');
+    console.error('Alternatives:');
+    console.error('  maxpool login --api   Add an API key instead');
+    process.exit(1);
+  }
+
+  // Cloud-aware: a linked team pool with a usable key may receive the login instead.
+  // Profile FIRST (once): a local match must win over the cloud default.
+  const profile = await fetchProfile(creds.accessToken);
+  const localMatch = (profile?.accountUuid && config.accounts.find(a => a.type === 'oauth' && sameAccountIdentity(a, profile)))
+    || (profile?.accountUuid && organizationUnknownMatch(config.accounts, profile))
+    || (profile?.email && config.accounts.find(a => a.type === 'oauth' && a.provider !== 'codex' && a.name === profile.email))
+    || null;
+  const plan = await chooseCliLoginPlan(config, localMatch);
   if (plan.action === 'fail') {
     console.error(plan.message);
     process.exit(1);
@@ -2052,6 +2067,70 @@ async function loginOAuthCommand() {
   }
   console.error(`${r.error}. NOTHING was saved on this laptop — not retried locally. Try again, or use --local to save here only.`);
   process.exit(1);
+}
+
+async function loginChatGPTCommand() {
+  try {
+    const config = await loadOrCreateConfig();
+    const requestedName = argValue('--name')?.trim();
+    const localPrior = requestedName ? config.accounts.find(account => account.name === requestedName
+      && account.provider === 'codex') : null;
+    const plan = await chooseCliLoginPlan(config, localPrior);
+    if (plan.action === 'fail') throw new Error(plan.message);
+    let hostId;
+    let prior;
+    if (plan.action === 'local') {
+      await atomicConfigUpdate(disk => { hostId = disk.chatgptHostId ||= `urn:uuid:${randomUUID()}`; });
+      prior = localPrior;
+    } else {
+      const pool = plan.pool;
+      const route = new URL(String(pool.url).replace(/\/+$/, '') + '/maxpool/chatgpt-login');
+      if (requestedName) route.searchParams.set('name', requestedName);
+      const result = await fetch(route, {
+        headers: { 'x-api-key': pool.key }, redirect: 'error', signal: AbortSignal.timeout(20_000),
+      });
+      if (result.status === 409) throw new Error('That account name is already used on the team pool. Choose a different name.');
+      if (!result.ok) throw new Error(`Team pool returned HTTP ${result.status}. Check that it supports ChatGPT sign-in.`);
+      ({ hostId, prior } = await result.json());
+      if (typeof hostId !== 'string' || !hostId.startsWith('urn:uuid:')) {
+        throw new Error('The team pool did not return a ChatGPT host ID');
+      }
+    }
+    const { profile, creds } = await loginOpenAI({ hostId, prior });
+    const models = await listOpenAIModels(creds.accessToken);
+    const requestedModel = argValue('--model') || prior?.model;
+    if (requestedModel && !models.includes(requestedModel)) {
+      throw new Error(`This ChatGPT account does not list ${requestedModel}. Available models: ${models.join(', ')}`);
+    }
+    creds.model = requestedModel || (models.includes(DEFAULT_OPENAI_MODEL) ? DEFAULT_OPENAI_MODEL
+      : models.find(model => model.startsWith('gpt-')) || models[0]);
+    if (!creds.model) throw new Error('This ChatGPT account returned no available models');
+    let name = (requestedName || `ChatGPT ${profile.email || profile.accountUuid.slice(0, 8)}`)
+      .replace(/[\x00-\x1f\x7f]/g, '').slice(0, 120);
+    if (plan.action === 'cloud') {
+      const pool = plan.pool;
+      const result = await sendLoginToPool({ url: pool.url, key: pool.key, name, profile, creds });
+      if (!result.ok) throw new Error(result.error);
+      console.log(`Connected "${result.name}" to "${pool.name}" using ${creds.model}.`);
+    } else {
+      await atomicConfigUpdate(disk => {
+        const existing = disk.accounts.find(a => sameAccountIdentity(a, profile));
+        if (existing) {
+          Object.assign(existing, creds);
+          name = existing.name;
+          return;
+        }
+        const base = name;
+        for (let suffix = 2; disk.accounts.some(a => a.name === name); suffix++) name = `${base} ${suffix}`;
+        disk.accounts.push({ name, type: 'oauth', provider: 'codex', priority: 30,
+          accountUuid: profile.accountUuid, organizationUuid: profile.organizationUuid, ...creds });
+      });
+      console.log(`Connected "${name}" on this laptop using ${creds.model}.`);
+    }
+  } catch (error) {
+    console.error(`ChatGPT sign-in failed. ${error.message}`);
+    process.exitCode = 1;
+  }
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -2305,7 +2384,7 @@ async function accountsCommand() {
   // Refresh expired tokens before fetching profiles
   let configDirty = false;
   await Promise.all(config.accounts.map(async (a) => {
-    if (a.type !== 'oauth' || !a.refreshToken) return;
+    if (a.type !== 'oauth' || a.provider === 'codex' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
       const newTokens = await refreshAccessToken(a.refreshToken);
@@ -2322,7 +2401,7 @@ async function accountsCommand() {
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken) : null
+      a.type === 'oauth' && a.provider !== 'codex' && a.accessToken ? fetchProfile(a.accessToken) : null
     )
   );
 
@@ -2516,6 +2595,7 @@ Commands:
   server              Start the proxy server (default)
   login               OAuth login via browser (adds the account you're signed into at claude.ai)
   login --api         Add an API key account
+  login --codex       Connect a ChatGPT subscription [--cloud|--local] [--name <name>] [--model <model>]
   login --cloud|--local [--pool <name>]  Send the login to the linked team pool (default when one is configured) or keep it on this laptop
   env [--with-key]    Print env vars to use with Claude
   pool shared <host> <key>  Point this machine at a shared team pool
@@ -2647,6 +2727,10 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       sameAccountIdentity(a, diskAcct) || nameMatches(a, diskAcct)
     );
     if (!mgr) continue;
+    if (diskAcct.provider === 'codex') {
+      mgr.oauthClientId = diskAcct.oauthClientId;
+      mgr.model = diskAcct.model;
+    }
     if (diskAcct.organizationUuid && !mgr.organizationUuid) mgr.organizationUuid = diskAcct.organizationUuid;
     const enabled = diskAcct.enabled !== false;
     if (mgr.enabled !== enabled) {
@@ -2687,7 +2771,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
       const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
         freshCred.expiresAt < mgr.expiresAt;
-      if (changed && !diskIsStaler) {
+      if (changed && (!diskIsStaler || diskAcct.provider === 'codex')) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
         console.log(`[Maxpool] Refreshed credentials for "${mgr.name}"`);
       }

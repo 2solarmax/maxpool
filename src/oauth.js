@@ -168,7 +168,8 @@ export async function fetchProfile(accessToken) {
 
 /** True when both records belong to the same Claude user (account.uuid). */
 export function sameUser(a, b) {
-  return Boolean(a?.accountUuid) && a.accountUuid === b?.accountUuid;
+  return Boolean(a?.accountUuid) && a.accountUuid === b?.accountUuid
+    && (a.provider === 'codex') === (b?.provider === 'codex');
 }
 
 /**

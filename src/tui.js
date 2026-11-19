@@ -1,6 +1,8 @@
 import { createInterface } from 'node:readline';
 import { TANK_MIN_UTIL } from './capacity-ledger.js';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
 import { readFileSync, writeSync } from 'node:fs';
 import { isatty } from 'node:tty';
 import { homedir } from 'node:os';
@@ -1424,13 +1426,14 @@ export class TUI {
   }
 
   // ── unified add-account flow ────────────────────────────────────────────────
-  // Four account types, two credential sources. Every path lands here so there is
+  // Every account type lands here so there is
   // exactly ONE thing to learn: press `a`, pick a type, supply a credential.
   static ADD_TYPES = [
     { key: '1', id: 'anthropic-oauth', label: 'Anthropic subscription', hint: 'log in with a browser (Max / Pro plan)' },
     { key: '2', id: 'anthropic-key',   label: 'Anthropic API key',      hint: 'pay-per-token key from console.anthropic.com' },
     { key: '3', id: 'zai',             label: 'GLM (z.ai) API key',     hint: '' },
     { key: '4', id: 'kimi',            label: 'Kimi (Moonshot) API key', hint: '' },
+    { key: '5', id: 'chatgpt',         label: 'ChatGPT subscription',   hint: 'log in with a browser' },
   ];
 
   _keyAddType(k) {
@@ -1440,6 +1443,12 @@ export class TUI {
   }
 
   _addAccountOfType(typeId) {
+    if (typeId === 'chatgpt') {
+      this.mode = 'accounts';
+      this._confirm('Connect a ChatGPT account?', 'Choose a name and sign in with your browser.',
+        () => this._doChatGPTLogin());
+      return;
+    }
     if (typeId === 'anthropic-oauth') {
       this.mode = 'accounts';
       this._confirm(
@@ -1673,6 +1682,8 @@ export class TUI {
     } else if (k === 'c' || k === 'C') {
       // Cycle the peak weekly cap: off → 25% → 50% → 75% → never-during-peak.
       this._cyclePeakCap();
+    } else if (k === 'o' && this.am.accounts.some(a => a.provider === 'codex')) {
+      this._toggleChatGPTSessionRouting().catch(error => this._addLog(`Could not save: ${error.message}`));
     } else if (k === 'g' || k === 'k') {
       // Per-provider Claude→provider fallback. Only affects routing under `sticky`
       // mode — under balance/prefer-* the mode itself controls eligibility. Still
@@ -1690,6 +1701,16 @@ export class TUI {
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
+  }
+
+  async _toggleChatGPTSessionRouting() {
+    const next = this.am._sessionRoutingFor('codex') === 'same-provider' ? 'cross-provider' : 'same-provider';
+    const scheduler = { ...this.config.scheduler };
+    scheduler.providers = { ...scheduler.providers, codex: { ...scheduler.providers?.codex, sessionRouting: next } };
+    await this.saveConfig({ ...this.config, scheduler });
+    this.config.scheduler = scheduler;
+    this.am.scheduler.providers = { ...this.am.scheduler.providers, codex: scheduler.providers.codex };
+    this._addLog(next === 'same-provider' ? 'ChatGPT sessions stay on ChatGPT' : 'ChatGPT sessions can switch providers');
   }
 
   /** Cycle ONE provider's Claude→provider setting. Turning it ON is the risky direction
@@ -2051,6 +2072,26 @@ export class TUI {
     }
   }
 
+  async _doChatGPTLogin() {
+    const wasRunning = this.running;
+    try {
+      if (wasRunning) await this.handOff();
+      const name = String(await this._ask('ChatGPT account name (use the same name to reconnect): ') || '').trim();
+      if (!name) return;
+      const cli = fileURLToPath(new URL('./index.js', import.meta.url));
+      const child = spawn(process.execPath, [cli, 'login', '--codex', '--name', name], { stdio: 'inherit' });
+      const [code] = await once(child, 'exit');
+      if (code !== 0) {
+        this._addLog('ChatGPT sign-in did not finish');
+        return;
+      }
+      await this.syncAccounts?.();
+      await Promise.all((this.am.poolLinks || []).map(link => link.poll()));
+    } finally {
+      if (wasRunning) this.start();
+    }
+  }
+
   // Browser OAuth login — the SAME flow re-authenticates an existing account (matched
   // by user + organization) or adds a new one. When the login is for an account already added,
   // we say so, keep its name, and skip the "name this account" prompt — so it's clear
@@ -2399,7 +2440,7 @@ export class TUI {
   }
 
   _oauthAccounts() {
-    return this.config.accounts.filter(a => a.type === 'oauth');
+    return this.config.accounts.filter(a => a.type === 'oauth' && a.provider !== 'codex');
   }
 
   // Find an already-configured OAuth account matching a fresh browser-login profile —
@@ -3774,6 +3815,10 @@ export class TUI {
       out.push(` ${bold('c')} GLM peak cap ${dim('— GLM accounts only, in GLM peak hours. Not Claude.')}`);
     }
     out.push(` ${bold('b')} Wait for busy account  ${cyan(this._stickyBusyLabel())}`);
+    if (this.am.accounts.some(a => a.provider === 'codex')) {
+      const label = this.am._sessionRoutingFor('codex') === 'same-provider' ? 'Stay on ChatGPT' : 'Allow provider switches';
+      out.push(` ${bold('o')} ChatGPT sessions  ${cyan(label)}`);
+    }
     // Where the per-account cap actually is.
     out.push(` ${dim('Usage cap for ONE account:')} ${bold('Esc')} ${dim('then')} ${bold('a')} ${dim('→')} ${bold('u')} ${dim('(Claude or GLM)')}`);
     const capped = this.am.accounts.filter(a => a.capUtilization != null && a.enabled !== false);
@@ -3800,7 +3845,7 @@ export class TUI {
       case 'accounts':
         return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'addtype':
-        return ` ${bold('1')}-${bold('4')} pick a type  ${bold('Esc')} Back`;
+        return ` ${bold('1')}-${bold('5')} pick a type  ${bold('Esc')} Back`;
       case 'routing': {
         const mode = this._routingModeDef(this.am.scheduler?.routingMode || 'sticky');
         const hasProviders = this.am.accounts.some(a => a.type === 'provider');

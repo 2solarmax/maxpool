@@ -1,3 +1,4 @@
+import { refreshOpenAIToken } from './openai-login.js';
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint, sameUser, sameAccountIdentity } from './oauth.js';
 import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity } from './pool-link.js';
 import { appendEventLog } from './event-log.js';
@@ -503,7 +504,7 @@ function lruSet(map, key, value) {
 }
 /** An Anthropic account with its own prompt cache (allow-list: a provider or legacy
  *  pool row can forward to GLM, so "not a provider" is not proof of a Claude cache). */
-const isClaudeAccount = (a) => a?.type === 'oauth' || a?.type === 'apikey';
+const isClaudeAccount = (a) => (a?.type === 'oauth' || a?.type === 'apikey') && a.provider !== 'codex';
 // Providers whose prompt cache is shared by every account of that provider, so a
 // conversation warm on one row is warm on all of them. Measured 2026-11-16 (Mac pool,
 // 4.9h): z.ai GLM->GLM hops re-wrote ~150-2.6k tokens vs ~190k per GLM->Claude hop.
@@ -737,6 +738,7 @@ export class AccountManager {
       else this.scheduler.routingMode = 'sticky';
     }
     this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
+    this._refreshOpenAIToken = dependencies.refreshOpenAIToken || refreshOpenAIToken;
     // Named-caller request attribution (team pools): callerName → requests served.
     // Server-side (not TUI-side) so headless pools feed the web screen too.
     this.callerCounts = new Map();
@@ -760,6 +762,7 @@ export class AccountManager {
       provider: acct.provider || (acct.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acct.accountUuid || null,
       organizationUuid: acct.organizationUuid || null,
+      oauthClientId: acct.oauthClientId || null,
       credential: acct.accessToken || acct.authToken || acct.apiKey,
       upstream: acct.upstream || null,
       authHeader: acct.authHeader || null,
@@ -833,6 +836,7 @@ export class AccountManager {
     // Bounded LRU — oldest conversations drop first; a dropped entry only means the
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
+    this.conversationProvider = new Map();
     // When that account last SERVED the conversation (first real upstream byte) —
     // holdsWarmConversation reads it. Same LRU bound, in-memory like the map above.
     this.conversationLastServedAt = new Map();
@@ -1949,7 +1953,7 @@ export class AccountManager {
   _hasAvailableProvider(requestInfo = {}, excludedIndexes = new Set()) {
     const profile = requestInfo.profile || 'claude';
     return this.accounts.some(account => {
-      if ((account.type !== 'provider' && account.type !== 'pool') || excludedIndexes.has(account.index)) return false;
+      if (isClaudeAccount(account) || excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
       return this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true });
     });
@@ -3542,7 +3546,7 @@ export class AccountManager {
       // queue-fairness gate (that alone 503'd every pinned Claude request). The
       // upstream throttle STAYS: it describes this pool's real egress to Anthropic.
       if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
-      if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) {
+      if (isClaudeAccount(account) && this._isUpstreamThrottleBlocking()) {
         requestInfo.pinRefusal = 'throttled';
         return false;
       }
@@ -3567,7 +3571,7 @@ export class AccountManager {
     if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
     // Cloud mirrors egress from the cloud's own IP — this machine's upstream throttle
     // and local queue fairness don't describe them.
-    const providerLike = account.type === 'provider' || Boolean(account.remote);
+    const providerLike = !isClaudeAccount(account) || Boolean(account.remote);
     // A request parked by the repeat cold-hop hold (red-team 2026-11-17 f1) still
     // registers a queue ticket like any queued request, but its ticket must not count
     // as a WAITER for anyone else: a queued waiter makes local Claude rows refuse every
@@ -3700,7 +3704,7 @@ export class AccountManager {
     // the others only when every preferred account is unavailable (the score loop's
     // pass-1 admits reserve accounts, so a loaded preferred account DOES give way).
     if (mode === 'prefer-claude') {
-      return account.type === 'provider' ? base : 0;
+      return isClaudeAccount(account) ? 0 : base;
     }
     if (mode === 'prefer-zai') {
       return account.provider === 'zai' ? 0 : base;
@@ -3905,7 +3909,15 @@ export class AccountManager {
   }
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
-    if (!this._matchesProfile(account, profile)) return false;
+    const family = accountFamily(account);
+    const pinnedFamily = requestInfo.pinAccount ? null : this.pinnedSessionProvider(requestInfo);
+    const only = requestInfo.onlyProvider || pinnedFamily;
+    if (only && family !== only) return false;
+    if (family === 'codex') {
+      if ((!['all', 'codex'].includes(profile) && only !== 'codex') || requestInfo.codexCompatible !== true) return false;
+      return !account.remote || String(requestInfo.path || '').startsWith('/v1/');
+    }
+    if (profile === 'codex' || !this._matchesProfile(account, profile)) return false;
     // A cloud mirror carries Anthropic-API traffic only (/v1/…). Browser noise
     // (favicon, stray GETs) must never be forwarded — on the remote it finds no
     // route, queues up to the hold window, and pins a link lease the whole time
@@ -4475,6 +4487,9 @@ export class AccountManager {
     if (requestInfo.isCountTokens) return;
     requestInfo._notedServed = account.name;
     requestInfo._servedAt = Date.now();
+    const providerKey = accountFamily(account);
+    const providerKeyForConversation = this._providerConversationKey(requestInfo);
+    if (providerKeyForConversation) lruSet(this.conversationProvider, providerKeyForConversation, providerKey);
     const key = this._affinityKey(requestInfo);
     const prev = key ? this.conversationLastAccount.get(key) : undefined;
     this._noteHomeServed(requestInfo, account, prev);
@@ -4526,6 +4541,37 @@ export class AccountManager {
    *  terminal key when a conversation id exists. When identity is genuinely broken
    *  (a fresh hash every request) the home is simply never found, so the normal pick
    *  stands — never a forced or wrong return. */
+  _sessionRoutingFor(providerKey) {
+    const mode = this.scheduler.providers?.[providerKey]?.sessionRouting ?? this.scheduler.sessionRouting;
+    if (mode === 'same-provider' || mode === 'cross-provider') return mode;
+    return providerKey === 'codex' ? 'same-provider' : 'cross-provider';
+  }
+
+  _providerConversationKey(requestInfo) {
+    if (requestInfo.clientThreadId && requestInfo.conversationHash) {
+      return `cc:${requestInfo.clientThreadId}:${requestInfo.conversationHash}`;
+    }
+    return this._homeKey(requestInfo);
+  }
+
+  pinnedSessionProvider(requestInfo) {
+    const provider = this.conversationProvider.get(this._providerConversationKey(requestInfo));
+    return provider && this._sessionRoutingFor(provider) === 'same-provider' ? provider : null;
+  }
+
+  exportSessionProviders() {
+    return [...this.conversationProvider];
+  }
+
+  restoreSessionProviders(entries) {
+    if (!Array.isArray(entries)) return;
+    for (const entry of entries) {
+      if (Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'string') {
+        lruSet(this.conversationProvider, entry[0], entry[1]);
+      }
+    }
+  }
+
   _homeKey(requestInfo = {}) {
     return requestInfo.affinityKey || requestInfo.sessionKey || null;
   }
@@ -6272,7 +6318,10 @@ export class AccountManager {
       // generation guard can detect another writer having already advanced it.
       account._refreshedFrom = account.refreshToken;
       try {
-        const newTokens = await this._refreshAccessToken(account.refreshToken);
+        const newTokens = account.provider === 'codex'
+          ? await this._refreshOpenAIToken(account)
+          : await this._refreshAccessToken(account.refreshToken);
+        if (account.provider === 'codex' && account.refreshToken !== account._refreshedFrom) return true;
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
@@ -6387,6 +6436,7 @@ export class AccountManager {
       provider: acctData.provider || (acctData.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acctData.accountUuid || null,
       organizationUuid: acctData.organizationUuid || null,
+      oauthClientId: acctData.oauthClientId || null,
       credential: acctData.accessToken || acctData.authToken || acctData.apiKey,
       upstream: acctData.upstream || null,
       authHeader: acctData.authHeader || null,
@@ -6691,7 +6741,8 @@ export class AccountManager {
     return this.accounts.filter(a => !a.remote).map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
-      const out = { accountUuid: a.accountUuid, organizationUuid: a.organizationUuid, name: a.name, quota };
+      const out = { accountUuid: a.accountUuid, organizationUuid: a.organizationUuid, name: a.name, quota,
+        ...(a.provider === 'codex' ? { provider: 'codex' } : {}) };
       // OUTSIDE-USAGE flag survives restart (red-team R1.2): a restart is exactly
       // when a leak's cards are most at risk — remediation rotates keys and
       // restarts the pool, and the in-memory flag would vanish mid-remediation.
@@ -6911,6 +6962,7 @@ export class AccountManager {
         this.addAccount({
           name, type: ra.type === 'oauth' ? 'oauth' : (ra.type === 'provider' ? 'provider' : ra.type),
           provider: ra.provider, profiles: ra.type === 'provider' ? ['all'] : ['claude', 'all'],
+          priority: ra.provider === 'codex' ? 30 : undefined,
           configSourced: true, runtime: false,
         });
         a = this.accounts[this.accounts.length - 1];
@@ -7092,7 +7144,7 @@ export class AccountManager {
   async tryReactiveClaim(account, { kind, weeklyUtil: _weeklyUtil = null }, now = Date.now()) {
     if (!account) return false;
     if (account.remote || account.poolBenchedBy || account.enabled === false) return false;
-    if (!account.credential || account.type !== 'oauth') return false;
+    if (!account.credential || account.type !== 'oauth' || account.provider === 'codex') return false;
     // C6 (finding 1): ONE claim per wall — after a claim, only a probe SENT after
     // it may show the wall again. Repeated 429s on the same wall never re-claim.
     // The general wall counts only claims that cleared it (red-team r4 #2): after a

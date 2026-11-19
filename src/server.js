@@ -1,4 +1,6 @@
-import { createHash } from 'node:crypto';
+import { fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest } from './openai-responses.js';
+import { DEFAULT_OPENAI_MODEL } from './openai-login.js';
+import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { normalizeClientHeaders, rewriteMetadataUserIdRaw } from './client-identity.js';
 import { appendEventLog } from './event-log.js';
@@ -478,6 +480,28 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // for X replaces the saved login for X), so no healthy-row refusal:
       // runtime refreshDead lags reality at boot anyway (scratch E2E 2026-10-30:
       // a dead-on-disk row read "healthy" and a real re-auth was refused 409).
+      if (req.method === 'GET' && /^\/maxpool\/chatgpt-login(?:\?|$)/.test(req.url)) {
+        if (strictClients ? !caller.ok : (!proxyApiKey || clientKey !== proxyApiKey)) {
+          rejectUnauthorized();
+          return;
+        }
+        const name = new URL(req.url, 'http://localhost').searchParams.get('name');
+        let hostId;
+        await atomicConfigUpdate(diskConfig => { hostId = diskConfig.chatgptHostId ||= `urn:uuid:${randomUUID()}`; });
+        config.chatgptHostId = hostId;
+        const prior = name ? config.accounts?.find(a => a.name === name) : null;
+        if (prior && prior.provider !== 'codex') {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'name_taken' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ hostId, ...(prior ? {
+          prior: { oauthClientId: prior.oauthClientId, accountUuid: prior.accountUuid, model: prior.model },
+        } : {}) }));
+        return;
+      }
+
       if (req.method === 'POST' && req.url === '/maxpool/accounts') {
         if (strictClients ? !caller.ok : (proxyApiKey && clientKey !== proxyApiKey)) {
           rejectUnauthorized();
@@ -588,6 +612,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           res.end(JSON.stringify({ ok: false, error: 'bad_request', message: 'Expected {account: {type:"oauth", accountUuid, accessToken, refreshToken, name?}}' }));
           return;
         }
+        const codex = acct.provider === 'codex';
+        if (codex && (!/^oaiapp_[A-Za-z0-9_-]+$/.test(acct.oauthClientId || '')
+          || acct.organizationUuid !== acct.oauthClientId || typeof acct.model !== 'string'
+          || !/^[a-z0-9][a-z0-9._-]{0,100}$/i.test(acct.model))) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid_chatgpt_account' }));
+          return;
+        }
         const who = caller.name || 'legacy-key';
         // Exact match (user + org), else the ONE same-user row with no org yet: a
         // login to a pool saved before organizations were recorded re-authenticates
@@ -606,6 +638,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           refreshToken: acct.refreshToken,
           expiresAt: typeof acct.expiresAt === 'number' ? acct.expiresAt : Date.now() + 3600_000,
           source: acct.source || 'remote-inject',
+          ...(codex ? { provider: 'codex', oauthClientId: acct.oauthClientId, model: acct.model } : {}),
         };
         if (amAcct) {
           // In-place revive, mirroring the TUI re-auth field set: fresh tokens
@@ -614,6 +647,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           amAcct.credential = tokenFields.accessToken;
           amAcct.refreshToken = tokenFields.refreshToken;
           amAcct.expiresAt = tokenFields.expiresAt;
+          if (codex) {
+            amAcct.oauthClientId = tokenFields.oauthClientId;
+            amAcct.model = tokenFields.model;
+            amAcct.rateLimitedUntil = null;
+            amAcct.cooldownUntil = null;
+          }
           amAcct.refreshDead = false;
           if (amAcct.status === 'error') amAcct.status = 'active';
           appendEventLog(`[Maxpool] Remote re-auth: "${amAcct.name}" (uuid ${acct.accountUuid.slice(0, 8)}) by ${who}`);
@@ -788,6 +827,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           requestInfo.queueBlockedReason = `request body ${body.length} bytes exceeds queue.maxQueuedBodyBytes ${maxQueuedBodyBytes}`;
         }
         requestInfo.profile = getMaxpoolProfile(req.headers);
+        if (requestInfo.profile === 'codex' || requestInfo.openAIModel) requestInfo.onlyProvider = 'codex';
+        const explicitProvider = headerValue(req.headers, 'x-maxpool-provider');
+        if (!requestInfo.onlyProvider && ['claude', 'zai', 'kimi', 'codex'].includes(explicitProvider)) {
+          requestInfo.onlyProvider = explicitProvider;
+        }
         // PIN (owner D8 per-account shape): a linked pool chose a specific account
         // here. Honored only for an authenticated NAMED client — an anonymous/legacy
         // caller can't steer routing. Applied by selection as an exclusive filter.
@@ -804,6 +848,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // too (bare `claude`, teammates' launchers): the conversation hash alone.
         requestInfo.affinityKey = requestInfo.conversationHash
           ? `${requestInfo.sessionKey || ''}:${requestInfo.conversationHash}` : null;
+        if (requestInfo.isCountTokens && (requestInfo.onlyProvider === 'codex'
+          || accountManager.pinnedSessionProvider?.(requestInfo) === 'codex'
+          || (requestInfo.profile === 'all'
+            && accountManager.accounts.some(a => a.provider === 'codex')
+            && !accountManager.hasAvailableRoute(requestInfo)
+            && accountManager.hasAvailableRoute({ ...requestInfo, codexCompatible: true, onlyProvider: 'codex' })))) {
+          ctx.status = 200;
+          res.writeHead(200, { 'Content-Type': 'application/json', 'x-maxpool-token-count': 'estimated' });
+          res.end(JSON.stringify({ input_tokens: Math.max(1, Math.ceil(body.length / 4)) }));
+          return;
+        }
         requestInfo.caller = req._caller || null;
         // Read per request (not captured at boot) so a config flip + seamless reload
         // takes effect on the next request with no restart.
@@ -931,6 +986,7 @@ function newInjectedEntry(acct, tokenFields, existing = []) {
   }
   const entry = { name, type: 'oauth', accountUuid: acct.accountUuid, enabled: true, ...tokenFields };
   if (acct.organizationUuid) entry.organizationUuid = acct.organizationUuid;
+  if (entry.provider === 'codex') entry.priority = 30;
   return entry;
 }
 
@@ -1176,7 +1232,7 @@ async function forwardRequest(
   // accounts on a streaming turn we could still fail over (nothing written yet). A
   // provider has its own classifier and never emits this stop_reason, so holding its
   // first events would be pure latency. See streamResponse + classifyHeldStreamPrefix.
-  requestInfo._refusalRerouteEligible = account.type !== 'provider'
+  requestInfo._refusalRerouteEligible = account.type !== 'provider' && account.provider !== 'codex'
     && canRetryBufferedBody
     && !clientHasRealBytes(res, requestInfo);
 
@@ -1695,9 +1751,9 @@ async function forwardRequest(
     return;
   }
 
-  const upstreamUrl = `${account.upstream || upstream}${req.url}`;
+  const openAI = account.provider === 'codex';
+  const upstreamUrl = openAI ? (account.upstream || OPENAI_RESPONSES_URL) : `${account.upstream || upstream}${req.url}`;
   const method = req.method;
-  const upstreamBody = rewriteBodyForAccount(body, account, { identity: requestInfo.accountIdentity });
 
   // A threaded follow-up routed to an account that does not hold the thread cannot be
   // served by it: a different Anthropic account 404s, a provider rejects the truncated
@@ -1706,9 +1762,10 @@ async function forwardRequest(
   // upstream produce an error the user sees.
   // `kind:'none'` when the gate is off makes every branch below a no-op, so the
   // disabled path costs one comparison and needs no further guarding.
-  const threadIntent = THREAD_GATE_ENABLED ? readThreadIntent(body) : { kind: 'none' };
+  const threadIntent = THREAD_GATE_ENABLED || openAI ? readThreadIntent(body) : { kind: 'none' };
   if (threadOwners.shouldRefuse(requestInfo.sessionKey, account.name, threadIntent, isThreadlessAccount(account))) {
     threadOwners.noteRefused(requestInfo.sessionKey, account.name);
+    res.off('close', onClientClose);
     accountManager.releaseAccount(lease, { neutral: true });
     console.log(`[Maxpool] thread not held by "${account.name}" — asking the client to resend this turn stateless [sess ${String(requestInfo.sessionKey || '?').slice(0, 8)}]`);
     ctx.status = 400;
@@ -1727,16 +1784,37 @@ async function forwardRequest(
     requestInfo._threadSink.attemptAccount = isThreadedIntent(threadIntent) ? account.name : null;
   }
 
+  let openAIRequest;
+  if (openAI) {
+    try {
+      openAIRequest = toOpenAIRequest(JSON.parse(body.toString()), requestInfo.openAIModel || account.model || DEFAULT_OPENAI_MODEL);
+    } catch {
+      res.off('close', onClientClose);
+      accountManager.releaseAccount(lease, { neutral: true });
+      ctx.status = 400;
+      sendErrorResponse(res, requestInfo, 400, {
+        type: 'error', error: { type: 'invalid_request_error', message: 'This Messages request could not be converted for OpenAI.' },
+      });
+      return;
+    }
+  }
+  const upstreamBody = openAIRequest ? JSON.stringify(openAIRequest.body)
+    : rewriteBodyForAccount(body, account, { identity: requestInfo.accountIdentity });
+  const upstreamHeaders = openAI ? {
+    authorization: `Bearer ${account.credential}`,
+    'content-type': 'application/json', accept: 'text/event-stream',
+  } : headers;
+
   // Build log sections
   const logSections = [];
   if (logDir) {
-    const safeHeaders = { ...headers };
+    const safeHeaders = { ...upstreamHeaders };
     // Mask credentials in logs
     if (safeHeaders['x-api-key']) {
       safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
     }
     if (safeHeaders['authorization']) {
-      safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
+      safeHeaders['authorization'] = '[redacted]';
     }
     logSections.push(
       `=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`,
@@ -1801,10 +1879,13 @@ async function forwardRequest(
     try {
       upstreamRes = await fetch(upstreamUrl, {
         method,
-        headers,
+        headers: upstreamHeaders,
         body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
         redirect: 'manual',
         signal: AbortSignal.any([clientGone.signal, ttfbController.signal]),
+      });
+      if (openAI) upstreamRes = await fromOpenAIResponse(upstreamRes, {
+        model: requestInfo.model, stream: requestInfo.stream, toolNames: openAIRequest.toolNames,
       });
     } finally {
       clearTimeout(ttfbTimer);
@@ -1843,7 +1924,7 @@ async function forwardRequest(
     // production-down deadlock (2026-07-25: 6 of 13 re-arms were client-side 400s
     // while accounts sat at 2%/11%/25% weekly). confirmUpstreamProbe also clears
     // lease.upstreamThrottleProbe, so the releaseAccount probe branch below no-ops.
-    if (!isCapacitySignalStatus(upstreamRes.status)) accountManager.confirmUpstreamProbe?.(lease);
+    if (!openAI && !isCapacitySignalStatus(upstreamRes.status)) accountManager.confirmUpstreamProbe?.(lease);
 
     // Retry/failover can only happen before response bytes are sent. Once a
     // streaming response starts, rerouting would corrupt Claude Code's stream.
@@ -2078,7 +2159,7 @@ async function forwardRequest(
       return;
     }
 
-    if (account.type === 'provider' && isProviderAuthStatus(upstreamRes.status)) {
+    if ((account.type === 'provider' || openAI) && isProviderAuthStatus(upstreamRes.status)) {
       const errorBody = await readErrorBody(upstreamRes);
       const forbidden = upstreamRes.status === 403;
       if (forbidden) {
@@ -2129,7 +2210,7 @@ async function forwardRequest(
       return;
     }
 
-    if (upstreamRes.status === 529 && account.type !== 'provider') {
+    if (upstreamRes.status === 529 && account.type !== 'provider' && !openAI) {
       const errorBody = await readErrorBody(upstreamRes);
       const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after')) || 30;
       const fingerprint = overloadFingerprint(errorBody, body);
@@ -2259,7 +2340,7 @@ async function forwardRequest(
       // ("messages.4.content.0.thinking.signature: Field required"). The second variant
       // used to fall straight through to a PERMANENT provider pin even though stripping
       // fixes it. Still deterministic — never the fuzzy isAnthropicIncompatBody heuristic.
-      const isSignatureRejection = account.type !== 'provider'
+      const isSignatureRejection = account.type !== 'provider' && !openAI
         && (/invalid `signature` in `thinking`/i.test(errorBody)
           || /content\.\d+\.thinking\.signature/i.test(errorBody)
           // A provider web search: `server_tool_use.id: String should match pattern
@@ -2277,7 +2358,7 @@ async function forwardRequest(
       // the offending system to the directive-only form the API accepts at any position
       // (content: [], text moved into output_config) — a shape-preserving transformation,
       // not the orphaning re-anchor.
-      const isOrderingRejection = account.type !== 'provider'
+      const isOrderingRejection = account.type !== 'provider' && !openAI
         && upstreamRes.status === 400
         && /role 'system' must (follow|precede)/i.test(errorBody);
       // LOG THE ACTUAL REASON. Previously a 4xx recorded only "HTTP 400" and the upstream
@@ -3552,7 +3633,7 @@ function isRequestShapeRefusal(headers, errorBody, requestBody) {
 }
 
 function classifyRateLimit(account, headers, body, opts = {}) {
-  if (account.type === 'provider') return { scope: 'account', fingerprint: null };
+  if (account.type === 'provider' || account.provider === 'codex') return { scope: 'account', fingerprint: null };
 
   const parsed = parseJsonError(body);
   const message = String(parsed?.message || '').toLowerCase();
@@ -4587,7 +4668,21 @@ function describeRequest(req, body) {
   try {
     const json = JSON.parse(body.toString());
     if (json.model) info.model = json.model;
+    if (typeof json.model === 'string' && /^(?:gpt-[a-z0-9._-]+|o[1-9][a-z0-9._-]*)$/i.test(json.model)) {
+      info.openAIModel = json.model;
+    }
+    info.codexCompatible = req.method === 'POST' && /^\/v1\/messages(?:\?|$)/.test(req.url)
+      && Array.isArray(json.messages) && json.messages.length > 0;
     if (json.stream) info.stream = true;
+    const clientIdentity = json.metadata?.user_id;
+    if (typeof clientIdentity === 'string' && clientIdentity.length < 2048) {
+      try {
+        const sessionId = JSON.parse(clientIdentity)?.session_id;
+        if (typeof sessionId === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(sessionId)) {
+          info.clientThreadId = sessionId;
+        }
+      } catch { /* legacy metadata is not a JSON string */ }
+    }
     // CONVERSATION identity for cache affinity (red-team 2026-11-08): the
     // x-maxpool-session header names a TERMINAL, and a main thread plus its parallel
     // subagents share it — so "last account used by this session" chased whichever

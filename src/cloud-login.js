@@ -22,6 +22,7 @@ export async function sendLoginToPool({ url, key, name, profile, creds, fetchImp
       body: JSON.stringify({
         account: {
           name, type: 'oauth',
+          ...(profile.provider === 'codex' ? { provider: 'codex', oauthClientId: creds.oauthClientId, model: creds.model } : {}),
           accountUuid: profile?.accountUuid,
           organizationUuid: profile?.organizationUuid,
           accessToken: creds.accessToken,
@@ -30,6 +31,7 @@ export async function sendLoginToPool({ url, key, name, profile, creds, fetchImp
           source: 'remote-login',
         },
       }),
+      ...(profile.provider === 'codex' ? { redirect: 'error' } : {}),
       signal: ctl.signal,
     });
     const json = await res.json().catch(() => ({}));

@@ -117,7 +117,7 @@ export class Prober {
         // token), so its access token is dead and every probe fails — each failure
         // widens the shared inter-probe gap and slows the HEALTHY rows. Its quota is
         // shown from the cloud mirror (am.remoteRowFor), not from a local probe.
-        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential && !a.refreshDead && !a.poolBenchedBy);
+        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.provider !== 'codex' && a.credential && !a.refreshDead && !a.poolBenchedBy);
         // Pool links are probed by their own PoolLink status poll, not here.
         const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);  // 'pool' rows are excluded by type
 
