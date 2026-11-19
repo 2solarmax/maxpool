@@ -305,3 +305,30 @@ test('the final provider snapshot replaces boot pins and honors current schedule
   manager.restoreSessionProviders([]);
   assert.deepEqual(manager.exportSessionProviders(), []);
 });
+
+test('only unresolved sticky family sends enter the final snapshot', () => {
+  const am = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }]);
+  function attempt(thread, family = 'codex', extra = {}) {
+    const info = { clientThreadId: thread, onlyProvider: family, profile: 'all', path: '/v1/messages',
+      codexCompatible: true, model: 'claude-sonnet-5', ...extra };
+    const lease = am.acquireAccount(info);
+    assert.ok(lease);
+    assert.equal(am.beginSessionProviderAttempt(lease), true);
+    return lease;
+  }
+  const rejected = attempt('rejected');
+  am.releaseAccount(rejected, { status: 429, neutral: true });
+  attempt('unresolved');
+  attempt('unresolved');
+  attempt('cross-provider', 'claude');
+  attempt('count-only', 'codex', { isCountTokens: true });
+  assert.deepEqual(am.exportSessionProviders(), []);
+  am.sessionProviderDrain = true;
+  am.sealSessionProviderHandoff();
+  assert.deepEqual(am.exportSessionProviders(), [['cc:unresolved', 'codex']]);
+  const unseen = { clientThreadId: 'unseen', profile: 'all', codexCompatible: true, model: 'claude-sonnet-5' };
+  const late = am.acquireAccount({ ...unseen, onlyProvider: 'codex' });
+  assert.equal(am.beginSessionProviderAttempt(late), false);
+  const ordinary = am.acquireAccount({ ...unseen, onlyProvider: 'claude' });
+  assert.equal(am.beginSessionProviderAttempt(ordinary), true);
+});

@@ -862,6 +862,8 @@ export class AccountManager {
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
     this.conversationProvider = new Map();
+    this.pendingSessionProviders = new Map();
+    this.sessionProviderDrain = false;
     this.nativeCodexConversationOwners = new Map();
     // When that account last SERVED the conversation (first real upstream byte) —
     // holdsWarmConversation reads it. Same LRU bound, in-memory like the map above.
@@ -1362,6 +1364,7 @@ export class AccountManager {
    */
   releaseAccount(lease, outcome = {}) {
     if (!lease?.account) return;
+    this.settleSessionProviderAttempt(lease);
     const account = lease.account;
 
     const depthBefore = account.activeWeight;
@@ -4753,6 +4756,41 @@ export class AccountManager {
     this.nativeCodexConversationOwners.clear();
     for (const entry of entries) {
       if (Array.isArray(entry)) this.rememberNativeCodexOwner(entry[0], entry[1]);
+    }
+  }
+
+  beginSessionProviderAttempt(lease) {
+    const { account, requestInfo } = lease;
+    if (!requestInfo || requestInfo.isCountTokens || requestInfo.nativeCodexClient) return true;
+    const key = this._providerConversationKey(requestInfo);
+    if (!key) return true;
+    const family = accountFamily(account);
+    const origin = this.conversationProvider.get(key);
+    if (origin) return !this.sessionProviderDrain || origin === family || this._sessionRoutingFor(origin) === 'cross-provider';
+    const sticky = this._sessionRoutingFor(family) === 'same-provider';
+    if (this.sessionProviderDrain) {
+      // A new sticky send belongs to the next worker. Unrelated cross-provider
+      // retries on this draining worker can still proceed.
+      if (sticky) return false;
+      for (const [pendingKey] of this.pendingSessionProviders.values()) {
+        if (pendingKey === key) return false;
+      }
+    } else if (sticky) {
+      this.pendingSessionProviders.set(lease, [key, family]);
+    }
+    return true;
+  }
+
+  settleSessionProviderAttempt(lease) {
+    this.pendingSessionProviders.delete(lease);
+  }
+
+  sealSessionProviderHandoff() {
+    // An outstanding first turn may finish successfully after this final flush.
+    // A confirmed origin wins. Conservatively retain the family of an unresolved
+    // send; a definitive failure before this point already released its lease.
+    for (const [key, family] of this.pendingSessionProviders.values()) {
+      if (!this.conversationProvider.has(key)) lruSet(this.conversationProvider, key, family);
     }
   }
 

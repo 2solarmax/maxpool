@@ -1794,6 +1794,7 @@ async function serverWorkerCommand() {
       // 3) Final flush of learned quota. FORCE it: releaseLease() above already
       //    flipped hasLease=false, and persistQuotaState no-ops without the lease —
       //    so an unforced call here silently drops the reload's final quota flush.
+      accountManager.sealSessionProviderHandoff();
       await persistQuotaState(true);
       // 3b) CAPACITY LEDGER: snapshot what we had flushed. We keep serving in-flight
       //     requests for up to RELOAD_DRAIN_MS after this, and those tokens are real

@@ -311,10 +311,16 @@ test('a Claude Code first turn on Codex after replacement boot stays on Codex th
     return server.address().port;
   }
   const hits = [];
+  let holdNext = false, releaseFirst;
+  t.after(() => releaseFirst?.());
   const upstream = await listen(http.createServer(async (req, res) => {
     for await (const chunk of req) { void chunk; }
     hits.push(req.url);
     if (req.url === '/v1/responses') {
+      if (holdNext) {
+        holdNext = false;
+        await new Promise(resolve => { releaseFirst = resolve; });
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       for (const event of [
         { type: 'response.created', response: { id: 'resp_fixture', model: 'gpt-6.2-sol' } },
@@ -368,6 +374,9 @@ test('a Claude Code first turn on Codex after replacement boot stays on Codex th
         messages: [{ role: 'user', content: 'hello' }] }), signal: AbortSignal.timeout(15000) });
   }
   assert.match(await (await turn(port, 'codex')).text(), /codex fixture/);
+  holdNext = true;
+  const pending = turn(port, 'codex', 'awaiting-first-byte');
+  await waitFor(() => releaseFirst != null, 12000, 25, 'first Codex request reached upstream');
   old.child.send({ type: 'release' });
   await old.wait('released');
   acceptor = next.child;
@@ -383,7 +392,10 @@ test('a Claude Code first turn on Codex after replacement boot stays on Codex th
   next.child.send({ type: 'takeover' }, listener);
   assert.match(await (await early).text(), /codex fixture/);
   await next.wait('primary');
+  releaseFirst();
+  assert.match(await (await pending).text(), /codex fixture/);
+  assert.match(await (await turn(port, 'claude', 'awaiting-first-byte')).text(), /codex fixture/);
   assert.match(await (await turn(port, 'claude')).text(), /codex fixture/);
   assert.match(await (await turn(port, 'claude', 'fresh-thread')).text(), /claude fixture/);
-  assert.deepEqual(hits, ['/v1/responses', '/v1/responses', '/v1/responses', '/v1/messages']);
+  assert.deepEqual(hits, [...Array(5).fill('/v1/responses'), '/v1/messages']);
 });

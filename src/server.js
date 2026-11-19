@@ -980,6 +980,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // this releasing worker.
   server.maxpoolBeginDrain = () => {
     draining = true;
+    accountManager.sessionProviderDrain = true;
     serveNativeCodex.beginDrain();
   };
 
@@ -1343,6 +1344,17 @@ async function forwardRequest(
     return;
   }
 
+  if (accountManager.beginSessionProviderAttempt?.(lease) === false) {
+    res.off('close', onClientClose);
+    accountManager.relinquishUpstreamProbe?.(lease);
+    accountManager.releaseAccount(lease, { neutral: true });
+    ctx.status = 503;
+    sendErrorResponse(res, requestInfo, 503, { type: 'error', error: {
+      type: 'restart_in_progress', message: 'Maxpool is handing off this session. Retry on the new worker.',
+    } }, { 'retry-after': '1' });
+    return;
+  }
+
   // Build upstream request headers
   const isOAuth = account.type === 'oauth';
   const headers = {};
@@ -1477,6 +1489,7 @@ async function forwardRequest(
       try {
         upRes = await fetch(linkUrl, { method: req.method, headers: linkHeaders, body: ['GET', 'HEAD'].includes(req.method) ? undefined : body, duplex: 'half', signal: linkCtl.signal });
       } finally { clearTimeout(linkTtfb); if (linkGraceTimer) clearTimeout(linkGraceTimer); }
+      if (upRes.status >= 300) accountManager.settleSessionProviderAttempt?.(lease);
       linkStatus = upRes.status;
       ctx.status = upRes.status;
       // The linked pool refused the request's SHAPE (not Claude Code). The cloud
@@ -1987,6 +2000,7 @@ async function forwardRequest(
           upstreamRes = await fetchUpstream();
         }
       }
+      if (upstreamRes.status >= 300) accountManager.settleSessionProviderAttempt?.(lease);
       if (openAI) upstreamRes = await fromOpenAIResponse(upstreamRes, {
         model: requestInfo.model, stream: requestInfo.stream, upstreamModel: openAIModel,
         upstreamEffort: openAIRequest.body.reasoning?.effort,
@@ -2013,6 +2027,7 @@ async function forwardRequest(
     // Log-only: no setting reads it.
     requestInfo._upstreamForwardStartAt = upstreamForwardStartAt;
     requestInfo._firstUpstreamByteAt = Date.now();
+    accountManager.settleSessionProviderAttempt?.(lease);
     // A 2xx answer: the conversation now lives on this account (never on a refusal).
     if (upstreamRes.status < 300) { accountManager.stampMovedFrom?.(requestInfo); accountManager.noteConversationServed?.(requestInfo, account); }
     // Response arrived — the pre-response leak window is over. Stop guarding for
