@@ -49,7 +49,7 @@ async function harness(fn) {
   let n = 0;
   const tag = `h${harness.count = (harness.count || 0) + 1}`;
   const upstream = http.createServer((req, res) => {
-    let raw = ''; req.on('data', c => { raw += c; });
+    req.resume();
     req.on('end', () => {
       n++;
       res.writeHead(200, { 'content-type': 'application/json' });
