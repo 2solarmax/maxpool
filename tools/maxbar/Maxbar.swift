@@ -1,10 +1,11 @@
 // Maxbar — menu-bar control for pmset disablesleep + auto-join iPhone hotspot
-// + lock-on-lid + Claude routing (Pool/Direct) toggle.
+// + lock-on-lid + Claude and Codex routing switches.
 // Pure AppKit (NSStatusItem) — no SwiftUI menu quirks. Build: ./build.sh
 import AppKit
 import ServiceManagement
 import CoreGraphics
 import UserNotifications
+import CoreWLAN
 
 let kLogPath = NSHomeDirectory() + "/Library/Logs/Maxbar.log"
 let kPrefsAutoJoin = "autoJoin"
@@ -12,7 +13,15 @@ let kPrefsLockOnLid = "lockOnLid"
 let kPrefsHotspotSSID = "hotspotSSID"
 let kPollSeconds = 15.0
 let kFastPollSeconds = 2.0
-let kOfflineChecksBeforeDial = 2   // ~30s without internet before dialing the phone
+let kOfflineChecksBeforeDial = 2        // ~30s without internet before dialing the phone
+let kOfflineChecksWhenAssociated = 4    // ~60s when Wi-Fi is still associated to SOME network
+                                        // (false-dial fix: transient probe failures at screen
+                                        // lock must not switch the Mac to the phone)
+let kHotspotLookbackChecks = 4          // on the phone: look for remembered Wi-Fi every ~60s
+let kWiFiTrialSeconds = 45.0            // a newly joined Wi-Fi must show internet within this
+let kWiFiCooldownSeconds = 600.0        // a Wi-Fi with no internet sits out 10 min, doubling
+let kWiFiCooldownMaxSeconds = 7200.0    // per repeat failure, capped at 2 h (car Wi-Fi etc.)
+let kDeadPhoneRedialChecks = 8          // on the phone with no internet: re-dial every ~2-4 min
 
 /// The hotspot name is per-user configuration, never compiled in.
 /// Set it in the menu ("Set hotspot name…"), or seed it on first launch with
@@ -32,6 +41,11 @@ func seedHotspotNameFromEnvOrArgs() {
     if !candidate.isEmpty {
         UserDefaults.standard.set(candidate, forKey: kPrefsHotspotSSID)
     }
+}
+
+/// The saved Personal Hotspot name ("" = not set yet).
+func hotspotName() -> String {
+    (UserDefaults.standard.string(forKey: kPrefsHotspotSSID) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 /// Wi-Fi device (usually en0) detected instead of assumed, so the app works
@@ -94,12 +108,47 @@ func sleepDisabled() -> Bool? {
     return line.hasSuffix("1")
 }
 
+/// Test switch to rehearse the screen-lock hiccup: makes both checks fail.
+/// `defaults write com.maxpool.maxbar simulateProbeFailureUntil -date "$(date -u -v+60S '+%Y-%m-%d %H:%M:%S +0000')"`
+/// It always expires (capped at 15 min from now) and the menu shows it while on.
+func simulatedOutageActive() -> Bool {
+    guard let until = UserDefaults.standard.object(forKey: "simulateProbeFailureUntil") as? Date else { return false }
+    return Date() < until && until.timeIntervalSinceNow <= 900
+}
+
 /// The Mac actually reaches the internet. Having a Wi-Fi address is not enough:
 /// a login-page network (airport, hotel) or a dead router still hands one out.
+/// Two real web checks from two companies (Apple, then Google) — either passing
+/// counts as online. One endpoint fails transiently (especially right after display
+/// sleep at screen lock), which used to make the app dial the phone over healthy
+/// Wi-Fi. Both are page fetches, not DNS lookups: a hotel login page answers DNS
+/// but serves its own page, and must still read as offline.
 func internetReachable() -> Bool {
+    if simulatedOutageActive() { return false }
     let (code, out) = run("/usr/bin/curl",
                           ["-s", "-m", "5", "http://captive.apple.com/hotspot-detect.html"], timeout: 8)
-    return code == 0 && out.contains("Success")
+    if code == 0 && out.contains("Success") { return true }
+    let (gCode, gOut) = run("/usr/bin/curl",
+                            ["-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}",
+                             "http://connectivitycheck.gstatic.com/generate_204"], timeout: 8)
+    return gCode == 0 && gOut == "204"
+}
+
+/// Wi-Fi is associated to SOME network (any SSID, ours or not). Used by the
+/// watchdog to tell "Wi-Fi link lost" (dial fast) from "link fine but probes
+/// failing" (wait longer — the network usually recovers on its own).
+/// NOTE: `networksetup -getairportnetwork` LIES on this Mac ("not associated"
+/// while fully connected) because macOS redacts Wi-Fi info without Location
+/// permission — the same redaction the README notes for SSID. `ipconfig
+/// getsummary` prints an SSID key (value redacted) only while associated.
+/// A failed or empty read counts as associated: when unsure, take the slower,
+/// safer path (wait longer) rather than dial the phone early.
+func wifiAssociated() -> Bool {
+    let (code, out) = run("/usr/sbin/ipconfig", ["getsummary", kWiFiDevice], timeout: 5)
+    if code != 0 || out.isEmpty { return true }
+    return out.split(separator: "\n").contains {
+        $0.trimmingCharacters(in: .whitespaces).hasPrefix("SSID :")   // not "BSSID :"
+    }
 }
 
 /// Session is currently showing the lock screen.
@@ -116,9 +165,87 @@ func onPhoneHotspot() -> Bool {
     return out.contains("gateway: 172.20.10.")
 }
 
+/// Which network the Mac is on, without its (hidden) name: default gateway + Wi-Fi
+/// channel. nil when there is no Wi-Fi link or no default route.
+func wifiLinkFingerprint() -> String? {
+    let (_, out) = run("/sbin/route", ["-n", "get", "default"], timeout: 5)
+    guard out.contains("interface: \(kWiFiDevice)"),
+          let gw = out.split(separator: "\n").first(where: { $0.contains("gateway:") })?
+              .split(separator: ":").last?.trimmingCharacters(in: .whitespaces),
+          let ch = CWWiFiClient.shared().interface()?.wlanChannel()
+    else { return nil }
+    return "\(gw)/\(ch.channelNumber)/\(ch.channelBand.rawValue)"
+}
+
 func wifiRadioOn() -> Bool {
     let (_, out) = run("/usr/sbin/networksetup", ["-getairportpower", kWiFiDevice], timeout: 5)
     return out.contains(": On")
+}
+
+/// Remembered Wi-Fi networks, highest priority first (the Wi-Fi menu's order),
+/// minus the phone hotspot. This list prints names even without Location permission.
+func preferredWiFiNetworks() -> [String] {
+    let phone = hotspotName()
+    let (_, out) = run("/usr/sbin/networksetup",
+                       ["-listpreferredwirelessnetworks", kWiFiDevice], timeout: 8)
+    return out.split(separator: "\n").dropFirst().compactMap { line in
+        let s = line.trimmingCharacters(in: .whitespaces)
+        // "DIRECT-" is the Wi-Fi Direct prefix (printers, cars): device links, never internet.
+        if s.isEmpty || s == phone || s.hasPrefix("DIRECT-") { return nil }
+        return s
+    }
+}
+
+/// Which remembered Wi-Fi networks are in range (best first), and which one we're on.
+/// Works with Location Services OFF: macOS hides names in scan results, but a scan
+/// ASKED FOR one name returns only that network — verified 2026-11-10 on this Mac
+/// (a home network → found, a made-up name → nothing). One real scan (~12s) refreshes
+/// macOS's scan cache; the by-name lookups then answer from it (~30ms each,
+/// 244 remembered networks ≈ 7s). Blocking: call off the main thread.
+/// The network we're on = the only in-range one on our radio channel (current name
+/// is hidden too); ambiguous or on the phone → nil.
+struct WiFiSurvey: Sendable {
+    let inRange: [String]
+    let current: String?
+}
+
+let kSurveyBudgetSeconds = 25.0   // locked-screen scans measured ~70s for all 244 names (2026-11-10)
+
+func surveyKnownWiFi(onPhone: Bool) -> WiFiSurvey {
+    guard let iface = CWWiFiClient.shared().interface() else { return WiFiSurvey(inRange: [], current: nil) }
+    _ = try? iface.scanForNetworks(withName: nil)
+    let mine = onPhone ? nil : iface.wlanChannel()
+    var inRange: [String] = []
+    var onMyChannel: [(name: String, rssiGap: Int)] = []
+    // Best-first, time-boxed: with the screen locked macOS scans far slower, so stop
+    // looking after the budget — the networks you use most are checked first.
+    let deadline = Date() + kSurveyBudgetSeconds
+    var cutShort = false
+    for name in preferredWiFiNetworks() {
+        if Date() > deadline { cutShort = true; break }
+        guard let hits = try? iface.scanForNetworks(withName: name), !hits.isEmpty else { continue }
+        inRange.append(name)
+        if let mine, let hit = hits.first(where: {
+            $0.wlanChannel?.channelNumber == mine.channelNumber && $0.wlanChannel?.channelBand == mine.channelBand
+        }) { onMyChannel.append((name, abs(hit.rssiValue - iface.rssiValue()))) }
+    }
+    // Two remembered networks on our channel: the one whose signal matches ours is us.
+    let ranked = onMyChannel.sorted { $0.rssiGap < $1.rssiGap }
+    // A search cut short may have skipped the network we're really on, so a lone
+    // match could be a neighbour on our channel — only trust it on a full search.
+    let current: String? = (ranked.count == 1 && !cutShort) || (ranked.count > 1 && ranked[1].rssiGap - ranked[0].rssiGap >= 10)
+        ? ranked.first?.name : nil
+    if cutShort { log("Wi-Fi search cut at \(Int(kSurveyBudgetSeconds))s after \(inRange.count) in-range match(es)") }
+    return WiFiSurvey(inRange: inRange, current: current)
+}
+
+/// Join a remembered network with its saved password. nil = joined.
+/// networksetup exits 0 even on failure and prints text only when the join failed;
+/// a join killed at the timeout exits non-zero with no text — that is a failure too.
+func joinWiFi(_ ssid: String) -> String? {
+    let (code, out) = run("/usr/sbin/networksetup", ["-setairportnetwork", kWiFiDevice, ssid], timeout: 40)
+    if code == 0 && out.isEmpty { return nil }
+    return out.isEmpty ? "join timed out (exit \(code))" : out
 }
 
 func setWifiRadio(_ on: Bool) {
@@ -194,6 +321,13 @@ func poolPrerequisiteProblem() -> String? {
     let (code, _) = run("/usr/bin/curl", ["-s", "-o", "/dev/null", "-m", "2", kPoolProxy + "/"], timeout: 4)
     if code == 7 || code == 28 { return "pool proxy not running on \(kPoolProxy)" }
     return nil
+}
+
+func changeCodexRouting(_ action: String) -> (Int32, String) {
+    guard let helper = Bundle.main.path(forResource: "codex-routing", ofType: "py") else {
+        return (1, "Codex routing helper is missing")
+    }
+    return run("/usr/bin/python3", [helper, action], timeout: 25)
 }
 
 /// Lid is physically closed (clamshell sensor).
@@ -333,7 +467,8 @@ func dialHotspot(ssid: String, restoreRadio: Bool) -> DialResult {
     // Right after a wake the phone's Wi-Fi can lag a few seconds: retry transient errors.
     var out = ""
     for attempt in 1...3 {
-        out = run("/usr/sbin/networksetup", args, timeout: 40).1
+        let (code, text) = run("/usr/sbin/networksetup", args, timeout: 40)
+        out = text.isEmpty && code != 0 ? "join timed out (exit \(code))" : text
         if out.isEmpty { return .joined }
         let transient = out.contains("Could not find network") || out.contains("-3900")
         guard transient, attempt < 3 else { break }
@@ -353,10 +488,35 @@ final class MaxbarController: NSObject, NSMenuDelegate {
     private var offlineChecks = 0       // consecutive polls without internet
     private var joinAttempts = 0
     private var lastError: String?
+    private var codexRoutingMode: String?
+    private var codexRoutingBusy = false
+    private var codexRoutingReadID: UUID?
     private var polling = false
     private var lidWasClosed = false
     private var checkingLid = false
     private var weKilledRadio = false   // we turned Wi-Fi off for lid-closed battery saving
+    private var hotspotOutageLogged = false  // one "not re-dialing" line per hotspot outage
+    private var hotspotOnlineChecks = 0      // polls on the phone with internet (Wi-Fi look-back pacing)
+    private var trialWiFi: (ssid: String, at: Date, fromPhone: Bool)?  // just joined; must show internet
+    private var wifiCooldown: [String: Date] = [:]          // Wi-Fi that had no internet → retry after
+    private var wifiFailures: [String: Int] = [:]           // repeat failures → longer cooldown
+    private var handJoined = false          // "Join hotspot now" chose the phone: stay until the Mac leaves it
+    private var offPhonePolls = 0           // consecutive polls off the phone (ends a hand-join)
+    private var outageSawAssociation = false  // Wi-Fi looked associated at any point this outage
+    private var onHotspotNow = false          // last poll's reading, for the menu text
+    private var returningToPhone = false      // left a working phone and lost the Wi-Fi: get back
+    private var benchedCurrent: String?   // the Wi-Fi we were on when it lost internet
+    // A closed lid weakens the Mac's Wi-Fi (the antennas sit in the display): the
+    // office Wi-Fi drops and every search comes up empty (seen 2026-11-14). Anything
+    // judged while the lid was closed is forgiven on open, and the open triggers an
+    // immediate look for remembered Wi-Fi instead of waiting for the next ~60s round.
+    private var benchedWhileLidClosed: Set<String> = []
+    private var lookForWiFiNow = false
+    // macOS joining a different Wi-Fi on its own mid-outage (seen 2026-11-14 11:04:
+    // the app then swapped it for the phone a minute later): a new link gets a fresh
+    // outage clock. Fingerprint = gateway + radio channel (names are hidden).
+    private var linkFingerprint: String?
+    private var outageClockReset = false   // once per outage, so constant hopping can't block the phone
 
     /// The user's Personal Hotspot name (UserDefaults; set from the menu).
     /// Empty = auto-join and manual join are inert until a name is set.
@@ -397,16 +557,19 @@ final class MaxbarController: NSObject, NSMenuDelegate {
             screenLockItem,
             .separator(),
             claudeRoutingItem, claudeNoteItem,
+            codexRoutingItem, codexNoteItem,
             .separator(),
             loginItem, quitItem,
         ].compactMap { $0 }
         // Without an explicit target the actions go up the responder chain and never reach us.
-        for item in [toggleSleepItem, setHotspotItem, autoJoinItem, joinNowItem, screenLockItem, claudeRoutingItem, loginItem, quitItem] {
+        for item in [toggleSleepItem, setHotspotItem, autoJoinItem, joinNowItem, screenLockItem, claudeRoutingItem, codexRoutingItem, loginItem, quitItem] {
             item.target = self
         }
         statusItem.menu = menu
         awake = sleepDisabled() ?? true
         renderMenu()
+        refreshCodexRouting()
+        if simulatedOutageActive() { log("TEST: simulated outage is ON (expires by itself)") }
         log("Maxbar started (sleep \(awake ? "off" : "normal"), auto-join \(autoJoin ? "on" : "off"), hotspot \"\(hotspot)\")")
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, err in
             log("Notification permission: \(granted ? "granted" : "denied")\(err.map { " (\($0.localizedDescription))" } ?? "")")
@@ -468,6 +631,15 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         let i = NSMenuItem(title: "Takes effect when the Claude app is next restarted", action: nil, keyEquivalent: "")
         i.isEnabled = false
         return i
+    }()
+
+    private lazy var codexRoutingItem = NSMenuItem(
+        title: "Codex routing: …", action: #selector(toggleCodexRouting), keyEquivalent: "")
+
+    private lazy var codexNoteItem: NSMenuItem = {
+        let item = NSMenuItem(title: "Restart Codex, then start a new chat", action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
     }()
 
     private lazy var loginItem = NSMenuItem(
@@ -548,6 +720,9 @@ final class MaxbarController: NSObject, NSMenuDelegate {
                 switch await offMain({ dialHotspot(ssid: ssid, restoreRadio: true) }) {
                 case .joined:
                     lastError = nil
+                    handJoined = true   // you chose the phone (owner 2026-11-10): no time limit
+                    trialWiFi = nil
+                    returningToPhone = false
                     log("Manual join OK (attempt \(attempt))")
                     notify("Joined \(ssid)", "Hotspot connected")
                     return
@@ -620,6 +795,40 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         }
     }
 
+    private func refreshCodexRouting() {
+        guard !codexRoutingBusy, codexRoutingReadID == nil else { return }
+        let readID = UUID()
+        codexRoutingReadID = readID
+        Task {
+            let (code, mode) = await offMain { changeCodexRouting("status") }
+            guard codexRoutingReadID == readID else { return }
+            codexRoutingReadID = nil
+            codexRoutingMode = code == 0 ? mode : nil
+            renderMenu()
+        }
+    }
+
+    @objc private func toggleCodexRouting() {
+        guard !codexRoutingBusy, let mode = codexRoutingMode else { return }
+        let action = mode == "Pool" ? "direct" : "pool"
+        codexRoutingReadID = nil
+        codexRoutingBusy = true
+        renderMenu()
+        Task {
+            let (code, result) = await offMain { changeCodexRouting(action) }
+            if code == 0 {
+                codexRoutingMode = result
+                lastError = nil
+                log("Codex routing set to \(result)")
+            } else {
+                lastError = "Codex routing: \(result.prefix(110))"
+                log("Codex routing change failed: \(result)")
+            }
+            codexRoutingBusy = false
+            renderMenu()
+        }
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
     }
@@ -638,7 +847,22 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         defer { checkingLid = false }
 
         let closed = await offMain { lidClosed() }
+        let wasClosed = lidWasClosed
         defer { lidWasClosed = closed }
+
+        if !closed, wasClosed {
+            if !benchedWhileLidClosed.isEmpty {
+                for ssid in benchedWhileLidClosed { wifiCooldown[ssid] = nil; wifiFailures[ssid] = nil }
+                log("Lid opened — giving \(benchedWhileLidClosed.sorted().joined(separator: ", ")) another chance")
+                benchedWhileLidClosed = []
+            }
+            lookForWiFiNow = true
+            // Let the radio re-hear the networks for a few seconds, then look.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(5))
+                await self?.poll()
+            }
+        }
 
         if closed, !lidWasClosed, lockOnLid, awake, !sessionLocked() {
             if externalDisplayActive() {
@@ -663,6 +887,99 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         }
     }
 
+    /// Bench a Wi-Fi that showed no internet: 10 min, doubling per repeat failure,
+    /// capped (a car Wi-Fi with no uplink stays in range for hours). A pass resets it.
+    private func bench(_ ssid: String, now: Date, why: String = "has no internet") {
+        let n = (wifiFailures[ssid] ?? 0) + 1
+        wifiFailures[ssid] = n
+        let secs = min(kWiFiCooldownSeconds * pow(2, Double(n - 1)), kWiFiCooldownMaxSeconds)
+        wifiCooldown[ssid] = now + secs
+        if lidWasClosed { benchedWhileLidClosed.insert(ssid) }
+        log("\(ssid) \(why) — not trying it again for \(Int(secs / 60)) min\(lidWasClosed ? " (or until the lid opens)" : "")")
+    }
+
+    /// Join the best remembered Wi-Fi in range, trying each candidate in order.
+    /// true = joined; the join then gets a trial period before the watchdog trusts it.
+    @discardableResult
+    private func tryKnownWiFi(reason: String, fromPhone: Bool, benchCurrent: Bool = false) async -> Bool {
+        let onPhone = fromPhone || onHotspotNow   // on the phone, our channel is the phone's
+        let survey = await offMain { surveyKnownWiFi(onPhone: onPhone) }
+        // The search takes up to ~25s; the internet may have come back meanwhile
+        // (seen 2026-11-10: a hiccup ended mid-search and the app still benched
+        // a healthy home Wi-Fi). Re-check before calling the Wi-Fi we're on dead.
+        if benchCurrent, await offMain({ internetReachable() }) {
+            log("Internet came back during the Wi-Fi search — staying put")
+            offlineChecks = 0
+            return false
+        }
+        // The Wi-Fi we're on just failed: bench it once so it isn't picked again.
+        if benchCurrent, let current = survey.current, wifiCooldown[current] == nil {
+            bench(current, now: Date())
+            benchedCurrent = current
+        }
+        let skip = Set(wifiCooldown.keys).union(survey.current.map { [$0] } ?? [])
+        for ssid in survey.inRange where !skip.contains(ssid) {
+            if manualJoining { return false }          // "Join now" started meanwhile
+            if let err = await offMain({ joinWiFi(ssid) }) {
+                log("Known Wi-Fi \(ssid) in range (\(reason)) but join failed: \(err.prefix(120))")
+                bench(ssid, now: Date(), why: "didn't join")
+                // A failed join can knock the Mac off the phone: make sure it gets back.
+                if fromPhone { returningToPhone = true }
+                continue
+            }
+            log("Joined known Wi-Fi \(ssid) (\(reason))")
+            benchedCurrent = nil    // we're moving on; that bench isn't ours to lift
+            trialWiFi = (ssid, Date(), fromPhone)
+            offlineChecks = 0
+            hotspotOnlineChecks = 0
+            lastError = nil
+            return true
+        }
+        return false
+    }
+
+    /// Watchdog dial of the phone. `onlyIfOffline`: every ordinary reason to dial is
+    /// "no internet", so confirm it right before waking the phone. The one exception
+    /// is getting off a stranger's iPhone, which has internet by definition.
+    private func dialPhone(onlyIfOffline: Bool = true) async {
+        guard !manualJoining else { return }    // "Join now" may have started during a survey
+        let ssid = hotspot
+        guard !ssid.isEmpty else { return }     // no hotspot name set: never dial
+        if onlyIfOffline, await offMain({ internetReachable() }) {
+            log("Internet is back — not dialing \(ssid)")
+            offlineChecks = 0
+            return
+        }
+        let restoreRadio = awake    // re-enable a switched-off radio only when unattended
+        switch await offMain({ dialHotspot(ssid: ssid, restoreRadio: restoreRadio) }) {
+        case .joined:
+            log("Joined \(ssid) after \(joinAttempts + 1) attempt(s)")
+            benchedCurrent = nil
+            joinAttempts = 0
+            offlineChecks = 0       // give the new link time before re-dialing
+            lastError = nil
+        case .radioRestored:
+            log("Wi-Fi radio was off — turned it back on")
+            lastError = nil
+        case .radioOff:
+            lastError = "Wi-Fi is switched off"
+        case .failed(let why):
+            joinAttempts += 1
+            if joinAttempts % 4 == 1 { log("Join attempt \(joinAttempts) failed: \(why.prefix(120))") }
+            lastError = why
+            // Every 8 failed tries, cycle the radio: airportd's scan can go stale
+            // exactly when an idle iPhone hotspot half-wakes.
+            if joinAttempts % 8 == 0, await offMain({ wifiRadioOn() }) {
+                log("Still unreachable after \(joinAttempts) tries — cycling Wi-Fi radio for a fresh scan")
+                await offMain {
+                    setWifiRadio(false)
+                    Thread.sleep(forTimeInterval: 2)
+                    setWifiRadio(true)
+                }
+            }
+        }
+    }
+
     /// Poll world state, drive the watchdog, refresh the icon.
     func poll() async {
         guard !polling else { return }
@@ -678,47 +995,118 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         if prevAwake != awake { log("pmset state changed: \(awake ? "awake (sleepoff)" : "normal (sleepon)")") }
         if prevOnline != online { log(online ? "Internet back" : "Internet lost") }
 
-        // Watchdog: no internet for a couple of checks + autoJoin on + a hotspot
-        // name configured -> dial the phone. A Wi-Fi radio that was switched off
-        // is only switched back on in sleep-off mode (unattended); otherwise
-        // switching it off is the user's call.
+        // Watchdog. Order of preference: the Wi-Fi we're on → any other remembered
+        // Wi-Fi in range → the phone (last resort, stay-awake mode only). While on a
+        // phone link — however it got there (the app, macOS's own auto-join, an app
+        // restart) — a remembered Wi-Fi in range wins (owner 2026-11-10). Only a phone
+        // you joined with "Join hotspot now" is left alone until the Mac leaves it.
+        let onHotspot = await offMain { onPhoneHotspot() }
+        onHotspotNow = onHotspot
+        let fingerprint = await offMain { wifiLinkFingerprint() }
+        defer { linkFingerprint = fingerprint }
+        // A hand-join lasts until the Mac is off the phone (two readings in a row, so one
+        // failed route lookup doesn't end it); a later rejoin by macOS isn't your choice.
+        offPhonePolls = onHotspot ? 0 : offPhonePolls + 1
+        if offPhonePolls >= 2 { handJoined = false }
+        if onHotspot || online { returningToPhone = false }
+        let now = Date()
+        wifiCooldown = wifiCooldown.filter { $0.value > now }
+        var dialNow = false
+
+        // Just switched to a Wi-Fi network: it must show internet within ~45s.
+        if let trial = trialWiFi {
+            if online && !onHotspot {
+                log("\(trial.ssid): internet OK")
+                wifiFailures[trial.ssid] = nil
+                trialWiFi = nil
+            } else if onHotspot {
+                // A phone gateway right after joining a Wi-Fi: either macOS fell back to
+                // your hotspot, or that "Wi-Fi" was someone else's iPhone (every iPhone hotspot
+                // uses the same 172.20.10.x gateway, so the two can't be told apart). Either way:
+                // bench it (backoff stops repeats) and dial your hotspot explicitly — a harmless
+                // rejoin if we're already on it, and off a stranger's phone if not.
+                bench(trial.ssid, now: now, why: "led to a phone hotspot")
+                trialWiFi = nil
+                if autoJoin { await dialPhone(onlyIfOffline: false) }
+                renderMenu()
+                return
+            } else if now.timeIntervalSince(trial.at) >= kWiFiTrialSeconds {
+                bench(trial.ssid, now: now)
+                trialWiFi = nil
+                if trial.fromPhone {
+                    // We left a working phone for it: go back, whatever the mode,
+                    // and keep trying until we're on it (one dial can fail).
+                    returningToPhone = true
+                    if autoJoin, !manualJoining { await dialPhone() }
+                    renderMenu()
+                    return
+                }
+                dialNow = true
+            }
+        }
+
         if online {
             offlineChecks = 0
             joinAttempts = 0
+            hotspotOutageLogged = false
+            outageSawAssociation = false
+            outageClockReset = false
             lastError = nil
-        } else {
-            offlineChecks += 1
-            // Don't dial from the watchdog while a manual "Join now" burst runs —
-            // two joiners fight and the radio cycle can kill the manual attempt.
-            let ssid = hotspot
-            if !manualJoining, !ssid.isEmpty, autoJoin && awake && offlineChecks >= kOfflineChecksBeforeDial {
-                let restoreRadio = awake
-                switch await offMain({ dialHotspot(ssid: ssid, restoreRadio: restoreRadio) }) {
-                case .joined:
-                    log("Joined \(ssid) after \(joinAttempts + 1) attempt(s)")
-                    joinAttempts = 0
-                    offlineChecks = 0       // give the new link time before re-dialing
-                    lastError = nil
-                case .radioRestored:
-                    log("Wi-Fi radio was off — turned it back on")
-                    lastError = nil
-                case .radioOff:
-                    lastError = "Wi-Fi is switched off"
-                case .failed(let why):
-                    joinAttempts += 1
-                    if joinAttempts % 4 == 1 { log("Join attempt \(joinAttempts) failed: \(why.prefix(120))") }
-                    lastError = why
-                    // Every ~2 min of failures, cycle the radio: airportd's scan
-                    // can go stale exactly when an idle iPhone hotspot half-wakes.
-                    if joinAttempts % 8 == 0, await offMain({ wifiRadioOn() }) {
-                        log("Still unreachable after \(joinAttempts) tries — cycling Wi-Fi radio for a fresh scan")
-                        await offMain {
-                            setWifiRadio(false)
-                            Thread.sleep(forTimeInterval: 2)
-                            setWifiRadio(true)
-                        }
-                    }
+            // Back online off the phone: the Wi-Fi we benched at the outage works again.
+            if !onHotspot, let b = benchedCurrent {
+                wifiFailures[b] = nil
+                wifiCooldown[b] = nil
+                benchedCurrent = nil
+            }
+            // On the phone with internet: every ~60s look for Wi-Fi (not while a hand-join is fresh).
+            if onHotspot, !handJoined, autoJoin, !manualJoining, trialWiFi == nil {
+                hotspotOnlineChecks += 1
+                if lookForWiFiNow || hotspotOnlineChecks % kHotspotLookbackChecks == 0 {
+                    lookForWiFiNow = false
+                    await tryKnownWiFi(reason: "leaving the phone", fromPhone: true)
                 }
+            } else {
+                hotspotOnlineChecks = 0
+            }
+            if !onHotspot { lookForWiFiNow = false }
+        } else if trialWiFi == nil {
+            offlineChecks += 1
+            // macOS moved to a different network on its own: give it the full wait
+            // before judging it, instead of the clock left over from the old one.
+            if !onHotspot, !outageClockReset, let prev = linkFingerprint, let cur = fingerprint, prev != cur {
+                log("macOS switched to another Wi-Fi during the outage — giving it time")
+                offlineChecks = 1
+                outageClockReset = true
+            }
+            // Wi-Fi associated at ANY point this outage means the link was up and the
+            // probes were failing transiently (typically right after screen lock) —
+            // demand a longer outage before switching away. Sticky per outage: one
+            // momentary "disconnected" reading must not bring back the 30s dial.
+            let associated = await offMain { wifiAssociated() }
+            if associated { outageSawAssociation = true }
+            if offlineChecks == 1 {
+                log("No internet — Wi-Fi link \(associated ? "connected" : "disconnected")\(onHotspot ? ", on \(hotspot)" : "")")
+            }
+            let threshold = outageSawAssociation ? kOfflineChecksWhenAssociated : kOfflineChecksBeforeDial
+            let due = dialNow || offlineChecks >= threshold || (onHotspot && lookForWiFiNow)
+            if onHotspot { lookForWiFiNow = false }
+            if onHotspot {
+                if !hotspotOutageLogged {
+                    log("On phone hotspot with no internet — looking for Wi-Fi, re-dialing the phone every ~2 min")
+                    hotspotOutageLogged = true
+                }
+                if due, autoJoin, !manualJoining {
+                    // Hand-joined: you chose the phone, so only re-dial it, never swap it for Wi-Fi.
+                    if !handJoined, await tryKnownWiFi(reason: "phone has no internet", fromPhone: false) { renderMenu(); return }
+                    if awake, offlineChecks % kDeadPhoneRedialChecks == 0 { await dialPhone() }
+                }
+            } else if returningToPhone, autoJoin, !manualJoining {
+                await dialPhone()   // whatever the mode: we're the ones who left the phone
+            } else if due, !manualJoining, autoJoin {
+                if await tryKnownWiFi(reason: "internet lost", fromPhone: false, benchCurrent: true) { renderMenu(); return }
+                guard offlineChecks > 0 else { renderMenu(); return }   // internet came back: stay put
+                guard awake else { renderMenu(); return }   // phone only in stay-awake mode
+                await dialPhone()
             }
         }
         renderMenu()
@@ -742,13 +1130,18 @@ final class MaxbarController: NSObject, NSMenuDelegate {
             wifiStatusItem.title = "Hotspot name not set — use Set hotspot name…"
         } else if online {
             wifiStatusItem.title = "Internet: connected"
-        } else if !awake {
-            wifiStatusItem.title = "No internet (dials only in stay-awake mode)"
-        } else if offlineChecks < kOfflineChecksBeforeDial {
+        } else if let trial = trialWiFi {
+            wifiStatusItem.title = "Trying \(trial.ssid)…"
+        } else if onHotspotNow {
+            wifiStatusItem.title = "No internet on \(ssid)"
+        } else if offlineChecks < (outageSawAssociation ? kOfflineChecksWhenAssociated : kOfflineChecksBeforeDial) {
             wifiStatusItem.title = "Internet: checking…"
+        } else if !awake {
+            wifiStatusItem.title = "No internet (phone only in stay-awake mode)"
         } else {
             wifiStatusItem.title = "No internet — dialing \(ssid) (attempt \(joinAttempts + 1))"
         }
+        if simulatedOutageActive() { wifiStatusItem.title = "⚠ TEST: simulated outage on — " + wifiStatusItem.title }
         errorItem.isHidden = lastError == nil
         if let err = lastError { errorItem.title = "! \(err)" }
         screenLockItem.state = lockOnLid ? .on : .off
@@ -757,6 +1150,12 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         case .some(false): claudeRoutingItem.title = "Claude routing: Direct (click for Pool)"
         case .none:        claudeRoutingItem.title = "Claude routing: settings unreadable"
         }
+        codexRoutingItem.isEnabled = codexRoutingMode != nil && !codexRoutingBusy
+        switch codexRoutingMode {
+        case "Pool":   codexRoutingItem.title = "Codex routing: Pool (click for Direct)"
+        case "Direct": codexRoutingItem.title = "Codex routing: Direct (click for Pool)"
+        default:       codexRoutingItem.title = codexRoutingReadID != nil ? "Checking Codex routing…" : "Codex routing unavailable"
+        }
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
@@ -764,6 +1163,7 @@ final class MaxbarController: NSObject, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         awake = sleepDisabled() ?? awake
+        refreshCodexRouting()
         renderMenu()
     }
 }
@@ -772,6 +1172,39 @@ final class MaxbarController: NSObject, NSMenuDelegate {
 enum MaxbarApp {
     static func main() {
         seedHotspotNameFromEnvOrArgs()
+        // Setup hook: `Maxbar --register-login` turns on "Launch at Login" and runs normally.
+        if CommandLine.arguments.contains("--register-login") {
+            do { try SMAppService.mainApp.register(); log("Launch at login enabled via setup flag") }
+            catch { log("Launch at login flag failed: \(error.localizedDescription)") }
+        }
+        // Diagnostic: `Maxbar --survey` prints what the Wi-Fi survey sees and exits.
+        if CommandLine.arguments.contains("--survey") {
+            let t0 = Date()
+            let s = surveyKnownWiFi(onPhone: onPhoneHotspot())
+            print("in range (best first): \(s.inRange)")
+            print("on now: \(s.current ?? "unknown")")
+            print(String(format: "took %.1fs", Date().timeIntervalSince(t0)))
+            return
+        }
+        // Diagnostic: `Maxbar --join-phone` wakes the phone over Bluetooth and joins
+        // your hotspot with the same code the watchdog uses (a test of switch-back from the phone).
+        if CommandLine.arguments.contains("--join-phone") {
+            // Off the main thread with the main run loop alive, as in the running app
+            // (the Bluetooth wake may deliver its callback on the main queue).
+            let ssid = hotspotName()
+            guard !ssid.isEmpty else { print("no hotspot name set"); return }
+            DispatchQueue.global().async {
+                switch dialHotspot(ssid: ssid, restoreRadio: false) {
+                case .joined: print("joined \(ssid)")
+                case .failed(let why): print("failed: \(why)")
+                case .radioOff: print("Wi-Fi radio is off")
+                case .radioRestored: print("Wi-Fi radio was off")
+                }
+                exit(0)
+            }
+            RunLoop.main.run()
+            return
+        }
         let app = NSApplication.shared
         let controller = MaxbarController()   // strong ref for the app lifetime
         app.run()
