@@ -1,10 +1,11 @@
+/* global Response */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { toOpenAIRequest } from '../src/openai-responses.js';
+import { fetchBoundedOpenAIResponse, fromOpenAIResponse, toOpenAIRequest } from '../src/openai-responses.js';
 
 const searchRequest = {
   model: 'claude-sonnet-5-5',
@@ -37,6 +38,11 @@ test('hosted search maps filters, location, explicit choice and search budget by
   assert.equal(bounded.boundedSearch.maxUses, 1);
   assert.equal(bounded.boundedSearch.directQuery, 'IANA reserved example domains');
   assert.deepEqual(bounded.boundedSearch.settings.filters, { allowed_domains: ['iana.org'] });
+
+  const extended = { ...request, tools: [{ ...search, max_uses: 100 }] };
+  for (const [priorSearches, maximum] of [[0, 32], [90, 10], [100, 0]]) {
+    assert.equal(toOpenAIRequest(extended, 'gpt-6.2-sol', { native: true, priorSearches }).boundedSearch.maxUses, maximum);
+  }
 
   const fn = toOpenAIRequest({ ...searchRequest, tools: [{ name: 'WebFetch', input_schema: { type: 'object' } }],
     tool_choice: { type: 'tool', name: 'WebFetch' } }, 'gpt-6.2-sol', { native: true });
@@ -192,4 +198,50 @@ test('native standalone search enforces the request cap and domain exclusions', 
   assert.ok(unavailable.status >= 400);
   assert.match((await unavailable.json()).error.message, /standalone web search is unavailable/);
   assert.equal(searches.length, 3, 'a failed standalone search must not fall back to an unfiltered search');
+});
+
+test('a blocked-domain search without max_uses stops even when the model keeps asking', async () => {
+  const request = toOpenAIRequest({
+    ...searchRequest, system: 'Search for the requested facts.',
+    tools: [{ ...searchRequest.tools[0], blocked_domains: ['iana.org'] }],
+  }, 'gpt-6.2-sol', { native: true });
+  let searchCalls = 0;
+  let planningRounds = 0;
+  const bounded = await fetchBoundedOpenAIResponse(request, {
+    budget: { used: 0, results: new Map() },
+    async fetchSearch({ settings }) {
+      searchCalls++;
+      assert.deepEqual(settings.filters, { blocked_domains: ['iana.org'] });
+      return Response.json({ output: 'Example result', results: [] });
+    },
+    async fetchResponses(body) {
+      const tool = body.tools?.find(tool => tool.name === 'maxpool_tool_hosted_web_search');
+      const events = [{ type: 'response.created', response: { id: 'resp_safety_fixture', model: body.model } }];
+      if (tool) {
+        planningRounds++;
+        assert.ok(planningRounds <= 32, 'the model kept receiving the search tool after the safety cap');
+        const queries = planningRounds === 32 ? 2 : 1;
+        for (let index = 0; index < queries; index++) {
+          const id = `${planningRounds}_${index}`;
+          events.push({ type: 'response.output_item.done', output_index: index, item: {
+            type: 'function_call', id: 'fc_' + id, name: tool.name, call_id: 'call_' + id,
+            arguments: JSON.stringify({ query: 'reserved domains ' + id }),
+          } });
+        }
+      } else {
+        events.push({ type: 'response.output_text.delta', item_id: 'final', delta: 'Summary of available results.' });
+      }
+      events.push({ type: 'response.completed', response: {} });
+      return new Response(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join(''), {
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    },
+  });
+  const response = await fromOpenAIResponse(bounded, { ...request, model: searchRequest.model, stream: false });
+  const message = await response.json();
+  assert.equal(searchCalls, 32);
+  assert.equal(planningRounds, 32);
+  assert.equal(message.content.find(block => block.content?.error_code)?.content.error_code, 'max_uses_exceeded');
+  assert.equal(message.content.at(-1).text, 'Summary of available results.');
+  assert.equal(message.stop_reason, 'end_turn');
 });

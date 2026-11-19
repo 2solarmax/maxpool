@@ -10,6 +10,7 @@ const blocks = value => Array.isArray(value) ? value : [{ type: 'text', text: va
 const omitted = new Set(['thinking', 'redacted_thinking', 'cache_creation']);
 const explicitEfforts = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 const searchVersions = new Set(['web_search_20250305', 'web_search_20260209', 'web_search_20260318']);
+const MAX_STANDALONE_SEARCHES_PER_REQUEST = 32;
 const searchFunction = {
   type: 'function',
   name: 'maxpool_tool_hosted_web_search',
@@ -43,7 +44,6 @@ function hostedWebSearch(tools, native) {
   if (allowed) tool.filters = { allowed_domains: allowed };
   if (search.user_location) tool.user_location = search.user_location;
   const bounded = native && (search.max_uses || blocked) ? {
-    maxUses: search.max_uses ?? Infinity,
     settings: { ...tool, allowed_callers: ['direct'] },
   } : null;
   if (bounded) {
@@ -185,9 +185,13 @@ export function toOpenAIRequest(json, model, { native = false, priorSearches = w
     }
   }
   if (json.tool_choice?.disable_parallel_tool_use) body.parallel_tool_calls = false;
+  // The OpenAI-hosted tool isn't used here. The proxy can make multiple Responses
+  // requests to plan searches, so give every incoming request a finite budget.
+  const turnRemaining = webSearch?.maxUses == null ? MAX_STANDALONE_SEARCHES_PER_REQUEST
+    : Math.max(0, webSearch.maxUses - priorSearches);
   const boundedSearch = webSearch?.bounded && body.tool_choice !== 'none' ? {
     ...webSearch.bounded,
-    maxUses: Math.max(0, webSearch.bounded.maxUses - priorSearches),
+    maxUses: Math.min(MAX_STANDALONE_SEARCHES_PER_REQUEST, turnRemaining),
     directQuery: claudeSearchQuery(json, instructions),
   } : null;
   return { body, toolNames, webSearch: webSearch?.name, boundedSearch };
@@ -391,6 +395,9 @@ export async function fetchBoundedOpenAIResponse({ body, boundedSearch }, { fetc
     }
     planningUsage = combineUsage(planningUsage, completed?.response?.usage);
     next = afterSearch(next, history, remaining > 0);
+    if (remaining <= 0) {
+      next.instructions += '\n\nThe web search limit has been reached. Answer using the available results.';
+    }
   }
 }
 
