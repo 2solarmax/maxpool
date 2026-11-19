@@ -1,10 +1,12 @@
-import { readFile, writeFile, mkdir, rename, chmod, unlink } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, chmod, unlink, lstat, realpath, readdir, rmdir } from 'node:fs/promises';
 import { DEFAULT_PEAK_PROVIDERS, mergePeakDefaults } from './peak-window.js';
 import { existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { copyFile } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
+import { setTimeout as delay } from 'node:timers/promises';
 import { SCHEMA_VERSION as CAPACITY_SCHEMA_VERSION } from './capacity-ledger.js';
 
 export function getConfigPath() {
@@ -183,8 +185,7 @@ export function createDefaultConfig() {
   };
 }
 
-export async function loadConfig() {
-  const path = getConfigPath();
+export async function loadConfig(path = getConfigPath()) {
   let raw;
   try {
     raw = await readFile(path, 'utf-8');
@@ -257,8 +258,8 @@ async function atomicWrite(path, content) {
   }
 }
 
-export async function saveConfig(config) {
-  await atomicWrite(getConfigPath(), JSON.stringify(config, null, 2) + '\n');
+export async function saveConfig(config, path = getConfigPath()) {
+  await atomicWrite(path, JSON.stringify(config, null, 2) + '\n');
 }
 
 /** Load runtime state (regenerable). Returns null if missing or unreadable —
@@ -374,11 +375,89 @@ let _configWriteChain = Promise.resolve();
  *  token can't be left unwritten when the new worker boots from disk (M3). */
 export const flushConfigWrites = () => _configWriteChain;
 
+const CONFIG_LOCK_TIMEOUT_MS = 5000;
+
+async function canonicalConfigPath() {
+  const configured = getConfigPath();
+  await mkdir(dirname(configured), { recursive: true });
+  const path = join(await realpath(dirname(configured)), basename(configured));
+  try { return await realpath(path); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    // A new file has no realpath yet. A broken symlink is different: do not
+    // replace the symlink or take a different lock from its eventual target.
+    const entry = await lstat(path).catch(missing => {
+      if (missing.code !== 'ENOENT') throw missing;
+    });
+    if (entry?.isSymbolicLink()) throw error;
+    return path;
+  }
+}
+
+async function removeConfigLockOwner(directory, marker) {
+  await unlink(join(directory, marker)).catch(error => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+  await rmdir(directory).catch(error => {
+    // A contender may already have replaced the empty directory with its
+    // own nonempty one. The unique marker above never removes its owner.
+    if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
+  });
+}
+
+async function clearDeadConfigWriter(directory) {
+  const entries = await readdir(directory).catch(error => {
+    if (error.code !== 'ENOENT') throw error;
+    return null;
+  });
+  if (!entries) return;
+  const marker = entries.length === 1 ? entries[0] : '';
+  const pid = /^([1-9]\d*)-[a-f0-9]{12}$/.exec(marker)?.[1];
+  if (!pid) return;
+  try {
+    process.kill(Number(pid), 0);
+  } catch (error) {
+    // Lack of permission or a reused live PID cannot establish death.
+    if (error.code === 'ESRCH') await removeConfigLockOwner(directory, marker);
+  }
+}
+
+async function withConfigWriteLock(path, update) {
+  const directory = path + '.write-lock';
+  const marker = `${process.pid}-${randomBytes(6).toString('hex')}`;
+  const candidate = `${directory}.${marker}`;
+  await mkdir(candidate, { mode: 0o700 });
+  let held = false;
+  try {
+    await writeFile(join(candidate, marker), '', { mode: 0o600, flag: 'wx' });
+    const until = performance.now() + CONFIG_LOCK_TIMEOUT_MS;
+    for (;;) {
+      try {
+        // Rename an already nonempty directory. Unlike a separately created
+        // lock and owner record, observers can never see a half-acquired lock.
+        await rename(candidate, directory);
+        held = true;
+        break;
+      } catch (error) {
+        if (!['ENOTEMPTY', 'EEXIST', 'EPERM'].includes(error.code)) throw error;
+        await clearDeadConfigWriter(directory);
+        if (performance.now() >= until) {
+          throw Object.assign(new Error('Another MaxPool process is updating this config. Try again.'), { code: 'CONFIG_BUSY' });
+        }
+        await delay(25);
+      }
+    }
+    return await update();
+  } finally {
+    await removeConfigLockOwner(held ? directory : candidate, marker).catch(error => {
+      console.error('[Maxpool] Could not release the config write lock:', error.code || error.message);
+    });
+  }
+}
+
 /**
- * Serialize an in-process read-modify-write of the config so concurrent updates
- * cannot lose each other's writes — e.g. a background OAuth token refresh
- * (fire-and-forget) racing a TUI account add/delete. Each update re-reads the
- * latest config, applies updater(config), then saves atomically.
+ * Serialize the config read-modify-write across processes, including local
+ * Codex login and its running worker's OAuth token persistence. Re-read the
+ * latest config inside the lock, apply updater(config), then save atomically.
  *
  * Defense-in-depth single-writer guard: the config carries a monotonic
  * `_generation`. If `guardGeneration` is supplied and the on-disk generation is
@@ -386,28 +465,27 @@ export const flushConfigWrites = () => _configWriteChain;
  * current writer). The updater additionally receives the on-disk generation as
  * `config._generation` so a refresh updater can SKIP a token rotation it sees a
  * fresher writer already performed. The generation is bumped on every write.
- *
- * NOTE: this serializes writes within THIS process only. A separate
- * `maxpool import`/`login` process writing concurrently is not coordinated
- * (that would require a lockfile) — but those are short, rare, human-driven.
  */
 export function atomicConfigUpdate(updater, { guardGeneration = null } = {}) {
   const run = async () => {
-    const config = await loadConfig() || createDefaultConfig();
-    const onDisk = Number(config._generation) || 0;
-    if (guardGeneration != null && onDisk > guardGeneration) {
-      // Refuse: a newer writer already advanced the config. Surface the live
-      // config so the caller can reconcile, but write nothing.
-      const refused = new Error('config generation advanced; stale write refused');
-      refused.code = 'STALE_GENERATION';
-      refused.onDiskGeneration = onDisk;
-      refused.config = config;
-      throw refused;
-    }
-    const result = await updater(config);
-    config._generation = onDisk + 1;
-    await saveConfig(config);
-    return result === undefined ? config : result;
+    const path = await canonicalConfigPath();
+    return withConfigWriteLock(path, async () => {
+      const config = await loadConfig(path) || createDefaultConfig();
+      const onDisk = Number(config._generation) || 0;
+      if (guardGeneration != null && onDisk > guardGeneration) {
+        // Refuse: a newer writer already advanced the config. Surface the live
+        // config so the caller can reconcile, but write nothing.
+        const refused = new Error('config generation advanced; stale write refused');
+        refused.code = 'STALE_GENERATION';
+        refused.onDiskGeneration = onDisk;
+        refused.config = config;
+        throw refused;
+      }
+      const result = await updater(config);
+      config._generation = onDisk + 1;
+      await saveConfig(config, path);
+      return result === undefined ? config : result;
+    });
   };
   // Run after any in-flight update regardless of whether it resolved or
   // rejected, so one failure doesn't poison the chain; the caller still sees
