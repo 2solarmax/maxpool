@@ -4,7 +4,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
+import { validCodexCatalog } from './codex-model-routing.js';
 import { sameAccountIdentity } from './oauth.js';
+import { checkForUpdate, compareVersions } from './updater.js';
 
 const AUTHORIZATION_URL = 'https://auth.openai.com/oauth/authorize';
 const TOKEN_URL = 'https://auth.openai.com/oauth/token';
@@ -17,10 +19,23 @@ const TERMINAL_REFRESH_ERRORS = new Set(['invalid_grant', 'invalid_refresh_token
 const NATIVE_BACKEND = 'https://chatgpt.com/backend-api/codex';
 export const NATIVE_CODEX_RESPONSES_URL = `${NATIVE_BACKEND}/responses`;
 
-// The upstream catalog is versioned by Codex client, even when no Codex binary is
-// used to send inference requests. This revision was verified with the models
-// published on 2026-11-19. Keep it real so subsequent responses are comparable.
-const VERIFIED_CODEX_VERSION = '0.169.1';
+const VERIFIED_CODEX_VERSION = '0.170.0';
+const STABLE_CODEX_VERSION = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/;
+const versionChecks = new WeakMap();
+
+function codexCatalogVersion(fetchImpl) {
+  const previous = versionChecks.get(fetchImpl);
+  if (previous && Date.now() < previous.expiresAt) return previous.pending;
+  const check = { version: previous?.version ?? VERIFIED_CODEX_VERSION, expiresAt: Date.now() + 60 * 60_000 };
+  // OpenAI serves different catalogs by client version. Read the published stable
+  // version without passing any plan credentials to the release registry.
+  check.pending = checkForUpdate(check.version, { packageName: '@openai/codex', timeoutMs: 1800, fetchImpl }).then(update => {
+    if (update?.hasUpdate && STABLE_CODEX_VERSION.test(update.latest)) check.version = update.latest;
+    return check.version;
+  });
+  versionChecks.set(fetchImpl, check);
+  return check.pending;
+}
 
 function jwtClaims(token) {
   if (typeof token !== 'string' || token.split('.').length !== 3) return {};
@@ -240,14 +255,20 @@ function normalizeModel(model) {
 export async function listNativeCodexModels(account, { etag, fetchImpl = fetch } = {}) {
   const identity = nativeCodexHeaders(account);
   if (!identity) throw new Error('Native Codex catalog requires account credentials');
-  const url = `${NATIVE_BACKEND}/models?client_version=${VERIFIED_CODEX_VERSION}`;
-  const headers = { ...identity, accept: 'application/json', ...(etag ? { 'if-none-match': etag } : {}) };
+  const publishedVersion = await codexCatalogVersion(fetchImpl);
+  const previousVersion = account.quota?.codexCatalogVersion;
+  const version = STABLE_CODEX_VERSION.test(previousVersion) && compareVersions(previousVersion, publishedVersion) > 0
+    ? previousVersion : publishedVersion;
+  const url = `${NATIVE_BACKEND}/models?client_version=${version}`;
+  const conditionalEtag = previousVersion === version ? etag : null;
+  const headers = { ...identity, accept: 'application/json', ...(conditionalEtag ? { 'if-none-match': conditionalEtag } : {}) };
   const response = await fetchImpl(url, { headers, redirect: 'error', signal: AbortSignal.timeout(15_000) });
-  if (response.status === 304 && etag) return { models: null, etag, notModified: true };
+  if (response.status === 304 && conditionalEtag) return { models: null, etag, version, notModified: true };
   if (!response.ok) {
     throw Object.assign(new Error(`Could not read the native Codex model catalog (HTTP ${response.status})`), { status: response.status });
   }
   const data = await response.json();
-  if (!Array.isArray(data?.models)) throw new Error('Native Codex returned an invalid model catalog');
-  return { models: data.models.map(normalizeModel).filter(Boolean), etag: response.headers.get('etag'), notModified: false };
+  const models = Array.isArray(data?.models) ? data.models.map(normalizeModel).filter(Boolean) : null;
+  if (!validCodexCatalog(models)) throw new Error('Native Codex returned an invalid model catalog');
+  return { models, etag: response.headers.get('etag'), version, notModified: false };
 }

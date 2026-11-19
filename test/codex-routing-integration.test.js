@@ -127,13 +127,14 @@ test('Codex quota sweep refreshes ETag catalog without trying Anthropic endpoint
     codexCatalogFn: async (_account, { etag }) => {
       assert.equal(etag, 'prior');
       catalogCalls++;
-      return { models: [model('gpt-6.3-sol')], etag: 'new' };
+      return { models: [model('gpt-6.3-sol')], etag: 'new', version: '0.200.0' };
     },
   });
   await prober.probeAll();
   await prober.probeAll();
   assert.equal(catalogCalls, 1);
   assert.equal(original.quota.codexCatalogEtag, 'new');
+  assert.equal(original.quota.codexCatalogVersion, '0.200.0');
   assert.equal(original.quota.codexResetCredits.available, 3);
   assert.equal(codexModelFor({ model: 'claude-sonnet-5-2' }, original), 'gpt-6.3-sol');
 });

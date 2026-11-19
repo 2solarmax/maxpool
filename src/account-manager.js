@@ -423,7 +423,8 @@ const PERSISTED_QUOTA_FIELDS = [
   // drops until the next probe sweep re-learns it. The probe still rewrites it on
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
-  'providerQuotaSource', 'lastProbeOkAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel',
+  'providerQuotaSource', 'lastProbeOkAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogVersion',
+  'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel',
 ];
 
 /** The sticky busy-wait budget actually in force, and where it comes from — ONE resolver

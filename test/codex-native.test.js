@@ -78,30 +78,56 @@ test('native refresh keeps an unrotated refresh grant and rejects a different wo
 });
 
 test('catalog reads the per-account native ETag and preserves supported model capabilities', async () => {
-  const actual = await listNativeCodexModels(account(), { fetchImpl: async (url, init) => {
+  let releaseChecks = 0;
+  const fetchImpl = async (url, init) => {
+    if (new URL(url).host === 'registry.npmjs.org') {
+      assert.equal(url, 'https://registry.npmjs.org/%40openai%2Fcodex/latest');
+      assert.equal(init.headers, undefined);
+      releaseChecks++;
+      return json({ version: '0.200.0' });
+    }
     assert.equal(new URL(url).pathname, '/backend-api/codex/models');
-    assert.match(url, /client_version=\d/);
+    assert.equal(new URL(url).searchParams.get('client_version'), '0.200.0');
     assert.equal(init.headers['chatgpt-account-id'], 'workspace-a');
     assert.equal(init.headers.authorization, 'Bearer access-grant');
     assert.equal(init.redirect, 'error');
+    if (init.headers['if-none-match'] === 'generation-a') return new Response(null, { status: 304 });
+    assert.equal(init.headers['if-none-match'], undefined);
     return json({ models: [{
       slug: 'gpt-luna', visibility: 'list', display_name: 'Luna', priority: 4,
       supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }],
       default_reasoning_level: 'low', input_modalities: ['text', 'image'],
       supports_tools: true, supports_search_tool: true, context_window: 200000,
     }, { slug: 'private-model', visibility: 'hide' }] }, { headers: { etag: 'generation-a' } });
-  } });
+  };
+  const actual = await listNativeCodexModels(account({ quota: { codexCatalogVersion: '0.170.0' } }), {
+    etag: 'older-client-generation', fetchImpl,
+  });
   assert.equal(actual.etag, 'generation-a');
+  assert.equal(actual.version, '0.200.0');
   assert.deepEqual(actual.models, [{
     slug: 'gpt-luna', displayName: 'Luna', priority: 4, efforts: ['low', 'high'],
     defaultEffort: 'low', supportsTools: true, supportsToolSearch: true, supportsVision: true, contextWindow: 200000,
   }]);
-  assert.deepEqual(await listNativeCodexModels(account(), { etag: actual.etag, fetchImpl: async (_url, init) => {
-    assert.equal(init.headers['if-none-match'], 'generation-a');
-    return new Response(null, { status: 304 });
-  } }), { models: null, etag: 'generation-a', notModified: true });
+  assert.deepEqual(await listNativeCodexModels(account({ quota: { codexCatalogVersion: actual.version } }), {
+    etag: actual.etag, fetchImpl,
+  }), { models: null, etag: 'generation-a', version: '0.200.0', notModified: true });
+  assert.equal(releaseChecks, 1);
   assert.equal(nativeCodexHeaders(account({ credential: 'header\r\nInjection' })), null);
   assert.equal(nativeCodexHeaders({ codexAuth: 'siwc', organizationUuid: 'app-only', accessToken: 'access' }), null);
+});
+
+test('an unavailable release registry cannot roll the account back to the bundled catalog client version', async () => {
+  const result = await listNativeCodexModels(account({ quota: { codexCatalogVersion: '0.210.0' } }), {
+    etag: 'newer-cached-catalog', async fetchImpl(url, init) {
+      if (new URL(url).host === 'registry.npmjs.org') throw new Error('offline');
+      assert.equal(new URL(url).searchParams.get('client_version'), '0.210.0');
+      assert.equal(init.headers['if-none-match'], 'newer-cached-catalog');
+      return new Response(null, { status: 304 });
+    },
+  });
+  assert.equal(result.notModified, true);
+  assert.equal(result.version, '0.210.0');
 });
 
 test('native Codex quota maps windows by duration and keeps absent holdings distinct from zero', async () => {

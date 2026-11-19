@@ -229,7 +229,8 @@ name on a request using automatic routing selects the newest compatible
 model for that class from the serving account's live Codex catalog. Fable and
 Opus use Astra, Sonnet uses Sol, and Haiku uses Luna. These names specify
 families, so compatible updates can roll in as the catalog refreshes. The
-client's effort is selected separately.
+catalog refresh follows the current stable Codex client version without
+requiring a Codex installation. The client's effort is selected separately.
 
 **Session routing.** A session that starts on Codex stays on that provider
 by default and can move to another eligible Codex account. Other

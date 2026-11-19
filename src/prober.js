@@ -183,6 +183,7 @@ export class Prober {
           if (catalog && this.am.accounts[account.index] === account && account.credential === credential) {
             if (!catalog.notModified) account.quota.codexModels = catalog.models;
             account.quota.codexCatalogEtag = catalog.etag;
+            account.quota.codexCatalogVersion = catalog.version;
             account.quota.codexCatalogCheckedAt = this._now();
           }
         }

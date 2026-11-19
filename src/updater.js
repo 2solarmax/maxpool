@@ -35,16 +35,13 @@ export function compareVersions(a, b) {
  * Check npm for a newer published version. Network-failure-safe: returns null
  * on any error (offline, timeout, bad response) so a check never breaks startup.
  */
-export async function checkForUpdate(currentVersion, { timeoutMs = 4000, registry = DEFAULT_REGISTRY } = {}) {
+export async function checkForUpdate(currentVersion, {
+  timeoutMs = 4000, registry = DEFAULT_REGISTRY, packageName = PACKAGE, fetchImpl = fetch,
+} = {}) {
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    let res;
-    try {
-      res = await fetch(`${registry}/${PACKAGE}/latest`, { signal: ctrl.signal });
-    } finally {
-      clearTimeout(timer);
-    }
+    const res = await fetchImpl(`${registry}/${encodeURIComponent(packageName)}/latest`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     if (!res.ok) return null;
     const data = await res.json();
     const latest = data.version;
