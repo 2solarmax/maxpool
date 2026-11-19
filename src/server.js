@@ -1877,13 +1877,27 @@ async function forwardRequest(
     // earlier attempts of a failover.
     const upstreamForwardStartAt = Date.now();
     try {
-      upstreamRes = await fetch(upstreamUrl, {
+      const signal = AbortSignal.any([clientGone.signal, ttfbController.signal]);
+      const fetchUpstream = () => fetch(upstreamUrl, {
         method,
         headers: upstreamHeaders,
         body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
         redirect: 'manual',
-        signal: AbortSignal.any([clientGone.signal, ttfbController.signal]),
+        signal,
       });
+      const attemptedCredential = account.credential;
+      upstreamRes = await fetchUpstream();
+      if (openAI && upstreamRes.status === 401 && !signal.aborted) {
+        // A revoked or early-expired access token can be rejected before its
+        // saved expiry. Only the normal writer may refresh it, at most once
+        // per request. Reuse a credential another request already refreshed.
+        if (account.credential === attemptedCredential) await accountManager.ensureTokenFresh(account.index, true);
+        if (account.credential !== attemptedCredential && !signal.aborted) {
+          await upstreamRes.body?.cancel();
+          upstreamHeaders.authorization = `Bearer ${account.credential}`;
+          upstreamRes = await fetchUpstream();
+        }
+      }
       if (openAI) upstreamRes = await fromOpenAIResponse(upstreamRes, {
         model: requestInfo.model, stream: requestInfo.stream, toolNames: openAIRequest.toolNames,
       });

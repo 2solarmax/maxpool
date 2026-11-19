@@ -44,7 +44,7 @@ test('Claude Code Messages route falls back to ChatGPT and replays a full tool r
     for await (const c of req) data += c;
     const body = JSON.parse(data);
     seen.push({ path: req.url, headers: req.headers, body });
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.writeHead(200, { 'set-cookie': 'upstream-only=1', 'x-codex-turn-state': 'upstream-only' });
     event(res, { type: 'response.created', response: { id: 'resp_openai' } });
     if (seen.length === 1) {
       const item = { id: 'fc_1', type: 'function_call', name: 'Bash', namespace: 'claude_code', call_id: 'call_x' };
@@ -63,8 +63,11 @@ test('Claude Code Messages route falls back to ChatGPT and replays a full tool r
     codex({ upstream: upstream + '/v1/responses' }),
   ], 0.9);
   const base = await start(t, createProxyServer(am, { proxy: { apiKey: 'test-client' }, queue: { enabled: false } }));
-  const first = await client(base, { messages: [user], tools: [tool] });
+  const first = await client(base, { messages: [user], tools: [tool], output_config: { effort: 'high' } });
   assert.equal(first.status, 200);
+  assert.equal(first.headers.get('content-type'), 'text/event-stream');
+  assert.equal(first.headers.get('set-cookie'), null);
+  assert.equal(first.headers.get('x-codex-turn-state'), null);
   const firstWire = await first.text();
   assert.match(firstWire, /"type":"tool_use","id":"call_x","name":"Bash"/);
   assert.match(firstWire, /"stop_reason":"tool_use"/);
@@ -73,7 +76,7 @@ test('Claude Code Messages route falls back to ChatGPT and replays a full tool r
   const second = await client(base, { messages: [user,
     { role: 'assistant', content: [{ type: 'tool_use', id: 'call_x', name: 'Bash', input: { command: 'pwd' } }] },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_x', content: '/test/project' }] },
-  ], tools: [tool] });
+  ], tools: [tool], output_config: { effort: 'auto' } });
   assert.equal(second.status, 200);
   assert.match(await second.text(), /Tool finished\./);
   assert.equal(seen.length, 2, 'same thread remains on ChatGPT after Claude recovers');
@@ -82,7 +85,10 @@ test('Claude Code Messages route falls back to ChatGPT and replays a full tool r
   assert.equal(seen[0].headers['x-api-key'], undefined);
   assert.equal(seen[0].body.model, 'gpt-test');
   assert.equal(seen[0].body.store, false);
-  assert.equal(seen[0].body.input[0].tools[0].tools[0].name, 'Bash');
+  assert.equal(seen[0].body.tools[0].tools[0].name, 'Bash');
+  assert.equal(seen[0].body.input[0].role, 'user');
+  assert.deepEqual(seen[0].body.reasoning, { effort: 'high' });
+  assert.equal(seen[1].body.reasoning, undefined);
   const output = seen[1].body.input.find(item => item.type === 'function_call_output');
   assert.equal(output.call_id, 'call_x');
   assert.equal(output.output[0].text, '/test/project');
@@ -247,4 +253,37 @@ test('the edge can route ordinary Claude Code Messages to a linked cloud ChatGPT
   assert.equal(answer.status, 200);
   assert.match(await answer.text(), /Cloud answer/);
   assert.equal(calls, 1);
+});
+
+test('an early OpenAI 401 forces one refresh and retries on the same account', async t => {
+  const attempts = [];
+  const upstream = await start(t, http.createServer(async (req, res) => {
+    for await (const _ of req) { /* read the request */ }
+    attempts.push(req.headers.authorization);
+    if (attempts.length === 1) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'token_expired', message: 'Provided authentication token is expired.' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    event(res, { type: 'response.output_text.delta', item_id: 'txt', delta: 'Refreshed' });
+    event(res, { type: 'response.completed', response: {} });
+    res.end();
+  }));
+  let refreshes = 0;
+  let persisted = false;
+  const am = new AccountManager([codex({
+    upstream, refreshToken: 'original-refresh', expiresAt: Date.now() + 3600_000,
+  })], 0.9, {}, { refreshOpenAIToken: async () => {
+    refreshes++;
+    return { accessToken: 'updated-access', refreshToken: 'new-refresh', expiresAt: Date.now() + 3600_000 };
+  } });
+  am.onTokenRefresh(() => { persisted = true; });
+  const base = await start(t, createProxyServer(am, { proxy: { apiKey: 'test-client' }, queue: { enabled: false } }));
+  const result = await client(base, { messages: [user] });
+  assert.equal(result.status, 200);
+  assert.match(await result.text(), /Refreshed/);
+  assert.deepEqual(attempts, ['Bearer dummy-openai-token', 'Bearer updated-access']);
+  assert.equal(refreshes, 1);
+  assert.equal(persisted, true);
 });

@@ -7,6 +7,7 @@ export const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
 const scope = 'claude_code';
 const blocks = value => Array.isArray(value) ? value : [{ type: 'text', text: value ?? '' }];
 const omitted = new Set(['thinking', 'redacted_thinking', 'cache_creation']);
+const explicitEfforts = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
 function wireName(name) {
   if (/^[a-zA-Z0-9_-]{1,64}$/.test(name) && !name.startsWith('maxpool_tool_')) return name;
@@ -42,7 +43,6 @@ export function toOpenAIRequest(json, model) {
     return { type: 'function', name, description: tool.description || '', parameters: tool.input_schema, strict: false };
   });
   const input = [];
-  if (tools.length) input.push({ type: 'additional_tools', tools: [{ type: 'namespace', name: scope, description: 'Tools executed by Claude Code.', tools }] });
   const instructions = blocks(json.system).filter(b => b.type === 'text' && !String(b.text).startsWith('x-anthropic-billing-header:'))
     .map(b => b.text).filter(Boolean).join('\n\n');
   for (const message of json.messages || []) {
@@ -77,7 +77,11 @@ export function toOpenAIRequest(json, model) {
     flush();
   }
   const body = { model, input, store: false, stream: true };
+  // The ChatGPT plan HTTP endpoint accepts function namespaces as top-level tools.
+  if (tools.length) body.tools = [{ type: 'namespace', name: scope, description: 'Tools executed by Claude Code.', tools }];
   if (instructions) body.instructions = instructions;
+  const effort = json.output_config?.effort;
+  if (explicitEfforts.has(effort)) body.reasoning = { effort };
   if (tools.length && json.tool_choice?.type === 'none') body.tool_choice = 'none';
   if (tools.length && json.tool_choice?.type === 'any') body.tool_choice = 'required';
   if (json.tool_choice?.type === 'tool' && toolNames.has(wireName(json.tool_choice.name))) body.tool_choice = {
@@ -127,7 +131,9 @@ function errorEvent(status, error) {
 
 function normalizedHeaders(original) {
   const headers = new Headers(original);
-  for (const name of ['content-length', 'content-encoding', 'transfer-encoding']) headers.delete(name);
+  for (const name of ['content-length', 'content-encoding', 'transfer-encoding', 'set-cookie', 'x-codex-turn-state']) {
+    headers.delete(name);
+  }
   return headers;
 }
 
@@ -147,7 +153,10 @@ export async function fromOpenAIResponse(response, { model, stream, toolNames })
     const error = (await response.json().catch(() => null))?.error;
     return jsonResponse(errorEvent(response.status, error), response.status, headers);
   }
-  if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) {
+  // The ChatGPT plan endpoint can return SSE with no Content-Type header.
+  // In that case the required Responses events verify the stream format.
+  const contentType = response.headers.get('content-type');
+  if (!response.body || (contentType && !contentType.includes('text/event-stream'))) {
     await response.body?.cancel();
     return jsonResponse(errorEvent(502), 502, headers);
   }
