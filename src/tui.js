@@ -2198,13 +2198,13 @@ export class TUI {
           if (this.codexResets === state) await this._showCodexResets(state.account, notice);
         }, 'codexResets');
     } else if (k === 'a' && this.onSetCodexAutoRedeem) {
-      const enabled = this.config?.codexAutoRedeemResets === true;
+      const enabled = state.account.autoRedeemReset === true;
       this._confirm(enabled ? 'Turn off automatic resets?' : 'Allow automatic resets?',
-        enabled ? 'Banked resets remain available for manual use.' : 'Allows the pool to redeem eligible banked Codex resets.',
+        enabled ? 'Banked resets remain available for manual use.' : 'Allow the pool to redeem eligible resets for this account.',
         async () => {
           try {
-            await this.onSetCodexAutoRedeem(!enabled);
-            if (this.config) this.config.codexAutoRedeemResets = !enabled;
+            await this.onSetCodexAutoRedeem(state.account.name, !enabled);
+            state.account.autoRedeemReset = !enabled;
             state.notice = enabled ? 'Automatic resets off.' : 'Automatic resets on.';
           } catch (error) {
             state.notice = `Could not save settings: ${error.message}`;
@@ -4031,7 +4031,7 @@ export class TUI {
       case 'accounts':
         return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'codexResets': {
-        const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.config?.codexAutoRedeemResets ? 'on' : 'off'}` : '';
+        const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset ? 'on' : 'off'}` : '';
         const redeem = this.redeemCodexReset ? `  ${bold('Enter')} Redeem` : '';
         return ` ${dim('↑↓')} Select${redeem}  ${bold('r')} Refresh${auto}  ${bold('Esc')} Back`;
       }

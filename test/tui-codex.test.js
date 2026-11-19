@@ -69,7 +69,7 @@ test('Codex account rows show native quota and distinguish unknown and banked re
 test('free reset inventory requires confirmation and refreshes after manual redemption', async () => {
   const calls = [];
   const tui = makeTui({
-    config: { proxy: { port: 3456 }, autoRedeemResets: true },
+    config: { proxy: { port: 3456 }, codexAutoRedeemResets: true },
     async codexResetDetails(name) {
       calls.push(['read', name]);
       return { credits: [
@@ -81,7 +81,7 @@ test('free reset inventory requires confirmation and refreshes after manual rede
       calls.push(['redeem', name, id]);
       return { redeemed: true };
     },
-    async onSetCodexAutoRedeem(enabled) { calls.push(['auto', enabled]); },
+    async onSetCodexAutoRedeem(name, enabled) { calls.push(['auto', name, enabled]); },
   });
   const account = tui.am.accounts[1];
   account.codexResetCredits = { available: 3, applicable: 1 };
@@ -110,8 +110,11 @@ test('free reset inventory requires confirmation and refreshes after manual rede
   assert.equal(tui.mode, 'confirm');
   tui._key('y');
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(tui.config.codexAutoRedeemResets, true);
-  assert.deepEqual(calls.at(-1), ['auto', true]);
+  assert.equal(account.autoRedeemReset, true);
+  assert.deepEqual(calls.at(-1), ['auto', account.name, true]);
+  assert.match(strip(tui._renderFooter()), /Auto: on/);
+  await tui._showCodexResets(codex('Separate account', { quota: {} }));
+  assert.match(strip(tui._renderFooter()), /Auto: off/);
   tui._key('esc');
   assert.equal(tui.mode, 'accounts');
 });
