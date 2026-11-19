@@ -265,7 +265,7 @@ test('R3: the floor is per-window — a 4.5h ses cycle passes, a 5.5-day wk cycl
 
 // ── 2026-11-18 capacity-screen audit: admission + estimate defects D1/D5/D6/D7/D16 ──
 // Basis: research/2026-11-18-capacity-audit.md (both pools' snapshots, 52-agent audit).
-import { segmentSlopes, cycleEstimate, tankStatsFromCycles } from '../src/capacity-ledger.js';
+import { tankStatsFromCycles } from '../src/capacity-ledger.js';
 
 const WK = 'wk';
 const day = 86400_000;
