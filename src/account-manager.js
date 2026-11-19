@@ -7068,6 +7068,7 @@ export class AccountManager {
       a.codexAuth = ra.codexAuth || null;
       a.codexModels = ra.codexModels || null;
       a.codexResetCredits = ra.codexResetCredits || null;
+      a.autoRedeemReset = ra.autoRedeemReset;
       a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
       a.status = ra.status || 'active';
       a.refreshDead = Boolean(ra.refreshDead);
@@ -7358,6 +7359,7 @@ export class AccountManager {
         provider: a.provider,
         ...(a.provider === 'codex' ? { codexAuth: a.codexAuth,
           codexModels: a.quota?.codexModels ?? a.codexModels,
+          autoRedeemReset: a.remote ? a.autoRedeemReset : a.autoRedeemReset === true,
           codexResetCredits: a.enabled === false ? null : a.quota?.codexResetCredits ?? a.codexResetCredits ?? null } : {}),
         enabled: a.enabled,
         poolBenchedBy: a.poolBenchedBy || null,

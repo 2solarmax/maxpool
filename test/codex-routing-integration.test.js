@@ -166,6 +166,7 @@ test('browser account screen shows native quota and banked reset inventory', asy
   assert.match(app.innerHTML, /45%/);
   assert.match(app.innerHTML, /Weekly reset/);
   assert.match(app.innerHTML, /3 banked · 0 eligible/);
+  assert.match(app.innerHTML, /Automatic resets off/);
 });
 
 test('a native model-specific limit follows the account’s selected effort-compatible model', () => {
@@ -217,6 +218,7 @@ test('linked pool accepts a native grant and advertises routing and reset metada
   assert.equal(saved.codexAuth, 'native');
   am.applyCodexUsageData(0, { sevenDay: { utilization: 0.24, resetAt: Date.now() + 900000 },
     modelBuckets: [], resetCredits: { available: 2, applicable: 1 } });
+  am.accounts[0].autoRedeemReset = true;
   const link = new PoolLink({ name: 'team', url: cloud, key: 'fixture' });
   await link.poll();
   const edge = new AccountManager([]);
@@ -226,6 +228,7 @@ test('linked pool accepts a native grant and advertises routing and reset metada
   assert.equal(mirror.credential, null);
   assert.equal(mirror.refreshToken, null);
   assert.equal(mirror.codexResetCredits.available, 2);
+  assert.equal(edge.getStatus().accounts[0].autoRedeemReset, true);
   assert.equal(mirror.quota.unified7d, 0.24);
   assert.equal(codexModelFor({ model: 'claude-fable-5-2' }, mirror), 'gpt-6.2-astra');
 });
