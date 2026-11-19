@@ -253,7 +253,8 @@ to extract information. Standalone Anthropic-hosted `web_fetch` and
 ChatGPT-hosted connectors use separate APIs.
 
 Codex quota and reset times appear in the account views whenever OpenAI
-reports the corresponding window. The account reset column shows how many credits OpenAI currently marks applicable. Use **Accounts → r** on a local Codex
+reports the corresponding window. The account reset column shows how many
+credits OpenAI currently marks applicable. Use **Accounts → r** on a local Codex
 account to inspect its free banked resets or confirm a redemption. Press
 **a** in that reset inventory to opt that account into automatic redemption,
 or set `autoRedeemReset: true` on its account entry. Newly added accounts start
@@ -264,6 +265,15 @@ an approaching natural refill.
 Token counts requested on the ChatGPT route are estimates. Claude Code
 Remote Control can steer the same running terminal session from a browser
 or app. Sessions launched on Anthropic's hosted workers use their own runtime.
+
+### Codex CLI and desktop on Mac
+
+Choose **Codex routing → Pool** in Maxbar, then start a new CLI process or
+restart the desktop app and open a new chat. MaxPool selects an eligible local
+ChatGPT account for the first turn and keeps the conversation on that account.
+This preserves provider-owned reasoning and tool state across turns. **Direct**
+restores your previous Codex provider for new chats. The Claude routing switch
+works independently. See the [Maxbar setup instructions](tools/maxbar/README.md).
 
 ## Restart behavior
 

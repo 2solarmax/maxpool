@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Native Codex clients in Maxbar
+
+The independent Codex routing switch uses the client's version-checked configuration service and a loopback Responses endpoint. The Mac's owner key authenticates the client. The scheduler selects a locally owned native account and binds subsequent requests to that identity for provider-owned state. Desktop and CLI share the model catalog, compaction and standalone search routes. Claude Code continues to use its Messages route.
+
 ### 2026-11-19 · Codex reset inventory
 
 OpenAI reports separate counts for unused and currently applicable credits. Accounts shows the applicable count, matching the other providers. Reset details lists unspent, unexpired credits supported by the plan and keeps both counts. Free-credit policy and local opt-in are independent of this display.
