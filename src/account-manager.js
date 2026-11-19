@@ -424,7 +424,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // drops until the next probe sweep re-learns it. The probe still rewrites it on
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
-  'providerQuotaSource', 'lastProbeOkAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogVersion',
+  'providerQuotaSource', 'lastProbeOkAt', 'probeRetryAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogVersion',
   'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel', 'codexFiveHourAbsent', 'codexWeeklyReadingAt',
 ];
 
@@ -7092,6 +7092,15 @@ export class AccountManager {
       out.lastFullGeneralClaimAt = a.lastFullGeneralClaimAt;
       return out;
     });
+  }
+
+  restoreProbeRetryDeadlines(saved) {
+    if (!Array.isArray(saved)) return;
+    for (const account of this.accounts) {
+      if (account.remote) continue;
+      const prior = saved.find(row => this._sameIdentity(row, account))?.quota;
+      if (prior && Object.hasOwn(prior, 'probeRetryAt')) account.quota.probeRetryAt = prior.probeRetryAt;
+    }
   }
 
   /**

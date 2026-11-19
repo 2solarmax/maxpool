@@ -120,7 +120,7 @@ export class Prober {
         // token), so its access token is dead and every probe fails — each failure
         // widens the shared inter-probe gap and slows the HEALTHY rows. Its quota is
         // shown from the cloud mirror (am.remoteRowFor), not from a local probe.
-        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.provider !== 'codex' && a.credential && !a.refreshDead && !a.poolBenchedBy);
+        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.provider !== 'codex' && a.credential && !a.refreshDead && !a.remote && !a.poolBenchedBy);
         const codex = this.am.accounts.filter(a => a.codexAuth === 'native' && a.credential && !a.refreshDead && !a.poolBenchedBy);
         // Pool links are probed by their own PoolLink status poll, not here.
         const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);  // 'pool' rows are excluded by type
@@ -137,12 +137,28 @@ export class Prober {
         // Rotate the start account each sweep so no account is systematically the
         // oldest-refreshed (the serialized sweep would otherwise always probe the
         // last account last).
+        const nextSweep = this.intervalMs > 0 ? this._now() + this.intervalMs : null;
         const start = oauth.length ? (this._sweepStart++ % oauth.length) : 0;
         for (let i = 0; i < oauth.length; i++) {
           if (this._stopping) break;
+          const account = oauth[(start + i) % oauth.length];
+          const q = account.quota ||= {};
+          q.probeIntervalMs = this.intervalMs;
+          const due = this._usageDeferredUntil(account);
+          if (due > this._now()) {
+            q.probeNextCheckAt = due;
+            continue; // no pacing slot, token refresh or grant listing for a deferred row
+          }
           await this._paceUsage();
           if (this._stopping) break;
-          const r = await this.probeOne(oauth[(start + i) % oauth.length]);
+          q.probeChecking = true;
+          let r;
+          try {
+            r = await this.probeOne(account);
+          } finally {
+            q.probeChecking = false;
+            q.probeNextCheckAt = this._usageDeferredUntil(account) || nextSweep;
+          }
           this._lastUsageProbeAt = Date.now();
           if (r && r.status === 429) this._bumpUsageGap();
           else if (r && r.ok) this._relaxUsageGap();
@@ -195,6 +211,21 @@ export class Prober {
         }
       } catch { /* Existing quota and entitlements remain available on transient errors. */ }
     }
+  }
+
+  _usageDeferredUntil(account) {
+    const now = this._now();
+    const q = account.quota || {};
+    // The provider's 429 deadline also applies to a one-shot/manual sweep.
+    const retryAt = q.probeRetryAt > now ? q.probeRetryAt : 0;
+    // A free reset can be used externally without moving the natural reset day.
+    // Recheck a fully used general week on the grant-list cadence, or sooner at
+    // the scheduled refill. A locally redeemed grant needs the next sweep.
+    const recentClaim = account.lastClaimAt && account.lastClaimAt >= (q.lastProbeOkSentAt || q.lastProbeOkAt);
+    const pendingGrant = account.resetGrants?.stale || this.am.isHoldingWall?.(account, now);
+    const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt && !recentClaim && !pendingGrant;
+    const due = weekly ? Math.min(q.lastProbeOkAt + GRANTS_EVERY_MS, q.unified7dReset ?? Infinity) : 0;
+    return Math.max(retryAt, due > now ? due : 0);
   }
 
   /** Wait until the current usage-probe gap has elapsed since the last usage
@@ -463,7 +494,8 @@ export class Prober {
   async probeOne(account) {
     // Benched duplicate: never refreshed locally (see the sweep filter in probeAll),
     // so the token is dead — a probe can only fail. Quota comes from the cloud mirror.
-    if (account.poolBenchedBy) return { ok: false, status: null, skipped: 'benched' };
+    if (account.poolBenchedBy || account.remote) return { ok: false, status: null, skipped: 'benched' };
+    if (account.quota?.probeRetryAt > this._now()) return { ok: false, status: null, skipped: 'retry-after' };
     // Subscription latched org-disabled (account-manager recordProbeError): the quota
     // endpoint 403s before answering anything, so probing is pure waste until the org
     // accepts OAuth again. Skipping also stops the every-60s hammer that ran 700+ times
@@ -512,6 +544,13 @@ export class Prober {
               account._grantsListedAt = nowMs;
               this.am.applyResetGrants(account.index, listing);
               this._logGrantListingTransition(account, listing);
+              // This listing and the usage read below hit the same endpoint.
+              if (listing.status === 429 && listing.retryAt > this._now()) {
+                (account.quota ||= {}).probeRetryAt = listing.retryAt;
+                this.am.recordProbeError?.(account.index, listing.error, 429);
+                try { await this._rescueHeldWall(account); } catch { /* the retry deadline still applies */ }
+                return { ok: false, status: 429 };
+              }
             }
           }
           // C1: decide AFTER this sweep's usage probe (below), never before it —
@@ -544,10 +583,14 @@ export class Prober {
       }
       if (usage == null || usage.error) { // timed out / HTTP error (e.g. 429) / fetch failure
         const e = usage == null ? 'probe timed out' : usage.error;
+        if (usage?.status === 429 && Number.isFinite(usage.retryAt) && usage.retryAt > this._now()) {
+          (account.quota ||= {}).probeRetryAt = usage.retryAt;
+        }
         this.am.recordProbeError?.(account.index, e, usage?.status ?? null);
         await this._rescueHeldWall(account);   // red-team r2 #1: a held wall must not strand
         return { ok: false, status: usage?.status ?? null };
       }
+      if (account.quota?.probeRetryAt) account.quota.probeRetryAt = null;
       this.am.applyUsageData(account.index, usage, { sentAt: probeSentAt }); // clears the error + stamps freshness
       // C1: decide the claim on the reading JUST stored (this sweep's probe), on
       // the listing stored this same sweep — never on a pre-probe reading.

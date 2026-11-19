@@ -1675,6 +1675,7 @@ async function serverWorkerCommand() {
     // The old worker could serve a first turn or evict an old conversation after
     // our headless boot. Adopt its final ownership maps before serving any socket.
     const finalState = await loadState();
+    accountManager.restoreProbeRetryDeadlines(finalState?.quota);
     accountManager.restoreSessionProviders(finalState?.sessionProviders);
     accountManager.restoreNativeCodexConversationOwners(finalState?.nativeCodexConversationOwners);
   };
