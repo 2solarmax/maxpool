@@ -1,4 +1,4 @@
-import { fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest } from './openai-responses.js';
+import { fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest } from './openai-responses.js';
 import { nativeCodexHeaders, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
 import { codexModelFor, validCodexCatalog } from './codex-model-routing.js';
 import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
@@ -1842,12 +1842,13 @@ async function forwardRequest(
   if (openAI) {
     try {
       openAIRequest = toOpenAIRequest(JSON.parse(body.toString()), openAIModel, { native: nativeCodex });
-    } catch {
+    } catch (error) {
       res.off('close', onClientClose);
       accountManager.releaseAccount(lease, { neutral: true });
       ctx.status = 400;
       sendErrorResponse(res, requestInfo, 400, {
-        type: 'error', error: { type: 'invalid_request_error', message: 'This Messages request could not be converted for OpenAI.' },
+        type: 'error', error: { type: 'invalid_request_error',
+          message: error instanceof UnsupportedOpenAIRequest ? error.message : 'This Messages request could not be converted for OpenAI.' },
       });
       return;
     }
@@ -1954,7 +1955,8 @@ async function forwardRequest(
         }
       }
       if (openAI) upstreamRes = await fromOpenAIResponse(upstreamRes, {
-        model: requestInfo.model, stream: requestInfo.stream, toolNames: openAIRequest.toolNames, upstreamModel: openAIModel,
+        model: requestInfo.model, stream: requestInfo.stream, upstreamModel: openAIModel,
+        toolNames: openAIRequest.toolNames, webSearch: openAIRequest.webSearch,
       });
     } finally {
       clearTimeout(ttfbTimer);

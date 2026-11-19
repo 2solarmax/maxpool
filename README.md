@@ -243,7 +243,14 @@ transcript and request compatibility.
 
 Local shell, editing, and MCP tools are executed by Claude Code. Provider
 reasoning blocks are omitted when translating the transcript for OpenAI.
-Anthropic-hosted tools and ChatGPT-hosted connectors have separate APIs.
+Claude Code WebSearch uses OpenAI's hosted search and returns source links.
+Use `allowed_domains` to scope searches. Search requests with
+`blocked_domains` return an error. On the ChatGPT subscription route,
+`max_uses` is best-effort guidance to the model.
+Claude Code WebFetch downloads the page locally and uses the routed model
+to extract information. Standalone Anthropic-hosted `web_fetch` and
+ChatGPT-hosted connectors use separate APIs.
+
 Codex quota and reset times appear in the account views whenever OpenAI
 reports the corresponding window. Use **Accounts → r** on a local Codex
 account to inspect its free banked resets or confirm a redemption. Press
