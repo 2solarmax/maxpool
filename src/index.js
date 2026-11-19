@@ -47,7 +47,7 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 );
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, sameUser, organizationUnknownMatch, resolveOrganizations } from './oauth.js';
 import { TUI, writeTerminalSync, reclaimRawModeLogged, whenTerminalCaughtUp } from './tui.js';
 import { createTerminalModeSwitcher } from './terminal-mode.js';
 import { RestartController } from './restart-controller.js';
@@ -2727,7 +2727,7 @@ async function upsertOAuthAccount(name, creds, profile) {
     for (const a of claudeAccounts) {
       if (a.organizationUuid) continue;
       const match = resolved.find(candidate => candidate.organizationUuid && candidate.name === a.name
-        && candidate.accountUuid === a.accountUuid && candidate.accessToken === a.accessToken);
+        && sameUser(candidate, a) && candidate.accessToken === a.accessToken);
       if (match) a.organizationUuid = match.organizationUuid;
     }
     const uncertain = profileOk && !name ? organizationUnknownMatch(claudeAccounts, profile) : null;

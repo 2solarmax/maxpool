@@ -2692,9 +2692,15 @@ export class TUI {
 
   _configAccountIndex(account) {
     if (!account) return -1;
+    const provider = configuredAccountProvider(account);
     const local = this.config.accounts.filter(candidate => candidate.type === account.type
-      && configuredAccountProvider(candidate) === configuredAccountProvider(account));
-    return this.config.accounts.indexOf(local[findAccountConfigIndex(local, account)]);
+      && configuredAccountProvider(candidate) === provider);
+    const match = local[findAccountConfigIndex(local, account)];
+    if (match) return this.config.accounts.indexOf(match);
+    // Older Claude config rows can hold settings under just the account name.
+    if (account.remote || provider !== 'anthropic') return -1;
+    return this.config.accounts.findIndex(candidate => candidate.name === account.name
+      && candidate.type == null && candidate.provider == null);
   }
 
   /** Where does this account live in config — `accounts` or `providers`?
