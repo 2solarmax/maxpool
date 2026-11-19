@@ -201,6 +201,7 @@ test('standalone search posts the native tool wire only on the exact conversatio
   } });
   const search = { id: 'shared-session', model: body.model, commands: { search_query: [{ q: 'OpenAI Codex docs' }] } };
   const headers = { authorization: 'Bearer owner-key', 'content-type': 'application/json',
+    'x-client-request-id': 'shared-session', 'thread-id': 'different-transport-thread',
     'x-codex-turn-metadata': JSON.stringify({ thread_id: 'specific-thread', session_id: 'shared-session' }) };
   const runSearch = () => fetch(url + '/alpha/search', { method: 'POST', headers, body: JSON.stringify(search) });
   assert.equal((await runSearch()).status, 409);

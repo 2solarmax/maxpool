@@ -61,11 +61,12 @@ function authorized(header, key) {
 
 function threadKey(req, body, path) {
   const metadata = req.headers['x-codex-turn-metadata'];
-  // Codex sends both headers with its thread ID. Its session ID can be
-  // overridden for prompt-cache affinity. Standalone search puts its thread
-  // ID in the turn metadata header and sends a session ID as the request ID.
-  const value = [req.headers['thread-id'], req.headers['x-client-request-id'],
-    typeof metadata === 'string' && withJsonBody(metadata)?.thread_id, req.headers.session_id,
+  // Responses sends thread-id. Codex standalone search instead sends the
+  // thread in turn metadata and a session-scoped id in its body. Prefer the
+  // operation's thread identity over shared session and transport request IDs.
+  const metadataThread = typeof metadata === 'string' && withJsonBody(metadata)?.thread_id;
+  const ids = path === SEARCH_PATH ? [metadataThread, req.headers['thread-id']] : [req.headers['thread-id'], metadataThread];
+  const value = [...ids, req.headers['x-client-request-id'], req.headers.session_id,
     req.headers['session-id'], path === SEARCH_PATH ? body.id : body.prompt_cache_key]
     .find(key => typeof key === 'string' && THREAD_ID.test(key));
   return value ? 'codex-wire:' + createHash('sha256').update(value).digest('hex') : null;

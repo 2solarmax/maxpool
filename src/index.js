@@ -1731,6 +1731,8 @@ async function serverWorkerCommand() {
     // boots headless (already done above) and waits for MSG_PROBE_READY/TAKEOVER.
     server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
 
+    let finishTakeoverRestore;
+    const restored = isReloadWorker ? new Promise(resolve => { finishTakeoverRestore = resolve; }) : null;
     const listenOnHandle = handle => new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(handle, () => { server.removeListener('error', reject); resolve(); });
@@ -1854,7 +1856,11 @@ async function serverWorkerCommand() {
           // A connection the supervisor's own accept loop won the race for (cold start
           // before MSG_PRIMARY, or the reload cutover gap). Serve it exactly as if we
           // had accepted it: http.Server wires up on the 'connection' event.
-          if (handle) { handle.resume?.(); server.emit('connection', handle); }
+          if (handle) {
+            if (restored && !await restored) { handle.destroy(); return; }
+            server.emit('connection', handle);
+            handle.resume?.();
+          }
         } else if (msg?.type === MSG_PROBE_READY) {
           // Headless reload worker: we've booted the new code and restored quota
           // in memory. Confirm readiness (we are NOT yet accepting / writing).
@@ -1882,7 +1888,13 @@ async function serverWorkerCommand() {
           // The supervisor holds the listening socket during this short disk read.
           // An encrypted continuation accepted early cannot recover its issuing
           // account from the incoming worker's boot snapshot.
-          await restoreTakeoverState();
+          try {
+            await restoreTakeoverState();
+            finishTakeoverRestore?.(true);
+          } catch (error) {
+            finishTakeoverRestore?.(false);
+            throw error;
+          }
           await listenOnHandle(handle);
           await becomePrimary({ viaTakeover: true });
         } else if (msg?.type === MSG_TTY_REASSERT) {
