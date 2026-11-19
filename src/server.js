@@ -4855,10 +4855,10 @@ function describeRequest(req, body) {
         if (sessionId) info.clientThreadId = agentId ? sessionId + ':' + agentId : sessionId;
       } catch { /* legacy metadata is not a JSON string */ }
     }
-    const cacheSession = claudeCodeId(req.headers['x-claude-code-session-id']) || sessionId
+    const cacheSession = claudeCodeId(req.headers?.['x-claude-code-session-id']) || sessionId
       || (typeof clientIdentity === 'string' && clientIdentity.length < 2048
         ? /_session_([a-f0-9-]{8,80})$/i.exec(clientIdentity)?.[1] : null);
-    const agentHeader = req.headers['x-claude-code-agent-id'];
+    const agentHeader = req.headers?.['x-claude-code-agent-id'];
     const cacheAgent = agentHeader === 'main' ? null : claudeCodeId(agentHeader) || agentId;
     if (cacheSession) info.codexCacheThreadId = cacheAgent ? cacheSession + ':' + cacheAgent : cacheSession;
     // CONVERSATION identity for cache affinity (red-team 2026-11-08): the
