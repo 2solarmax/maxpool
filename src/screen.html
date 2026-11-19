@@ -55,6 +55,18 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
   function setKey(k) { try { if (k) localStorage.setItem(KEY_STORE, k); else localStorage.removeItem(KEY_STORE); } catch (e) {} }
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
   function pct(v) { if (v == null || !isFinite(v)) return null; return Math.max(0, Math.min(100, v > 1 ? v : v * 100)); }
+  function providerName(a) { return a.provider === 'codex' ? 'Codex' : (a.provider || (a.type === 'oauth' ? 'Claude' : a.type)); }
+  function codexQuotaDetails(a) {
+    if (a.provider !== 'codex') return '';
+    var q = a.quota || {};
+    var items = [];
+    if (Number.isFinite(q.unified5hReset)) items.push('Session reset ' + new Date(q.unified5hReset).toLocaleString());
+    if (Number.isFinite(q.unified7dReset)) items.push('Weekly reset ' + new Date(q.unified7dReset).toLocaleString());
+    var credits = a.codexResetCredits;
+    if (credits && Number.isFinite(credits.available)) items.push(credits.available + ' banked' +
+      (Number.isFinite(credits.applicable) ? ' · ' + credits.applicable + ' eligible' : ''));
+    return items.map(function (item) { return '<div class="sub">' + esc(item) + '</div>'; }).join('');
+  }
 
   function gate(msg) {
     app.innerHTML = '<div class="gate"><h1>Maxpool accounts</h1>' +
@@ -100,8 +112,8 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
         var week = q.unified7d != null ? q.unified7d : q.providerWk;
         var st = ra.refreshDead ? ['bad', 'Needs login'] : ra.status === 'error' ? ['bad', 'Error'] : (week != null && week >= 0.999) ? ['warn', 'Exhausted this week'] : ra.status === 'throttled' ? ['warn', 'Resting'] : ['ok', 'Ready'];
         return '<div class="acct">' +
-          '<div><div class="name">' + esc(ra.name) + '</div><div class="sub">' + esc(ra.provider || (ra.type === 'oauth' ? 'Claude' : ra.type)) + ' · cloud</div></div>' +
-          '<div class="bars">' + bar('5h', five) + bar('7d', week) + '</div>' +
+          '<div><div class="name">' + esc(ra.name) + '</div><div class="sub">' + esc(providerName(ra)) + ' · cloud</div></div>' +
+          '<div class="bars">' + bar('5h', five) + bar('7d', week) + codexQuotaDetails(ra) + '</div>' +
           '<span class="state ' + st[0] + '">' + st[1] + '</span></div>';
       }).join('');
       out += '<div style="margin:14px 0 4px" class="sub">' + tag + '</div><div class="grid">' + accts + '</div>';
@@ -131,9 +143,9 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
       var five = q.unified5h != null ? q.unified5h : q.providerSes;
       var week = q.unified7d != null ? q.unified7d : q.providerWk;
       return '<div class="acct' + (a.refreshDead ? ' dead' : '') + '">' +
-        '<div><div class="name">' + esc(a.name) + '</div><div class="sub">' + esc(a.provider || (a.type === 'oauth' ? 'Claude' : a.type)) +
+        '<div><div class="name">' + esc(a.name) + '</div><div class="sub">' + esc(providerName(a)) +
         (a.inFlight ? ' · ' + a.inFlight + ' running' : '') + '</div></div>' +
-        '<div class="bars">' + bar('5h', five) + bar('7d', week) + '</div>' +
+        '<div class="bars">' + bar('5h', five) + bar('7d', week) + codexQuotaDetails(a) + '</div>' +
         '<span class="state ' + st[0] + '">' + st[1] + '</span></div>';
     }).join('');
     var ver = (s.runningVersion || (s.version && s.version.current) || '');

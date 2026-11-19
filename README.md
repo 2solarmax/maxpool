@@ -206,10 +206,11 @@ Every account/provider row also includes load telemetry: `Load current/weight`, 
 
 ### ChatGPT subscriptions in Claude Code
 
-Connect each account with a distinct name. The sign-in opens ChatGPT and asks
-permission to use the selected workspace's plan. Enter the same name when
-reconnecting. You can also choose **Accounts → Add account → ChatGPT
-subscription** from the dashboard.
+Connect each account with a distinct name. MaxPool opens the Codex sign-in
+for the selected ChatGPT workspace and maintains its own grant. Use
+**Accounts → Add account → ChatGPT subscription** in the terminal UI to
+connect it. In Accounts, **c** reconnects an existing Codex row in its owning
+pool.
 
 ```sh
 maxpool login --codex --cloud --name "ChatGPT work"
@@ -224,11 +225,14 @@ Messages API, and MaxPool translates requests and tool results to OpenAI
 Responses when it picks a ChatGPT account. The `all` profile considers
 ChatGPT along with the configured Claude, GLM, and Kimi accounts.
 `cc --model <OpenAI model slug>` selects OpenAI explicitly. An Anthropic model
-name on a request using automatic routing lets MaxPool select the OpenAI
-account's configured model.
+name on a request using automatic routing selects the newest compatible
+model for that class from the serving account's live Codex catalog. Fable and
+Opus use Astra, Sonnet uses Sol, and Haiku uses Luna. These names specify
+families, so compatible updates can roll in as the catalog refreshes. The
+client's effort is selected separately.
 
-**Session routing.** A conversation served by ChatGPT stays in that provider
-family by default and can move to another eligible ChatGPT account. Other
+**Session routing.** A session that starts on Codex stays on that provider
+by default and can move to another eligible Codex account. Other
 providers keep their configured fallback behavior. In the Routing menu,
 press **o** to toggle the ChatGPT policy. Set `scheduler.sessionRouting` to
 `same-provider` or `cross-provider` for a pool-wide default, or override that
@@ -239,6 +243,15 @@ transcript and request compatibility.
 Local shell, editing, and MCP tools are executed by Claude Code. Provider
 reasoning blocks are omitted when translating the transcript for OpenAI.
 Anthropic-hosted tools and ChatGPT-hosted connectors have separate APIs.
+Codex quota and reset times appear in the account views whenever OpenAI
+reports the corresponding window. Use **Accounts → r** on a local Codex
+account to inspect its free banked resets or confirm a redemption. Automatic
+redemption is opt-in using the Codex reset inventory or
+`codexAutoRedeemResets`. The policy can wait for a dry pool and limit
+redemptions by time to the natural reset, reset cohort and daily cap with
+`codexAutoRedeemMinDaysToReset`, `codexAutoRedeemMaxShare` and
+`codexAutoRedeemMaxPerDay`.
+
 Token counts requested on the ChatGPT route are estimates. Claude Code
 Remote Control can steer the same running terminal session from a browser
 or app. Sessions launched on Anthropic's hosted workers use their own runtime.

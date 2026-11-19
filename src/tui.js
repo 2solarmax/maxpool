@@ -298,6 +298,32 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+function codexResetCells(account, now = Date.now()) {
+  const reset = account.quota?.codexResetCredits ?? account.codexResetCredits;
+  let label = '-';
+  if (account.enabled !== false && Number.isInteger(reset?.available) && reset.available >= 0) {
+    label = String(reset.available);
+    const stale = reset.stale || account.refreshDead || account.subscriptionGone
+      || (reset.checkedAt != null && now - reset.checkedAt > LISTING_FRESH_MS);
+    if (stale) label += '?';
+    else if (reset.available > 0) label = reset.applicable === 0 ? yellow(label) : green(label);
+  }
+  return rpad(gray('-'), MRST_W) + ' ' + rpad(label, ARST_W);
+}
+
+function codexLoginArgs(cli, name, account) {
+  const args = [cli, 'login', '--codex'];
+  if (name) args.push('--name', name);
+  if (account?.remote) args.push('--cloud', '--pool', account.remote.linkName);
+  else if (account) args.push('--local');
+  return args;
+}
+
+function canRedeemCodexCredit(credit, now = Date.now()) {
+  return credit?.status === 'available' && credit.supportedByPlan !== false
+    && (credit.expiresAt == null || credit.expiresAt > now);
+}
+
 function quotaLabel(ratio, resetTs, width) {
   const rst = formatReset(resetTs);
   if (ratio == null || isNaN(ratio)) return (rst || '-').slice(0, width);
@@ -695,7 +721,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct, codexLoginArgs };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -734,7 +760,8 @@ export function decideLoginTarget({ mirror, links, existing, accountUuid }) {
 }
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart, spawnDetached }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart, spawnDetached,
+    codexResetDetails, redeemCodexReset, onSetCodexAutoRedeem }) {
     this.am = accountManager;
     // Runs the tmux detach for q in service mode; a seam so tests never start tmux.
     this._spawnDetached = spawnDetached || ((cmd, args) => {
@@ -745,6 +772,9 @@ export class TUI {
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
+    this.codexResetDetails = codexResetDetails;
+    this.redeemCodexReset = redeemCodexReset;
+    this.onSetCodexAutoRedeem = onSetCodexAutoRedeem;
     this._startedAt = Date.now();   // the efficiency line's "since restart" window
     // Set by index.js after construction (a deferred closure, not a constructor literal —
     // avoids the const TDZ on applyUpdateIfReady, which is defined after `new TUI`).
@@ -768,6 +798,8 @@ export class TUI {
     this.confirmTitle = '';
     this.confirmDetail = '';
     this.confirmCb = null;
+    this.confirmReturnMode = 'normal';
+    this.codexResets = null;
     this.frame = 0;
     this.running = false;
     this.timer = null;
@@ -1067,6 +1099,7 @@ export class TUI {
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
       case 'confirm': this._keyConfirm(k); break;
+      case 'codexResets': this._keyCodexResets(k); break;
     }
     this.forceRender();
   }
@@ -1240,7 +1273,7 @@ export class TUI {
   }
 
   /** EFFICIENCY line (2026-11-15), directly under Routing: is the prompt cache holding,
-   *  and what are moves costing — Claude and GLM never blended. null with no traffic.
+   *  and what are moves costing — cache readings stay scoped to each provider.
    *  Colours are WARN-only proposals until a one-day baseline exists; a red names the
    *  cause and the account.
    *  Honest-efficiency rework (2026-11-17, audit findings 2-6):
@@ -1255,35 +1288,39 @@ export class TUI {
   _efficiencyLine(W = 80, now = Date.now()) {
     const eff = this.am.efficiencyOverall?.('last15m', now);
     if (!eff) return null;
-    const { claude: c, glm: g } = eff;
-    const served = c.served + g.served;
-    const bounced = c.bounced + g.bounced;
+    const { claude: c, glm: g, codex } = eff;
+    const groups = codex ? [c, g, codex] : [c, g];
+    const total = field => groups.reduce((sum, group) => sum + (group[field] || 0), 0);
+    const served = total('served');
+    const bounced = total('bounced');
     if (served + bounced === 0) return null;
     const sinceMs = now - (this._startedAt ?? now);
     const since = sinceMs < 15 * 60_000 ? dim(`  since restart ${Math.max(1, Math.round(sinceMs / 60_000))}m`) : '';
-    if (c.lowVolume && g.lowVolume) return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
+    if (groups.every(group => group.lowVolume)) return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
     const pctTxt = x => `${Math.round(x * 100)}%`;
     const parts = [];
     if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}${c.writeShare != null ? ` (w/ ${pctTxt(c.writeShare)} of cost)` : ''}`);
     if (g.hit != null) parts.push(`GLM ${g.lowVolume ? dim(pctTxt(g.hit)) : pctTxt(g.hit)}`);
+    if (codex?.hit != null) parts.push(`Codex ${codex.lowVolume ? dim(pctTxt(codex.hit)) : pctTxt(codex.hit)}`);
     const missTxt = t => t >= 1e6 ? `${(t / 1e6).toFixed(1)}M` : `${Math.round(t / 1000)}k`;
     if (c.hit != null || c.missTokens) parts.push(`Claude miss ${missTxt(c.missTokens)} tok`);
     if (g.hit != null || g.missTokens) parts.push(`GLM miss ${missTxt(g.missTokens)} tok`);
-    const cause = k => c.movedByCause[k] + g.movedByCause[k];
+    if (codex && (codex.hit != null || codex.missTokens)) parts.push(`Codex miss ${missTxt(codex.missTokens)} tok`);
+    const cause = k => groups.reduce((sum, group) => sum + (group.movedByCause?.[k] || 0), 0);
     const per100 = n => (served ? Math.round(n * 100 / served) : 0);
-    const cross = (c.movedCross || 0) + (g.movedCross || 0);
+    const cross = total('movedCross');
     // Causes list only what happened — a row of zeros is width the line cannot spare.
     const causeTxt = ['busy', 'balance', 'wall', 'link', 'other'].filter(k => cause(k) > 0).map(k => ` · ${k} ${cause(k)}`).join('');
-    parts.push(`cross-moves ${per100(cross)}/100 (same ${(c.movedSame || 0) + (g.movedSame || 0)}${causeTxt})`);
+    parts.push(`cross-moves ${per100(cross)}/100 (same ${total('movedSame')}${causeTxt})`);
     const bounceShare = bounced / (served + bounced);
     if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}`);
     const glmBusy = g.movedByCause.busy || 0;
     if (glmBusy) parts.push(`glm busy-bounced ${glmBusy}`);
-    const waited = c.waited + g.waited;
-    if (waited) parts.push(`busy-bounce waits ${waited} (avg ${((c.waitMs + g.waitMs) / waited / 1000).toFixed(1)}s)`);
+    const waited = total('waited');
+    if (waited) parts.push(`busy-bounce waits ${waited} (avg ${(total('waitMs') / waited / 1000).toFixed(1)}s)`);
 
     // RED — the first cause that applies, named with the account behind it.
-    const wtm = c.waitThenMoved + g.waitThenMoved;
+    const wtm = total('waitThenMoved');
     let red_ = null;
     if (!c.lowVolume && c.hit != null && c.hit < 0.5) red_ = `Claude ${pctTxt(c.hit)} on ${this._worstCacheAccount() || '?'}`;
     else if (!c.lowVolume && c.writeShare != null && c.writeShare > 0.6) red_ = `write share ${pctTxt(c.writeShare)} of cost on ${this._worstCacheAccount() || '?'}`;
@@ -1305,7 +1342,7 @@ export class TUI {
   _worstCacheAccount() {
     let worst = null;
     for (const a of this.am.accounts) {
-      if (a.enabled === false || a.type === 'provider') continue;
+      if (a.enabled === false || a.type === 'provider' || a.provider === 'codex') continue;
       const e = this._accountLoad(a)?.last15m?.efficiency;
       if (e && !e.lowVolume && e.hit != null && (!worst || e.hit < worst.hit)) worst = { name: a.name, hit: e.hit };
     }
@@ -1409,6 +1446,10 @@ export class TUI {
         'Opens a browser. Logging into an account that\'s already added (same user, same organization) RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Another organization of the same user, or a new user, is added as a new account.',
         () => this._doLogin(),
       );
+    } else if (k === 'c' && this.am.accounts.some(a => a.provider === 'codex')) {
+      this._startSelection('codexLogin');
+    } else if (k === 'r' && this.codexResetDetails && this.am.accounts.some(a => a.provider === 'codex' && !a.remote)) {
+      this._startSelection('codexResets');
     } else if (k === 'n' && this.am.accounts.length > 0) {
       this._startSelection('rename');
     } else if (k === 't' && this.am.accounts.length > 0) {
@@ -1445,7 +1486,7 @@ export class TUI {
   _addAccountOfType(typeId) {
     if (typeId === 'chatgpt') {
       this.mode = 'accounts';
-      this._confirm('Connect a ChatGPT account?', 'Choose a name and sign in with your browser.',
+      this._confirm('Connect ChatGPT?', 'Choose where to save the account, then sign in with your browser.',
         () => this._doChatGPTLogin());
       return;
     }
@@ -1510,8 +1551,7 @@ export class TUI {
       buf.push(`   ${bold(t.key)}  ${t.label.padEnd(26)}${dim(t.hint || '')}`);
     }
     buf.push('');
-    buf.push(dim('   Fixing an account that says "reauth"? Pick 1 and log in as that account.'));
-    buf.push(dim('   It repairs the existing row, it does not add a second one.'));
+    buf.push(dim('   Reconnect from Accounts: l for Claude, c for ChatGPT.'));
     buf.push('');
     // Kept verbatim from the deleted Providers panel — the only place that explained
     // BOTH credential sources and the gcloud command a non-owner needs.
@@ -1705,10 +1745,16 @@ export class TUI {
 
   async _toggleChatGPTSessionRouting() {
     const next = this.am._sessionRoutingFor('codex') === 'same-provider' ? 'cross-provider' : 'same-provider';
-    const scheduler = { ...this.config.scheduler };
+    const previous = this.config.scheduler;
+    const scheduler = { ...previous };
     scheduler.providers = { ...scheduler.providers, codex: { ...scheduler.providers?.codex, sessionRouting: next } };
-    await this.saveConfig({ ...this.config, scheduler });
     this.config.scheduler = scheduler;
+    try {
+      await this.saveConfig(this.config);
+    } catch (error) {
+      if (this.config.scheduler === scheduler) this.config.scheduler = previous;
+      throw error;
+    }
     this.am.scheduler.providers = { ...this.am.scheduler.providers, codex: scheduler.providers.codex };
     this._addLog(next === 'same-provider' ? 'ChatGPT sessions stay on ChatGPT' : 'ChatGPT sessions can switch providers');
   }
@@ -1925,6 +1971,11 @@ export class TUI {
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doRename(targetIdx, String(value || '').trim());
+      } else if (this.selAction === 'codexLogin') {
+        this._confirm('Reconnect ChatGPT?', `Open browser for "${account.remote?.remoteName || account.name}".`,
+          () => this._doChatGPTLogin(account), 'accounts');
+      } else if (this.selAction === 'codexResets') {
+        this._showCodexResets(account).catch(error => this._addLog(`Could not read resets: ${error.message}`));
       } else if (this.selAction === 'cap') {
         const targetIdx = this.selIdx;
         const current = account.name;
@@ -2002,6 +2053,8 @@ export class TUI {
       .map(index => ({ account: this.am.accounts[index], index }))
       .filter(({ account }) => {
         if (action === 'prefer') return account.type !== 'provider' && account.enabled;
+        if (action === 'codexLogin') return account.provider === 'codex';
+        if (action === 'codexResets') return account.provider === 'codex' && !account.remote;
         // Enable/disable works on EVERY row — including a session-created provider,
         // where it is the DURABLE action (exportRuntimeProviders persists `enabled`,
         // and the header path never re-enables a row the user benched).
@@ -2042,18 +2095,20 @@ export class TUI {
     }
   }
 
-  _confirm(title, detail, cb) {
+  _confirm(title, detail, cb, returnMode = 'normal') {
     this.mode = 'confirm';
     this.confirmTitle = title;
     this.confirmDetail = detail;
     this.confirmCb = cb;
+    this.confirmReturnMode = returnMode;
   }
 
   _clearConfirm() {
-    this.mode = 'normal';
+    this.mode = this.confirmReturnMode;
     this.confirmTitle = '';
     this.confirmDetail = '';
     this.confirmCb = null;
+    this.confirmReturnMode = 'normal';
   }
 
   // ── account operations ─────────────────────────────
@@ -2072,24 +2127,117 @@ export class TUI {
     }
   }
 
-  async _doChatGPTLogin() {
+  async _doChatGPTLogin(account) {
     const wasRunning = this.running;
+    setConsoleStdoutSuppressed(true);
     try {
       if (wasRunning) await this.handOff();
-      const name = String(await this._ask('ChatGPT account name (use the same name to reconnect): ') || '').trim();
-      if (!name) return;
+      const name = account
+        ? account.remote?.remoteName || account.name
+        : String(await this._ask('ChatGPT account name (optional): ') || '').trim();
       const cli = fileURLToPath(new URL('./index.js', import.meta.url));
-      const child = spawn(process.execPath, [cli, 'login', '--codex', '--name', name], { stdio: 'inherit' });
+      const child = spawn(process.execPath, codexLoginArgs(cli, name, account), { stdio: 'inherit' });
       const [code] = await once(child, 'exit');
       if (code !== 0) {
         this._addLog('ChatGPT sign-in did not finish');
         return;
       }
       await this.syncAccounts?.();
-      await Promise.all((this.am.poolLinks || []).map(link => link.poll()));
+      await Promise.allSettled((this.am.poolLinks || []).map(link => link.poll()));
     } finally {
+      setConsoleStdoutSuppressed(false);
       if (wasRunning) this.start();
     }
+  }
+
+  async _showCodexResets(account, notice = '') {
+    const state = { account, credits: [], selected: 0, busy: true, notice };
+    this.codexResets = state;
+    this.mode = 'codexResets';
+    this.forceRender();
+    try {
+      const result = await this.codexResetDetails(account.name);
+      if (result.error) state.notice = `Could not read resets: ${result.error}`;
+      else state.credits = result.credits || [];
+    } catch (error) {
+      state.notice = `Could not read resets: ${error.message}`;
+    } finally {
+      state.busy = false;
+      if (this.codexResets === state) this.forceRender();
+    }
+  }
+
+  _keyCodexResets(k) {
+    const state = this.codexResets;
+    if (k === 'esc' || k === 'q') {
+      this.codexResets = null;
+      this.mode = 'accounts';
+      return;
+    }
+    if (!state || state.busy) return;
+    if (k === 'up' || k === 'k') state.selected = Math.max(0, state.selected - 1);
+    else if (k === 'down' || k === 'j') state.selected = Math.min(Math.max(0, state.credits.length - 1), state.selected + 1);
+    else if (k === 'r') {
+      this._showCodexResets(state.account).catch(error => this._addLog(`Could not read resets: ${error.message}`));
+    } else if (k === 'enter' && this.redeemCodexReset) {
+      const credit = state.credits[state.selected];
+      if (state.account.enabled === false || !canRedeemCodexCredit(credit)) {
+        state.notice = 'This reset cannot be redeemed.';
+        return;
+      }
+      this._confirm('Redeem this reset?', 'Uses one banked reset and refreshes eligible Codex limits.',
+        async () => {
+          state.busy = true;
+          let notice;
+          try {
+            const result = await this.redeemCodexReset(state.account.name, credit.id);
+            notice = result.redeemed ? 'Reset redeemed.' : `Reset not redeemed: ${result.reason || result.error || 'provider declined'}`;
+          } catch (error) {
+            notice = `Could not redeem reset: ${error.message}`;
+          }
+          if (this.codexResets === state) await this._showCodexResets(state.account, notice);
+        }, 'codexResets');
+    } else if (k === 'a' && this.onSetCodexAutoRedeem) {
+      const enabled = this.config?.codexAutoRedeemResets === true;
+      this._confirm(enabled ? 'Turn off automatic resets?' : 'Allow automatic resets?',
+        enabled ? 'Banked resets remain available for manual use.' : 'Allows the pool to redeem eligible banked Codex resets.',
+        async () => {
+          try {
+            await this.onSetCodexAutoRedeem(!enabled);
+            if (this.config) this.config.codexAutoRedeemResets = !enabled;
+            state.notice = enabled ? 'Automatic resets off.' : 'Automatic resets on.';
+          } catch (error) {
+            state.notice = `Could not save settings: ${error.message}`;
+          }
+          this.forceRender();
+        }, 'codexResets');
+    }
+  }
+
+  _renderCodexResets(maxRows) {
+    const state = this.codexResets;
+    const out = ['', ` ${bold('Codex resets')}  ${state.account.name}`];
+    const summary = state.account.quota?.codexResetCredits ?? state.account.codexResetCredits;
+    if (Number.isInteger(summary?.available) && Number.isInteger(summary?.applicable)) {
+      out.push(` ${summary.available} banked · ${summary.applicable} redeemable now`);
+    }
+    const quota = state.account.quota;
+    const windows = [];
+    if (quota.unified5h != null) windows.push(`5h ${quotaLabel(quota.unified5h, quota.unified5hReset, 20)}`);
+    if (quota.unified7d != null) windows.push(`Weekly ${quotaLabel(quota.unified7d, quota.unified7dReset, 20)}`);
+    if (windows.length) out.push(` ${windows.join('  ·  ')}`);
+    if (state.notice) out.push(` ${state.notice.replace(/[\x00-\x1f\x7f-\x9f]/g, '')}`);
+    if (state.busy) out.push(dim(' Reading reset inventory…'));
+    else if (state.credits.length === 0) out.push(dim(' No reset details available'));
+    const visible = Math.max(1, maxRows - out.length);
+    const start = Math.max(0, state.selected - visible + 1);
+    for (const [offset, credit] of state.credits.slice(start, start + visible).entries()) {
+      const title = String(credit.title || 'Usage reset').replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 34);
+      const expiry = credit.expiresAt == null ? '' : formatReset(credit.expiresAt);
+      const status = canRedeemCodexCredit(credit) ? 'Available' : 'Unavailable';
+      out.push(` ${start + offset === state.selected ? '›' : ' '} ${title}  ${dim(status + (expiry ? ' · expires in ' + expiry : ''))}`);
+    }
+    return out;
   }
 
   // Browser OAuth login — the SAME flow re-authenticates an existing account (matched
@@ -2862,6 +3010,15 @@ export class TUI {
       this._writeScreen(lines, W, H);
       return;
     }
+    if (this.mode === 'codexResets') {
+      const maxRows = H - lines.length - 2;
+      lines.push(...this._renderCodexResets(maxRows).slice(0, Math.max(0, maxRows)));
+      while (lines.length < H - 2) lines.push('');
+      lines.push(' ' + dim('─'.repeat(W - 2)));
+      lines.push(this._renderFooter());
+      this._writeScreen(lines, W, H);
+      return;
+    }
 
     // ── Accounts
     if (this.am.accounts.length === 0) {
@@ -2891,13 +3048,17 @@ export class TUI {
       // routing/index-keyed actions are unaffected). Selection navigation shares the
       // SAME order via _selectableIndexes → _displayOrder.
       let hidden = 0;
+      const showSelectedCodex = this.mode === 'select'
+        && (this.selAction === 'codexLogin' || this.selAction === 'codexResets');
       for (const i of this._displayOrder()) {
         // Same key also hides local copies guarded by the duplicate guard — they are
         // effectively off (owner 2026-10-29: "should it hide the local ones that are
         // in the cloud... they're effectively disabled as well"). No separate key.
         // One predicate shared with the Capacity page so the two row orders cannot drift.
-        if (this.am.hiddenOnMainScreen(this.am.accounts[i], this.hideDisabled)) { hidden++; continue; }
-        lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession));
+        const account = this.am.accounts[i];
+        const hiddenByChoice = this.hideDisabled && !(showSelectedCodex && account.provider === 'codex');
+        if (this.am.hiddenOnMainScreen(account, hiddenByChoice)) { hidden++; continue; }
+        lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession, W));
       }
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
@@ -2948,7 +3109,8 @@ export class TUI {
 
     // Completed log
     // 2 = separator + footer; confirm adds its detail line; updates adds its detail block.
-    const footerH = this.mode === 'confirm' ? 3
+    const codexAccountActions = this.mode === 'accounts' && this.am.accounts.some(a => a.provider === 'codex');
+    const footerH = this.mode === 'confirm' || codexAccountActions ? 3
       : this.mode === 'updates' ? 2 + this._renderUpdatesDetail().length
       : this.mode === 'routing' ? 2 + this._renderRoutingDetail().length
       : 2;
@@ -2972,6 +3134,10 @@ export class TUI {
     // ── Footer
     lines.push(' ' + dim('─'.repeat(W - 2)));
     if (this.mode === 'confirm') lines.push(` ${this.confirmDetail}`);
+    if (codexAccountActions) {
+      const resets = this.codexResetDetails && this.am.accounts.some(a => a.provider === 'codex' && !a.remote);
+      lines.push(` ${bold('c')} Reconnect ChatGPT${resets ? `  ${bold('r')} Codex resets` : ''}`);
+    }
     // Updates DETAIL — without this, pressing 'u' changed only the one-line footer at the
     // very bottom of a busy screen, which reads as "nothing happened" (reported twice).
     // Every other mode draws something visible; this one must too.
@@ -3008,12 +3174,16 @@ export class TUI {
       return;   // frame owed: written once, on 'drain'
     }
     this._forceNext = false;
+    // A queued frame can sit below Node's writable high-water mark, so
+    // 'drain' will not fire. Keep one outstanding frame and let the periodic
+    // renderer retry once the terminal accepts it.
+    if (this._nb && process.stdout.writableLength > 0) return;
     this._lastFrame = buf;
     this._lastFullWriteAt = Date.now();
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true) {
+  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true, width = Infinity) {
     let a = this.am.accounts[idx];
     // A row benched by the duplicate guard renders the CLOUD's live copy (status,
     // bars, in-flight, request counts) — never the stale local snapshot. Identity
@@ -3088,7 +3258,7 @@ export class TUI {
     // account. Don't mislabel healthy accounts as per-account "paused": show
     // the one running the recovery probe as "probing" and the rest "waiting"
     // (the pool-wide throttle banner above conveys the cause).
-    const upstreamBlocking = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
+    const upstreamBlocking = a.type !== 'provider' && a.provider !== 'codex' && this.am._isUpstreamThrottleBlocking?.();
     // A mirror row whose link is down/stale is benched by syncRemoteMirrors with
     // enabled=false — show it as cloud-unreachable, never as "disabled" (which reads
     // as "I switched this off"). _cloud/_cloudOk were never set; key on a.remote.
@@ -3197,7 +3367,9 @@ export class TUI {
     // (expiresAt==null || expiresAt>now) — a frozen `expired` flag never keeps a
     // dead reset on screen (pre-mortem #18).
     let resetsCell;
-    {
+    if (a.provider === 'codex') {
+      resetsCell = codexResetCells(a);
+    } else {
       const now = Date.now();
       let general = 0;       // resetsLeft of general-weekly grants + live cards
       let scoped = 0;        // resetsLeft of model-scoped grants (tagged F)
@@ -3294,7 +3466,7 @@ export class TUI {
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
 
-    if (q.unified5h != null || q.unified7d != null) {
+    if (a.provider === 'codex' || q.unified5h != null || q.unified7d != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
@@ -3313,15 +3485,29 @@ export class TUI {
     const bars = [];
     // The Fable bar comes first, before the session and weekly bars, on every row
     // type, so each bar starts at the same offset on OAuth, API-key and provider rows.
-    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
-    if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
-    if (showBoth) {
-      // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
-      // both render as an empty bar. Say which, so a healthy uncapped account
-      // (privacy@gomokka.com, measured 2026-08-06) doesn't read as broken.
-      bars.push((r2 == null && q.weeklyAbsent)
-        ? `${l2} ${emptyBar('none', bw)}`
-        : `${l2} ${bar(r2, bw, t2)}`);
+    const barCount = Number(showFable) + Number(showSession) + Number(showBoth);
+    const barsFit = width >= BAR_START + barCount * BAR_MIN_W + (barCount - 1) * BAR_GAP;
+    if (a.provider === 'codex' && !barsFit) {
+      // With the fixed account columns, an 80-column terminal only has five
+      // cells for the reading. Put the percentage before an optional long label.
+      const used = r2 ?? r1;
+      if (used != null) {
+        const pct = `${Math.round(used * 100)}%`;
+        const label = r2 != null ? 'Wk' : '5h';
+        const space = width - (BAR_START - 4);
+        bars.push(space >= pct.length + label.length ? label + pct : pct);
+      } else bars.push(dim('—'));
+    } else {
+      if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+      if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
+      if (showBoth) {
+        // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
+        // both render as an empty bar. Say which, so a healthy uncapped account
+        // (privacy@gomokka.com, measured 2026-08-06) doesn't read as broken.
+        bars.push((r2 == null && q.weeklyAbsent)
+          ? `${l2} ${emptyBar('none', bw)}`
+          : `${l2} ${bar(r2, bw, t2)}`);
+      }
     }
     let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${bars.join('  ')}`;
     const weekly = weeklyPolicyText(this.am, a);
@@ -3844,6 +4030,11 @@ export class TUI {
       }
       case 'accounts':
         return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
+      case 'codexResets': {
+        const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.config?.codexAutoRedeemResets ? 'on' : 'off'}` : '';
+        const redeem = this.redeemCodexReset ? `  ${bold('Enter')} Redeem` : '';
+        return ` ${dim('↑↓')} Select${redeem}  ${bold('r')} Refresh${auto}  ${bold('Esc')} Back`;
+      }
       case 'addtype':
         return ` ${bold('1')}-${bold('5')} pick a type  ${bold('Esc')} Back`;
       case 'routing': {
@@ -3877,6 +4068,10 @@ export class TUI {
         return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('Esc')} Back`;
       }
       case 'select': {
+        if (this.selAction === 'codexLogin' || this.selAction === 'codexResets') {
+          const action = this.selAction === 'codexLogin' ? 'Reconnect' : 'View resets';
+          return ` ${dim('↑↓')} Select Codex account  ${bold('Enter')} ${action}  ${bold('Esc')} Cancel`;
+        }
         const act = this.selAction === 'prefer'
           ? 'prefer'
           : this.selAction === 'toggle'

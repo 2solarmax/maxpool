@@ -35,8 +35,9 @@ function inputPart(block) {
  * calls and outputs as matching Responses items. Provider-owned state can travel
  * as visible context, and opaque thinking is kept out of the request.
  */
-export function toOpenAIRequest(json, model) {
+export function toOpenAIRequest(json, model, { native = false } = {}) {
   const toolNames = new Map();
+  const functionScope = native ? {} : { namespace: scope };
   const tools = (json.tools || []).filter(tool => tool.input_schema && typeof tool.name === 'string').map(tool => {
     const name = wireName(tool.name);
     toolNames.set(name, tool.name);
@@ -54,11 +55,14 @@ export function toOpenAIRequest(json, model) {
       }
       content = [];
     };
+    if (message.role === 'system' && typeof message.output_config?.directives === 'string' && message.output_config.directives) {
+      content.push({ type: 'input_text', text: message.output_config.directives });
+    }
     for (const block of blocks(message.content)) {
       if (!block || omitted.has(block.type)) continue;
       if (block.type === 'tool_use' && block.id && block.name) {
         flush();
-        input.push({ type: 'function_call', call_id: wireCallId(block.id), namespace: scope,
+        input.push({ type: 'function_call', call_id: wireCallId(block.id), ...functionScope,
           name: wireName(block.name), arguments: JSON.stringify(block.input ?? {}) });
       } else if (block.type === 'tool_result' && block.tool_use_id) {
         flush();
@@ -77,15 +81,15 @@ export function toOpenAIRequest(json, model) {
     flush();
   }
   const body = { model, input, store: false, stream: true };
-  // The ChatGPT plan HTTP endpoint accepts function namespaces as top-level tools.
-  if (tools.length) body.tools = [{ type: 'namespace', name: scope, description: 'Tools executed by Claude Code.', tools }];
-  if (instructions) body.instructions = instructions;
+  // Native Codex uses flat function declarations, as in CLIProxyAPI's translator.
+  if (tools.length) body.tools = native ? tools : [{ type: 'namespace', name: scope, description: 'Tools executed by Claude Code.', tools }];
+  if (instructions || native) body.instructions = instructions || 'You are a helpful coding assistant.';
   const effort = json.output_config?.effort;
   if (explicitEfforts.has(effort)) body.reasoning = { effort };
   if (tools.length && json.tool_choice?.type === 'none') body.tool_choice = 'none';
   if (tools.length && json.tool_choice?.type === 'any') body.tool_choice = 'required';
   if (json.tool_choice?.type === 'tool' && toolNames.has(wireName(json.tool_choice.name))) body.tool_choice = {
-    type: 'function', namespace: scope, name: wireName(json.tool_choice.name),
+    type: 'function', ...functionScope, name: wireName(json.tool_choice.name),
   };
   if (json.tool_choice?.disable_parallel_tool_use) body.parallel_tool_calls = false;
   return { body, toolNames };
@@ -109,9 +113,11 @@ async function* readEvents(body) {
 
 function usageOf(response) {
   const usage = response?.usage || {};
+  const input = usage.input_tokens || 0;
   const cached = usage.input_tokens_details?.cached_tokens || 0;
-  return { input_tokens: Math.max(0, (usage.input_tokens || 0) - cached),
-    cache_read_input_tokens: cached, cache_creation_input_tokens: 0, output_tokens: usage.output_tokens || 0 };
+  const created = Math.min(Math.max(0, input - cached), usage.input_tokens_details?.cache_write_tokens || 0);
+  return { input_tokens: Math.max(0, input - cached - created),
+    cache_read_input_tokens: cached, cache_creation_input_tokens: created, output_tokens: usage.output_tokens || 0 };
 }
 
 function failureStatus(error) {
@@ -147,10 +153,13 @@ function jsonResponse(body, status, headers) {
  * meaningful event before releasing the response to the existing retry layer,
  * so early structured quota failures can take the same failover path as HTTP 429.
  */
-export async function fromOpenAIResponse(response, { model, stream, toolNames }) {
+export async function fromOpenAIResponse(response, { model, stream, toolNames, upstreamModel }) {
   const headers = normalizedHeaders(response.headers);
   if (!response.ok) {
     const error = (await response.json().catch(() => null))?.error;
+    if (typeof error?.code === 'string' && /^[a-z0-9_]{1,80}$/.test(error.code)) {
+      headers.set('x-maxpool-openai-error-code', error.code);
+    }
     return jsonResponse(errorEvent(response.status, error), response.status, headers);
   }
   // The ChatGPT plan endpoint can return SSE with no Content-Type header.
@@ -162,24 +171,34 @@ export async function fromOpenAIResponse(response, { model, stream, toolNames })
   }
   const events = readEvents(response.body);
   let id;
+  let servedModel;
   let first;
   for (;;) {
     const next = await events.next();
     if (next.done) return jsonResponse(errorEvent(502), 502, headers);
     first = next.value;
     id ||= first.response?.id;
+    servedModel ||= first.response?.model;
     if (first.type === 'error' || first.type === 'response.failed') {
       await events.return();
       const error = first.response?.error || first;
       const status = failureStatus(error);
+      if (typeof error?.code === 'string' && /^[a-z0-9_]{1,80}$/.test(error.code)) {
+        headers.set('x-maxpool-openai-error-code', error.code);
+      }
       return jsonResponse(errorEvent(status, error), status, headers);
     }
     if (first.type === 'response.output_item.added' && first.item?.type === 'function_call') break;
     if (first.type === 'response.output_text.delta' || first.type === 'response.refusal.delta'
       || first.type === 'response.completed' || first.type === 'response.incomplete') break;
   }
-  const message = { id: 'msg_' + String(id || 'openai').replace(/^resp_/, ''), type: 'message',
+  const actualModel = servedModel || upstreamModel;
+  const tagged = typeof actualModel === 'string' && /^[a-zA-Z0-9._-]{1,100}$/.test(actualModel);
+  const upstreamId = String(id || 'openai').replace(/^resp_/, '');
+  const messageId = tagged ? 'msg_maxpool_codex_' + Buffer.from(actualModel).toString('hex') + '_' + upstreamId : 'msg_' + upstreamId;
+  const message = { id: messageId, type: 'message',
     role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: usageOf() };
+  if (tagged) headers.set('x-maxpool-served-model', actualModel);
   const converted = convertEvents(events, first, message, toolNames);
   if (stream) {
     headers.set('content-type', 'text/event-stream');

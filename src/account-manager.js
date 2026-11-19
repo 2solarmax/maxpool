@@ -1,4 +1,7 @@
 import { refreshOpenAIToken } from './openai-login.js';
+import { refreshNativeCodexToken } from './codex-native.js';
+import { codexModelFor } from './codex-model-routing.js';
+import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint, sameUser, sameAccountIdentity } from './oauth.js';
 import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity } from './pool-link.js';
 import { appendEventLog } from './event-log.js';
@@ -420,7 +423,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // drops until the next probe sweep re-learns it. The probe still rewrites it on
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
-  'providerQuotaSource', 'lastProbeOkAt', 'noPlan',
+  'providerQuotaSource', 'lastProbeOkAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel',
 ];
 
 /** The sticky busy-wait budget actually in force, and where it comes from — ONE resolver
@@ -526,6 +529,7 @@ const COLD_HOLD_MIN_BYTES = 150_000;
  *  family — z.ai's cache is shared across that provider's accounts, so a zai→zai hop
  *  re-writes ~nothing while a Claude↔provider hop re-writes the whole prompt. */
 const accountFamily = (a) => (isClaudeAccount(a) ? 'claude' : String(a?.provider || 'provider'));
+const efficiencyProvider = account => isClaudeAccount(account) ? 'claude' : account.provider === 'codex' ? 'codex' : 'glm';
 const IDENTITY_WINDOW_MS = 15 * 60_000;
 const IDENTITY_MAX_SAMPLES = 4000;
 const IDENTITY_MIN_PER_SESSION = 8;
@@ -739,9 +743,11 @@ export class AccountManager {
     }
     this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
     this._refreshOpenAIToken = dependencies.refreshOpenAIToken || refreshOpenAIToken;
+    this._refreshNativeCodexToken = dependencies.refreshNativeCodexToken || refreshNativeCodexToken;
     // Named-caller request attribution (team pools): callerName → requests served.
     // Server-side (not TUI-side) so headless pools feed the web screen too.
     this.callerCounts = new Map();
+    this.recentMessageRoutes = new Map();
     // Per-person usage analytics (owner 2026-10-29; red-team verdict: persisted
     // buckets, requests AND tokens, never the rotating event log). caller -> {
     //   hours: { 'YYYY-MM-DDTHH' UTC: {req, tok} } (rolling 48)
@@ -763,6 +769,10 @@ export class AccountManager {
       accountUuid: acct.accountUuid || null,
       organizationUuid: acct.organizationUuid || null,
       oauthClientId: acct.oauthClientId || null,
+      codexAuth: acct.codexAuth || null,
+      codexAccountId: acct.codexAccountId || null,
+      codexModels: acct.codexModels || null,
+      autoRedeemReset: acct.autoRedeemReset,
       credential: acct.accessToken || acct.authToken || acct.apiKey,
       upstream: acct.upstream || null,
       authHeader: acct.authHeader || null,
@@ -974,7 +984,7 @@ export class AccountManager {
       // finite hold. It must NEVER contribute the WEEKLY reset (days) — that is the
       // multi-day-hang the bounded path fences off; see the !fairnessOnlyBlock
       // guards on the weekly branches below.
-      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, model: requestInfo.model, now })) {
+      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, model: this._availabilityModel(account, requestInfo), now })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -983,15 +993,15 @@ export class AccountManager {
           matchingRoutes,
         };
       }
-      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
+      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: this._availabilityModel(account, requestInfo), now })) {
         soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
         if (!boundedHoldCause) boundedHoldCause = 'queued_behind_fairness';
         continue;
       }
 
-      const retry = this._retryInfo(account, requestInfo.model, now);
+      const retry = this._retryInfo(account, this._availabilityModel(account, requestInfo), now);
       note(retry.cause);
-      if (!fairnessOnlyBlock && retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
+      if (!fairnessOnlyBlock && retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: this._availabilityModel(account, requestInfo) })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -1111,7 +1121,7 @@ export class AccountManager {
       // (_selectNext's coolBest), matching what the acquire path would actually do.
       if (this._recentlyRefusedBusy(account, now)
         && (!this._holdsRequest(account, requestInfo) || requestInfo._busyExcluded?.has(account.name))) return false;
-      return this._isAvailable(account, { ...options, model: requestInfo.model, now });
+      return this._isAvailable(account, { ...options, model: this._availabilityModel(account, requestInfo), now });
     }));
   }
 
@@ -1548,7 +1558,7 @@ export class AccountManager {
   /** Cache / move / bounce figures for one account over a window (getStatus + TUI only —
    *  never on the scoring path). Additive sums plus derived hit share. */
   _efficiencySummary(account, windowMs, now = Date.now()) {
-    return finishEfficiency(this._efficiencyAcc(account, windowMs, now), isClaudeAccount(account) ? 'claude' : 'glm');
+    return finishEfficiency(this._efficiencyAcc(account, windowMs, now), efficiencyProvider(account));
   }
 
   _efficiencyAcc(account, windowMs, now = Date.now()) {
@@ -1615,7 +1625,7 @@ export class AccountManager {
   rowEfficiencySummary(account, windowKey = 'last15m', now = Date.now()) {
     const windowMs = efficiencyWindowMs(windowKey);
     const acc = account.remote ? this._mirrorEfficiencyAcc(account, windowKey, windowMs, now) : this._efficiencyAcc(account, windowMs, now);
-    return finishEfficiency(acc, isClaudeAccount(account) ? 'claude' : 'glm');
+    return finishEfficiency(acc, efficiencyProvider(account));
   }
 
   /** Overall efficiency, per provider, for the TUI / `maxpool status`: this pool's own
@@ -1625,15 +1635,18 @@ export class AccountManager {
    *  an edge busy wait shows up in p95. */
   efficiencyOverall(windowKey = 'last15m', now = Date.now(), { mirrors = true } = {}) {
     const windowMs = efficiencyWindowMs(windowKey);
-    const by = { claude: emptyEfficiency(), glm: emptyEfficiency() };
+    const by = { claude: emptyEfficiency(), glm: emptyEfficiency(), codex: emptyEfficiency() };
+    let hasCodex = false;
     for (const a of this.accounts) {
       if (a.enabled === false || (a.remote && !mirrors)) continue;
-      const tag = isClaudeAccount(a) ? 'claude' : 'glm';
+      const tag = efficiencyProvider(a);
+      if (tag === 'codex') hasCodex = true;
       const e = a.remote ? this._mirrorEfficiencyAcc(a, windowKey, windowMs, now) : this._efficiencyAcc(a, windowMs, now);
       addEfficiency(by[tag], e);
     }
-    const e2e = [...by.claude.e2e, ...by.glm.e2e];
+    const e2e = [...by.claude.e2e, ...by.glm.e2e, ...by.codex.e2e];
     return { claude: finishEfficiency(by.claude, 'claude'), glm: finishEfficiency(by.glm, 'glm'),
+      ...(hasCodex ? { codex: finishEfficiency(by.codex, 'codex') } : {}),
       e2eP50: pct(e2e, 0.5), e2eP95: pct(e2e, 0.95) };
   }
 
@@ -1698,10 +1711,17 @@ export class AccountManager {
   // weekly (Fable can be 100% while unified is 56%). A model-agnostic request (no
   // family) or an account with no scoped data fails OPEN (returns null), matching
   // prior behavior. Gate: is_active AND (severity critical OR util ≥ exhausted).
+  _availabilityModel(account, requestInfo) {
+    return account.provider === 'codex' ? codexModelFor(requestInfo, account) : requestInfo.model;
+  }
+
   _scopedExhausted(account, model) {
-    const fam = modelFamily(model);
+    const fam = account.provider === 'codex'
+      ? codexModelFor({ model, ...(/^gpt-|^o[1-9]/i.test(model) ? { openAIModel: model } : {}) }, account)
+      : modelFamily(model);
     if (!fam) return null;
-    const e = account.quota?.scopedWeekly?.[fam];
+    const scope = account.provider === 'codex' && account.quota.codexLimitByModel?.[fam];
+    const e = account.quota?.scopedWeekly?.[scope || fam];
     if (!e || e.isActive === false) return null;
     // Bench ONLY at genuine exhaustion (>= weeklyExhaustedThreshold). Anthropic
     // labels a scoped weekly `severity:'critical'` well before it's actually
@@ -1711,7 +1731,7 @@ export class AccountManager {
     // exhaustion is still caught by the threshold. Same predicate drives the TUI
     // `maxed` tag, so "maxed" renders iff the model is actually benched.
     const exhausted = e.utilization != null && e.utilization >= this.scheduler.weeklyExhaustedThreshold;
-    return exhausted ? { resetAt: e.resetAt || null, family: fam } : null;
+    return exhausted ? { resetAt: e.resetAt || null, family: scope || fam } : null;
   }
 
   /** Review r2 A: inside a request-scoped soft cooldown (new placements only). */
@@ -2704,7 +2724,7 @@ export class AccountManager {
       if (!this._isWarming(account, now)) continue;
       if (!this._matchesRequest(account, profile, requestInfo)) continue;
       // Genuinely-healthy target only (same bar as the hot-rebalance candidate scan).
-      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: this._availabilityModel(account, requestInfo), now })) continue;
       const score = this._scoreAccount(account, requestInfo, ctx);
       if (score < bestScore) {
         bestScore = score;
@@ -2745,7 +2765,7 @@ export class AccountManager {
       // would immediately be a 2x-burn destination. Peak-only ⇒ inert off-peak.
       if (this._peakTier(account, now) > 0) continue;
       // Genuinely-healthy alternatives only (normal/soft/unknown weekly + model headroom).
-      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: this._availabilityModel(account, requestInfo), now })) continue;
       const score = this._scoreAccount(account, requestInfo, scoringCtx);
       if (score < bestScore) {
         bestScore = score;
@@ -3036,7 +3056,7 @@ export class AccountManager {
       const pinned = this.accounts.find(a => a.name === requestInfo.pinnedAccountName);
       if (pinned && !excludedIndexes.has(pinned.index)
         && this._matchesRequest(pinned, profile, requestInfo)
-        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
+        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: this._availabilityModel(pinned, requestInfo), now })) {
         this.currentIndex = pinned.index;
         return pinned;
       }
@@ -3048,7 +3068,7 @@ export class AccountManager {
         { allowWeeklyReserve: true, allowWeeklyCritical: false },
         { allowWeeklyReserve: true, allowWeeklyCritical: true },
       ];
-      if (preferredPasses.some(options => this._isAvailable(preferred, { ...options, model: requestInfo.model, now }))) {
+      if (preferredPasses.some(options => this._isAvailable(preferred, { ...options, model: this._availabilityModel(preferred, requestInfo), now }))) {
         this.currentIndex = preferred.index;
         return preferred;
       }
@@ -3119,7 +3139,7 @@ export class AccountManager {
         const critUnlock = weeklyOptions.allowWeeklyCritical
           ? null
           : this._criticalUnlock(account, requestInfo, excludedIndexes, null, now);
-        if (!this._isAvailable(account, { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!critUnlock, model: requestInfo.model, now })) continue;
+        if (!this._isAvailable(account, { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!critUnlock, model: this._availabilityModel(account, requestInfo), now })) continue;
 
         const priority = this._effectivePriority(account, requestInfo, now);
         const score = this._scoreAccount(account, requestInfo, scoringCtx, critUnlock);
@@ -3316,7 +3336,7 @@ export class AccountManager {
     if (!account) return null;
     if (excludedIndexes.has(account.index)) return null;
     if (!this._matchesRequest(account, profile, requestInfo)) return null;
-    if (!this._isAvailable(account, { ...options, model: requestInfo.model })) return null;
+    if (!this._isAvailable(account, { ...options, model: this._availabilityModel(account, requestInfo) })) return null;
     return account;
   }
 
@@ -3388,7 +3408,7 @@ export class AccountManager {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
       const priority = this._priority(account);
-      return priority < boundPriority && this._isAvailable(account, { allowWeeklyReserve: true, model: requestInfo.model });
+      return priority < boundPriority && this._isAvailable(account, { allowWeeklyReserve: true, model: this._availabilityModel(account, requestInfo) });
     });
   }
 
@@ -3558,7 +3578,7 @@ export class AccountManager {
       // by the selection loop's _isAvailable, so the refusal reads 'unavailable' and the
       // edge moves at once instead of waiting out its budget on it.
       if ((account.inFlight || 0) >= this._pinBusyLimit(account)
-        && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
+        && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: this._availabilityModel(account, requestInfo) })) {
         requestInfo.pinRefusedBusy = true;
         requestInfo.pinRefusal = 'busy';
         return false;
@@ -3910,11 +3930,12 @@ export class AccountManager {
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
     const family = accountFamily(account);
-    const pinnedFamily = requestInfo.pinAccount ? null : this.pinnedSessionProvider(requestInfo);
-    const only = requestInfo.onlyProvider || pinnedFamily;
+    const pinnedFamily = this.pinnedSessionProvider(requestInfo);
+    const only = pinnedFamily === 'codex' ? pinnedFamily : requestInfo.onlyProvider || (requestInfo.pinAccount ? null : pinnedFamily);
     if (only && family !== only) return false;
     if (family === 'codex') {
       if ((!['all', 'codex'].includes(profile) && only !== 'codex') || requestInfo.codexCompatible !== true) return false;
+      if (!codexModelFor(requestInfo, account)) return false;
       return !account.remote || String(requestInfo.path || '').startsWith('/v1/');
     }
     if (profile === 'codex' || !this._matchesProfile(account, profile)) return false;
@@ -3982,6 +4003,12 @@ export class AccountManager {
       if (this._claudeFallbackFor(account.provider) === 'never') return false;
     }
     return true;
+  }
+
+  rememberMessageRoute(id, provider, model) {
+    if (!['codex', 'zai', 'kimi'].includes(provider) || typeof id !== 'string' || id.length > 300
+      || typeof model !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,100}$/i.test(model)) return;
+    lruSet(this.recentMessageRoutes, id, { provider, model });
   }
 
   _noteRequestPolicy(requestInfo = {}) {
@@ -4489,7 +4516,9 @@ export class AccountManager {
     requestInfo._servedAt = Date.now();
     const providerKey = accountFamily(account);
     const providerKeyForConversation = this._providerConversationKey(requestInfo);
-    if (providerKeyForConversation) lruSet(this.conversationProvider, providerKeyForConversation, providerKey);
+    if (providerKeyForConversation && !this.conversationProvider.has(providerKeyForConversation)) {
+      lruSet(this.conversationProvider, providerKeyForConversation, providerKey);
+    }
     const key = this._affinityKey(requestInfo);
     const prev = key ? this.conversationLastAccount.get(key) : undefined;
     this._noteHomeServed(requestInfo, account, prev);
@@ -4548,10 +4577,9 @@ export class AccountManager {
   }
 
   _providerConversationKey(requestInfo) {
-    if (requestInfo.clientThreadId && requestInfo.conversationHash) {
-      return `cc:${requestInfo.clientThreadId}:${requestInfo.conversationHash}`;
-    }
-    return this._homeKey(requestInfo);
+    const caller = requestInfo.caller;
+    const key = requestInfo.clientThreadId ? 'cc:' + requestInfo.clientThreadId : this._homeKey(requestInfo);
+    return key && caller && caller !== 'legacy-key' ? caller + ':' + key : key;
   }
 
   pinnedSessionProvider(requestInfo) {
@@ -4752,7 +4780,7 @@ export class AccountManager {
     if (excludedIndexes.has(last.index)) return 'released:excluded';
     if (!this._matchesRequest(last, requestInfo.profile || 'claude', requestInfo)) return 'released:not-eligible';
     const unlock = weeklyOptions.allowWeeklyCritical ? null : this._criticalUnlock(last, requestInfo, excludedIndexes, null, now);
-    const avail = { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!unlock, model: requestInfo.model, now };
+    const avail = { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!unlock, model: this._availabilityModel(last, requestInfo), now };
     if (!this._isAvailable(last, avail)) return `released:unavailable(${this._unavailableCause(last, now)})`;
     const gate = this._affinityRelease(last, unlock);
     if (gate) return `released:${gate}`;
@@ -4965,7 +4993,7 @@ export class AccountManager {
     for (const a of this.accounts) {
       if (excludedIndexes.has(a.index)) continue;
       if (!this._matchesRequest(a, profile, requestInfo)) continue;
-      if (!this._isAvailable(a, { allowWeeklyReserve: true, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
+      if (!this._isAvailable(a, { allowWeeklyReserve: true, allowWeeklyCritical: false, model: this._availabilityModel(a, requestInfo), now })) continue;
       const target = this._weeklyRawState(a) === 'reserve'
         ? this.scheduler.reserveConcurrencyTarget
         : this.scheduler.perAccountConcurrencyTarget;
@@ -5326,6 +5354,47 @@ export class AccountManager {
       account.probing = false;
       account.requalify = true;
     }
+  }
+
+  applyCodexUsageData(accountIndex, usage, { sentAt = Date.now(), partial = false } = {}) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage || usage.error || sentAt < (account.codexQuotaSentAt || 0)) return;
+    account.codexQuotaSentAt = sentAt;
+    const scopedWeekly = partial ? { ...account.quota.scopedWeekly } : {};
+    for (const bucket of usage.modelBuckets || []) {
+      const key = bucket.normalModelSlug || bucket.slug;
+      if (key) scopedWeekly[key] = { utilization: bucket.utilization, resetAt: bucket.resetAt, isActive: true };
+    }
+    if (!partial && Array.isArray(usage.modelBuckets) && !usage.fiveHour && !usage.sevenDay && !usage.modelBuckets.length) {
+      if (!account.quota.unified5hReset && !account.quota.unified7dReset) account.quota.weeklyAbsent = true;
+    }
+    this.applyUsageData(accountIndex, {
+      fiveHour: usage.fiveHour,
+      sevenDay: usage.sevenDay,
+      scopedWeekly,
+      ...(usage.sevenDay ? { weeklyAbsent: false } : {}),
+    }, { sentAt });
+    if (usage.resetCredits) {
+      const summary = { ...usage.resetCredits, checkedAt: Date.now() };
+      account.codexResetCredits = summary;
+      account.quota.codexResetCredits = summary;
+    }
+  }
+
+  applyCodexQuotaHeaders(accountIndex, headers, sentAt, model) {
+    const parsed = parseCodexQuota(headers);
+    const account = this.accounts[accountIndex];
+    const activeLimit = parseCodexActiveLimit(headers);
+    if (model && activeLimit && account) {
+      account.quota.codexLimitByModel = { ...account.quota.codexLimitByModel, [model]: activeLimit };
+    }
+    if (!Object.keys(parsed).length) return;
+    const window = (utilization, resetAt) => utilization == null ? null : { utilization, resetAt };
+    this.applyCodexUsageData(accountIndex, {
+      fiveHour: window(parsed.unified5h, parsed.unified5hReset),
+      sevenDay: window(parsed.unified7d, parsed.unified7dReset),
+      modelBuckets: parsed.modelBuckets,
+    }, { sentAt, partial: true });
   }
 
   /**
@@ -6318,9 +6387,9 @@ export class AccountManager {
       // generation guard can detect another writer having already advanced it.
       account._refreshedFrom = account.refreshToken;
       try {
-        const newTokens = account.provider === 'codex'
-          ? await this._refreshOpenAIToken(account)
-          : await this._refreshAccessToken(account.refreshToken);
+        const newTokens = account.codexAuth === 'native' ? await this._refreshNativeCodexToken(account)
+          : account.provider === 'codex' ? await this._refreshOpenAIToken(account)
+            : await this._refreshAccessToken(account.refreshToken);
         if (account.provider === 'codex' && account.refreshToken !== account._refreshedFrom) return true;
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
@@ -6437,6 +6506,10 @@ export class AccountManager {
       accountUuid: acctData.accountUuid || null,
       organizationUuid: acctData.organizationUuid || null,
       oauthClientId: acctData.oauthClientId || null,
+      codexAuth: acctData.codexAuth || null,
+      codexAccountId: acctData.codexAccountId || null,
+      codexModels: acctData.codexModels || null,
+      autoRedeemReset: acctData.autoRedeemReset,
       credential: acctData.accessToken || acctData.authToken || acctData.apiKey,
       upstream: acctData.upstream || null,
       authHeader: acctData.authHeader || null,
@@ -6975,6 +7048,9 @@ export class AccountManager {
       a.remoteUuid = ra.accountUuid || null;
       a.remoteOrganizationUuid = ra.organizationUuid || null;
       a.provider = ra.provider || a.provider;
+      a.codexAuth = ra.codexAuth || null;
+      a.codexModels = ra.codexModels || null;
+      a.codexResetCredits = ra.codexResetCredits || null;
       a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
       a.status = ra.status || 'active';
       a.refreshDead = Boolean(ra.refreshDead);
@@ -7263,6 +7339,9 @@ export class AccountManager {
         name: a.name,
         type: a.type,
         provider: a.provider,
+        ...(a.provider === 'codex' ? { codexAuth: a.codexAuth,
+          codexModels: a.quota?.codexModels ?? a.codexModels,
+          codexResetCredits: a.enabled === false ? null : a.quota?.codexResetCredits ?? a.codexResetCredits ?? null } : {}),
         enabled: a.enabled,
         poolBenchedBy: a.poolBenchedBy || null,
         remote: Boolean(a.remote),

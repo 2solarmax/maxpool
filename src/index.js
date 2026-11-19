@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import net from 'node:net';
-import { randomUUID } from 'node:crypto';
-import { DEFAULT_OPENAI_MODEL, listOpenAIModels, loginOpenAI } from './openai-login.js';
+import { listNativeCodexModels, loginNativeCodex } from './codex-native.js';
+import { validCodexCatalog } from './codex-model-routing.js';
+import { ResetCreditRedeemer } from './codex-reset-credits.js';
 
 // DUAL-STACK TUNING (2026-10-08). Node ≥20 enables happy-eyeballs with a 250ms
 // per-family attempt timeout. On networks where IPv6 is degraded-but-not-dead and the
@@ -20,6 +21,7 @@ import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setConsoleNonBlocking, reassertConsoleNonBlocking, appendEventLog, printFatal } from './event-log.js';
 import { sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
+import { fetchRemoteStatus } from './pool-link.js';
 import { SleepGuard } from './sleep-guard.js';
 import { controllingTerminalAlive } from './terminal-alive.js';
 import { AccountManager, combineEfficiency } from './account-manager.js';
@@ -867,6 +869,26 @@ async function serverWorkerCommand() {
   // render must be the only writer to the terminal, 2026-11-12).
   const uiLog = (...a) => console.log(...a);
   const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000, log: uiLog });
+  const codexReset = new ResetCreditRedeemer(accountManager, {
+    config,
+    isAvailable: (account, info) => accountManager._isRequestCompatible(account, info.profile, info)
+      && accountManager._isAvailable(account, { model: accountManager._availabilityModel(account, info), allowWeeklyReserve: true, allowWeeklyCritical: true }),
+    applyUsage: (account, usage) => {
+      if (accountManager.accounts[account.index] === account) accountManager.applyCodexUsageData(account.index, usage);
+    },
+    transactState: async update => {
+      if (!hasLease) throw new Error('Codex resets run on the primary worker');
+      let value;
+      await atomicConfigUpdate(disk => {
+        if (!hasLease) throw new Error('Codex resets run on the primary worker');
+        const result = update(disk.codexResetState);
+        disk.codexResetState = result.state;
+        value = result.value;
+      });
+      return value;
+    },
+  });
+  const owningCodex = name => accountManager.accounts.find(a => a.name === name && a.codexAuth === 'native' && !a.remote && !a.poolBenchedBy);
   // Tell the AM the probe cadence so the TUI can flag a scoped/provider tag whose
   // background probe has gone stale (> 3× interval since last success).
   accountManager.quotaProbeIntervalMs = probeSeconds * 1000;
@@ -1076,6 +1098,12 @@ async function serverWorkerCommand() {
   // A second signal forces an immediate exit. Override via config.shutdown.drainTimeoutMs.
   const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
   const hooks = {
+    redeemCodexForRequest: info => {
+      if (!hasLease || config.codexAutoRedeemResets !== true) return null;
+      const candidates = accountManager.accounts.filter(account => account.codexAuth === 'native' && !account.remote
+        && accountManager._isRequestCompatible(account, info.profile, info));
+      return codexReset.maybeRedeemForPool(candidates, info);
+    },
     onRequestStart: (id, info) => {
       const accepted = restartController.requestStarted(id);
       if (accepted) tui?.onRequestStart(id, info);
@@ -1391,6 +1419,13 @@ async function serverWorkerCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config,
+      codexResetDetails: name => codexReset.readDetails(owningCodex(name)),
+      redeemCodexReset: (name, creditId) => codexReset.manualRedeem(owningCodex(name), creditId),
+      onSetCodexAutoRedeem: async enabled => {
+        if (!hasLease) throw new Error('Codex resets run on the primary worker');
+        await atomicConfigUpdate(disk => { disk.codexAutoRedeemResets = enabled === true; });
+        config.codexAutoRedeemResets = enabled === true;
+      },
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         diskConfig.routing = {
           mode: config.routing?.mode || 'automatic',
@@ -2073,62 +2108,73 @@ async function loginChatGPTCommand() {
   try {
     const config = await loadOrCreateConfig();
     const requestedName = argValue('--name')?.trim();
-    const localPrior = requestedName ? config.accounts.find(account => account.name === requestedName
-      && account.provider === 'codex') : null;
+    const existing = requestedName && config.accounts.find(account => account.name === requestedName
+      && account.provider === 'codex');
+    const localPrior = !args.includes('--cloud') && !argValue('--pool') ? existing : null;
     const plan = await chooseCliLoginPlan(config, localPrior);
     if (plan.action === 'fail') throw new Error(plan.message);
-    let hostId;
-    let prior;
-    if (plan.action === 'local') {
-      await atomicConfigUpdate(disk => { hostId = disk.chatgptHostId ||= `urn:uuid:${randomUUID()}`; });
-      prior = localPrior;
-    } else {
+    let prior = localPrior;
+    if (plan.action === 'cloud') {
       const pool = plan.pool;
       const route = new URL(String(pool.url).replace(/\/+$/, '') + '/maxpool/chatgpt-login');
+      route.searchParams.set('native', '1');
       if (requestedName) route.searchParams.set('name', requestedName);
       const result = await fetch(route, {
         headers: { 'x-api-key': pool.key }, redirect: 'error', signal: AbortSignal.timeout(20_000),
       });
       if (result.status === 409) throw new Error('That account name is already used on the team pool. Choose a different name.');
-      if (!result.ok) throw new Error(`Team pool returned HTTP ${result.status}. Check that it supports ChatGPT sign-in.`);
-      ({ hostId, prior } = await result.json());
-      if (typeof hostId !== 'string' || !hostId.startsWith('urn:uuid:')) {
-        throw new Error('The team pool did not return a ChatGPT host ID');
-      }
+      if (!result.ok) throw new Error('The team pool could not prepare Codex sign-in (HTTP ' + result.status + ').');
+      const capabilities = await result.json();
+      if (capabilities.nativeCodex !== true) throw new Error('Update the team pool to a MaxPool release that supports native Codex sign-in.');
+      prior = capabilities.prior;
     }
-    const { profile, creds } = await loginOpenAI({ hostId, prior });
-    const models = await listOpenAIModels(creds.accessToken);
-    const requestedModel = argValue('--model') || prior?.model;
-    if (requestedModel && !models.includes(requestedModel)) {
-      throw new Error(`This ChatGPT account does not list ${requestedModel}. Available models: ${models.join(', ')}`);
+    const { profile, creds } = await loginNativeCodex({ prior: prior?.codexAuth === 'native' ? prior : null });
+    const catalog = await listNativeCodexModels(creds);
+    if (!validCodexCatalog(catalog.models)) throw new Error('This Codex account returned no eligible models.');
+    creds.codexModels = catalog.models;
+    const requestedModel = argValue('--model');
+    if (requestedModel && !creds.codexModels.some(model => model.slug === requestedModel)) {
+      throw new Error('This Codex account does not list ' + requestedModel + '.');
     }
-    creds.model = requestedModel || (models.includes(DEFAULT_OPENAI_MODEL) ? DEFAULT_OPENAI_MODEL
-      : models.find(model => model.startsWith('gpt-')) || models[0]);
-    if (!creds.model) throw new Error('This ChatGPT account returned no available models');
-    let name = (requestedName || `ChatGPT ${profile.email || profile.accountUuid.slice(0, 8)}`)
+    if (requestedModel) creds.model = requestedModel;
+    let name = (requestedName || 'ChatGPT ' + (profile.email || profile.accountUuid.slice(0, 8)))
       .replace(/[\x00-\x1f\x7f]/g, '').slice(0, 120);
     if (plan.action === 'cloud') {
+      if (config.accounts.some(account => sameAccountIdentity(account, profile))) {
+        throw new Error('This Codex account already lives on this Mac. Reconnect it locally.');
+      }
       const pool = plan.pool;
       const result = await sendLoginToPool({ url: pool.url, key: pool.key, name, profile, creds });
       if (!result.ok) throw new Error(result.error);
-      console.log(`Connected "${result.name}" to "${pool.name}" using ${creds.model}.`);
-    } else {
-      await atomicConfigUpdate(disk => {
-        const existing = disk.accounts.find(a => sameAccountIdentity(a, profile));
-        if (existing) {
-          Object.assign(existing, creds);
-          name = existing.name;
-          return;
-        }
-        const base = name;
-        for (let suffix = 2; disk.accounts.some(a => a.name === name); suffix++) name = `${base} ${suffix}`;
-        disk.accounts.push({ name, type: 'oauth', provider: 'codex', priority: 30,
-          accountUuid: profile.accountUuid, organizationUuid: profile.organizationUuid, ...creds });
-      });
-      console.log(`Connected "${name}" on this laptop using ${creds.model}.`);
+      console.log('Connected "' + result.name + '" to "' + pool.name + '".');
+      return;
     }
+    const { usable } = await resolveUsablePools(config.pools, async names => {
+      const { resolveSecrets } = await import('./secret-resolver.js');
+      return resolveSecrets(names);
+    });
+    const linkedAccounts = await Promise.all(usable.map(async pool => {
+      const status = await fetchRemoteStatus(pool.url, pool.key, { timeoutMs: 5000 });
+      const owned = status.ok && status.json?.accounts?.some(account => !account.remote && sameAccountIdentity(account, profile));
+      return owned ? pool.name : null;
+    }));
+    const owningPool = linkedAccounts.find(Boolean);
+    if (owningPool) throw new Error('This Codex account already lives in "' + owningPool + '". Reconnect it there.');
+    await atomicConfigUpdate(disk => {
+      const match = disk.accounts.find(account => sameAccountIdentity(account, profile));
+      if (match) {
+        Object.assign(match, creds);
+        name = match.name;
+        return;
+      }
+      const base = name;
+      for (let suffix = 2; disk.accounts.some(account => account.name === name); suffix++) name = base + ' ' + suffix;
+      disk.accounts.push({ name, type: 'oauth', provider: 'codex', priority: 30,
+        accountUuid: profile.accountUuid, organizationUuid: profile.organizationUuid, ...creds });
+    });
+    console.log('Connected "' + name + '" on this Mac.');
   } catch (error) {
-    console.error(`ChatGPT sign-in failed. ${error.message}`);
+    console.error('ChatGPT sign-in failed. ' + error.message);
     process.exitCode = 1;
   }
 }
@@ -2729,6 +2775,10 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     if (!mgr) continue;
     if (diskAcct.provider === 'codex') {
       mgr.oauthClientId = diskAcct.oauthClientId;
+      mgr.codexAuth = diskAcct.codexAuth;
+      mgr.codexAccountId = diskAcct.codexAccountId;
+      mgr.codexModels = diskAcct.codexModels;
+      mgr.autoRedeemReset = diskAcct.autoRedeemReset;
       mgr.model = diskAcct.model;
     }
     if (diskAcct.organizationUuid && !mgr.organizationUuid) mgr.organizationUuid = diskAcct.organizationUuid;
@@ -2883,9 +2933,11 @@ function efficiencyLines(data, key = 'last15m') {
   if (!overall) return [];
   const claude = overall.claude || combineEfficiency([], 'claude');
   const glm = overall.glm || combineEfficiency([], 'glm');
-  const served = claude.served + glm.served;
-  const sum = (f) => (claude[f] || 0) + (glm[f] || 0);
-  const cause = (c) => (claude.movedByCause?.[c] || 0) + (glm.movedByCause?.[c] || 0);
+  const codex = overall.codex;
+  const families = codex ? [claude, glm, codex] : [claude, glm];
+  const sum = field => families.reduce((total, block) => total + (block[field] || 0), 0);
+  const served = sum('served');
+  const cause = key => families.reduce((total, block) => total + (block.movedByCause?.[key] || 0), 0);
   const anyData = served + sum('bounced') > 0;
   const n = (x) => (anyData ? String(x) : '—');
   const failed = accts.reduce((t, a) => t + (a.load?.[key]?.failed || 0), 0);
@@ -2894,7 +2946,7 @@ function efficiencyLines(data, key = 'last15m') {
   const s = (ms) => (ms == null ? '—' : `${(ms / 1000).toFixed(1)}s`);
   return [
     `Efficiency (${key === 'last1h' ? '1h' : '15m'}):`,
-    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok${claude.writeShare != null ? ` · writes ${pctOrDash(claude.writeShare)} of cost` : ''}) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)`,
+    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok${claude.writeShare != null ? ` · writes ${pctOrDash(claude.writeShare)} of cost` : ''}) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)${codex ? ' · Codex ' + pctOrDash(codex.hit) + ' (miss ' + (codex.missTokens / 1e6).toFixed(1) + 'M tok)' : ''}`,
     `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))})`,
     `  Bounced:      ${n(sum('bounced'))} (refused ${n(sum('refused'))}) · failed ${failed} · link drops ${linkDrops}`,
     `  Busy waits:   ${n(sum('waited'))}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${n(sum('waitThenMoved'))} (busy-bounce waits only; queue holds show in first-byte p95)`,

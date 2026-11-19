@@ -1,0 +1,189 @@
+// Adapted from TeamClaude v1.1.30 (KarpelesLab). License in codex-quota.js.
+// Read-only Codex subscription usage.
+//
+// This is an internal ChatGPT endpoint used by Codex clients, not the public
+// OpenAI API. Keep it isolated from the Anthropic usage probe so credentials
+// are sent only to the provider that issued them.
+
+import { nativeCodexHeaders } from './codex-native.js';
+import { windowBucket } from './codex-quota.js';
+
+export const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+
+/**
+ * @param {any} window
+ */
+function windowReading(window) {
+  if (!window || typeof window !== 'object') return null;
+  const used = Number(window.used_percent ?? window.usedPercentage ?? window.utilization);
+  const seconds = Number(window.limit_window_seconds ?? window.window_seconds);
+  if (!Number.isFinite(used) || used < 0 || !Number.isFinite(seconds) || seconds <= 0) return null;
+  const reset = Number(window.reset_at ?? window.resetAt);
+  return {
+    utilization: used / 100,
+    resetAt: Number.isFinite(reset) && reset > 0 ? reset * 1000 : null,
+    seconds,
+  };
+}
+
+/**
+ * @param {any} rateLimit
+ */
+function classify(rateLimit) {
+  const readings = Object.values(rateLimit || {}).flatMap(w => windowReading(w) ?? []);
+  // Filed by length with the header path's own rule, so the two paths agree
+  // and a monthly window is dropped instead of read as the weekly one.
+  const fiveHour = readings.find(r => windowBucket(r.seconds / 60) === 'fiveHour') || null;
+  const sevenDay = readings.find(r => windowBucket(r.seconds / 60) === 'weekly') || null;
+  return { fiveHour, sevenDay };
+}
+
+/**
+ * Name each extra limit from the entry itself.
+ *
+ * A live subscription sends `additional_rate_limits` as a LIST whose entries
+ * name themselves (`metered_feature`, `limit_name`); older readings used an
+ * object keyed by the feature. `Object.entries` over a list hands back array
+ * indices, so every bucket was filed as "0" and "1" — two accounts' Spark
+ * limits collided under one meaningless key, and the header path's name for
+ * the same bucket stacked beside it rather than replacing it.
+ *
+ * `metered_feature` is that header name with a `codex_` prefix (`codex_bengalfox`
+ * here is `x-codex-bengalfox-*` there), so stripping it makes the two paths
+ * agree on one key per bucket.
+ *
+ * @param {any} additional
+ * @returns {Array<{slug: string, name: string, rateLimit: any}>}
+ */
+function additionalLimits(additional) {
+  if (Array.isArray(additional)) {
+    const out = [];
+    for (const entry of additional) {
+      if (!entry || typeof entry !== 'object') continue;
+      const feature = typeof entry.metered_feature === 'string' ? entry.metered_feature.replace(/^codex_/, '') : '';
+      const label = typeof entry.limit_name === 'string' ? entry.limit_name : '';
+      const slug = feature || label;
+      if (!slug) continue;
+      out.push({ slug, name: label || slug, rateLimit: entry.rate_limit || entry });
+    }
+    return out;
+  }
+  return Object.entries(additional || {})
+    .map(([key, value]) => ({ slug: key, name: key, rateLimit: value?.rate_limit || value }));
+}
+
+/**
+ * The free rate-limit reset credits this account holds, or null when the
+ * payload says nothing about them. Two counts, kept apart on purpose:
+ *
+ *  - `available` is what the account HOLDS, and is the number every display
+ *    surface reports. It says nothing about whether this plan may spend one.
+ *  - `applicable` is upstream's own view of how many would reset something
+ *    right now — 0 whenever no window is currently eligible.
+ *
+ * Neither decides a redemption: only the detail rows say whether a specific
+ * credit is both available and supported by the plan, and spending one is not
+ * recoverable. See codex-reset-credits.js.
+ *
+ * @param {any} raw  the payload's `rate_limit_reset_credits` object
+ */
+function resetCredits(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const available = creditCount(raw.available_count);
+  // A malformed or absent count is dropped rather than read as zero, the same
+  // way a zeroed window is above: "none" and "we were not told" have different
+  // consequences, and only one of them is a fact.
+  if (available == null) return null;
+  return { available, applicable: creditCount(raw.applicable_available_count) };
+}
+
+// The most credits any surface will report. The count is drawn as `RC<n>` on a
+// TUI row budgeted to the cell, so it has to stay two digits wide whatever the
+// payload says; nobody holds a hundred of something granted one at a time.
+const RESET_CREDIT_COUNT_MAX = 99;
+
+/**
+ * One credit counter from the payload as a whole number in 0..99, or null when
+ * it is not a count at all (absent, non-numeric, infinite, negative).
+ *
+ * Truncated and capped because the value comes from a private endpoint and goes
+ * straight onto width-budgeted display rows: `1.5` or `1e9` would otherwise be
+ * drawn verbatim and push the row past its edge.
+ *
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+export function creditCount(value) {
+  if (value == null || typeof value === 'boolean' || String(value).trim() === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.min(Math.trunc(n), RESET_CREDIT_COUNT_MAX);
+}
+
+/**
+ * Convert the private `/wham/usage` response into TeamClaude quota fields.
+ *
+ * @param {any} data
+ */
+export function normalizeCodexUsagePayload(data) {
+  const rateLimit = data?.rate_limit || data?.rate_limits;
+  const shared = classify(rateLimit);
+  const modelBuckets = [];
+  /** @type {{utilization: number, resetAt: number|null, seconds: number}|null} */
+  let extraFiveHour = null;
+  for (const { slug, name, rateLimit: extra } of additionalLimits(data?.additional_rate_limits)) {
+    const reading = classify(extra);
+    // Taken before the weekly guard below, so an extra limit stating a 5-hour
+    // window and no weekly one contributes its reading instead of being
+    // dropped whole. Tightest wins when several state one.
+    if (reading.fiveHour && (!extraFiveHour || reading.fiveHour.utilization > extraFiveHour.utilization)) {
+      extraFiveHour = reading.fiveHour;
+    }
+    if (reading.sevenDay) {
+      modelBuckets.push({
+        slug,
+        name,
+        utilization: reading.sevenDay.utilization,
+        resetAt: reading.sevenDay.resetAt,
+      });
+    }
+  }
+
+  // The shared `rate_limit` on a subscription states a 7-day window and a null
+  // secondary, so it yields no 5-hour reading; the only one the payload states
+  // sits in an extra limit. Fall back to that so the probe learns a session
+  // window at all, and never let it replace a shared reading: an extra limit
+  // meters the models it names, and one barring the rest would be the one-way
+  // ratchet the weekly buckets are written to avoid.
+  const fiveHour = shared.fiveHour || extraFiveHour;
+
+  return {
+    fiveHour: fiveHour && { utilization: fiveHour.utilization, resetAt: fiveHour.resetAt },
+    sevenDay: shared.sevenDay && { utilization: shared.sevenDay.utilization, resetAt: shared.sevenDay.resetAt },
+    modelBuckets,
+    planType: data?.plan_type || null,
+    resetCredits: resetCredits(data?.rate_limit_reset_credits),
+  };
+}
+
+/**
+ * Fetch Codex quota without sending an inference request.
+ *
+ * @param {Record<string, any>|null|undefined} account
+ * @param {{ fetchImpl?: Function, timeoutMs?: number, url?: string }} [opts]
+ */
+export async function fetchCodexUsage(account, { fetchImpl = fetch, timeoutMs = 10_000, url = CODEX_USAGE_URL } = {}) {
+  const headers = nativeCodexHeaders(account);
+  if (!headers) return { error: 'missing Codex account identity' };
+  try {
+    const res = await fetchImpl(url, {
+      headers: { ...headers, accept: 'application/json' },
+      redirect: 'error',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
+    return normalizeCodexUsagePayload(await res.json());
+  } catch (/** @type {any} */ err) {
+    return { error: err?.message || String(err), status: null };
+  }
+}

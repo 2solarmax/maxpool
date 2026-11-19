@@ -22,7 +22,10 @@ export async function sendLoginToPool({ url, key, name, profile, creds, fetchImp
       body: JSON.stringify({
         account: {
           name, type: 'oauth',
-          ...(profile.provider === 'codex' ? { provider: 'codex', oauthClientId: creds.oauthClientId, model: creds.model } : {}),
+          ...(profile.provider === 'codex' ? {
+            provider: 'codex', oauthClientId: creds.oauthClientId, model: creds.model,
+            codexAuth: creds.codexAuth, codexAccountId: creds.codexAccountId, codexModels: creds.codexModels,
+          } : {}),
           accountUuid: profile?.accountUuid,
           organizationUuid: profile?.organizationUuid,
           accessToken: creds.accessToken,

@@ -1,5 +1,7 @@
 import { fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest } from './openai-responses.js';
-import { DEFAULT_OPENAI_MODEL } from './openai-login.js';
+import { nativeCodexHeaders, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
+import { codexModelFor, validCodexCatalog } from './codex-model-routing.js';
+import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
 import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { normalizeClientHeaders, rewriteMetadataUserIdRaw } from './client-identity.js';
@@ -447,6 +449,20 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      if (req.method === 'GET' && /^\/maxpool\/last-route(?:\?|$)/.test(req.url)) {
+        const address = req.socket.remoteAddress;
+        if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address)
+          || !((proxyApiKey && clientKey === proxyApiKey) || (strictClients && caller.ok))) {
+          rejectUnauthorized();
+          return;
+        }
+        const id = new URL(req.url, 'http://localhost').searchParams.get('messageId');
+        const route = accountManager.recentMessageRoutes?.get(id);
+        res.writeHead(route ? 200 : 404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(route || { error: 'unknown_message' }));
+        return;
+      }
+
       // Status exposes account names and quota state, so require the local
       // proxy key even for loopback callers.
       if (req.method === 'GET' && req.url === '/maxpool/status') {
@@ -485,20 +501,27 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           rejectUnauthorized();
           return;
         }
-        const name = new URL(req.url, 'http://localhost').searchParams.get('name');
-        let hostId;
-        await atomicConfigUpdate(diskConfig => { hostId = diskConfig.chatgptHostId ||= `urn:uuid:${randomUUID()}`; });
-        config.chatgptHostId = hostId;
+        const query = new URL(req.url, 'http://localhost').searchParams;
+        const name = query.get('name');
         const prior = name ? config.accounts?.find(a => a.name === name) : null;
         if (prior && prior.provider !== 'codex') {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'name_taken' }));
           return;
         }
+        let hostId;
+        if (query.get('native') !== '1') {
+          await atomicConfigUpdate(diskConfig => {
+            hostId = diskConfig.chatgptHostId ||= 'urn:uuid:' + randomUUID();
+          });
+          config.chatgptHostId = hostId;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ hostId, ...(prior ? {
-          prior: { oauthClientId: prior.oauthClientId, accountUuid: prior.accountUuid, model: prior.model },
-        } : {}) }));
+        const identity = prior && (query.get('native') === '1'
+          ? { provider: 'codex', codexAuth: prior.codexAuth, accountUuid: prior.accountUuid,
+            organizationUuid: prior.organizationUuid, codexAccountId: prior.codexAccountId, model: prior.model }
+          : { oauthClientId: prior.oauthClientId, accountUuid: prior.accountUuid, model: prior.model });
+        res.end(JSON.stringify({ nativeCodex: true, hostId, ...(identity ? { prior: identity } : {}) }));
         return;
       }
 
@@ -613,9 +636,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           return;
         }
         const codex = acct.provider === 'codex';
-        if (codex && (!/^oaiapp_[A-Za-z0-9_-]+$/.test(acct.oauthClientId || '')
-          || acct.organizationUuid !== acct.oauthClientId || typeof acct.model !== 'string'
-          || !/^[a-z0-9][a-z0-9._-]{0,100}$/i.test(acct.model))) {
+        const nativeCodex = codex && acct.codexAuth === 'native';
+        const invalidCredentials = nativeCodex
+          ? typeof acct.codexAccountId !== 'string' || !/^[a-z0-9_-]{1,150}$/i.test(acct.codexAccountId)
+            || acct.organizationUuid !== acct.codexAccountId || !validCodexCatalog(acct.codexModels)
+          : !/^oaiapp_[A-Za-z0-9_-]+$/.test(acct.oauthClientId || '') || acct.organizationUuid !== acct.oauthClientId;
+        if (codex && (invalidCredentials || (acct.model != null && !/^[a-z0-9][a-z0-9._-]{0,100}$/i.test(acct.model)))) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'invalid_chatgpt_account' }));
           return;
@@ -638,7 +664,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           refreshToken: acct.refreshToken,
           expiresAt: typeof acct.expiresAt === 'number' ? acct.expiresAt : Date.now() + 3600_000,
           source: acct.source || 'remote-inject',
-          ...(codex ? { provider: 'codex', oauthClientId: acct.oauthClientId, model: acct.model } : {}),
+          ...(codex ? { provider: 'codex', oauthClientId: acct.oauthClientId, model: acct.model,
+            ...(nativeCodex ? { codexAuth: 'native', codexAccountId: acct.codexAccountId, codexModels: acct.codexModels } : {}) } : {}),
         };
         if (amAcct) {
           // In-place revive, mirroring the TUI re-auth field set: fresh tokens
@@ -650,6 +677,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           if (codex) {
             amAcct.oauthClientId = tokenFields.oauthClientId;
             amAcct.model = tokenFields.model;
+            amAcct.codexAuth = tokenFields.codexAuth;
+            amAcct.codexAccountId = tokenFields.codexAccountId;
+            amAcct.codexModels = tokenFields.codexModels;
+            delete amAcct.quota.codexModels;
+            delete amAcct.quota.codexCatalogCheckedAt;
             amAcct.rateLimitedUntil = null;
             amAcct.cooldownUntil = null;
           }
@@ -844,6 +876,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         console.error('[Maxpool] x-maxpool-pin-account dropped: the link authenticated with the remote\'s legacy apiKey — mint a named client key (proxy.clients) so pins and per-person attribution work');
       }
         requestInfo.sessionKey = headerValue(req.headers, 'x-maxpool-session');
+        requestInfo.caller = req._caller || null;
         // Affinity key = terminal + conversation. Works without the session header
         // too (bare `claude`, teammates' launchers): the conversation hash alone.
         requestInfo.affinityKey = requestInfo.conversationHash
@@ -859,7 +892,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           res.end(JSON.stringify({ input_tokens: Math.max(1, Math.ceil(body.length / 4)) }));
           return;
         }
-        requestInfo.caller = req._caller || null;
         // Read per request (not captured at boot) so a config flip + seamless reload
         // takes effect on the next request with no restart.
         requestInfo.providerThinkingScrub = Boolean(config.providerThinkingScrub);
@@ -1048,6 +1080,18 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
+async function redeemCodexForRequest(req, res, requestInfo, hooks) {
+  if (!hooks.redeemCodexForRequest || !requestInfo.codexCompatible || requestInfo.pinAccount
+    || requestInfo._codexResetConsidered || req.aborted || res.destroyed || clientHasRealBytes(res, requestInfo)) return false;
+  if (requestInfo.deadlineAt != null && requestInfo.deadlineAt - Date.now() < 10_000) return false;
+  requestInfo._codexResetConsidered = true;
+  try {
+    return (await hooks.redeemCodexForRequest(requestInfo))?.redeemed === true;
+  } catch {
+    return false;
+  }
+}
+
 async function forwardRequest(
   req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir,
   retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes,
@@ -1137,6 +1181,11 @@ async function forwardRequest(
     else logFailedAttempt(pendingSame.account, pendingSame.kind, `${pendingSame.detail}; same account refused by selection, served by "${account.name}"`, 'moved');
   }
   if (!account) {
+    const redeemed = await redeemCodexForRequest(req, res, requestInfo, hooks);
+    if (redeemed && !clientHasRealBytes(res, requestInfo)) {
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir,
+        retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+    }
     const queued = await queueAndRetry(
       'no eligible account/provider currently available',
       req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
@@ -1226,6 +1275,9 @@ async function forwardRequest(
 
   // Track which account handles this request
   ctx.account = account.name;
+  requestInfo._routeProvider = account.provider;
+  requestInfo._routeModel = null;
+  requestInfo._routeMessageId = null;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // SAFEGUARD-REFUSAL REROUTE (2026-09-14): arm the stream-side hold only for Anthropic
@@ -1752,7 +1804,9 @@ async function forwardRequest(
   }
 
   const openAI = account.provider === 'codex';
-  const upstreamUrl = openAI ? (account.upstream || OPENAI_RESPONSES_URL) : `${account.upstream || upstream}${req.url}`;
+  const nativeCodex = account.codexAuth === 'native';
+  const openAIModel = openAI ? codexModelFor(requestInfo, account) : null;
+  const upstreamUrl = openAI ? (account.upstream || (nativeCodex ? NATIVE_CODEX_RESPONSES_URL : OPENAI_RESPONSES_URL)) : `${account.upstream || upstream}${req.url}`;
   const method = req.method;
 
   // A threaded follow-up routed to an account that does not hold the thread cannot be
@@ -1787,7 +1841,7 @@ async function forwardRequest(
   let openAIRequest;
   if (openAI) {
     try {
-      openAIRequest = toOpenAIRequest(JSON.parse(body.toString()), requestInfo.openAIModel || account.model || DEFAULT_OPENAI_MODEL);
+      openAIRequest = toOpenAIRequest(JSON.parse(body.toString()), openAIModel, { native: nativeCodex });
     } catch {
       res.off('close', onClientClose);
       accountManager.releaseAccount(lease, { neutral: true });
@@ -1802,6 +1856,7 @@ async function forwardRequest(
     : rewriteBodyForAccount(body, account, { identity: requestInfo.accountIdentity });
   const upstreamHeaders = openAI ? {
     authorization: `Bearer ${account.credential}`,
+    ...(nativeCodex ? nativeCodexHeaders(account) : {}),
     'content-type': 'application/json', accept: 'text/event-stream',
   } : headers;
 
@@ -1899,7 +1954,7 @@ async function forwardRequest(
         }
       }
       if (openAI) upstreamRes = await fromOpenAIResponse(upstreamRes, {
-        model: requestInfo.model, stream: requestInfo.stream, toolNames: openAIRequest.toolNames,
+        model: requestInfo.model, stream: requestInfo.stream, toolNames: openAIRequest.toolNames, upstreamModel: openAIModel,
       });
     } finally {
       clearTimeout(ttfbTimer);
@@ -1922,11 +1977,17 @@ async function forwardRequest(
     res.off('close', onClientClose);
 
     // Extract rate limit headers
+    requestInfo._routeModel = upstreamRes.headers.get('x-maxpool-served-model');
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
       rateLimitHeaders[key] = value;
     }
-    accountManager.updateQuota(account.index, rateLimitHeaders);
+    if (nativeCodex) {
+      accountManager.applyCodexQuotaHeaders(account.index, rateLimitHeaders, upstreamForwardStartAt, openAIModel);
+      if ([400, 404].includes(upstreamRes.status)) account.quota.codexCatalogCheckedAt = 0;
+    } else {
+      accountManager.updateQuota(account.index, rateLimitHeaders);
+    }
 
     // SETTLE THE SHARED BREAKER AT THE HEADER BOUNDARY. Anthropic ANSWERED, so unless
     // the status is itself a capacity signal, the upstream is provably reachable and
@@ -1940,12 +2001,34 @@ async function forwardRequest(
     // lease.upstreamThrottleProbe, so the releaseAccount probe branch below no-ops.
     if (!openAI && !isCapacitySignalStatus(upstreamRes.status)) accountManager.confirmUpstreamProbe?.(lease);
 
+    if (nativeCodex && ['model_not_found', 'model_not_supported', 'model_not_available'].includes(
+      upstreamRes.headers.get('x-maxpool-openai-error-code'))
+      && canRetryBufferedBody && retryCount + 1 < maxAttempts && !clientHasRealBytes(res, requestInfo)) {
+      excludedIndexes.add(account.index);
+      if (hasEligibleRoute(accountManager, requestInfo, excludedIndexes)) {
+        accountManager.releaseAccount(lease, { status: upstreamRes.status, neutral: true, error: 'model_unavailable' });
+        await upstreamRes.body?.cancel();
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+          retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, excludedIndexes);
+      }
+    }
+
     // Retry/failover can only happen before response bytes are sent. Once a
     // streaming response starts, rerouting would corrupt Claude Code's stream.
     if (upstreamRes.status === 429) {
       const errorBody = await readErrorBody(upstreamRes);
-      const retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
+      let retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
+      const nativeQuota = nativeCodex ? parseCodexQuota(rateLimitHeaders) : null;
+      const accountWindowSpent = nativeQuota && (nativeQuota.unified5h >= 1 || nativeQuota.unified7d >= 1);
+      const scopedWindow = nativeQuota?.modelBuckets?.find(bucket => bucket.utilization >= 1
+        && (bucket.normalModelSlug === openAIModel || bucket.slug === openAIModel
+          || bucket.slug === parseCodexActiveLimit(rateLimitHeaders)));
+      if (nativeQuota) {
+        const reset = Math.max(nativeQuota.unified5h >= 1 ? nativeQuota.unified5hReset || 0 : 0,
+          nativeQuota.unified7d >= 1 ? nativeQuota.unified7dReset || 0 : 0, scopedWindow?.resetAt || 0);
+        if (reset > Date.now()) retryAfter = Math.max(retryAfter || 0, Math.ceil((reset - Date.now()) / 1000));
+      }
       // REQUEST-SHAPE refusal (2026-11-08): on a subscription login Anthropic serves
       // Opus/Sonnet only to Claude-Code-shaped requests; anything else gets a bare 429
       // ("Error", no quota headers) while Haiku on the same account is served —
@@ -1953,7 +2036,7 @@ async function forwardRequest(
       // healthy, so benching it (60s) blocked every real session on it, and failing
       // over just collected the same refusal from every other account. Answer THIS
       // request and leave the account untouched.
-      if (account.type === 'oauth' && !/haiku/.test(String(requestInfo.model || '')) && isRequestShapeRefusal(rateLimitHeaders, errorBody, body)) {
+      if (!openAI && account.type === 'oauth' && !/haiku/.test(String(requestInfo.model || '')) && isRequestShapeRefusal(rateLimitHeaders, errorBody, body)) {
         // Anthropic answered, but a bare headerless "Error" 429 is also what a REAL
         // fleet throttle looks like to this shape — evidence neither way. Hand the
         // recovery probe back UNUSED: no deferral, no clearing; the very next request
@@ -1996,7 +2079,8 @@ async function forwardRequest(
         return;
       }
 
-      const rateLimit = classifyRateLimit(account, rateLimitHeaders, errorBody, { model: requestInfo.model, retryAfter });
+      const rateLimit = nativeQuota ? { scope: 'account', modelScope: !accountWindowSpent && scopedWindow ? (scopedWindow.normalModelSlug || scopedWindow.slug) : null }
+        : classifyRateLimit(account, rateLimitHeaders, errorBody, { model: requestInfo.model, retryAfter });
       if (rateLimit.scope === 'upstream') {
         const parsedError = parseJsonError(errorBody);
         const fingerprint = `429:${rateLimit.fingerprint || overloadFingerprint(errorBody, body)}`;
@@ -2149,6 +2233,14 @@ async function forwardRequest(
         );
       }
 
+      if (nativeCodex && canRetryBufferedBody && retryCount + 1 < maxAttempts) {
+        const redeemed = await redeemCodexForRequest(req, res, requestInfo, hooks);
+        if (redeemed && !clientHasRealBytes(res, requestInfo)) {
+          // The selection policy and re-read decide which account recovered.
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir,
+            retryConfig, queueConfig, requestInfo, canRetryBufferedBody, canQueueBufferedBody, new Set());
+        }
+      }
       const queued = await queueAndRetry(
         `all routes failed after 429 from "${account.name}"`,
         req, res, body, accountManager, upstream, hooks, reqId, ctx, logDir,
@@ -2879,6 +2971,10 @@ async function forwardRequest(
       const buf = Buffer.from(arr);
       extractUsageFromBody(buf, account.index, accountManager, requestInfo);
       markThinkingFromResponse(buf, accountManager, requestInfo);
+      if (upstreamRes.ok && ['codex', 'zai', 'kimi'].includes(account.provider)) {
+        const reply = safeJsonParse(buf);
+        accountManager.rememberMessageRoute?.(reply?.id, account.provider, requestInfo._routeModel || reply?.model);
+      }
       accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
       if (logDir) {
         try {
@@ -4682,6 +4778,10 @@ function describeRequest(req, body) {
   try {
     const json = JSON.parse(body.toString());
     if (json.model) info.model = json.model;
+    info.hasTools = Array.isArray(json.tools) && json.tools.some(tool => tool?.input_schema);
+    if (['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(json.output_config?.effort)) {
+      info.reasoningEffort = json.output_config.effort;
+    }
     if (typeof json.model === 'string' && /^(?:gpt-[a-z0-9._-]+|o[1-9][a-z0-9._-]*)$/i.test(json.model)) {
       info.openAIModel = json.model;
     }
@@ -4693,7 +4793,9 @@ function describeRequest(req, body) {
       try {
         const sessionId = JSON.parse(clientIdentity)?.session_id;
         if (typeof sessionId === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(sessionId)) {
-          info.clientThreadId = sessionId;
+          const agentId = JSON.parse(clientIdentity)?.agent_id;
+          info.clientThreadId = typeof agentId === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(agentId)
+            ? sessionId + ':' + agentId : sessionId;
         }
       } catch { /* legacy metadata is not a JSON string */ }
     }
@@ -5350,6 +5452,7 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
         modelEchoBuffer = modelEchoBuffer ? [...modelEchoBuffer, value] : [value];
         const s = decoder.decode(concatUint8(modelEchoBuffer));
         if (s.includes('"model"') && s.includes('\n\n')) {
+          if (!requestInfo._routeModel) requestInfo._routeModel = /"model"\s*:\s*"([^"]+)"/.exec(s)?.[1];
           // \s* — providers serialize SSE JSON with spaces ("model": "glm-5.3"),
           // Anthropic compact ("model":"…"). The tight form shipped 2026-08-31 and never
           // matched a single real z.ai byte (all 1,546 glm rows in this very session
@@ -5630,6 +5733,11 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
     // the gate can judge the next continue by thread identity instead of by terminal.
     if (data?.type === 'message_start' && typeof data.message?.id === 'string') {
       captureThreadReply(requestInfo, data.message.id);
+      requestInfo._routeMessageId = data.message.id;
+      requestInfo._routeModel ||= data.message.model;
+    }
+    if (data?.type === 'message_stop') {
+      accountManager.rememberMessageRoute?.(requestInfo._routeMessageId, requestInfo._routeProvider, requestInfo._routeModel);
     }
     // CAPACITY LEDGER (2026-08-22): stream-level usage feeds the per-cycle ledger.
     // M3: Anthropic interim message_delta usage is CUMULATIVE — add-semantics inflates

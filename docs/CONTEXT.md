@@ -20,12 +20,28 @@
 
 MaxPool v1.24.112 serves Claude Code with Anthropic, GLM, and Kimi. On
 `codex/maxpool-openai`, ChatGPT plan usage is added as another inference
-provider behind the same Claude Code Messages API. Browser sign-in and
-routing are in local verification before release.
+provider behind the same Claude Code Messages API. Native Codex quota, resets,
+and provider-sticky routing are being qualified on an isolated listener.
 
 ---
 
 ## Decisions
+
+### 2026-11-19 · #10 — Native Codex provider behind Claude Code
+
+**Context.** The first pilot used the app-scoped ChatGPT plan grant. Native
+Codex login also exposes live quota, reset inventory, and model entitlements.
+
+**Decision.** Reuse the TeamClaude native quota and reset interfaces and the
+tested CLIProxyAPI Responses wire behavior in MaxPool's provider adapter.
+The first serving provider of each Claude Code session controls its existing
+provider-stickiness option. Codex stays pinned by default, with account
+rotation and class-aware model selection within that family.
+
+**Consequences.** Native Codex and the pilot's original grant have separate
+credential/transport paths. Codex free reset automation is independently
+opt-in. Stage on a separate port and verify before changing the normal local
+package or enrolling a local account.
 
 ### 2026-11-19 · #9 — ChatGPT plan usage behind Claude Code
 
