@@ -291,3 +291,10 @@ test('ESCAPE: a manual quit+relaunch clears the quarantine (fresh process)', asy
   const r2 = await checkAndMaybeApply(CFG_AUTO, h.deps);
   assert.equal(r2.applied, true, 'quarantine cleared — 1.0.4 applies cleanly');
 });
+
+test('a local candidate stays ahead of the prior published patch until its release ships', () => {
+  assert.equal(compareVersions('1.24.112', '1.24.113-local.7'), -1);
+  assert.equal(compareVersions('1.24.113-local.10', '1.24.113-local.7'), 1);
+  assert.equal(compareVersions('1.24.113', '1.24.113-local.10'), 1);
+  assert.equal(compareVersions('1.24.113+mac', '1.24.113'), 0);
+});
