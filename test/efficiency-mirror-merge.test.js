@@ -59,15 +59,29 @@ test('first-byte percentiles include cloud-served turns, edge waits included', (
   assert.equal(o.e2eP95, 9500, `p95 sees the 8 s wait (got ${o.e2eP95})`);
 });
 
-test('the TUI Cache line turns red on a cloud-only Mac with a high bounce share', () => {
+test('a cloud mirror preserves local and exported hold reasons', () => {
+  const { am, row } = macWithMirror();
+  Object.assign(row._remoteLoad.last15m.efficiency, { moved: 1, movedSame: 1, movedByWhy: { holdCeiling: 1 } });
+  am.releaseAccount(lease(row), { success: true, status: 200, usage: { in: 100, cr: 9900, cc: 0 },
+    moved: true, movedSame: true, movedWhy: 'outscored:fixture' });
+  assert.deepEqual(am.efficiencyOverall('last15m').claude.movedByWhy, {
+    outscored: 1, holdCeiling: 1, released: 0, other: 0,
+  });
+});
+
+test('the TUI Moves line turns red on a cloud-only Mac with a high bounce share', () => {
   const { am, row } = macWithMirror();
   bookEdgeEvents(am, row);
   const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } } });
-  const line = strip(tui._efficiencyLine(200) || '');
+  const moves = strip(tui._movesLine(200) || '');
   // RED (⚠) with the account behind it — not just the always-present "busy 0" label.
-  assert.match(line, /⚠ cross moves \d+\/100 — most refusals on cloud-a ☁/, `red names cause + account: ${line}`);
-  assert.match(line, /bounced 25%/, `the bounce share is shown: ${line}`);
-  assert.match(line, /busy-bounce waits 30 \(avg 8\.0s\)/, `the waits are shown: ${line}`);
+  assert.match(moves, /⚠ cross moves \d+\/100 — most refusals on cloud-a ☁/, `red names cause + account: ${moves}`);
+  assert.match(moves, /bounced 25%/, `the bounce share is shown: ${moves}`);
+  assert.match(moves, /busy-waits 30 \(avg 8\.0s\)/, `the waits are shown: ${moves}`);
+  // And the Cache line stays a pure health line (no move/bounce figures on it).
+  const cache = strip(tui._cacheLine(200) || '');
+  assert.match(cache, /Claude 99%/, `cache health from the serving pool's export: ${cache}`);
+  assert.doesNotMatch(cache, /bounced|cross/, `no move figures on the Cache line: ${cache}`);
 });
 
 test('an older cloud with no export: the edge events alone feed the overall figures', () => {

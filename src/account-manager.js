@@ -1,3 +1,8 @@
+import { refreshOpenAIToken } from './openai-login.js';
+import { rememberNativeRefresh } from './account-config.js';
+import { nativeCodexOwnerIdentity, refreshNativeCodexToken } from './codex-native.js';
+import { codexModelFor } from './codex-model-routing.js';
+import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint, sameUser, sameAccountIdentity } from './oauth.js';
 import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity } from './pool-link.js';
 import { appendEventLog } from './event-log.js';
@@ -419,7 +424,8 @@ const PERSISTED_QUOTA_FIELDS = [
   // drops until the next probe sweep re-learns it. The probe still rewrites it on
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
-  'providerQuotaSource', 'lastProbeOkAt', 'noPlan',
+  'providerQuotaSource', 'lastProbeOkAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogVersion',
+  'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel', 'codexFiveHourAbsent', 'codexWeeklyReadingAt',
 ];
 
 /** The sticky busy-wait budget actually in force, and where it comes from — ONE resolver
@@ -443,7 +449,19 @@ const efficiencyWindowMs = (windowKey) => (windowKey === 'last1h' ? 60 * 60_000 
 function emptyEfficiency() {
   return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0, movedSame: 0, movedCross: 0,
     movedByCause: { busy: 0, wall: 0, balance: 0, link: 0, other: 0 },
+    movedByWhy: { outscored: 0, holdCeiling: 0, released: 0, other: 0 },
     newConversation: 0, bounced: 0, refused: 0, waited: 0, waitMs: 0, waitThenMoved: 0, e2e: [] };
+}
+/** Bucket key for the 24h cache rollup: the ISO UTC hour ('YYYY-MM-DDTHH'). */
+const efficiencyHourKey = (now) => new Date(now).toISOString().slice(0, 13);
+/** Classify a move-reason string (from `_moveReason`, or `movedWhy` on the outcome)
+ *  into the coarse dashboard families the Moves line shows. */
+function moveWhyFamily(why) {
+  if (!why) return 'other';
+  if (why.startsWith('outscored')) return 'outscored';
+  if (why.includes('hold-ceiling')) return 'holdCeiling';
+  if (why.startsWith('released:')) return 'released';
+  return 'other';
 }
 /** Add one exported/summarized efficiency block into an accumulator (missing fields = 0).
  *  Old blocks without movedSame/movedCross keep their moved total (shown as same-family
@@ -455,6 +473,7 @@ function addEfficiency(acc, e) {
   }
   if (!hasSplit) acc.movedSame += Number(e.moved) || 0;
   for (const c of Object.keys(acc.movedByCause)) acc.movedByCause[c] += Number(e.movedByCause?.[c]) || 0;
+  for (const w of Object.keys(acc.movedByWhy)) acc.movedByWhy[w] += Number(e.movedByWhy?.[w]) || 0;
   // Latency samples exist for this pool's own rows only (percentiles do not add).
   if (Array.isArray(e.e2e)) acc.e2e.push(...e.e2e);
 }
@@ -503,7 +522,7 @@ function lruSet(map, key, value) {
 }
 /** An Anthropic account with its own prompt cache (allow-list: a provider or legacy
  *  pool row can forward to GLM, so "not a provider" is not proof of a Claude cache). */
-const isClaudeAccount = (a) => a?.type === 'oauth' || a?.type === 'apikey';
+const isClaudeAccount = (a) => (a?.type === 'oauth' || a?.type === 'apikey') && a.provider !== 'codex';
 // Providers whose prompt cache is shared by every account of that provider, so a
 // conversation warm on one row is warm on all of them. Measured 2026-11-16 (Mac pool,
 // 4.9h): z.ai GLM->GLM hops re-wrote ~150-2.6k tokens vs ~190k per GLM->Claude hop.
@@ -525,6 +544,7 @@ const COLD_HOLD_MIN_BYTES = 150_000;
  *  family — z.ai's cache is shared across that provider's accounts, so a zai→zai hop
  *  re-writes ~nothing while a Claude↔provider hop re-writes the whole prompt. */
 const accountFamily = (a) => (isClaudeAccount(a) ? 'claude' : String(a?.provider || 'provider'));
+const efficiencyProvider = account => isClaudeAccount(account) ? 'claude' : account.provider === 'codex' ? 'codex' : 'glm';
 const IDENTITY_WINDOW_MS = 15 * 60_000;
 const IDENTITY_MAX_SAMPLES = 4000;
 const IDENTITY_MIN_PER_SESSION = 8;
@@ -737,9 +757,12 @@ export class AccountManager {
       else this.scheduler.routingMode = 'sticky';
     }
     this._refreshAccessToken = dependencies.refreshAccessToken || refreshAccessToken;
+    this._refreshOpenAIToken = dependencies.refreshOpenAIToken || refreshOpenAIToken;
+    this._refreshNativeCodexToken = dependencies.refreshNativeCodexToken || refreshNativeCodexToken;
     // Named-caller request attribution (team pools): callerName → requests served.
     // Server-side (not TUI-side) so headless pools feed the web screen too.
     this.callerCounts = new Map();
+    this.recentMessageRoutes = new Map();
     // Per-person usage analytics (owner 2026-10-29; red-team verdict: persisted
     // buckets, requests AND tokens, never the rotating event log). caller -> {
     //   hours: { 'YYYY-MM-DDTHH' UTC: {req, tok} } (rolling 48)
@@ -760,6 +783,11 @@ export class AccountManager {
       provider: acct.provider || (acct.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acct.accountUuid || null,
       organizationUuid: acct.organizationUuid || null,
+      oauthClientId: acct.oauthClientId || null,
+      codexAuth: acct.codexAuth || null,
+      codexAccountId: acct.codexAccountId || null,
+      codexModels: acct.codexModels || null,
+      autoRedeemReset: acct.autoRedeemReset,
       credential: acct.accessToken || acct.authToken || acct.apiKey,
       upstream: acct.upstream || null,
       authHeader: acct.authHeader || null,
@@ -833,6 +861,10 @@ export class AccountManager {
     // Bounded LRU — oldest conversations drop first; a dropped entry only means the
     // next turn is balanced fresh.
     this.conversationLastAccount = new Map();
+    this.conversationProvider = new Map();
+    this.pendingSessionProviders = new Map();
+    this.sessionProviderDrain = false;
+    this.nativeCodexConversationOwners = new Map();
     // When that account last SERVED the conversation (first real upstream byte) —
     // holdsWarmConversation reads it. Same LRU bound, in-memory like the map above.
     this.conversationLastServedAt = new Map();
@@ -970,7 +1002,7 @@ export class AccountManager {
       // finite hold. It must NEVER contribute the WEEKLY reset (days) — that is the
       // multi-day-hang the bounded path fences off; see the !fairnessOnlyBlock
       // guards on the weekly branches below.
-      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, model: requestInfo.model, now })) {
+      if (!fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, model: this._availabilityModel(account, requestInfo), now })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -979,15 +1011,15 @@ export class AccountManager {
           matchingRoutes,
         };
       }
-      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
+      if (fairnessOnlyBlock && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: this._availabilityModel(account, requestInfo), now })) {
         soonestBoundedHold = Math.min(soonestBoundedHold, BOUNDED_REPOLL_HOLD_MS);
         if (!boundedHoldCause) boundedHoldCause = 'queued_behind_fairness';
         continue;
       }
 
-      const retry = this._retryInfo(account, requestInfo.model, now);
+      const retry = this._retryInfo(account, this._availabilityModel(account, requestInfo), now);
       note(retry.cause);
-      if (!fairnessOnlyBlock && retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
+      if (!fairnessOnlyBlock && retry.weeklyCritical && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: this._availabilityModel(account, requestInfo) })) {
         return {
           available: true,
           retryAfterMs: 0,
@@ -1107,7 +1139,7 @@ export class AccountManager {
       // (_selectNext's coolBest), matching what the acquire path would actually do.
       if (this._recentlyRefusedBusy(account, now)
         && (!this._holdsRequest(account, requestInfo) || requestInfo._busyExcluded?.has(account.name))) return false;
-      return this._isAvailable(account, { ...options, model: requestInfo.model, now });
+      return this._isAvailable(account, { ...options, model: this._availabilityModel(account, requestInfo), now });
     }));
   }
 
@@ -1140,7 +1172,7 @@ export class AccountManager {
     if (!account) return null;
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
-    const upstreamThrottleProbe = account.type !== 'provider' && !account.remote && this._claimUpstreamThrottleProbe();
+    const upstreamThrottleProbe = isClaudeAccount(account) && !account.remote && this._claimUpstreamThrottleProbe();
     if (requestInfo.sessionKey) {
       // Same clock the selection above used, so the peak-failover guard can never
       // disagree with the peak tier that caused the move (defaults to real time).
@@ -1256,6 +1288,34 @@ export class AccountManager {
     }]));
   }
 
+  /** 24h efficiency rollup across restarts: per-account hourly buckets (pruned on
+   *  export, so state.json never grows). Restore is additive into whatever buckets
+   *  the running pool already has (a seamless reload folds the same events once). */
+  exportEfficiencyHours() {
+    const out = {};
+    for (const a of this.accounts) {
+      if (!a.efficiencyHours || !Object.keys(a.efficiencyHours).length) continue;
+      out[a.name] = a.efficiencyHours;
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
+  restoreEfficiencyHours(saved) {
+    if (!saved || typeof saved !== 'object') return;
+    const now = Date.now();
+    for (const [name, hours] of Object.entries(saved)) {
+      if (!hours || typeof hours !== 'object') continue;
+      const a = this.accounts.find(x => x.name === name);
+      if (!a) continue;
+      a.efficiencyHours ||= {};
+      for (const [k, b] of Object.entries(hours)) {
+        if (Date.parse(k + ':00:00Z') <= now - 24 * 3600_000) continue;
+        const dst = a.efficiencyHours[k] ||= { served: 0, in: 0, out: 0, cr: 0, cc: 0, bounced: 0, movedCross: 0, movedSame: 0 };
+        for (const f of ['served', 'in', 'out', 'cr', 'cc', 'bounced', 'movedCross', 'movedSame']) dst[f] += Number(b[f]) || 0;
+      }
+    }
+  }
+
   /** SC22 windows: rolling 24h (from hourly buckets), 7d/30d + prior (daily). */
   callerWindowStats() {
     const now = Date.now();
@@ -1304,6 +1364,7 @@ export class AccountManager {
    */
   releaseAccount(lease, outcome = {}) {
     if (!lease?.account) return;
+    this.settleSessionProviderAttempt(lease);
     const account = lease.account;
 
     const depthBefore = account.activeWeight;
@@ -1442,12 +1503,19 @@ export class AccountManager {
           && this._outcomeMoveCross(outcome, lease, account)),
       newConversation: Boolean(outcome.newConversation),
       moveCause: outcome.moveCause || null,
+      // The `conversation moved:` line's why=, bucketed (outscored / holdCeiling /
+      // released / other) — the Moves screen line shows these families. Older events
+      // and outcome-passed moves without a reason stay null (shown as 'other').
+      movedWhy: outcome.movedWhy ? moveWhyFamily(outcome.movedWhy) : null,
       busyWaitMs: outcome.busyWaitMs || 0,
       e2eFirstByteMs: Number.isFinite(outcome.e2eFirstByteMs) ? outcome.e2eFirstByteMs : null,
       refusal: outcome.refusal || null,
       // _efficiencyAcc skips these: a count_tokens call is not a conversation turn.
       countTokens: Boolean(outcome.countTokens),
     });
+    // 24h rollup: same event, folded into the hourly bucket (survives restarts).
+    const ev = account.loadEvents[account.loadEvents.length - 1];
+    if (ev) this._bumpEfficiencyHour(account, ev);
     this._pruneLoadEvents(account, now);
   }
 
@@ -1534,6 +1602,7 @@ export class AccountManager {
       moved,
       movedSame, movedCross,
       moveCause: moved ? (ri._moveCause || (ri._hop > 0 ? 'other' : 'balance')) : null,
+      movedWhy: moved ? (ri._moveWhy || null) : null,
       newConversation: !pinned && Boolean(ri._newConversation) && ri._notedServed === account.name,
 
       busyWaitMs: ri._busyWaitMs || 0,
@@ -1544,7 +1613,7 @@ export class AccountManager {
   /** Cache / move / bounce figures for one account over a window (getStatus + TUI only —
    *  never on the scoring path). Additive sums plus derived hit share. */
   _efficiencySummary(account, windowMs, now = Date.now()) {
-    return finishEfficiency(this._efficiencyAcc(account, windowMs, now), isClaudeAccount(account) ? 'claude' : 'glm');
+    return finishEfficiency(this._efficiencyAcc(account, windowMs, now), efficiencyProvider(account));
   }
 
   _efficiencyAcc(account, windowMs, now = Date.now()) {
@@ -1568,6 +1637,14 @@ export class AccountManager {
         else out.movedSame++;   // legacy events (no split) default to the cheap side
         const c = Object.hasOwn(out.movedByCause, e.moveCause) ? e.moveCause : 'other';
         out.movedByCause[c]++;
+        // The why families (outscored / holdCeiling / released) describe the WARM
+        // HOLD letting a same-family sibling win — counted there only, so the
+        // Moves line's "same N (why …)" parenthetical attributes cleanly. A cross
+        // move's story is the cross count itself.
+        if (!e.movedCross) {
+          const w = Object.hasOwn(out.movedByWhy, e.movedWhy) ? e.movedWhy : 'other';
+          out.movedByWhy[w]++;
+        }
         if (e.busyWaitMs > 0) out.waitThenMoved++;
       }
       if (e.newConversation) out.newConversation++;
@@ -1575,6 +1652,65 @@ export class AccountManager {
       if (e.e2eFirstByteMs != null) out.e2e.push(e.e2eFirstByteMs);
     }
     return out;
+  }
+
+  /** 24h cache rollup, per family, from hourly buckets (owner question 2026-11-19:
+   *  a heavy-moving 15m slice read 28% while the 24h truth was 92% — the line needs
+   *  both windows side by side). Hourly buckets survive restarts (state.json), so a
+   *  long-lived pool still shows a true 24h. Edge rows only: a mirror row's cache
+   *  comes from the serving pool's export, and exports are 15m/1h — the 24h figure
+   *  would silently cover this pool's clients alone. Callers that need the team-wide
+   *  24h sum the linked pool's own exports when it grows a last24h window. */
+  _rollup24(account, now = Date.now()) {
+    account.efficiencyHours ||= {};
+    const out = emptyEfficiency();
+    const cutoff = now - 24 * 3600_000;
+    for (const [k, b] of Object.entries(account.efficiencyHours)) {
+      const t = Date.parse(k + ':00:00Z');
+      if (!(t > cutoff)) continue;
+      out.served += b.served; out.in += b.in; out.out += b.out; out.cr += b.cr; out.cc += b.cc;
+      out.bounced += b.bounced;
+      if (b.movedCross) out.movedCross += b.movedCross;
+      if (b.movedSame) out.movedSame += b.movedSame;
+    }
+    return out;
+  }
+
+  /** Fold one load event into the account's hourly efficiency bucket (restart-safe 24h). */
+  _bumpEfficiencyHour(account, e) {
+    account.efficiencyHours ||= {};
+    const key = efficiencyHourKey(e.at);
+    const b = account.efficiencyHours[key] ||= { served: 0, in: 0, out: 0, cr: 0, cc: 0, bounced: 0, movedCross: 0, movedSame: 0 };
+    if (e.bounced) {
+      if (!e.repeatBounce) b.bounced++;
+      return;
+    }
+    if (!e.success || e.countTokens) return;
+    b.served++;
+    if (e.usage) { b.in += e.usage.in; b.out += e.usage.out; b.cr += e.usage.cr; b.cc += e.usage.cc; }
+    if (e.movedCross) b.movedCross++;
+    else if (e.moved) b.movedSame++;
+    const cutoff = e.at - 25 * 3600_000;   // 24h window + 1h slack so the prune never eats the live edge
+    for (const k of Object.keys(account.efficiencyHours)) {
+      if (Date.parse(k + ':00:00Z') < cutoff) delete account.efficiencyHours[k];
+    }
+  }
+
+  /** Cache hit by tokens, per family, over the rolling 24h (TUI Cache line's long
+   *  window). null when no prompt tokens in the window. */
+  efficiency24h(now = Date.now()) {
+    const by = { claude: emptyEfficiency(), glm: emptyEfficiency() };
+    for (const a of this.accounts) {
+      if (a.enabled === false) continue;
+      const tag = efficiencyProvider(a);
+      addEfficiency(by[tag] ||= emptyEfficiency(), this._rollup24(a, now));
+    }
+    const finish = (acc) => {
+      const prompt = acc.cr + acc.cc + acc.in;
+      return { served: acc.served, hit: prompt > 0 ? acc.cr / prompt : null };
+    };
+    return { claude: finish(by.claude), glm: finish(by.glm),
+      ...(by.codex ? { codex: finish(by.codex) } : {}) };
   }
 
   /** One cloud MIRROR row's figures, each field taken from the only pool that can know it
@@ -1599,8 +1735,10 @@ export class AccountManager {
     acc.movedSame = (expSplit ? Number(exp.movedSame) || 0 : Number(exp.moved) || 0) + edge.movedSame;
     acc.movedCross = (expSplit ? Number(exp.movedCross) || 0 : 0) + edge.movedCross;
     for (const k of EDGE_EFFICIENCY_FIELDS) acc[k] = (Number(exp[k]) || 0) + edge[k];
-    for (const c of Object.keys(acc.movedByCause)) {
-      acc.movedByCause[c] = (Number(exp.movedByCause?.[c]) || 0) + edge.movedByCause[c];
+    for (const field of ['movedByCause', 'movedByWhy']) {
+      for (const key of Object.keys(acc[field])) {
+        acc[field][key] = (Number(exp[field]?.[key]) || 0) + edge[field][key];
+      }
     }
     acc.e2e = edge.e2e;
     return acc;
@@ -1611,7 +1749,7 @@ export class AccountManager {
   rowEfficiencySummary(account, windowKey = 'last15m', now = Date.now()) {
     const windowMs = efficiencyWindowMs(windowKey);
     const acc = account.remote ? this._mirrorEfficiencyAcc(account, windowKey, windowMs, now) : this._efficiencyAcc(account, windowMs, now);
-    return finishEfficiency(acc, isClaudeAccount(account) ? 'claude' : 'glm');
+    return finishEfficiency(acc, efficiencyProvider(account));
   }
 
   /** Overall efficiency, per provider, for the TUI / `maxpool status`: this pool's own
@@ -1621,15 +1759,18 @@ export class AccountManager {
    *  an edge busy wait shows up in p95. */
   efficiencyOverall(windowKey = 'last15m', now = Date.now(), { mirrors = true } = {}) {
     const windowMs = efficiencyWindowMs(windowKey);
-    const by = { claude: emptyEfficiency(), glm: emptyEfficiency() };
+    const by = { claude: emptyEfficiency(), glm: emptyEfficiency(), codex: emptyEfficiency() };
+    let hasCodex = false;
     for (const a of this.accounts) {
       if (a.enabled === false || (a.remote && !mirrors)) continue;
-      const tag = isClaudeAccount(a) ? 'claude' : 'glm';
+      const tag = efficiencyProvider(a);
+      if (tag === 'codex') hasCodex = true;
       const e = a.remote ? this._mirrorEfficiencyAcc(a, windowKey, windowMs, now) : this._efficiencyAcc(a, windowMs, now);
       addEfficiency(by[tag], e);
     }
-    const e2e = [...by.claude.e2e, ...by.glm.e2e];
+    const e2e = [...by.claude.e2e, ...by.glm.e2e, ...by.codex.e2e];
     return { claude: finishEfficiency(by.claude, 'claude'), glm: finishEfficiency(by.glm, 'glm'),
+      ...(hasCodex ? { codex: finishEfficiency(by.codex, 'codex') } : {}),
       e2eP50: pct(e2e, 0.5), e2eP95: pct(e2e, 0.95) };
   }
 
@@ -1694,10 +1835,19 @@ export class AccountManager {
   // weekly (Fable can be 100% while unified is 56%). A model-agnostic request (no
   // family) or an account with no scoped data fails OPEN (returns null), matching
   // prior behavior. Gate: is_active AND (severity critical OR util ≥ exhausted).
+  _availabilityModel(account, requestInfo) {
+    return account.provider === 'codex' ? codexModelFor(requestInfo, account) : requestInfo.model;
+  }
+
   _scopedExhausted(account, model) {
-    const fam = modelFamily(model);
+    const existingScope = account.quota.codexLimitByModel?.[model];
+    const exactCodexModel = existingScope || account.quota.scopedWeekly?.[model] ? model : null;
+    const fam = account.provider === 'codex'
+      ? exactCodexModel ?? codexModelFor({ model, ...(/^gpt-|^o[1-9]/i.test(model) ? { openAIModel: model } : {}) }, account)
+      : modelFamily(model);
     if (!fam) return null;
-    const e = account.quota?.scopedWeekly?.[fam];
+    const scope = account.provider === 'codex' && account.quota.codexLimitByModel?.[fam];
+    const e = account.quota?.scopedWeekly?.[scope || fam];
     if (!e || e.isActive === false) return null;
     // Bench ONLY at genuine exhaustion (>= weeklyExhaustedThreshold). Anthropic
     // labels a scoped weekly `severity:'critical'` well before it's actually
@@ -1707,7 +1857,7 @@ export class AccountManager {
     // exhaustion is still caught by the threshold. Same predicate drives the TUI
     // `maxed` tag, so "maxed" renders iff the model is actually benched.
     const exhausted = e.utilization != null && e.utilization >= this.scheduler.weeklyExhaustedThreshold;
-    return exhausted ? { resetAt: e.resetAt || null, family: fam } : null;
+    return exhausted ? { resetAt: e.resetAt || null, family: scope || fam } : null;
   }
 
   /** Review r2 A: inside a request-scoped soft cooldown (new placements only). */
@@ -1949,7 +2099,7 @@ export class AccountManager {
   _hasAvailableProvider(requestInfo = {}, excludedIndexes = new Set()) {
     const profile = requestInfo.profile || 'claude';
     return this.accounts.some(account => {
-      if ((account.type !== 'provider' && account.type !== 'pool') || excludedIndexes.has(account.index)) return false;
+      if (isClaudeAccount(account) || excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
       return this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true });
     });
@@ -2700,7 +2850,7 @@ export class AccountManager {
       if (!this._isWarming(account, now)) continue;
       if (!this._matchesRequest(account, profile, requestInfo)) continue;
       // Genuinely-healthy target only (same bar as the hot-rebalance candidate scan).
-      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: this._availabilityModel(account, requestInfo), now })) continue;
       const score = this._scoreAccount(account, requestInfo, ctx);
       if (score < bestScore) {
         bestScore = score;
@@ -2741,7 +2891,7 @@ export class AccountManager {
       // would immediately be a 2x-burn destination. Peak-only ⇒ inert off-peak.
       if (this._peakTier(account, now) > 0) continue;
       // Genuinely-healthy alternatives only (normal/soft/unknown weekly + model headroom).
-      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
+      if (!this._isAvailable(account, { allowWeeklyReserve: false, allowWeeklyCritical: false, model: this._availabilityModel(account, requestInfo), now })) continue;
       const score = this._scoreAccount(account, requestInfo, scoringCtx);
       if (score < bestScore) {
         bestScore = score;
@@ -3032,7 +3182,7 @@ export class AccountManager {
       const pinned = this.accounts.find(a => a.name === requestInfo.pinnedAccountName);
       if (pinned && !excludedIndexes.has(pinned.index)
         && this._matchesRequest(pinned, profile, requestInfo)
-        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model, now })) {
+        && this._isAvailable(pinned, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: this._availabilityModel(pinned, requestInfo), now })) {
         this.currentIndex = pinned.index;
         return pinned;
       }
@@ -3044,7 +3194,7 @@ export class AccountManager {
         { allowWeeklyReserve: true, allowWeeklyCritical: false },
         { allowWeeklyReserve: true, allowWeeklyCritical: true },
       ];
-      if (preferredPasses.some(options => this._isAvailable(preferred, { ...options, model: requestInfo.model, now }))) {
+      if (preferredPasses.some(options => this._isAvailable(preferred, { ...options, model: this._availabilityModel(preferred, requestInfo), now }))) {
         this.currentIndex = preferred.index;
         return preferred;
       }
@@ -3115,7 +3265,7 @@ export class AccountManager {
         const critUnlock = weeklyOptions.allowWeeklyCritical
           ? null
           : this._criticalUnlock(account, requestInfo, excludedIndexes, null, now);
-        if (!this._isAvailable(account, { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!critUnlock, model: requestInfo.model, now })) continue;
+        if (!this._isAvailable(account, { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!critUnlock, model: this._availabilityModel(account, requestInfo), now })) continue;
 
         const priority = this._effectivePriority(account, requestInfo, now);
         const score = this._scoreAccount(account, requestInfo, scoringCtx, critUnlock);
@@ -3252,6 +3402,9 @@ export class AccountManager {
           // the loop's own pick, before any return-home switch.
           let why = 'unknown';
           try { why = this._moveReason(lastName, pickedBeforeHome, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(pickedBeforeHome.name) || null, now); } catch (e) { why = `error:${e.message}`; }
+          // The same why= the log line prints rides the request, so the served event
+          // books it (movedWhy) and the Moves screen line can split hold reasons.
+          requestInfo._moveWhy = why;
           console.log(`[Maxpool] conversation moved: ${lastName} → ${best.name} (${requestInfo.bodyBytes ?? '?'}B) why=${why}${homeNote ? ` ${homeNote}` : ''}`);
         }
         return best;
@@ -3312,7 +3465,7 @@ export class AccountManager {
     if (!account) return null;
     if (excludedIndexes.has(account.index)) return null;
     if (!this._matchesRequest(account, profile, requestInfo)) return null;
-    if (!this._isAvailable(account, { ...options, model: requestInfo.model })) return null;
+    if (!this._isAvailable(account, { ...options, model: this._availabilityModel(account, requestInfo) })) return null;
     return account;
   }
 
@@ -3384,7 +3537,7 @@ export class AccountManager {
       if (excludedIndexes.has(account.index)) return false;
       if (!this._matchesRequest(account, profile, requestInfo)) return false;
       const priority = this._priority(account);
-      return priority < boundPriority && this._isAvailable(account, { allowWeeklyReserve: true, model: requestInfo.model });
+      return priority < boundPriority && this._isAvailable(account, { allowWeeklyReserve: true, model: this._availabilityModel(account, requestInfo) });
     });
   }
 
@@ -3542,7 +3695,7 @@ export class AccountManager {
       // queue-fairness gate (that alone 503'd every pinned Claude request). The
       // upstream throttle STAYS: it describes this pool's real egress to Anthropic.
       if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
-      if (account.type !== 'provider' && this._isUpstreamThrottleBlocking()) {
+      if (isClaudeAccount(account) && this._isUpstreamThrottleBlocking()) {
         requestInfo.pinRefusal = 'throttled';
         return false;
       }
@@ -3554,7 +3707,7 @@ export class AccountManager {
       // by the selection loop's _isAvailable, so the refusal reads 'unavailable' and the
       // edge moves at once instead of waiting out its budget on it.
       if ((account.inFlight || 0) >= this._pinBusyLimit(account)
-        && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: requestInfo.model })) {
+        && this._isAvailable(account, { allowWeeklyReserve: true, allowWeeklyCritical: true, model: this._availabilityModel(account, requestInfo) })) {
         requestInfo.pinRefusedBusy = true;
         requestInfo.pinRefusal = 'busy';
         return false;
@@ -3567,7 +3720,7 @@ export class AccountManager {
     if (!this._isRequestCompatible(account, profile, requestInfo)) return false;
     // Cloud mirrors egress from the cloud's own IP — this machine's upstream throttle
     // and local queue fairness don't describe them.
-    const providerLike = account.type === 'provider' || Boolean(account.remote);
+    const providerLike = !isClaudeAccount(account) || Boolean(account.remote);
     // A request parked by the repeat cold-hop hold (red-team 2026-11-17 f1) still
     // registers a queue ticket like any queued request, but its ticket must not count
     // as a WAITER for anyone else: a queued waiter makes local Claude rows refuse every
@@ -3700,7 +3853,7 @@ export class AccountManager {
     // the others only when every preferred account is unavailable (the score loop's
     // pass-1 admits reserve accounts, so a loaded preferred account DOES give way).
     if (mode === 'prefer-claude') {
-      return account.type === 'provider' ? base : 0;
+      return isClaudeAccount(account) ? 0 : base;
     }
     if (mode === 'prefer-zai') {
       return account.provider === 'zai' ? 0 : base;
@@ -3905,7 +4058,21 @@ export class AccountManager {
   }
 
   _isRequestCompatible(account, profile, requestInfo = {}) {
-    if (!this._matchesProfile(account, profile)) return false;
+    const family = accountFamily(account);
+    const pinnedFamily = this.pinnedSessionProvider(requestInfo);
+    const only = pinnedFamily === 'codex' ? pinnedFamily : requestInfo.onlyProvider || (requestInfo.pinAccount ? null : pinnedFamily);
+    if (only && family !== only) return false;
+    if (family === 'codex') {
+      if (requestInfo.nativeCodexClient) {
+        if (account.codexAuth !== 'native' || account.remote || account.poolBenchedBy
+          || !account.accountUuid || !account.codexAccountId) return false;
+        if (requestInfo.nativeCodexOwner && nativeCodexOwnerIdentity(account) !== requestInfo.nativeCodexOwner) return false;
+      }
+      if ((!['all', 'codex'].includes(profile) && only !== 'codex') || requestInfo.codexCompatible !== true) return false;
+      if (!codexModelFor(requestInfo, account)) return false;
+      return !account.remote || String(requestInfo.path || '').startsWith('/v1/');
+    }
+    if (profile === 'codex' || !this._matchesProfile(account, profile)) return false;
     // A cloud mirror carries Anthropic-API traffic only (/v1/…). Browser noise
     // (favicon, stray GETs) must never be forwarded — on the remote it finds no
     // route, queues up to the hold window, and pins a link lease the whole time
@@ -3970,6 +4137,12 @@ export class AccountManager {
       if (this._claudeFallbackFor(account.provider) === 'never') return false;
     }
     return true;
+  }
+
+  rememberMessageRoute(id, provider, model) {
+    if (!['codex', 'zai', 'kimi'].includes(provider) || typeof id !== 'string' || id.length > 300
+      || typeof model !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,100}$/i.test(model)) return;
+    lruSet(this.recentMessageRoutes, id, { provider, model });
   }
 
   _noteRequestPolicy(requestInfo = {}) {
@@ -4165,13 +4338,22 @@ export class AccountManager {
     // of the same subscription (uuid:U vs uuid:U:org) groups with self and must
     // never count as a second roomy member of the pool.
     const selfGroup = new Set(this.capacityGroupOf(self));
+    const family = self?.provider === 'codex' ? 'codex' : 'claude';
     const selfProfiles = self?.profiles || ['claude', 'all'];
+    const ownModels = family === 'codex' ? self.quota?.codexModels ?? self.codexModels : null;
     const roomLeft = (util, ceiling, room) => Number.isFinite(util) && util <= ceiling - room;
     const roomy = [];
     for (const p of this.accounts) {
       const id = this.capacityIdentity(p);
       if (id == null || selfGroup.has(p)) continue;
-      if (p.type !== 'oauth' || p.enabled === false) continue;
+      if (p.type !== 'oauth' || p.enabled === false || accountFamily(p) !== family) continue;
+      if (family === 'codex') {
+        const peerModels = p.quota?.codexModels ?? p.codexModels;
+        // Codex threads stay on this provider, and accounts can have different
+        // entitlements. An unknown or incomplete model set cannot cover a hold.
+        if (!ownModels?.length || !peerModels?.length
+          || ownModels.some(model => !peerModels.some(peer => peer.slug === model.slug))) continue;
+      }
       // A benched local copy is skipped; its identity is counted through the cloud
       // MIRROR of the same account (one peer per capacity group, below).
       if (p.poolBenchedBy) continue;
@@ -4185,11 +4367,13 @@ export class AccountManager {
       const q = p.quota || {};
       // Probe-fresh only: a peer whose reading predates this sweep's decision is
       // unknown capacity, and unknown capacity must not hold a claim.
-      const fresh = q.lastProbeOkAt != null && now - q.lastProbeOkAt <= CLAIM_FRESH_MS;
+      const readingAt = family === 'codex' ? q.codexWeeklyReadingAt : q.lastProbeOkAt;
+      const fresh = readingAt != null && now - readingAt <= CLAIM_FRESH_MS;
       if (!fresh) continue;
       const wkCeiling = this._effectiveCap(p, 'wk', now) ?? 1;
       if (!roomLeft(q.unified7d, wkCeiling, POLICY.holdPeerWeeklyRoom)) continue;
-      if (!roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
+      if (!(family === 'codex' && q.codexFiveHourAbsent === true)
+        && !roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
       const buckets = Object.values(q.scopedWeekly || {}).filter(e => e && e.isActive !== false);
       if (buckets.some(e => !roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom))) continue;
       // One peer per capacity GROUP (lowest member index as its key): an org-less twin
@@ -4198,7 +4382,7 @@ export class AccountManager {
     }
     if (!selfProfiles.length) return 0;
     return Math.min(...selfProfiles.map(pr =>
-      new Set(roomy.filter(({ p }) => this._matchesProfile(p, pr)).map(({ key }) => key)).size));
+      new Set(roomy.filter(({ p }) => family === 'codex' || this._matchesProfile(p, pr)).map(({ key }) => key)).size));
   }
 
   // ── R7 hold register (red-team r2 #1/#2) ──────────────────────────────────
@@ -4240,9 +4424,10 @@ export class AccountManager {
     // capacity group is self, never a second holder. An older cloud exports no
     // wallHolding, so it adds none (the previous behaviour).
     const selfGroup = new Set(this.capacityGroupOf(self).map(x => x.index));
-    const remoteHolders = this.accounts.filter(a => a !== self && a.remote && a.enabled !== false
+    const family = accountFamily(self);
+    const remoteHolders = this.accounts.filter(a => a !== self && accountFamily(a) === family && a.remote && a.enabled !== false
       && a._remoteWallHolding === true && !selfGroup.has(a.index)).length;
-    return 1 + this.accounts.filter(a => a !== self && this.isHoldingWall(a, now)).length + remoteHolders;
+    return 1 + this.accounts.filter(a => a !== self && accountFamily(a) === family && this.isHoldingWall(a, now)).length + remoteHolders;
   }
 
   /**
@@ -4475,6 +4660,11 @@ export class AccountManager {
     if (requestInfo.isCountTokens) return;
     requestInfo._notedServed = account.name;
     requestInfo._servedAt = Date.now();
+    const providerKey = accountFamily(account);
+    const providerKeyForConversation = this._providerConversationKey(requestInfo);
+    if (providerKeyForConversation && !this.conversationProvider.has(providerKeyForConversation)) {
+      lruSet(this.conversationProvider, providerKeyForConversation, providerKey);
+    }
     const key = this._affinityKey(requestInfo);
     const prev = key ? this.conversationLastAccount.get(key) : undefined;
     this._noteHomeServed(requestInfo, account, prev);
@@ -4526,6 +4716,99 @@ export class AccountManager {
    *  terminal key when a conversation id exists. When identity is genuinely broken
    *  (a fresh hash every request) the home is simply never found, so the normal pick
    *  stands — never a forced or wrong return. */
+  _sessionRoutingFor(providerKey) {
+    const mode = this.scheduler.providers?.[providerKey]?.sessionRouting ?? this.scheduler.sessionRouting;
+    if (mode === 'same-provider' || mode === 'cross-provider') return mode;
+    return providerKey === 'codex' ? 'same-provider' : 'cross-provider';
+  }
+
+  _providerConversationKey(requestInfo) {
+    const caller = requestInfo.caller;
+    const key = requestInfo.clientThreadId ? 'cc:' + requestInfo.clientThreadId : this._homeKey(requestInfo);
+    return key && caller && caller !== 'legacy-key' ? caller + ':' + key : key;
+  }
+
+  pinnedSessionProvider(requestInfo) {
+    const provider = this.conversationProvider.get(this._providerConversationKey(requestInfo));
+    return provider && this._sessionRoutingFor(provider) === 'same-provider' ? provider : null;
+  }
+
+  nativeCodexOwner(key) {
+    return this.nativeCodexConversationOwners.get(key) || null;
+  }
+
+  rememberNativeCodexOwner(key, identity) {
+    if (/^codex-wire:[a-f0-9]{64}$/.test(key) && /^[a-f0-9]{64}$/.test(identity)) {
+      lruSet(this.nativeCodexConversationOwners, key, identity);
+    }
+  }
+
+  forgetNativeCodexOwner(key, identity) {
+    if (this.nativeCodexConversationOwners.get(key) === identity) this.nativeCodexConversationOwners.delete(key);
+  }
+
+  exportNativeCodexConversationOwners() {
+    return [...this.nativeCodexConversationOwners];
+  }
+
+  restoreNativeCodexConversationOwners(entries) {
+    if (!Array.isArray(entries)) return;
+    this.nativeCodexConversationOwners.clear();
+    for (const entry of entries) {
+      if (Array.isArray(entry)) this.rememberNativeCodexOwner(entry[0], entry[1]);
+    }
+  }
+
+  beginSessionProviderAttempt(lease) {
+    const { account, requestInfo } = lease;
+    if (!requestInfo || requestInfo.isCountTokens || requestInfo.nativeCodexClient) return true;
+    const key = this._providerConversationKey(requestInfo);
+    if (!key) return true;
+    const family = accountFamily(account);
+    const origin = this.conversationProvider.get(key);
+    if (origin) return !this.sessionProviderDrain || origin === family || this._sessionRoutingFor(origin) === 'cross-provider';
+    const sticky = this._sessionRoutingFor(family) === 'same-provider';
+    if (this.sessionProviderDrain) {
+      // A new sticky send belongs to the next worker. Unrelated cross-provider
+      // retries on this draining worker can still proceed.
+      if (sticky) return false;
+      for (const [pendingKey] of this.pendingSessionProviders.values()) {
+        if (pendingKey === key) return false;
+      }
+    } else if (sticky) {
+      this.pendingSessionProviders.set(lease, [key, family]);
+    }
+    return true;
+  }
+
+  settleSessionProviderAttempt(lease) {
+    this.pendingSessionProviders.delete(lease);
+  }
+
+  sealSessionProviderHandoff() {
+    // An outstanding first turn may finish successfully after this final flush.
+    // A confirmed origin wins. Conservatively retain the family of an unresolved
+    // send; a definitive failure before this point already released its lease.
+    for (const [key, family] of this.pendingSessionProviders.values()) {
+      if (!this.conversationProvider.has(key)) lruSet(this.conversationProvider, key, family);
+    }
+  }
+
+  exportSessionProviders() {
+    return [...this.conversationProvider];
+  }
+
+  restoreSessionProviders(entries) {
+    if (!Array.isArray(entries)) return; // legacy or unreadable snapshot
+    this.conversationProvider.clear();
+    for (const entry of entries) {
+      if (Array.isArray(entry) && typeof entry[0] === 'string' && entry[0]
+        && typeof entry[1] === 'string' && entry[1] && !this.conversationProvider.has(entry[0])) {
+        lruSet(this.conversationProvider, entry[0], entry[1]);
+      }
+    }
+  }
+
   _homeKey(requestInfo = {}) {
     return requestInfo.affinityKey || requestInfo.sessionKey || null;
   }
@@ -4706,7 +4989,7 @@ export class AccountManager {
     if (excludedIndexes.has(last.index)) return 'released:excluded';
     if (!this._matchesRequest(last, requestInfo.profile || 'claude', requestInfo)) return 'released:not-eligible';
     const unlock = weeklyOptions.allowWeeklyCritical ? null : this._criticalUnlock(last, requestInfo, excludedIndexes, null, now);
-    const avail = { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!unlock, model: requestInfo.model, now };
+    const avail = { ...weeklyOptions, allowWeeklyCritical: weeklyOptions.allowWeeklyCritical || !!unlock, model: this._availabilityModel(last, requestInfo), now };
     if (!this._isAvailable(last, avail)) return `released:unavailable(${this._unavailableCause(last, now)})`;
     const gate = this._affinityRelease(last, unlock);
     if (gate) return `released:${gate}`;
@@ -4919,7 +5202,7 @@ export class AccountManager {
     for (const a of this.accounts) {
       if (excludedIndexes.has(a.index)) continue;
       if (!this._matchesRequest(a, profile, requestInfo)) continue;
-      if (!this._isAvailable(a, { allowWeeklyReserve: true, allowWeeklyCritical: false, model: requestInfo.model, now })) continue;
+      if (!this._isAvailable(a, { allowWeeklyReserve: true, allowWeeklyCritical: false, model: this._availabilityModel(a, requestInfo), now })) continue;
       const target = this._weeklyRawState(a) === 'reserve'
         ? this.scheduler.reserveConcurrencyTarget
         : this.scheduler.perAccountConcurrencyTarget;
@@ -5282,6 +5565,67 @@ export class AccountManager {
     }
   }
 
+  applyCodexUsageData(accountIndex, usage, { sentAt = Date.now(), partial = false } = {}) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage || usage.error || sentAt < (account.codexQuotaSentAt || 0)) return;
+    // A positive reset must be followed by a full, newer quota read showing
+    // the weekly wall cleared before dropping its last observed 429 bench.
+    const wall = this.scheduler.weeklyExhaustedThreshold;
+    if (!partial && account.lastClaimAt && sentAt >= account.lastClaimAt
+      && account.status === 'throttled' && account.lastError === 'rate_limited'
+      && account.lastErrorAt <= account.lastClaimAt && account.quota.unified7d >= wall
+      && usage.sevenDay?.utilization < wall && usage.sevenDay.resetAt > sentAt) {
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+      account.lastError = null;
+      account.lastErrorAt = null;
+    }
+    account.codexQuotaSentAt = sentAt;
+    if (!partial && usage.sevenDay) account.quota.codexFiveHourAbsent = !usage.fiveHour;
+    if (Number.isFinite(usage.sevenDay?.utilization) && Number.isFinite(usage.sevenDay?.resetAt)) {
+      account.quota.codexWeeklyReadingAt = sentAt;
+    }
+    const scopedWeekly = partial ? { ...account.quota.scopedWeekly } : {};
+    for (const bucket of usage.modelBuckets || []) {
+      const key = bucket.normalModelSlug || bucket.slug;
+      if (key) scopedWeekly[key] = { utilization: bucket.utilization, resetAt: bucket.resetAt, isActive: true };
+    }
+    if (!partial && Array.isArray(usage.modelBuckets) && !usage.fiveHour && !usage.sevenDay && !usage.modelBuckets.length) {
+      if (!account.quota.unified5hReset && !account.quota.unified7dReset) account.quota.weeklyAbsent = true;
+    }
+    this.applyUsageData(accountIndex, {
+      fiveHour: usage.fiveHour,
+      sevenDay: usage.sevenDay,
+      scopedWeekly,
+      ...(usage.sevenDay ? { weeklyAbsent: false } : {}),
+    }, { sentAt });
+    if (usage.resetCredits) {
+      const summary = { ...usage.resetCredits, checkedAt: Date.now() };
+      account.codexResetCredits = summary;
+      account.quota.codexResetCredits = summary;
+    }
+  }
+
+  applyCodexQuotaHeaders(accountIndex, headers, sentAt, model) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    this._noteAccountResponse(account);
+    if (sentAt < (account.codexQuotaSentAt || 0)) return;
+    const parsed = parseCodexQuota(headers);
+    const activeLimit = parseCodexActiveLimit(headers);
+    if (model && activeLimit) {
+      account.quota.codexLimitByModel = { ...account.quota.codexLimitByModel, [model]: activeLimit };
+    }
+    if (!Object.keys(parsed).length) return;
+    account.quota.lastHeaderQuotaAt = Date.now();
+    const window = (utilization, resetAt) => utilization == null ? null : { utilization, resetAt };
+    this.applyCodexUsageData(accountIndex, {
+      fiveHour: window(parsed.unified5h, parsed.unified5hReset),
+      sevenDay: window(parsed.unified7d, parsed.unified7dReset),
+      modelBuckets: parsed.modelBuckets,
+    }, { sentAt, partial: true });
+  }
+
   /**
    * Record a background probe FAILURE for an account (called by the prober instead
    * of swallowing the error). Surfaced in getStatus()/the TUI so a persistently
@@ -5556,6 +5900,11 @@ export class AccountManager {
     return (now - last) > Math.max(3 * interval, 180_000);
   }
 
+  _noteAccountResponse(account) {
+    account.usage.totalRequests++;
+    account.usage.lastUsed = new Date().toISOString();
+  }
+
   /**
    * Update an account's quota tracking from upstream response headers.
    */
@@ -5664,8 +6013,7 @@ export class AccountManager {
       || genericLimit != null || genericRemaining != null;
     if (gotQuotaHeader) account.quota.lastHeaderQuotaAt = Date.now();
 
-    account.usage.totalRequests++;
-    account.usage.lastUsed = new Date().toISOString();
+    this._noteAccountResponse(account);
 
     // Log when approaching quota
     if (this._isNearQuota(account)) {
@@ -6234,6 +6582,9 @@ export class AccountManager {
   async ensureTokenFresh(accountIndex, force = false) {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth' || !account.refreshToken) return true;
+    // The in-memory token changes before the disk write finishes. A concurrent
+    // request must still await persistence even if that token is already fresh.
+    if (account._refreshPromise) return account._refreshPromise;
 
     // Single-writer baton: a worker without the lease NEVER rotates a single-use
     // refresh token (doing so would invalidate the lease holder's token →
@@ -6263,16 +6614,35 @@ export class AccountManager {
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return true;
 
-    // Coalesce concurrent refreshes
-    if (account._refreshPromise) return account._refreshPromise;
-
+    const target = {
+      name: account.name, provider: account.provider, codexAuth: account.codexAuth,
+      accountUuid: account.accountUuid, organizationUuid: account.organizationUuid, codexAccountId: account.codexAccountId,
+      oauthClientId: account.oauthClientId, credential: account.credential, refreshToken: account.refreshToken,
+    };
+    // Profile reads can fill missing Claude metadata while the same grant is
+    // rotating. Known identity fields must remain stable, and the grant must
+    // still match before writing the returned tokens.
+    const matchesClaudeIdentity = () => target.provider === 'anthropic'
+      && (!target.accountUuid || sameUser(account, target))
+      && (!target.organizationUuid || account.organizationUuid === target.organizationUuid);
+    const currentAccount = () => this.accounts[account.index] === account && account.provider === target.provider
+      && account.codexAuth === target.codexAuth && account.codexAccountId === target.codexAccountId
+      && (matchesClaudeIdentity() || (target.accountUuid ? sameAccountIdentity(account, target)
+        : !account.accountUuid && account.organizationUuid === target.organizationUuid));
+    const sameGrant = () => account.credential === target.credential && account.refreshToken === target.refreshToken;
     account._refreshPromise = (async () => {
       console.log(`[Maxpool] Refreshing token for account "${account.name}"...`);
       // Record the token we're rotating FROM so the persistence layer's
       // generation guard can detect another writer having already advanced it.
-      account._refreshedFrom = account.refreshToken;
+      account._refreshedFrom = target.refreshToken;
+      account._refreshedAccessFrom = target.credential;
       try {
-        const newTokens = await this._refreshAccessToken(account.refreshToken);
+        const newTokens = target.codexAuth === 'native' ? await this._refreshNativeCodexToken(target)
+          : target.provider === 'codex' ? await this._refreshOpenAIToken(target)
+            : await this._refreshAccessToken(target.refreshToken);
+        if (!currentAccount()) return false;
+        if (!sameGrant()) return true;
+        if (target.codexAuth === 'native') rememberNativeRefresh(account, newTokens);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
@@ -6292,12 +6662,14 @@ export class AccountManager {
         // refresh failure (which would latch refreshDead on a working account), so
         // guard the await too.
         try {
-          await this._onTokenRefresh?.(accountIndex, newTokens);
+          await this._onTokenRefresh?.(account.index, newTokens, { account, target, refreshedFrom: target.refreshToken });
         } catch (persistErr) {
           console.error(`[Maxpool] Token persist raised unexpectedly for "${account.name}": ${persistErr?.message || persistErr}`);
         }
-        return true;
+        return currentAccount();
       } catch (err) {
+        if (!currentAccount()) return false;
+        if (!sameGrant()) return true;
         console.error(`[Maxpool] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token
@@ -6307,9 +6679,9 @@ export class AccountManager {
             // failure (fetch failed / timeout) → short fixed cooldown so it auto-recovers
             // when the network returns. A retryable HTTP status (429 / 5xx from the OAuth
             // endpoint) is server-side → keep the exponential backoff.
-            this.markTransientFailure(accountIndex, `token_refresh_${err.status || 'network'}`, { network: !err.status });
+            this.markTransientFailure(account.index, `token_refresh_${err.status || 'network'}`, { network: !err.status });
           } else {
-            this.markAuthFailed(accountIndex, err.status || 401, 'token_refresh_failed');
+            this.markAuthFailed(account.index, err.status || 401, 'token_refresh_failed');
             // The refresh TOKEN itself was rejected (invalid_grant) — permanent until
             // browser re-auth. Latch so ensureTokenFresh + the prober stop retrying a
             // dead token. Set ONLY here (a rejected refresh), never in markAuthFailed
@@ -6354,10 +6726,11 @@ export class AccountManager {
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
-  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
+  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }, { persist = true } = {}) {
     const account = this.accounts[accountIndex];
     if (!account || account.type !== 'oauth') return;
 
+    const target = { ...account };
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
@@ -6368,11 +6741,11 @@ export class AccountManager {
     // claim org and the claim backoff (finding 10).
     this._forgetClaimState(account.name);
     console.log(`[Maxpool] Updated tokens for account "${account.name}"`);
-    this._onTokenRefresh?.(accountIndex, {
+    if (persist) this._onTokenRefresh?.(accountIndex, {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
-    });
+    }, { account, target, refreshedFrom: target.refreshToken });
   }
 
   /**
@@ -6387,6 +6760,11 @@ export class AccountManager {
       provider: acctData.provider || (acctData.type === 'provider' ? 'provider' : 'anthropic'),
       accountUuid: acctData.accountUuid || null,
       organizationUuid: acctData.organizationUuid || null,
+      oauthClientId: acctData.oauthClientId || null,
+      codexAuth: acctData.codexAuth || null,
+      codexAccountId: acctData.codexAccountId || null,
+      codexModels: acctData.codexModels || null,
+      autoRedeemReset: acctData.autoRedeemReset,
       credential: acctData.accessToken || acctData.authToken || acctData.apiKey,
       upstream: acctData.upstream || null,
       authHeader: acctData.authHeader || null,
@@ -6691,7 +7069,8 @@ export class AccountManager {
     return this.accounts.filter(a => !a.remote).map(a => {
       const quota = {};
       for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
-      const out = { accountUuid: a.accountUuid, organizationUuid: a.organizationUuid, name: a.name, quota };
+      const out = { accountUuid: a.accountUuid, organizationUuid: a.organizationUuid, name: a.name, quota,
+        ...(a.provider === 'codex' ? { provider: 'codex' } : {}) };
       // OUTSIDE-USAGE flag survives restart (red-team R1.2): a restart is exactly
       // when a leak's cards are most at risk — remediation rotates keys and
       // restarts the pool, and the in-memory flag would vanish mid-remediation.
@@ -6911,6 +7290,7 @@ export class AccountManager {
         this.addAccount({
           name, type: ra.type === 'oauth' ? 'oauth' : (ra.type === 'provider' ? 'provider' : ra.type),
           provider: ra.provider, profiles: ra.type === 'provider' ? ['all'] : ['claude', 'all'],
+          priority: ra.provider === 'codex' ? 30 : undefined,
           configSourced: true, runtime: false,
         });
         a = this.accounts[this.accounts.length - 1];
@@ -6923,6 +7303,10 @@ export class AccountManager {
       a.remoteUuid = ra.accountUuid || null;
       a.remoteOrganizationUuid = ra.organizationUuid || null;
       a.provider = ra.provider || a.provider;
+      a.codexAuth = ra.codexAuth || null;
+      a.codexModels = ra.codexModels || null;
+      a.codexResetCredits = ra.codexResetCredits || null;
+      a.autoRedeemReset = ra.autoRedeemReset;
       a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
       a.status = ra.status || 'active';
       a.refreshDead = Boolean(ra.refreshDead);
@@ -7092,7 +7476,7 @@ export class AccountManager {
   async tryReactiveClaim(account, { kind, weeklyUtil: _weeklyUtil = null }, now = Date.now()) {
     if (!account) return false;
     if (account.remote || account.poolBenchedBy || account.enabled === false) return false;
-    if (!account.credential || account.type !== 'oauth') return false;
+    if (!account.credential || account.type !== 'oauth' || account.provider === 'codex') return false;
     // C6 (finding 1): ONE claim per wall — after a claim, only a probe SENT after
     // it may show the wall again. Repeated 429s on the same wall never re-claim.
     // The general wall counts only claims that cleared it (red-team r4 #2): after a
@@ -7199,7 +7583,7 @@ export class AccountManager {
       // Overall cache / move / bounce / wait figures — the SAME merge the TUI Cache line
       // uses (mirror rows: cache + served from the serving pool's export, edge-only
       // fields from this pool's own events), plus edge client outcomes.
-      efficiency: { last15m: this.efficiencyOverall('last15m', now), last1h: this.efficiencyOverall('last1h', now) },
+      efficiency: { last15m: this.efficiencyOverall('last15m', now), last1h: this.efficiencyOverall('last1h', now), last24h: this.efficiency24h(now) },
       clientOutcomes: { last15m: this.clientOutcomeSummary(15 * 60_000, now), last1h: this.clientOutcomeSummary(60 * 60_000, now) },
       switchThreshold: this.switchThreshold,
       routing: {
@@ -7211,6 +7595,10 @@ export class AccountManager {
         name: a.name,
         type: a.type,
         provider: a.provider,
+        ...(a.provider === 'codex' ? { codexAuth: a.codexAuth,
+          codexModels: a.quota?.codexModels ?? a.codexModels,
+          autoRedeemReset: a.remote ? a.autoRedeemReset : a.autoRedeemReset === true,
+          codexResetCredits: a.enabled === false ? null : a.quota?.codexResetCredits ?? a.codexResetCredits ?? null } : {}),
         enabled: a.enabled,
         poolBenchedBy: a.poolBenchedBy || null,
         remote: Boolean(a.remote),

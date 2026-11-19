@@ -8,10 +8,11 @@
 //   4. keeps hammering a session the server rejects (archived/deleted)
 //   5. keeps using a credential the server has rejected (401 must disarm)
 //   6. acts before any authenticated request has been observed
-import test from 'node:test';
+import test, { mock } from 'node:test';
+import { once } from 'node:events';
 import assert from 'node:assert/strict';
 import https from 'node:https';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,7 +27,7 @@ const FIXTURES_PRESENT = existsSync(join(GATE_DIR, 'anthropic-mitm.key'));
 const gateDescribe = FIXTURES_PRESENT ? test : test.skip;
 
 // A TLS upstream standing in for api.anthropic.com, using the gate's own mkcert pair.
-function fakeUpstream(handler) {
+function fakeUpstream(t, handler) {
   const server = https.createServer({
     cert: readFileSync(join(GATE_DIR, 'anthropic-mitm.crt')),
     key: readFileSync(join(GATE_DIR, 'anthropic-mitm.key')),
@@ -35,6 +36,10 @@ function fakeUpstream(handler) {
     req.on('data', c => chunks.push(c));
     req.on('end', () => handler(req, res, Buffer.concat(chunks).toString('utf8')));
   });
+  t.after(() => new Promise(resolve => {
+    server.close(resolve);
+    server.closeAllConnections();
+  }));
   return server;
 }
 
@@ -42,8 +47,9 @@ function listen(server) {
   return new Promise(r => server.listen(0, '127.0.0.1', () => r(server.address().port)));
 }
 
-function sessionsDir(entries) {
+function sessionsDir(t, entries) {
   const dir = mkdtempSync(join(tmpdir(), 'ts-sessions-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   entries.forEach((e, i) => writeFileSync(join(dir, `${1000 + i}.json`), JSON.stringify(e)));
   return dir;
 }
@@ -54,24 +60,58 @@ const AUTH = { authorization: 'Bearer sk-ant-oat01-testtoken' };
 
 // Load a FRESH module instance per test — authTemplate is module-level state.
 async function freshModule(dir) {
+  const previous = process.env.RC_GATE_SESSIONS_DIR;
   process.env.RC_GATE_SESSIONS_DIR = dir;
-  return await import(`${join(GATE_DIR, 'title-sync.js')}?t=${Math.random()}`);
+  try {
+    return await import(`${join(GATE_DIR, 'title-sync.js')}?t=${Math.random()}`);
+  } finally {
+    if (previous === undefined) delete process.env.RC_GATE_SESSIONS_DIR;
+    else process.env.RC_GATE_SESSIONS_DIR = previous;
+  }
 }
 
-async function runOneCycle(mod, port, stateFile, intervalMs = 25) {
-  const stop = mod.startTitleSync({ host: '127.0.0.1', port, stateFile, intervalMs, log: () => {} });
-  await new Promise(r => setTimeout(r, intervalMs * 6));
-  stop();
+async function runOneCycle(mod, port, stateFile) {
+  // Observe one real interval tick, then stop scheduling more. Stopping the
+  // timer alone doesn't wait for the HTTPS work the tick has already started.
+  const realInterval = globalThis.setInterval;
+  let resolveTick;
+  const ticked = new Promise(resolve => { resolveTick = resolve; });
+  const interval = mock.method(globalThis, 'setInterval', (cycle, ms) => realInterval(() => {
+    cycle();
+    resolveTick();
+  }, ms));
+  let stop;
+  try {
+    stop = mod.startTitleSync({ host: '127.0.0.1', port, stateFile, intervalMs: 1, log: () => {} });
+    assert.equal(interval.mock.callCount(), 1, 'title sync schedules its interval');
+  } finally {
+    interval.mock.restore();
+  }
+
+  // Pass through to real HTTPS and wait for each issued request to finish.
+  // Handling one response may start another request in the same cycle.
+  const requests = mock.method(https, 'request');
+  try {
+    await ticked;
+    stop();
+    for (let i = 0; i < requests.mock.callCount(); i++) {
+      const request = requests.mock.calls[i].result;
+      if (!request.closed) await once(request, 'close');
+    }
+  } finally {
+    stop();
+    requests.mock.restore();
+  }
 }
 
-gateDescribe('pushes a user-renamed session, once, and records it', async () => {
+gateDescribe('pushes a user-renamed session, once, and records it', async t => {
   const puts = [];
-  const server = fakeUpstream((req, res, body) => {
+  const server = fakeUpstream(t, (req, res, body) => {
     puts.push({ method: req.method, url: req.url, body, auth: req.headers.authorization, version: req.headers['anthropic-version'] });
     res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}');
   });
   const port = await listen(server);
-  const dir = sessionsDir([{ bridgeSessionId: 'sess_abc', name: 'maxpool', nameSource: 'user' }]);
+  const dir = sessionsDir(t, [{ bridgeSessionId: 'sess_abc', name: 'maxpool', nameSource: 'user' }]);
   const stateFile = join(dir, 'state.json');
   const mod = await freshModule(dir);
   mod.noteAuthHeaders('/v1/code/sessions/sess_abc', AUTH);
@@ -88,14 +128,13 @@ gateDescribe('pushes a user-renamed session, once, and records it', async () => 
   // Second run over the same state must be silent — no re-push of an unchanged name.
   await runOneCycle(mod, port, stateFile);
   assert.equal(puts.length, 1, 'no re-push when the name has not changed');
-  server.closeAllConnections?.(); server.close();
 });
 
-gateDescribe('a later rename IS pushed', async () => {
+gateDescribe('a later rename IS pushed', async t => {
   const puts = [];
-  const server = fakeUpstream((req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
+  const server = fakeUpstream(t, (req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
   const port = await listen(server);
-  const dir = sessionsDir([{ bridgeSessionId: 'sess_r', name: 'first', nameSource: 'user' }]);
+  const dir = sessionsDir(t, [{ bridgeSessionId: 'sess_r', name: 'first', nameSource: 'user' }]);
   const stateFile = join(dir, 'state.json');
   const mod = await freshModule(dir);
   mod.noteAuthHeaders('/v1/code/sessions', AUTH);
@@ -105,14 +144,13 @@ gateDescribe('a later rename IS pushed', async () => {
   await runOneCycle(mod, port, stateFile);
 
   assert.deepEqual(puts.map(b => JSON.parse(b).title), ['first', 'second']);
-  server.closeAllConnections?.(); server.close();
 });
 
-gateDescribe('never pushes derived names, unnamed sessions, or sessions with no bridge id', async () => {
+gateDescribe('never pushes derived names, unnamed sessions, or sessions with no bridge id', async t => {
   const puts = [];
-  const server = fakeUpstream((req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
+  const server = fakeUpstream(t, (req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
   const port = await listen(server);
-  const dir = sessionsDir([
+  const dir = sessionsDir(t, [
     { bridgeSessionId: 'sess_d', name: 'team-workspace-5e', nameSource: 'derived' },
     { bridgeSessionId: 'sess_n' },
     { name: 'no bridge here', nameSource: 'user' },
@@ -123,14 +161,13 @@ gateDescribe('never pushes derived names, unnamed sessions, or sessions with no 
   await runOneCycle(mod, port, join(dir, 'state.json'));
 
   assert.deepEqual(puts.map(b => JSON.parse(b).title), ['real name']);
-  server.closeAllConnections?.(); server.close();
 });
 
-gateDescribe('does nothing until an authenticated request has been observed', async () => {
+gateDescribe('does nothing until an authenticated request has been observed', async t => {
   const puts = [];
-  const server = fakeUpstream((req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
+  const server = fakeUpstream(t, (req, res, body) => { puts.push(body); res.writeHead(200); res.end('{}'); });
   const port = await listen(server);
-  const dir = sessionsDir([{ bridgeSessionId: 'sess_q', name: 'quiet', nameSource: 'user' }]);
+  const dir = sessionsDir(t, [{ bridgeSessionId: 'sess_q', name: 'quiet', nameSource: 'user' }]);
   const mod = await freshModule(dir);
   // no noteAuthHeaders call at all
   await runOneCycle(mod, port, join(dir, 'state.json'));
@@ -140,65 +177,62 @@ gateDescribe('does nothing until an authenticated request has been observed', as
   mod.noteAuthHeaders('/v1/code/sessions', { authorization: 'Bearer not-an-oauth-token' });
   await runOneCycle(mod, port, join(dir, 'state.json'));
   assert.equal(puts.length, 0, 'a non-sk-ant credential is ignored');
-  server.closeAllConnections?.(); server.close();
 });
 
-gateDescribe('401 disarms the borrowed credential instead of retrying with it', async () => {
+gateDescribe('401 disarms the borrowed credential instead of retrying with it', async t => {
   let calls = 0;
-  const server = fakeUpstream((req, res) => { calls++; res.writeHead(401); res.end('{"error":"invalid"}'); });
+  const server = fakeUpstream(t, (req, res) => { calls++; res.writeHead(401); res.end('{"error":"invalid"}'); });
   const port = await listen(server);
-  const dir = sessionsDir([
+  const dir = sessionsDir(t, [
     { bridgeSessionId: 'sess_1', name: 'one', nameSource: 'user' },
     { bridgeSessionId: 'sess_2', name: 'two', nameSource: 'user' },
   ]);
   const mod = await freshModule(dir);
   mod.noteAuthHeaders('/v1/code/sessions', AUTH);
-  await runOneCycle(mod, port, join(dir, 'state.json'), 25);
+  await runOneCycle(mod, port, join(dir, 'state.json'));
 
   assert.equal(calls, 1, 'stops at the first 401 — does not walk the rest with a dead token');
-  server.closeAllConnections?.(); server.close();
+  await runOneCycle(mod, port, join(dir, 'state.json'));
+  assert.equal(calls, 1, 'the following tick also ignores the rejected credential');
 });
 
-gateDescribe('gives up on a session the server keeps rejecting', async () => {
+gateDescribe('gives up on a session the server keeps rejecting', async t => {
   let calls = 0;
-  const server = fakeUpstream((req, res) => { calls++; res.writeHead(404); res.end('{"error":"gone"}'); });
+  const server = fakeUpstream(t, (req, res) => { calls++; res.writeHead(404); res.end('{"error":"gone"}'); });
   const port = await listen(server);
-  const dir = sessionsDir([{ bridgeSessionId: 'sess_gone', name: 'archived', nameSource: 'user' }]);
+  const dir = sessionsDir(t, [{ bridgeSessionId: 'sess_gone', name: 'archived', nameSource: 'user' }]);
   const stateFile = join(dir, 'state.json');
   const mod = await freshModule(dir);
   mod.noteAuthHeaders('/v1/code/sessions', AUTH);
 
-  for (let i = 0; i < 5; i++) await runOneCycle(mod, port, stateFile, 20);
-  assert.ok(calls <= 3, `bounded retries, got ${calls}`);
-  assert.ok(calls >= 3, `should have tried the full budget, got ${calls}`);
-  server.closeAllConnections?.(); server.close();
+  for (let i = 0; i < 5; i++) await runOneCycle(mod, port, stateFile);
+  assert.equal(calls, 3, 'spends the full retry budget exactly once');
 });
 
-gateDescribe('a rename after a failure streak gets a fresh attempt', async () => {
+gateDescribe('a rename after a failure streak gets a fresh attempt', async t => {
   // The failure budget is per-TITLE. Keyed per-session it would mute a session's
   // name forever after one bad stretch, which is the opposite of the point.
-  let calls = 0, fail = true;
-  const server = fakeUpstream((req, res) => {
-    calls++;
+  const titles = [];
+  let fail = true;
+  const server = fakeUpstream(t, (req, res, body) => {
+    titles.push(JSON.parse(body).title);
     if (fail) { res.writeHead(500); res.end('{}'); } else { res.writeHead(200); res.end('{}'); }
   });
   const port = await listen(server);
-  const dir = sessionsDir([{ bridgeSessionId: 'sess_f', name: 'old name', nameSource: 'user' }]);
+  const dir = sessionsDir(t, [{ bridgeSessionId: 'sess_f', name: 'old name', nameSource: 'user' }]);
   const stateFile = join(dir, 'state.json');
   const mod = await freshModule(dir);
   mod.noteAuthHeaders('/v1/code/sessions', AUTH);
 
-  for (let i = 0; i < 4; i++) await runOneCycle(mod, port, stateFile, 20);
-  const spent = calls;
-  assert.ok(spent <= 3, `budget exhausted, got ${spent}`);
+  for (let i = 0; i < 4; i++) await runOneCycle(mod, port, stateFile);
+  assert.deepEqual(titles, ['old name', 'old name', 'old name']);
 
-  await runOneCycle(mod, port, stateFile, 20);
-  assert.equal(calls, spent, 'stays quiet while the name is unchanged');
+  await runOneCycle(mod, port, stateFile);
+  assert.equal(titles.length, 3, 'stays quiet while the name is unchanged');
 
   fail = false;
   writeFileSync(join(dir, '1000.json'), JSON.stringify({ bridgeSessionId: 'sess_f', name: 'new name', nameSource: 'user' }));
-  await runOneCycle(mod, port, stateFile, 20);
-  assert.ok(calls > spent, 'a NEW name is retried despite the earlier streak');
+  await runOneCycle(mod, port, stateFile);
+  assert.deepEqual(titles, ['old name', 'old name', 'old name', 'new name']);
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).sess_f.title, 'new name');
-  server.closeAllConnections?.(); server.close();
 });

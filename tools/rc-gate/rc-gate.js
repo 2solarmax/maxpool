@@ -26,7 +26,8 @@ import os from 'node:os';
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
-import { readFileSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync, watchFile } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { classifyLoopGap, readLastWakeMs } from './loop-gap.js';
@@ -154,7 +155,32 @@ const MAXPOOL_KEY = process.env.RC_GATE_MAXPOOL_KEY || '';
 // Message bodies are tens of KB to a few MB; 10 min is far above any real upload.
 const MITM_BODY_DEADLINE_MS = Number(process.env.RC_GATE_MITM_BODY_DEADLINE_MS) || 600_000;
 const MITM_HOSTS = new Set((process.env.RC_GATE_MITM_HOSTS || 'api.anthropic.com').split(',').map(s => s.trim()).filter(Boolean));
-const PROFILE = process.env.RC_GATE_PROFILE || 'claude';
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+const localDesktopGate = LOOPBACK_HOSTS.has(GATE_HOST) && LOOPBACK_HOSTS.has(MAXPOOL_HOST);
+const operatorProfile = process.env.RC_GATE_PROFILE;
+let defaultProfile = operatorProfile || 'claude';
+
+// Maxbar opts in with the same atomic settings edit that turns its proxy on.
+// Watch for changes off the request path. Legacy settings or Direct use Claude.
+function watchDesktopProfile(port) {
+  if (operatorProfile || !localDesktopGate) return;
+  const settingsFile = path.join(os.homedir(), '.claude', 'settings.json');
+  const proxy = `http://127.0.0.1:${port}`;
+  let revision = 0;
+  async function refresh() {
+    const current = ++revision;
+    let selected = 'claude';
+    try {
+      const env = JSON.parse(await readFile(settingsFile, 'utf8')).env;
+      if (env?.MAXBAR_CLAUDE_POOL_PROFILE === 'all' && env?.HTTPS_PROXY === proxy) selected = 'all';
+    } catch { /* unreadable or removed settings retain the legacy default */ }
+    if (current !== revision || selected === defaultProfile) return;
+    defaultProfile = selected;
+    console.log(`[desktop-profile] unprofiled local requests use ${selected}`);
+  }
+  watchFile(settingsFile, { persistent: false, interval: 1000 }, refresh);
+  void refresh();
+}
 
 // LIVE ROUTING SWITCH (owner 2026-11-01: "make the routing switch without having to
 // restart the app"). A running Claude session pins its proxy env at launch, but every
@@ -276,7 +302,7 @@ const mitmServer = http.createServer((creq, cres) => {
   delete headers.authorization;           // pool accounts supply upstream auth
   delete headers['proxy-connection'];
   if (MAXPOOL_KEY) headers['x-api-key'] = MAXPOOL_KEY;  // per-person pool key (remote pool)
-  if (!headers['x-maxpool-profile']) headers['x-maxpool-profile'] = PROFILE;
+  if (!headers['x-maxpool-profile']) headers['x-maxpool-profile'] = defaultProfile;
 
   // `/v1/sessions/<id>` is the v1-COMPAT Remote Control session API (fetch / patch /
   // mark-read / archive) — identity-bound to the OAuth account that created the session,
@@ -700,8 +726,9 @@ gate.listen(GATE_PORT, GATE_HOST, () => {
   // how the tests get a private port, and echoing the literal 0 gave them nothing to
   // connect to. Identical output in production, where the requested port is the bound one.
   const boundPort = gate.address()?.port ?? GATE_PORT;
+  watchDesktopProfile(boundPort);
   console.log(`rc-gate listening on ${GATE_HOST}:${boundPort}`);
-  console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool ${MAXPOOL_HOST}:${MAXPOOL_PORT} (profile: ${PROFILE}${MAXPOOL_KEY ? ', key: on' : ''})`);
+  console.log(`  MITM hosts: ${[...MITM_HOSTS].join(', ')} -> maxpool ${MAXPOOL_HOST}:${MAXPOOL_PORT} (profile: ${operatorProfile || 'claude by default'}${MAXPOOL_KEY ? ', key: on' : ''})`);
   console.log(`  everything else: blind tunnel`);
 });
 

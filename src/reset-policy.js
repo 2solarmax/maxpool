@@ -1,10 +1,11 @@
 /**
  * WHEN to redeem a limit-reset: the deliberate decision layer.
  *
- * Two value sources, one policy:
+ * Sources normalized into the shared reset policy:
  *  - z.ai reset cards: { fiveHour:[{recordId,expiresAt,expired}], weekly:[...] }
  *  - Claude cedar_ember grants: { grants:[{id,resetsLeft,endsAt,usableNow,paused,
  *    requiresLimit,clears}], nextGrantId, cooldownUntil, eligible }
+ *  - Codex banked credits: general-weekly grants after plan and expiry checks
  *
  * Rules (owner, 2026-09-30 — "account not just for exhaustion, but also the time
  * left until expiry of the reset"):
@@ -205,7 +206,7 @@ export function probeSentAt(q) {
  *  would expire before the refill (or within a day after it — it would sit unspent
  *  at ~0% used) is claimed as today. Dying-value claims stay exempt: an expiring
  *  grant's value cannot survive any wait. */
-export function decideClaudeWithReason(account, listing, now = Date.now(), opts = {}) {
+function decideSubscriptionWithReason(account, listing, now, opts) {
   const skip = reason => ({ action: null, reason });
   if (account?.enabled === false) return skip('account disabled');   // R0
   if (!listing) return skip('no listing');
@@ -317,4 +318,25 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
 
   // Session-only grants: NEVER claimed (owner 2026-10-30) — falls through.
   return out(null, reason ?? 'below wall');
+}
+
+export function decideClaudeWithReason(account, listing, now = Date.now(), opts = {}) {
+  return decideSubscriptionWithReason(account, listing, now, opts);
+}
+
+// Codex banked resets use the subscription's general weekly allowance. Only
+// actual weekly data can support the decision: an unrelated 5h/model reading
+// refreshing the account's generic probe timestamp is insufficient.
+export function decideCodexWithReason(account, credits, now = Date.now(), opts = {}) {
+  const q = account.quota || {};
+  if (!(q.unified7dReset > now)) return { action: null, reason: 'weekly window unknown or elapsed' };
+  const grants = (credits || []).filter(credit => credit?.status === 'available'
+    && credit.supportedByPlan !== false).map(credit => ({
+    id: credit.id, credit, endsAt: credit.expiresAt, resetsLeft: 1,
+    clears: ['seven_day'],
+  }));
+  return decideSubscriptionWithReason({
+    ...account,
+    quota: { ...q, lastProbeOkAt: q.codexWeeklyReadingAt, lastProbeOkSentAt: q.codexWeeklyReadingAt },
+  }, { grants, checkedAt: opts.listingCheckedAt }, now, opts);
 }

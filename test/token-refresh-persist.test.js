@@ -104,3 +104,38 @@ test('a rejected refresh (invalid_grant) logs the REJECTED-fingerprint diagnosti
   assert.match(out, new RegExp(`fp=${sentFp}`), 'names the exact rejected token so a lost-rotation is distinguishable from a revocation');
   assert.equal(am.accounts[0].refreshDead, true, 'still latches dead (storm control unchanged)');
 });
+
+test('a Claude refresh persists if the same grant learns its user or organization while awaiting the token response', async () => {
+  for (const accountUuid of [null, 'claude-user']) {
+    let finish;
+    const pending = new Promise(resolve => { finish = resolve; });
+    const am = new AccountManager([{ name: 'legacy', type: 'oauth', accountUuid,
+      accessToken: 'old-access', refreshToken: 'old-refresh', expiresAt: 1 }], 0.9, {}, { refreshAccessToken: () => pending });
+    const account = am.accounts[0];
+    let persisted;
+    am.onTokenRefresh((_index, tokens) => { persisted = tokens; });
+    const refreshing = am.ensureTokenFresh(0);
+    account.accountUuid = 'claude-user';
+    account.organizationUuid = 'learned-org';
+    const current = { accessToken: 'new-access', refreshToken: 'new-refresh', expiresAt: Date.now() + 3600000 };
+    finish(current);
+    assert.equal(await refreshing, true);
+    assert.deepEqual(persisted, current);
+    assert.equal(account.refreshToken, 'new-refresh');
+    assert.equal(account.organizationUuid, 'learned-org');
+  }
+});
+
+test('a refresh cannot follow a Claude row reassigned to a different known organization', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const am = new AccountManager([{ name: 'claude', type: 'oauth', accountUuid: 'user', organizationUuid: 'original-org',
+    accessToken: 'old-access', refreshToken: 'old-refresh', expiresAt: 1 }], 0.9, {}, { refreshAccessToken: () => pending });
+  let persisted = 0;
+  am.onTokenRefresh(() => { persisted++; });
+  const refreshing = am.ensureTokenFresh(0);
+  am.accounts[0].organizationUuid = 'different-org';
+  finish({ accessToken: 'new-access', refreshToken: 'new-refresh', expiresAt: Date.now() + 3600000 });
+  assert.equal(await refreshing, false);
+  assert.equal(persisted, 0);
+});

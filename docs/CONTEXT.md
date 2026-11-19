@@ -18,32 +18,10 @@
 
 ## Current focus
 
-Multi-provider + routing modes + restart UX shipped v1.5.64–v1.5.83. The proxy now
-load-balances across Anthropic OAuth + GLM (z.ai) + Kimi (Moonshot) with five named
-routing modes. Current version: **v1.5.83** (installed as a global symlink to
-`~/maxpool`, so `git pull` updates the running install).
-
-**Recently shipped (2026-08-10/11):**
-- v1.5.80: routing modes (`balance`, `prefer-claude`, `prefer-zai`, `prefer-kimi`,
-  `sticky`) replacing the opaque 3-policy knob. Utilisation-weighted scoring in
-  `balance` mode. Session binding only under `sticky`.
-- v1.5.81: restart UX fix — seamless path skips the 10s pre-drain (it was pure cost:
-  30-60s requests never finish in 10s, so it was always 10s of guaranteed 503s for
-  zero drained requests). Progress ticks during cold-path drain. Honest confirm text.
-- v1.5.82: cache-first secret resolution (reads `~/.claude/.credentials-cache` before
-  `gcloud`, fixing `secret-unresolved` rows that spawned duplicate `-fallback`
-  entries). Routing modes exposed in TUI (`f`/`m` key cycle).
-- v1.5.83: hide inert "Cross-provider: always" text under non-sticky modes (it
-  looked like two conflicting controls when only the mode governed routing).
-
-**Open items:**
-- `glm max@gomokka.com` (legacy TOKENS_LIMIT plan) has no weekly limit — confirmed
-  real (not a parse gap), but z.ai is sunsetting legacy plans (migration notice
-  April 2026). Don't rely on this long-term.
-- Ahmed's RESTRICTED_AL_MAXPOOL_ZAI key is absent from Max's credentials cache
-  (~17s gcloud resolution at boot on Max's machine; instant on Ahmed's).
-- `crossProviderFallbackPolicy: when-exhausted` still in config.json — inert
-  (routingMode takes precedence), cleaned up on next `f` key cycle.
+MaxPool v1.24.112 serves Claude Code with Anthropic, GLM, and Kimi. On
+`codex/maxpool-openai`, ChatGPT plan usage is added as another inference
+provider behind the same Claude Code Messages API. Native Codex quota, resets,
+and provider-sticky routing are being qualified on an isolated listener.
 
 ---
 
@@ -52,6 +30,68 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 ### 2026-11-19 · Local terminal request cap
 
 The local proxy checks the full terminal UUID and resolved caller before admitting a message. Operators can arm an existing terminal for a bounded task. Each incoming client attempt consumes one slot even when its eventual request fails. Slots persist across worker restarts. Cloud retries inside that request, generated tokens, and subscription quota use require separate measurement.
+
+### 2026-11-19 · Account configuration writes
+
+Claude browser login matches only Claude OAuth accounts. Another provider can keep the requested name and grant while the new Claude account gets a distinct label. Local CLI enrollment updates the latest locked config, and terminal account actions apply the selected row and fields so concurrent enrollment, credential rotation, and deletion survive.
+
+### 2026-11-19 · Cache dashboard at terminal width
+
+Show a named pair of 15-minute and 24-hour cache hit rates for Claude, GLM, and Codex when provisioned. A dash marks an idle or unmeasured window. Routing details show per-provider misses on their own line, and `maxpool status` keeps the existing quota-burn wording.
+
+### 2026-11-19 · Codex prompt cache from Claude Code
+
+The Codex Messages adapter sends stable Claude Code system text as the first developer input and drops the per-request Anthropic billing header. The native transport gives OpenAI matching prompt and session cache keys scoped to the authenticated caller, Claude Code thread and agent, serving account and resolved model. The dashboard continues to measure upstream cache-read tokens over total input tokens.
+
+### 2026-11-19 · Desktop Claude Pool opt-in
+
+Maxbar writes the Claude desktop Pool selection alongside its proxy settings. The loopback gate uses it to default unprofiled requests to `all`. Direct removes the opt-in. Explicit client and operator profiles keep precedence, and other gates retain the Claude default.
+
+### 2026-11-19 · Provider cache and move summaries
+
+The terminal displays separate Cache and Moves lines. Cache pairs each provider's 15-minute and 24-hour hit rates, including Codex. The 24-hour readings survive a restart. Routing and `maxpool status` show per-provider miss tokens. Move totals include Codex and preserve held-session release reasons from linked accounts.
+
+### 2026-11-19 · Native Codex clients in Maxbar
+
+The independent Codex routing switch uses the client's version-checked configuration service and a loopback Responses endpoint. The Mac's owner key authenticates the client. The scheduler selects a locally owned native account and binds subsequent requests to that identity for provider-owned state. Desktop and CLI share the model catalog, compaction and standalone search routes. Claude Code continues to use its Messages route.
+
+### 2026-11-19 · Codex reset inventory
+
+OpenAI reports separate counts for unused and currently applicable credits. Accounts shows the balance of unused credits, following the Codex CLI. Reset details lists unspent, unexpired credits supported by the plan. The optional usage-summary applicability count can stay zero as usage rises. At the weekly policy threshold, check the individual credit and use OpenAI’s redemption verdict. A decline leaves the credit banked. Free-credit policy and local opt-in are independent of this display.
+
+### 2026-11-19 · Codex account display
+
+Use the signed-in email as the default local account name. Reserve the Fable quota column for Anthropic rows. The dashboard summarizes cache hits by provider, with detailed counters available in Routing and `maxpool status`.
+
+### 2026-11-19 · #10 — Native Codex provider behind Claude Code
+
+**Context.** The first pilot used the app-scoped ChatGPT plan grant. Native
+Codex login also exposes live quota, reset inventory, and model entitlements.
+
+**Decision.** Reuse the TeamClaude native quota and reset interfaces and the
+tested CLIProxyAPI Responses wire behavior in MaxPool's provider adapter.
+The first serving provider of each Claude Code session controls its existing
+provider-stickiness option. Codex stays pinned by default, with account
+rotation and class-aware model selection within that family.
+
+**Consequences.** Native Codex and the pilot's original grant have separate
+credential/transport paths. Codex free reset automation is independently
+opt-in. Stage on a separate port and verify before changing the normal local
+package or enrolling a local account.
+
+### 2026-11-19 · #9 — ChatGPT plan usage behind Claude Code
+
+**Context.** Quota exhaustion needs a new provider on the existing `cc` path,
+including cloud account onboarding and Remote Control sessions.
+
+**Decision.** Add Sign in with ChatGPT to MaxPool and stream OpenAI Responses
+as Claude Messages. Use the existing linked-pool account handoff. Set the
+default session policy for ChatGPT to same provider, configurable per provider
+or pool-wide. Preserve the client-owned tool loop and the original transcript.
+
+**Consequences.** ChatGPT accounts can serve `cc all` traffic and rotate among
+eligible accounts. Verification needs both the Claude Code tool round trip
+and a real ChatGPT plan authorization before enabling it on the live pool.
 
 ### 2026-11-13 · release B red-team round 1 — first-byte floor vs client patience, mixed-version 504
 

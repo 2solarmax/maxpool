@@ -5,6 +5,20 @@
 
 const TIMEOUT_MS = 20_000;
 
+/** Resolve a Codex enrollment endpoint before transmitting the key or grant. */
+export function codexPoolEndpoint(base, path) {
+  const url = new URL(base);
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) {
+    throw new Error('Codex team sign-in requires HTTPS or a loopback tunnel.');
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error('Configure the Codex team pool with a base URL and a separate pool key.');
+  }
+  url.pathname = url.pathname.replace(/\/+$/, '') + path;
+  return url;
+}
+
 /**
  * POST a fresh OAuth login to the team pool. Never throws.
  * @returns {Promise<{ok:boolean, result?:string, name?:string, error?:string}>}
@@ -16,12 +30,18 @@ export async function sendLoginToPool({ url, key, name, profile, creds, fetchImp
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const res = await fetchImpl(`${String(url).replace(/\/+$/, '')}/maxpool/accounts`, {
+    const endpoint = profile.provider === 'codex' ? codexPoolEndpoint(url, '/maxpool/accounts')
+      : `${String(url).replace(/\/+$/, '')}/maxpool/accounts`;
+    const res = await fetchImpl(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': key || '' },
       body: JSON.stringify({
         account: {
           name, type: 'oauth',
+          ...(profile.provider === 'codex' ? {
+            provider: 'codex', oauthClientId: creds.oauthClientId, model: creds.model,
+            codexAuth: creds.codexAuth, codexAccountId: creds.codexAccountId, codexModels: creds.codexModels,
+          } : {}),
           accountUuid: profile?.accountUuid,
           organizationUuid: profile?.organizationUuid,
           accessToken: creds.accessToken,
@@ -30,6 +50,7 @@ export async function sendLoginToPool({ url, key, name, profile, creds, fetchImp
           source: 'remote-login',
         },
       }),
+      ...(profile.provider === 'codex' ? { redirect: 'error' } : {}),
       signal: ctl.signal,
     });
     const json = await res.json().catch(() => ({}));

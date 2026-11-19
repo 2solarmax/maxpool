@@ -1,10 +1,13 @@
 import { createInterface } from 'node:readline';
 import { TANK_MIN_UTIL } from './capacity-ledger.js';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
 import { readFileSync, writeSync } from 'node:fs';
 import { isatty } from 'node:tty';
 import { homedir } from 'node:os';
-import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
+import { fetchProfile, loginOAuth, tokenFingerprint, isLoginCancelled, sameUser, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName } from './oauth.js';
+import { configuredAccountProvider, findAccountConfigIndex, findClaudeOAuthLoginIndex, isClaudeOAuthAccount, planClaudeOAuthLogin } from './account-config.js';
 import { appendEventLog, setConsoleStdoutSuppressed } from './event-log.js';
 import { sendLoginToPool } from './cloud-login.js';
 import { sendProviderToPool } from './cloud-login.js';
@@ -294,6 +297,36 @@ function formatReset(resetTs) {
   const days = Math.floor(hrs / 24);
   const rh = hrs % 24;
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
+}
+
+function resetSummary(account) {
+  return account.quota?.codexResetCredits ?? account.codexResetCredits;
+}
+
+function codexResetCells(account, now = Date.now()) {
+  const reset = resetSummary(account);
+  let label = '-';
+  if (account.enabled !== false && Number.isInteger(reset?.available) && reset.available >= 0) {
+    label = String(reset.available);
+    const stale = reset.stale || account.refreshDead || account.subscriptionGone
+      || (reset.checkedAt != null && now - reset.checkedAt > LISTING_FRESH_MS);
+    if (stale) label += '?';
+    else label = reset.available > 0 ? green(label) : gray(label);
+  }
+  return rpad(gray('-'), MRST_W) + ' ' + rpad(label, ARST_W);
+}
+
+function codexLoginArgs(cli, name, account) {
+  const args = [cli, 'login', '--codex'];
+  if (name) args.push('--name', name);
+  if (account?.remote) args.push('--cloud', '--pool', account.remote.linkName);
+  else if (account) args.push('--local');
+  return args;
+}
+
+function canRedeemCodexCredit(credit, now = Date.now()) {
+  return credit?.status === 'available' && credit.supportedByPlan !== false
+    && (credit.expiresAt == null || credit.expiresAt > now);
 }
 
 function quotaLabel(ratio, resetTs, width) {
@@ -693,7 +726,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct, codexLoginArgs };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -732,7 +765,8 @@ export function decideLoginTarget({ mirror, links, existing, accountUuid }) {
 }
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart, spawnDetached }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart, spawnDetached,
+    codexResetDetails, redeemCodexReset, onSetCodexAutoRedeem }) {
     this.am = accountManager;
     // Runs the tmux detach for q in service mode; a seam so tests never start tmux.
     this._spawnDetached = spawnDetached || ((cmd, args) => {
@@ -743,6 +777,9 @@ export class TUI {
     this.syncAccounts = syncAccounts;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
+    this.codexResetDetails = codexResetDetails;
+    this.redeemCodexReset = redeemCodexReset;
+    this.onSetCodexAutoRedeem = onSetCodexAutoRedeem;
     this._startedAt = Date.now();   // the efficiency line's "since restart" window
     // Set by index.js after construction (a deferred closure, not a constructor literal —
     // avoids the const TDZ on applyUpdateIfReady, which is defined after `new TUI`).
@@ -766,6 +803,8 @@ export class TUI {
     this.confirmTitle = '';
     this.confirmDetail = '';
     this.confirmCb = null;
+    this.confirmReturnMode = 'normal';
+    this.codexResets = null;
     this.frame = 0;
     this.running = false;
     this.timer = null;
@@ -1065,6 +1104,7 @@ export class TUI {
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
       case 'confirm': this._keyConfirm(k); break;
+      case 'codexResets': this._keyCodexResets(k); break;
     }
     this.forceRender();
   }
@@ -1237,73 +1277,108 @@ export class TUI {
     return ` Routing  ${cyan(routing)}${xpText}`;
   }
 
-  /** EFFICIENCY line (2026-11-15), directly under Routing: is the prompt cache holding,
-   *  and what are moves costing — Claude and GLM never blended. null with no traffic.
-   *  Colours are WARN-only proposals until a one-day baseline exists; a red names the
-   *  cause and the account.
-   *  Honest-efficiency rework (2026-11-17, audit findings 2-6):
-   *  - hit% never travels alone: writeShare (1.25·cc / 0.1·cr+1.25·cc+in) rides beside
-   *    it — a 91% hit line can carry writes worth half the spend, and that is the number
-   *    that hid the cold-hop waste. Yellow >40%, red >60% (Claude).
-   *  - moves split cross-family (the prompt re-wrote wholesale; drives the red alarm)
-   *    vs same-family (near-free: z.ai's cache is shared across its accounts).
-   *  - miss is per provider — GLM and Claude tokenizers differ ~1.6x, a blended sum is
-   *    unit-inconsistent.
-   *  - waits say what they count: busy-bounce waits only (queue holds book 0 here). */
-  _efficiencyLine(W = 80, now = Date.now()) {
-    const eff = this.am.efficiencyOverall?.('last15m', now);
-    if (!eff) return null;
-    const { claude: c, glm: g } = eff;
-    const served = c.served + g.served;
-    const bounced = c.bounced + g.bounced;
-    if (served + bounced === 0) return null;
+  /** Keep the two cache windows paired with each provider in the overview. */
+  _cacheLine(W = 80, now = Date.now()) {
+    const recent = this.am.efficiencyOverall?.('last15m', now);
+    if (!recent) return null;
+    const day = this.am.efficiency24h?.(now) || {};
+    const dayHit = group => group?.hit != null && group.served >= 20 ? group.hit : null;
+    const groups = [['claude', 'Claude'], ['glm', 'GLM']];
+    if (recent.codex || day.codex) groups.push(['codex', 'Codex']);
+    const hasDay = groups.some(([key]) => dayHit(day[key]) != null);
+    if (!hasDay && groups.every(([key]) => !(recent[key]?.served || recent[key]?.bounced))) return null;
     const sinceMs = now - (this._startedAt ?? now);
     const since = sinceMs < 15 * 60_000 ? dim(`  since restart ${Math.max(1, Math.round(sinceMs / 60_000))}m`) : '';
-    if (c.lowVolume && g.lowVolume) return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
-    const pctTxt = x => `${Math.round(x * 100)}%`;
-    const parts = [];
-    if (c.hit != null) parts.push(`Claude ${c.lowVolume ? dim(pctTxt(c.hit)) : pctTxt(c.hit)}${c.writeShare != null ? ` (w/ ${pctTxt(c.writeShare)} of cost)` : ''}`);
-    if (g.hit != null) parts.push(`GLM ${g.lowVolume ? dim(pctTxt(g.hit)) : pctTxt(g.hit)}`);
-    const missTxt = t => t >= 1e6 ? `${(t / 1e6).toFixed(1)}M` : `${Math.round(t / 1000)}k`;
-    if (c.hit != null || c.missTokens) parts.push(`Claude miss ${missTxt(c.missTokens)} tok`);
-    if (g.hit != null || g.missTokens) parts.push(`GLM miss ${missTxt(g.missTokens)} tok`);
-    const cause = k => c.movedByCause[k] + g.movedByCause[k];
-    const per100 = n => (served ? Math.round(n * 100 / served) : 0);
-    const cross = (c.movedCross || 0) + (g.movedCross || 0);
-    // Causes list only what happened — a row of zeros is width the line cannot spare.
-    const causeTxt = ['busy', 'balance', 'wall', 'link', 'other'].filter(k => cause(k) > 0).map(k => ` · ${k} ${cause(k)}`).join('');
-    parts.push(`cross-moves ${per100(cross)}/100 (same ${(c.movedSame || 0) + (g.movedSame || 0)}${causeTxt})`);
-    const bounceShare = bounced / (served + bounced);
-    if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}`);
-    const glmBusy = g.movedByCause.busy || 0;
-    if (glmBusy) parts.push(`glm busy-bounced ${glmBusy}`);
-    const waited = c.waited + g.waited;
-    if (waited) parts.push(`busy-bounce waits ${waited} (avg ${((c.waitMs + g.waitMs) / waited / 1000).toFixed(1)}s)`);
+    if (!hasDay && groups.every(([key]) => !recent[key] || recent[key].lowVolume)) {
+      return truncLine(` Cache    ${dim('— (little traffic)')}${since}`, W);
+    }
+    const pct = hit => hit == null ? dim('—') : `${Math.round(hit * 100)}%`;
+    const parts = groups.map(([key, label]) => {
+      const period = recent[key];
+      const short = pct(period?.hit);
+      return `${label} ${period?.lowVolume && period.hit != null ? dim(short) : short}/${pct(dayHit(day[key]))}`;
+    });
+    const figures = `${dim('[15m/24h]')}  ${parts.join(' · ')}`;
 
-    // RED — the first cause that applies, named with the account behind it.
-    const wtm = c.waitThenMoved + g.waitThenMoved;
+    const claude = recent.claude;
+    const hour = this.am.efficiencyOverall('last1h', now).claude;
+    const drift = !claude.lowVolume && !hour.lowVolume && claude.hit != null && hour.hit != null && hour.hit - claude.hit >= 0.15;
+    const severe = !claude.lowVolume && claude.hit != null && claude.hit < 0.5;
+    if (severe) {
+      const account = this._worstCacheAccount() || '?';
+      const prefix = ` ${red('Cache')}    `;
+      const line = `${prefix}${red(`⚠ Claude ${pct(claude.hit)} on ${account}`)} · ${figures}`;
+      if (vw(line) <= W) return truncLine(line + since, W);
+      return truncLine(`${prefix}${figures} · ${red(`⚠ ${account}`)}`, W);
+    }
+    const warn = (!claude.lowVolume && claude.hit != null && claude.hit < 0.7) || drift;
+    return truncLine(` ${warn ? yellow('Cache') : green('Cache')}    ${figures}${since}`, W);
+  }
+
+  _missTxt(t) {
+    if (t == null) return '—';
+    return t >= 1e6 ? `${(t / 1e6).toFixed(1)}M tok` : `${Math.round(t / 1000)}k tok`;
+  }
+
+  /** The moves half of the old efficiency line: causes only, no cache figures.
+   *  cross/100 is the costly signal (the prompt re-wrote wholesale on the new
+   *  family). same-family moves split by WHY they left the holder — outscored (the
+   *  sibling won on load), hold-ceiling (the depth cap released it), released (a
+   *  hold gate let go) — so a wave of moves names its driver instead of a bare
+   *  count. "glm moved-busy" (renamed from the mislabeled "busy-bounced": these
+   *  are moves, not bounces) stays as the GLM capacity note. */
+  _movesLine(W = 80, now = Date.now()) {
+    const eff = this.am.efficiencyOverall?.('last15m', now);
+    if (!eff) return null;
+    const groups = [eff.claude, eff.glm, eff.codex].filter(Boolean);
+    const total = field => groups.reduce((sum, group) => sum + (group[field] || 0), 0);
+    const by = (field, key) => groups.reduce((sum, group) => sum + (group[field]?.[key] || 0), 0);
+    const served = total('served');
+    const bounced = total('bounced');
+    if (served + bounced === 0) return null;
+    if (served === 0) return truncLine(` Moves   ${dim('— (no served traffic)')}`, W);
+    const pctTxt = x => `${Math.round(x * 100)}%`;
+    const per100 = n => Math.round(n * 100 / served);
+    const cross = total('movedCross');
+    const same = total('movedSame');
+    const why = k => by('movedByWhy', k);
+    const parts = [`cross ${per100(cross)}/100`];
+    if (same) {
+      const whyTxt = ['outscored', 'holdCeiling', 'released', 'other'].filter(k => why(k) > 0)
+        .map(k => `${k === 'holdCeiling' ? 'hold-ceiling' : k} ${why(k)}`).join(' · ');
+      parts.push(`same ${same}${whyTxt ? ` (${whyTxt})` : ''}`);
+    }
+    const cause = k => by('movedByCause', k);
+    const causeTxt = ['busy', 'balance', 'wall', 'link'].filter(k => cause(k) > 0).map(k => `${k} ${cause(k)}`).join(' · ');
+    if (causeTxt) parts.push(causeTxt);
+    const bounceShare = bounced / (served + bounced);
+    if (bounced) parts.push(`bounced ${pctTxt(bounceShare)}${bounceShare > 0.05 ? dim(` (worst: ${this._mostBouncedAccount(now) || '?'})`) : ''}`);
+    const glmBusy = eff.glm?.movedByCause?.busy || 0;
+    if (glmBusy) parts.push(`glm moved-busy ${glmBusy}`);
+    const waited = total('waited');
+    if (waited) parts.push(`busy-waits ${waited} (avg ${(total('waitMs') / waited / 1000).toFixed(1)}s)`);
+
+    // RED — moves/bounces only (cache health lives on the Cache line).
+    const wtm = total('waitThenMoved');
     let red_ = null;
-    if (!c.lowVolume && c.hit != null && c.hit < 0.5) red_ = `Claude ${pctTxt(c.hit)} on ${this._worstCacheAccount() || '?'}`;
-    else if (!c.lowVolume && c.writeShare != null && c.writeShare > 0.6) red_ = `write share ${pctTxt(c.writeShare)} of cost on ${this._worstCacheAccount() || '?'}`;
-    else if (per100(cross) > 2) red_ = `cross moves ${per100(cross)}/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
+    if (per100(cross) > 2) red_ = `cross moves ${per100(cross)}/100 — most refusals on ${this._mostBouncedAccount(now) || '?'}`;
     else if (bounceShare > 0.1) red_ = `${pctTxt(bounceShare)} bounced — most on ${this._mostBouncedAccount(now) || '?'}`;
     else if (wtm * 100 / Math.max(1, served) > 0.5) red_ = `${wtm} waits still moved — on ${this._mostBouncedAccount(now) || '?'}`;
-    if (red_) return truncLine(` ${red('Cache')}    ${red(`⚠ ${red_}`)} ${dim('·')} ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
-    // YELLOW — Claude below 70%, write share over 40% of cost, drifting 15+ points
-    // under its hour, or waits are common.
-    const hour = this.am.efficiencyOverall('last1h', now).claude;
-    const drift = !c.lowVolume && !hour.lowVolume && c.hit != null && hour.hit != null && hour.hit - c.hit >= 0.15;
-    const warn = (!c.lowVolume && c.hit != null && c.hit < 0.7)
-      || (!c.lowVolume && c.writeShare != null && c.writeShare > 0.4)
-      || drift || waited > 0.25 * served;
-    return truncLine(` ${warn ? yellow('Cache') : green('Cache')}    ${parts.join(' · ')}  ${dim('[15m]')}${since}`, W);
+    if (red_) {
+      const metrics = parts.join(' · ');
+      const warning = red(`⚠ ${red_}`);
+      const line = ` ${red('Moves')}   ${warning} · ${metrics}  ${dim('[15m]')}`;
+      return truncLine(vw(line) <= W ? line : ` ${red('Moves')}   ${dim('[15m]')} ${metrics} · ${warning}`, W);
+    }
+    const warn = per100(cross) > 1 || bounceShare > 0.05;
+    return truncLine(` ${warn ? yellow('Moves') : green('Moves')}   ${parts.join(' · ')}  ${dim('[15m]')}`, W);
   }
 
   /** The Claude row with the lowest cache share in the window (enough volume only). */
   _worstCacheAccount() {
     let worst = null;
     for (const a of this.am.accounts) {
-      if (a.enabled === false || a.type === 'provider') continue;
+      if (a.enabled === false || a.type === 'provider' || a.provider === 'codex') continue;
       const e = this._accountLoad(a)?.last15m?.efficiency;
       if (e && !e.lowVolume && e.hit != null && (!worst || e.hit < worst.hit)) worst = { name: a.name, hit: e.hit };
     }
@@ -1407,6 +1482,10 @@ export class TUI {
         'Opens a browser. Logging into an account that\'s already added (same user, same organization) RE-AUTHENTICATES it in place (revives a reauth/error account) — no duplicate. Another organization of the same user, or a new user, is added as a new account.',
         () => this._doLogin(),
       );
+    } else if (k === 'c' && this.am.accounts.some(a => a.provider === 'codex')) {
+      this._startSelection('codexLogin');
+    } else if (k === 'r' && this.codexResetDetails && this.am.accounts.some(a => a.provider === 'codex' && !a.remote)) {
+      this._startSelection('codexResets');
     } else if (k === 'n' && this.am.accounts.length > 0) {
       this._startSelection('rename');
     } else if (k === 't' && this.am.accounts.length > 0) {
@@ -1424,13 +1503,14 @@ export class TUI {
   }
 
   // ── unified add-account flow ────────────────────────────────────────────────
-  // Four account types, two credential sources. Every path lands here so there is
+  // Every account type lands here so there is
   // exactly ONE thing to learn: press `a`, pick a type, supply a credential.
   static ADD_TYPES = [
     { key: '1', id: 'anthropic-oauth', label: 'Anthropic subscription', hint: 'log in with a browser (Max / Pro plan)' },
     { key: '2', id: 'anthropic-key',   label: 'Anthropic API key',      hint: 'pay-per-token key from console.anthropic.com' },
     { key: '3', id: 'zai',             label: 'GLM (z.ai) API key',     hint: '' },
     { key: '4', id: 'kimi',            label: 'Kimi (Moonshot) API key', hint: '' },
+    { key: '5', id: 'chatgpt',         label: 'ChatGPT subscription',   hint: 'log in with a browser' },
   ];
 
   _keyAddType(k) {
@@ -1440,6 +1520,12 @@ export class TUI {
   }
 
   _addAccountOfType(typeId) {
+    if (typeId === 'chatgpt') {
+      this.mode = 'accounts';
+      this._confirm('Connect ChatGPT?', 'Choose where to save the account, then sign in with your browser.',
+        () => this._doChatGPTLogin());
+      return;
+    }
     if (typeId === 'anthropic-oauth') {
       this.mode = 'accounts';
       this._confirm(
@@ -1501,8 +1587,7 @@ export class TUI {
       buf.push(`   ${bold(t.key)}  ${t.label.padEnd(26)}${dim(t.hint || '')}`);
     }
     buf.push('');
-    buf.push(dim('   Fixing an account that says "reauth"? Pick 1 and log in as that account.'));
-    buf.push(dim('   It repairs the existing row, it does not add a second one.'));
+    buf.push(dim('   Reconnect from Accounts: l for Claude, c for ChatGPT.'));
     buf.push('');
     // Kept verbatim from the deleted Providers panel — the only place that explained
     // BOTH credential sources and the gcloud command a non-owner needs.
@@ -1673,6 +1758,8 @@ export class TUI {
     } else if (k === 'c' || k === 'C') {
       // Cycle the peak weekly cap: off → 25% → 50% → 75% → never-during-peak.
       this._cyclePeakCap();
+    } else if (k === 'o' && this.am.accounts.some(a => a.provider === 'codex')) {
+      this._toggleChatGPTSessionRouting().catch(error => this._addLog(`Could not save: ${error.message}`));
     } else if (k === 'g' || k === 'k') {
       // Per-provider Claude→provider fallback. Only affects routing under `sticky`
       // mode — under balance/prefer-* the mode itself controls eligibility. Still
@@ -1690,6 +1777,22 @@ export class TUI {
     } else if (k === 'esc' || k === 'q') {
       this.mode = 'normal';
     }
+  }
+
+  async _toggleChatGPTSessionRouting() {
+    const next = this.am._sessionRoutingFor('codex') === 'same-provider' ? 'cross-provider' : 'same-provider';
+    const previous = this.config.scheduler;
+    const scheduler = { ...previous };
+    scheduler.providers = { ...scheduler.providers, codex: { ...scheduler.providers?.codex, sessionRouting: next } };
+    this.config.scheduler = scheduler;
+    try {
+      await this.saveConfig(this.config);
+    } catch (error) {
+      if (this.config.scheduler === scheduler) this.config.scheduler = previous;
+      throw error;
+    }
+    this.am.scheduler.providers = { ...this.am.scheduler.providers, codex: scheduler.providers.codex };
+    this._addLog(next === 'same-provider' ? 'ChatGPT sessions stay on ChatGPT' : 'ChatGPT sessions can switch providers');
   }
 
   /** Cycle ONE provider's Claude→provider setting. Turning it ON is the risky direction
@@ -1904,6 +2007,11 @@ export class TUI {
         this.inputBuf = '';
         this.inputSensitive = false;
         this.inputCb = value => this._doRename(targetIdx, String(value || '').trim());
+      } else if (this.selAction === 'codexLogin') {
+        this._confirm('Reconnect ChatGPT?', `Open browser for "${account.remote?.remoteName || account.name}".`,
+          () => this._doChatGPTLogin(account), 'accounts');
+      } else if (this.selAction === 'codexResets') {
+        this._showCodexResets(account).catch(error => this._addLog(`Could not read resets: ${error.message}`));
       } else if (this.selAction === 'cap') {
         const targetIdx = this.selIdx;
         const current = account.name;
@@ -1981,6 +2089,8 @@ export class TUI {
       .map(index => ({ account: this.am.accounts[index], index }))
       .filter(({ account }) => {
         if (action === 'prefer') return account.type !== 'provider' && account.enabled;
+        if (action === 'codexLogin') return account.provider === 'codex';
+        if (action === 'codexResets') return account.provider === 'codex' && !account.remote;
         // Enable/disable works on EVERY row — including a session-created provider,
         // where it is the DURABLE action (exportRuntimeProviders persists `enabled`,
         // and the header path never re-enables a row the user benched).
@@ -2021,18 +2131,20 @@ export class TUI {
     }
   }
 
-  _confirm(title, detail, cb) {
+  _confirm(title, detail, cb, returnMode = 'normal') {
     this.mode = 'confirm';
     this.confirmTitle = title;
     this.confirmDetail = detail;
     this.confirmCb = cb;
+    this.confirmReturnMode = returnMode;
   }
 
   _clearConfirm() {
-    this.mode = 'normal';
+    this.mode = this.confirmReturnMode;
     this.confirmTitle = '';
     this.confirmDetail = '';
     this.confirmCb = null;
+    this.confirmReturnMode = 'normal';
   }
 
   // ── account operations ─────────────────────────────
@@ -2049,6 +2161,120 @@ export class TUI {
     } catch (e) {
       this._addLog(`Sync failed: ${e.message}`);
     }
+  }
+
+  async _doChatGPTLogin(account) {
+    const wasRunning = this.running;
+    setConsoleStdoutSuppressed(true);
+    try {
+      if (wasRunning) await this.handOff();
+      const name = account
+        ? account.remote?.remoteName || account.name
+        : String(await this._ask('ChatGPT account name (optional): ') || '').trim();
+      const cli = fileURLToPath(new URL('./index.js', import.meta.url));
+      const child = spawn(process.execPath, codexLoginArgs(cli, name, account), { stdio: 'inherit' });
+      const [code] = await once(child, 'exit');
+      if (code !== 0) {
+        this._addLog('ChatGPT sign-in did not finish');
+        return;
+      }
+      await this.syncAccounts?.();
+      await Promise.allSettled((this.am.poolLinks || []).map(link => link.poll()));
+    } finally {
+      setConsoleStdoutSuppressed(false);
+      if (wasRunning) this.start();
+    }
+  }
+
+  async _showCodexResets(account, notice = '') {
+    const state = { account, credits: [], selected: 0, busy: true, notice };
+    this.codexResets = state;
+    this.mode = 'codexResets';
+    this.forceRender();
+    try {
+      const result = await this.codexResetDetails(account.name);
+      if (result.error) state.notice = `Could not read resets: ${result.error}`;
+      else state.credits = (result.credits || []).filter(credit => canRedeemCodexCredit(credit));
+    } catch (error) {
+      state.notice = `Could not read resets: ${error.message}`;
+    } finally {
+      state.busy = false;
+      if (this.codexResets === state) this.forceRender();
+    }
+  }
+
+  _keyCodexResets(k) {
+    const state = this.codexResets;
+    if (k === 'esc' || k === 'q') {
+      this.codexResets = null;
+      this.mode = 'accounts';
+      return;
+    }
+    if (!state || state.busy) return;
+    if (k === 'up' || k === 'k') state.selected = Math.max(0, state.selected - 1);
+    else if (k === 'down' || k === 'j') state.selected = Math.min(Math.max(0, state.credits.length - 1), state.selected + 1);
+    else if (k === 'r') {
+      this._showCodexResets(state.account).catch(error => this._addLog(`Could not read resets: ${error.message}`));
+    } else if (k === 'enter' && this.redeemCodexReset) {
+      const credit = state.credits[state.selected];
+      if (state.account.enabled === false || !canRedeemCodexCredit(credit)) {
+        state.notice = 'This reset cannot be redeemed.';
+        return;
+      }
+      this._confirm('Redeem this reset?', 'Uses one banked reset and refreshes eligible Codex limits.',
+        async () => {
+          state.busy = true;
+          let notice;
+          try {
+            const result = await this.redeemCodexReset(state.account.name, credit.id);
+            notice = result.redeemed ? 'Reset redeemed.' : `Reset not redeemed: ${result.reason || result.error || 'provider declined'}`;
+          } catch (error) {
+            notice = `Could not redeem reset: ${error.message}`;
+          }
+          if (this.codexResets === state) await this._showCodexResets(state.account, notice);
+        }, 'codexResets');
+    } else if (k === 'a' && this.onSetCodexAutoRedeem) {
+      const enabled = state.account.autoRedeemReset === true;
+      this._confirm(enabled ? 'Turn off automatic resets?' : 'Allow automatic resets?',
+        enabled ? 'Banked resets remain available for manual use.' : 'Allow the pool to redeem eligible resets for this account.',
+        async () => {
+          try {
+            await this.onSetCodexAutoRedeem(state.account.name, !enabled);
+            state.account.autoRedeemReset = !enabled;
+            state.notice = enabled ? 'Automatic resets off.' : 'Automatic resets on.';
+          } catch (error) {
+            state.notice = `Could not save settings: ${error.message}`;
+          }
+          this.forceRender();
+        }, 'codexResets');
+    }
+  }
+
+  _renderCodexResets(maxRows) {
+    const state = this.codexResets;
+    const out = ['', ` ${bold('Codex resets')}  ${state.account.name}`];
+    const summary = resetSummary(state.account);
+    if (Number.isInteger(summary?.available)) {
+      const balance = summary.available + (summary.available === 1 ? ' banked reset' : ' banked resets');
+      out.push(' ' + balance);
+    }
+    const quota = state.account.quota;
+    const windows = [];
+    if (quota.unified5h != null) windows.push(`5h ${quotaLabel(quota.unified5h, quota.unified5hReset, 20)}`);
+    if (quota.unified7d != null) windows.push(`Weekly ${quotaLabel(quota.unified7d, quota.unified7dReset, 20)}`);
+    if (windows.length) out.push(` ${windows.join('  ·  ')}`);
+    if (state.notice) out.push(` ${state.notice.replace(/[\x00-\x1f\x7f-\x9f]/g, '')}`);
+    if (state.busy) out.push(dim(' Reading reset inventory…'));
+    else if (state.credits.length === 0) out.push(dim(' No reset details available'));
+    const visible = Math.max(1, maxRows - out.length);
+    const start = Math.max(0, state.selected - visible + 1);
+    for (const [offset, credit] of state.credits.slice(start, start + visible).entries()) {
+      const title = String(credit.title || 'Usage reset').replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 34);
+      const expiry = credit.expiresAt == null ? '' : formatReset(credit.expiresAt);
+      const status = 'Banked';
+      out.push(` ${start + offset === state.selected ? '›' : ' '} ${title}  ${dim(status + (expiry ? ' · expires in ' + expiry : ''))}`);
+    }
+    return out;
   }
 
   // Browser OAuth login — the SAME flow re-authenticates an existing account (matched
@@ -2134,10 +2360,10 @@ export class TUI {
     // Message honors the ACTUAL result: if a manually-typed name collided with a
     // different existing account, upsert updates in place → "Re-authenticated", never
     // a false "Added new account".
-    const { updated } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
+    const { updated, name: savedName = name } = await this._upsertOAuthAccount({ creds, profile, name, source: 'login' });
     process.stdout.write(updated
-      ? `\nRe-authenticated "${name}". Returning to maxpool…\n`
-      : `\nAdded new account "${name}". Returning to maxpool…\n`);
+      ? `\nRe-authenticated "${savedName}". Returning to maxpool…\n`
+      : `\nAdded new account "${savedName}". Returning to maxpool…\n`);
   }
 
   // One readline question → answer string.
@@ -2157,7 +2383,8 @@ export class TUI {
     // pool saved the account before organizations were recorded) still owns the
     // login when it is the only same-user mirror: re-authenticate it rather than
     // add a second row. Two known orgs never alias.
-    const mirrors = this.am.accounts.filter(a => a.remote && a.enabled !== false && sameUser({ accountUuid: a.remoteUuid }, profile));
+    const mirrors = this.am.accounts.filter(a => a.remote && a.enabled !== false
+      && configuredAccountProvider(a) === 'anthropic' && sameUser({ accountUuid: a.remoteUuid }, profile));
     return mirrors.find(a => sameAccountIdentity({ accountUuid: a.remoteUuid, organizationUuid: a.remoteOrganizationUuid }, profile))
       || (profile.organizationUuid && mirrors.filter(a => !a.remoteOrganizationUuid).length === 1
         ? mirrors.find(a => !a.remoteOrganizationUuid) : null);
@@ -2221,20 +2448,17 @@ export class TUI {
 
     const loc = this._configLocation(account);
     if (loc) {
-      const prev = this.config[loc.array][loc.index].capUtilization ?? null;
-      const prevMode = this.config[loc.array][loc.index].capMode ?? null;
-      if (cap == null) delete this.config[loc.array][loc.index].capUtilization;
-      else this.config[loc.array][loc.index].capUtilization = cap;
-      if (mode == null) delete this.config[loc.array][loc.index].capMode;
-      else this.config[loc.array][loc.index].capMode = mode;
+      const before = this.config[loc.array][loc.index];
+      const entry = { ...before };
+      if (cap == null) delete entry.capUtilization;
+      else entry.capUtilization = cap;
+      if (mode == null) delete entry.capMode;
+      else entry.capMode = mode;
+      this.config[loc.array][loc.index] = entry;
       try {
-        await this.saveConfig(this.config);
+        await this.saveConfig(this.config, { collection: loc.array, before, after: entry, fields: ['capUtilization', 'capMode'] });
       } catch (error) {
-        // rollback both config and (below) skip the live apply
-        if (prev == null) delete this.config[loc.array][loc.index].capUtilization;
-        else this.config[loc.array][loc.index].capUtilization = prev;
-        if (prevMode == null) delete this.config[loc.array][loc.index].capMode;
-        else this.config[loc.array][loc.index].capMode = prevMode;
+        this.config[loc.array][loc.index] = before;
         throw error;
       }
     }
@@ -2266,53 +2490,33 @@ export class TUI {
     const cfgIdx = loc.index;
     const cfgArray = loc.array;
     const old = account.name;
-    const prev = this.config[cfgArray][cfgIdx].name;
-    this.config[cfgArray][cfgIdx].name = newName;
-    if (this.config.routing?.preferredAccount === old) this.config.routing.preferredAccount = newName;
+    const before = this.config[cfgArray][cfgIdx];
+    const entry = { ...before, name: newName };
+    const wasPreferred = this.config.routing?.preferredAccount === old;
+    this.config[cfgArray][cfgIdx] = entry;
+    if (wasPreferred) this.config.routing.preferredAccount = newName;
     try {
-      await this.saveConfig(this.config);
+      await this.saveConfig(this.config, { collection: cfgArray, before, after: entry, fields: ['name'] });
     } catch (error) {
-      this.config[cfgArray][cfgIdx].name = prev;
+      this.config[cfgArray][cfgIdx] = before;
+      if (wasPreferred) this.config.routing.preferredAccount = old;
       throw error;
     }
     account.name = newName; // update the running account manager
     this._addLog(`Renamed "${old}" → "${newName}"`);
   }
 
-  // Upsert an OAuth account into config + the running manager. Dedupes by
-  // user + organization, then name. Shared by import and browser login.
+  // Upsert Claude OAuth into config and the running manager.
   async _upsertOAuthAccount({ creds, profile, name, source, verb = 'Added' }) {
-    if (!name) name = suggestAccountName(this.config.accounts, profile);
-    const entry = {
-      name, type: 'oauth', source,
-      accountUuid: profile?.accountUuid || null,
-      organizationUuid: profile?.organizationUuid || null,
-      accessToken: creds.accessToken,
-      refreshToken: creds.refreshToken,
-      expiresAt: creds.expiresAt,
-    };
-
-    // Identity first; the name only picks up rows that cannot carry an identity
-    // (saved before uuids were stored). A row of the SAME USER with a KNOWN,
-    // DIFFERENT organization never matches by name: its tokens are its own.
-    let idx = this.config.accounts.findIndex(a => sameAccountIdentity(a, entry));
-    if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name && !knownDifferentOrg(a, entry));
+    const { index: idx, entry } = planClaudeOAuthLogin(this.config.accounts, { creds, profile, name, source },
+      [...(this.config.providers || []), ...this.am.accounts]);
+    name = entry.name;
 
     if (idx >= 0) {
       const previous = this.config.accounts[idx];
-      entry.enabled = previous.enabled;
       this.config.accounts[idx] = entry;
-      // Update the AccountManager to the FRESH tokens BEFORE persisting. The
-      // saveConfig writer (index.js) derives the ON-DISK tokens from the
-      // AccountManager, not from config.accounts — so persisting first writes the
-      // STALE pre-re-auth token (typically the dead one we're re-authing away from)
-      // to disk. The account then works in memory but boots DEAD on the next restart
-      // (a just-re-authed token rejected as invalid_grant). A later refresh does NOT
-      // heal disk (persistTokenRefresh's generation guard skips a disk token that
-      // != _refreshedFrom), so disk must be made correct right here.
-      const amAcct = this.am.accounts.find(account =>
-        sameAccountIdentity(account, entry) || (account.name === name && !knownDifferentOrg(account, entry))
-      );
+      // Revive the account in memory even if the disk write fails.
+      const amAcct = this._runningAccount(previous);
       if (amAcct) {
         amAcct.credential = creds.accessToken;
         amAcct.refreshToken = creds.refreshToken;
@@ -2327,36 +2531,33 @@ export class TUI {
         if (amAcct.status === 'error') amAcct.status = 'active';
       }
       try {
-        await this.saveConfig(this.config);
+        await this.saveConfig(this.config, { before: previous, after: entry,
+          fields: ['source', 'accountUuid', 'organizationUuid', 'accessToken', 'refreshToken', 'expiresAt'] });
       } catch (error) {
         // Persist failed (e.g. disk full). The browser re-auth genuinely SUCCEEDED,
         // so KEEP the AccountManager on the fresh tokens — reverting it to the dead
         // token would brick a working in-memory account. Roll back only the
-        // config.accounts mirror and surface the error; disk self-heals on the next
-        // saveConfig (the AM-derived writer re-writes the fresh token).
+        // config.accounts mirror and surface the error.
         this.config.accounts[idx] = previous;
         throw error;
       }
       this._addLog(`Updated account "${name}"`);
-      // Confirm the fresh token actually reached DISK (saveConfig awaited above +
-      // the AM was updated before it, so disk now holds creds.refreshToken). This
-      // is the verifiable proof a re-auth "stuck" — its fp must match the on-disk
-      // token; a later "REJECTED sent fp=<other>" then means an upstream revocation,
-      // not a lost persist. console.log (not _addLog) so it's VISIBLE during the
-      // stopped-TUI login flow, mirroring the sibling "Persisted rotated token" line.
+      // The fingerprint matches the persisted grant and stays visible while the TUI is stopped.
       console.log(`[Maxpool] Re-authenticated "${name}" — fresh token persisted (fp=${tokenFingerprint(creds.refreshToken)})`);
       return { updated: true, name };
     } else {
       this.config.accounts.push(entry);
       try {
-        await this.saveConfig(this.config);
+        const saved = await this.saveConfig(this.config, { after: entry });
+        if (saved?.name) entry.name = saved.name;
       } catch (error) {
-        this.config.accounts.pop();
+        const failed = this.config.accounts.indexOf(entry);
+        if (failed >= 0) this.config.accounts.splice(failed, 1);
         throw error;
       }
       this.am.addAccount(entry);
-      this._addLog(`${verb} account "${name}"`);
-      return { updated: false, name };
+      this._addLog(`${verb} account "${entry.name}"`);
+      return { updated: false, name: entry.name };
     }
   }
 
@@ -2395,11 +2596,12 @@ export class TUI {
   }
 
   _runningAccount(entry) {
-    return this.am.accounts.find(a => a.name === entry.name);
+    const local = this.am.accounts.filter(account => !account.remote);
+    return local[findClaudeOAuthLoginIndex(local, entry)];
   }
 
   _oauthAccounts() {
-    return this.config.accounts.filter(a => a.type === 'oauth');
+    return this.config.accounts.filter(isClaudeOAuthAccount);
   }
 
   // Find an already-configured OAuth account matching a fresh browser-login profile —
@@ -2448,13 +2650,14 @@ export class TUI {
     const entry = { name, type: 'apikey', apiKey: key };
     this.config.accounts.push(entry);
     try {
-      await this.saveConfig(this.config);
+      const saved = await this.saveConfig(this.config, { after: entry });
+      if (saved?.name) entry.name = saved.name;
     } catch (error) {
       this.config.accounts.pop();
       throw error;
     }
     this.am.addAccount(entry);
-    this._addLog(`Added API key account "${name}"`);
+    this._addLog(`Added API key account "${entry.name}"`);
   }
 
   async _setAutomaticRouting() {
@@ -2489,11 +2692,15 @@ export class TUI {
 
   _configAccountIndex(account) {
     if (!account) return -1;
-    if (account.accountUuid) {
-      const byUuid = this.config.accounts.findIndex(candidate => sameAccountIdentity(candidate, account));
-      if (byUuid >= 0) return byUuid;
-    }
-    return this.config.accounts.findIndex(candidate => candidate.name === account.name);
+    const provider = configuredAccountProvider(account);
+    const local = this.config.accounts.filter(candidate => candidate.type === account.type
+      && configuredAccountProvider(candidate) === provider);
+    const match = local[findAccountConfigIndex(local, account)];
+    if (match) return this.config.accounts.indexOf(match);
+    // Older Claude config rows can hold settings under just the account name.
+    if (account.remote || provider !== 'anthropic') return -1;
+    return this.config.accounts.findIndex(candidate => candidate.name === account.name
+      && candidate.type == null && candidate.provider == null);
   }
 
   /** Where does this account live in config — `accounts` or `providers`?
@@ -2507,7 +2714,7 @@ export class TUI {
     if (accIdx >= 0) return { array: 'accounts', index: accIdx };
     const provs = this.config.providers;
     if (Array.isArray(provs)) {
-      const pIdx = provs.findIndex(p => p.name === account.name);
+      const pIdx = provs.findIndex(p => p.name === account.name && (!account.provider || p.provider === account.provider));
       if (pIdx >= 0) return { array: 'providers', index: pIdx };
     }
     return null;
@@ -2541,7 +2748,8 @@ export class TUI {
         const applied = applyProviderEnabledToConfig(this.config, account.name, enabled);
         if (applied.changed) {
           try {
-            await this.saveConfig(this.config);
+            const entry = this.config.providers.find(provider => provider.name === account.name);
+            await this.saveConfig(this.config, { collection: 'providers', before: entry, after: entry, fields: ['enabled'] });
           } catch (error) {
             applyProviderEnabledToConfig(this.config, account.name, applied.previous);
             throw error;
@@ -2555,17 +2763,18 @@ export class TUI {
       this._addLog(`Cannot ${enabled ? 'enable' : 'disable'} "${account.name}" here (not in config)`);
       return;
     }
-    const previous = this.config.accounts[configIndex].enabled;
-    this.config.accounts[configIndex].enabled = enabled;
+    const entry = this.config.accounts[configIndex];
+    const previous = entry.enabled;
+    entry.enabled = enabled;
     const previousRouting = this.config.routing;
     const resetsRouting = !enabled && this.config.routing?.preferredAccount === account.name;
     if (resetsRouting) {
       this.config.routing = { mode: 'automatic', preferredAccount: null };
     }
     try {
-      await this.saveConfig(this.config);
+      await this.saveConfig(this.config, { before: entry, after: entry, fields: ['enabled'] });
     } catch (error) {
-      this.config.accounts[configIndex].enabled = previous;
+      entry.enabled = previous;
       this.config.routing = previousRouting;
       throw error;
     }
@@ -2604,8 +2813,9 @@ export class TUI {
     if (this.config.routing?.preferredAccount === name) {
       this.config.routing = { mode: 'automatic', preferredAccount: null };
     }
+    let removedOnDisk;
     try {
-      await this.saveConfig(this.config);
+      removedOnDisk = await this.saveConfig(this.config, { collection: configArray, before: removedConfig });
     } catch (error) {
       this.config[configArray].splice(configIndex, 0, removedConfig);
       this.config.routing = previousRouting;
@@ -2616,7 +2826,9 @@ export class TUI {
       this.config[configArray].splice(configIndex, 0, removedConfig);
       this.config.routing = previousRouting;
       this.am.setAccountEnabled(idx, wasEnabled);
-      await this.saveConfig(this.config);
+      if (removedOnDisk !== null) {
+        await this.saveConfig(this.config, { collection: configArray, after: removedOnDisk || removedConfig });
+      }
       throw new Error(`Account "${name}" became active before deletion completed`);
     }
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
@@ -2770,8 +2982,11 @@ export class TUI {
       if (provReq > 0) xpText += `  ${dim('·')}  ${yellow(`providers: ${provReq} req/15m`)}`;
     }
     lines.push(this._routingLine(routing, xpText));
-    const effLine = this._efficiencyLine(W);
-    if (effLine != null) lines.push(effLine);
+    const efficiencyNow = Date.now();
+    const cacheLine = this._cacheLine(W, efficiencyNow);
+    if (cacheLine != null) lines.push(cacheLine);
+    const movesLine = this._movesLine(W, efficiencyNow);
+    if (movesLine != null) lines.push(movesLine);
     lines.push(...this._cloudLinkLines(W));
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     // Throttle and WAITING are different things and used to share one line labelled
@@ -2821,6 +3036,15 @@ export class TUI {
       this._writeScreen(lines, W, H);
       return;
     }
+    if (this.mode === 'codexResets') {
+      const maxRows = H - lines.length - 2;
+      lines.push(...this._renderCodexResets(maxRows).slice(0, Math.max(0, maxRows)));
+      while (lines.length < H - 2) lines.push('');
+      lines.push(' ' + dim('─'.repeat(W - 2)));
+      lines.push(this._renderFooter());
+      this._writeScreen(lines, W, H);
+      return;
+    }
 
     // ── Accounts
     if (this.am.accounts.length === 0) {
@@ -2850,13 +3074,17 @@ export class TUI {
       // routing/index-keyed actions are unaffected). Selection navigation shares the
       // SAME order via _selectableIndexes → _displayOrder.
       let hidden = 0;
+      const showSelectedCodex = this.mode === 'select'
+        && (this.selAction === 'codexLogin' || this.selAction === 'codexResets');
       for (const i of this._displayOrder()) {
         // Same key also hides local copies guarded by the duplicate guard — they are
         // effectively off (owner 2026-10-29: "should it hide the local ones that are
         // in the cloud... they're effectively disabled as well"). No separate key.
         // One predicate shared with the Capacity page so the two row orders cannot drift.
-        if (this.am.hiddenOnMainScreen(this.am.accounts[i], this.hideDisabled)) { hidden++; continue; }
-        lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession));
+        const account = this.am.accounts[i];
+        const hiddenByChoice = this.hideDisabled && !(showSelectedCodex && account.provider === 'codex');
+        if (this.am.hiddenOnMainScreen(account, hiddenByChoice)) { hidden++; continue; }
+        lines.push(this._renderAcct(i, bw, showBoth, showFable, showSession, W));
       }
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
@@ -2907,9 +3135,11 @@ export class TUI {
 
     // Completed log
     // 2 = separator + footer; confirm adds its detail line; updates adds its detail block.
-    const footerH = this.mode === 'confirm' ? 3
+    const codexAccountActions = this.mode === 'accounts' && this.am.accounts.some(a => a.provider === 'codex');
+    const routingDetail = this.mode === 'routing' ? this._renderRoutingDetail(W, efficiencyNow) : null;
+    const footerH = this.mode === 'confirm' || codexAccountActions ? 3
       : this.mode === 'updates' ? 2 + this._renderUpdatesDetail().length
-      : this.mode === 'routing' ? 2 + this._renderRoutingDetail().length
+      : routingDetail ? 2 + routingDetail.length
       : 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
@@ -2931,11 +3161,15 @@ export class TUI {
     // ── Footer
     lines.push(' ' + dim('─'.repeat(W - 2)));
     if (this.mode === 'confirm') lines.push(` ${this.confirmDetail}`);
+    if (codexAccountActions) {
+      const resets = this.codexResetDetails && this.am.accounts.some(a => a.provider === 'codex' && !a.remote);
+      lines.push(` ${bold('c')} Reconnect ChatGPT${resets ? `  ${bold('r')} Codex resets` : ''}`);
+    }
     // Updates DETAIL — without this, pressing 'u' changed only the one-line footer at the
     // very bottom of a busy screen, which reads as "nothing happened" (reported twice).
     // Every other mode draws something visible; this one must too.
     if (this.mode === 'updates') lines.push(...this._renderUpdatesDetail());
-    if (this.mode === 'routing') lines.push(...this._renderRoutingDetail());
+    if (routingDetail) lines.push(...routingDetail);
     lines.push(this._renderFooter());
 
     this._writeScreen(lines, W, H);
@@ -2967,12 +3201,16 @@ export class TUI {
       return;   // frame owed: written once, on 'drain'
     }
     this._forceNext = false;
+    // A queued frame can sit below Node's writable high-water mark, so
+    // 'drain' will not fire. Keep one outstanding frame and let the periodic
+    // renderer retry once the terminal accepts it.
+    if (this._nb && process.stdout.writableLength > 0) return;
     this._lastFrame = buf;
     this._lastFullWriteAt = Date.now();
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true) {
+  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true, width = Infinity) {
     let a = this.am.accounts[idx];
     // A row benched by the duplicate guard renders the CLOUD's live copy (status,
     // bars, in-flight, request counts) — never the stale local snapshot. Identity
@@ -3047,7 +3285,7 @@ export class TUI {
     // account. Don't mislabel healthy accounts as per-account "paused": show
     // the one running the recovery probe as "probing" and the rest "waiting"
     // (the pool-wide throttle banner above conveys the cause).
-    const upstreamBlocking = a.type !== 'provider' && this.am._isUpstreamThrottleBlocking?.();
+    const upstreamBlocking = a.type !== 'provider' && a.provider !== 'codex' && this.am._isUpstreamThrottleBlocking?.();
     // A mirror row whose link is down/stale is benched by syncRemoteMirrors with
     // enabled=false — show it as cloud-unreachable, never as "disabled" (which reads
     // as "I switched this off"). _cloud/_cloudOk were never set; key on a.remote.
@@ -3156,7 +3394,9 @@ export class TUI {
     // (expiresAt==null || expiresAt>now) — a frozen `expired` flag never keeps a
     // dead reset on screen (pre-mortem #18).
     let resetsCell;
-    {
+    if (a.provider === 'codex') {
+      resetsCell = codexResetCells(a);
+    } else {
       const now = Date.now();
       let general = 0;       // resetsLeft of general-weekly grants + live cards
       let scoped = 0;        // resetsLeft of model-scoped grants (tagged F)
@@ -3253,7 +3493,7 @@ export class TUI {
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
 
-    if (q.unified5h != null || q.unified7d != null) {
+    if (a.provider === 'codex' || q.unified5h != null || q.unified7d != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
@@ -3272,15 +3512,29 @@ export class TUI {
     const bars = [];
     // The Fable bar comes first, before the session and weekly bars, on every row
     // type, so each bar starts at the same offset on OAuth, API-key and provider rows.
-    if (showFable) bars.push(`Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
-    if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
-    if (showBoth) {
-      // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
-      // both render as an empty bar. Say which, so a healthy uncapped account
-      // (privacy@gomokka.com, measured 2026-08-06) doesn't read as broken.
-      bars.push((r2 == null && q.weeklyAbsent)
-        ? `${l2} ${emptyBar('none', bw)}`
-        : `${l2} ${bar(r2, bw, t2)}`);
+    const barCount = Number(showFable) + Number(showSession) + Number(showBoth);
+    const barsFit = width >= BAR_START + barCount * BAR_MIN_W + (barCount - 1) * BAR_GAP;
+    if (a.provider === 'codex' && !barsFit) {
+      // With the fixed account columns, an 80-column terminal only has five
+      // cells for the reading. Put the percentage before an optional long label.
+      const used = r2 ?? r1;
+      if (used != null) {
+        const pct = `${Math.round(used * 100)}%`;
+        const label = r2 != null ? 'Wk' : '5h';
+        const space = width - (BAR_START - 4);
+        bars.push(space >= pct.length + label.length ? label + pct : pct);
+      } else bars.push(dim('—'));
+    } else {
+      if (showFable) bars.push(a.provider === 'codex' ? ' '.repeat(4 + bw) : `Fbl ${scopedWeeklyBar(q, 'fable', bw)}`);
+      if (showSession) bars.push(`${l1} ${bar(r1, bw, t1)}`);
+      if (showBoth) {
+        // "no weekly cap on this plan" is a DIFFERENT state from "not read yet", and
+        // both render as an empty bar. Say which, so a healthy uncapped account
+        // (privacy@gomokka.com, measured 2026-08-06) doesn't read as broken.
+        bars.push((r2 == null && q.weeklyAbsent)
+          ? `${l2} ${emptyBar('none', bw)}`
+          : `${l2} ${bar(r2, bw, t2)}`);
+      }
     }
     let line = ` ${sel}${cur} ${name} ${whereCell(a)} ${type} ${status} ${resetsCell} ${bars.join('  ')}`;
     const weekly = weeklyPolicyText(this.am, a);
@@ -3756,9 +4010,16 @@ export class TUI {
    * (2026-10-13: "the cap setting only changes GLM", "I pinned an account and have no
    * idea how to switch it back", "where is the cap for individual accounts?")
    */
-  _renderRoutingDetail() {
+  _renderRoutingDetail(W = 80, now = Date.now()) {
     // Every line fits 80 columns: a truncated explanation is no explanation.
     const out = [];
+    const recent = this.am.efficiencyOverall?.('last15m', now);
+    const misses = [['claude', 'Claude'], ['glm', 'GLM'], ['codex', 'Codex']]
+      .filter(([key]) => recent?.[key]?.hit != null)
+      .map(([key, label]) => `${label} ${this._missTxt(recent[key].missTokens)}`);
+    if (misses.length) {
+      out.push(truncLine(` Cache misses ${dim('[15m]')}  ${misses.join(' · ')}`, W));
+    }
     const pinned = this.am.routingMode === 'preferred' && this.am.preferredAccountName;
     // The manual pin: state, what it does, and the way out — always visible.
     if (pinned) {
@@ -3774,6 +4035,10 @@ export class TUI {
       out.push(` ${bold('c')} GLM peak cap ${dim('— GLM accounts only, in GLM peak hours. Not Claude.')}`);
     }
     out.push(` ${bold('b')} Wait for busy account  ${cyan(this._stickyBusyLabel())}`);
+    if (this.am.accounts.some(a => a.provider === 'codex')) {
+      const label = this.am._sessionRoutingFor('codex') === 'same-provider' ? 'Stay on ChatGPT' : 'Allow provider switches';
+      out.push(` ${bold('o')} ChatGPT sessions  ${cyan(label)}`);
+    }
     // Where the per-account cap actually is.
     out.push(` ${dim('Usage cap for ONE account:')} ${bold('Esc')} ${dim('then')} ${bold('a')} ${dim('→')} ${bold('u')} ${dim('(Claude or GLM)')}`);
     const capped = this.am.accounts.filter(a => a.capUtilization != null && a.enabled !== false);
@@ -3799,8 +4064,16 @@ export class TUI {
       }
       case 'accounts':
         return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
+      case 'codexResets': {
+        const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset ? 'on' : 'off'}` : '';
+        const state = this.codexResets;
+        const selectable = state.account.enabled !== false
+          && canRedeemCodexCredit(state.credits[state.selected]);
+        const redeem = this.redeemCodexReset && selectable ? `  ${bold('Enter')} Redeem` : '';
+        return ` ${dim('↑↓')} Select${redeem}  ${bold('r')} Refresh${auto}  ${bold('Esc')} Back`;
+      }
       case 'addtype':
-        return ` ${bold('1')}-${bold('4')} pick a type  ${bold('Esc')} Back`;
+        return ` ${bold('1')}-${bold('5')} pick a type  ${bold('Esc')} Back`;
       case 'routing': {
         const mode = this._routingModeDef(this.am.scheduler?.routingMode || 'sticky');
         const hasProviders = this.am.accounts.some(a => a.type === 'provider');
@@ -3832,6 +4105,10 @@ export class TUI {
         return ` ${bold('f')} Routing: ${cyan(mode.label)} ↻${provPart}${peakPart}  ${bold('Esc')} Back`;
       }
       case 'select': {
+        if (this.selAction === 'codexLogin' || this.selAction === 'codexResets') {
+          const action = this.selAction === 'codexLogin' ? 'Reconnect' : 'View resets';
+          return ` ${dim('↑↓')} Select Codex account  ${bold('Enter')} ${action}  ${bold('Esc')} Cancel`;
+        }
         const act = this.selAction === 'prefer'
           ? 'prefer'
           : this.selAction === 'toggle'

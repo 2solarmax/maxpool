@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { sendLoginToPool, chooseLoginTarget, resolveUsablePools, planCliLogin } from '../src/cloud-login.js';
+import { codexPoolEndpoint, sendLoginToPool, chooseLoginTarget, resolveUsablePools, planCliLogin } from '../src/cloud-login.js';
 
 const creds = { accessToken: 'at', refreshToken: 'rt', expiresAt: 123 };
 const profile = { accountUuid: 'uuid-1' };
@@ -21,6 +21,22 @@ function fake(handler) {
   });
 }
 const reply = (code, obj) => (req, res) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+
+test('Codex enrollment sends credentials only over HTTPS or loopback', async () => {
+  const path = '/maxpool/chatgpt-login';
+  for (const base of ['https://team.example/pool', 'http://127.0.0.1:3456', 'http://[::1]:3456', 'http://localhost:3456']) {
+    assert.equal(codexPoolEndpoint(base + '/', path).href, base + path);
+  }
+  for (const url of ['http://team.example', 'http://127.0.0.1.example', 'file:///tmp/pool',
+    'https://name:password@team.example', 'https://team.example?query=1']) {
+    assert.throws(() => codexPoolEndpoint(url, path));
+    let calls = 0;
+    const result = await sendLoginToPool({ url, key: 'k', name: 'codex', profile: { ...profile, provider: 'codex' },
+      creds, fetchImpl: async () => { calls++; } });
+    assert.equal(result.ok, false);
+    assert.equal(calls, 0);
+  }
+});
 
 test('sendLoginToPool: added', async () => {
   const f = await fake(reply(200, { ok: true, result: 'added', name: 'x@y.z' }));

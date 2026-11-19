@@ -323,11 +323,11 @@ test('an UPDATE-driven reload that rolls back falls back to a cold restart (the 
   assert.match(src, /const swapWasSlowNotBroken = answered && reason === 'timeout' && !idless;/,
     "a build that CRASHED never earns a cold restart — nor does an id-less 'timeout', which an old supervisor sends for one");
   // Anchored inside each REAL update path: the test seams (testHookFires lines) also set
-  // the flag right before requestRestart, and an unanchored pattern matched those.
+  // the flag before requesting a reload, and an unanchored pattern matched those.
   for (const name of ['applyUpdateIfReady', 'applyNow']) {
     const body = src.match(new RegExp(`const ${name} = r => \\{[\\s\\S]*?\\n {2}\\};\\n`));
     assert.ok(body, `${name} found`);
-    assert.match(body[0], /reloadIsForUpdate = true;[\s\S]{0,80}restartController\.requestRestart\(\)/,
+    assert.match(body[0], /reloadIsForUpdate = true;\s*requestManagedRestart\(\)/,
       `${name} marks the reload as update-driven before requesting it`);
   }
   assert.match(src, /coldFallbackUsed = true;[\s\S]{0,1400}restartWorkerNow\(\)/,

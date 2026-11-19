@@ -27,7 +27,7 @@ export const SUB_RECHECK_MS = 30 * 60_000;
 const STALE_LISTING_SKIPS = new Set(['listing stale', 'listing failed']);
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null, zaiUsageFn = fetchZaiModelUsage, cardsFn = listResetCards, now = Date.now } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, providerProbeFn = fetchProviderUsage, grantsFn = listResetGrants, timeoutMs = 10_000, log = console.log, usageGapMs = null, zaiUsageFn = fetchZaiModelUsage, cardsFn = listResetCards, now = Date.now, codexProbeFn = fetchCodexUsage, codexCatalogFn = listNativeCodexModels, onCodexQuota } = {}) {
     this.am = accountManager;
     // Injectable like probeFn: the default hits api.anthropic.com, so a harness that
     // doesn't stub it makes a REAL network call per oauth sweep (a test then passes
@@ -35,6 +35,9 @@ export class Prober {
     this.grantsFn = grantsFn;
     this.intervalMs = intervalMs;
     this.probeFn = probeFn;
+    this.codexProbeFn = codexProbeFn;
+    this.codexCatalogFn = codexCatalogFn;
+    this.onCodexQuota = onCodexQuota;
     this.providerProbeFn = providerProbeFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
@@ -117,7 +120,8 @@ export class Prober {
         // token), so its access token is dead and every probe fails — each failure
         // widens the shared inter-probe gap and slows the HEALTHY rows. Its quota is
         // shown from the cloud mirror (am.remoteRowFor), not from a local probe.
-        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.credential && !a.refreshDead && !a.poolBenchedBy);
+        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.provider !== 'codex' && a.credential && !a.refreshDead && !a.poolBenchedBy);
+        const codex = this.am.accounts.filter(a => a.codexAuth === 'native' && a.credential && !a.refreshDead && !a.poolBenchedBy);
         // Pool links are probed by their own PoolLink status poll, not here.
         const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);  // 'pool' rows are excluded by type
 
@@ -129,6 +133,7 @@ export class Prober {
         // Probe the OAuth accounts ONE AT A TIME, paced across the interval, and back
         // off on a 429 — so the whole fleet refreshes instead of self-throttling.
         const providerWork = Promise.all(providers.map(a => this.probeProvider(a)));
+        const codexWork = this._probeCodexAccounts(codex);
         // Rotate the start account each sweep so no account is systematically the
         // oldest-refreshed (the serialized sweep would otherwise always probe the
         // last account last).
@@ -143,6 +148,7 @@ export class Prober {
           else if (r && r.ok) this._relaxUsageGap();
         }
         await providerWork.catch(() => {});
+        await codexWork;
       } finally {
         this._running = false;
         this._inflight = null;
@@ -153,6 +159,42 @@ export class Prober {
       }
     })();
     return this._inflight;
+  }
+
+  async _probeCodexAccounts(accounts) {
+    for (const account of accounts) {
+      if (this._stopping) break;
+      const present = () => this.am.accounts[account.index] === account && !account.poolBenchedBy;
+      try {
+        if (!present() || !await this.am.ensureTokenFresh(account.index) || !present()) continue;
+        let sentAt = this._now();
+        let credential = account.credential;
+        let usage = await this._withTimeout(this.codexProbeFn(account));
+        if (usage?.status === 401 && present() && account.enabled !== false && !this._stopping) {
+          if (account.credential === credential) await this.am.ensureTokenFresh(account.index, true);
+          if (present() && account.credential !== credential && !this._stopping) {
+            sentAt = this._now();
+            credential = account.credential;
+            usage = await this._withTimeout(this.codexProbeFn(account));
+          }
+        }
+        if (!present() || account.credential !== credential) continue;
+        if (usage && !usage.error) {
+          this.am.applyCodexUsageData(account.index, usage, { sentAt });
+          if (!this._stopping && account.autoRedeemReset === true) await this.onCodexQuota?.(account);
+        } else this.am.recordProbeError?.(account.index, usage?.error || 'probe timed out', usage?.status ?? null);
+        if (present() && !this._stopping && !account.refreshDead
+          && this._now() - (account.quota.codexCatalogCheckedAt || 0) >= 5 * 60_000) {
+          const catalog = await this._withTimeout(this.codexCatalogFn(account, { etag: account.quota.codexCatalogEtag }));
+          if (catalog && present() && account.credential === credential) {
+            if (!catalog.notModified) account.quota.codexModels = catalog.models;
+            account.quota.codexCatalogEtag = catalog.etag;
+            account.quota.codexCatalogVersion = catalog.version;
+            account.quota.codexCatalogCheckedAt = this._now();
+          }
+        }
+      } catch { /* Existing quota and entitlements remain available on transient errors. */ }
+    }
   }
 
   /** Wait until the current usage-probe gap has elapsed since the last usage
@@ -598,3 +640,5 @@ export class Prober {
     ]);
   }
 }
+import { fetchCodexUsage } from './codex-usage.js';
+import { listNativeCodexModels } from './codex-native.js';

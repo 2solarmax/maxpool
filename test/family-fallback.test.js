@@ -15,8 +15,9 @@ test('pool raises the per-family connect attempt timeout above Node 20\'s 250ms 
     'the 250ms default is raised (overridable via env)');
 });
 
-test('the default really is 250ms without the fix (documents why this matters)', () => {
-  // A fresh Node process starts at 250 — proving the failure mode exists without the
-  // fix rather than being hypothetical. (This test does NOT import index.js.)
-  assert.equal(net.getDefaultAutoSelectFamilyAttemptTimeout?.(), 250);
+test('MaxPool gives address families more time than the Node runtime default', () => {
+  // Node 20 uses 250ms and newer Node versions use 500ms. Both can cut off
+  // the slow fallback documented above. This process does not import index.js.
+  const runtimeDefault = net.getDefaultAutoSelectFamilyAttemptTimeout();
+  assert.ok(runtimeDefault > 0 && runtimeDefault < 2000);
 });

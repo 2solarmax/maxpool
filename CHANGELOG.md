@@ -5,6 +5,73 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.114] - 2026-11-19
+
+### Added
+
+- Route Claude Code through ChatGPT subscriptions
+- Route Claude Code through native Codex subscriptions
+- Show automatic reset preference in MaxPool account details
+- Switch Codex between MaxPool and Direct
+- Route native Codex clients through local MaxPool
+
+### Changed
+
+- Align release checks with supported Node versions
+- Cover Codex quota ownership and banked reset routing
+- Support Claude Code web tools on native Codex accounts
+- Honor Codex web search limits and blocked domains
+- Keep web search caps across Messages tool continuations
+- Clarify cache and quota reporting for local Codex accounts
+- Select the all-provider profile when Maxbar enables pool routing
+- Revert "Select the all-provider profile when Maxbar enables pool routing"
+- Compare local prereleases against the full numeric patch before auto-updating
+- Verify banked resets wait for weekly need and provider eligibility
+- Split the efficiency line into Cache (health, 15m + restart-safe 24h) and Moves (causes + hold-reason split)
+- Align TUI/CLI efficiency tests with the two-line Cache/Moves split
+- Drop five dead symbols the newer eslint flags (pre-existing on main)
+- Thread-id harness must consume the POST body (req.resume), not drop the listener
+- Protect Codex credentials during team pool enrollment
+- Invalidate superseded Codex reset inventory after confirmed redemption
+- Allow a local alternate Claude gateway port in Maxbar
+- Preserve Claude Code prompt cache affinity on native Codex
+- Verify automatic updates enter the refresh-safe restart path
+- Preserve request classification when optional client headers are absent
+- Await title sync requests and release fixture servers on failure
+- Show serving Codex effort in the Claude Code status line
+- Preserve dashboard cache slots and status wording from PR 8
+- Adopt the outgoing Claude session provider pins before serving a takeover
+- Carry unanswered sticky-provider first turns through the release boundary
+- Check Codex miss tokens in Routing details
+- Isolate Claude login and TUI account writes by provider
+- Restore legacy Claude cap edits and shared identity matching
+
+### Documentation
+
+- Explain independent Claude and Codex routing in Maxbar
+
+### Fixed
+
+- Handle ChatGPT plan streams in the isolated provider pilot
+- Report unavailable Codex routes accurately
+- Follow stable Codex clients for model discovery
+- Allow time for interactive Codex sign-in
+- Reuse MaxPool's weekly reset policy for Codex
+- Scope the reset toggle to the selected Codex account
+- Show actionable Codex resets and honor desktop pool routing
+- Keep dashboard favicon requests out of the inference queue
+- Show the banked Codex reset balance even while usage is low
+- Preserve a rotated Codex grant during config sync
+- Cap standalone web searches in each Messages request
+- Reserve Anthropic recovery probes for Claude accounts
+- Keep Codex token refresh bound to its account
+- Use shared account identity check during token refresh
+- Follow Codex credit inventory and redemption verdict at weekly limits
+- Recover OAuth refreshes from identity and disk races
+- Scope Claude desktop pool routing to Maxbar opt-in
+- Preserve Codex ownership and refresh continuity during handoff
+- Serialize config writes across local login and refresh processes
+
 ## [1.24.112] - 2026-11-19
 
 ### Changed

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build Maxbar.app — menu-bar sleep toggle + hotspot auto-join + lid lock +
-# Claude routing Pool/Direct toggle. Works on any arm64 Mac with Xcode CLT.
+# Claude and Codex routing switches. Works on arm64 Macs with Xcode CLT.
 # Output: ./Maxbar.app next to this script (NOT auto-installed — run the
 # "Install to /Applications" step below yourself; a build script that silently
 # kills and replaces a running app is rude on shared machines).
@@ -23,6 +23,8 @@ swiftc -O -parse-as-library -swift-version 6 -target arm64-apple-macos13.0 \
   -framework SwiftUI -framework AppKit
 
 cp Info.plist "$CONTENTS/Info.plist"
+cp claude-routing.py "$RESOURCES/claude-routing.py"
+cp codex-routing.py "$RESOURCES/codex-routing.py"
 
 codesign --force --sign - "$APP"
 
@@ -51,4 +53,7 @@ Next steps — one-time setup per machine:
  4. "Claude routing" only works after the pool proxy (rc-gate) is set up on
     that machine — see tools/rc-gate/ in this repo. On machines without it,
     leave routing on Direct. After switching, restart the Claude app.
+
+ 5. "Codex routing" uses the authenticated MaxPool Codex listener on this Mac.
+    After switching, restart the Codex app or start a new CLI process.
 EOF

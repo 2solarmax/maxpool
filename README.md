@@ -204,7 +204,87 @@ When GLM/Kimi return 429 without standard retry headers, Maxpool also parses pro
 
 Every account/provider row also includes load telemetry: `Load current/weight`, `15m <requests> <avg latency>`, and `1h <requests>`. This is based on completed requests retained in memory for the last hour, plus current in-flight requests.
 
-### Restart behavior
+### ChatGPT subscriptions in Claude Code
+
+Connect each account with a distinct name. MaxPool opens the Codex sign-in
+for the selected ChatGPT workspace and maintains its own grant. Use
+**Accounts → Add account → ChatGPT subscription** in the terminal UI to
+connect it. In Accounts, **c** reconnects an existing Codex row in its owning
+pool.
+
+```sh
+maxpool login --codex --cloud --name "ChatGPT work"
+maxpool login --codex --local --name "ChatGPT laptop"
+```
+
+Use `--pool <name>` for a specific linked team pool or `--model <slug>` to
+select the account's default model. Upgrade both MaxPool endpoints before
+adding accounts to a linked cloud pool. For Codex sign-in, connect to the
+team pool over HTTPS or use a tunnel with a loopback address. The chosen
+pool owns token renewal.
+MaxPool lists the account as Codex. Clients continue to send Claude Code's
+Messages API, and MaxPool translates requests and tool results to OpenAI
+Responses when it picks a ChatGPT account. The `all` profile considers
+ChatGPT along with the configured Claude, GLM, and Kimi accounts.
+`cc --model <OpenAI model slug>` selects OpenAI explicitly. An Anthropic model
+name on a request using automatic routing selects the newest compatible
+model for that class from the serving account's live Codex catalog. Fable and
+Opus use Astra, Sonnet uses Sol, and Haiku uses Luna. These names specify
+families, so compatible updates can roll in as the catalog refreshes. The
+catalog refresh follows the current stable Codex client version without
+requiring a Codex installation. A newly named family stays available by exact
+model ID. Automatic class routing skips it until it has a class mapping. If
+no eligible class match exists, the configured routing policy selects another
+eligible account or reports that none is available. Claude Code's status line
+shows the serving model and effort. An omitted effort uses the model default.
+
+**Session routing.** A session that starts on Codex stays on that provider
+by default and can move to another eligible Codex account. Other
+providers keep their configured fallback behavior. In the Routing menu,
+press **o** to toggle the ChatGPT policy. Set `scheduler.sessionRouting` to
+`same-provider` or `cross-provider` for a pool-wide default, or override that
+default in `scheduler.providers.<name>.sessionRouting`. Provider names are
+`claude`, `zai`, `kimi`, and `codex`. Cross-provider routing still checks
+transcript and request compatibility.
+
+Local shell, editing, and MCP tools are executed by Claude Code. Provider
+reasoning blocks are omitted when translating the transcript for OpenAI.
+Claude Code WebSearch uses OpenAI search and returns source links.
+ChatGPT subscription requests with `max_uses` or `blocked_domains` use
+Codex's standalone search. MaxPool forwards the domain filter and caps
+standalone searches at 32 per request. An explicit `max_uses` also limits
+searches across the turn, including client tool continuations. Extra search
+calls receive `max_uses_exceeded`. If standalone search is unavailable,
+the client receives an error. Use `allowed_domains` to restrict the search
+to approved sites.
+Claude Code WebFetch downloads the page locally and uses the routed model
+to extract information. Standalone Anthropic-hosted `web_fetch` and
+ChatGPT-hosted connectors use separate APIs.
+
+Codex quota and reset times appear in the account views whenever OpenAI
+reports the corresponding window. The account reset column shows how many
+unused credits are saved for later. Use **Accounts → r** on a local Codex
+account to inspect its free banked resets or confirm a redemption. Press
+**a** in that reset inventory to opt that account into automatic redemption,
+or set `autoRedeemReset: true` on its account entry. Newly added accounts start
+with automatic redemption off. MaxPool applies its shared weekly reset policy
+after a fresh quota reading, including its rules for expiring banked resets and
+an approaching natural refill.
+
+Token counts requested on the ChatGPT route are estimates. Claude Code
+Remote Control can steer the same running terminal session from a browser
+or app. Sessions launched on Anthropic's hosted workers use their own runtime.
+
+### Codex CLI and desktop on Mac
+
+Choose **Codex routing → Pool** in Maxbar, then start a new CLI process or
+restart the desktop app and open a new chat. MaxPool selects an eligible local
+ChatGPT account for the first turn and keeps the conversation on that account.
+This preserves provider-owned reasoning and tool state across turns. **Direct**
+restores your previous Codex provider for new chats. The Claude routing switch
+works independently. See the [Maxbar setup instructions](tools/maxbar/README.md).
+
+## Restart behavior
 
 When you confirm Restart, confirm Stop, press Ctrl-C, or send SIGTERM, Maxpool enters draining shutdown:
 
@@ -438,7 +518,7 @@ No. The bars show how *full* an account is toward its limit, so an empty bar mea
 Set `"autoUpdate": true` in your config and maxpool installs new versions itself (applied on the next restart; running sessions are never interrupted). Otherwise `npm i -g maxpool` updates it.
 
 **Where do my tokens go?**
-They're stored locally in your config (file mode `0600`) and sent only to Anthropic — or, in the optional `all` profile, to GLM/Kimi if you supply those. Nothing else leaves your machine. Zero third-party dependencies.
+MaxPool stores credentials in the account's chosen pool config (file mode `0600`). Inference uses the selected provider's credential. A cloud login transfers the new credential to the authenticated linked pool, which handles renewal. MaxPool has zero third-party runtime dependencies.
 
 **How do I stop it?**
 Press `q` in the TUI (or Ctrl-C). It drains briefly, then exits.

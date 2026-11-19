@@ -18,7 +18,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -129,7 +129,7 @@ class Terminal {
   }
 }
 
-async function bootPool({ supervised = false, env: extraEnv = {} } = {}) {
+async function bootPool({ supervised = false, env: extraEnv = {}, extraConfig = {} } = {}) {
   const port = await getFreePort();
   const upstream = await startUpstream();
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-pty-'));
@@ -141,6 +141,7 @@ async function bootPool({ supervised = false, env: extraEnv = {} } = {}) {
     restartDrainTimeoutMs: 500,
     retry: { maxAttemptsPerRequest: 3 },   // room for the effort-repair retry with one account
     accounts: [{ name: 'a1', type: 'oauth', accountUuid: 'u1', accessToken: 'at1', refreshToken: 'rt1', expiresAt: Date.now() + 3600_000 }],
+    ...extraConfig,
   }) + '\n');
   const env = {
     ...process.env,
@@ -160,7 +161,7 @@ async function bootPool({ supervised = false, env: extraEnv = {} } = {}) {
   // The pool's event log sits next to its config (config.js getLogPath).
   const logPath = configPath.replace(/\.json$/, '.log');
   const log = () => readFile(logPath, 'utf8').catch(() => '');
-  return { port, term, pid, log, cleanup: () => { term.close(); upstream.server.close(); } };
+  return { port, term, pid, configPath, log, cleanup: () => { term.close(); upstream.server.close(); } };
 }
 
 // The supervisor's live worker children (newest last).
@@ -182,6 +183,44 @@ const indexesOf = (out, needle) => {
   for (let i = out.indexOf(needle); i >= 0; i = out.indexOf(needle, i + 1)) at.push(i);
   return at;
 };
+
+test('TUI account writes preserve a disk-only enrollment and remove only the selected account', { skip, timeout: 30_000 }, async () => {
+  const expiresAt = Date.now() + 3600_000;
+  const claude = { name: 'a1', type: 'oauth', accountUuid: 'u1', accessToken: 'at1', refreshToken: 'rt1', expiresAt };
+  const removedElsewhere = { ...claude, name: 'a2', accountUuid: 'u2' };
+  const { term, configPath, cleanup } = await bootPool({
+    extraConfig: { sync: { accountsIntervalMs: 60_000 }, accounts: [claude, removedElsewhere] },
+  });
+  try {
+    const readConfig = async () => JSON.parse(await readFile(configPath, 'utf8'));
+    const freshClaude = { ...claude, accessToken: 'fresh-access', refreshToken: 'fresh-grant', capUtilization: 0.8, capMode: 'fixed' };
+    const codex = { name: 'new-codex', type: 'oauth', provider: 'codex', codexAuth: 'native',
+      accountUuid: 'codex-user', codexAccountId: 'codex-workspace', accessToken: 'ca', refreshToken: 'cr', expiresAt };
+    const external = { ...await readConfig(), accounts: [freshClaude, codex] };
+    await writeFile(configPath + '.fixture', JSON.stringify(external));
+    await rename(configPath + '.fixture', configPath);
+
+    async function confirmAccountAction(key, title) {
+      term.cmd('keys 61');
+      await waitFor(async () => (await term.screen()).includes('Enable/disable'), 4_000, 'the accounts menu');
+      term.cmd('keys ' + Buffer.from(key).toString('hex'));
+      await waitFor(async () => (await term.screen()).includes('select'), 4_000, 'account selection');
+      term.cmd('keys 6b');
+      await sleep(100);
+      term.cmd('keys 0d');
+      await waitFor(async () => (await term.screen()).includes(title), 4_000, title);
+      term.cmd('keys 79');
+    }
+
+    await confirmAccountAction('t', 'Disable "a1"?');
+    await waitFor(async () => (await readConfig()).accounts[0]?.enabled === false, 4_000, 'the account toggle');
+    assert.deepEqual((await readConfig()).accounts, [{ ...freshClaude, enabled: false }, codex]);
+
+    await confirmAccountAction('d', 'Delete "a1"?');
+    await waitFor(async () => !(await readConfig()).accounts.some(account => account.name === 'a1'), 4_000, 'the account deletion');
+    assert.deepEqual((await readConfig()).accounts, [codex]);
+  } finally { cleanup(); }
+});
 
 test('(a) a terminal that stops reading never stops the pool answering', { skip, timeout: 60_000 }, async () => {
   const { port, term, cleanup } = await bootPool();

@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import net from 'node:net';
+import { listNativeCodexModels, loginNativeCodex, nativeCodexOwnerIdentity } from './codex-native.js';
+import { validCodexCatalog } from './codex-model-routing.js';
+import { ResetCreditRedeemer } from './codex-reset-credits.js';
 
 // DUAL-STACK TUNING (2026-10-08). Node ≥20 enables happy-eyeballs with a 250ms
 // per-family attempt timeout. On networks where IPv6 is degraded-but-not-dead and the
@@ -17,7 +20,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setConsoleNonBlocking, reassertConsoleNonBlocking, appendEventLog, printFatal } from './event-log.js';
-import { sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
+import { codexPoolEndpoint, sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
+import { fetchRemoteStatus } from './pool-link.js';
 import { SleepGuard } from './sleep-guard.js';
 import { controllingTerminalAlive } from './terminal-alive.js';
 import { AccountManager, combineEfficiency } from './account-manager.js';
@@ -44,11 +48,11 @@ net.setDefaultAutoSelectFamilyAttemptTimeout(
 );
 import { Prober } from './prober.js';
 import { CapacityLedger } from './capacity-ledger.js';
-import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, organizationUnknownMatch, resolveOrganizations, suggestAccountName, knownDifferentOrg } from './oauth.js';
+import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, tokenFingerprint, isLoginCancelled, sameAccountIdentity, sameUser, organizationUnknownMatch, resolveOrganizations } from './oauth.js';
 import { TUI, writeTerminalSync, reclaimRawModeLogged, whenTerminalCaughtUp } from './tui.js';
 import { createTerminalModeSwitcher } from './terminal-mode.js';
 import { RestartController } from './restart-controller.js';
-import { resolveAccounts } from './account-config.js';
+import { applyTuiAccountChange, canPersistOAuthRefresh, findAccountConfigIndex, isClaudeOAuthAccount, oauthTokensForDiskSync, planClaudeOAuthLogin, resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
@@ -136,7 +140,7 @@ switch (command) {
     break;
   case 'login':
     await loginCommand();
-    process.exit(0);
+    process.exit(process.exitCode ?? 0);
     break;
   case 'env':
     await envCommand();
@@ -695,6 +699,8 @@ async function serverWorkerCommand() {
   // lease holder); a cold/direct worker reads the on-disk state file.
   const savedState = await loadState();
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
+  accountManager.restoreSessionProviders(savedState?.sessionProviders);
+  accountManager.restoreNativeCodexConversationOwners(savedState?.nativeCodexConversationOwners);
   if (savedState?.capacity) {
     // Measured maxpool downtime = state-file last write → boot. A seamless reload
     // worker's state was handed over live (no gap) → null skips the partial check.
@@ -717,6 +723,8 @@ async function serverWorkerCommand() {
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
   if (savedState?.callerStats) accountManager.restoreCallerStats?.(savedState.callerStats);
+  // 24h cache rollup: additive restore into the running buckets (see exportEfficiencyHours).
+  if (savedState?.efficiencyHours) accountManager.restoreEfficiencyHours?.(savedState.efficiencyHours);
 
   // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
   // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
@@ -808,6 +816,8 @@ async function serverWorkerCommand() {
     return saveState(
       {
         quota: accountManager.exportQuotaState(),
+        sessionProviders: accountManager.exportSessionProviders(),
+        nativeCodexConversationOwners: accountManager.exportNativeCodexConversationOwners(),
         // Runtime providers so glm-fallback/kimi-fallback survive a restart (they're
         // header-derived, not in config). Empty [] when none — harmless.
         runtimeProviders: accountManager.exportRuntimeProviders(),
@@ -820,6 +830,8 @@ async function serverWorkerCommand() {
         // SC22 per-person analytics — same generation-guarded payload, survives
         // restarts and seamless reloads.
         callerStats: accountManager.exportCallerStats?.() || {},
+        // 24h efficiency rollup (hourly buckets) — the Cache line's long window.
+        efficiencyHours: accountManager.exportEfficiencyHours?.() || null,
         // Last-good remote identity maps — the boot-time single-writer guard reads
         // these (see restore above). Rides the same generation-guarded payload.
         poolIdentities: accountManager.exportPoolIdentities?.() || null,
@@ -871,7 +883,30 @@ async function serverWorkerCommand() {
   // Late-bound: routes probe lines through the TUI once it owns the console (a TUI
   // render must be the only writer to the terminal, 2026-11-12).
   const uiLog = (...a) => console.log(...a);
-  const prober = new Prober(accountManager, { intervalMs: probeSeconds * 1000, log: uiLog });
+  const codexReset = new ResetCreditRedeemer(accountManager, {
+    config,
+    applyUsage: (account, usage, timing) => {
+      if (hasLease && accountManager.accounts[account.index] === account) {
+        accountManager.applyCodexUsageData(account.index, usage, timing);
+      }
+    },
+    transactState: async update => {
+      if (!hasLease) throw new Error('Codex resets run on the primary worker');
+      let value;
+      await atomicConfigUpdate(disk => {
+        if (!hasLease) throw new Error('Codex resets run on the primary worker');
+        const result = update(disk.codexResetState);
+        disk.codexResetState = result.state;
+        value = result.value;
+      });
+      return value;
+    },
+  });
+  const prober = new Prober(accountManager, {
+    intervalMs: probeSeconds * 1000, log: uiLog,
+    onCodexQuota: account => hasLease ? codexReset.maybeRedeemForPool([account]) : null,
+  });
+  const owningCodex = name => accountManager.accounts.find(a => a.name === name && a.codexAuth === 'native' && !a.remote && !a.poolBenchedBy);
   // Tell the AM the probe cadence so the TUI can flag a scoped/provider tag whose
   // background probe has gone stale (> 3× interval since last success).
   accountManager.quotaProbeIntervalMs = probeSeconds * 1000;
@@ -928,48 +963,44 @@ async function serverWorkerCommand() {
   //
   // BULLETPROOF CONTRACT: ensureTokenFresh now AWAITs this (persist-before-serve),
   // so it must NEVER throw or reject. A throw here — including from the synchronous
-  // prologue (findConfigAccount / addAccount) — would land in ensureTokenFresh's
+  // prologue (account lookup / addAccount) — would land in ensureTokenFresh's
   // refresh-FAILURE catch and latch `refreshDead` on an account whose refresh POST
   // actually SUCCEEDED (bricking a working account — strictly worse than the window
   // this fix closes). So the ENTIRE body is wrapped, prologue included, and every
   // exit resolves. Returns the awaitable persist promise.
-  const persistTokenRefresh = async (idx, newTokens) => {
-    const account = accountManager.accounts[idx];
-    if (!account) return;
+  const persistTokenRefresh = async (_idx, newTokens, rotation) => {
+    const { account, target } = rotation;
     try {
-      // Keep config.accounts in sync so TUI saveConfig doesn't clobber fresh tokens
-      const memIdx = findConfigAccount(config, account);
-      if (memIdx >= 0) {
-        config.accounts[memIdx].accessToken = newTokens.accessToken;
-        config.accounts[memIdx].refreshToken = newTokens.refreshToken;
-        config.accounts[memIdx].expiresAt = newTokens.expiresAt;
-      }
+      const native = target.codexAuth === 'native';
+      const owner = native ? nativeCodexOwnerIdentity(target) : null;
+      const stillCurrent = () => accountManager.accounts[account.index] === account
+        && account.refreshToken === newTokens.refreshToken && account.credential === newTokens.accessToken
+        && (!native || (owner && nativeCodexOwnerIdentity(account) === owner));
+      if (!stillCurrent()) return;
       let skipped = false; // guard-skip or account-not-on-disk → nothing was persisted
       await atomicConfigUpdate(diskConfig => {
+        if (!stillCurrent()) { skipped = true; return; }
+        const record = native ? target : account;
+        const cfgIdx = findAccountConfigIndex(diskConfig.accounts, record);
+        if (cfgIdx < 0) { skipped = true; return; }
+        const onDisk = diskConfig.accounts[cfgIdx];
+        if (!canPersistOAuthRefresh(onDisk, newTokens, rotation)) {
+          skipped = true;
+          return;
+        }
         // Pick up any new accounts from disk so index matching stays correct
         // (only add, don't refresh credentials — we're about to write the authoritative tokens)
         for (const diskAcct of diskConfig.accounts) {
-          const known = config.accounts.some(a => sameAccountIdentity(a, diskAcct) || nameMatches(a, diskAcct));
+          const known = findAccountConfigIndex(config.accounts, diskAcct) >= 0
+            || accountManager.accounts.some(a => a.name === diskAcct.name);
           if (!known) {
             config.accounts.push(diskAcct);
             accountManager.addAccount(diskAcct);
           }
         }
-        // Match by UUID first, then by name — index may have shifted
-        const cfgIdx = findConfigAccount(diskConfig, account);
-        if (cfgIdx < 0) { skipped = true; return; }
-        const onDisk = diskConfig.accounts[cfgIdx];
-        // Generation guard: if the on-disk refresh token already advanced past
-        // the token we rotated FROM, another writer beat us — skip the write so
-        // we don't revert a fresher single-use token (the brick-the-account case).
-        if (onDisk.refreshToken && onDisk.refreshToken !== account._refreshedFrom &&
-            onDisk.refreshToken !== newTokens.refreshToken) {
-          skipped = true;
-          return;
-        }
-        onDisk.accessToken = newTokens.accessToken;
-        onDisk.refreshToken = newTokens.refreshToken;
-        onDisk.expiresAt = newTokens.expiresAt;
+        const memIdx = findAccountConfigIndex(config.accounts, record);
+        if (memIdx >= 0) Object.assign(config.accounts[memIdx], newTokens);
+        Object.assign(onDisk, newTokens);
       });
       // Monitoring: the rotated token is now DURABLE on disk. Correlate this fp
       // with a later "REJECTED sent fp=" line to tell a lost-rotation double-spend
@@ -1023,6 +1054,7 @@ async function serverWorkerCommand() {
   // MSG_ROLLED_BACK.
   let reloadSeq = 0;
   let openReload = null;
+  let preparingNativeReload = false;
 
   // Best-effort terminal restore on ANY abnormal exit path (uncaughtException,
   // a bare process.exit, a crash) so the user's shell is never left in raw mode
@@ -1081,6 +1113,12 @@ async function serverWorkerCommand() {
   // A second signal forces an immediate exit. Override via config.shutdown.drainTimeoutMs.
   const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
   const hooks = {
+    redeemCodexForRequest: info => {
+      if (!hasLease) return null;
+      const candidates = accountManager.accounts.filter(account => account.codexAuth === 'native' && !account.remote
+        && accountManager._isRequestCompatible(account, info.profile, info));
+      return codexReset.maybeRedeemForPool(candidates, { reactive: true });
+    },
     onRequestStart: (id, info) => {
       const accepted = restartController.requestStarted(id);
       if (accepted) tui?.onRequestStart(id, info);
@@ -1195,6 +1233,11 @@ async function serverWorkerCommand() {
     if (draining) return; // MSG_RELEASE already arrived → a real reload, not a rollback
     // An update that asked while this reload was already open was folded into it.
     const forUpdate = reloadIsForUpdate;
+    if (preparingNativeReload && hasLease) {
+      preparingNativeReload = false;
+      accountManager.setWriterLease(true);
+      prober.start();
+    }
     openReload = null;
     reloadIsForUpdate = false;
     const why = !answered ? 'the supervisor did not answer'
@@ -1307,6 +1350,22 @@ async function serverWorkerCommand() {
     ...(Number.isFinite(config.restartDrainTimeoutMs) ? { drainTimeoutMs: config.restartDrainTimeoutMs } : {}),
   });
 
+  // The installed supervisor can outlive several package upgrades. Its release
+  // acknowledgement deadline is 20s, while a native refresh alone can take 30s.
+  // Finish rotations with admission still open, before starting its baton clock.
+  const requestManagedRestart = async (headlessSignal = false) => {
+    if (draining || openReload || preparingNativeReload) return;
+    if (hasLease && restartController.isSeamless()
+      && accountManager.accounts.some(a => a.codexAuth === 'native' && !a.remote)) {
+      preparingNativeReload = true;
+      accountManager.setWriterLease(false);
+      await Promise.all([prober.stop(), accountManager.drainRefreshes()]);
+      if (draining) return;
+    }
+    if (headlessSignal) requestReload();
+    else restartController.requestRestart();
+  };
+
   // Test-only: drive the real interactive restart path (the TUI `r` key) headless,
   // so the end-to-end "restart while requests are in flight completes bounded and
   // the server comes back" is provable without allocating a pty. Gated — never
@@ -1315,7 +1374,7 @@ async function serverWorkerCommand() {
     process.on('SIGUSR2', () => {
       if (testHookFires('MAXPOOL_TEST_SIGNAL_COLD_RESTART')) { restartWorkerNow(); return; }   // test seam: the abrupt restart
       if (testHookFires('MAXPOOL_TEST_RELOAD_IS_UPDATE')) reloadIsForUpdate = true;   // test seam: an update-driven reload
-      restartController?.requestRestart();
+      requestManagedRestart();
     });
   }
 
@@ -1396,7 +1455,23 @@ async function serverWorkerCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config,
-      saveConfig: () => atomicConfigUpdate(async diskConfig => {
+      codexResetDetails: name => codexReset.readDetails(owningCodex(name)),
+      redeemCodexReset: (name, creditId) => codexReset.manualRedeem(owningCodex(name), creditId),
+      onSetCodexAutoRedeem: async (name, enabled) => {
+        const account = owningCodex(name);
+        if (!hasLease || !account) throw new Error('Only the owning pool can set automatic resets');
+        const autoRedeemReset = enabled === true;
+        await atomicConfigUpdate(disk => {
+          if (!hasLease || owningCodex(name) !== account) throw new Error('Account ownership changed');
+          const entry = disk.accounts[findAccountConfigIndex(disk.accounts, account)];
+          if (!entry) throw new Error('The account is missing from the pool config');
+          entry.autoRedeemReset = autoRedeemReset;
+        });
+        account.autoRedeemReset = autoRedeemReset;
+        const entry = config.accounts[findAccountConfigIndex(config.accounts, account)];
+        if (entry) entry.autoRedeemReset = autoRedeemReset;
+      },
+      saveConfig: (_config, accountChange) => atomicConfigUpdate(diskConfig => {
         diskConfig.routing = {
           mode: config.routing?.mode || 'automatic',
           preferredAccount: config.routing?.preferredAccount || null,
@@ -1432,24 +1507,7 @@ async function serverWorkerCommand() {
         for (const key of ['updateCheck', 'autoUpdate', 'autoApply']) {
           if (config[key] !== undefined) diskConfig[key] = config[key];
         }
-        // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists.
-        // Use live tokens from AccountManager (not the stale config.accounts copy).
-        diskConfig.accounts = config.accounts.map(a => {
-          const am = accountManager.accounts.find(candidate =>
-            sameAccountIdentity(candidate, a) || nameMatches(candidate, a)
-          );
-          const live = am ? {
-            ...a,
-            accessToken: am.credential,
-            refreshToken: am.refreshToken,
-            expiresAt: am.expiresAt,
-          } : a;
-          const diskAcct = diskConfig.accounts.find(
-            d => sameAccountIdentity(d, a) || nameMatches(d, a)
-          );
-          return diskAcct ? { ...diskAcct, ...live } : live;
-        });
+        if (accountChange) return applyTuiAccountChange(diskConfig, accountChange);
       }),
       syncAccounts: async () => {
         const diskConfig = await loadConfig();
@@ -1461,7 +1519,7 @@ async function serverWorkerCommand() {
       },
       onRestart: () => {
         if (testHookFires('MAXPOOL_TEST_RELOAD_IS_UPDATE')) reloadIsForUpdate = true;   // test seam: an update-driven reload
-        restartController.requestRestart();
+        requestManagedRestart();
       },
     });
   }
@@ -1507,7 +1565,7 @@ async function serverWorkerCommand() {
       // silently resuming the old build. A plain 'r' restart never does that — there a
       // rollback should leave the healthy worker serving.
       reloadIsForUpdate = true;
-      restartController.requestRestart();
+      requestManagedRestart();
     }
   };
   // Manual apply (the TUI 'u' → check & apply now): reload into a freshly-installed
@@ -1523,7 +1581,7 @@ async function serverWorkerCommand() {
       // silently resuming the old build. A plain 'r' restart never does that — there a
       // rollback should leave the healthy worker serving.
       reloadIsForUpdate = true;
-      restartController.requestRestart();
+      requestManagedRestart();
     }
   };
   // ONE in-flight latch shared by the periodic timer, the cold-start probe, AND the
@@ -1611,25 +1669,30 @@ async function serverWorkerCommand() {
     }
   };
 
-  const becomePrimary = async ({ viaTakeover }) => {
-    // Cold start: the terminal first, as always (nothing else to hand over). A reload
-    // TAKEOVER serves and announces primacy FIRST and takes the terminal last (below):
-    // whatever the terminal does, the baton completes and the port keeps answering.
-    if (!viaTakeover) takeTerminal({ viaTakeover });
+  const restoreTakeoverState = async () => {
     // On a reload TAKEOVER, adopt the latest tokens from disk. The headless
     // reload worker loaded config at spawn time; the OLD worker may have rotated
     // a single-use refresh token DURING the handoff (and flushed it before
     // MSG_RELEASED). Without this re-sync the new worker would present the now-
     // invalidated token on its first refresh → invalid_grant → bricked account.
-    if (viaTakeover) {
-      try {
-        const diskConfig = await loadConfig();
-        if (diskConfig) await syncAccountsFromDisk(diskConfig, config, accountManager);
-      } catch (err) {
-        console.error(`[Maxpool] Token re-sync at takeover failed: ${err.message}`);
-      }
+    try {
+      const diskConfig = await loadConfig();
+      if (diskConfig) await syncAccountsFromDisk(diskConfig, config, accountManager);
+    } catch (err) {
+      console.error(`[Maxpool] Token re-sync at takeover failed: ${err.message}`);
     }
+    // The old worker could serve a first turn or evict an old conversation after
+    // our headless boot. Adopt its final ownership maps before serving any socket.
+    const finalState = await loadState();
+    accountManager.restoreSessionProviders(finalState?.sessionProviders);
+    accountManager.restoreNativeCodexConversationOwners(finalState?.nativeCodexConversationOwners);
+  };
 
+  const becomePrimary = async ({ viaTakeover }) => {
+    // Cold start: the terminal first, as always (nothing else to hand over). A reload
+    // TAKEOVER serves and announces primacy FIRST and takes the terminal last (below):
+    // whatever the terminal does, the baton completes and the port keeps answering.
+    if (!viaTakeover) takeTerminal({ viaTakeover });
     // Acquire the lease (re-syncs state generation + enables writes) BEFORE we
     // announce primacy, so the moment the supervisor reaps the old worker we are
     // a fully-functional sole writer.
@@ -1661,6 +1724,8 @@ async function serverWorkerCommand() {
     // boots headless (already done above) and waits for MSG_PROBE_READY/TAKEOVER.
     server.on('error', err => console.error(`[Maxpool] Server error: ${err.message}`));
 
+    let finishTakeoverRestore;
+    const restored = isReloadWorker ? new Promise(resolve => { finishTakeoverRestore = resolve; }) : null;
     const listenOnHandle = handle => new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(handle, () => { server.removeListener('error', reject); resolve(); });
@@ -1719,6 +1784,7 @@ async function serverWorkerCommand() {
       // 3) Final flush of learned quota. FORCE it: releaseLease() above already
       //    flipped hasLease=false, and persistQuotaState no-ops without the lease —
       //    so an unforced call here silently drops the reload's final quota flush.
+      accountManager.sealSessionProviderHandoff();
       await persistQuotaState(true);
       // 3b) CAPACITY LEDGER: snapshot what we had flushed. We keep serving in-flight
       //     requests for up to RELOAD_DRAIN_MS after this, and those tokens are real
@@ -1784,7 +1850,11 @@ async function serverWorkerCommand() {
           // A connection the supervisor's own accept loop won the race for (cold start
           // before MSG_PRIMARY, or the reload cutover gap). Serve it exactly as if we
           // had accepted it: http.Server wires up on the 'connection' event.
-          if (handle) { handle.resume?.(); server.emit('connection', handle); }
+          if (handle) {
+            if (restored && !await restored) { handle.destroy(); return; }
+            server.emit('connection', handle);
+            handle.resume?.();
+          }
         } else if (msg?.type === MSG_PROBE_READY) {
           // Headless reload worker: we've booted the new code and restored quota
           // in memory. Confirm readiness (we are NOT yet accepting / writing).
@@ -1809,6 +1879,16 @@ async function serverWorkerCommand() {
           // Baton acquire: the old worker already released, so we're the SOLE
           // acceptor. Start accepting + take the writer lease + TUI. becomePrimary
           // sends MSG_PRIMARY (the baton waits on it).
+          // The supervisor holds the listening socket during this short disk read.
+          // An encrypted continuation accepted early cannot recover its issuing
+          // account from the incoming worker's boot snapshot.
+          try {
+            await restoreTakeoverState();
+            finishTakeoverRestore?.(true);
+          } catch (error) {
+            finishTakeoverRestore?.(false);
+            throw error;
+          }
           await listenOnHandle(handle);
           await becomePrimary({ viaTakeover: true });
         } else if (msg?.type === MSG_TTY_REASSERT) {
@@ -1887,7 +1967,7 @@ async function serverWorkerCommand() {
   // the pool. Re-check shortly after, in case the signal raced the terminal revoke.
   const hangupShutdown = () => shutdownGracefully('SIGHUP', { terminalClose: true });
   process.on('SIGHUP', () => {
-    if (!isInteractiveTerminal()) return requestReload();
+    if (!isInteractiveTerminal()) return requestManagedRestart(true);
     if (!controllingTerminalAlive()) return hangupShutdown();
     console.log('[Maxpool] Ignored SIGHUP: this terminal is still open, so another program sent it (not a closed window). Maxpool keeps running — press r to restart it.');
     for (const ms of [500, 2000]) {
@@ -1921,6 +2001,10 @@ function logPlainServerStart({ host, port, accounts, threshold, config }) {
 // ── login ───────────────────────────────────────────────────
 
 async function loginCommand() {
+  if (args.includes('--codex') || args.includes('--chatgpt')) {
+    await loginChatGPTCommand();
+    return;
+  }
   if (args.includes('--api')) {
     await loginApiCommand();
     return;
@@ -1941,6 +2025,7 @@ async function loginCommand() {
   console.log('Select login method:\n');
   console.log('  1. Claude subscription  (Pro, Max, Team, Enterprise)');
   console.log('  2. Anthropic API key    (Console API billing)');
+  console.log('  3. ChatGPT subscription');
   console.log('');
   const choice = await new Promise(resolve => rl.question('Choice [1]: ', resolve));
   rl.close();
@@ -1948,6 +2033,7 @@ async function loginCommand() {
   switch (choice.trim() || '1') {
     case '1': await loginOAuthCommand(); break;
     case '2': await loginApiCommand(); break;
+    case '3': await loginChatGPTCommand(); break;
     default:
       console.error(`Invalid choice: ${choice.trim()}`);
       process.exit(1);
@@ -1978,36 +2064,7 @@ async function loginApiCommand() {
   console.log(`Saved to ${getConfigPath()}`);
 }
 
-async function loginOAuthCommand() {
-  const config = await loadOrCreateConfig();
-  let name = argValue('--name');
-
-  console.log('Starting OAuth login...');
-  console.log('Note: this adds whatever account you are currently signed into at claude.ai —');
-  console.log('there is no account picker. To add a DIFFERENT account, sign into THAT account at');
-  console.log('claude.ai first (or use a logged-out / incognito browser window), then continue.');
-  let creds;
-  try {
-    creds = await loginOAuth();
-  } catch (err) {
-    if (isLoginCancelled(err)) {
-      console.error('Login cancelled.');
-      process.exit(0);
-    }
-    console.error(`OAuth login failed: ${err.message}`);
-    console.error('');
-    console.error('Alternatives:');
-    console.error('  maxpool login --api   Add an API key instead');
-    process.exit(1);
-  }
-
-  // Cloud-aware: a linked team pool with a usable key may receive the login instead.
-  // Profile FIRST (once): a local match must win over the cloud default.
-  const profile = await fetchProfile(creds.accessToken);
-  const localMatch = (profile?.accountUuid && config.accounts.find(a => a.type === 'oauth' && sameAccountIdentity(a, profile)))
-    || (profile?.accountUuid && organizationUnknownMatch(config.accounts, profile))
-    || (profile?.email && config.accounts.find(a => a.type === 'oauth' && a.name === profile.email))
-    || null;
+async function chooseCliLoginPlan(config, localMatch) {
   const { usable, unresolved, error } = await resolveUsablePools(config.pools, async (names) => {
     const { resolveSecrets } = await import('./secret-resolver.js');
     return resolveSecrets(names);
@@ -2036,12 +2093,47 @@ async function loginOAuthCommand() {
     input.answer = await ask(`Add/update this account in the team pool "${plan.pool.name}" (recommended) or this laptop only? [T/l]: `);
     plan = planCliLogin(input);
   }
+  return plan;
+}
+
+async function loginOAuthCommand() {
+  const config = await loadOrCreateConfig();
+  let name = argValue('--name');
+
+  console.log('Starting OAuth login...');
+  console.log('Note: this adds whatever account you are currently signed into at claude.ai —');
+  console.log('there is no account picker. To add a DIFFERENT account, sign into THAT account at');
+  console.log('claude.ai first (or use a logged-out / incognito browser window), then continue.');
+  let creds;
+  try {
+    creds = await loginOAuth();
+  } catch (err) {
+    if (isLoginCancelled(err)) {
+      console.error('Login cancelled.');
+      process.exit(0);
+    }
+    console.error(`OAuth login failed: ${err.message}`);
+    console.error('');
+    console.error('Alternatives:');
+    console.error('  maxpool login --api   Add an API key instead');
+    process.exit(1);
+  }
+
+  // Cloud-aware: a linked team pool with a usable key may receive the login instead.
+  // Profile FIRST (once): a local match must win over the cloud default.
+  const profile = await fetchProfile(creds.accessToken);
+  const claudeAccounts = config.accounts.filter(isClaudeOAuthAccount);
+  const localMatch = (profile?.accountUuid && claudeAccounts.find(a => sameAccountIdentity(a, profile)))
+    || (profile?.accountUuid && organizationUnknownMatch(claudeAccounts, profile))
+    || (profile?.email && claudeAccounts.find(a => a.name === profile.email))
+    || null;
+  const plan = await chooseCliLoginPlan(config, localMatch);
   if (plan.action === 'fail') {
     console.error(plan.message);
     process.exit(1);
   }
   if (plan.action === 'local') {
-    await upsertOAuthAccount(config, name, creds, 'login', profile);
+    await upsertOAuthAccount(name, creds, profile);
     return;
   }
 
@@ -2061,6 +2153,81 @@ async function loginOAuthCommand() {
   }
   console.error(`${r.error}. NOTHING was saved on this laptop — not retried locally. Try again, or use --local to save here only.`);
   process.exit(1);
+}
+
+async function loginChatGPTCommand() {
+  try {
+    const config = await loadOrCreateConfig();
+    const requestedName = argValue('--name')?.trim();
+    const existing = requestedName && config.accounts.find(account => account.name === requestedName
+      && account.provider === 'codex');
+    const localPrior = !args.includes('--cloud') && !argValue('--pool') ? existing : null;
+    const plan = await chooseCliLoginPlan(config, localPrior);
+    if (plan.action === 'fail') throw new Error(plan.message);
+    let prior = localPrior;
+    if (plan.action === 'cloud') {
+      const pool = plan.pool;
+      const route = codexPoolEndpoint(pool.url, '/maxpool/chatgpt-login');
+      route.searchParams.set('native', '1');
+      if (requestedName) route.searchParams.set('name', requestedName);
+      const result = await fetch(route, {
+        headers: { 'x-api-key': pool.key }, redirect: 'error', signal: AbortSignal.timeout(20_000),
+      });
+      if (result.status === 409) throw new Error('That account name is already used on the team pool. Choose a different name.');
+      if (!result.ok) throw new Error('The team pool could not prepare Codex sign-in (HTTP ' + result.status + ').');
+      const capabilities = await result.json();
+      if (capabilities.nativeCodex !== true) throw new Error('Update the team pool to a MaxPool release that supports native Codex sign-in.');
+      prior = capabilities.prior;
+    }
+    const { profile, creds } = await loginNativeCodex({ prior: prior?.codexAuth === 'native' ? prior : null });
+    const catalog = await listNativeCodexModels(creds);
+    if (!validCodexCatalog(catalog.models)) throw new Error('This Codex account returned no eligible models.');
+    creds.codexModels = catalog.models;
+    const requestedModel = argValue('--model');
+    if (requestedModel && !creds.codexModels.some(model => model.slug === requestedModel)) {
+      throw new Error('This Codex account does not list ' + requestedModel + '.');
+    }
+    if (requestedModel) creds.model = requestedModel;
+    let name = (requestedName || profile.email || 'ChatGPT ' + profile.accountUuid.slice(0, 8))
+      .replace(/[\x00-\x1f\x7f]/g, '').slice(0, 120);
+    if (plan.action === 'cloud') {
+      if (config.accounts.some(account => sameAccountIdentity(account, profile))) {
+        throw new Error('This Codex account already lives on this Mac. Reconnect it locally.');
+      }
+      const pool = plan.pool;
+      const result = await sendLoginToPool({ url: pool.url, key: pool.key, name, profile, creds });
+      if (!result.ok) throw new Error(result.error);
+      console.log('Connected "' + result.name + '" to "' + pool.name + '".');
+      return;
+    }
+    const { usable } = await resolveUsablePools(config.pools, async names => {
+      const { resolveSecrets } = await import('./secret-resolver.js');
+      return resolveSecrets(names);
+    });
+    const linkedAccounts = await Promise.all(usable.map(async pool => {
+      const status = await fetchRemoteStatus(pool.url, pool.key, { timeoutMs: 5000 });
+      const owned = status.ok && status.json?.accounts?.some(account => !account.remote && sameAccountIdentity(account, profile));
+      return owned ? pool.name : null;
+    }));
+    const owningPool = linkedAccounts.find(Boolean);
+    if (owningPool) throw new Error('This Codex account already lives in "' + owningPool + '". Reconnect it there.');
+    await atomicConfigUpdate(disk => {
+      const match = disk.accounts.find(account => sameAccountIdentity(account, profile));
+      if (match) {
+        Object.assign(match, creds);
+        name = match.name;
+        return;
+      }
+      const base = name;
+      for (let suffix = 2; disk.accounts.some(account => account.name === name); suffix++) name = base + ' ' + suffix;
+      disk.accounts.push({ name, type: 'oauth', provider: 'codex', priority: 30,
+        accountUuid: profile.accountUuid, organizationUuid: profile.organizationUuid, ...creds });
+    });
+    console.log('Connected "' + name + '" on this Mac.');
+  } catch (error) {
+    console.error('ChatGPT sign-in failed. ' + error.message);
+    process.exitCode = 1;
+  }
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -2314,7 +2481,7 @@ async function accountsCommand() {
   // Refresh expired tokens before fetching profiles
   let configDirty = false;
   await Promise.all(config.accounts.map(async (a) => {
-    if (a.type !== 'oauth' || !a.refreshToken) return;
+    if (a.type !== 'oauth' || a.provider === 'codex' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
       const newTokens = await refreshAccessToken(a.refreshToken);
@@ -2331,7 +2498,7 @@ async function accountsCommand() {
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken) : null
+      a.type === 'oauth' && a.provider !== 'codex' && a.accessToken ? fetchProfile(a.accessToken) : null
     )
   );
 
@@ -2525,6 +2692,7 @@ Commands:
   server              Start the proxy server (default)
   login               OAuth login via browser (adds the account you're signed into at claude.ai)
   login --api         Add an API key account
+  login --codex       Connect a ChatGPT subscription [--cloud|--local] [--name <name>] [--model <model>]
   login --cloud|--local [--pool <name>]  Send the login to the linked team pool (default when one is configured) or keep it on this laptop
   env [--with-key]    Print env vars to use with Claude
   pool shared <host> <key>  Point this machine at a shared team pool
@@ -2555,69 +2723,42 @@ Config: ${getConfigPath()}
 
 // ── shared account upsert ────────────────────────────────────
 
-async function upsertOAuthAccount(config, name, creds, source = 'unknown', prefetchedProfile = null) {
-  // Fetch profile to auto-name and deduplicate by account UUID (reuse one already fetched)
-  const profile = prefetchedProfile || await fetchProfile(creds.accessToken);
+async function upsertOAuthAccount(name, creds, profile) {
   const profileOk = profile && !profile.error;
-
   if (!profileOk) {
     console.error(`Warning: could not fetch account profile — ${profile?.error || 'no token'}`);
   }
-  if (profileOk) await resolveOrganizations(config.accounts.filter(a => a.type === 'oauth'), profile.accountUuid);
-  const uncertain = profileOk && !name ? organizationUnknownMatch(config.accounts, profile) : null;
+  // Do the legacy profile reads before taking the write lock. Only carry an org
+  // back to the exact Claude grant it was read from.
+  const resolved = ((await loadConfig())?.accounts || []).filter(a => isClaudeOAuthAccount(a) && !a.organizationUuid);
+  if (profileOk) await resolveOrganizations(resolved, profile.accountUuid);
+  const { entry, index, uncertain } = await atomicConfigUpdate(disk => {
+    const claudeAccounts = disk.accounts.filter(isClaudeOAuthAccount);
+    for (const a of claudeAccounts) {
+      if (a.organizationUuid) continue;
+      const match = resolved.find(candidate => candidate.organizationUuid && candidate.name === a.name
+        && sameUser(candidate, a) && candidate.accessToken === a.accessToken);
+      if (match) a.organizationUuid = match.organizationUuid;
+    }
+    const uncertain = profileOk && !name ? organizationUnknownMatch(claudeAccounts, profile) : null;
+    const { index, entry } = planClaudeOAuthLogin(disk.accounts, {
+      creds, profile, name: name || uncertain?.name, source: 'login',
+    }, disk.providers || []);
+    if (index < 0) disk.accounts.push(entry);
+    else disk.accounts[index] = entry;
+    return { entry, index, uncertain };
+  });
   if (uncertain) {
-    name = uncertain.name;
-    console.log(`Same Claude user as "${name}", and its organization could not be checked: re-authenticating it in place. To add this login as a second account, run again with --name <new name>.`);
-  }
-  if (!name && profile?.email) {
+    console.log(`Same Claude user as "${entry.name}", and its organization could not be checked: re-authenticating it in place. To add this login as a second account, run again with --name <new name>.`);
+  } else if (!name && profile?.email) {
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  if (!name) name = suggestAccountName(config.accounts, profile);
-
-  const account = {
-    name,
-    type: 'oauth',
-    source,
-    accountUuid: profile?.accountUuid || null,
-    organizationUuid: profile?.organizationUuid || null,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Deduplicate: match by user + organization first, then by name
-  let idx = config.accounts.findIndex(a => sameAccountIdentity(a, account));
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
-
-  if (idx >= 0) {
-    config.accounts[idx] = account;
-    console.log(`Updated account "${name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added account "${name}"`);
-  }
-
-  await saveConfig(config);
+  console.log(`${index >= 0 ? 'Updated' : 'Added'} account "${entry.name}"`);
   console.log(`Saved to ${getConfigPath()}`);
 }
 
 // ── config sync helpers ─────────────────────────────────────
-
-/**
- * Find a config account entry matching an in-memory account (by user + organization,
- * then name).
- */
-// Name fallback must never cross organizations: a same-user row with a KNOWN,
-// DIFFERENT organization owns its name and its tokens.
-function nameMatches(a, diskAcct) {
-  return a.name === diskAcct.name && !knownDifferentOrg(a, diskAcct);
-}
-function findConfigAccount(diskConfig, account) {
-  const idx = diskConfig.accounts.findIndex(a => sameAccountIdentity(a, account));
-  if (idx >= 0) return idx;
-  return diskConfig.accounts.findIndex(a => a.name === account.name);
-}
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -2627,11 +2768,12 @@ function findConfigAccount(diskConfig, account) {
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
   for (const diskAcct of diskConfig.accounts) {
-    const matchByUuid = memConfig.accounts.findIndex(a => sameAccountIdentity(a, diskAcct));
-    const matchByName = memConfig.accounts.findIndex(a => a.name === diskAcct.name);
-    const memIdx = (matchByUuid >= 0 ? matchByUuid : null) ?? (matchByName >= 0 ? matchByName : -1);
+    const memIdx = findAccountConfigIndex(memConfig.accounts, diskAcct);
 
     if (memIdx < 0) {
+      // The normal enrollment path gives new owners distinct names. A hand-edited
+      // collision must not turn a live account into another workspace.
+      if (accountManager.accounts.some(a => a.name === diskAcct.name)) continue;
       // New account discovered on disk — add to running server
       memConfig.accounts.push(diskAcct);
       accountManager.addAccount(diskAcct);
@@ -2653,10 +2795,16 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     if (!freshCred) continue;
 
     // Find the corresponding AccountManager entry and update credentials
-    const mgr = accountManager.accounts.find(a =>
-      sameAccountIdentity(a, diskAcct) || nameMatches(a, diskAcct)
-    );
+    const mgr = accountManager.accounts[findAccountConfigIndex(accountManager.accounts, diskAcct)];
     if (!mgr) continue;
+    if (diskAcct.provider === 'codex') {
+      mgr.oauthClientId = diskAcct.oauthClientId;
+      mgr.codexAuth = diskAcct.codexAuth;
+      mgr.codexAccountId = diskAcct.codexAccountId;
+      mgr.codexModels = diskAcct.codexModels;
+      mgr.autoRedeemReset = diskAcct.autoRedeemReset;
+      mgr.model = diskAcct.model;
+    }
     if (diskAcct.organizationUuid && !mgr.organizationUuid) mgr.organizationUuid = diskAcct.organizationUuid;
     const enabled = diskAcct.enabled !== false;
     if (mgr.enabled !== enabled) {
@@ -2688,17 +2836,16 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       mgr.capRampStart = dRamp;
       console.log(`[Maxpool] Usage cap for "${mgr.name}" ${diskCap ? `set to ${Math.round(diskCap * 100)}% (${diskMode})` : 'removed'} from config`);
     }
-    memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct };
+    if (freshCred.accessToken) freshCred = oauthTokensForDiskSync(mgr, freshCred);
+    if (!mgr.accountUuid && diskAcct.accountUuid && freshCred.accessToken === mgr.credential
+      && freshCred.refreshToken === mgr.refreshToken) mgr.accountUuid = diskAcct.accountUuid;
+    memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct, ...(freshCred.accessToken ? freshCred : {}) };
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
         mgr.refreshToken !== freshCred.refreshToken;
-      // Don't overwrite in-memory credentials with staler ones from disk
-      // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
-      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
-        freshCred.expiresAt < mgr.expiresAt;
-      if (changed && !diskIsStaler) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
+      if (changed) {
+        accountManager.updateAccountTokens(mgr.index, freshCred, { persist: false });
         console.log(`[Maxpool] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
@@ -2807,11 +2954,28 @@ function efficiencyLines(data, key = 'last15m') {
   const accts = data.accounts || [];
   const overall = data.efficiency?.[key];
   if (!overall) return [];
-  const claude = overall.claude || combineEfficiency([], 'claude');
-  const glm = overall.glm || combineEfficiency([], 'glm');
-  const served = claude.served + glm.served;
-  const sum = (f) => (claude[f] || 0) + (glm[f] || 0);
-  const cause = (c) => (claude.movedByCause?.[c] || 0) + (glm.movedByCause?.[c] || 0);
+  const day = data.efficiency?.last24h;
+  const groups = [['claude', 'Claude'], ['glm', 'GLM']];
+  if (overall.codex || day?.codex) groups.push(['codex', 'Codex']);
+  const families = groups.map(([provider, label]) => ({
+    provider, label, block: overall[provider] || combineEfficiency([], provider),
+  }));
+  const sum = field => families.reduce((total, { block }) => total + (block[field] || 0), 0);
+  const by = (field, key) => families.reduce((total, { block }) => total + (block[field]?.[key] || 0), 0);
+  const served = sum('served');
+  const cause = key => by('movedByCause', key);
+  const why = key => by('movedByWhy', key);
+  const cache = families.map(({ provider, label, block }) => {
+    const miss = (block.missTokens / 1e6).toFixed(1);
+    const writes = provider === 'claude' && block.writeShare != null
+      ? ` · writes ${pctOrDash(block.writeShare)} of cost (quota-burn proxy, not money)` : '';
+    return `${label} ${pctOrDash(block.hit)} (miss ${miss}M tok${writes})`;
+  }).join(' · ');
+  const cache24h = day ? families.map(({ provider, label }) => {
+    const summary = day[provider];
+    const hit = summary?.hit != null && summary.served >= 20 ? `${pctOrDash(summary.hit)} (${summary.served} served)` : '—';
+    return `${label} ${hit}`;
+  }).join(' · ') : '—';
   const anyData = served + sum('bounced') > 0;
   const n = (x) => (anyData ? String(x) : '—');
   const failed = accts.reduce((t, a) => t + (a.load?.[key]?.failed || 0), 0);
@@ -2820,8 +2984,10 @@ function efficiencyLines(data, key = 'last15m') {
   const s = (ms) => (ms == null ? '—' : `${(ms / 1000).toFixed(1)}s`);
   return [
     `Efficiency (${key === 'last1h' ? '1h' : '15m'}):`,
-    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok${claude.writeShare != null ? ` · writes ${pctOrDash(claude.writeShare)} of cost` : ''}) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)`,
-    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))})`,
+    `  Cache:        ${cache}`,
+    `  24h cache:    ${cache24h}`,
+    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · why: outscored ${n(why('outscored'))} · hold-ceiling ${n(why('holdCeiling'))} · released ${n(why('released'))} · other ${n(why('other'))})`,
+    `  Move causes:  busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))}`,
     `  Bounced:      ${n(sum('bounced'))} (refused ${n(sum('refused'))}) · failed ${failed} · link drops ${linkDrops}`,
     `  Busy waits:   ${n(sum('waited'))}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${n(sum('waitThenMoved'))} (busy-bounce waits only; queue holds show in first-byte p95)`,
     `  Client errors: ${co ? `${co.poolErrors + co.requestErrors} of ${co.total} (pool ${co.poolErrors} · request ${co.requestErrors})` : '—'}`,

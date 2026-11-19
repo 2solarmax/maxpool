@@ -38,34 +38,23 @@ test('A: writeShare null only when the window processed no prompt tokens at all'
   assert.equal(idle._efficiencySummary(idle.accounts[0], 15 * 60_000).writeShare, null);
 });
 
-test('A: the TUI cache line shows the write share beside hit%, and it colours on it', () => {
+test('A: the TUI cache line drops the cost proxy; the CLI detail keeps it labelled', () => {
   const m = new AccountManager([acct('c1')], 0.9);
-  // Real volume, hit 90% — but writes carry 55% of cost-equivalent: not green.
-  // (hit .9 needs cr=9(cc+in); share .55 then needs cc/in ≈ 15.5.)
+  // Real volume, hit 90%, writes carry 55% of cost-equivalent (the old line printed
+  // "(w/ 55% of cost)" here — a quota-burn proxy that read as money).
   for (let i = 0; i < 30; i++) served(m, m.accounts[0], { in: 100, cr: 14_850, cc: 1_550, out: 10 });
-  const line = strip(tui(m)._efficiencyLine(160));
-  assert.match(line, /Claude 90% \(w\/ 55% of cost\)/, `write share beside hit: ${line}`);
-  // And a genuinely healthy window stays green with the figure present.
+  const line = strip(tui(m)._cacheLine(160));
+  assert.match(line, /Claude 90%/, `hit still shown: ${line}`);
+  assert.doesNotMatch(line, /of cost/, `the cost proxy is off the screen line: ${line}`);
+  // The figure survives where it belongs — the detail view, labelled as a proxy.
+  const e = m.efficiencyOverall('last15m').claude;
+  assert.ok(Math.abs(e.writeShare - 0.55) < 0.01, `writeShare still computed: ${e.writeShare}`);
+  // And a genuinely healthy window stays green.
   const ok = new AccountManager([acct('c1')], 0.9);
   for (let i = 0; i < 30; i++) served(ok, ok.accounts[0], { in: 100, cr: 9900, cc: 100, out: 10 });
-  const okLine = strip(tui(ok)._efficiencyLine(160));
-  assert.match(okLine, /Claude 98% \(w\/ 10% of cost\)/, okLine);
+  const okLine = strip(tui(ok)._cacheLine(160));
+  assert.match(okLine, /Claude 98%/, okLine);
   assert.doesNotMatch(okLine, /⚠/);
-});
-
-test('A: yellow at write share > 40%, red > 60% (Claude, real volume)', () => {
-  const line = (u) => {
-    const m = new AccountManager([acct('c1')], 0.9);
-    for (let i = 0; i < 30; i++) served(m, m.accounts[0], { ...u, out: 1 });
-    return strip(tui(m)._efficiencyLine(200));
-  };
-  // hit 90%, write share 47%: above the 40% yellow line, below the 60% red line.
-  const y = line({ in: 1000, cr: 9 * 4630, cc: 3630 });
-  assert.match(y, /Claude 90% \(w\/ 47% of cost\)/, y);
-  assert.doesNotMatch(y, /⚠/, `47% is yellow, not red: ${y}`);
-  // hit 51%, write share 70%: above the 60% red line (hit still over the 50% red floor).
-  const r = line({ in: 10_000, cr: 37_000, cc: 25_300 });
-  assert.match(r, /⚠ write share 70% of cost/, `red names the write share: ${r}`);
 });
 
 // ── C (finding 4): same-family vs cross-family moves ────────────────────────
@@ -123,9 +112,9 @@ test('C: the red "forced moves/100" alarm fires on CROSS-FAMILY moves only', () 
   for (let i = 0; i < 5; i++) {
     servedOn(m, z1, `g${i}`); servedOn(m, z2, `g${i}`, { moveCause: 'busy' });
   }
-  let line = strip(tui(m)._efficiencyLine(200));
-  assert.doesNotMatch(line, /forced moves\/100/, `same-family bounces are not the red alarm: ${line}`);
-  assert.match(line, /glm busy-bounced 5/, `they surface as a capacity note: ${line}`);
+  let moves = strip(tui(m)._movesLine(200));
+  assert.doesNotMatch(moves, /forced moves\/100/, `same-family bounces are not the red alarm: ${moves}`);
+  assert.match(moves, /glm moved-busy 5/, `they surface as a capacity note (renamed from "busy-bounced"): ${moves}`);
   // One cross-family move above the cross threshold... one move on 45 served is 2/100 —
   // use two cross moves on 40 served → 5/100 → red.
   const m2 = pool3();
@@ -133,21 +122,27 @@ test('C: the red "forced moves/100" alarm fires on CROSS-FAMILY moves only', () 
   for (let i = 0; i < 2; i++) {
     servedOn(m2, m2.accounts[0], `x${i}`); servedOn(m2, m2.accounts[2], `x${i}`, { moveCause: 'busy' });
   }
-  line = strip(tui(m2)._efficiencyLine(200));
-  assert.match(line, /⚠.*cross moves 5\/100/, `cross-family moves drive the red alarm: ${line}`);
+  moves = strip(tui(m2)._movesLine(200));
+  assert.match(moves, /⚠.*cross moves 5\/100/, `cross-family moves drive the red alarm: ${moves}`);
 });
 
-test('C: the headline shows cross-family moves as the cost signal', () => {
+test('C: the Moves line shows cross-family per 100 and the hold-reason split', () => {
   const m = pool3();
   const [c1, c2, z1, z2] = m.accounts;
   for (let i = 0; i < 40; i++) served(m, i % 2 ? c2 : c1, { in: 1000, cr: 9000, cc: 0, out: 10 });
-  for (let i = 0; i < 3; i++) {
-    servedOn(m, z1, `g${i}`); servedOn(m, z2, `g${i}`, { moveCause: 'busy' });
-  }
-  servedOn(m, c1, 'x'); servedOn(m, z1, 'x', { moveCause: 'busy' });
-  const line = strip(tui(m)._efficiencyLine(200));
-  assert.match(line, /cross-moves 2\/100/, `cost signal is cross-family per 100: ${line}`); // 2 cross / 44 served
-  assert.doesNotMatch(line, /cross-moves 4\/100/, 'the blended 4/100 (moves/served on glm+claude rows) is not shown as cross');
+  // Same-family (z1→z2) moves, each carrying its WHY: two outscored, one hold-ceiling.
+  servedOn(m, z1, 'g0'); servedOn(m, z2, 'g0', { moveCause: 'busy', movedWhy: 'outscored:12.3(concurrency+9.0;bonus=400;depth=60/10)' });
+  servedOn(m, z1, 'g1'); servedOn(m, z2, 'g1', { moveCause: 'busy', movedWhy: 'outscored:8.1(capPenalty+5.0;bonus=400;depth=55/12)' });
+  servedOn(m, z1, 'g2'); servedOn(m, z2, 'g2', { moveCause: 'busy', movedWhy: 'released:hold-ceiling(inflight=7/6)' });
+  // One cross-family move (c1→z1) — its why is NOT in the same-family split.
+  servedOn(m, c1, 'x'); servedOn(m, z1, 'x', { moveCause: 'busy', movedWhy: 'released:hold-ceiling(inflight=7/6)' });
+  const moves = strip(tui(m)._movesLine(200));
+  assert.match(moves, /cross 2\/100/, `cost signal is cross-family per 100: ${moves}`); // 2 cross / 44 served
+  assert.match(moves, /same 3 \(outscored 2 · hold-ceiling 1\)/, `same-family moves split by WHY: ${moves}`);
+  assert.doesNotMatch(moves, /cross 4\/100/, 'the blended 4/100 (moves/served on glm+claude rows) is not shown as cross');
+  // The Cache line carries no move figures at all — one line, one decision.
+  const cache = strip(tui(m)._cacheLine(200));
+  assert.doesNotMatch(cache, /cross/, `no move counts on the Cache line: ${cache}`);
 });
 
 // ── D (finding 5): miss per provider, no blended sum; capacity axis label ────
@@ -157,10 +152,10 @@ test('D: miss is shown per provider, never a blended cross-tokenizer sum', () =>
   // Enough volume that neither side is lowVolume (the line renders numbers).
   for (let i = 0; i < 30; i++) served(m, m.accounts[0], { in: 500, cr: 100_000, cc: 1500, out: 10 });
   for (let i = 0; i < 30; i++) served(m, m.accounts[1], { in: 300, cr: 100_000, cc: 0, out: 10 });
-  const line = strip(tui(m)._efficiencyLine(200));
+  const line = tui(m)._renderRoutingDetail().map(strip).find(row => row.includes('Cache misses'));
   assert.doesNotMatch(line, /(?:^|· )miss \d+k tok/, `no blended miss figure: ${line}`);
-  assert.match(line, /Claude miss 60k tok/, line);
-  assert.match(line, /GLM miss 9k tok/, line);
+  assert.match(line, /Claude 60k tok/, line);
+  assert.match(line, /GLM 9k tok/, line);
 });
 
 test('D: the capacity page axis says provider-native tokens', () => {
@@ -173,10 +168,10 @@ test('D: the capacity page axis says provider-native tokens', () => {
 
 // ── E (finding 6): the wait figure says what it counts ───────────────────────
 
-test('E: the wait figures say they count busy-bounce waits only', () => {
+test('E: the wait figures say they count busy-waits only (Moves line)', () => {
   const m = new AccountManager([acct('c1'), { ...acct('g1', 'provider'), provider: 'zai' }], 0.9);
   for (let i = 0; i < 30; i++) served(m, m.accounts[0], { in: 100, cr: 9900, cc: 0, out: 1 }, { busyWaitMs: 8000 });
-  const line = strip(tui(m)._efficiencyLine(160));
-  assert.match(line, /busy-bounce waits 30 \(avg 8\.0s\)/, `relabeled: ${line}`);
-  assert.doesNotMatch(line, /(?<![-a-z])waited 30/, `not the old ambiguous label: ${line}`);
+  const moves = strip(tui(m)._movesLine(160));
+  assert.match(moves, /busy-waits 30 \(avg 8\.0s\)/, `relabeled, on the Moves line: ${moves}`);
+  assert.doesNotMatch(moves, /(?<![-a-z])waited 30/, `not the old ambiguous label: ${moves}`);
 });

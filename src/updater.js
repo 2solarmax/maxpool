@@ -20,31 +20,45 @@ export async function getCurrentVersion() {
   }
 }
 
-/** Compare two dotted versions. Returns 1 if a>b, -1 if a<b, 0 if equal. */
+// Compare the numeric release before its prerelease suffix. Build metadata has
+// no precedence, so a public patch can safely supersede a local candidate.
 export function compareVersions(a, b) {
-  const pa = String(a).split('.').map(n => Number(n) || 0);
-  const pb = String(b).split('.').map(n => Number(n) || 0);
+  const split = value => String(value).split('+', 1)[0].split(/-(.*)/s);
+  const [coreA, preA] = split(a);
+  const [coreB, preB] = split(b);
+  const pa = coreA.split('.').map(Number);
+  const pb = coreB.split('.').map(Number);
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
     if ((pa[i] || 0) > (pb[i] || 0)) return 1;
     if ((pa[i] || 0) < (pb[i] || 0)) return -1;
   }
-  return 0;
+  if (preA === preB) return 0;
+  if (preA === undefined) return 1;
+  if (preB === undefined) return -1;
+  const left = preA.split('.');
+  const right = preB.split('.');
+  for (let i = 0; i < Math.min(left.length, right.length); i++) {
+    const x = left[i], y = right[i];
+    if (x === y) continue;
+    const nx = /^\d+$/.test(x), ny = /^\d+$/.test(y);
+    if (nx !== ny) return nx ? -1 : 1;
+    if (nx && x.length !== y.length) return x.length > y.length ? 1 : -1;
+    return x > y ? 1 : -1;
+  }
+  return Math.sign(left.length - right.length);
 }
 
 /**
  * Check npm for a newer published version. Network-failure-safe: returns null
  * on any error (offline, timeout, bad response) so a check never breaks startup.
  */
-export async function checkForUpdate(currentVersion, { timeoutMs = 4000, registry = DEFAULT_REGISTRY } = {}) {
+export async function checkForUpdate(currentVersion, {
+  timeoutMs = 4000, registry = DEFAULT_REGISTRY, packageName = PACKAGE, fetchImpl = fetch,
+} = {}) {
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    let res;
-    try {
-      res = await fetch(`${registry}/${PACKAGE}/latest`, { signal: ctrl.signal });
-    } finally {
-      clearTimeout(timer);
-    }
+    const res = await fetchImpl(`${registry}/${encodeURIComponent(packageName)}/latest`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
     if (!res.ok) return null;
     const data = await res.json();
     const latest = data.version;

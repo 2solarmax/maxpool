@@ -96,6 +96,22 @@ test('scheduler skips throttled accounts and resumes them after retry window', (
   assert.ok(laterLeases.some(l => l.account.name === 'a1'));
 });
 
+test('a Claude Code turn served by Codex leaves the Anthropic recovery probe for Claude', () => {
+  const am = manager(2);
+  am.accounts[1].provider = 'codex';
+  am.markUpstreamThrottled(60, 'temporary Anthropic limit');
+  am.upstreamThrottle.until = Date.now() - 1;
+
+  const codex = am.acquireAccount({ model: 'gpt-6.2-sol', openAIModel: 'gpt-6.2-sol',
+    codexCompatible: true, profile: 'codex' }, new Set([0]));
+  assert.equal(codex.account.provider, 'codex');
+  assert.equal(codex.upstreamThrottleProbe, false);
+  am.releaseAccount(codex, { success: true, status: 200 });
+  const probe = am.acquireAccount({ profile: 'claude' });
+  assert.equal(probe.upstreamThrottleProbe, true);
+  am.releaseAccount(probe, { success: true, status: 200 });
+});
+
 test('shared upstream throttle allows one recovery probe and self-clears on success', () => {
   const am = manager(2);
   am.markUpstreamThrottled(60, 'temporary server limit');

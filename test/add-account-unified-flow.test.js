@@ -15,14 +15,14 @@ const am = () => new AccountManager([
   { name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
 ], 0.90);
 
-test('the add-account type picker offers all FOUR account types', () => {
+test('the add-account type picker offers all supported account types', () => {
   const types = TUI.ADD_TYPES;
-  assert.equal(types.length, 4);
+  assert.equal(types.length, 5);
   const ids = types.map(t => t.id);
-  assert.deepEqual(ids, ['anthropic-oauth', 'anthropic-key', 'zai', 'kimi'],
-    'subscription, Anthropic key, GLM, Kimi — the four the user named');
+  assert.deepEqual(ids, ['anthropic-oauth', 'anthropic-key', 'zai', 'kimi', 'chatgpt'],
+    'Claude subscription, Anthropic key, GLM, Kimi, and ChatGPT subscription');
   // Every type is reachable by a single keypress.
-  assert.deepEqual(types.map(t => t.key), ['1', '2', '3', '4']);
+  assert.deepEqual(types.map(t => t.key), ['1', '2', '3', '4', '5']);
 });
 
 test('the type picker RENDERS its options (not just a title)', () => {
@@ -34,6 +34,7 @@ test('the type picker RENDERS its options (not just a title)', () => {
   assert.match(text, /Anthropic API key/);
   assert.match(text, /GLM/);
   assert.match(text, /Kimi/);
+  assert.match(text, /ChatGPT subscription/);
   // And it explains BOTH credential sources — the thing that was missing.
   assert.match(text, /GCP Secret Manager/, 'must explain the GCP option');
   assert.match(text, /application-default login/, 'must say HOW gcloud auth works');
@@ -62,7 +63,7 @@ test('pressing `a` on the accounts screen opens the type picker', () => {
 });
 
 test('each number key selects its account type', () => {
-  for (const [key, expectMode] of [['3', 'input'], ['4', 'input']]) {
+  for (const [key, expectMode] of [['3', 'input'], ['4', 'input'], ['5', 'confirm']]) {
     const tui = new TUI({ accountManager: am() });
     tui.mode = 'addtype';
     tui._keyAddType(key);
