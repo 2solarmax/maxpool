@@ -157,3 +157,66 @@ test('a held reset or stale grant listing still gets the normal decision cadence
   await prober.probeAll();
   assert.equal(calls.length, 4);
 });
+
+test('a confirmed empty grant listing cuts both usage reads to one per half-hour, then discovers an unseen refill', async t => {
+  let full = true;
+  const reset = Date.now() + 4 * 86400_000, listings = [];
+  const { am, calls, prober, advance } = harness(t, {
+    usage: name => ({ sevenDay: { utilization: name === 'full' && full ? 1 : 0.3, resetAt: reset } }),
+    grants: async name => { listings.push(name); return { grants: [], eligible: true }; },
+  });
+  await prober.probeAll();
+  assert.equal(am.accounts[0].quota.probeNextCheckAt, Date.now() + 30 * minute);
+  full = false;
+  for (let i = 0; i < 29; i++) { advance(minute); await prober.probeAll(); }
+  const count = rows => rows.filter(name => name === 'full').length;
+  assert.equal(count(calls), 1);
+  assert.equal(count(listings), 1);
+  advance(minute); await prober.probeAll();
+  assert.equal(count(calls), 2);
+  assert.equal(count(listings), 2);
+  assert.equal(am.accounts[0].quota.unified7d, 0.3);
+  advance(minute); await prober.probeAll();
+  assert.equal(count(calls), 3);
+});
+
+test('Accounts Check quota advances only the selected owning row, never bypasses Retry-After', async t => {
+  const reset = Date.now() + 4 * 86400_000;
+  let full = true;
+  const { am, calls, prober, advance } = harness(t, {
+    usage: () => ({ sevenDay: { utilization: full ? 1 : 0.2, resetAt: reset } }),
+    grants: async () => ({ grants: [], eligible: true }),
+  });
+  await prober.probeAll();
+  full = false;
+  am.accounts[1].poolBenchedBy = 'team';
+  const tui = new TUI({ accountManager: am, onQuotaRecheck: row => prober.requestUsageRecheck(row) });
+  tui._keyAccounts('v');
+  assert.deepEqual(tui._selectableIndexes('check quota'), [0]);
+  tui._keySelect('enter');
+  assert.equal(am.accounts[0].quota.probeRecheckRequested, true);
+  assert.deepEqual(calls, ['full', 'available'], 'the TUI cannot launch a separate, unpaced upstream read');
+  advance(minute); await prober.probeAll();
+  assert.deepEqual(calls, ['full', 'available', 'full']);
+  assert.equal(am.accounts[0].quota.unified7d, 0.2);
+  assert.equal(am.accounts[0].quota.probeRecheckRequested, false);
+  am.accounts[0].quota.probeRetryAt = Date.now() + 120000;
+  assert.match(prober.requestUsageRecheck(am.accounts[0]), /requested a wait/);
+  assert.equal(am.accounts[0].quota.probeRecheckRequested, false);
+  assert.match(prober.requestUsageRecheck(am.accounts[1]), /owning pool/);
+});
+
+test('a fresh grant cooldown wakes an empty-listing account at its recorded deadline', async t => {
+  const reset = Date.now() + 4 * 86400_000, cooldownUntil = Date.now() + 2 * minute;
+  const { am, calls, prober, advance } = harness(t, {
+    usage: () => ({ sevenDay: { utilization: 1, resetAt: reset } }),
+    grants: async () => ({ grants: [], eligible: false, cooldownUntil }),
+  });
+  await prober.probeAll();
+  assert.equal(am.accounts[0].quota.probeNextCheckAt, cooldownUntil);
+  advance(minute); await prober.probeAll();
+  assert.equal(calls.length, 2);
+  advance(minute); await prober.probeAll();
+  assert.equal(calls.length, 4);
+  assert.equal(am.accounts[0].quota.probeNextCheckAt, Date.now() + 30 * minute);
+});

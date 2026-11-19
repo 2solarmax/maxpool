@@ -765,7 +765,7 @@ export function decideLoginTarget({ mirror, links, existing, accountUuid }) {
 }
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart, spawnDetached,
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuotaRecheck, onQuit, onRestart, spawnDetached,
     codexResetDetails, redeemCodexReset, onSetCodexAutoRedeem }) {
     this.am = accountManager;
     // Runs the tmux detach for q in service mode; a seam so tests never start tmux.
@@ -775,6 +775,7 @@ export class TUI {
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
+    this.onQuotaRecheck = onQuotaRecheck;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
     this.codexResetDetails = codexResetDetails;
@@ -1486,6 +1487,8 @@ export class TUI {
       this._startSelection('codexLogin');
     } else if (k === 'r' && this.codexResetDetails && this.am.accounts.some(a => a.provider === 'codex' && !a.remote)) {
       this._startSelection('codexResets');
+    } else if (k === 'v' && this.onQuotaRecheck) {
+      this._startSelection('check quota');
     } else if (k === 'n' && this.am.accounts.length > 0) {
       this._startSelection('rename');
     } else if (k === 't' && this.am.accounts.length > 0) {
@@ -1965,7 +1968,10 @@ export class TUI {
         this.mode = 'normal';
         return;
       }
-      if (this.selAction === 'prefer') {
+      if (this.selAction === 'check quota') {
+        this.mode = 'accounts';
+        this._addLog(this.onQuotaRecheck(account));
+      } else if (this.selAction === 'prefer') {
         if (account.type === 'provider') {
           this._addLog('Manual preference is available only for Claude accounts');
           return;
@@ -2041,9 +2047,10 @@ export class TUI {
   _startSelection(action) {
     const selectable = this._selectableIndexes(action);
     if (!selectable.length) {
+      const unavailable = action === 'check quota' ? 'Check cloud accounts on their owning pool'
+        : 'No configurable account is available for this action';
       this._addLog(action === 'prefer'
-        ? 'No enabled Claude account is available for manual preference'
-        : 'No configurable account is available for this action');
+        ? 'No enabled Claude account is available for manual preference' : unavailable);
       return;
     }
     this.mode = 'select';
@@ -2088,6 +2095,8 @@ export class TUI {
     return this._displayOrder()
       .map(index => ({ account: this.am.accounts[index], index }))
       .filter(({ account }) => {
+        if (action === 'check quota') return account.type === 'oauth' && account.provider !== 'codex' && account.credential
+          && !account.remote && !account.poolBenchedBy && !account.refreshDead;
         if (action === 'prefer') return account.type !== 'provider' && account.enabled;
         if (action === 'codexLogin') return account.provider === 'codex';
         if (action === 'codexResets') return account.provider === 'codex' && !account.remote;
@@ -3628,6 +3637,7 @@ export class TUI {
     const nextAt = Math.max(q.probeRetryAt || 0, q.probeNextCheckAt || 0);
     let action;
     if (q.probeChecking && !(q.probeRetryAt > now)) action = remote ? 'cloud reported a check in progress' : 'refreshing now';
+    else if (q.probeRecheckRequested) action = 'check queued';
     else if (nextAt) action = nextAt > now ? `next check due in ${formatAge(nextAt - now)}` : 'check due';
     else if (remote) action = interval === 0 ? 'cloud checks off' : 'cloud check time unavailable';
     else action = `${throttled ? 'retrying' : 'refreshing'} ${this._probeNextText()}`;
@@ -4072,7 +4082,7 @@ export class TUI {
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
       }
       case 'accounts':
-        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('v')} Check quota  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'codexResets': {
         const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset ? 'on' : 'off'}` : '';
         const state = this.codexResets;
@@ -4124,7 +4134,7 @@ export class TUI {
             ? 'enable/disable'
             : this.selAction === 'rename'
               ? 'rename'
-              : 'delete';
+              : this.selAction === 'check quota' ? 'check quota' : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'input': {

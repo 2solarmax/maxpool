@@ -1446,6 +1446,7 @@ async function serverWorkerCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config,
+      onQuotaRecheck: account => prober.requestUsageRecheck(account),
       codexResetDetails: name => codexReset.readDetails(owningCodex(name)),
       redeemCodexReset: (name, creditId) => codexReset.manualRedeem(owningCodex(name), creditId),
       onSetCodexAutoRedeem: async (name, enabled) => {

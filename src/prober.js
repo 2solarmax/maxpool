@@ -21,6 +21,9 @@ export { GRANTS_EVERY_MS, GRANTS_RETRY_MS, CLAIM_BACKOFF_STEPS_MS, CLAIM_BACKOFF
 // How often a subscription-latched account is rechecked (one probe + at most one
 // token refresh per window — cheap, and bounded so a truly canceled plan isn't hammered).
 export const SUB_RECHECK_MS = 30 * 60_000;
+// With a confirmed empty grant listing there is no reset to act on. Sample
+// twice an hour for an unseen external refill or newly issued grant.
+export const EXHAUSTED_NO_GRANTS_MS = 30 * 60_000;
 
 // The sweep-decision skips that mean "this tick's LISTING can't be trusted" — the
 // only skips after a successful probe that hand a held wall to the rescue (r2 #1).
@@ -151,6 +154,7 @@ export class Prober {
           }
           await this._paceUsage();
           if (this._stopping) break;
+          q.probeRecheckRequested = false;
           q.probeChecking = true;
           let r;
           try {
@@ -213,18 +217,36 @@ export class Prober {
     }
   }
 
+  requestUsageRecheck(account) {
+    if (account?.type !== 'oauth' || account.provider === 'codex' || account.remote || account.poolBenchedBy
+        || account.refreshDead || !account.credential) return 'Select an Anthropic subscription on its owning pool';
+    if (this.intervalMs <= 0 || this._stopping || this.am.writerLease === false) return 'Quota checks are paused';
+    const q = account.quota;
+    if (q.probeRetryAt > this._now()) return 'Provider requested a wait before the next quota check';
+    if (q.probeChecking) return 'Quota check already in progress';
+    q.probeRecheckRequested = true;
+    q.probeNextCheckAt = null;
+    return 'Quota check queued for the next sweep';
+  }
+
   _usageDeferredUntil(account) {
     const now = this._now();
     const q = account.quota || {};
     // The provider's 429 deadline also applies to a one-shot/manual sweep.
     const retryAt = q.probeRetryAt > now ? q.probeRetryAt : 0;
     // A free reset can be used externally without moving the natural reset day.
-    // Recheck a fully used general week on the grant-list cadence, or sooner at
-    // the scheduled refill. A locally redeemed grant needs the next sweep.
+    // Unknown/available grants stay on the grant-list cadence. An explicitly
+    // empty listing can wait longer; the natural refill bounds either delay.
     const recentClaim = account.lastClaimAt && account.lastClaimAt >= (q.lastProbeOkSentAt || q.lastProbeOkAt);
     const pendingGrant = account.resetGrants?.stale || this.am.isHoldingWall?.(account, now);
-    const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt && !recentClaim && !pendingGrant;
-    const due = weekly ? Math.min(q.lastProbeOkAt + GRANTS_EVERY_MS, q.unified7dReset ?? Infinity) : 0;
+    const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
+      && !recentClaim && !pendingGrant && !q.probeRecheckRequested;
+    const listing = account.resetGrants;
+    const noGrants = listing?.checkedAt && Array.isArray(listing.grants) && listing.grants.length === 0
+      && !listing.nextGrantId;
+    const interval = noGrants ? EXHAUSTED_NO_GRANTS_MS : GRANTS_EVERY_MS;
+    const grantCooldown = listing?.cooldownUntil > q.lastProbeOkAt ? listing.cooldownUntil : Infinity;
+    const due = weekly ? Math.min(q.lastProbeOkAt + interval, q.unified7dReset ?? Infinity, grantCooldown) : 0;
     return Math.max(retryAt, due > now ? due : 0);
   }
 
