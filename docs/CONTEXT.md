@@ -245,3 +245,5 @@ on public GitHub Release bodies (do not bulk-populate the ~50 old ones); use
 neutral, factual phrasing in anything release-surfaced. **Log everything, announce
 almost nothing** — reserve any announcement for a major or security release.
 **Consequences:** The low-profile posture is the default for all release work here.
+
+Maxbar’s Pool selection supplies the all-provider profile for new Claude Code sessions. Direct removes the header Maxbar added, and explicit client profiles are preserved. The Mac’s installed Maxbar was built from `07eb948`, which includes its newer Wi-Fi controls.

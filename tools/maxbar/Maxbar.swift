@@ -158,10 +158,25 @@ func setClaudeRouting(pool: Bool) -> String? {
         raw, perm = "{}\\n", 0o600
     d = json.loads(raw)
     env = d.setdefault("env", {})
+    profile_header = "x-maxpool-profile: all"
+    header_key = "ANTHROPIC_CUSTOM_HEADERS"
+    managed_key = "MAXBAR_ADDED_POOL_PROFILE"
+    headers = env.get(header_key, "")
     if mode == "pool":
+        # The gate uses its Claude-only profile for unlabelled clients.
+        # Keep an explicit caller profile and all unrelated custom headers.
+        if not any(line.partition(":")[0].strip().lower() == "x-maxpool-profile" for line in headers.splitlines()):
+            env[header_key] = (headers + "\\n" if headers else "") + profile_header
+            env[managed_key] = "1"
         env["HTTPS_PROXY"] = proxy
         env["NODE_EXTRA_CA_CERTS"] = ca
     else:
+        if env.pop(managed_key, None) == "1":
+            remaining = [line for line in headers.split("\\n") if line != profile_header]
+            if remaining:
+                env[header_key] = "\\n".join(remaining)
+            else:
+                env.pop(header_key, None)
         env.pop("HTTPS_PROXY", None)
         env.pop("NODE_EXTRA_CA_CERTS", None)
     out = json.dumps(d, indent=2, ensure_ascii=False) + ("\\n" if raw.endswith("\\n") else "")
