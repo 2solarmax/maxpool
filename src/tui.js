@@ -3600,7 +3600,8 @@ export class TUI {
     const q = a.quota || {};
     const remote = Boolean(a.remote || a.poolBenchedBy);
     const now = Date.now();
-    const weeklyWall = q.unified7d >= 1 && (!q.unified7dReset || q.unified7dReset > now);
+    const weeklyWall = a.type === 'oauth' && a.provider !== 'codex' && q.unified7d >= 1
+      && (!q.unified7dReset || q.unified7dReset > now);
     if (a.poolBenchedBy && !Object.keys(q).length) return `  ${dim('cloud quota unavailable')}`;
     const interval = remote ? q.probeIntervalMs : this.am.quotaProbeIntervalMs;
     const hasPlan = remote ? interval !== 0 : interval > 0;

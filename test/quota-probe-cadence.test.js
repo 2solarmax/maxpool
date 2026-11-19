@@ -220,3 +220,14 @@ test('a fresh grant cooldown wakes an empty-listing account at its recorded dead
   assert.equal(calls.length, 4);
   assert.equal(am.accounts[0].quota.probeNextCheckAt, Date.now() + 30 * minute);
 });
+
+test('Claude quota check selection and exhausted cadence leave a fresh Codex account alone', () => {
+  const am = new AccountManager([account('claude'), { ...account('codex'), provider: 'codex', codexAuth: 'native' }]);
+  am.quotaProbeIntervalMs = minute;
+  const codex = am.accounts[1];
+  Object.assign(codex.quota, { lastProbeOkAt: Date.now(), unified7d: 1, unified7dReset: Date.now() + 86400_000 });
+  const tui = new TUI({ accountManager: am });
+  assert.deepEqual(tui._selectableIndexes('check quota'), [0]);
+  assert.deepEqual(tui._selectableIndexes('codexResets'), [1]);
+  assert.equal(tui._probeHealthNote(codex), '');
+});
