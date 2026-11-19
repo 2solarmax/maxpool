@@ -6458,8 +6458,9 @@ export class AccountManager {
       oauthClientId: account.oauthClientId, credential: account.credential, refreshToken: account.refreshToken,
     };
     const currentAccount = () => this.accounts[account.index] === account && account.provider === target.provider
-      && account.codexAuth === target.codexAuth && account.accountUuid === target.accountUuid
-      && account.organizationUuid === target.organizationUuid && account.codexAccountId === target.codexAccountId;
+      && account.codexAuth === target.codexAuth && account.codexAccountId === target.codexAccountId
+      && (target.accountUuid ? sameAccountIdentity(account, target)
+        : !account.accountUuid && account.organizationUuid === target.organizationUuid);
     const sameGrant = () => account.credential === target.credential && account.refreshToken === target.refreshToken;
     account._refreshPromise = (async () => {
       console.log(`[Maxpool] Refreshing token for account "${account.name}"...`);
