@@ -4,6 +4,7 @@ import { normalizeClientHeaders, rewriteMetadataUserIdRaw } from './client-ident
 import { appendEventLog } from './event-log.js';
 import { atomicConfigUpdate } from './config.js';
 import { HOP_HEADER, nextHopCount, safeText } from './pool-link.js';
+import { admitSessionRequest, sessionCapRoot } from './session-cap.js';
 import { ThreadOwners, readThreadIntent, threadRefusalBody, isThreadlessAccount, isThreadedIntent } from './thread-gate.js';
 import { ProviderThinkingScrubber, scrubProviderResponseBody, scrubEnabledFor, foreignToolBlockText, describeScrub } from './provider-thinking-scrub.js';
 import { writeFile, mkdir } from 'node:fs/promises';
@@ -314,6 +315,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
+  const capRoot = sessionCapRoot();
   let requestCounter = 0;
 
   // ── team clients (per-person keys + caller identity) ──
@@ -401,6 +403,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // data-free on purpose — it must answer before auth, and must never be
       // mistaken for a request to proxy upstream.
       if (req.method === 'GET' && req.url === '/maxpool/ping') {
+        res.setHeader('x-maxpool-session-cap-version', '1');
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end('{"ok":true}');
         return;
@@ -670,6 +673,24 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // In strict mode the legacy single key is still accepted; label it so its
       // traffic is attributed and logged rather than anonymous.
       req.callerName = caller.name || (strictClients ? 'legacy-key' : null);
+      if (isLocal && req.method === 'POST' && /^\/v1\/messages\/?(?:\?|$)/.test(req.url)) {
+        const session = headerValue(req.headers, 'x-maxpool-session');
+        let message;
+        try {
+          if (!await admitSessionRequest(capRoot, session, caller.name)) {
+            message = 'Local terminal request cap reached. Disarm the session cap to continue.';
+          }
+        } catch (err) {
+          appendEventLog('[Maxpool] Session cap check failed: ' + safeText(err.message));
+          message = 'Unable to check the local terminal request cap.';
+        }
+        if (message) {
+          req.resume();
+          res.writeHead(403, { 'content-type': 'application/json', 'x-should-retry': 'false', 'x-maxpool-session-cap': 'blocked' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message } }));
+          return;
+        }
+      }
       // SC22: count ONLY when this pool serves the request upstream. A request
       // later routed to a linked pool is UN-counted at release time (the serving
       // pool owns it) — see the pool-forward path's countRequest(name,{forwarded:true}).

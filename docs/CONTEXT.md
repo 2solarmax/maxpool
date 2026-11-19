@@ -49,6 +49,10 @@ routing modes. Current version: **v1.5.83** (installed as a global symlink to
 
 ## Decisions
 
+### 2026-11-19 · Local terminal request cap
+
+The local proxy checks the full terminal UUID and resolved caller before admitting a message. Operators can arm an existing terminal for a bounded task. Each incoming client attempt consumes one slot even when its eventual request fails. Slots persist across worker restarts. Cloud retries inside that request, generated tokens, and subscription quota use require separate measurement.
+
 ### 2026-11-13 · release B red-team round 1 — first-byte floor vs client patience, mixed-version 504
 
 - **Deadline present ⇒ the first-byte wait is min(remaining, hop cap), not the 120s floor.** The floor still applies to
