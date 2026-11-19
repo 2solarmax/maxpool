@@ -51,7 +51,7 @@ import { loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, toke
 import { TUI, writeTerminalSync, reclaimRawModeLogged, whenTerminalCaughtUp } from './tui.js';
 import { createTerminalModeSwitcher } from './terminal-mode.js';
 import { RestartController } from './restart-controller.js';
-import { resolveAccounts } from './account-config.js';
+import { oauthTokensForDiskSync, resolveAccounts } from './account-config.js';
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
@@ -2824,16 +2824,13 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       mgr.capRampStart = dRamp;
       console.log(`[Maxpool] Usage cap for "${mgr.name}" ${diskCap ? `set to ${Math.round(diskCap * 100)}% (${diskMode})` : 'removed'} from config`);
     }
-    memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct };
+    if (freshCred.accessToken) freshCred = oauthTokensForDiskSync(mgr, freshCred);
+    memConfig.accounts[memIdx] = { ...memConfig.accounts[memIdx], ...diskAcct, ...(freshCred.accessToken ? freshCred : {}) };
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
         mgr.refreshToken !== freshCred.refreshToken;
-      // Don't overwrite in-memory credentials with staler ones from disk
-      // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
-      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
-        freshCred.expiresAt < mgr.expiresAt;
-      if (changed && (!diskIsStaler || diskAcct.provider === 'codex')) {
+      if (changed) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
         console.log(`[Maxpool] Refreshed credentials for "${mgr.name}"`);
       }

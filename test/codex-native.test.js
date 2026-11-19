@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { oauthTokensForDiskSync } from '../src/account-config.js';
 import {
   listNativeCodexModels, loginNativeCodex, nativeCodexHeaders, parseNativeCodexCallback, refreshNativeCodexToken,
 } from '../src/codex-native.js';
@@ -341,4 +342,28 @@ test('Codex can hold for natural refill only when a fresh, entitled Codex peer h
   assert.equal(manager.countPeersWithRoom(self, resetNow), 1);
   same.quota.codexWeeklyReadingAt = resetNow - 6 * minutes;
   assert.equal(manager.countPeersWithRoom(self, resetNow), 0);
+});
+
+test('disk sync racing a Codex refresh keeps the replacement and accepts a separate reauthorization', async () => {
+  const old = { accessToken: 'old-access', refreshToken: 'consumed', expiresAt: Date.now() - 1000 };
+  const fresh = { accessToken: 'new-access', refreshToken: 'rotated', expiresAt: Date.now() + 3_600_000 };
+  const am = new AccountManager([{ name: 'fixture', type: 'oauth', provider: 'codex', codexAuth: 'native', ...old }],
+    0.9, {}, { refreshNativeCodexToken: async () => fresh });
+  let release;
+  let started;
+  const saving = new Promise(resolve => { started = resolve; });
+  const persisted = new Promise(resolve => { release = resolve; });
+  am.onTokenRefresh(() => { started(); return persisted; });
+  const refresh = am.ensureTokenFresh(0);
+  await saving;
+  try {
+    // Capture the race independent of which token has the longer lifetime.
+    assert.deepEqual(oauthTokensForDiskSync(am.accounts[0], old), fresh);
+    assert.deepEqual(oauthTokensForDiskSync(am.accounts[0], { ...old, expiresAt: fresh.expiresAt + 1000 }), fresh);
+    const reauthorized = { ...old, accessToken: 'reauthorized-access', refreshToken: 'different-grant', expiresAt: fresh.expiresAt - 1000 };
+    assert.deepEqual(oauthTokensForDiskSync(am.accounts[0], reauthorized), reauthorized);
+  } finally {
+    release();
+    assert.equal(await refresh, true);
+  }
 });
