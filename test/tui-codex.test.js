@@ -127,19 +127,27 @@ test('free reset inventory requires confirmation and refreshes after manual rede
   assert.equal(tui.mode, 'accounts');
 });
 
-test('capacity headline reports Codex separately and includes its traffic in shared counts', () => {
+test('Cache and Moves keep separate Codex health and include its hold reasons', () => {
   const tui = makeTui();
-  const empty = { served: 0, bounced: 0, hit: null, lowVolume: true, movedByCause: {} };
-  tui.am.efficiencyOverall = () => ({
-    claude: empty,
-    glm: empty,
-    codex: { served: 5, bounced: 0, hit: 0.8, missTokens: 4_000, lowVolume: false,
-      movedSame: 2, movedByCause: { busy: 2 } },
-  });
-  const cacheLine = strip(tui._efficiencyLine(130));
-  assert.match(cacheLine, /Codex 80%.*Codex miss 4k tok.*same 2.*busy 2/);
-  assert.doesNotMatch(cacheLine, /GLM|Claude/);
-  assert.ok(strip(tui._efficiencyLine(80)).length <= 80);
+  tui.am.addAccount({ name: 'GLM', type: 'provider', provider: 'zai', apiKey: 'fixture' });
+  const [anthropic, openai, glm] = tui.am.accounts;
+  for (const [account, hit] of [[anthropic, 90], [openai, 80], [glm, 95]]) {
+    for (let i = 0; i < 25; i++) {
+      const moved = account === openai && i < 2;
+      account.inFlight++;
+      tui.am.releaseAccount({ account, weight: 1, startedAt: Date.now() - 100, requestInfo: {} }, {
+        success: true, status: 200, usage: { in: (100 - hit) * 100, cr: hit * 100, cc: 0 },
+        ...moved && { moved: true, movedSame: true, moveCause: 'busy', movedWhy: 'released:hold-ceiling(inflight=6/6)' },
+      });
+    }
+  }
+  const cache = strip(tui._cacheLine(80));
+  assert.match(cache, /\[15m\/24h\].*Claude 90%\/90% · GLM 95%\/95% · Codex 80%\/80%/);
+  assert.doesNotMatch(cache, /miss|cost|same/);
+  assert.match(strip(tui._cacheLine(170, Date.now(), true)), /Codex miss 50k tok/);
+  assert.match(strip(tui._movesLine(80)), /cross 0\/100 · same 2 \(hold-ceiling 2\) · busy 2/);
+  assert.equal(tui.am.efficiency24h().codex.served, 25);
+  assert.equal(tui.am.efficiency24h().glm.served, 25);
 });
 
 test('Codex routing toggle persists the live config before applying it', async () => {

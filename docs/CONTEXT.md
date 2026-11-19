@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Provider cache and move summaries
+
+The terminal displays separate Cache and Moves lines. Cache pairs each provider's 15-minute and 24-hour hit rates, including Codex. The 24-hour readings survive a restart. Routing and `maxpool status` show per-provider miss tokens. Move totals include Codex and preserve held-session release reasons from linked accounts.
+
 ### 2026-11-19 · Native Codex clients in Maxbar
 
 The independent Codex routing switch uses the client's version-checked configuration service and a loopback Responses endpoint. The Mac's owner key authenticates the client. The scheduler selects a locally owned native account and binds subsequent requests to that identity for provider-owned state. Desktop and CLI share the model catalog, compaction and standalone search routes. Claude Code continues to use its Messages route.

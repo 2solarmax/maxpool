@@ -10,7 +10,6 @@ const mirrorAcct = (name, remoteName) => {
   a.remote = { linkName: 'team', remoteName, url: 'http://127.0.0.1:9', key: 'k', link: {} };
   return a;
 };
-
 test('D3: a mirror row builds a live tank from the exported open cycle', () => {
   const acct = mirrorAcct('m', 'real');
   const am = new AccountManager([acct], 0.95);

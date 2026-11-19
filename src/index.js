@@ -714,6 +714,8 @@ async function serverWorkerCommand() {
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
   if (savedState?.callerStats) accountManager.restoreCallerStats?.(savedState.callerStats);
+  // 24h cache rollup: additive restore into the running buckets (see exportEfficiencyHours).
+  if (savedState?.efficiencyHours) accountManager.restoreEfficiencyHours?.(savedState.efficiencyHours);
 
   // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
   // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
@@ -819,6 +821,8 @@ async function serverWorkerCommand() {
         // SC22 per-person analytics — same generation-guarded payload, survives
         // restarts and seamless reloads.
         callerStats: accountManager.exportCallerStats?.() || {},
+        // 24h efficiency rollup (hourly buckets) — the Cache line's long window.
+        efficiencyHours: accountManager.exportEfficiencyHours?.() || null,
         // Last-good remote identity maps — the boot-time single-writer guard reads
         // these (see restore above). Rides the same generation-guarded payload.
         poolIdentities: accountManager.exportPoolIdentities?.() || null,
@@ -2928,13 +2932,28 @@ function efficiencyLines(data, key = 'last15m') {
   const accts = data.accounts || [];
   const overall = data.efficiency?.[key];
   if (!overall) return [];
-  const claude = overall.claude || combineEfficiency([], 'claude');
-  const glm = overall.glm || combineEfficiency([], 'glm');
-  const codex = overall.codex;
-  const families = codex ? [claude, glm, codex] : [claude, glm];
-  const sum = field => families.reduce((total, block) => total + (block[field] || 0), 0);
+  const day = data.efficiency?.last24h;
+  const groups = [['claude', 'Claude'], ['glm', 'GLM']];
+  if (overall.codex || day?.codex) groups.push(['codex', 'Codex']);
+  const families = groups.map(([provider, label]) => ({
+    provider, label, block: overall[provider] || combineEfficiency([], provider),
+  }));
+  const sum = field => families.reduce((total, { block }) => total + (block[field] || 0), 0);
+  const by = (field, key) => families.reduce((total, { block }) => total + (block[field]?.[key] || 0), 0);
   const served = sum('served');
-  const cause = key => families.reduce((total, block) => total + (block.movedByCause?.[key] || 0), 0);
+  const cause = key => by('movedByCause', key);
+  const why = key => by('movedByWhy', key);
+  const cache = families.map(({ provider, label, block }) => {
+    const miss = (block.missTokens / 1e6).toFixed(1);
+    const writes = provider === 'claude' && block.writeShare != null
+      ? ` · writes ${pctOrDash(block.writeShare)} of estimated quota use` : '';
+    return `${label} ${pctOrDash(block.hit)} (miss ${miss}M tok${writes})`;
+  }).join(' · ');
+  const cache24h = day ? families.map(({ provider, label }) => {
+    const summary = day[provider];
+    const hit = summary?.hit != null && summary.served >= 20 ? `${pctOrDash(summary.hit)} (${summary.served} served)` : '—';
+    return `${label} ${hit}`;
+  }).join(' · ') : '—';
   const anyData = served + sum('bounced') > 0;
   const n = (x) => (anyData ? String(x) : '—');
   const failed = accts.reduce((t, a) => t + (a.load?.[key]?.failed || 0), 0);
@@ -2943,8 +2962,10 @@ function efficiencyLines(data, key = 'last15m') {
   const s = (ms) => (ms == null ? '—' : `${(ms / 1000).toFixed(1)}s`);
   return [
     `Efficiency (${key === 'last1h' ? '1h' : '15m'}):`,
-    `  Cache:        Claude ${pctOrDash(claude.hit)} (miss ${(claude.missTokens / 1e6).toFixed(1)}M tok${claude.writeShare != null ? ` · writes ${pctOrDash(claude.writeShare)} of cost` : ''}) · GLM ${pctOrDash(glm.hit)} (miss ${(glm.missTokens / 1e6).toFixed(1)}M tok)${codex ? ' · Codex ' + pctOrDash(codex.hit) + ' (miss ' + (codex.missTokens / 1e6).toFixed(1) + 'M tok)' : ''}`,
-    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))})`,
+    `  Cache:        ${cache}`,
+    `  24h cache:    ${cache24h}`,
+    `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · why: outscored ${n(why('outscored'))} · hold-ceiling ${n(why('holdCeiling'))} · released ${n(why('released'))} · other ${n(why('other'))})`,
+    `  Move causes:  busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))}`,
     `  Bounced:      ${n(sum('bounced'))} (refused ${n(sum('refused'))}) · failed ${failed} · link drops ${linkDrops}`,
     `  Busy waits:   ${n(sum('waited'))}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${n(sum('waitThenMoved'))} (busy-bounce waits only; queue holds show in first-byte p95)`,
     `  Client errors: ${co ? `${co.poolErrors + co.requestErrors} of ${co.total} (pool ${co.poolErrors} · request ${co.requestErrors})` : '—'}`,

@@ -449,7 +449,19 @@ const efficiencyWindowMs = (windowKey) => (windowKey === 'last1h' ? 60 * 60_000 
 function emptyEfficiency() {
   return { served: 0, in: 0, out: 0, cr: 0, cc: 0, moved: 0, movedSame: 0, movedCross: 0,
     movedByCause: { busy: 0, wall: 0, balance: 0, link: 0, other: 0 },
+    movedByWhy: { outscored: 0, holdCeiling: 0, released: 0, other: 0 },
     newConversation: 0, bounced: 0, refused: 0, waited: 0, waitMs: 0, waitThenMoved: 0, e2e: [] };
+}
+/** Bucket key for the 24h cache rollup: the ISO UTC hour ('YYYY-MM-DDTHH'). */
+const efficiencyHourKey = (now) => new Date(now).toISOString().slice(0, 13);
+/** Classify a move-reason string (from `_moveReason`, or `movedWhy` on the outcome)
+ *  into the coarse dashboard families the Moves line shows. */
+function moveWhyFamily(why) {
+  if (!why) return 'other';
+  if (why.startsWith('outscored')) return 'outscored';
+  if (why.includes('hold-ceiling')) return 'holdCeiling';
+  if (why.startsWith('released:')) return 'released';
+  return 'other';
 }
 /** Add one exported/summarized efficiency block into an accumulator (missing fields = 0).
  *  Old blocks without movedSame/movedCross keep their moved total (shown as same-family
@@ -461,6 +473,7 @@ function addEfficiency(acc, e) {
   }
   if (!hasSplit) acc.movedSame += Number(e.moved) || 0;
   for (const c of Object.keys(acc.movedByCause)) acc.movedByCause[c] += Number(e.movedByCause?.[c]) || 0;
+  for (const w of Object.keys(acc.movedByWhy)) acc.movedByWhy[w] += Number(e.movedByWhy?.[w]) || 0;
   // Latency samples exist for this pool's own rows only (percentiles do not add).
   if (Array.isArray(e.e2e)) acc.e2e.push(...e.e2e);
 }
@@ -1273,6 +1286,34 @@ export class AccountManager {
     }]));
   }
 
+  /** 24h efficiency rollup across restarts: per-account hourly buckets (pruned on
+   *  export, so state.json never grows). Restore is additive into whatever buckets
+   *  the running pool already has (a seamless reload folds the same events once). */
+  exportEfficiencyHours() {
+    const out = {};
+    for (const a of this.accounts) {
+      if (!a.efficiencyHours || !Object.keys(a.efficiencyHours).length) continue;
+      out[a.name] = a.efficiencyHours;
+    }
+    return Object.keys(out).length ? out : null;
+  }
+
+  restoreEfficiencyHours(saved) {
+    if (!saved || typeof saved !== 'object') return;
+    const now = Date.now();
+    for (const [name, hours] of Object.entries(saved)) {
+      if (!hours || typeof hours !== 'object') continue;
+      const a = this.accounts.find(x => x.name === name);
+      if (!a) continue;
+      a.efficiencyHours ||= {};
+      for (const [k, b] of Object.entries(hours)) {
+        if (Date.parse(k + ':00:00Z') <= now - 24 * 3600_000) continue;
+        const dst = a.efficiencyHours[k] ||= { served: 0, in: 0, out: 0, cr: 0, cc: 0, bounced: 0, movedCross: 0, movedSame: 0 };
+        for (const f of ['served', 'in', 'out', 'cr', 'cc', 'bounced', 'movedCross', 'movedSame']) dst[f] += Number(b[f]) || 0;
+      }
+    }
+  }
+
   /** SC22 windows: rolling 24h (from hourly buckets), 7d/30d + prior (daily). */
   callerWindowStats() {
     const now = Date.now();
@@ -1459,12 +1500,19 @@ export class AccountManager {
           && this._outcomeMoveCross(outcome, lease, account)),
       newConversation: Boolean(outcome.newConversation),
       moveCause: outcome.moveCause || null,
+      // The `conversation moved:` line's why=, bucketed (outscored / holdCeiling /
+      // released / other) — the Moves screen line shows these families. Older events
+      // and outcome-passed moves without a reason stay null (shown as 'other').
+      movedWhy: outcome.movedWhy ? moveWhyFamily(outcome.movedWhy) : null,
       busyWaitMs: outcome.busyWaitMs || 0,
       e2eFirstByteMs: Number.isFinite(outcome.e2eFirstByteMs) ? outcome.e2eFirstByteMs : null,
       refusal: outcome.refusal || null,
       // _efficiencyAcc skips these: a count_tokens call is not a conversation turn.
       countTokens: Boolean(outcome.countTokens),
     });
+    // 24h rollup: same event, folded into the hourly bucket (survives restarts).
+    const ev = account.loadEvents[account.loadEvents.length - 1];
+    if (ev) this._bumpEfficiencyHour(account, ev);
     this._pruneLoadEvents(account, now);
   }
 
@@ -1551,6 +1599,7 @@ export class AccountManager {
       moved,
       movedSame, movedCross,
       moveCause: moved ? (ri._moveCause || (ri._hop > 0 ? 'other' : 'balance')) : null,
+      movedWhy: moved ? (ri._moveWhy || null) : null,
       newConversation: !pinned && Boolean(ri._newConversation) && ri._notedServed === account.name,
 
       busyWaitMs: ri._busyWaitMs || 0,
@@ -1585,6 +1634,14 @@ export class AccountManager {
         else out.movedSame++;   // legacy events (no split) default to the cheap side
         const c = Object.hasOwn(out.movedByCause, e.moveCause) ? e.moveCause : 'other';
         out.movedByCause[c]++;
+        // The why families (outscored / holdCeiling / released) describe the WARM
+        // HOLD letting a same-family sibling win — counted there only, so the
+        // Moves line's "same N (why …)" parenthetical attributes cleanly. A cross
+        // move's story is the cross count itself.
+        if (!e.movedCross) {
+          const w = Object.hasOwn(out.movedByWhy, e.movedWhy) ? e.movedWhy : 'other';
+          out.movedByWhy[w]++;
+        }
         if (e.busyWaitMs > 0) out.waitThenMoved++;
       }
       if (e.newConversation) out.newConversation++;
@@ -1592,6 +1649,65 @@ export class AccountManager {
       if (e.e2eFirstByteMs != null) out.e2e.push(e.e2eFirstByteMs);
     }
     return out;
+  }
+
+  /** 24h cache rollup, per family, from hourly buckets (owner question 2026-11-19:
+   *  a heavy-moving 15m slice read 28% while the 24h truth was 92% — the line needs
+   *  both windows side by side). Hourly buckets survive restarts (state.json), so a
+   *  long-lived pool still shows a true 24h. Edge rows only: a mirror row's cache
+   *  comes from the serving pool's export, and exports are 15m/1h — the 24h figure
+   *  would silently cover this pool's clients alone. Callers that need the team-wide
+   *  24h sum the linked pool's own exports when it grows a last24h window. */
+  _rollup24(account, now = Date.now()) {
+    account.efficiencyHours ||= {};
+    const out = emptyEfficiency();
+    const cutoff = now - 24 * 3600_000;
+    for (const [k, b] of Object.entries(account.efficiencyHours)) {
+      const t = Date.parse(k + ':00:00Z');
+      if (!(t > cutoff)) continue;
+      out.served += b.served; out.in += b.in; out.out += b.out; out.cr += b.cr; out.cc += b.cc;
+      out.bounced += b.bounced;
+      if (b.movedCross) out.movedCross += b.movedCross;
+      if (b.movedSame) out.movedSame += b.movedSame;
+    }
+    return out;
+  }
+
+  /** Fold one load event into the account's hourly efficiency bucket (restart-safe 24h). */
+  _bumpEfficiencyHour(account, e) {
+    account.efficiencyHours ||= {};
+    const key = efficiencyHourKey(e.at);
+    const b = account.efficiencyHours[key] ||= { served: 0, in: 0, out: 0, cr: 0, cc: 0, bounced: 0, movedCross: 0, movedSame: 0 };
+    if (e.bounced) {
+      if (!e.repeatBounce) b.bounced++;
+      return;
+    }
+    if (!e.success || e.countTokens) return;
+    b.served++;
+    if (e.usage) { b.in += e.usage.in; b.out += e.usage.out; b.cr += e.usage.cr; b.cc += e.usage.cc; }
+    if (e.movedCross) b.movedCross++;
+    else if (e.moved) b.movedSame++;
+    const cutoff = e.at - 25 * 3600_000;   // 24h window + 1h slack so the prune never eats the live edge
+    for (const k of Object.keys(account.efficiencyHours)) {
+      if (Date.parse(k + ':00:00Z') < cutoff) delete account.efficiencyHours[k];
+    }
+  }
+
+  /** Cache hit by tokens, per family, over the rolling 24h (TUI Cache line's long
+   *  window). null when no prompt tokens in the window. */
+  efficiency24h(now = Date.now()) {
+    const by = { claude: emptyEfficiency(), glm: emptyEfficiency() };
+    for (const a of this.accounts) {
+      if (a.enabled === false) continue;
+      const tag = efficiencyProvider(a);
+      addEfficiency(by[tag] ||= emptyEfficiency(), this._rollup24(a, now));
+    }
+    const finish = (acc) => {
+      const prompt = acc.cr + acc.cc + acc.in;
+      return { served: acc.served, hit: prompt > 0 ? acc.cr / prompt : null };
+    };
+    return { claude: finish(by.claude), glm: finish(by.glm),
+      ...(by.codex ? { codex: finish(by.codex) } : {}) };
   }
 
   /** One cloud MIRROR row's figures, each field taken from the only pool that can know it
@@ -1616,8 +1732,10 @@ export class AccountManager {
     acc.movedSame = (expSplit ? Number(exp.movedSame) || 0 : Number(exp.moved) || 0) + edge.movedSame;
     acc.movedCross = (expSplit ? Number(exp.movedCross) || 0 : 0) + edge.movedCross;
     for (const k of EDGE_EFFICIENCY_FIELDS) acc[k] = (Number(exp[k]) || 0) + edge[k];
-    for (const c of Object.keys(acc.movedByCause)) {
-      acc.movedByCause[c] = (Number(exp.movedByCause?.[c]) || 0) + edge.movedByCause[c];
+    for (const field of ['movedByCause', 'movedByWhy']) {
+      for (const key of Object.keys(acc[field])) {
+        acc[field][key] = (Number(exp[field]?.[key]) || 0) + edge[field][key];
+      }
     }
     acc.e2e = edge.e2e;
     return acc;
@@ -3281,6 +3399,9 @@ export class AccountManager {
           // the loop's own pick, before any return-home switch.
           let why = 'unknown';
           try { why = this._moveReason(lastName, pickedBeforeHome, requestInfo, excludedIndexes, scoringCtx, weeklyOptions, bestUnlockMap.get(pickedBeforeHome.name) || null, now); } catch (e) { why = `error:${e.message}`; }
+          // The same why= the log line prints rides the request, so the served event
+          // books it (movedWhy) and the Moves screen line can split hold reasons.
+          requestInfo._moveWhy = why;
           console.log(`[Maxpool] conversation moved: ${lastName} → ${best.name} (${requestInfo.bodyBytes ?? '?'}B) why=${why}${homeNote ? ` ${homeNote}` : ''}`);
         }
         return best;
@@ -7422,7 +7543,7 @@ export class AccountManager {
       // Overall cache / move / bounce / wait figures — the SAME merge the TUI Cache line
       // uses (mirror rows: cache + served from the serving pool's export, edge-only
       // fields from this pool's own events), plus edge client outcomes.
-      efficiency: { last15m: this.efficiencyOverall('last15m', now), last1h: this.efficiencyOverall('last1h', now) },
+      efficiency: { last15m: this.efficiencyOverall('last15m', now), last1h: this.efficiencyOverall('last1h', now), last24h: this.efficiency24h(now) },
       clientOutcomes: { last15m: this.clientOutcomeSummary(15 * 60_000, now), last1h: this.clientOutcomeSummary(60 * 60_000, now) },
       switchThreshold: this.switchThreshold,
       routing: {

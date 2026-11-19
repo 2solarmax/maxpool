@@ -1,5 +1,6 @@
-// The TUI efficiency line (2026-11-15): under Routing, only with traffic, red names the
-// cause, low volume says so instead of numbers, and it fits the terminal width.
+// The TUI Cache + Moves lines (two-line rework 2026-11-19, owner question): under
+// Routing, only with traffic, red names the cause, low volume says so instead of
+// numbers, and each line fits the terminal width. Cache first, Moves directly under.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
@@ -20,11 +21,13 @@ function frameAt(tui, columns) {
   return strip(buf).split(/\r?\n/);
 }
 
-test('renders directly under the Routing line, and not at all without traffic', () => {
+test('renders Cache then Moves directly under the Routing line, and not at all without traffic', () => {
   const quiet = new TUI({ accountManager: am(), config: { proxy: { port: 3456 } } });
-  assert.equal(quiet._efficiencyLine(100), null, 'no traffic, no line');
+  assert.equal(quiet._cacheLine(100), null, 'no traffic, no Cache line');
+  assert.equal(quiet._movesLine(100), null, 'no traffic, no Moves line');
   const lines = frameAt(quiet, 100);
   assert.ok(!lines.some(l => l.trim().startsWith('Cache')), 'not in the frame');
+  assert.ok(!lines.some(l => l.trim().startsWith('Moves')), 'not in the frame');
 
   const m = am();
   served(m, m.accounts[0], { in: 1000, cr: 90_000, cc: 0, out: 10 });   // 98.9%, still low volume
@@ -33,41 +36,51 @@ test('renders directly under the Routing line, and not at all without traffic', 
   const frame = frameAt(tui, 120);
   const routing = frame.findIndex(l => l.trim().startsWith('Routing'));
   const cache = frame.findIndex(l => l.trim().startsWith('Cache'));
+  const moves = frame.findIndex(l => l.trim().startsWith('Moves'));
   assert.ok(routing >= 0, 'Routing line present');
-  assert.ok(cache === routing + 1, `directly under Routing (routing=${routing}, cache=${cache})`);
+  assert.ok(cache === routing + 1, `Cache directly under Routing (routing=${routing}, cache=${cache})`);
+  assert.ok(moves === routing + 2, `Moves directly under Cache (moves=${moves})`);
   assert.match(frame[cache], /Claude 99%/, 'per-provider share');
-  assert.doesNotMatch(frame[cache], /miss|moves|of cost/, 'the overview shows cache hits only');
+  assert.doesNotMatch(frame[cache], /miss|of cost/, 'the overview shows cache hit rates');
+  assert.match(frame[cache], /\[15m\/24h\] .*Claude 99%\/99%/, 'the two windows stay beside the provider');
+  assert.match(frame[moves], /cross 0\/100/, 'the Moves line carries the move figures');
   tui.mode = 'routing';
-  assert.match(frameAt(tui, 160).find(l => l.trim().startsWith('Cache')), /Claude miss 25k tok/, 'routing retains detailed metrics');
-  assert.match(frame[cache], /\[15m\]/, 'window');
+  assert.match(frameAt(tui, 160).find(l => l.trim().startsWith('Cache')), /Claude miss 25k tok/, 'Routing includes detailed cache figures');
 });
 
-test('a red line names the cause and the account behind it', () => {
+test('a red line names the cause and the account behind it — on its OWN line', () => {
   const m = am(2);
   const [a, b] = m.accounts;
-  // a: 40% hit with real volume; b: healthy. Forced moves above 2/100 → red.
+  // a: 40% hit with real volume; b: healthy. Moves above 2/100 → the MOVES line is
+  // red (cross count); the CACHE line is red for its OWN cause (Claude 40% on c1).
   for (let i = 0; i < 30; i++) {
     served(m, i % 3 === 0 ? b : a, { in: 6_000, cr: 4_000, cc: 0, out: 10 });
   }
   for (let i = 0; i < 3; i++) served(m, b, { in: 100, cr: 900, cc: 0 }, { moved: true, moveCause: 'busy' });
-  const line = strip(new TUI({ accountManager: m, config: { proxy: { port: 3456 } } })._efficiencyLine(160));
-  assert.match(line, /⚠/, 'red names a cause');
-  assert.ok(/c1/.test(line), `names the account: ${line}`);
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  const cache = strip(tui._cacheLine(160));
+  const moves = strip(tui._movesLine(160));
+  // Cache red: low hit with the account behind it.
+  assert.match(cache, /⚠ Claude 40% on c1/, `cache red names account: ${cache}`);
+  // Moves red: the cross-count cause (no account here — no bounces booked).
+  assert.match(moves, /⚠ cross moves/, `moves red names its cause: ${moves}`);
 });
 
-test('low volume says so instead of numbers, and the line fits 65 columns', () => {
+test('low volume says so instead of numbers, and both lines fit 65 columns', () => {
   const m = am();
   served(m, m.accounts[0], { in: 100, cr: 9_900, cc: 0, out: 1 });
   const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
-  const line = strip(tui._efficiencyLine(65));
+  const line = strip(tui._cacheLine(65));
   assert.match(line, /little traffic/, line);
   for (const W of [65, 100, 112, 140]) {
-    assert.ok(strip(tui._efficiencyLine(W)).length <= W, `fits ${W}: ${strip(tui._efficiencyLine(W)).length}`);
+    assert.ok(strip(tui._cacheLine(W)).length <= W, `Cache fits ${W}: ${strip(tui._cacheLine(W)).length}`);
+    assert.ok(strip(tui._movesLine(W)).length <= W, `Moves fits ${W}: ${strip(tui._movesLine(W)).length}`);
   }
   // With real volume the numbers appear and STILL fit 65.
   for (let i = 0; i < 30; i++) served(m, m.accounts[0], { in: 100, cr: 9_900, cc: 0 });
   for (let i = 0; i < 4; i++) served(m, m.accounts[0], { in: 100, cr: 9_900, cc: 0 }, { moved: true, moveCause: 'balance' });
-  const full = strip(tui._efficiencyLine(65));
-  assert.ok(full.length <= 65, `fits 65 with numbers: ${full.length}`);
-  assert.match(full, /moves \d+\/100/, full);
+  const full = strip(tui._movesLine(65));
+  assert.ok(full.length <= 65, `Moves fits 65 with numbers: ${full.length}`);
+  assert.match(full, /cross \d+\/100/, full);
+  assert.ok(strip(tui._cacheLine(65)).length <= 65, 'Cache still fits 65 with numbers');
 });

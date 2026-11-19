@@ -19,11 +19,18 @@ test('status prints the Efficiency block and per-account cache figures', async (
   const am = new AccountManager([
     { name: 'c1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5, accountUuid: 'U1' },
     { name: 'g1', type: 'provider', provider: 'zai', authToken: 'k', accountUuid: 'U2' },
+    { name: 'o1', type: 'oauth', provider: 'codex', accessToken: 't3', accountUuid: 'U3' },
   ], 0.9);
   for (let i = 0; i < 5; i++) {
     am.releaseAccount(lease(am.accounts[0]), { success: true, status: 200, usage: { in: 1000, cr: 9000, cc: 0, out: 10 } });
   }
   am.releaseAccount(lease(am.accounts[0]), { success: true, status: 200, usage: { in: 1000, cr: 0, cc: 0 }, moved: true, moveCause: 'busy', busyWaitMs: 1200 });
+  for (let i = 0; i < 20; i++) {
+    am.releaseAccount(lease(am.accounts[2]), {
+      success: true, status: 200, usage: { in: 2000, cr: 8000, cc: 0, out: 10 },
+      ...i === 0 && { moved: true, movedSame: true, moveCause: 'balance', movedWhy: 'outscored:fixture' },
+    });
+  }
   // A cloud mirror whose SERVING pool exported its own figures.
   am.addAccount({ name: 'cloud ☁', type: 'oauth', configSourced: true, runtime: false });
   const mirrorRow = am.accounts.find(a => a.name === 'cloud ☁');
@@ -44,9 +51,12 @@ test('status prints the Efficiency block and per-account cache figures', async (
       child.on('exit', () => resolve(buf));
     });
     assert.match(out, /Efficiency \(15m\):/, out);
-    assert.match(out, /Claude 88% \(miss 0\.0M tok · writes 0% of cost\)/, `local + cloud export combined: ${out}`);
+    assert.match(out, /Claude 88% \(miss 0\.0M tok · writes 0% of estimated quota use\)/, `local + cloud export combined: ${out}`);
     assert.match(out, /GLM —/, 'missing GLM figures read as a dash');
-    assert.match(out, /Moves:\s+17\/100 served \(cross-family 1 · same-family 0 · busy 1 · balance 0 · wall 0 · link 0 · other 0\)/, out);
+    assert.match(out, /Cache: .*Codex 80% \(miss 0\.0M tok\)/, out);
+    assert.match(out, /Moves:\s+8\/100 served \(cross-family 1 · same-family 1 · why: outscored 1 · hold-ceiling 0 · released 0 · other 0\)/, out);
+    assert.match(out, /Move causes:\s+busy 1 · balance 1 · wall 0 · link 0 · other 0/, out);
+    assert.match(out, /24h cache: .*Codex 80% \(20 served\)/, out);
     assert.match(out, /Busy waits:\s+1 \(avg 1\.2s\) · waited then moved 1/, 'a wait that still moved is counted as waste');
     assert.doesNotMatch(out, /g1 \(provider\)\n(?:.*\n){2}\s+Cache:/, 'an idle row prints no cache line');
     assert.match(out, /Cache:\s+88% over 1h, 6 served, 0 bounced/, `per-account row: ${out}`);
