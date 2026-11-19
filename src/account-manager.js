@@ -232,6 +232,12 @@ const DEFAULT_SCHEDULER = {
   // Measured 2026-11-19 on the live log: first-byte median 2.5 s at 4 in flight,
   // 3.1 s at 5-6, 5.2 s at 7-9, while a move costs ~+1.6 s plus a full cache re-write.
   claudeWarmHoldMaxInFlight: 6,
+  // Same ceiling for a reserve / unlocked-critical holder. Break-even measured at 6; reserve
+  // stays at 4 (= the previous 2/3 tightening at the defaults) so reserve accounts fan out
+  // sooner. Independent of perAccountConcurrencyTarget. Both knobs: a finite number >= 1
+  // (floored); 0, negative or non-number fall back to the default (6 / 4). To turn the hold
+  // off use claudeWarmHold:false.
+  claudeWarmHoldReserveMaxInFlight: 4,
   // RETURN HOME after a provider detour (owner 2026-11-09): when a conversation's turn
   // went to GLM/Kimi and a later turn is routed back to Claude, it prefers the Claude
   // account it used last — that account still holds its stored copy. Only while the copy
@@ -3184,9 +3190,10 @@ export class AccountManager {
       // on the new account. Not when the hold has let go (_affinityRelease), the holder sits
       // in a worse priority tier, the pick is a provider row (cross-family is untouched),
       // or return-home just chose home (that block owns the detour return).
-      const holdMaxInFlight = !holdCand ? Infinity
-        : Math.max(1, Math.round((Number(this.scheduler.claudeWarmHoldMaxInFlight) || 6)
-          * this._reserveTightening(holdCand.account, holdCand.critUnlock)));
+      const holdMaxInFlight = !holdCand ? Infinity : this._warmHoldMaxInFlight(holdCand.account, holdCand.critUnlock);
+      const holdInFlightNow = holdCand ? (holdCand.account.inFlight || 0) + 1 : 0;   // this turn included
+      requestInfo.warmHoldCeiling = null;   // stale from an earlier pass of this request
+      const holdUnderCeiling = holdInFlightNow <= holdMaxInFlight;
       if (best && holdCand && best !== holdCand.account
         && isClaudeAccount(holdCand.account) && isClaudeAccount(best)
         && !(home && best.name === home.name)
@@ -3195,8 +3202,8 @@ export class AccountManager {
         // "regardless of score", not "regardless of depth". The ceiling counts in-flight
         // REQUESTS (this pool's own leases, this turn included), not conversation size:
         // latency follows the number of requests in flight. Past it the conversation moves.
-        && (holdCand.account.inFlight || 0) + 1 <= holdMaxInFlight
-        && !this._affinityRelease(holdCand.account, holdCand.critUnlock)) {
+        && !this._affinityRelease(holdCand.account, holdCand.critUnlock)
+        && (holdUnderCeiling || (requestInfo.warmHoldCeiling = { holder: holdCand.account.name, n: holdInFlightNow, m: holdMaxInFlight }, false))) {
         const outscoredBy = best;
         best = holdCand.account;
         bestPriority = holdCand.priority;
@@ -3205,7 +3212,7 @@ export class AccountManager {
         const hkey = this._affinityKey(requestInfo);
         if (hkey && this.conversationWarmHoldLogged.get(hkey) !== best.name) {
           lruSet(this.conversationWarmHoldLogged, hkey, best.name);
-          console.log(`[Maxpool] warm-hold=${best.name}:kept(pick ${outscoredBy.name} depth=${best.activeWeight}/${outscoredBy.activeWeight}) (${requestInfo.bodyBytes ?? '?'}B)`);
+          console.log(`[Maxpool] warm-hold=${best.name}:kept(pick ${outscoredBy.name} depth=${best.activeWeight}/${outscoredBy.activeWeight} inflight=${holdInFlightNow}/${holdMaxInFlight}) (${requestInfo.bodyBytes ?? '?'}B)`);
         }
       }
 
@@ -4666,6 +4673,14 @@ export class AccountManager {
     return Math.min(bonus, maxExtra * unit);
   }
 
+  /** Warm-hold in-flight ceiling for `account`: the reserve knob when reserve/unlocked-critical
+   *  tightening applies, else the normal knob. Invalid values (non-finite, < 1) fall back to 6 / 4. */
+  _warmHoldMaxInFlight(account, criticalUnlock) {
+    const tight = this._reserveTightening(account, criticalUnlock) < 1;
+    const v = Number(tight ? this.scheduler.claudeWarmHoldReserveMaxInFlight : this.scheduler.claudeWarmHoldMaxInFlight);
+    return Number.isFinite(v) && v >= 1 ? Math.floor(v) : (tight ? 4 : 6);
+  }
+
   /** Multiplier (<= 1) on the anti-dogpile depth allowance: a reserve (or unlocked-critical)
    *  account's tighter concurrency target, reserveConcurrencyTarget / perAccountConcurrencyTarget;
    *  1 for every other account. */
@@ -4696,6 +4711,9 @@ export class AccountManager {
     const gate = this._affinityRelease(last, unlock);
     if (gate) return `released:${gate}`;
     if (this._effectivePriority(last, requestInfo, now) > this._effectivePriority(best, requestInfo, now)) return 'released:priority-tier';
+    // The warm hold was live and only its in-flight ceiling let go (recorded at the ceiling check).
+    const wc = requestInfo.warmHoldCeiling;
+    if (wc && wc.holder === lastName && !asHolder) return `released:hold-ceiling(inflight=${wc.n}/${wc.m})`;
     if (this._cacheAffinity(last, requestInfo, unlock, holder) <= 0) return 'released:no-hold';
     const lt = this._scoreTerms(last, requestInfo, scoringCtx, unlock, holder);
     const bt = this._scoreTerms(best, requestInfo, scoringCtx, bestUnlock);

@@ -50,7 +50,7 @@ test('HOLD: a warm conversation stays on its available Claude holder although a 
   const { name, logs } = pick(m);
   assert.equal(name, 'a1', `kept on the holder: ${logs.join(' | ')}`);
   assert.ok(!logs.some(l => l.includes('conversation moved:')), 'no move line');
-  assert.ok(logs.some(l => /warm-hold=a1:kept\(pick a[23] depth=\d+\/\d+\)/.test(l)), `one kept line naming the pick: ${logs.join(' | ')}`);
+  assert.ok(logs.some(l => /warm-hold=a1:kept\(pick a[23] depth=\d+\/\d+ inflight=\d+\/\d+\)/.test(l)), `one kept line naming the pick: ${logs.join(' | ')}`);
 });
 
 test('HOLD applies in prefer-claude mode too (scored mode)', () => {
@@ -263,4 +263,76 @@ test('KNOB: claudeWarmHoldMaxInFlight is settable and defaults to 6', () => {
   const m2 = claude3({ claudeWarmHoldMaxInFlight: 3 }); const b1 = byName(m2, 'a1');
   served(m2, b1); b1.activeWeight = 60; b1.inFlight = 2;
   assert.equal(pick(m2).name, 'a1', 'max 3: 2 in flight + this turn holds');
+});
+
+// ── red team round 2: log tokens, reserve knob, knob validation ─────────────────────
+const holderAt = (inFlight, opts = {}, { reserve = false } = {}) => {
+  const m = claude3(opts); const a1 = byName(m, 'a1');
+  served(m, a1); a1.activeWeight = 60; a1.inFlight = inFlight;
+  if (reserve) { const orig = m._weeklyRawState.bind(m); m._weeklyRawState = (a) => (a === a1 ? 'reserve' : orig(a)); }
+  return pick(m);
+};
+test('C1: past the ceiling the move line says released:hold-ceiling(inflight=N/M), not outscored', () => {
+  const { name, logs } = holderAt(6);
+  assert.notEqual(name, 'a1');
+  const mv = logs.find(l => l.includes('conversation moved:'));
+  assert.ok(mv, logs.join(' | '));
+  assert.ok(mv.endsWith('why=released:hold-ceiling(inflight=7/6)'), mv);
+  assert.ok(!mv.includes('outscored'), mv);
+});
+test('C1: reserve holder past its ceiling reports its own ceiling (inflight=5/4)', () => {
+  const { logs } = holderAt(4, {}, { reserve: true });
+  assert.ok(logs.some(l => l.endsWith('why=released:hold-ceiling(inflight=5/4)')), logs.join(' | '));
+});
+test('C1: the kept line keeps depth=H/D and appends inflight=N/M after it', () => {
+  const { name, logs } = holderAt(5);
+  assert.equal(name, 'a1');
+  const kept = logs.find(l => l.includes('warm-hold=a1:kept'));
+  assert.match(kept, /^\[Maxpool\] warm-hold=a1:kept\(pick a[23] depth=60\/\d+ inflight=6\/6\) \(10000B\)$/);
+  assert.match(kept, /depth=(\d+)\/(\d+)/, 'old parsers still match');
+});
+test('C1: a release gate still wins over the ceiling reason (holder on cooldown, deep)', () => {
+  const m = claude3(); const a1 = byName(m, 'a1');
+  served(m, a1); a1.inFlight = 9; a1.cooldownUntil = Date.now() + 30_000;
+  const { logs } = pick(m);
+  assert.ok(logs.some(l => /why=released:unavailable\(cooldown\)/.test(l)), logs.join(' | '));
+});
+test('C3: reserve knob is separate and defaults to 4; reserve holds at 3, moves at 4', () => {
+  assert.equal(claude3().scheduler.claudeWarmHoldReserveMaxInFlight, 4);
+  assert.equal(holderAt(3, {}, { reserve: true }).name, 'a1');
+  assert.notEqual(holderAt(4, {}, { reserve: true }).name, 'a1');
+});
+test('C3: perAccountConcurrencyTarget no longer moves either ceiling', () => {
+  const o = { perAccountConcurrencyTarget: 5 };
+  assert.equal(holderAt(5, o).name, 'a1', 'normal still holds at 5+1=6');
+  assert.notEqual(holderAt(6, o).name, 'a1', 'normal still moves at 6+1=7');
+  assert.equal(holderAt(3, o, { reserve: true }).name, 'a1', 'reserve still holds at 3+1=4');
+  assert.notEqual(holderAt(4, o, { reserve: true }).name, 'a1', 'reserve still moves at 4+1=5');
+});
+test('C3: claudeWarmHoldReserveMaxInFlight is honoured for reserve holders and ignored for normal ones', () => {
+  assert.equal(holderAt(5, { claudeWarmHoldReserveMaxInFlight: 7 }, { reserve: true }).name, 'a1');
+  assert.equal(holderAt(5, { claudeWarmHoldReserveMaxInFlight: 7 }).name, 'a1', 'normal holder at 5 still holds');
+  assert.notEqual(holderAt(6, { claudeWarmHoldReserveMaxInFlight: 7 }).name, 'a1', 'normal ceiling unaffected by the reserve knob');
+});
+test('C4: invalid knob values fall back to the default; fractions floor', () => {
+  // 0 -> 6: holds at 5, moves at 6
+  assert.equal(holderAt(5, { claudeWarmHoldMaxInFlight: 0 }).name, 'a1');
+  assert.notEqual(holderAt(6, { claudeWarmHoldMaxInFlight: 0 }).name, 'a1');
+  // 'x' -> 6
+  assert.equal(holderAt(5, { claudeWarmHoldMaxInFlight: 'x' }).name, 'a1');
+  assert.notEqual(holderAt(6, { claudeWarmHoldMaxInFlight: 'x' }).name, 'a1');
+  // negative -> 6
+  assert.equal(holderAt(5, { claudeWarmHoldMaxInFlight: -3 }).name, 'a1');
+  // 2.7 -> 2: holds at 1, moves at 2
+  assert.equal(holderAt(1, { claudeWarmHoldMaxInFlight: 2.7 }).name, 'a1');
+  assert.notEqual(holderAt(2, { claudeWarmHoldMaxInFlight: 2.7 }).name, 'a1');
+  // reserve knob: 0 -> 4 (holds at 3, moves at 4); 'x' -> 4
+  assert.equal(holderAt(3, { claudeWarmHoldReserveMaxInFlight: 0 }, { reserve: true }).name, 'a1');
+  assert.notEqual(holderAt(4, { claudeWarmHoldReserveMaxInFlight: 'x' }, { reserve: true }).name, 'a1');
+});
+test('C4: 0.5 and Infinity fall back to the default; 2.7 reports the floored ceiling 2 in the log', () => {
+  assert.equal(holderAt(5, { claudeWarmHoldMaxInFlight: 0.5 }).name, 'a1', '0.5 is < 1 -> default 6, not a ceiling of 0');
+  assert.notEqual(holderAt(6, { claudeWarmHoldMaxInFlight: Infinity }).name, 'a1', 'Infinity is not finite -> default 6');
+  const { logs } = holderAt(2, { claudeWarmHoldMaxInFlight: 2.7 });
+  assert.ok(logs.some(l => l.endsWith('why=released:hold-ceiling(inflight=3/2)')), logs.join(' | '));
 });
