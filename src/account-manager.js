@@ -4761,9 +4761,11 @@ export class AccountManager {
   }
 
   restoreSessionProviders(entries) {
-    if (!Array.isArray(entries)) return;
+    if (!Array.isArray(entries)) return; // legacy or unreadable snapshot
+    this.conversationProvider.clear();
     for (const entry of entries) {
-      if (Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'string') {
+      if (Array.isArray(entry) && typeof entry[0] === 'string' && entry[0]
+        && typeof entry[1] === 'string' && entry[1] && !this.conversationProvider.has(entry[0])) {
         lruSet(this.conversationProvider, entry[0], entry[1]);
       }
     }

@@ -287,3 +287,21 @@ test('an early OpenAI 401 forces one refresh and retries on the same account', a
   assert.equal(refreshes, 1);
   assert.equal(persisted, true);
 });
+
+test('the final provider snapshot replaces boot pins and honors current scheduler policy', () => {
+  const manager = new AccountManager([codex()]);
+  const thread = { clientThreadId: 'shared', caller: 'owner' };
+  manager.restoreSessionProviders([['owner:cc:evicted', 'codex']]);
+  for (const legacy of [null, undefined, {}]) manager.restoreSessionProviders(legacy);
+  assert.equal(manager.pinnedSessionProvider({ ...thread, clientThreadId: 'evicted' }), 'codex');
+  manager.restoreSessionProviders([['owner:cc:shared', 'codex'], ['owner:cc:shared', 'claude'],
+    ['peer:cc:shared', 'claude'], null, ['', 'codex'], ['bad', null]]);
+  assert.deepEqual(manager.exportSessionProviders(), [['owner:cc:shared', 'codex'], ['peer:cc:shared', 'claude']]);
+  assert.equal(manager.pinnedSessionProvider(thread), 'codex');
+  assert.equal(manager.pinnedSessionProvider({ ...thread, caller: 'peer' }), null);
+  assert.equal(manager.pinnedSessionProvider({ ...thread, clientThreadId: 'evicted' }), null);
+  manager.scheduler.providers = { codex: { sessionRouting: 'cross-provider' } };
+  assert.equal(manager.pinnedSessionProvider(thread), null);
+  manager.restoreSessionProviders([]);
+  assert.deepEqual(manager.exportSessionProviders(), []);
+});

@@ -1691,7 +1691,10 @@ async function serverWorkerCommand() {
     } catch (err) {
       console.error(`[Maxpool] Token re-sync at takeover failed: ${err.message}`);
     }
+    // The old worker could serve a first turn or evict an old conversation after
+    // our headless boot. Adopt its final ownership maps before serving any socket.
     const finalState = await loadState();
+    accountManager.restoreSessionProviders(finalState?.sessionProviders);
     accountManager.restoreNativeCodexConversationOwners(finalState?.nativeCodexConversationOwners);
   };
 

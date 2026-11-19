@@ -300,3 +300,90 @@ test('an encrypted continuation arriving through the supervisor waits for the fi
     await new Promise(r => listener.close(r));
   }
 });
+
+test('a Claude Code first turn on Codex after replacement boot stays on Codex through takeover', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-claude-provider-handoff-'));
+  const configPath = join(dir, 'config.json');
+  async function listen(server) {
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    t.after(() => { server.close(); server.closeAllConnections?.(); });
+    return server.address().port;
+  }
+  const hits = [];
+  const upstream = await listen(http.createServer(async (req, res) => {
+    for await (const chunk of req) { void chunk; }
+    hits.push(req.url);
+    if (req.url === '/v1/responses') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      for (const event of [
+        { type: 'response.created', response: { id: 'resp_fixture', model: 'gpt-6.2-sol' } },
+        { type: 'response.output_text.delta', item_id: 'item', delta: 'codex fixture' },
+        { type: 'response.completed', response: { usage: { input_tokens: 5, output_tokens: 2 } } },
+      ]) res.write('event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n');
+      return res.end();
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ content: [{ type: 'text', text: 'claude fixture' }] }));
+  }));
+  const listener = net.createServer({ pauseOnConnect: true });
+  const port = await listen(listener);
+  const host = 'http://127.0.0.1:' + upstream;
+  await writeFile(configPath, JSON.stringify({ proxy: { host: '127.0.0.1', port, apiKey: 'fixture' },
+    updateCheck: false, preventSleep: false, queue: { enabled: false },
+    accounts: [
+      { name: 'Claude', type: 'apikey', apiKey: 'fake', upstream: host },
+      { name: 'Codex', type: 'oauth', provider: 'codex', codexAuth: 'native', accountUuid: 'user',
+        codexAccountId: 'workspace', accessToken: 'fake', expiresAt: Date.now() + 3_600_000,
+        upstream: host + '/v1/responses', codexModels: [{ slug: 'gpt-6.2-sol', efforts: ['high'] }] },
+    ] }));
+  async function worker(reload) {
+    const child = fork(cliPath, ['server'], { env: { ...process.env, MAXPOOL_CONFIG: configPath,
+      MAXPOOL_SERVER_WORKER: '1', MAXPOOL_RELOAD_WORKER: reload ? '1' : '',
+      MAXPOOL_DISABLE_QUOTA_PROBE: '1', MAXPOOL_DISABLE_SLEEP_GUARD: '1' },
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'], detached: true });
+    t.after(() => killGroup(child));
+    const messages = new Set();
+    let errors = '';
+    child.stderr.on('data', data => { errors += data; });
+    child.on('message', msg => messages.add(msg.type));
+    const wait = type => waitFor(() => messages.has(type), 15000, 25, type, () => errors);
+    await waitFor(() => {
+      if (messages.has('ready')) return true;
+      child.send({ type: 'probe-ready' });
+    }, 15000, 50, 'worker boot', () => errors);
+    return { child, wait };
+  }
+  const old = await worker(false);
+  let acceptor = old.child;
+  listener.on('connection', socket => acceptor.send({ type: 'conn' }, socket));
+  old.child.send({ type: 'listen' }, listener);
+  await old.wait('primary');
+  const next = await worker(true);
+  function turn(at, provider, thread = 'handoff-thread') {
+    return fetch('http://127.0.0.1:' + at + '/v1/messages', { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'fixture', connection: 'close',
+        'x-maxpool-profile': 'all', 'x-maxpool-provider': provider },
+      body: JSON.stringify({ model: 'claude-sonnet-5', stream: true, metadata: { user_id: JSON.stringify({ session_id: thread }) },
+        messages: [{ role: 'user', content: 'hello' }] }), signal: AbortSignal.timeout(15000) });
+  }
+  assert.match(await (await turn(port, 'codex')).text(), /codex fixture/);
+  old.child.send({ type: 'release' });
+  await old.wait('released');
+  acceptor = next.child;
+
+  // A separate supervisor-accepted socket guarantees this request is delivered
+  // via MSG_CONN before TAKEOVER, even if the OS would otherwise pick a worker.
+  const earlyListener = net.createServer({ pauseOnConnect: true });
+  const earlyPort = await listen(earlyListener);
+  const forwarded = new Promise((resolve, reject) => earlyListener.once('connection', socket =>
+    next.child.send({ type: 'conn' }, socket, err => err ? reject(err) : resolve())));
+  const early = turn(earlyPort, 'claude');
+  await forwarded;
+  next.child.send({ type: 'takeover' }, listener);
+  assert.match(await (await early).text(), /codex fixture/);
+  await next.wait('primary');
+  assert.match(await (await turn(port, 'claude')).text(), /codex fixture/);
+  assert.match(await (await turn(port, 'claude', 'fresh-thread')).text(), /claude fixture/);
+  assert.deepEqual(hits, ['/v1/responses', '/v1/responses', '/v1/responses', '/v1/messages']);
+});
