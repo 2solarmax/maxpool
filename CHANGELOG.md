@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.111] - 2026-11-19
+
+### Changed
+
+- Provider add: an unsaved row matched by KEY (not only name) is dropped before the dedupe, never a false exists
+
 ## [1.24.110] - 2026-11-18
 
 ### Changed
