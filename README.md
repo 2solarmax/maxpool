@@ -530,6 +530,30 @@ by Mark Karpelès, substantially extended with rate-aware (use-it-or-lose-it)
 load balancing, interactive account & routing management, atomic credential
 storage, and resilient upstream-error handling. Thanks to the original authors.
 
+## Cap one existing terminal
+
+Check that the **serving local worker** returns `x-maxpool-session-cap-version: 1` on
+`GET /maxpool/ping`. A terminal using the pool route sends its full session UUID
+in `x-maxpool-session`. Use the same MaxPool config as the running worker.
+
+```sh
+maxpool session-cap arm "$terminal_uuid" 3
+maxpool session-cap status "$terminal_uuid"
+maxpool session-cap disarm "$terminal_uuid"
+```
+
+A named pool client adds `--caller NAME` to each command. A shared proxy key
+in strict-client mode uses `--caller legacy-key`. The default local anonymous
+caller omits it. Status includes the number of admitted client
+requests and whether an over-limit request was blocked. The cap takes effect
+on the next local `POST /v1/messages`. It persists through restarts until
+disarmed. Any in-flight requests admitted before arming run to completion.
+A fresh client retry consumes a slot. Requests past the cap receive a
+non-retryable 403 before forwarding. Internal upstream retries, token counts
+and account quota are separate. Terminals using a direct provider route bypass
+this local control.
+If an armed cap’s run directory goes missing, that terminal receives 403 until you disarm its cap.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright © 2026 KarpelesLab and Max Krasnykh.
