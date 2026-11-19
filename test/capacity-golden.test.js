@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { tankStatsFromCycles, cycleEstimate } from '../src/capacity-ledger.js';
+import { tankStatsFromCycles } from '../src/capacity-ledger.js';
 
 const SNAP = '/private/tmp/claude-501/-Users-maxkrasnykh-Mokka-mokka-workspace/a8e511db-78c9-4c92-aeb5-3283036af0eb/scratchpad/cap-audit';
 const LAPTOP = join(SNAP, 'laptop-capacity.json');
