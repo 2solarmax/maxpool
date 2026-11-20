@@ -10,6 +10,7 @@
 import { fetchUsage, fetchProviderUsage } from './oauth.js';
 import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset-cards.js';
 import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
+import { rememberZaiTerms } from './subscription-terms.js';
 import { listResetGrants, claimResetGrant, appliesTo, clearsGeneralWeekly } from './claude-reset-grants.js';
 import { decideZai, decideClaudeWithReason, CLAUDE_WALL_WEEKLY } from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
@@ -338,9 +339,13 @@ export class Prober {
         if (account.provider === 'zai' && this.am.applyMonthlyPrice) {
           try {
             if (!account._subsCheckedAt || Date.now() - account._subsCheckedAt > 24 * 3600_000) {
-              const subs = await this._withTimeout(listSubscriptions(account.credential));
+              const credential = account.credential;
+              const subs = await this._withTimeout(listSubscriptions(credential));
               account._subsCheckedAt = Date.now();
-              if (subs && !subs.error) this.am.applyMonthlyPrice(account.index, monthlyPriceUSD(subs.subscriptions));
+              if (subs && !subs.error && account.credential === credential) {
+                this.am.applyMonthlyPrice(account.index, monthlyPriceUSD(subs.subscriptions));
+                rememberZaiTerms(account, subs.subscriptions);
+              }
             }
           } catch { /* price is display-only */ }
         }

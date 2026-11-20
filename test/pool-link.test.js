@@ -733,7 +733,7 @@ test('price cell derivation: weekly-plan accounts derive weekly tank at 5h × 5.
   assert.doesNotMatch(page, /\$3\.\d\d/, 'the ×33.6 figure ($3.34) must not appear');
 });
 
-test('capacity page on the REAL two-pool shape: cloud rows get their price and tank (owner 2026-10-31 screen showed "--")', async () => {
+test('capacity page retains cloud tank measurements and ignores prices from an older linked worker', async () => {
   const { CapacityLedger } = await import('../src/capacity-ledger.js');
   const { TUI } = await import('../src/tui.js');
   const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
@@ -758,8 +758,11 @@ test('capacity page on the REAL two-pool shape: cloud rows get their price and t
   const t = new TUI({ accountManager: am, config: {} });
   t.capacityWindow = 'wk';
   const page = t._renderCapacityPage(140).map(strip).join('\n');
-  assert.match(page, /\$4\.60/, 'Claude mirror: $200 ÷ (10M × 4.3486) local pre-migration tank');
-  assert.match(page, /\$3\.86/, 'GLM mirror: $134.4 ÷ (8M × 4.3486) cloud tank');
+  assert.doesNotMatch(page, /\$(4\.60|3\.86)/);
+  for (const row of am.accounts.filter(a => a.remote)) {
+    assert.equal(am.monthlyPriceFor(row), null);
+    assert.ok(am.capacityTank(row.index, 'wk')?.avg > 0);
+  }
   am.setPoolLinks([]);
 });
 

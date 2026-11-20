@@ -117,9 +117,9 @@ test('A7 a full 19-char email renders in full (Account column widened to 20)', (
 test('A7 the header columns sit at the widened offsets', () => {
   const hdr = strip(__tuiTest.acctHeader(100));
   assert.equal(hdr.indexOf('Account'), 4);
-  assert.equal(hdr.indexOf('Where'), 25, 'Local/Cloud column after Account (2026-10-29)');
-  assert.equal(hdr.indexOf('Provider'), 31);
-  assert.equal(hdr.indexOf('Status'), 41);
+  assert.equal(hdr.indexOf('Where'), 34, 'Local/Cloud column after Account and Cache 3h');
+  assert.equal(hdr.indexOf('Provider'), 40);
+  assert.equal(hdr.indexOf('Status'), 50);
 });
 
 // ── U1: the update banner appears only when a newer version is published ──────────

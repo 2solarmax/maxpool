@@ -461,7 +461,8 @@ test('WIRING: every worker exit path kills the terminal helper first (a pending 
   // ...and so do the IPC handler's exit-75 paths (that handler only exists supervised).
   assert.match(src, /MSG_LISTEN with no socket handle — exiting for respawn\.'\);\s*terminalHandedOff = true;[^\n]*\n\s*process\.exit\(SERVER_RESTART_EXIT_CODE\);/);
   assert.match(src, /if \(!isReloadWorker\) \{ terminalHandedOff = true; process\.exit\(SERVER_RESTART_EXIT_CODE\); \}/);
-  assert.match(src, /const exitAfterMergeFlush = \(\) => \{\s*terminalMode\.close\(\);/);
+  const drainExit = src.match(/const exitAfterMergeFlush = \(\) => \{[\s\S]*?\n {6}\};/)[0];
+  assert.match(drainExit, /terminalMode\.close\(\);[\s\S]*publishCapacityDrain\(\)[\s\S]*process\.exit\(0\)/);
   const sg = src.match(/const shutdownGracefully = [\s\S]*?\n {2}\};\n/)[0];
   assert.match(sg, /terminalMode\.close\(\);\s[\s\S]{0,700}if \(supervised\) terminalHandedOff = true;\s*if \(tui\?\.running\) tui\.stop\(supervised \? \{ keepRaw: true \} : \{\}\);/);
 });

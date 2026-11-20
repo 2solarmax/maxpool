@@ -5,6 +5,22 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.116] - 2026-11-20
+
+### Added
+
+- Show account cache and private subscription details in activity analytics
+
+### Changed
+
+- Verify terminal cleanup precedes asynchronous drain on exit
+
+### Fixed
+
+- Include unassigned historical usage in linked provider totals
+- Retain the newest usage when link reports share a timestamp
+- Preserve configured display names in capacity and activity
+
 ## [1.24.114] - 2026-11-19
 
 ### Added

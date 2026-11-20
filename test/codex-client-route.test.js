@@ -91,6 +91,8 @@ test('native Responses preserve the wire and report cache-aware usage to the ser
   assert.equal(am.callerStats.get('local-codex').total.tok, 12);
   const { cr, cc, promptTokens, hit } = am.efficiencyOverall().codex;
   assert.deepEqual({ cr, cc, promptTokens, hit }, { cr: 3, cc: 2, promptTokens: 8, hit: 0.375 });
+  assert.deepEqual(am.accountCacheWindows(am.accounts[0]).windows.all,
+    { input: 3, cacheRead: 3, cacheWrite: 2, output: 4, hit: 3 / 8, partial: false });
   const saved = am.exportNativeCodexConversationOwners();
   const restored = new AccountManager([native('a'), native('b')]);
   restored.restoreNativeCodexConversationOwners(saved);
@@ -136,6 +138,9 @@ test('Codex clients that close after response.completed still record success and
   assert.equal(am.accounts[0].completedRequests, 1);
   assert.equal(am.accounts[0].failedRequests, 0);
   assert.equal(am.callerStats.get('local-codex').total.tok, 12);
+  const observed = am.providerCacheWindows().codex.windows.all;
+  assert.equal(observed.input, 8);
+  assert.equal(observed.output, 4);
 });
 
 test('native Codex rotates before starting a turn but keeps encrypted state on its exact owner', async t => {

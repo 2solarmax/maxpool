@@ -48,7 +48,7 @@ test('Codex account rows show native quota and distinguish unknown and banked re
   const tui = makeTui();
   const account = tui.am.accounts[1];
   const { bw, showBoth, showFable, showSession } = barLayout(80, true);
-  const col = strip(acctHeader(80)).indexOf('ARst');
+  const col = strip(acctHeader(160)).indexOf('ARst');
   const wideRow = strip(tui._renderAcct(1, 9, true, true, true, 160));
   assert.doesNotMatch(wideRow, /Fbl|Fable/i);
   assert.match(wideRow, /Wk/);

@@ -161,6 +161,9 @@ test('V10: plan config → monthly price; Anthropic with no plan defaults to mon
   assert.equal(am.monthlyPriceFor(am.accounts[0]), 200);
   am.accounts[0].plan = sanitizePlan({ tier: 'Max 20x', cadence: 'monthly', priceUsd: 250, billingMonths: 1 });
   assert.equal(am.monthlyPriceFor(am.accounts[0]), 250, 'configured plan overrides the default');
+  const codex = new AccountManager([{ name: 'c', type: 'oauth', provider: 'codex', accessToken: 't' }], 0.9);
+  assert.equal(codex.monthlyPriceFor(codex.accounts[0]), null, 'Codex has no implicit Claude subscription price');
+  assert.equal(codex.capacityRows([0])[0].plan, null);
   const g = new AccountManager([{ name: 'g', type: 'provider', provider: 'zai', authToken: 'z', upstream: 'https://z', profiles: ['all'] }], 0.9);
   assert.equal(g.monthlyPriceFor(g.accounts[0]), null, 'no default for GLM');
   g.accounts[0].plan = sanitizePlan({ tier: 'GLM Coding Max', cadence: 'quarterly', priceUsd: 403.2, billingMonths: 3 });
@@ -172,7 +175,7 @@ test('V10: plan config → monthly price; Anthropic with no plan defaults to mon
 // ── one row per identity ────────────────────────────────────────────────────
 function twoPoolAM() {
   const am = new AccountManager([
-    { name: 'mk@gomokka', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5, accountUuid: 'U1' },
+    { name: 'mk@gomokka', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5, accountUuid: 'U1', plan: { tier: 'Local subscription', cadence: 'monthly', priceUsd: 200 } },
     { name: 'kira', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5, accountUuid: 'U2' },
     { name: 'nouuid', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5 },
   ], 0.9, { routingMode: 'balance' });
@@ -201,7 +204,7 @@ test('V11: a benched local row + its cloud mirror (same uuid) render as ONE row,
   const mk = page.split('\n').filter(l => /mk@gomokka/.test(l));
   assert.equal(mk.length, 1, 'one row per identity:\n' + page);
   assert.match(mk[0], /both/);
-  assert.match(mk[0], /Max 20x M \$200\/mo/, 'plan cell from the cloud-exported plan');
+  assert.match(mk[0], /Local subscription M \$200\/mo/, 'only the local owner’s configured plan supplies the terms');
   assert.doesNotMatch(page, /cache \d+%/, 'no cosmetic cache note');
   // merged history: local 6M@1.0 + cloud 5M@1.0 are DISJOINT windows → median of [6M,5M] = 5.5M; $200/5.5M
   assert.match(mk[0], /5\.5M/);
@@ -224,7 +227,7 @@ test('V13: capacityTank for a mirror unions BOTH ledgers (never "more cycles win
   am.setPoolLinks([]);
 });
 
-test('V14: getStatus exports bounded closed cycles per window and plan', () => {
+test('V14: getStatus exports bounded closed cycles and keeps commercial terms private', () => {
   const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 36e5, accountUuid: 'U',
     plan: { tier: 'Max 20x', cadence: 'monthly', priceUsd: 200 } }], 0.9);
   for (let i = 0; i < 20; i++) {
@@ -234,6 +237,8 @@ test('V14: getStatus exports bounded closed cycles per window and plan', () => {
   }
   const row = am.getStatus().accounts[0];
   assert.equal(row.cycles.wk.length, 12);
-  assert.equal(row.plan.tier, 'Max 20x');
+  assert.equal(row.plan, undefined);
+  assert.equal(row.monthlyPriceUSD, undefined);
+  assert.equal(am.monthlyPriceFor(am.accounts[0]), 200);
   assert.equal(row.cache, undefined, 'no cache field exported');
 });

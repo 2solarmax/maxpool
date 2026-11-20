@@ -18,7 +18,7 @@ import { stat } from 'node:fs/promises';
 import { unlinkSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, saveStateUnbumped } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, writeCapacityDrain, readCapacityDrains, acknowledgeCapacityDrains } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setConsoleNonBlocking, reassertConsoleNonBlocking, appendEventLog, printFatal } from './event-log.js';
 import { codexPoolEndpoint, sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
 import { fetchRemoteStatus } from './pool-link.js';
@@ -723,8 +723,6 @@ async function serverWorkerCommand() {
   // final flush and restores fully (the reported zero-request case).
   if (savedState?.runtimeProviders) accountManager.restoreRuntimeProviders(savedState.runtimeProviders);
   if (savedState?.callerStats) accountManager.restoreCallerStats?.(savedState.callerStats);
-  // 24h cache rollup: additive restore into the running buckets (see exportEfficiencyHours).
-  if (savedState?.efficiencyHours) accountManager.restoreEfficiencyHours?.(savedState.efficiencyHours);
 
   // ── config-sourced providers (GCP Secret Manager) ──────────────────────────
   // Provider keys (GLM, Kimi) defined in the config's `providers` section, each
@@ -756,6 +754,9 @@ async function serverWorkerCommand() {
       console.error(`[Maxpool] Config provider resolution failed: ${err.message}`);
     }
   }
+
+  accountManager.restoreEfficiencyHours(savedState?.efficiencyHours);
+  accountManager.restoreAccountCacheHours(savedState?.efficiencyHours);
 
   // ── team-pool links (owner D8): each remote pool becomes ONE routable account ──
   // config.pools: [{ name, url, keySecret? | key? }]. The person's pool key is
@@ -803,72 +804,58 @@ async function serverWorkerCommand() {
   // write races this one). Without force, this no-ops post-release and the reload's
   // learned-quota flush is silently dropped — the new worker would boot from up-to-
   // 60s-stale quota and the state generation would never advance across a reload.
-  const persistQuotaState = (force = false) => {
-    if (!hasLease && !force) return Promise.resolve();
-    // The forced final flush (baton release / shutdown) is the SOLE writer at that
-    // point — releaseLease() already cleared the periodic interval and the next
-    // worker hasn't acquired the lease yet — so it bypasses the cross-worker
-    // stale-generation guard. Without this, a 60s-interval write that fired just
-    // before releaseLease could bump the on-disk generation and get the forced
-    // flush REFUSED (dropping the final quota snapshot). The guard only exists to
-    // serialize CROSS-worker writes; the final flush is provably intra-worker.
-    const expectedGeneration = force ? null : stateGeneration;
-    return saveState(
-      {
-        quota: accountManager.exportQuotaState(),
-        sessionProviders: accountManager.exportSessionProviders(),
-        nativeCodexConversationOwners: accountManager.exportNativeCodexConversationOwners(),
-        // Runtime providers so glm-fallback/kimi-fallback survive a restart (they're
-        // header-derived, not in config). Empty [] when none — harmless.
-        runtimeProviders: accountManager.exportRuntimeProviders(),
-        // CAPACITY LEDGER (2026-08-22) rides the SAME payload on purpose: it inherits
-        // the writer lease, the generation guard and the serialized write chain. A
-        // separate file would need its own copy of all three (pre-mortem B2), and the
-        // OPEN cycle must persist or a mid-cycle restart records a near-empty cycle as
-        // a real capacity observation and poisons the averages forever (B1).
-        capacity: accountManager.capacity?.serialize?.() || null,
-        // SC22 per-person analytics — same generation-guarded payload, survives
-        // restarts and seamless reloads.
-        callerStats: accountManager.exportCallerStats?.() || {},
-        // 24h efficiency rollup (hourly buckets) — the Cache line's long window.
-        efficiencyHours: accountManager.exportEfficiencyHours?.() || null,
-        // Last-good remote identity maps — the boot-time single-writer guard reads
-        // these (see restore above). Rides the same generation-guarded payload.
-        poolIdentities: accountManager.exportPoolIdentities?.() || null,
-        poolIdentitiesAt: accountManager.poolIdentitiesAt?.() ?? null,
-      },
-      { expectedGeneration },
-    )
-      .then(written => { if (written != null) stateGeneration = written; })
-      .catch(() => {});
-  };
-  // CAPACITY LEDGER drain-exit merge-flush (B2). `capacityFlushSnapshot` is taken at
-  // the released worker's FINAL flush; everything accrued after it is drain-time work
-  // whose tokens would otherwise be discarded when this worker exits bare.
   let capacityFlushSnapshot = null;
-  const mergeFlushCapacityDelta = async () => {
-    if (!capacityFlushSnapshot) return;
-    const after = accountManager.capacity?.serialize?.();
-    if (!after) return;
-    const disk = await loadState();
-    if (!disk) { // a failed read must not be "merged" into a quota-less state file (RT2-4)
-      console.error('[Maxpool] Capacity drain-flush skipped: state file unreadable — drain-time token delta not persisted.');
-      return;
+  let quotaPersistChain = Promise.resolve();
+  const persistQuotaState = (force = false, snapshotForDrain = false) => {
+    if (!hasLease && !force) return Promise.resolve();
+    const persist = async () => {
+      const ledger = accountManager.capacity;
+      const drains = await readCapacityDrains(ledger);
+      const capacity = ledger.serialize();
+      // Use the exact snapshot passed to the disk writer. Requests can finish
+      // while the asynchronous write is in flight.
+      if (snapshotForDrain) capacityFlushSnapshot = capacity;
+      const expectedGeneration = force ? null : stateGeneration;
+      const written = await saveState(
+        {
+          quota: accountManager.exportQuotaState(),
+          sessionProviders: accountManager.exportSessionProviders(),
+          nativeCodexConversationOwners: accountManager.exportNativeCodexConversationOwners(),
+          // Runtime providers so glm-fallback/kimi-fallback survive a restart (they're
+          // header-derived, not in config). Empty [] when none — harmless.
+          runtimeProviders: accountManager.exportRuntimeProviders(),
+          // CAPACITY LEDGER (2026-08-22) rides the SAME payload on purpose: it inherits
+          // the writer lease, the generation guard and the serialized write chain. A
+          // separate file would need its own copy of all three (pre-mortem B2), and the
+          // OPEN cycle must persist or a mid-cycle restart records a near-empty cycle as
+          // a real capacity observation and poisons the averages forever (B1).
+          capacity,
+          // SC22 per-person analytics — same generation-guarded payload, survives
+          // restarts and seamless reloads.
+          callerStats: accountManager.exportCallerStats?.() || {},
+          // 24h efficiency rollup (hourly buckets) — the Cache line's long window.
+          efficiencyHours: accountManager.exportEfficiencyHours?.() || null,
+          // Last-good remote identity maps — the boot-time single-writer guard reads
+          // these (see restore above). Rides the same generation-guarded payload.
+          poolIdentities: accountManager.exportPoolIdentities?.() || null,
+          poolIdentitiesAt: accountManager.poolIdentitiesAt?.() ?? null,
+        },
+        { expectedGeneration },
+      );
+      if (written != null) {
+        stateGeneration = written;
+        await acknowledgeCapacityDrains(ledger, drains);
+      }
+    };
+    quotaPersistChain = quotaPersistChain.then(persist).catch(err => {
+      console.error('[Maxpool] Could not persist quota/accounting state:', err.message);
+    });
+    return quotaPersistChain;
+  };
+  const publishCapacityDrain = async () => {
+    if (capacityFlushSnapshot) {
+      await writeCapacityDrain(CapacityLedger.drainDelta(capacityFlushSnapshot, accountManager.capacity.serialize()));
     }
-    const capacity = CapacityLedger.mergeDelta(disk.capacity, capacityFlushSnapshot, after);
-    // Re-write the FULL on-disk state with only `capacity` replaced: quota and
-    // runtimeProviders belong to the NEW worker now and must not be reverted to ours.
-    // No generation guard — we are deliberately amending a file another writer owns,
-    // and a same-instant race costs at most this drain's delta.
-    const { _generation, ...rest } = disk;
-    // NO generation bump: re-write the file at the SAME generation so the new
-    // worker's stateGeneration stays valid. saveState refuses a lower generation
-    // only — writing the observed one back is accepted and bumps nothing. Bumping
-    // here (the naive first version) wedged the new worker's periodic flush for its
-    // entire tenure: onDisk advanced past its stateGeneration and every guarded
-    // write was refused forever (red-team 2026-08-22).
-    await saveStateUnbumped({ ...rest, capacity }, _generation ?? 0);
-    await flushStateWrites();
   };
 
   // Persist quota every minute; unref so it never keeps the process alive.
@@ -1157,6 +1144,8 @@ async function serverWorkerCommand() {
     try { stateGeneration = await readGeneration(getStatePath()); } catch { /* keep prior */ }
     hasLease = true;
     accountManager.setWriterLease(true);
+    // Recover any completed drain that survived a restart before the first repaint.
+    await readCapacityDrains(accountManager.capacity).catch(err => console.error('[Maxpool] Could not recover capacity drain:', err.message));
     if (!quotaSaveInterval) {
       quotaSaveInterval = setInterval(() => { persistQuotaState(); }, 60_000);
       quotaSaveInterval.unref?.();
@@ -1686,6 +1675,10 @@ async function serverWorkerCommand() {
     // our headless boot. Adopt its final ownership maps before serving any socket.
     const finalState = await loadState();
     accountManager.restoreProbeRetryDeadlines(finalState?.quota);
+    if (finalState?.capacity) {
+      accountManager.restoreCapacityState(finalState.capacity);
+      accountManager.restoreAccountCacheHours(finalState.efficiencyHours);
+    }
     accountManager.restoreSessionProviders(finalState?.sessionProviders);
     accountManager.restoreNativeCodexConversationOwners(finalState?.nativeCodexConversationOwners);
   };
@@ -1787,12 +1780,7 @@ async function serverWorkerCommand() {
       //    flipped hasLease=false, and persistQuotaState no-ops without the lease —
       //    so an unforced call here silently drops the reload's final quota flush.
       accountManager.sealSessionProviderHandoff();
-      await persistQuotaState(true);
-      // 3b) CAPACITY LEDGER: snapshot what we had flushed. We keep serving in-flight
-      //     requests for up to RELOAD_DRAIN_MS after this, and those tokens are real
-      //     measured capacity — but the NEW worker owns the state file by then. At
-      //     exit we merge (now − this snapshot) onto whatever it has written (B2).
-      capacityFlushSnapshot = accountManager.capacity?.serialize?.() || null;
+      await persistQuotaState(true, true);
       // 4) Barrier: ensure every queued config write (a rotated-token persist is
       //    fire-and-forget) AND state write has actually hit disk before we hand
       //    off (M3 — otherwise the new worker boots from the invalidated token).
@@ -1813,13 +1801,15 @@ async function serverWorkerCommand() {
       // exit(0). Cap = RELOAD_DRAIN_MS (above the idle reaper) so a long streaming
       // response finishes instead of being cut; the supervisor SIGKILLs us only if
       // we outlive its (slightly longer) cap.
-      // Exit only AFTER folding the drain-time capacity delta into the new worker's
-      // state file. Bounded (1s) and best-effort: losing the delta is a measurement
+      // Exit after publishing the drain for the new lease holder to collect. Bounded (1s) and best-effort: losing the delta is a measurement
       // gap, hanging the released worker is an operational fault, so the timeout wins.
+      let exiting = false;
       const exitAfterMergeFlush = () => {
+        if (exiting) return;
+        exiting = true;
         terminalMode.close();   // a switch still waiting for the terminal never holds the exit
-        Promise.race([mergeFlushCapacityDelta(), delay(1000)])
-          .catch(() => {})
+        Promise.race([publishCapacityDrain(), delay(1000)])
+          .catch(err => console.error('[Maxpool] Could not persist released worker capacity:', err.message))
           .finally(() => process.exit(0));
       };
       const waitForDrain = () => {
@@ -1894,6 +1884,7 @@ async function serverWorkerCommand() {
           await listenOnHandle(handle);
           await becomePrimary({ viaTakeover: true });
         } else if (msg?.type === MSG_TTY_REASSERT) {
+          persistQuotaState(); // old worker has finished its drain
           // The old worker has now EXITED, and its exit reset the shared terminal out
           // of raw mode (libuv's uv_tty_reset_mode on process exit). Reclaim it on the
           // helper thread, so a terminal that is behind never stalls this worker;

@@ -48,8 +48,9 @@ function proxyGet(port, apiKey, timeoutMs = 8000) {
   });
 }
 
-function startJsonUpstream() {
+function startJsonUpstream(handle) {
   const server = http.createServer((req, res) => {
+    if (handle(req, res)) return;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
   });
@@ -71,7 +72,17 @@ function awaitChildExit(child) {
 }
 
 test('M4: quota persistence keeps working after a reload (state generation advances post-swap)', async () => {
-  const upstream = await startJsonUpstream();
+  // One mock upstream response deliberately finishes on the retired worker.
+  let holdNext = false, completeDrain;
+  const upstream = await startJsonUpstream((_req, res) => {
+    if (!holdNext) return false;
+    holdNext = false;
+    completeDrain = () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ usage: { input_tokens: 2, cache_read_input_tokens: 7, output_tokens: 3 } }));
+    };
+    return true;
+  });
   const port = await getFreePort();
   const apiKey = 'mp-test-key';
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-gen-'));
@@ -104,10 +115,21 @@ test('M4: quota persistence keeps working after a reload (state generation advan
 
     // Reload — the old worker flushes state (bumping the on-disk generation), the
     // new primary must re-sync it so ITS writes aren't refused.
+    holdNext = true;
+    const inflight = proxyGet(port, apiKey, 45000);
+    inflight.catch(() => {});
+    await waitFor(() => Boolean(completeDrain));
     child.kill('SIGHUP');
     await waitFor(() => /cutover complete/.test(out), 20000);
     await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
 
+    completeDrain();
+    assert.equal((await inflight).status, 200);
+    const readCache = async () => {
+      const state = JSON.parse(await readFile(statePath, 'utf8'));
+      return Object.values(state.capacity?.ownerCache || {})[0]?.total;
+    };
+    await waitFor(async () => (await readCache())?.[1] === 7, 20000);
     const genAfterReload = await readStateGen();
 
     // The NEW primary must ADVANCE the state generation. Reload again and confirm
@@ -117,6 +139,7 @@ test('M4: quota persistence keeps working after a reload (state generation advan
     await waitFor(async () => { try { return (await proxyGet(port, apiKey)).status === 200; } catch { return false; } }, 20000);
     await waitFor(async () => (await readStateGen()) > genAfterReload, 20000);
 
+    assert.deepEqual(await readCache(), [2, 7, 0, 3], 'subsequent primary flush preserves old-worker usage exactly once');
     const finalGen = await readStateGen();
     assert.ok(finalGen > genAfterReload, `state generation advanced after reload (${genAfterReload} -> ${finalGen}); persistence not wedged`);
   } finally {
