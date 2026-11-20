@@ -1,3 +1,4 @@
+import { LinkedMessageEnvelope, finishInference, capacityDenial, noteMessageBody, noteMessageEvent, noteRoutingUsage } from './routing-service-analytics.js';
 import { createCodexClientRoute, isCodexClientPath } from './codex-client-route.js';
 import { fetchBoundedOpenAIResponse, fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest, webSearchesInTurn } from './openai-responses.js';
 import { nativeCodexHeaders, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
@@ -909,6 +910,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // too (bare `claude`, teammates' launchers): the conversation hash alone.
         requestInfo.affinityKey = requestInfo.conversationHash
           ? `${requestInfo.sessionKey || ''}:${requestInfo.conversationHash}` : null;
+        if (req.method === 'POST' && /^\/v1\/messages(?:\?|$)/.test(req.url) && requestInfo.model) {
+          const session = requestInfo.sessionKey || requestInfo.codexCacheThreadId;
+          requestInfo._service = accountManager.routingService?.begin({
+            peer: Number(inboundHops) > 0, session: session ? JSON.stringify([requestInfo.caller, session]) : null,
+          });
+        }
         if (requestInfo.isCountTokens && (requestInfo.onlyProvider === 'codex'
           || accountManager.pinnedSessionProvider?.(requestInfo) === 'codex'
           || (requestInfo.profile === 'all'
@@ -967,6 +974,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         if (sink?.replyId && sink.account) {
           threadOwners.noteThreadId(sink.replyId, sink.account);
         }
+        finishInference(requestInfo._service, ctx.status,
+          requestInfo._clientCancelled || ctx.status === 499 || (res.destroyed && !res.writableFinished));
         accountManager.noteClientOutcome?.(requestInfo, ctx.status);
         hooks.onRequestEnd?.(reqId, {
           method: req.method, path: req.url,
@@ -1202,6 +1211,14 @@ async function forwardRequest(
   }
   const lease = accountManager.acquireAccount(requestInfo, excludedIndexes);
   const account = lease?.account;
+  if (account && requestInfo._service) {
+    const trace = requestInfo._service;
+    trace.terminal = null;
+    trace.limited = false;
+    trace.denied = false;
+    trace.usage = null;
+    trace.route(account.name);
+  }
   requestInfo._hop = retryCount;
   // The sticky-wait retry pin is good for exactly this one acquire.
   if (requestInfo._stickyPin) {
@@ -1229,12 +1246,16 @@ async function forwardRequest(
     if (requestInfo.pinAccount != null) {
       ctx.status = 503;
       const busy = Boolean(requestInfo.pinRefusedBusy);
+      const pinned = accountManager.accounts.find(a => !a.remote && a.name === requestInfo.pinAccount);
+      if (pinned && requestInfo._service) {
+        requestInfo._service.refusedOn(pinned.name);
+        if (busy) requestInfo._service.denied = 'concurrencyDenied';
+      }
       ctx.account = `(pinned ${requestInfo.pinAccount} ${busy ? 'busy' : 'unavailable'})`;
       try {
         res.setHeader('retry-after', busy ? '2' : '30');
         // Machine-readable cause + depth for the linked pool (additive; old pools ignore them).
         res.setHeader('x-maxpool-pin-refusal', requestInfo.pinRefusal || 'unavailable');
-        const pinned = accountManager.accounts.find(a => !a.remote && a.name === requestInfo.pinAccount);
         if (pinned) {
           res.setHeader('x-maxpool-pin-inflight', String(pinned.inFlight || 0));
           res.setHeader('x-maxpool-pin-limit', String(accountManager._pinBusyLimit(pinned)));
@@ -1248,6 +1269,7 @@ async function forwardRequest(
     ctx.status = 429;
     ctx.account = '(none available)';
     const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
+    if (requestInfo._service) requestInfo._service.denied ||= capacityDenial(retryPlan);
     const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
     // CLI-RETRIABLE CAP (2026-10-11 "bricked sessions"). The real soonest reset can
     // be hours out; sending `retry-after: 10800` makes Claude Code's SDK treat the
@@ -1565,7 +1587,9 @@ async function forwardRequest(
             // chunk stops it. Only the grace TIMER is cleared after the sleep; a committed
             // heartbeat keeps running. No lease and no queue ticket is held while waiting.
             const grace = armStreamForwardGrace(res, requestInfo, queueConfig, accountManager);
+            requestInfo._service?.wait();
             const stayed = await sleepUnlessClientGone(waitMs, req, res);
+            requestInfo._service?.resume();
             if (grace) clearTimeout(grace);
             if (!stayed) {
               clearQueueHeartbeat(requestInfo);
@@ -1618,6 +1642,7 @@ async function forwardRequest(
         );
         if (queued) return;
         ctx.status = upRes.status;
+        if (requestInfo._service) requestInfo._service.denied ||= refusal.cause === 'busy' ? 'concurrencyDenied' : 'unclassifiedDenied';
         sendErrorResponse(res, requestInfo, upRes.status, { type: 'error', error: { type: 'overloaded_error', message: `Team pool account "${account.name}" is at capacity` } });
         return;
       }
@@ -2108,7 +2133,7 @@ async function forwardRequest(
       const errorBody = await readErrorBody(upstreamRes);
       let retryAfter = parseRetryAfter(upstreamRes.headers.get('retry-after'))
         || parseProviderRetryAfter(errorBody, account.provider);
-      const nativeLimit = nativeCodex ? codexRateLimit(rateLimitHeaders, openAIModel) : null;
+      const nativeLimit = nativeCodex ? codexRateLimit(rateLimitHeaders, openAIModel, Date.now(), account.quota.codexLimitByModel?.[openAIModel]) : null;
       if (nativeLimit?.retryAfter) retryAfter = Math.max(retryAfter || 0, nativeLimit.retryAfter);
       // REQUEST-SHAPE refusal (2026-11-08): on a subscription login Anthropic serves
       // Opus/Sonnet only to Claude-Code-shaped requests; anything else gets a bare 429
@@ -2267,6 +2292,7 @@ async function forwardRequest(
         recordFailure: false,
         fingerprint: rateLimit.scope === 'unknown' ? rateLimit.fingerprint : null,
         modelScope: rateLimit.modelScope || null,
+        modelWindow: nativeLimit?.modelWindow,
       });
       // C2 REACTIVE CLAIM (2026-11-10): a 429 on the serving lease claims a held
       // reset AT ONCE, not after a full prober sweep. Only on the lease's LOCAL
@@ -2332,6 +2358,7 @@ async function forwardRequest(
       ctx.status = 429;
       if (logDir) writeRequestLog(logDir, reqId, logSections);
       const retryPlan = accountManager.nextRetryForRequest?.(requestInfo, new Set()) || {};
+      if (requestInfo._service) requestInfo._service.denied ||= capacityDenial(retryPlan);
       const willRecoverSoon = Number.isFinite(retryPlan.retryAfterMs);
       const realWaitS = willRecoverSoon ? Math.max(1, Math.ceil(retryPlan.retryAfterMs / 1000)) : 60;
       console.log(`[Maxpool] No route after failover — returning 429 (cause: ${retryPlan.cause || 'unavailable'}, recovers-soon: ${willRecoverSoon})`);
@@ -3055,6 +3082,9 @@ async function forwardRequest(
         const reply = safeJsonParse(buf);
         accountManager.rememberMessageRoute?.(reply?.id, account.provider, requestInfo._routeModel || reply?.model);
       }
+      // A heartbeat already committed SSE. The buffered answer below becomes a
+      // downstream error; settle the placement comparison on that same outcome.
+      if (requestInfo.queueHeartbeatActive && requestInfo._service) requestInfo._service.terminal = 'failed';
       accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
       if (logDir) {
         try {
@@ -4393,6 +4423,7 @@ function isRetriableUpstreamStatus(status) {
 }
 
 function sendErrorResponse(res, requestInfo, status, payload, headers = {}) {
+  if (requestInfo?._service) requestInfo._service.terminal = 'failed';
   if (requestInfo.queueHeartbeatActive || res.headersSent) {
     clearQueueHeartbeat(requestInfo);
     if (!res.destroyed && !res.writableEnded) {
@@ -4582,6 +4613,7 @@ async function queueAndRetryInner(
   // Weekly-capped but the reset time is unknown (cold start / probe failure):
   // we can't estimate a wait, so don't pretend to — error honestly now.
   if (retryPlan.cause === 'weekly_reset_unknown') {
+    if (requestInfo._service) requestInfo._service.denied = 'unclassifiedDenied';
     return giveUp(honestMessage);
   }
 
@@ -4650,6 +4682,7 @@ async function queueAndRetryInner(
     maxQueuedBytes: queueConfig.maxQueuedBytes,
   });
   if (ticket === null) {
+    if (requestInfo._service) requestInfo._service.denied = 'unclassifiedDenied';
     // Backpressure: too many requests already waiting / too many bytes buffered.
     // Reject honestly instead of growing the heap unbounded.
     return giveUp('Maxpool queue is full — too many requests are already waiting for capacity. Try again shortly.');
@@ -4670,7 +4703,10 @@ async function queueAndRetryInner(
   console.log(`[Maxpool] ${reason}; queueing request for up to ${Math.ceil(remaining / 1000)}s (cause: ${cause}, retry: ${retryPlan.cause}${requestInfo.queueHoldChain ? ', hold-chain: reset beyond window' : ''})`);
   ensureQueueHeartbeat(res, requestInfo, queueConfig, accountManager);
 
+  requestInfo._service?.wait();
   const available = await waitForAvailableRoute(req, res, accountManager, requestInfo, queueConfig, remaining);
+  requestInfo._service?.resume();
+  if (!available && requestInfo._service) requestInfo._service.denied ||= capacityDenial(retryPlan);
   if (!available) {
     accountManager.removeQueuedRequest?.(requestInfo);
     return giveUp(honestMessage);
@@ -4789,6 +4825,7 @@ function clearQueueHeartbeat(requestInfo) {
 
 function finishQueuedStreamIfNeeded(res, requestInfo, message) {
   if (!requestInfo.queueHeartbeatActive) return false;
+  if (requestInfo._service) requestInfo._service.terminal = res.destroyed ? 'cancelled' : 'failed';
   clearQueueHeartbeat(requestInfo);
   if (!res.destroyed && !res.writableEnded) {
     res.write(`event: error\ndata: ${JSON.stringify({
@@ -5764,6 +5801,7 @@ function noteCapacityUsage(requestInfo, usage, withOutput) {
   requestInfo._capacityInput = Math.max(requestInfo._capacityInput || 0, usage?.input_tokens || 0);
   if (withOutput) requestInfo._capacityOutput = Math.max(requestInfo._capacityOutput || 0, usage?.output_tokens || 0);
   noteCapacityCache(requestInfo, usage);
+  noteRoutingUsage(requestInfo._service, requestInfo);
 }
 
 /** Pure: the usage object at the END of a JSON message body, from its tail (the body
@@ -5791,8 +5829,17 @@ function tapLinkUsage(chunk, requestInfo) {
   if (requestInfo.isCountTokens) return;
   if (!requestInfo.stream) {
     if (chunk) {
-      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + Buffer.from(chunk).toString()).slice(-64 * 1024);
+      const text = Buffer.from(chunk).toString();
+      if (requestInfo._service) {
+        requestInfo._linkedEnvelope ??= new LinkedMessageEnvelope();
+        requestInfo._linkedEnvelope.push(text);
+      }
+      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + text).slice(-64 * 1024);
       return;
+    }
+    if (requestInfo._linkedEnvelope) {
+      noteMessageBody(requestInfo, requestInfo._linkedEnvelope.message());
+      delete requestInfo._linkedEnvelope;
     }
     const u = usageFromBodyTail(requestInfo._tapBuf);
     requestInfo._tapBuf = '';
@@ -5807,6 +5854,7 @@ function tapLinkUsage(chunk, requestInfo) {
     if (!dataLine) continue;
     let data;
     try { data = JSON.parse(dataLine.slice(6)); } catch { continue; }
+    noteMessageEvent(requestInfo, data);
     const u = usageFromSseData(data);
     if (u) noteCapacityUsage(requestInfo, u, data.type === 'message_delta');
   }
@@ -5828,6 +5876,7 @@ function parseSSEEvent(event, accountIndex, accountManager, requestInfo = {}) {
 
   try {
     const data = JSON.parse(dataLine.slice(6));
+    noteMessageEvent(requestInfo, data);
     // THREAD OWNERSHIP: message_start carries the reply's own id — the id the client
     // will continue from (previous_message_id). Capture it on the SERVING account so
     // the gate can judge the next continue by thread identity instead of by terminal.
@@ -5898,6 +5947,7 @@ function classifyHeldStreamPrefix(prefix) {
 function extractUsageFromBody(buffer, accountIndex, accountManager, requestInfo = {}) {
   try {
     const json = JSON.parse(buffer.toString());
+    noteMessageBody(requestInfo, json);
     // THREAD OWNERSHIP: a non-streaming reply's own id is the next continue's anchor.
     if (typeof json.id === 'string') captureThreadReply(requestInfo, json.id);
     if (json.usage) {

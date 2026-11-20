@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { routingSources } from './routing-report.js';
 import { TANK_MIN_UTIL } from './capacity-ledger.js';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -3892,6 +3893,18 @@ export class TUI {
 
   _keyAnalytics(k) {
     const state = this.analytics;
+    if (state.routing) {
+      if (k === 'esc' || k === 'q' || k === 'r') { state.routing = false; state.scroll = 0; }
+      else if (k === 't') { state.period = ({ '1h': '24h', '24h': '7d', '7d': '1h' })[state.period]; state.scroll = 0; }
+      else if (k === 'w') { state.worker = (state.worker + 1) % routingSources(this.am, Date.now()).length; state.scroll = 0; }
+      else if (k === 'up' || k === 'k') state.scroll = Math.max(0, state.scroll - 1);
+      else if (k === 'down' || k === 'j') state.scroll++;
+      return;
+    }
+    if (k === 'r' && !state.detail) {
+      Object.assign(state, { routing: true, period: '24h', worker: 0, scroll: 0 });
+      return;
+    }
     if (k === 'esc' || k === 'q') {
       if (state.detail) { state.detail = false; state.scroll = 0; }
       else this.mode = state.back;
@@ -3914,6 +3927,7 @@ export class TUI {
 
   _renderAnalyticsPage(W, H) {
     const state = this.analytics;
+    if (state.routing) return this._renderRoutingPage(W, H);
     const rows = this._analyticsRows();
     state.selected = Math.max(0, Math.min(state.selected, rows.length - 1));
     const selected = state.detail && rows.find(row => (row.account || row.name) === state.detail);
@@ -3946,11 +3960,96 @@ export class TUI {
       lines.push(dim(' All = since tracking. * = incomplete or estimated.'));
       if (rows.length > visible) lines.push(dim(` ${state.selected + 1} of ${rows.length}`));
       footer = ` ↑↓ Select  Enter Detail  p ${state.providers ? 'Accounts' : 'Providers'}  Esc Back`;
-      if (W < footer.length) footer = ` ↑↓  Enter Detail  p ${state.providers ? 'Accounts' : 'Providers'}  Esc Back`;
+      footer = ' r Routing ' + footer;
+      if (W < footer.length) footer = ' r Routing  ↑↓  Enter  p Group  Esc Back';
     }
     while (lines.length < H - 1) lines.push('');
     lines.push(footer);
     return lines;
+  }
+
+  _renderRoutingPage(W, H) {
+    const state = this.analytics;
+    const sources = routingSources(this.am, Date.now());
+    const source = sources[state.worker] || sources[0];
+    const report = source.report;
+    const m = report?.service?.[state.period];
+    const lines = [];
+    const number = n => Number.isFinite(n) ? n.toLocaleString('en-US') : '—';
+    const share = (n, d = 1) => Number.isFinite(n) && d > 0 ? (100 * n / d).toFixed(1) + '%' : '—';
+    const time = n => !Number.isFinite(n) ? '—' : n < 1000 ? n + 'ms' : (n / 1000).toFixed(1) + 's';
+    const safe = value => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
+    const date = n => Number.isFinite(n) && n > 0 && n < 8.64e15 ? new Date(n).toISOString().slice(0, 16).replace('T', ' ') : '—';
+    if (!m) lines.push(dim(' Routing telemetry unavailable from this worker.'));
+    else {
+      lines.push(bold(' Timely completions  ' + share(m.timelyCompleted, m.requests))
+        + '  ' + number(m.timelyCompleted) + ' / ' + number(m.requests));
+      lines.push(dim(' Completed successfully with ≤' + time(m.waitTargetMs) + ' router wait, per finalized request.'));
+      lines.push(' Arrivals ' + number(m.arrivals) + '   In progress ' + number(m.active)
+        + '   Failed ' + number(m.failed) + '   Cancelled ' + number(m.cancelled) + '   Incomplete ' + number(m.incomplete));
+      lines.push(' Queue wait  p90 ≤' + time(m.waitP90Ms) + '   p95 ≤' + time(m.waitP95Ms)
+        + '   Queued ' + number(m.queuedRequests));
+      if (m.queuedRequests > 0) lines.push(' Among queued requests  p95 ≤' + time(m.queuedWaitP95Ms));
+      lines.push(' Serving ' + number(m.serving) + '   Peak requests ' + number(m.peakServing)
+        + '   Peak identified sessions ' + number(m.peakSessions));
+      lines.push(' Capacity denials ' + number(m.capacityDenied) + '   Input served from cache ' + share(m.cachedInputTokens, m.inputTokens));
+      if (m.capacityDenied > 0) {
+        lines.push('   Weekly ' + number(m.weeklyDenied) + '   Session ' + number(m.sessionDenied)
+          + '   Concurrency ' + number(m.concurrencyDenied) + '   Other ' + number(m.unclassifiedDenied));
+      }
+      lines.push(dim(' Observed hours  ' + date(m.from) + ' to ' + date(m.to) + ' UTC'));
+      lines.push(dim(' History · ' + (m.completeCoverage ? 'continuous coverage' : 'partial coverage') + ' · since ' + date(m.coverageSince) + ' UTC'));
+      if (report.placement) {
+        const p = report.placement;
+        lines.push(' New-chat comparison since boot  ' + number(p.disagreed) + ' differed / ' + number(p.comparable) + ' comparable');
+      }
+      if (Array.isArray(m.accounts) && m.accounts.length) {
+        lines.push('', bold(' Finalized requests by account'), dim(' Includes forwarded requests handled here.'));
+        for (const a of m.accounts) {
+          lines.push(' ' + safe(a.name) + '  ' + number(a.timelyCompleted) + '/' + number(a.requests)
+            + ' timely  ·  p95 ≤' + time(a.waitP95Ms) + '  ·  peak ' + number(a.peakServing));
+          if (a.concurrencyDenied > 0) lines.push(dim('   Concurrency refusals ' + number(a.concurrencyDenied)));
+        }
+      }
+      lines.push('', bold(' Unused quota at reset · by account'));
+      const meaning = { 'eligible-demand-served-elsewhere': 'eligible work served elsewhere', 'no-observed-demand': 'no work observed here',
+        'fully-used': 'fully used', 'unattributed': 'cause undetermined', 'unknown': 'insufficient evidence' };
+      const missing = { 'stale-reading': 'last reading too old', 'replaced-before-reset': 'window changed early',
+        'conflicting-reset': 'conflicting reset times', 'disabled': 'account disabled', 'refill': 'quota refilled' };
+      for (const row of Array.isArray(report.quotas) ? report.quotas : []) {
+        lines.push(' ' + safe(row.name) + '  ·  ' + (row.window === 'ses' ? '5h only' : row.window === 'wk' ? 'weekly' : 'window unknown'));
+        const cycles = Array.isArray(row.cycles) ? row.cycles : [];
+        if (!cycles.length) lines.push(dim('   Awaiting a measured reset.'));
+        for (const c of cycles) {
+          const detail = c.unusedFraction == null ? (missing[c.reason] || 'insufficient evidence') : (meaning[c.attribution] || 'cause undetermined');
+          lines.push('   ' + date(c.resetAt) + ' UTC  ' + share(c.unusedFraction) + '  ' + detail
+            + (c.alternativeTurns > 0 ? ' (' + number(c.alternativeTurns) + ')' : ''));
+        }
+      }
+      lines.push(dim(' Unused is estimated from peak usage and a fresh reading before reset.'));
+      if (Array.isArray(report.daily) && report.daily.length) {
+        lines.push('', bold(' Timely completions by UTC day'));
+        for (const d of report.daily) {
+          lines.push(' ' + date(d.day).slice(0, 10) + '   ' + number(d.timelyCompleted) + '/' + number(d.requests)
+            + '   ' + share(d.timelyCompleted, d.requests) + '   denials ' + number(d.capacityDenied));
+        }
+      }
+      const sizing = report.provisioning;
+      if (sizing) {
+        lines.push('', bold(' Additional accounts'));
+        lines.push(sizing.status === 'no-observed-demand' ? ' 0 for demand observed in the last three full weeks.' : ' Insufficient evidence for a subscription count.');
+        lines.push(dim(' ' + number(sizing.coveredWeeks) + '/' + number(sizing.sampledWeeks) + ' weeks observed continuously; '
+          + number(sizing.weeklyDenied) + ' weekly denials of ' + number(sizing.capacityDenied) + ' capacity denials.'));
+        if (sizing.status !== 'no-observed-demand') lines.push(dim(' Need unmet weekly workload and comparable plan yield.'));
+      }
+    }
+    const header = bold(' Routing analytics · ' + safe(source.name) + ' · ' + state.period) + (source.stale ? yellow(' · stale') : '');
+    const height = Math.max(1, H - 2);
+    state.scroll = Math.min(Math.max(0, lines.length - height), state.scroll);
+    const view = [header, ...lines.slice(state.scroll, state.scroll + height)];
+    while (view.length < H - 1) view.push('');
+    view.push(W < 62 ? ' ↑↓ Scroll  t Time  w Worker  Esc Back' : ' ↑↓ Scroll   t Time window   w Worker   Esc Back');
+    return view;
   }
 
   _analyticsDetail(row, W) {

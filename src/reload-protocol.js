@@ -26,6 +26,7 @@ export const MSG_PROBE_READY = 'probe-ready'; // ask a headless worker to confir
 // Worker → supervisor
 export const MSG_RELOAD_REQUEST = 'reload-request'; // primary worker asks for a seamless reload
 export const MSG_READY = 'ready';         // headless worker booted new code successfully
+export const MSG_STOPPING = 'stopping';   // operator shutdown; the worker is draining
 export const MSG_FAILED = 'failed';       // worker failed to boot/bind/restore
 export const MSG_RELEASED = 'released';   // old worker stopped accepting + writing, flushed
 export const MSG_PRIMARY = 'primary';     // new worker is now sole acceptor + lease holder
@@ -35,11 +36,12 @@ export const MSG_CONN = 'conn';           // (with socket) supervisor-accepted c
 /**
  * Outcome codes for a reload attempt, surfaced to the supervisor so it can log
  * and decide fallback. SWAPPED = fully cut over; ROLLED_BACK = old worker stays
- * primary (no disruption); FALLBACK = abrupt exit-75 restart path taken.
+ * primary (no disruption); FALLBACK = abrupt restart; STOPPED = operator quit.
  */
 export const RELOAD_SWAPPED = 'swapped';
 export const RELOAD_ROLLED_BACK = 'rolled-back';
 export const RELOAD_FALLBACK = 'fallback';
+export const RELOAD_STOPPED = 'stopped';
 
 /**
  * Drive the baton handshake over two worker "channels" (anything with
@@ -64,6 +66,7 @@ export async function runReloadBaton({
   newWorker,
   handle,
   prepareHandle = async h => h,
+  shutdownRequested = () => false,
   readyTimeoutMs = 10_000,
   releaseTimeoutMs = 20_000,
   takeoverTimeoutMs = 10_000,
@@ -119,6 +122,7 @@ export async function runReloadBaton({
   try {
     liveHandle = await prepareHandle(handle);
   } catch (err) {
+    if (shutdownRequested()) return RELOAD_STOPPED;
     log(`reload: could not re-arm listening socket (${err.message}); falling back`);
     return RELOAD_FALLBACK;
   }
@@ -126,9 +130,12 @@ export async function runReloadBaton({
   // (d) New worker takes over: it becomes the SOLE acceptor (old already closed)
   //     and ACQUIRES the writer lease (refresh/probe/persist re-enabled) + TUI.
   try {
+    if (shutdownRequested()) return RELOAD_STOPPED;
     newWorker.send({ type: MSG_TAKEOVER }, liveHandle);
-    await newWorker.waitFor([MSG_PRIMARY], takeoverTimeoutMs);
+    const reply = await newWorker.waitFor([MSG_PRIMARY, MSG_STOPPING], takeoverTimeoutMs);
+    if (reply.type === MSG_STOPPING || shutdownRequested()) return RELOAD_STOPPED;
   } catch (err) {
+    if (shutdownRequested()) return RELOAD_STOPPED;
     // The new worker failed to start accepting after the old already released.
     // Neither is accepting now — fall back so the supervisor force-restarts and
     // a worker comes back up on the supervisor-owned socket (queued conns drain).

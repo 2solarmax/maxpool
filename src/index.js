@@ -18,12 +18,14 @@ import { stat } from 'node:fs/promises';
 import { unlinkSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { RoutingServiceAnalytics } from './routing-service-analytics.js';
+import { RoutingCapacityAnalytics } from './routing-capacity-analytics.js';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, writeCapacityDrain, readCapacityDrains, acknowledgeCapacityDrains } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setConsoleNonBlocking, reassertConsoleNonBlocking, appendEventLog, printFatal } from './event-log.js';
 import { codexPoolEndpoint, sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
 import { fetchRemoteStatus } from './pool-link.js';
 import { SleepGuard } from './sleep-guard.js';
-import { controllingTerminalAlive } from './terminal-alive.js';
+import { controllingTerminalAlive, terminalOutputAlive } from './terminal-alive.js';
 import { AccountManager, combineEfficiency } from './account-manager.js';
 import { sessionCapCommand } from './session-cap.js';
 import { cacheUsageLabel } from './usage-label.js';
@@ -56,9 +58,9 @@ import { applyTuiAccountChange, canPersistOAuthRefresh, findAccountConfigIndex, 
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
-  RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
+  RELOAD_SWAPPED, RELOAD_ROLLED_BACK, RELOAD_STOPPED,
   MSG_LISTEN, MSG_RELEASE, MSG_TAKEOVER, MSG_PROBE_READY,
-  MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
+  MSG_RELOAD_REQUEST, MSG_READY, MSG_STOPPING, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
   MSG_TTY_REASSERT, MSG_CONN, describeOldWorkerExit, makeWorkerChannel, rollbackNoticeAction,
 } from './reload-protocol.js';
 
@@ -106,6 +108,10 @@ const SERVER_RESPAWNED_WORKER_ENV = 'MAXPOOL_RESPAWNED_WORKER';
 // lets the (non-pty) test suite exercise the terminal-hangup path deterministically.
 function isInteractiveTerminal() {
   return Boolean(process.stdout.isTTY) || process.env.MAXPOOL_FORCE_TTY === '1';
+}
+
+function shutdownDrainMs(config) {
+  return Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
 }
 
 // Wire up the persistent event log (default-on; disable with `eventLog: false` in
@@ -314,8 +320,11 @@ async function supervisorCommand() {
   // ignores SIGINT/SIGTERM itself (the worker drains + exits, ending the turn).
   let activeWorker = null;
   const forwardSignal = sig => { try { activeWorker?.child.kill(sig); } catch { /* ignore */ } };
-  process.on('SIGINT', () => { /* delivered to the worker by the TTY group */ });
-  process.on('SIGTERM', () => { /* delivered to the worker by the TTY group */ });
+  // A legacy successor cannot announce its shutdown. If it exits 1 on a
+  // not-yet-listening server, the foreground group signal explains that exit.
+  const noteGroupStop = () => { if (acceptTarget) acceptTarget.sawStopSignal = true; };
+  process.on('SIGINT', noteGroupStop);
+  process.on('SIGTERM', noteGroupStop);
   // SIGHUP: in a terminal, a window hangup delivers SIGHUP to the whole foreground
   // group, so the worker ALSO received it and (interactive) is already shutting
   // itself down — the supervisor must NOT forward a second signal, or the worker
@@ -323,7 +332,18 @@ async function supervisorCommand() {
   // exit is then misread as a crash → respawn into a headless orphan, the exact
   // bug). Only forward in headless/service mode, where SIGHUP is the conventional
   // reload trigger and reaches the supervisor alone.
-  process.on('SIGHUP', () => { if (!isInteractiveTerminal()) forwardSignal('SIGHUP'); });
+  process.on('SIGHUP', () => {
+    if (!isInteractiveTerminal()) { forwardSignal('SIGHUP'); return; }
+    const worker = acceptTarget;
+    if (!worker || worker.terminalClosed || terminalOutputAlive()) return;
+    // The foreground terminal really closed during takeover. Give the worker
+    // its configured shutdown drain. Some legacy workers block in open(/dev/tty)
+    // when the pty is revoked and can never announce or complete that drain.
+    worker.terminalClosed = true;
+    const deadline = setTimeout(() => worker.child.kill('SIGKILL'), shutdownDrainMs(config));
+    deadline.unref();
+    worker.child.once('exit', () => clearTimeout(deadline));
+  });
   // A dead controlling terminal (window closed) makes writes to stdout/stderr emit
   // EPIPE/EIO — swallow them so a shutdown-time log can't crash the supervisor.
   process.stdout.on('error', () => {});
@@ -414,12 +434,12 @@ async function supervisorCommand() {
     worker.child.once('exit', (code, signal) => {
       // Only the worker that is STILL active when it exits ends the turn. A
       // reaped old worker (already swapped out) exiting must be ignored here.
-      if (activeWorker === worker) endTurn?.({ code, signal });
+      if (activeWorker === worker && !worker.releasedForTakeover) endTurn?.({ code, signal });
     });
     // A spawn-time failure (EMFILE/EAGAIN under load) surfaces as 'error', not
     // 'exit' — treat it as a crashed turn so backoff handles it (M5).
     worker.child.once('error', err => {
-      if (activeWorker === worker) endTurn?.({ code: 1, signal: null, spawnError: err.message });
+      if (activeWorker === worker && !worker.releasedForTakeover) endTurn?.({ code: 1, signal: null, spawnError: err.message });
     });
   };
 
@@ -447,19 +467,38 @@ async function supervisorCommand() {
     };
     try {
       newWorker = spawnWorker({ reload: true });
+      // A stop can arrive before the baton starts waiting for PRIMARY.
+      newWorker.child.on('message', msg => {
+        if (msg?.type === MSG_READY) newWorker.reportsShutdown = msg.reportsShutdown === true;
+        if (msg?.type === MSG_STOPPING) newWorker.stopping = true;
+      });
       // Hold the new worker's spawn-error so a fork failure mid-baton becomes a
       // clean ROLLED_BACK/FALLBACK instead of crashing the supervisor (M5).
       newWorker.child.once('error', () => { /* surfaced via waitFor reject */ });
       const outcome = await runReloadBaton({
         oldWorker,
         newWorker,
+        // Only consulted after RELEASED. Old workers lack the shutdown message:
+        // q or a hangup exits 0, and a group stop before listen can instead
+        // make their server.close() fail and exit 1.
+        shutdownRequested: () => newWorker.stopping || newWorker.terminalClosed ||
+          (!newWorker.reportsShutdown && (newWorker.child.exitCode === 0 ||
+            (newWorker.sawStopSignal && newWorker.child.exitCode === 1))),
         handle: masterHandle(),
         // After the OLD worker has released its fd, re-arm the supervisor's own
         // listener to cover the cutover gap, then hand THAT live handle to the
         // new worker. The new worker's MSG_PRIMARY then closes it again.
         // The old worker has released, so gap-accepted connections now belong to the
         // incoming worker (before this point the still-serving old one is the target).
-        prepareHandle: async () => { acceptTarget = newWorker; await relistenMaster(); return masterHandle(); },
+        prepareHandle: async () => {
+          // RELEASED is acknowledged before this callback. The old worker can
+          // finish its drain before PRIMARY arrives. The baton now owns recovery
+          // if takeover fails; that outgoing exit cannot end supervision.
+          oldWorker.releasedForTakeover = true;
+          acceptTarget = newWorker;
+          await relistenMaster();
+          return masterHandle();
+        },
         // Generous, env-tunable readiness/takeover budgets — the 10s default rolled back
         // on this user's loaded Mac (the update never landed). See RELOAD_READY_MS.
         readyTimeoutMs: RELOAD_READY_MS,
@@ -468,6 +507,13 @@ async function supervisorCommand() {
         reloadId,
       });
 
+      if (outcome === RELOAD_STOPPED) {
+        if (activeWorker === oldWorker && endTurn === turnEnd) {
+          reapOldWorker(oldWorker);
+          turnEnd?.({ code: 0, signal: null });
+        }
+        return;
+      }
       if (outcome === RELOAD_SWAPPED) {
         // Re-point monitoring to the new worker (it's now primary), THEN reap the
         // old one. Order matters: monitorAsActive sets activeWorker=new so the
@@ -596,7 +642,8 @@ function reapOldWorker(worker, onExited = () => {}) {
     finish();
   }, cap);
   timer.unref?.();
-  worker.child.once('exit', finish);
+  if (worker.child.exitCode !== null || worker.child.signalCode !== null) finish();
+  else worker.child.once('exit', finish);
 }
 
 // Test seam (gated: inert unless a MAXPOOL_TEST_* variable is set). '1' fires every
@@ -665,6 +712,7 @@ async function serverWorkerCommand() {
 
   const threshold = config.switchThreshold || 0.90;
   const accountManager = new AccountManager(accounts, threshold, config.scheduler || {});
+  accountManager.routingService.setServing(false);
   // The EXECUTING build: a disk read taken NOW, before any self-install can rewrite
   // package.json. Fire-and-forget — the status endpoint reports null until it lands
   // (milliseconds), never a wrong number.
@@ -698,6 +746,8 @@ async function serverWorkerCommand() {
   // A reload worker restores quota IN-MEMORY only (state file handed via the
   // lease holder); a cold/direct worker reads the on-disk state file.
   const savedState = await loadState();
+  accountManager.routingService.restoreState(savedState?.routingService);
+  accountManager.routingCapacity.restore(savedState?.routingCapacity);
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
   accountManager.restoreSessionProviders(savedState?.sessionProviders);
   accountManager.restoreNativeCodexConversationOwners(savedState?.nativeCodexConversationOwners);
@@ -805,16 +855,24 @@ async function serverWorkerCommand() {
   // learned-quota flush is silently dropped — the new worker would boot from up-to-
   // 60s-stale quota and the state generation would never advance across a reload.
   let capacityFlushSnapshot = null;
+  let routingFlushSnapshot = null;
+  let quotaAnalyticsFlushSnapshot = null;
   let quotaPersistChain = Promise.resolve();
   const persistQuotaState = (force = false, snapshotForDrain = false) => {
     if (!hasLease && !force) return Promise.resolve();
     const persist = async () => {
       const ledger = accountManager.capacity;
-      const drains = await readCapacityDrains(ledger);
+      const drains = await readCapacityDrains(ledger, getStatePath(), accountManager);
       const capacity = ledger.serialize();
       // Use the exact snapshot passed to the disk writer. Requests can finish
       // while the asynchronous write is in flight.
-      if (snapshotForDrain) capacityFlushSnapshot = capacity;
+      const routingService = accountManager.routingService.exportState();
+      const routingCapacity = accountManager.routingCapacity.serialize();
+      if (snapshotForDrain) {
+        capacityFlushSnapshot = capacity;
+        routingFlushSnapshot = routingService;
+        quotaAnalyticsFlushSnapshot = routingCapacity;
+      }
       const expectedGeneration = force ? null : stateGeneration;
       const written = await saveState(
         {
@@ -830,6 +888,8 @@ async function serverWorkerCommand() {
           // OPEN cycle must persist or a mid-cycle restart records a near-empty cycle as
           // a real capacity observation and poisons the averages forever (B1).
           capacity,
+          routingService,
+          routingCapacity,
           // SC22 per-person analytics — same generation-guarded payload, survives
           // restarts and seamless reloads.
           callerStats: accountManager.exportCallerStats?.() || {},
@@ -854,7 +914,11 @@ async function serverWorkerCommand() {
   };
   const publishCapacityDrain = async () => {
     if (capacityFlushSnapshot) {
-      await writeCapacityDrain(CapacityLedger.drainDelta(capacityFlushSnapshot, accountManager.capacity.serialize()));
+      const delta = CapacityLedger.drainDelta(capacityFlushSnapshot, accountManager.capacity.serialize());
+      const after = accountManager.routingService.exportState();
+      delta.routingService = RoutingServiceAnalytics.drainDelta(routingFlushSnapshot, after);
+      delta.routingCapacity = RoutingCapacityAnalytics.drainDelta(quotaAnalyticsFlushSnapshot, accountManager.routingCapacity.serialize());
+      await writeCapacityDrain(delta);
     }
   };
 
@@ -889,6 +953,7 @@ async function serverWorkerCommand() {
       return value;
     },
   });
+  accountManager.codexResetOpportunity = (account, now) => codexReset.expiringOpportunity(account, now);
   const prober = new Prober(accountManager, {
     intervalMs: probeSeconds * 1000, log: uiLog,
     onCodexQuota: account => hasLease ? codexReset.maybeRedeemForPool([account]) : null,
@@ -1098,7 +1163,7 @@ async function serverWorkerCommand() {
   // 'q' / Ctrl-C / SIGTERM actually quits under a continuous request flood
   // (where there are always active requests) instead of waiting indefinitely.
   // A second signal forces an immediate exit. Override via config.shutdown.drainTimeoutMs.
-  const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
+  const drainTimeoutMs = shutdownDrainMs(config);
   const hooks = {
     redeemCodexForRequest: info => {
       if (!hasLease) return null;
@@ -1143,9 +1208,10 @@ async function serverWorkerCommand() {
     // the current on-disk generation.
     try { stateGeneration = await readGeneration(getStatePath()); } catch { /* keep prior */ }
     hasLease = true;
+    accountManager.routingService.setServing(true);
     accountManager.setWriterLease(true);
     // Recover any completed drain that survived a restart before the first repaint.
-    await readCapacityDrains(accountManager.capacity).catch(err => console.error('[Maxpool] Could not recover capacity drain:', err.message));
+    await readCapacityDrains(accountManager.capacity, getStatePath(), accountManager).catch(err => console.error('[Maxpool] Could not recover capacity drain:', err.message));
     if (!quotaSaveInterval) {
       quotaSaveInterval = setInterval(() => { persistQuotaState(); }, 60_000);
       quotaSaveInterval.unref?.();
@@ -1160,6 +1226,7 @@ async function serverWorkerCommand() {
   const releaseLease = async () => {
     if (!hasLease) return;
     hasLease = false;
+    accountManager.routingService.setServing(false);
     if (quotaSaveInterval) { clearInterval(quotaSaveInterval); quotaSaveInterval = null; }
     accountManager.setWriterLease(false);
     sleepGuard.stop(); // release the wake — only the active lease-holder keeps the Mac awake
@@ -1368,6 +1435,9 @@ async function serverWorkerCommand() {
   }
 
   const shutdownGracefully = (reason, options = {}) => {
+    if (supervised && isReloadWorker && process.connected && !options.restart) {
+      try { process.send({ type: MSG_STOPPING }, () => {}); } catch { /* supervisor gone */ }
+    }
     // A terminal-close shutdown must NEVER exit non-zero: the supervisor reads a
     // fast non-zero exit as a crash and respawns a fresh worker — onto the now-dead
     // terminal, re-creating the headless orphan. So even a drain-timeout or close
@@ -1673,6 +1743,8 @@ async function serverWorkerCommand() {
     // The old worker could serve a first turn or evict an old conversation after
     // our headless boot. Adopt its final ownership maps before serving any socket.
     const finalState = await loadState();
+    accountManager.routingService.restoreState(finalState?.routingService);
+    accountManager.routingCapacity.restore(finalState?.routingCapacity);
     if (finalState?.capacity) {
       accountManager.restoreCapacityState(finalState.capacity);
       accountManager.restoreAccountCacheHours(finalState.efficiencyHours);
@@ -1860,10 +1932,10 @@ async function serverWorkerCommand() {
             // readiness timeout ('timeout' rollback).
           } else if (Number(process.env.MAXPOOL_TEST_RELOAD_READY_DELAY_MS) > 0) {
             // Test seam: a new build that reports ready only after a delay.
-            setTimeout(() => { try { process.send({ type: MSG_READY }); } catch { /* gone */ } },
+            setTimeout(() => { try { process.send({ type: MSG_READY, reportsShutdown: true }); } catch { /* gone */ } },
               Number(process.env.MAXPOOL_TEST_RELOAD_READY_DELAY_MS));
           } else {
-            process.send({ type: MSG_READY });
+            process.send({ type: MSG_READY, reportsShutdown: true });
           }
         } else if (msg?.type === MSG_TAKEOVER && handle) {
           // Baton acquire: the old worker already released, so we're the SOLE

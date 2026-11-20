@@ -93,6 +93,9 @@ test('native Responses preserve the wire and report cache-aware usage to the ser
   assert.deepEqual({ cr, cc, promptTokens, hit }, { cr: 3, cc: 2, promptTokens: 8, hit: 0.375 });
   assert.deepEqual(am.accountCacheWindows(am.accounts[0]).windows.all,
     { input: 3, cacheRead: 3, cacheWrite: 2, output: 4, hit: 3 / 8, partial: false });
+  const service = am.routingService.snapshot();
+  assert.deepEqual([service.requests, service.completed, service.timelyCompleted, service.inputTokens, service.cachedInputTokens],
+    [1, 1, 1, 8, 3]);
   const saved = am.exportNativeCodexConversationOwners();
   const restored = new AccountManager([native('a'), native('b')]);
   restored.restoreNativeCodexConversationOwners(saved);
@@ -193,6 +196,8 @@ test('catalog and compact use exact native operations and retain the listed Code
   });
   assert.equal(compactResponse.status, 200);
   assert.deepEqual(await compactResponse.json(), compacted);
+  const measured = am.routingService.snapshot();
+  assert.deepEqual([measured.arrivals, measured.requests, measured.completed, measured.inputTokens], [1, 1, 1, 15]);
   assert.equal(calls[1].url, 'https://chatgpt.com/backend-api/codex/responses/compact');
   assert.deepEqual(JSON.parse(calls[1].body), requestBody);
   assert.equal(am.accounts[0].usage.totalRequests, 1, 'the headerless compact response is still counted');
@@ -269,31 +274,33 @@ test('a re-provisioned workspace cannot receive encrypted state from the old wor
   assert.equal(calls.length, 1);
 });
 
-test('a native model cap preserves the upstream reset error and keeps other models usable', async t => {
-  const resetAt = Math.ceil(Date.now() / 1000) + 1800;
-  const quotaError = { error: { type: 'usage_limit_reached', resets_at: resetAt, plan_type: 'pro' } };
-  const { url, calls, am } = await createFixture(t, {
-    accounts: [native('a', [{ slug: body.model }, { slug: 'gpt-6-luna' }])],
-    upstream(_pathname, _init, observed) {
-      if (observed.length === 1) return new Response(JSON.stringify(quotaError), { status: 429, headers: {
-        'x-codex-active-limit': 'premium', 'x-codex-premium-primary-used-percent': '100',
-        'x-codex-premium-primary-window-minutes': '10080', 'x-codex-premium-primary-reset-at': String(resetAt),
-      } });
-      return streamed();
-    },
+for (const [minutes, field] of [['300', 'codexScopedFiveHour'], ['10080', 'scopedWeekly']]) {
+  test(`a named ${minutes}-minute Codex cap preserves the reset error and keeps other models usable`, async t => {
+    const resetAt = Math.ceil(Date.now() / 1000) + 1800;
+    const quotaError = { error: { type: 'usage_limit_reached', resets_at: resetAt, plan_type: 'pro' } };
+    const { url, calls, am } = await createFixture(t, {
+      accounts: [native('a', [{ slug: body.model }, { slug: 'gpt-6-luna' }])],
+      upstream(_pathname, _init, observed) {
+        if (observed.length === 1) return new Response(JSON.stringify(quotaError), { status: 429, headers: {
+          'x-codex-active-limit': 'premium', 'x-codex-premium-primary-used-percent': '100',
+          'x-codex-premium-primary-window-minutes': minutes, 'x-codex-premium-primary-reset-at': String(resetAt),
+        } });
+        return streamed();
+      },
+    });
+    const capped = await response(url);
+    assert.equal(capped.status, 429);
+    assert.deepEqual(await capped.json(), quotaError);
+    assert.ok(Number(capped.headers.get('retry-after')) >= 1800);
+    assert.equal(am.accounts[0].quota[field].premium.utilization, 1);
+    assert.equal((await response(url)).status, 429);
+    assert.equal(calls.length, 1);
+    const other = await response(url, { ...body, model: 'gpt-6-luna' });
+    assert.equal(other.status, 200);
+    await other.text();
+    assert.equal(calls.length, 2);
   });
-  const capped = await response(url);
-  assert.equal(capped.status, 429);
-  assert.deepEqual(await capped.json(), quotaError);
-  assert.ok(Number(capped.headers.get('retry-after')) >= 1800);
-  assert.equal(am.accounts[0].quota.scopedWeekly.premium.utilization, 1);
-  assert.equal((await response(url)).status, 429);
-  assert.equal(calls.length, 1);
-  const other = await response(url, { ...body, model: 'gpt-6-luna' });
-  assert.equal(other.status, 200);
-  await other.text();
-  assert.equal(calls.length, 2);
-});
+}
 
 test('a linked native mirror, disabled account, and unsupported model never receive raw native turns', async t => {
   const { url, calls, am } = await createFixture(t, { accounts: [native('cloud'), native('disabled'), native('wrong-model', [{ slug: 'gpt-luna' }])] });
@@ -398,4 +405,15 @@ test('a delayed 401 retries the new authorization without refreshing its grant',
   await accepted.text();
   assert.equal(rotations, 0);
   assert.deepEqual(calls.map(call => call.headers.authorization), ['Bearer upstream-grant-a', 'Bearer browser-reauthorized']);
+});
+
+test('native inference analytics classify terminal errors, incomplete frames and a premature EOF independently of HTTP 200', async t => {
+  const frames = ['response.failed', 'response.incomplete', 'response.created'];
+  const { url, am } = await createFixture(t, { upstream() {
+    return new Response('data: ' + JSON.stringify({ type: frames.shift(), response: {} }) + '\n\n',
+      { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  for (let i = 0; i < 3; i++) await (await response(url, body, { 'thread-id': 'analytics-thread-' + i })).text();
+  const row = am.routingService.snapshot();
+  assert.deepEqual([row.requests, row.completed, row.failed, row.incomplete, row.cancelled], [3, 0, 1, 2, 0]);
 });

@@ -156,6 +156,7 @@ function classify(windows) {
  * @property {number} [unified5hReset] When that window resets, ms epoch.
  * @property {number} [unified7d] Weekly-window utilization, 0-1.
  * @property {number} [unified7dReset] When that window resets, ms epoch.
+ * @property {{slug: string, name: string, utilization: number, resetAt: number|null}[]} [modelFiveHourBuckets] Model-scoped session buckets.
  * @property {{slug: string, name: string, utilization: number, resetAt: number|null}[]} [modelBuckets] Model-scoped weekly buckets.
  */
 
@@ -184,41 +185,12 @@ export function parseCodexQuota(headers) {
     if (account.weekly.resetAt) quota.unified7dReset = account.weekly.resetAt;
   }
 
-  // Model-scoped families. Their weekly reading is the family bucket, carried
-  // alongside the name upstream gave it. Their 5-hour one is picked up below:
-  // on a subscription it is the only 5h this API ever states.
-  /** @type {QuotaWindow|null} */
-  let scopedFiveHour = null;
-  for (const fam of families.values()) {
-    if (!fam.slug) continue;
-    const scoped = classify(fam.windows);
-    // Tightest wins, so the reading is taken before the weekly guard below
-    // drops a family that states a 5h window and no weekly one.
-    if (scoped.fiveHour && (!scopedFiveHour || scoped.fiveHour.utilization > scopedFiveHour.utilization)) {
-      scopedFiveHour = scoped.fiveHour;
-    }
-    if (!scoped.weekly) continue;
-    (quota.modelBuckets ??= []).push({
-      slug: fam.slug,
-      name: fam.name || fam.slug,
-      utilization: scoped.weekly.utilization,
-      resetAt: scoped.weekly.resetAt,
-    });
-  }
-
-  // A subscription's account-wide family states no 5-hour window at all: it
-  // puts the 7-day one in `primary` and zeroes `secondary`, which classify()
-  // drops, correctly, because a zero-length window is how this API says "not
-  // applicable". The only 5h it states sits in a named family, and upstream
-  // returns the same one whatever model was asked for — it is the account's
-  // session window wearing a model's name. So fill the shared bucket from it
-  // when the account-wide family left it empty, and never overwrite a reading
-  // the account-wide family did give: a family bucket barring models it does
-  // not meter would be the one-way ratchet the weekly buckets take such care
-  // to avoid.
-  if (quota.unified5h == null && scopedFiveHour) {
-    quota.unified5h = scopedFiveHour.utilization;
-    if (scopedFiveHour.resetAt) quota.unified5hReset = scopedFiveHour.resetAt;
+  for (const family of families.values()) {
+    if (!family.slug) continue;
+    const { fiveHour, weekly } = classify(family.windows);
+    const identity = { slug: family.slug, name: family.name || family.slug };
+    if (fiveHour) (quota.modelFiveHourBuckets ??= []).push({ ...identity, ...fiveHour });
+    if (weekly) (quota.modelBuckets ??= []).push({ ...identity, ...weekly });
   }
 
   return quota;
@@ -247,17 +219,8 @@ const isSpent = (utilization) => utilization != null && utilization >= 1;
  * cannot serve again until the window resets, so waiting out `retry-after` and
  * asking the SAME account again is futile, however momentary the 429 looked.
  *
- * Every family is read, not just the account-wide one. A subscription states
- * its only 5-hour window inside a NAMED family (see parseCodexQuota), so the
- * account-wide percentages alone would never show a spent session window; and a
- * model-scoped weekly bucket is spent on its own terms, whatever the
- * account-wide reading says.
- *
- * The labels name what is spent, for the log line that follows, and they keep
- * the two scopes apart: `5h` and `weekly` are windows the whole account shares,
- * while `<name> weekly` is one model family's bucket. The caller needs that
- * distinction (see isAccountWideCodexWindow), because only the first kind is a
- * reason to take the account out of rotation.
+ * Bare labels are account-wide. Named labels identify the independent five-hour
+ * or weekly meter. Seeing that meter on a response does not bind unrelated models.
  *
  * @param {Record<string, string>} headers Rate-limit headers from the response.
  * @returns {string[]} One label per spent window, e.g. `['weekly']`.
@@ -267,6 +230,9 @@ export function codexSpentWindows(headers) {
   const spent = [];
   if (isSpent(quota.unified5h)) spent.push('5h');
   if (isSpent(quota.unified7d)) spent.push('weekly');
+  for (const bucket of quota.modelFiveHourBuckets ?? []) {
+    if (isSpent(bucket.utilization)) spent.push(`${bucket.name} 5h`);
+  }
   for (const bucket of quota.modelBuckets ?? []) {
     if (isSpent(bucket.utilization)) spent.push(`${bucket.name} weekly`);
   }
@@ -276,7 +242,7 @@ export function codexSpentWindows(headers) {
 /**
  * Is this `codexSpentWindows` label a window the whole account shares?
  *
- * A model-scoped bucket is always labelled `<name> weekly`, so it can never
+ * A model-scoped bucket always includes its name and duration, so it cannot
  * collide with the two bare labels. The scope matters to the 429 handler: a
  * spent account-wide window refuses every request, so the account is held; a
  * spent model bucket refuses one family only, and holding the account for it
@@ -309,19 +275,28 @@ export function parseCodexActiveLimit(headers) {
   return value ? String(value).trim().toLowerCase() || null : null;
 }
 
-/** A 429 can exhaust one model while other models still have headroom. */
-export function codexRateLimit(headers, model, now = Date.now()) {
+/**
+ * A named reading is evidence for this request only if it matches its active
+ * meter. Headers often advertise other families too. If the active bucket is
+ * absent, use the ordinary 429 retry hint instead of another family's reset.
+ */
+export function codexRateLimit(headers, model, now = Date.now(), knownLimit = null) {
   const quota = parseCodexQuota(headers);
-  const sessionSpent = quota.unified5h >= 1;
-  const weeklySpent = quota.unified7d >= 1;
-  const activeLimit = parseCodexActiveLimit(headers);
-  const scoped = quota.modelBuckets?.find(bucket => bucket.utilization >= 1
-    && (bucket.normalModelSlug === model || bucket.slug === model || bucket.slug === activeLimit));
-  const resetAt = Math.max(sessionSpent ? quota.unified5hReset || 0 : 0,
-    weeklySpent ? quota.unified7dReset || 0 : 0, scoped?.resetAt || 0);
+  const sessionSpent = isSpent(quota.unified5h);
+  const weeklySpent = isSpent(quota.unified7d);
+  const active = parseCodexActiveLimit(headers) || knownLimit;
+  const matches = bucket => isSpent(bucket.utilization)
+    && (active ? bucket.slug === active : bucket.slug === model || bucket.name === model);
+  const session = quota.modelFiveHourBuckets?.find(matches);
+  const weekly = quota.modelBuckets?.find(matches);
+  const scoped = !sessionSpent && !weeklySpent && (weekly || session);
+  // A longer named reset must never lengthen a genuine account-wide cooldown.
+  const resetAt = scoped ? Math.max(session?.resetAt || 0, weekly?.resetAt || 0)
+    : Math.max(sessionSpent ? quota.unified5hReset || 0 : 0, weeklySpent ? quota.unified7dReset || 0 : 0);
   return {
     scope: 'account',
-    modelScope: !sessionSpent && !weeklySpent && scoped ? (scoped.normalModelSlug || scoped.slug) : null,
+    modelScope: scoped ? scoped.slug : null,
+    ...(scoped ? { modelWindow: weekly && (!session || (weekly.resetAt || 0) >= (session.resetAt || 0)) ? 'weekly' : '5h' } : {}),
     retryAfter: resetAt > now ? Math.ceil((resetAt - now) / 1000) : 0,
   };
 }

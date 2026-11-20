@@ -81,6 +81,8 @@ test('native requests, quota, attribution and provider affinity survive compacti
   }, { 'x-maxpool-provider': 'codex' });
   assert.equal(first.status, 200);
   const firstText = await first.text();
+  const service = am.routingService.snapshot();
+  assert.deepEqual([service.arrivals, service.requests, service.completed, service.inputTokens, service.peakSessions], [1, 1, 1, 10, 1]);
   assert.match(firstText, /native fixture completed/);
   assert.match(firstText, /"model":"claude-fable-5-2"/);
   const id = /"id":"(msg_maxpool_codex_[^"]+)"/.exec(firstText)?.[1];
