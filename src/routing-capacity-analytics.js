@@ -1,3 +1,5 @@
+import { InvalidCapacityDrain } from './capacity-drain.js';
+
 // Vendor quota readings describe a subscription even if MaxPool served zero requests.
 // A closing reading is an estimate of headroom at the reset. Usage can still arrive
 // between the last probe and the boundary, including traffic outside MaxPool.
@@ -21,6 +23,16 @@ export function classifyCapacityOpportunity(cycle, demand) {
     return 'no-observed-demand';
   }
   return 'unattributed';
+}
+
+// Preserve a measured idle window after the service ledger's shorter history
+// expires. Complete coverage can establish idle; any observed work disproves it.
+function reconcileCycle(cycle, demandBetween) {
+  if (cycle.attribution !== 'unattributed' && cycle.attribution !== 'no-observed-demand') return;
+  const demand = demandBetween(cycle.startAt, cycle.endedAt);
+  if (demand?.completeCoverage || demand?.arrivals > 0 || demand?.peerArrivals > 0 || demand?.peakOutstanding > 0) {
+    cycle.attribution = classifyCapacityOpportunity(cycle, demand);
+  }
 }
 
 // Size for weekly volume on this worker. The three disjoint trailing weeks end at
@@ -54,7 +66,7 @@ export function provisioningEvidence(demandBetween, now, measuredWeeklyCycles = 
 }
 
 function validObservation(row) {
-  return row && Object.hasOwn(SPAN, row.window) && Number.isFinite(row.observedAt)
+  return row && typeof row.window === 'string' && Object.hasOwn(SPAN, row.window) && Number.isFinite(row.observedAt)
     && Number.isFinite(row.resetAt) && row.resetAt > row.observedAt
     && row.resetAt - row.observedAt <= SPAN[row.window] + STAMP_JITTER
     && Number.isFinite(row.utilization) && row.utilization >= 0 && row.utilization <= 1;
@@ -162,16 +174,39 @@ export class RoutingCapacityAnalytics {
     }
   }
 
-  snapshot(owner, now = Date.now(), demandBetween) {
+  // A late worker can add either coverage or demand. Correct intersecting
+  // cycles before the service evidence ages out, even without a dashboard poll.
+  reconcileDemand(after, service) {
+    let from = Infinity, to = -Infinity;
+    for (const row of Array.isArray(after?.hours) ? after.hours : []) {
+      if (!Number.isSafeInteger(row?.hour)) continue;
+      from = Math.min(from, row.hour);
+      to = Math.max(to, row.hour + 60 * MINUTE);
+    }
+    for (const interval of Array.isArray(after?.coverage) ? after.coverage : []) {
+      if (!Array.isArray(interval) || interval.length !== 2 || !interval.every(Number.isSafeInteger)) continue;
+      from = Math.min(from, interval[0]);
+      to = Math.max(to, interval[1]);
+    }
+    if (to <= from) return;
+    const readDemand = service.demandReader();
+    for (const { cycles } of this.owners.values()) {
+      for (const cycle of cycles) {
+        if (cycle.startAt < to && cycle.endedAt > from) reconcileCycle(cycle, readDemand);
+      }
+    }
+  }
+
+  snapshot(owner, now = Date.now(), demandBetween, limit = Infinity) {
     const rec = this.owners.get(owner);
-    const cycles = (rec?.cycles || []).filter(c => c.endedAt >= now - KEEP_MS).reverse().map(c => {
-      // Worker coverage can catch up after a boundary or a link can be attached.
-      if (c.attribution !== 'unattributed' || !demandBetween) return { ...c };
-      return { ...c, attribution: classifyCapacityOpportunity(c, demandBetween(c.startAt, c.endedAt)) };
-    });
-    const window = rec?.open?.window || cycles[0]?.window || null;
-    const comparable = cycles.filter(c => c.window === window);
+    const recent = (rec?.cycles || []).filter(c => c.endedAt >= now - KEEP_MS).reverse();
+    const window = rec?.open?.window || recent[0]?.window || null;
+    const comparable = recent.filter(c => c.window === window);
     const measured = comparable.filter(c => c.unusedFraction != null);
+    const cycles = recent.slice(0, limit).map(c => {
+      if (demandBetween) reconcileCycle(c, demandBetween);
+      return { ...c };
+    });
     return {
       window, cycles, measuredCycles: measured.length, unknownCycles: comparable.length - measured.length,
       meanUnusedFraction: measured.length ? measured.reduce((sum, c) => sum + c.unusedFraction, 0) / measured.length : null,
@@ -202,18 +237,18 @@ export class RoutingCapacityAnalytics {
 
   mergeDrain(delta, id, now = Date.now()) {
     if (!id || this.appliedDrains.has(id)) return;
-    if (delta?.version !== 1 || !Array.isArray(delta.owners)) throw Error('Invalid routing quota drain');
+    if (delta?.version !== 1 || !Array.isArray(delta.owners)) throw new InvalidCapacityDrain('Invalid routing quota drain');
     const updates = new Map();
     for (const entry of delta.owners) {
-      if (!Array.isArray(entry)) throw Error('Invalid quota drain owner');
+      if (!Array.isArray(entry)) throw new InvalidCapacityDrain('Invalid quota drain owner');
       const [owner, changes] = entry;
-      if (typeof owner !== 'string' || !owner || !Array.isArray(changes) || updates.has(owner)) throw Error('Invalid quota drain owner');
+      if (typeof owner !== 'string' || !owner || !Array.isArray(changes) || updates.has(owner)) throw new InvalidCapacityDrain('Invalid quota drain owner');
       const rec = structuredClone(this.owners.get(owner) || { open: null, cycles: [] });
       for (const change of changes) {
         const row = change?.row;
         if (!validObservation(row) || !usedFraction(row.peakUtilization) || !Number.isFinite(row.freshForMs)
           || !Number.isFinite(row.startAt) || !Number.isSafeInteger(row.alternativeTurns) || row.alternativeTurns < 0
-          || !Number.isSafeInteger(change.addedTurns) || change.addedTurns < 0) throw Error('Invalid quota drain observation');
+          || !Number.isSafeInteger(change.addedTurns) || change.addedTurns < 0) throw new InvalidCapacityDrain('Invalid quota drain observation');
         if (row.resetAt < now - KEEP_MS) continue;
         const open = sameWindow(rec.open, row.window, row.resetAt);
         const existing = open ? rec.open : rec.cycles.find(c => sameWindow(c, row.window, row.resetAt));

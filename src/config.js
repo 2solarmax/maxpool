@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rename, chmod, unlink, lstat, realpath, readdir, rmdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, chmod, unlink, lstat, stat, realpath, readdir, rmdir } from 'node:fs/promises';
 import { DEFAULT_PEAK_PROVIDERS, mergePeakDefaults } from './peak-window.js';
 import { existsSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { copyFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
+import { InvalidCapacityDrain, parseCapacityDrain } from './capacity-drain.js';
 import { SCHEMA_VERSION as CAPACITY_SCHEMA_VERSION } from './capacity-ledger.js';
 
 export function getConfigPath() {
@@ -267,11 +268,20 @@ export async function writeCapacityDrain(delta, statePath = getStatePath()) {
   await atomicWrite(join(statePath + '.drains', id), JSON.stringify(delta));
 }
 
+// Retain the original file and receipt IDs for repairs. A rejected file revision
+// costs only a stat per poll, and a worker restart revalidates it once.
+const rejectedDrainFiles = new WeakMap();
+
 export async function readCapacityDrains(ledger, statePath = getStatePath(), { routingService, routingCapacity } = {}) {
   const dir = statePath + '.drains';
+  let rejected = rejectedDrainFiles.get(ledger);
+  if (!rejected) {
+    rejected = new Map();
+    rejectedDrainFiles.set(ledger, rejected);
+  }
   // A concurrent reader can consume a newly published ID while readdir is in
   // flight. Its receipt must survive until a later directory snapshot.
-  const previous = [ledger.appliedDrains, routingService?.appliedDrains, routingCapacity?.appliedDrains]
+  const previous = [ledger.appliedDrains, routingService?.appliedDrains, routingCapacity?.appliedDrains, rejected]
     .filter(Boolean).map(receipts => [receipts, [...receipts.keys()]]);
   let files;
   try { files = await readdir(dir); }
@@ -290,8 +300,13 @@ export async function readCapacityDrains(ledger, statePath = getStatePath(), { r
   }
   for (const id of ids) {
     if (ledger.appliedDrains.has(id)) continue;
+    let revision;
     try {
-      const delta = JSON.parse(await readFile(join(dir, id), 'utf8'));
+      const path = join(dir, id);
+      const info = await stat(path, { bigint: true });
+      revision = [info.dev, info.ino, info.size, info.ctimeNs, info.mtimeNs].join(':');
+      if (rejected.get(id) === revision) continue;
+      const delta = parseCapacityDrain(await readFile(path, 'utf8'));
       // Every store checkpoints its own progress. The legacy ledger receipt is
       // written last and acknowledges the complete drain in the shared state file.
       if (delta.routingService) {
@@ -302,9 +317,18 @@ export async function readCapacityDrains(ledger, statePath = getStatePath(), { r
         if (!routingCapacity) throw Error('Routing quota store unavailable');
         routingCapacity.mergeDrain(delta.routingCapacity, id);
       }
+      if (delta.routingService) routingCapacity?.reconcileDemand(delta.routingService.after, routingService);
       ledger.applyDrain(delta, id);
+      rejected.delete(id);
+    } catch (err) {
+      if (err instanceof InvalidCapacityDrain) {
+        if (rejected.get(id) === revision) continue; // another poll already reported this revision
+        rejected.set(id, revision);
+        console.error(`[Maxpool] Retained malformed capacity drain ${id}; waiting for a corrected file:`, err.message);
+      } else {
+        console.error('[Maxpool] Could not read released worker capacity:', err.message);
+      }
     }
-    catch (e) { console.error('[Maxpool] Could not read released worker capacity:', e.message); }
   }
   return ids.filter(id => ledger.appliedDrains.has(id));
 }

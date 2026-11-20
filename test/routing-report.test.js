@@ -40,6 +40,39 @@ test('holder records idle natural weeks from fresh paired vendor readings and re
   assert.doesNotMatch(JSON.stringify(report), /private-owner|accessToken|fixture/);
 });
 
+test('authenticated status reporting can classify a reset when its demand history arrives after cycle closure', () => {
+  const am = makeManager();
+  const end = Date.now() - 60_000, start = end - 7 * 86400_000;
+  const owner = am._localCacheKeys(am.accounts[0])[0];
+  am.routingCapacity.observe({ owner, window: 'wk', resetAt: end, observedAt: end - 1000, utilization: 0.4 });
+  am.closeExpiredCapacityCycles(end);
+  assert.equal(am.routingCapacity.snapshot(owner).cycles[0].attribution, 'unattributed');
+  am.routingService.restoreState({ version: 1, coverage: [[start, end]], hours: [] });
+  assert.equal(am.getStatus().routingAnalytics.quotas[0].cycles[0].attribution, 'no-observed-demand');
+  assert.equal(am.routingCapacity.serialize().owners[0][1].cycles[0].attribution, 'no-observed-demand');
+});
+
+test('a service-only retired worker drain retracts an idle classification before the demand history expires', async t => {
+  const path = await drainPath(t), am = makeManager();
+  const end = Date.now() - 60_000, start = end - 7 * 86400_000;
+  am.routingService.restoreState({ version: 1, coverage: [[start, end]], hours: [] });
+  const owner = am._localCacheKeys(am.accounts[0])[0];
+  am.routingCapacity.observe({ owner, window: 'wk', resetAt: end, observedAt: end - 1000, utilization: 0.4 });
+  am.closeExpiredCapacityCycles(end);
+  assert.equal(am.routingCapacity.snapshot(owner).cycles[0].attribution, 'no-observed-demand');
+
+  const retiring = new RoutingServiceAnalytics(() => end - 1000);
+  retiring.begin({ peer: true }).finish('completed');
+  await writeCapacityDrain({ accounts: {}, owners: {}, routingService:
+    RoutingServiceAnalytics.drainDelta(null, retiring.exportState()) }, path);
+  assert.equal((await readCapacityDrains(am.capacity, path, am)).length, 1);
+
+  const restored = makeManager();
+  restored.routingCapacity.restore(am.routingCapacity.serialize());
+  assert.equal(restored.routingCapacity.snapshot(owner, end + 42 * 86400_000).cycles[0].attribution, 'unattributed');
+  assert.equal(am.getStatus().routingAnalytics.quotas[0].cycles[0].attribution, 'unattributed');
+});
+
 test('fresh utilization cannot borrow a reset stamp from an older Anthropic header', () => {
   const am = makeManager();
   const stamp = Math.ceil(Date.now() / 1000) + 2;

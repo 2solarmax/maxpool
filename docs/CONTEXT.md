@@ -24,6 +24,10 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-20 · Quota attribution after a worker handoff
+
+Late coverage can establish that an unused window had no observed demand. A late request from a retiring worker can retract that conclusion. MaxPool saves corrections with the quota cycle so they survive the shorter demand-history retention. The terminal and status report share one demand summary across accounts. A malformed handoff stays on disk under its original ID and is retried when the file changes. Transient failures continue to retry.
+
 ### 2026-11-20 · Measure routing outcomes at ingress and quota expiry at the holder
 
 Activity analytics opens routing with `v` then `r`. It reports terminal inference outcomes and router-controlled wait. Native and translated requests share the five-second queue budget. A forwarded hop is visible to the receiving account without adding another external arrival. Each worker reports its own observations and coverage through the versioned `routingAnalytics` field of the existing status response. The terminal can select an individual worker.

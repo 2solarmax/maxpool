@@ -166,3 +166,18 @@ test('mixed route blockers cannot be attributed to the first quota that will rec
   assert.equal(capacityDenial({ cause: 'session_limit', matchingRoutes: 1, reasons: { session_limit: 1 } }), 'sessionDenied');
   assert.equal(capacityDenial({ cause: 'no_eligible_route' }), null);
 });
+
+test('reused demand summaries keep exact uptime bounds and separate partial, disjoint and empty windows', () => {
+  const now = 72 * HOUR + 10, from = now - 2 * HOUR;
+  const ledger = new RoutingServiceAnalytics(() => now);
+  ledger.restoreState({ version: 1, coverage: [[from + 5, now]], hours: [1, 2, 3].map((n, i) => ({
+    hour: (70 + i) * HOUR, total: { arrivals: n, peakOutstanding: 4 - n }, accounts: [],
+  })) });
+  const demand = ledger.demandReader();
+  assert.equal(demand(from, now).completeCoverage, false);
+  assert.equal(demand(from + 5, now).completeCoverage, true);
+  assert.deepEqual([demand(from, now).arrivals, demand(from, now).peakOutstanding], [6, 3]);
+  assert.deepEqual([demand(71 * HOUR, 72 * HOUR).arrivals, demand(72 * HOUR, now).arrivals], [2, 3]);
+  assert.equal(demand(from - 8 * HOUR, from - 4 * HOUR).arrivals, 0);
+  assert.equal(demand(now, now).arrivals, 0);
+});

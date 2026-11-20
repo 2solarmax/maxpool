@@ -30,6 +30,7 @@ export function buildRoutingReport(am, now) {
     service[period] = { ...metrics(sample),
       accounts: (sample.accounts || []).map(a => ({ name: a.name, ...metrics(a) })) };
   }
+  const demandBetween = am.routingService.demandReader(now);
   const owners = new Set();
   const quotas = [];
   for (const account of am.accounts) {
@@ -37,12 +38,12 @@ export function buildRoutingReport(am, now) {
     const owner = am._localCacheKeys(account)[0];
     if (owners.has(owner)) continue;
     owners.add(owner);
-    const sample = am.routingCapacity.snapshot(owner, now);
+    const sample = am.routingCapacity.snapshot(owner, now, demandBetween, 12);
     quotas.push({
       name: account.name, provider: account.provider || account.type,
       window: sample.window, measuredCycles: sample.measuredCycles,
       unknownCycles: sample.unknownCycles, meanUnusedFraction: sample.meanUnusedFraction,
-      cycles: sample.cycles.slice(0, 12).map(c => ({
+      cycles: sample.cycles.map(c => ({
         startAt: c.startAt, resetAt: c.resetAt, observedAt: c.observedAt, window: c.window,
         unusedFraction: c.unusedFraction, reason: c.reason, attribution: c.attribution,
         alternativeTurns: c.alternativeTurns,
@@ -51,7 +52,7 @@ export function buildRoutingReport(am, now) {
   }
   return { version: 1, source: am.capacity.poolCacheSource, asOf: now,
     service, daily: [...daily.values()], quotas, placement: am.placementComparison?.() || null,
-    provisioning: provisioningEvidence((start, end) => am.routingService.demandBetween(start, end), now,
+    provisioning: provisioningEvidence(demandBetween, now,
       quotas.filter(q => q.window === 'wk').reduce((sum, q) => sum + q.measuredCycles, 0)),
   };
 }

@@ -1,3 +1,5 @@
+import { InvalidCapacityDrain } from './capacity-drain.js';
+
 // Worker-originated inference demand. Peer hops only count as inbound demand for
 // capacity attribution; adding them to client outcomes would count a forwarded turn twice.
 const HOUR = 3_600_000;
@@ -8,6 +10,8 @@ const WAIT_BOUNDS = [0, 10, 50, 100, 250, 500, 1000, 2000, WAIT_TARGET, 10_000, 
   120_000, 300_000, 900_000, 1_800_000, 3_600_000, 86_400_000];
 const COUNTERS = ['arrivals', 'peerArrivals', 'requests', 'completed', 'timelyCompleted', 'failed', 'cancelled',
   'incomplete', 'capacityDenied', 'weeklyDenied', 'sessionDenied', 'concurrencyDenied', 'unclassifiedDenied', 'queuedRequests', 'inputTokens', 'cachedInputTokens'];
+const DEMAND_COUNTERS = ['arrivals', 'peerArrivals', 'capacityDenied', 'weeklyDenied', 'sessionDenied', 'concurrencyDenied',
+  'unclassifiedDenied', 'requests', 'completed', 'failed', 'cancelled', 'incomplete'];
 const PEAKS = ['peakOutstanding', 'peakServing', 'peakSessions', 'longestWaitMs'];
 const hourOf = t => Math.floor(t / HOUR) * HOUR;
 const count = n => Number.isSafeInteger(n) && n >= 0 ? n : 0;
@@ -246,20 +250,36 @@ export class RoutingServiceAnalytics {
   }
 
   demandBetween(from, to) {
-    const now = this.now();
+    return this.demandReader()(from, to);
+  }
+
+  // One report checks overlapping windows from many accounts. Build cumulative
+  // totals once, then subtract at the two hour boundaries. Peaks are maxima,
+  // and uptime coverage uses the exact requested timestamps.
+  demandReader(now = this.now()) {
     this.observe(now);
-    const counters = { arrivals: 0, peerArrivals: 0, capacityDenied: 0, weeklyDenied: 0, sessionDenied: 0, concurrencyDenied: 0, unclassifiedDenied: 0, requests: 0, completed: 0, failed: 0,
-      cancelled: 0, incomplete: 0 };
-    let peakOutstanding = 0;
-    for (const [hour, bucket] of this.hours) {
-      if (hour >= to || hour + HOUR <= from) continue;
-      for (const key of Object.keys(counters)) counters[key] += bucket.total[key];
-      peakOutstanding = Math.max(peakOutstanding, bucket.total.peakOutstanding);
+    const coverage = this._intervals(now);
+    const last = hourOf(now), retained = last - RETENTION + HOUR;
+    const first = Math.max(retained, Math.min(...this.hours.keys()));
+    const hours = (last - first) / HOUR + 1;
+    const sums = DEMAND_COUNTERS.map(() => new Float64Array(hours + 1));
+    const peaks = new Float64Array(hours);
+    for (let i = 0; i < hours; i++) {
+      const row = this.hours.get(first + i * HOUR)?.total;
+      for (let k = 0; k < DEMAND_COUNTERS.length; k++) sums[k][i + 1] = sums[k][i] + (row?.[DEMAND_COUNTERS[k]] || 0);
+      peaks[i] = row?.peakOutstanding || 0;
     }
-    const completeCoverage = Number.isSafeInteger(from) && Number.isSafeInteger(to) && to > from
-      && from >= hourOf(now) - RETENTION + HOUR
-      && this._intervals(now).some(([start, end]) => start <= from && end >= to);
-    return { ...counters, peakOutstanding, completeCoverage };
+    return (from, to) => {
+      const valid = Number.isSafeInteger(from) && Number.isSafeInteger(to) && to > from;
+      const begin = valid ? Math.max(0, Math.min(hours, (hourOf(from) - first) / HOUR)) : 0;
+      const end = valid ? Math.max(begin, Math.min(hours, (hourOf(to - 1) - first) / HOUR + 1)) : 0;
+      const result = {};
+      for (let k = 0; k < DEMAND_COUNTERS.length; k++) result[DEMAND_COUNTERS[k]] = sums[k][end] - sums[k][begin];
+      let peakOutstanding = 0;
+      for (let i = begin; i < end; i++) peakOutstanding = Math.max(peakOutstanding, peaks[i]);
+      const completeCoverage = valid && from >= retained && coverage.some(([start, stop]) => start <= from && stop >= to);
+      return { ...result, peakOutstanding, completeCoverage };
+    };
   }
 
   _intervals(now) {
@@ -300,19 +320,29 @@ export class RoutingServiceAnalytics {
   // and session IDs are ephemeral; history retains observed concurrent peaks.
   mergeDrain(baseline, final, id) {
     if (id && this.appliedDrains.has(id)) return;
-    if (final?.version !== 1 || !Array.isArray(final.hours) || (baseline && !Array.isArray(baseline.hours))) {
-      if (id) throw Error('Invalid routing service drain');
+    if (final?.version !== 1 || !Array.isArray(final.hours)
+      || (final.coverage != null && (!Array.isArray(final.coverage) || !final.coverage.every(interval =>
+        Array.isArray(interval) && interval.length === 2 && interval.every(Number.isSafeInteger) && interval[1] >= interval[0])))
+      || (baseline && !Array.isArray(baseline.hours))) {
+      if (id) throw new InvalidCapacityDrain('Invalid routing service drain');
       return;
     }
     const now = this.now();
     const firstHour = hourOf(now) - RETENTION + HOUR;
-    const before = new Map((baseline?.hours || []).map(row => [row.hour, row]));
+    const before = new Map();
+    for (const row of baseline?.hours || []) {
+      if (!row || !Number.isSafeInteger(row.hour)
+        || (row.accounts != null && (!Array.isArray(row.accounts) || !row.accounts.every(Array.isArray)))) {
+        throw new InvalidCapacityDrain('Invalid routing service baseline');
+      }
+      before.set(row.hour, row);
+    }
     const updates = new Map();
     for (const row of final.hours) {
-      if (!row || !Number.isSafeInteger(row.hour) || row.hour % HOUR) throw Error('Invalid routing service hour');
+      if (!row || !Number.isSafeInteger(row.hour) || row.hour % HOUR) throw new InvalidCapacityDrain('Invalid routing service hour');
       if (row.hour < firstHour || row.hour > now) continue;
-      if (updates.has(row.hour)) throw Error('Duplicate routing service hour');
-      if (!row.total || typeof row.total !== 'object' || !Array.isArray(row.accounts)) throw Error('Invalid routing service counters');
+      if (updates.has(row.hour)) throw new InvalidCapacityDrain('Duplicate routing service hour');
+      if (!row.total || typeof row.total !== 'object' || !Array.isArray(row.accounts)) throw new InvalidCapacityDrain('Invalid routing service counters');
       const old = before.get(row.hour);
       const existing = this.hours.get(row.hour);
       // Only copy the affected hour's totals and account rows. Live request
@@ -322,7 +352,7 @@ export class RoutingServiceAnalytics {
       const oldAccounts = new Map(old?.accounts || []);
       for (const item of row.accounts || []) {
         if (!Array.isArray(item) || typeof item[0] !== 'string' || !item[1] || typeof item[1] !== 'object') {
-          throw Error('Invalid routing service account counters');
+          throw new InvalidCapacityDrain('Invalid routing service account counters');
         }
         if (!item[0] || item[0].length > 256) continue;
         const stats = existing?.accounts.get(item[0]);
