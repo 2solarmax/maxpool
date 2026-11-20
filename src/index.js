@@ -25,7 +25,7 @@ import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setC
 import { codexPoolEndpoint, sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
 import { fetchRemoteStatus } from './pool-link.js';
 import { SleepGuard } from './sleep-guard.js';
-import { controllingTerminalAlive } from './terminal-alive.js';
+import { controllingTerminalAlive, terminalOutputAlive } from './terminal-alive.js';
 import { AccountManager, combineEfficiency } from './account-manager.js';
 import { sessionCapCommand } from './session-cap.js';
 import { cacheUsageLabel } from './usage-label.js';
@@ -58,9 +58,9 @@ import { applyTuiAccountChange, canPersistOAuthRefresh, findAccountConfigIndex, 
 import { maybeCheckForUpdate, getCurrentVersion, markApplied, clearQuarantine, captureBootVersion } from './updater.js';
 import {
   runReloadBaton,
-  RELOAD_SWAPPED, RELOAD_ROLLED_BACK,
+  RELOAD_SWAPPED, RELOAD_ROLLED_BACK, RELOAD_STOPPED,
   MSG_LISTEN, MSG_RELEASE, MSG_TAKEOVER, MSG_PROBE_READY,
-  MSG_RELOAD_REQUEST, MSG_READY, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
+  MSG_RELOAD_REQUEST, MSG_READY, MSG_STOPPING, MSG_FAILED, MSG_RELEASED, MSG_PRIMARY, MSG_ROLLED_BACK,
   MSG_TTY_REASSERT, MSG_CONN, describeOldWorkerExit, makeWorkerChannel, rollbackNoticeAction,
 } from './reload-protocol.js';
 
@@ -108,6 +108,10 @@ const SERVER_RESPAWNED_WORKER_ENV = 'MAXPOOL_RESPAWNED_WORKER';
 // lets the (non-pty) test suite exercise the terminal-hangup path deterministically.
 function isInteractiveTerminal() {
   return Boolean(process.stdout.isTTY) || process.env.MAXPOOL_FORCE_TTY === '1';
+}
+
+function shutdownDrainMs(config) {
+  return Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
 }
 
 // Wire up the persistent event log (default-on; disable with `eventLog: false` in
@@ -316,8 +320,11 @@ async function supervisorCommand() {
   // ignores SIGINT/SIGTERM itself (the worker drains + exits, ending the turn).
   let activeWorker = null;
   const forwardSignal = sig => { try { activeWorker?.child.kill(sig); } catch { /* ignore */ } };
-  process.on('SIGINT', () => { /* delivered to the worker by the TTY group */ });
-  process.on('SIGTERM', () => { /* delivered to the worker by the TTY group */ });
+  // A legacy successor cannot announce its shutdown. If it exits 1 on a
+  // not-yet-listening server, the foreground group signal explains that exit.
+  const noteGroupStop = () => { if (acceptTarget) acceptTarget.sawStopSignal = true; };
+  process.on('SIGINT', noteGroupStop);
+  process.on('SIGTERM', noteGroupStop);
   // SIGHUP: in a terminal, a window hangup delivers SIGHUP to the whole foreground
   // group, so the worker ALSO received it and (interactive) is already shutting
   // itself down — the supervisor must NOT forward a second signal, or the worker
@@ -325,7 +332,18 @@ async function supervisorCommand() {
   // exit is then misread as a crash → respawn into a headless orphan, the exact
   // bug). Only forward in headless/service mode, where SIGHUP is the conventional
   // reload trigger and reaches the supervisor alone.
-  process.on('SIGHUP', () => { if (!isInteractiveTerminal()) forwardSignal('SIGHUP'); });
+  process.on('SIGHUP', () => {
+    if (!isInteractiveTerminal()) { forwardSignal('SIGHUP'); return; }
+    const worker = acceptTarget;
+    if (!worker || worker.terminalClosed || terminalOutputAlive()) return;
+    // The foreground terminal really closed during takeover. Give the worker
+    // its configured shutdown drain. Some legacy workers block in open(/dev/tty)
+    // when the pty is revoked and can never announce or complete that drain.
+    worker.terminalClosed = true;
+    const deadline = setTimeout(() => worker.child.kill('SIGKILL'), shutdownDrainMs(config));
+    deadline.unref();
+    worker.child.once('exit', () => clearTimeout(deadline));
+  });
   // A dead controlling terminal (window closed) makes writes to stdout/stderr emit
   // EPIPE/EIO — swallow them so a shutdown-time log can't crash the supervisor.
   process.stdout.on('error', () => {});
@@ -449,12 +467,23 @@ async function supervisorCommand() {
     };
     try {
       newWorker = spawnWorker({ reload: true });
+      // A stop can arrive before the baton starts waiting for PRIMARY.
+      newWorker.child.on('message', msg => {
+        if (msg?.type === MSG_READY) newWorker.reportsShutdown = msg.reportsShutdown === true;
+        if (msg?.type === MSG_STOPPING) newWorker.stopping = true;
+      });
       // Hold the new worker's spawn-error so a fork failure mid-baton becomes a
       // clean ROLLED_BACK/FALLBACK instead of crashing the supervisor (M5).
       newWorker.child.once('error', () => { /* surfaced via waitFor reject */ });
       const outcome = await runReloadBaton({
         oldWorker,
         newWorker,
+        // Only consulted after RELEASED. Old workers lack the shutdown message:
+        // q or a hangup exits 0, and a group stop before listen can instead
+        // make their server.close() fail and exit 1.
+        shutdownRequested: () => newWorker.stopping || newWorker.terminalClosed ||
+          (!newWorker.reportsShutdown && (newWorker.child.exitCode === 0 ||
+            (newWorker.sawStopSignal && newWorker.child.exitCode === 1))),
         handle: masterHandle(),
         // After the OLD worker has released its fd, re-arm the supervisor's own
         // listener to cover the cutover gap, then hand THAT live handle to the
@@ -478,6 +507,13 @@ async function supervisorCommand() {
         reloadId,
       });
 
+      if (outcome === RELOAD_STOPPED) {
+        if (activeWorker === oldWorker && endTurn === turnEnd) {
+          reapOldWorker(oldWorker);
+          turnEnd?.({ code: 0, signal: null });
+        }
+        return;
+      }
       if (outcome === RELOAD_SWAPPED) {
         // Re-point monitoring to the new worker (it's now primary), THEN reap the
         // old one. Order matters: monitorAsActive sets activeWorker=new so the
@@ -1127,7 +1163,7 @@ async function serverWorkerCommand() {
   // 'q' / Ctrl-C / SIGTERM actually quits under a continuous request flood
   // (where there are always active requests) instead of waiting indefinitely.
   // A second signal forces an immediate exit. Override via config.shutdown.drainTimeoutMs.
-  const drainTimeoutMs = Math.max(1000, Number(config.shutdown?.drainTimeoutMs) || 15_000);
+  const drainTimeoutMs = shutdownDrainMs(config);
   const hooks = {
     redeemCodexForRequest: info => {
       if (!hasLease) return null;
@@ -1399,6 +1435,9 @@ async function serverWorkerCommand() {
   }
 
   const shutdownGracefully = (reason, options = {}) => {
+    if (supervised && isReloadWorker && process.connected && !options.restart) {
+      try { process.send({ type: MSG_STOPPING }, () => {}); } catch { /* supervisor gone */ }
+    }
     // A terminal-close shutdown must NEVER exit non-zero: the supervisor reads a
     // fast non-zero exit as a crash and respawns a fresh worker — onto the now-dead
     // terminal, re-creating the headless orphan. So even a drain-timeout or close
@@ -1893,10 +1932,10 @@ async function serverWorkerCommand() {
             // readiness timeout ('timeout' rollback).
           } else if (Number(process.env.MAXPOOL_TEST_RELOAD_READY_DELAY_MS) > 0) {
             // Test seam: a new build that reports ready only after a delay.
-            setTimeout(() => { try { process.send({ type: MSG_READY }); } catch { /* gone */ } },
+            setTimeout(() => { try { process.send({ type: MSG_READY, reportsShutdown: true }); } catch { /* gone */ } },
               Number(process.env.MAXPOOL_TEST_RELOAD_READY_DELAY_MS));
           } else {
-            process.send({ type: MSG_READY });
+            process.send({ type: MSG_READY, reportsShutdown: true });
           }
         } else if (msg?.type === MSG_TAKEOVER && handle) {
           // Baton acquire: the old worker already released, so we're the SOLE
