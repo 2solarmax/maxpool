@@ -31,6 +31,7 @@ export function provisioningEvidence(demandBetween, now, measuredWeeklyCycles = 
   const through = Math.floor(now / hour) * hour;
   const sampledWeeks = 3;
   let coveredWeeks = 0, idleWeeks = 0, arrivals = 0, peerArrivals = 0, capacityDenied = 0;
+  let weeklyDenied = 0;
   for (let i = 0; i < sampledWeeks; i++) {
     const end = through - i * SPAN.wk;
     const demand = demandBetween(end - SPAN.wk, end);
@@ -38,6 +39,7 @@ export function provisioningEvidence(demandBetween, now, measuredWeeklyCycles = 
     arrivals += demand.arrivals || 0;
     peerArrivals += demand.peerArrivals || 0;
     capacityDenied += demand.capacityDenied || 0;
+    weeklyDenied += demand.weeklyDenied || 0;
     if (!demand.completeCoverage) continue;
     coveredWeeks++;
     if (demand.arrivals === 0 && demand.peerArrivals === 0 && demand.peakOutstanding === 0) idleWeeks++;
@@ -47,7 +49,7 @@ export function provisioningEvidence(demandBetween, now, measuredWeeklyCycles = 
   return {
     status: idle ? 'no-observed-demand' : 'insufficient-evidence', reason,
     low: idle ? 0 : null, high: idle ? 0 : null, from: through - sampledWeeks * SPAN.wk, through,
-    sampledWeeks, coveredWeeks, arrivals, peerArrivals, capacityDenied, measuredWeeklyCycles,
+    sampledWeeks, coveredWeeks, arrivals, peerArrivals, capacityDenied, weeklyDenied, measuredWeeklyCycles,
   };
 }
 

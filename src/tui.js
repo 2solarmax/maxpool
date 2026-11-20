@@ -3997,16 +3997,18 @@ export class TUI {
         lines.push('   Weekly ' + number(m.weeklyDenied) + '   Session ' + number(m.sessionDenied)
           + '   Concurrency ' + number(m.concurrencyDenied) + '   Other ' + number(m.unclassifiedDenied));
       }
+      lines.push(dim(' Bucket range  ' + date(m.from) + ' to ' + date(m.to) + ' UTC'));
       lines.push(dim(' Hour buckets · ' + (m.completeCoverage ? 'continuous coverage' : 'partial coverage') + ' · since ' + date(m.coverageSince) + ' UTC'));
       if (report.placement) {
         const p = report.placement;
         lines.push(' New-chat comparison since boot  ' + number(p.disagreed) + ' differed / ' + number(p.comparable) + ' comparable');
       }
       if (Array.isArray(m.accounts) && m.accounts.length) {
-        lines.push('', bold(' Finalized requests by last serving account'));
+        lines.push('', bold(' Finalized requests by account'));
         for (const a of m.accounts) {
           lines.push(' ' + safe(a.name) + '  ' + number(a.timelyCompleted) + '/' + number(a.requests)
             + ' timely  ·  p95 ≤' + time(a.waitP95Ms) + '  ·  peak ' + number(a.peakServing));
+          if (a.concurrencyDenied > 0) lines.push(dim('   Concurrency refusals ' + number(a.concurrencyDenied)));
         }
       }
       lines.push('', bold(' Unused quota at reset · by account'));
@@ -4022,7 +4024,7 @@ export class TUI {
             + (c.alternativeTurns > 0 ? ' (' + number(c.alternativeTurns) + ')' : ''));
         }
       }
-      lines.push(dim(' Unused = last fresh vendor reading before a natural reset.'));
+      lines.push(dim(' Unused = 100% less peak usage, with a fresh reading at natural reset.'));
       if (Array.isArray(report.daily) && report.daily.length) {
         lines.push('', bold(' Timely completions by UTC day'));
         for (const d of report.daily) {
@@ -4035,7 +4037,7 @@ export class TUI {
         lines.push('', bold(' Additional accounts'));
         lines.push(sizing.status === 'no-observed-demand' ? ' 0 for demand observed in the last three full weeks.' : ' Insufficient evidence for a subscription count.');
         lines.push(dim(' ' + number(sizing.coveredWeeks) + '/' + number(sizing.sampledWeeks) + ' weeks observed continuously; '
-          + number(sizing.capacityDenied) + ' capacity denials observed.'));
+          + number(sizing.weeklyDenied) + ' weekly denials of ' + number(sizing.capacityDenied) + ' capacity denials.'));
         if (sizing.status !== 'no-observed-demand') lines.push(dim(' Need unmet weekly workload and comparable plan yield.'));
       }
     }

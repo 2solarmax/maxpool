@@ -1246,13 +1246,16 @@ async function forwardRequest(
     if (requestInfo.pinAccount != null) {
       ctx.status = 503;
       const busy = Boolean(requestInfo.pinRefusedBusy);
-      if (requestInfo._service && busy) requestInfo._service.denied = 'concurrencyDenied';
+      const pinned = accountManager.accounts.find(a => !a.remote && a.name === requestInfo.pinAccount);
+      if (pinned && requestInfo._service) {
+        requestInfo._service.refusedOn(pinned.name);
+        if (busy) requestInfo._service.denied = 'concurrencyDenied';
+      }
       ctx.account = `(pinned ${requestInfo.pinAccount} ${busy ? 'busy' : 'unavailable'})`;
       try {
         res.setHeader('retry-after', busy ? '2' : '30');
         // Machine-readable cause + depth for the linked pool (additive; old pools ignore them).
         res.setHeader('x-maxpool-pin-refusal', requestInfo.pinRefusal || 'unavailable');
-        const pinned = accountManager.accounts.find(a => !a.remote && a.name === requestInfo.pinAccount);
         if (pinned) {
           res.setHeader('x-maxpool-pin-inflight', String(pinned.inFlight || 0));
           res.setHeader('x-maxpool-pin-limit', String(accountManager._pinBusyLimit(pinned)));
@@ -3079,6 +3082,9 @@ async function forwardRequest(
         const reply = safeJsonParse(buf);
         accountManager.rememberMessageRoute?.(reply?.id, account.provider, requestInfo._routeModel || reply?.model);
       }
+      // A heartbeat already committed SSE. The buffered answer below becomes a
+      // downstream error; settle the placement comparison on that same outcome.
+      if (requestInfo.queueHeartbeatActive && requestInfo._service) requestInfo._service.terminal = 'failed';
       accountManager.releaseAccount(lease, { success: upstreamRes.status < 500, status: upstreamRes.status });
       if (logDir) {
         try {
@@ -3089,7 +3095,6 @@ async function forwardRequest(
         writeRequestLog(logDir, reqId, logSections);
       }
       if (requestInfo.queueHeartbeatActive) {
-        if (requestInfo._service) requestInfo._service.terminal = 'failed';
         clearQueueHeartbeat(requestInfo);
         if (!res.destroyed && !res.writableEnded) {
           // We already committed `200 text/event-stream` (the queue heartbeat), but

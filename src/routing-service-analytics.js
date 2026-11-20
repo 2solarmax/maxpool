@@ -162,6 +162,11 @@ export class RoutingServiceAnalytics {
       waitingSince = null;
     };
     return {
+      refusedOn: name => {
+        // A holder can decline a verified pin before a lease exists. Attribute the
+        // terminal refusal without counting a request or session as in service.
+        if (!ended && !serving) account = name;
+      },
       route: name => {
         if (ended || !name) return;
         const now = this.now();
