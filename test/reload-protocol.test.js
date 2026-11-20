@@ -113,3 +113,23 @@ test('an operator stop before TAKEOVER or before PRIMARY never falls back to a n
     assert.equal(newWorker.types.includes(MSG_TAKEOVER), !alreadyStopping);
   }
 });
+
+for (const during of ['re-arm failure', 'PRIMARY', 'successor exit']) {
+  test(`shutdown requested during ${during} wins over the takeover result`, async () => {
+    const oldWorker = fakeWorker([{ type: MSG_RELEASED }]);
+    const incoming = fakeWorker([{ type: MSG_READY }, during === 'successor exit' ? 'EXIT' : { type: MSG_PRIMARY }]);
+    let stopping = false;
+    const newWorker = { ...incoming, send(msg) {
+      incoming.send(msg);
+      if (msg.type === MSG_TAKEOVER) stopping = true;
+    } };
+    const result = await runReloadBaton({ oldWorker, newWorker, handle: {}, shutdownRequested: () => stopping,
+      prepareHandle(handle) {
+        if (during !== 're-arm failure') return handle;
+        stopping = true;
+        throw new Error('operator closed the listener');
+      } });
+    assert.equal(result, RELOAD_STOPPED);
+    assert.equal(incoming.types.includes(MSG_TAKEOVER), during !== 're-arm failure');
+  });
+}

@@ -104,8 +104,8 @@ export class RoutingCapacityAnalytics {
     const sameOpen = sameWindow(open, window, resetAt);
     if (sameOpen && observedAt >= open.resetAt) return;
     if (!sameOpen && rec.cycles.some(c => sameWindow(c, window, resetAt))) return;
-    if (open && claimedDuring(open, lastClaimAt)) open.refilled = true;
     if (open && !sameOpen) {
+      if (claimedDuring(open, lastClaimAt)) open.refilled = true;
       // A changed plan or an early advance replaces the previously advertised reset.
       // The new window's utilization cannot stand in for the old window's reading.
       const replaced = open.window !== window || observedAt < open.resetAt - STAMP_JITTER;

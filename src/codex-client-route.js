@@ -60,12 +60,10 @@ function authorized(header, key) {
   return received.length === expected.length && timingSafeEqual(received, expected);
 }
 
-function threadKey(req, body, path) {
-  const metadata = req.headers['x-codex-turn-metadata'];
+function threadKey(req, body, path, metadataThread) {
   // Responses sends thread-id. Codex standalone search instead sends the
   // thread in turn metadata and a session-scoped id in its body. Prefer the
   // operation's thread identity over shared session and transport request IDs.
-  const metadataThread = typeof metadata === 'string' && withJsonBody(metadata)?.thread_id;
   const ids = path === SEARCH_PATH ? [metadataThread, req.headers['thread-id']] : [req.headers['thread-id'], metadataThread];
   const value = [...ids, req.headers['x-client-request-id'], req.headers.session_id,
     req.headers['session-id'], path === SEARCH_PATH ? body.id : body.prompt_cache_key]
@@ -267,13 +265,15 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
     if (!data || typeof data.model !== 'string' || !MODEL_ID.test(data.model) || data.store === true || data.background === true) {
       return routeError(res, 400, 'invalid_request_error', 'Supply an entitled Codex model and a foreground request with store disabled.');
     }
-    const key = threadKey(req, data, path);
+    const metadata = req.headers['x-codex-turn-metadata'];
+    const metadataThread = metadata && withJsonBody(metadata)?.thread_id;
+    const key = threadKey(req, data, path, typeof metadata === 'string' ? metadataThread : null);
     let identifiedSession = false;
     if (path === SEARCH_PATH) ctx.endAuxiliary = manager.routingService?.auxiliary();
     else if (manager.routingService) {
       // x-client-request-id and prompt_cache_key can change per call. Neither
       // identifies a distinct active session for the parallelism KPI.
-      const session = [req.headers['thread-id'], withJsonBody(req.headers['x-codex-turn-metadata'] || '')?.thread_id,
+      const session = [req.headers['thread-id'], metadataThread,
         req.headers.session_id, req.headers['session-id']].find(value => typeof value === 'string' && THREAD_ID.test(value));
       identifiedSession = Boolean(session);
       ctx.service = manager.routingService.begin({ session });

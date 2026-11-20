@@ -202,6 +202,10 @@ export class RoutingServiceAnalytics {
         leave();
         if (peer) this.activePeer--;
         else this.active--;
+        const cached = count(usage?._capacityCacheRead);
+        const input = cached + count(usage?._capacityInput) + count(usage?._capacityCacheCreation);
+        const index = WAIT_BOUNDS.findIndex(max => waitMs <= max);
+        const waitBin = index < 0 ? WAIT_BOUNDS.length : index;
         for (const stats of [peer ? null : bucket.total, accountStats(bucket, account)]) {
           if (!stats) continue;
           stats.requests++;
@@ -217,19 +221,17 @@ export class RoutingServiceAnalytics {
               stats[key]++;
             }
           }
-          const cached = count(usage?._capacityCacheRead);
           stats.cachedInputTokens += cached;
-          stats.inputTokens += cached + count(usage?._capacityInput) + count(usage?._capacityCacheCreation);
+          stats.inputTokens += input;
           if (waited) stats.queuedRequests++;
-          const index = WAIT_BOUNDS.findIndex(max => waitMs <= max);
-          stats.waits[index < 0 ? WAIT_BOUNDS.length : index]++;
+          stats.waits[waitBin]++;
           stats.longestWaitMs = Math.max(stats.longestWaitMs, waitMs);
         }
       },
     };
   }
 
-  snapshot(windowMs = 24 * HOUR, now = this.now()) {
+  snapshot(windowMs = 24 * HOUR, now = this.now(), summarizeHour = summarize) {
     this.observe(now);
     const total = empty(), accounts = new Map(), timeline = [];
     const from = hourOf(now - Math.min(RETENTION, Math.max(1, windowMs)) + 1);
@@ -240,7 +242,7 @@ export class RoutingServiceAnalytics {
         if (!accounts.has(name)) accounts.set(name, empty());
         combine(accounts.get(name), row);
       }
-      timeline.push({ hour, ...summarize(bucket.total) });
+      if (summarizeHour) timeline.push({ hour, ...summarizeHour(bucket.total) });
     }
     const completeCoverage = this._intervals(now).some(([start, end]) => start <= from && end >= now);
     return { ...summarize(total), completeCoverage, active: this.active, serving: this.serving, activeSessions: this.sessions.size,

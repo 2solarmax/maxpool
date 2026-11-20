@@ -55,8 +55,8 @@ export function proxyRequest(port, timeoutMs = 1000) {
 
 /** The terminal side of a pty running maxpool. */
 export class Terminal {
-  constructor({ cli = HEAD_CLI, cols = 200, rows = 60, args = ['server'], env }) {
-    this.proc = spawn('python3', [HARNESS, String(cols), String(rows), '--', process.execPath, cli, ...args],
+  constructor({ cli = HEAD_CLI, cols = 200, rows = 60, args = ['server'], env, controllingTerminal = false }) {
+    this.proc = spawn('python3', [HARNESS, String(cols), String(rows), ...(controllingTerminal ? ['--ctty'] : []), '--', process.execPath, cli, ...args],
       { env, stdio: ['pipe', 'pipe', 'inherit'] });
     this.lines = [];
     this.waiting = [];
@@ -115,7 +115,8 @@ export async function probePendingSwitch() {
 }
 
 /** Boot a supervised pool on a pty; resolves once it serves and has settled 3s. */
-export async function bootPool({ cli = HEAD_CLI, cols = 200, rows = 60, readyMs = 10_000, selfHealMs = 15_000, env: extraEnv = {} } = {}) {
+export async function bootPool({ cli = HEAD_CLI, cols = 200, rows = 60, readyMs = 10_000, selfHealMs = 15_000,
+  env: extraEnv = {}, controllingTerminal = false, drainTimeoutMs } = {}) {
   const port = await getFreePort();
   const upstream = await startUpstream();
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-ptyreload-'));
@@ -125,6 +126,7 @@ export async function bootPool({ cli = HEAD_CLI, cols = 200, rows = 60, readyMs 
     upstream: `http://127.0.0.1:${upstream.port}`,
     updateCheck: false,
     restartDrainTimeoutMs: 500,
+    shutdown: drainTimeoutMs == null ? undefined : { drainTimeoutMs },
     accounts: [{ name: 'api-live', type: 'apikey', apiKey: 'sk-ant-stub' }],
   }) + '\n');
   const env = {
@@ -139,7 +141,7 @@ export async function bootPool({ cli = HEAD_CLI, cols = 200, rows = 60, readyMs 
   };
   delete env.MAXPOOL_SERVER_WORKER;
   delete env.MAXPOOL_RELOAD_WORKER;
-  const term = new Terminal({ cli, cols, rows, env });
+  const term = new Terminal({ cli, cols, rows, env, controllingTerminal });
   const pid = Number((await term.next('PID ')).slice(4));
   term.cmd('read');
   const deadline = Date.now() + 30_000;
