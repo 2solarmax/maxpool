@@ -94,6 +94,9 @@ test('terminal check: open terminal → alive; revoked terminal or a pipe → tr
   const ok = { isTTY: true, fd: 1, open: () => 9, close: () => {}, write: () => 0 };
   assert.equal(controllingTerminalAlive(ok), true);
   assert.equal(controllingTerminalAlive({ ...ok, open: () => { throw Object.assign(new Error('ENXIO'), { code: 'ENXIO' }); } }), false);
-  assert.equal(controllingTerminalAlive({ ...ok, write: () => { throw Object.assign(new Error('EIO'), { code: 'EIO' }); } }), false);
+  let opened = false;
+  assert.equal(controllingTerminalAlive({ ...ok, open: () => { opened = true; },
+    write: () => { throw Object.assign(new Error('EIO'), { code: 'EIO' }); } }), false);
+  assert.equal(opened, false, 'a revoked macOS tty can block an open after its descriptor already reports EIO');
   assert.equal(controllingTerminalAlive({ ...ok, isTTY: false }), false, 'pipe/test mode keeps the old hangup answer');
 });

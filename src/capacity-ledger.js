@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { InvalidCapacityDrain } from './capacity-drain.js';
 import { addCacheUsage, cacheHistoryFromHours, cacheWindows, emptyCacheHistory, mergeCacheDelta, restoreCacheHistory, validCacheSource } from './account-cache.js';
 
 /**
@@ -299,6 +300,7 @@ export class CapacityLedger {
     this.appliedDrains = new Set();
     this._ownerCache = new Map();
     this.poolCacheSource = randomUUID();
+    this.legacyCacheImportComplete = false;
     // True only for a ledger restored with no usable history — see fromSerialized.
     // Cleared per account+window once that window's first boundary is behind us.
     this._joinedMidWindow = false;
@@ -337,9 +339,15 @@ export class CapacityLedger {
       return l;
     }
     try {
-      if (validCacheSource(payload.poolCacheSource)) l.poolCacheSource = payload.poolCacheSource;
+      if (validCacheSource(payload.poolCacheSource)) {
+        l.poolCacheSource = payload.poolCacheSource;
+        // v1.24.116 wrote the source ID after switching to owner-keyed usage.
+        // Its saved hourly totals are overlapping measurements on later boots.
+        l.legacyCacheImportComplete = payload.legacyCacheImportComplete !== false;
+      }
+      const unverifiedLegacy = l.legacyCacheImportComplete && payload.legacyCacheImportComplete == null;
       for (const [key, raw] of Object.entries(payload.ownerCache || {})) {
-        const history = restoreCacheHistory(raw, now());
+        const history = restoreCacheHistory(raw, now(), { unverifiedLegacy });
         if (history) l._ownerCache.set(key, history);
       }
       l.appliedDrains = new Set(Array.isArray(payload.appliedDrains) ? payload.appliedDrains : []);
@@ -399,7 +407,7 @@ export class CapacityLedger {
       };
     }
     const ownerCache = Object.fromEntries([...this._ownerCache].map(([key, history]) => [key, structuredClone(history)]));
-    return { schemaVersion: SCHEMA_VERSION, accounts, poolCacheSource: this.poolCacheSource, ...(this._ownerCache.size ? { ownerCache } : {}), ...(this.appliedDrains.size ? { appliedDrains: [...this.appliedDrains] } : {}) };
+    return { schemaVersion: SCHEMA_VERSION, accounts, poolCacheSource: this.poolCacheSource, legacyCacheImportComplete: this.legacyCacheImportComplete, ...(this._ownerCache.size ? { ownerCache } : {}), ...(this.appliedDrains.size ? { appliedDrains: [...this.appliedDrains] } : {}) };
   }
 
   _rec(name) {
@@ -894,27 +902,57 @@ export class CapacityLedger {
 
   applyDrain(delta, id) {
     if (id && this.appliedDrains.has(id)) return;
+    const isRecord = value => value && typeof value === 'object' && !Array.isArray(value);
+    const validCounter = value => Number.isFinite(value) && value >= 0;
+    const updateCache = (current, change) => {
+      const vector = value => Array.isArray(value) && value.length === 4 && value.every(validCounter);
+      if (!isRecord(change) || !vector(change.total) || !Number.isFinite(change.since) || !isRecord(change.minutes)
+        || !Object.entries(change.minutes).every(([minute, counts]) => /^\d+$/.test(minute) && vector(counts))) {
+        throw new InvalidCapacityDrain('Invalid capacity cache drain');
+      }
+      // A cache history can span a week of minutes. Only the minute vectors
+      // named by the retiring worker can change.
+      const copy = current && { ...current, total: [...current.total], minutes: { ...current.minutes } };
+      if (copy) for (const minute of Object.keys(change.minutes)) {
+        if (copy.minutes[minute]) copy.minutes[minute] = [...copy.minutes[minute]];
+      }
+      return mergeCacheDelta(copy, null, change);
+    };
+    if (!isRecord(delta) || (delta.accounts != null && !isRecord(delta.accounts))
+      || (delta.owners != null && !isRecord(delta.owners))) throw new InvalidCapacityDrain('Invalid capacity drain');
+    const ownerUpdates = new Map(), accountUpdates = new Map();
     for (const [key, change] of Object.entries(delta.owners || {})) {
-      this._ownerCache.set(key, mergeCacheDelta(this._ownerCache.get(key), null, change));
+      ownerUpdates.set(key, updateCache(this._ownerCache.get(key), change));
     }
     for (const [name, changes] of Object.entries(delta.accounts || {})) {
-      const rec = this._rec(name);
-      if (changes.cacheHistory) {
-        rec.cacheHistory = mergeCacheDelta(rec.cacheHistory, null, changes.cacheHistory);
-      }
+      if (!isRecord(changes)) throw new InvalidCapacityDrain('Invalid capacity account drain');
+      const existing = this._accounts.get(name);
+      const rec = existing ? { ...existing } : { ses: { open: null, closed: [] }, wk: { open: null, closed: [] }, days: {} };
+      if (changes.cacheHistory) rec.cacheHistory = updateCache(rec.cacheHistory, changes.cacheHistory);
       for (const window of ['ses', 'wk']) {
         const open = rec[window].open;
         const change = changes[window];
         // A window that rolled during the drain must never be reopened or charged again.
-        if (!open || !change || change.startedAt !== open.startedAt) continue;
-        open.tokensSoFar += change.tokens;
-        open.lastAccrualAt = Math.max(open.lastAccrualAt || 0, change.lastAccrualAt || 0);
+        if (!change) continue;
+        if (!isRecord(change) || !validCounter(change.tokens) || !Number.isFinite(change.startedAt)
+          || (change.lastAccrualAt != null && !Number.isFinite(change.lastAccrualAt))) throw new InvalidCapacityDrain('Invalid capacity window drain');
+        if (!open || change.startedAt !== open.startedAt) continue;
+        rec[window] = { ...rec[window], open: { ...open, tokensSoFar: open.tokensSoFar + change.tokens,
+          lastAccrualAt: Math.max(open.lastAccrualAt || 0, change.lastAccrualAt || 0) } };
       }
-      for (const [day, tokens] of Object.entries(changes.days || {})) {
-        const bucket = rec.days[day] ||= { tokens: 0, partial: false };
-        bucket.tokens += tokens;
+      if (changes.days != null) {
+        if (!isRecord(changes.days)) throw new InvalidCapacityDrain('Invalid capacity day drain');
+        rec.days = { ...rec.days };
+        for (const [day, tokens] of Object.entries(changes.days)) {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !validCounter(tokens)) throw new InvalidCapacityDrain('Invalid capacity day drain');
+          const bucket = rec.days[day] || { tokens: 0, partial: false };
+          rec.days[day] = { ...bucket, tokens: bucket.tokens + tokens };
+        }
       }
+      accountUpdates.set(name, rec);
     }
+    for (const [key, history] of ownerUpdates) if (history) this._ownerCache.set(key, history);
+    for (const [name, rec] of accountUpdates) this._accounts.set(name, rec);
     if (id) this.appliedDrains.add(id);
   }
 

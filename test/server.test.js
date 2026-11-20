@@ -2424,3 +2424,44 @@ test('failover-exhausted 429 carries a CLI-retriable retry-after (≤60s)', asyn
   assert.ok(Number.isFinite(ra) && ra <= RETRIABLE_S,
     `failover-path retry-after must stay ≤${RETRIABLE_S}s (CLI-retriable) — got ${ra}s`);
 });
+
+test('a buffered reply rejected after the SSE heartbeat cannot count as a successful alternative placement', async () => {
+  let finishUpstream;
+  const held = new Promise(resolve => { finishUpstream = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    await held;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'message', stop_reason: 'end_turn', usage: { input_tokens: 8, output_tokens: 2 } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(accounts());
+  // Seed an already selected comparison on the actual lease; scoring has its
+  // own tests. This path must settle it using the response delivered downstream.
+  const acquire = am.acquireAccount.bind(am);
+  am.acquireAccount = (...args) => {
+    const lease = acquire(...args);
+    lease.comparison = { alternative: { owner: 'fixture-alternative' } };
+    return lease;
+  };
+  const alternatives = [];
+  am.routingCapacity.noteAlternative = event => alternatives.push(event);
+  const proxy = createProxyServer(am, { upstream: 'http://127.0.0.1:' + upstreamPort,
+    queue: { streamForwardGraceMs: 1 } });
+  const port = await listen(proxy);
+  try {
+    const response = await fetch('http://127.0.0.1:' + port + '/v1/messages', { method: 'POST',
+      signal: AbortSignal.timeout(5000), headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: true, model: 'test', messages: [] }) });
+    assert.match(response.headers.get('content-type'), /text\/event-stream/);
+    finishUpstream();
+    assert.match(await response.text(), /Upstream returned a non-streaming 200 response/);
+    assert.equal(am.routingService.snapshot().failed, 1);
+    assert.equal(am.placementComparison().successful, 0);
+    assert.equal(am.placementComparison().failed, 1);
+    assert.equal(alternatives.length, 0);
+  } finally {
+    finishUpstream();
+    await close(proxy);
+    await close(upstream);
+  }
+});

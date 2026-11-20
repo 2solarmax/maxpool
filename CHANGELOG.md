@@ -5,6 +5,37 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.118] - 2026-11-20
+
+### Added
+
+- Measure routing service and unused quota at natural resets
+
+### Changed
+
+- Verify released worker reaping and cold restart by IPC events
+
+### Fixed
+
+- Preserve shadow identity across compaction and support CI runtime
+- Attribute pin refusals and buffered stream errors to their real outcomes
+- Keep placement telemetry failures off the routing path
+- Preserve quota protections and replay worker drains exactly once
+- Keep supervising when a released worker exits during takeover
+- Reconcile late quota evidence and retain malformed worker drains
+- Honor operator shutdown during worker takeover
+
+## [1.24.117] - 2026-11-20
+
+### Changed
+
+- Pin migration state and historical coverage across upgrades
+
+### Fixed
+
+- Import legacy hourly usage once across account changes
+- Mark historical imports with unknown source ownership as estimates
+
 ## [1.24.116] - 2026-11-20
 
 ### Added

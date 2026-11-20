@@ -1,3 +1,6 @@
+import { RoutingServiceAnalytics } from './routing-service-analytics.js';
+import { RoutingCapacityAnalytics, capacityKpiWindow } from './routing-capacity-analytics.js';
+import { buildRoutingReport } from './routing-report.js';
 import { combineCacheWindows, readCacheSnapshot } from './account-cache.js';
 import { refreshOpenAIToken } from './openai-login.js';
 import { isClaudeOAuthAccount, rememberNativeRefresh } from './account-config.js';
@@ -426,7 +429,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
   'providerQuotaSource', 'lastProbeOkAt', 'probeRetryAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogVersion',
-  'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel', 'codexFiveHourAbsent', 'codexWeeklyReadingAt',
+  'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel', 'codexScopedFiveHour', 'codexSharedFiveHourVerified', 'codexFiveHourAbsent', 'codexWeeklyReadingAt',
 ];
 
 /** The sticky busy-wait budget actually in force, and where it comes from — ONE resolver
@@ -745,6 +748,41 @@ export function normalizeRemoteResets(ra) {
   return out;
 }
 
+// Before meter provenance was persisted a shared 5h reading could be genuine
+// or copied from a named meter. Preserve its protection only until the stated
+// reset or an authoritative replacement. Never resurrect an unbounded reading.
+function expireLegacyCodexSession(q, now) {
+  if (!q.codexSharedFiveHourVerified && !(Number.isFinite(q.unified5hReset) && q.unified5hReset > now)) {
+    q.unified5h = q.unified5hReset = null;
+  }
+}
+
+function mergeScopedReadings(previous, readings) {
+  const now = Date.now();
+  const fresh = {};
+  for (const [fam, e] of Object.entries(readings)) {
+    if (!e) continue;
+    fresh[fam] = {
+      utilization: e.utilization != null ? clamp01(e.utilization) : null,
+      resetAt: e.resetAt != null ? e.resetAt : null,
+      severity: e.severity || null,
+      isActive: e.isActive !== false,
+      ...(e.reactive === true ? { reactive: true } : {}),
+    };
+  }
+  for (const [fam, pe] of Object.entries(previous || {})) {
+    if (!pe || !pe.reactive || pe.resetAt == null || pe.resetAt <= now) continue;
+    const f = fresh[fam];
+    // Probe absent, null, or LOWER than the reactive bench → keep the bench.
+    // Probe CONFIRMS >= the reactive level → take the fresh reading (still >=
+    // threshold, so still exhausted; no stickiness needed).
+    if (!f || f.utilization == null || f.utilization < (pe.utilization ?? 0)) {
+      fresh[fam] = { ...pe };
+    }
+  }
+  return fresh;
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.90, schedulerOptions = {}, dependencies = {}) {
     this.scheduler = { ...DEFAULT_SCHEDULER, ...schedulerOptions };
@@ -897,6 +935,12 @@ export class AccountManager {
     // CAPACITY LEDGER (2026-08-22): observed tokens per completed window cycle, so
     // "true capacity" is comparable across providers. Restored from state on boot.
     this.capacity = new CapacityLedger();
+    this.routingService = new RoutingServiceAnalytics();
+    this.placementCounts = { since: Date.now(), observed: 0, comparable: 0, disagreed: 0, successful: 0, failed: 0 };
+    this.placementTanks = new WeakMap();
+    this.routingCapacity = new RoutingCapacityAnalytics({
+      demandBetween: (start, end) => this.routingService.demandBetween(start, end),
+    });
     this.sessionPolicies = new Map();
     this.upstreamThrottle = {
       until: null,
@@ -935,9 +979,9 @@ export class AccountManager {
    * Get the best available account, rotating if the current one is near quota.
    * Returns null if all accounts are exhausted.
    */
-  getActiveAccount(requestInfo = {}, excludedIndexes = new Set()) {
+  getActiveAccount(requestInfo = {}, excludedIndexes = new Set(), placement = null) {
     this.refreshExpiredQuotas();
-    return this._selectNext(requestInfo, excludedIndexes, requestInfo.now);
+    return this._selectNext(requestInfo, excludedIndexes, requestInfo.now, placement);
   }
 
   nextRetryForRequest(requestInfo = {}, excludedIndexes = new Set(), now = Date.now()) {
@@ -1172,11 +1216,28 @@ export class AccountManager {
       ? this._sessionBinding(requestInfo.sessionKey)?.currentName
       : null;
     requestInfo.returnedHome = null;   // set by the selection loop when it sends the turn home
-    const account = this.getActiveAccount(requestInfo, excludedIndexes);
+    const key = this._affinityKey(requestInfo);
+    // Compaction can replace the prompt-derived affinity key. Claude Code's
+    // caller-scoped thread still identifies a previously served conversation.
+    const knownThread = requestInfo.clientThreadId && this.conversationProvider.has(this._providerConversationKey(requestInfo));
+    const placement = key && !knownThread && (!requestInfo.nativeCodexClient || requestInfo.identifiedSession) && !prevCurrentName && !this.conversationLastAccount.has(key) && !excludedIndexes.size
+      && !requestInfo.nativeCodexOwner && !requestInfo.pinnedAccountName && !requestInfo.pinAccount
+      && !requestInfo.retrySameAccountName && !requestInfo.isCountTokens && !requestInfo._placementCompared
+      ? { candidates: [] } : null;
+    const account = this.getActiveAccount(requestInfo, excludedIndexes, placement);
     // The D3 retry-same hint is good for exactly ONE acquire, honored or not — a stale
     // hint would pull a later failover hop back onto the account it just left.
     requestInfo.retrySameAccountName = null;
     if (!account) return null;
+    let comparison = null;
+    if (placement && placement.candidates.length) {
+      requestInfo._placementCompared = true;
+      try {
+        comparison = this._comparePlacement(account, placement.candidates, requestInfo, requestInfo.now ?? Date.now());
+      } catch {
+        this._notePlacementFault();
+      }
+    }
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
     const upstreamThrottleProbe = isClaudeAccount(account) && !account.remote && this._claimUpstreamThrottleProbe();
@@ -1195,7 +1256,7 @@ export class AccountManager {
     const migratedFromName = (prevCurrentName && account.name !== prevCurrentName) ? prevCurrentName : null;
     const returnedHome = requestInfo.returnedHome?.name === account.name;
     const returnedHomeSwitched = returnedHome && requestInfo.returnedHome.switched === true;
-    return { account, weight, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName, returnedHome, returnedHomeSwitched, requestInfo };
+    return { account, weight, comparison, startedAt: Date.now(), upstreamThrottleProbe, migratedFromName, returnedHome, returnedHomeSwitched, requestInfo };
   }
 
   /** Fail-safe: snap a session's binding back to the pre-migration issuing account
@@ -1372,6 +1433,19 @@ export class AccountManager {
   releaseAccount(lease, outcome = {}) {
     if (!lease?.account) return;
     this.settleSessionProviderAttempt(lease);
+    if (lease.comparison) {
+      const { alternative } = lease.comparison;
+      lease.comparison = null;
+      try {
+        const trace = lease.requestInfo?._service;
+        const completed = (!trace || trace.terminal === 'completed') && outcome.success
+          && outcome.status >= 200 && outcome.status < 300 && !outcome.error && !outcome.refusal && !outcome.bounced && !outcome.linkFault;
+        this.placementCounts[completed ? 'successful' : 'failed']++;
+        if (completed && alternative?.owner) this.routingCapacity.noteAlternative(alternative);
+      } catch {
+        this._notePlacementFault();
+      }
+    }
     const account = lease.account;
 
     const depthBefore = account.activeWeight;
@@ -1846,25 +1920,26 @@ export class AccountManager {
     return account.provider === 'codex' ? codexModelFor(requestInfo, account) : requestInfo.model;
   }
 
+  _quotaScope(account, model) {
+    if (!model) return null;
+    if (account.provider !== 'codex') return modelFamily(model);
+    const q = account.quota;
+    if (Object.hasOwn(q.codexLimitByModel || {}, model)) return q.codexLimitByModel[model];
+    if (Object.hasOwn(q.scopedWeekly || {}, model) || Object.hasOwn(q.codexScopedFiveHour || {}, model)) return model;
+    const resolved = codexModelFor({ model, ...(/^gpt-|^o[1-9]/i.test(model) ? { openAIModel: model } : {}) }, account);
+    return q.codexLimitByModel?.[resolved] || resolved;
+  }
+
   _scopedExhausted(account, model) {
-    const existingScope = account.quota.codexLimitByModel?.[model];
-    const exactCodexModel = existingScope || account.quota.scopedWeekly?.[model] ? model : null;
-    const fam = account.provider === 'codex'
-      ? exactCodexModel ?? codexModelFor({ model, ...(/^gpt-|^o[1-9]/i.test(model) ? { openAIModel: model } : {}) }, account)
-      : modelFamily(model);
-    if (!fam) return null;
-    const scope = account.provider === 'codex' && account.quota.codexLimitByModel?.[fam];
-    const e = account.quota?.scopedWeekly?.[scope || fam];
-    if (!e || e.isActive === false) return null;
-    // Bench ONLY at genuine exhaustion (>= weeklyExhaustedThreshold). Anthropic
-    // labels a scoped weekly `severity:'critical'` well before it's actually
-    // capped (~90%), where the model still has headroom and is still served — a
-    // hard bench there strands the remainder and mislabels the account "maxed".
-    // A real scoped 429 writes utilization:1 (markRateLimited), so genuine
-    // exhaustion is still caught by the threshold. Same predicate drives the TUI
-    // `maxed` tag, so "maxed" renders iff the model is actually benched.
-    const exhausted = e.utilization != null && e.utilization >= this.scheduler.weeklyExhaustedThreshold;
-    return exhausted ? { resetAt: e.resetAt || null, family: scope || fam } : null;
+    const family = this._quotaScope(account, model);
+    if (!family) return null;
+    const q = account.quota;
+    const weekly = q.scopedWeekly?.[family];
+    const session = q.codexScopedFiveHour?.[family];
+    const exhausted = e => e && e.isActive !== false && e.utilization >= this.scheduler.weeklyExhaustedThreshold;
+    if (exhausted(weekly)) return { resetAt: Math.max(weekly.resetAt || 0, exhausted(session) ? session.resetAt || 0 : 0) || null, family };
+    if (exhausted(session)) return { resetAt: session.resetAt || null, family, session: true };
+    return null;
   }
 
   /** Review r2 A: inside a request-scoped soft cooldown (new placements only). */
@@ -2281,11 +2356,11 @@ export class AccountManager {
 
     // Expire per-model weekly sub-limits on their own reset (a family whose scoped
     // window has passed is usable again for that model, independent of unified).
-    if (q.scopedWeekly && typeof q.scopedWeekly === 'object') {
-      for (const [fam, e] of Object.entries(q.scopedWeekly)) {
+    for (const [map, window] of [[q.scopedWeekly, 'weekly'], [q.codexScopedFiveHour, '5h']]) {
+      for (const [fam, e] of Object.entries(map || {})) {
         if (e && e.resetAt && now >= e.resetAt) {
-          console.log(`[Maxpool] Account "${account.name}" ${fam} weekly sub-limit reset`);
-          delete q.scopedWeekly[fam];
+          console.log(`[Maxpool] Account "${account.name}" ${fam} ${window} sub-limit reset`);
+          delete map[fam];
           changed = true;
         }
       }
@@ -2968,6 +3043,7 @@ export class AccountManager {
     // reset consistently (agreeing with _isAvailable's model gate above; the oracle
     // still returns available:true off any SIBLING account with model headroom).
     const scoped = model ? this._scopedExhausted(account, model) : null;
+    if (scoped?.session) return { cause: 'session_limit', retryAt: scoped.resetAt, queueable: Boolean(scoped.resetAt), modelScoped: true };
     if (scoped) return { cause: 'weekly_exhausted', retryAt: scoped.resetAt, queueable: false, modelScoped: true };
 
     // RAW weekly state, so the retry oracle agrees with _isAvailable's raw gate.
@@ -3169,7 +3245,7 @@ export class AccountManager {
 
   // `now` is the injected clock for every time-varying predicate on the selection
   // path (peak tier, sticky escape). Defaults to the real clock; tests pass it.
-  _selectNext(requestInfo = {}, excludedIndexes = new Set(), now = Date.now()) {
+  _selectNext(requestInfo = {}, excludedIndexes = new Set(), now = Date.now(), placement = null) {
     // Adaptive least-loaded balancing: spread requests across every healthy
     // account immediately, and let live load, quota pressure, and recent errors
     // push traffic away from weaker accounts.
@@ -3255,6 +3331,7 @@ export class AccountManager {
     const home = this._returnHome(requestInfo, now);
     const warmHolder = this._claudeWarmHolder(requestInfo);
     for (const weeklyOptions of weeklyPasses) {
+      if (placement) placement.candidates.length = 0;
       best = null;
       bestScore = Infinity;
       bestPriority = Infinity;
@@ -3293,6 +3370,7 @@ export class AccountManager {
           }
           continue;
         }
+        if (placement) placement.candidates.push({ account, priority, score });
         if (priority < bestPriority || (priority === bestPriority && score < bestScore)) {
           bestPriority = priority;
           bestScore = score;
@@ -3584,7 +3662,10 @@ export class AccountManager {
     // CAPACITY LEDGER: a cycle that spent part of its life DISABLED did not get the
     // chance to deliver its true capacity, so it is not a capacity observation —
     // flag it partial (shown, excluded from the averages).
-    if (!enabled && account.enabled) this.capacity.markPartial(account.name, { disabled: true });
+    if (!enabled && account.enabled) {
+      this.capacity.markPartial(account.name, { disabled: true });
+      if (!account.remote) this.routingCapacity.markUnavailable(this._localCacheKeys(account)[0]);
+    }
     account.enabled = Boolean(enabled);
     if (!enabled && account.name === this.preferredAccountName) {
       this.setRoutingMode('automatic');
@@ -4381,6 +4462,7 @@ export class AccountManager {
       if (!roomLeft(q.unified7d, wkCeiling, POLICY.holdPeerWeeklyRoom)) continue;
       if (!(family === 'codex' && q.codexFiveHourAbsent === true)
         && !roomLeft(q.unified5h, this._sessionBenchThreshold(p, now), POLICY.holdPeerSessionRoom)) continue;
+      if (family === 'codex' && Object.values(q.codexScopedFiveHour || {}).some(e => e && !roomLeft(e.utilization, 1, POLICY.holdPeerSessionRoom))) continue;
       const buckets = Object.values(q.scopedWeekly || {}).filter(e => e && e.isActive !== false);
       if (buckets.some(e => !roomLeft(e.utilization, 1, POLICY.holdPeerWeeklyRoom))) continue;
       // One peer per capacity GROUP (lowest member index as its key): an org-less twin
@@ -4566,8 +4648,9 @@ export class AccountManager {
     // at weeklyExhaustedThreshold, so it's chosen only as overflow (rarely
     // re-429ing). Scoped weekly is otherwise absent from scoring. Soft, never a
     // bench; 0 below reserve and for models with no scoped cap.
-    const scopedPace = requestInfo.model
-      ? this._scopedScarcity(account, requestInfo.model, now) * this.scheduler.paceCostWeight
+    const scopedModel = this._availabilityModel(account, requestInfo);
+    const scopedPace = scopedModel
+      ? this._scopedScarcity(account, scopedModel, now) * this.scheduler.paceCostWeight
       : 0;
 
     const fleetRecentWeight = ctx?.fleetRecentWeight ?? 0;
@@ -5029,6 +5112,97 @@ export class AccountManager {
     return account.status || 'other';
   }
 
+  _notePlacementFault() {
+    if (this.placementFaultLogged) return;
+    this.placementFaultLogged = true;
+    console.log('[MaxPool] A placement comparison could not be recorded. Further comparison errors are suppressed for this worker.');
+  }
+
+  placementComparison() {
+    return { ...this.placementCounts };
+  }
+
+  // A quota percentage is not a quantity of work. Use recent, completed, measured
+  // cycles on the common token axis. Cache only the tank size; all quota and
+  // eligibility checks still use current readings at the time of placement.
+  _placementTank(account, window, now) {
+    let cache = this.placementTanks.get(account);
+    if (!cache) this.placementTanks.set(account, cache = {});
+    if (!cache[window] || now >= cache[window].until || now < cache[window].at) {
+      const t = this.capacityTank(account.index, window);
+      const size = t?.source === 'cycles' && t.exact >= 2 && !t.bounded && t.recent > 0 ? t.recent : null;
+      cache[window] = { at: now, until: now + 60_000, size };
+    }
+    return cache[window].size;
+  }
+
+  _placementOpportunity(account, model, now) {
+    const q = account.quota;
+    const window = capacityKpiWindow(account);
+    if (account.provider === 'codex' && q.unified5h != null && !q.codexSharedFiveHourVerified) return null;
+    const readAt = account.provider === 'codex' ? q.codexWeeklyReadingAt : q.lastProbeOkAt;
+    if (!(readAt > 0 && readAt <= now && now - readAt <= CLAIM_FRESH_MS)) return null;
+    const resetAt = this._capWindowFields(account, window).resetAt;
+    if (!(resetAt > now)) return null;
+    const scope = this._quotaScope(account, model);
+    // No token-denominated tank is measured for a named sublimit. Decline the
+    // comparison if it is near the wall rather than counting it as usable work.
+    if ([q.scopedWeekly?.[scope], q.codexScopedFiveHour?.[scope]]
+      .some(e => e?.isActive !== false && e?.utilization >= this.scheduler.weeklyReserveThreshold)) return null;
+    const remaining = kind => {
+      const used = this._windowUtilization(account, kind);
+      const size = this._placementTank(account, kind, now);
+      if (!size || !Number.isFinite(used)) return null;
+      const ceiling = this._effectiveCap(account, kind, now) ?? 1;
+      return Math.max(0, ceiling - used) * size;
+    };
+    let spare = remaining(window);
+    if (!(spare > 0)) return null;
+    if (window === 'wk' && this._windowUtilization(account, 'ses') != null) {
+      const sessionSpare = remaining('ses');
+      if (!(sessionSpare > 0)) return null;
+      spare = Math.min(spare, sessionSpare);
+    }
+    const reset = account.autoRedeemReset === true && (account.remote
+      ? account.remoteCodexResetOpportunity : this.codexResetOpportunity?.(account, now));
+    return { window, resetAt, rate: spare / (resetAt - now),
+      credit: reset?.validUntil > now && reset.expiresAt > now ? reset.expiresAt : Infinity };
+  }
+
+  _comparePlacement(actual, candidates, request, now) {
+    this.placementCounts.observed++;
+    const chosen = candidates.find(c => c.account === actual);
+    if (!chosen || candidates.length < 2) return null;
+    const model = this._availabilityModel(actual, request);
+    if (!model) return null;
+    // Evaluate only near ties within the winning eligible tier. A different
+    // provider/model, an override, or materially higher load is not a substitute.
+    const others = candidates.filter(c => c !== chosen && c.priority === chosen.priority
+      && c.score <= chosen.score + 0.5 && cacheProvider(actual) === cacheProvider(c.account)
+      && this._availabilityModel(c.account, request) === model && c.account.model === actual.model
+      && JSON.stringify(c.account.modelMap || {}) === JSON.stringify(actual.modelMap || {}));
+    if (!others.length) return null;
+    let best = this._placementOpportunity(actual, model, now);
+    if (!best) return null;
+    let alternate = null;
+    let comparable = false;
+    for (const { account } of others) {
+      const opportunity = this._placementOpportunity(account, model, now);
+      if (!opportunity || opportunity.window !== best.window) continue;
+      comparable = true;
+      if (opportunity.credit < best.credit || (opportunity.credit === best.credit && opportunity.rate > best.rate)) {
+        best = opportunity;
+        alternate = account;
+      }
+    }
+    if (!comparable) return null;
+    this.placementCounts.comparable++;
+    if (alternate) this.placementCounts.disagreed++;
+    const alternative = alternate && !alternate.remote && !alternate.poolBenchedBy
+      ? { owner: this._localCacheKeys(alternate)[0], window: best.window, resetAt: best.resetAt, at: now } : null;
+    return { alternative };
+  }
+
   /**
    * Per-model weekly pace-overage for `model`'s family, or 0 when the account has
    * no scoped cap for it, the cap is inactive, or it's below the reserve tier
@@ -5036,12 +5210,12 @@ export class AccountManager {
    * a scoped window about to reset is cheap to spend.
    */
   _scopedScarcity(account, model, now = Date.now()) {
-    const fam = modelFamily(model);
-    if (!fam) return 0;
-    const e = account.quota?.scopedWeekly?.[fam];
-    if (!e || e.isActive === false || e.utilization == null) return 0;
-    if (e.utilization < this.scheduler.weeklyReserveThreshold) return 0;
-    return this._windowScarcity(e.utilization, e.resetAt, WEEK_MS, now);
+    const family = this._quotaScope(account, model);
+    if (!family) return 0;
+    const scarcity = (reading, duration) => reading?.isActive !== false && reading?.utilization >= this.scheduler.weeklyReserveThreshold
+      ? this._windowScarcity(reading.utilization, reading.resetAt, duration, now) : 0;
+    return Math.max(scarcity(account.quota.scopedWeekly?.[family], WEEK_MS),
+      scarcity(account.quota.codexScopedFiveHour?.[family], FIVE_HOUR_MS));
   }
 
   /**
@@ -5495,6 +5669,7 @@ export class AccountManager {
     }
     this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.fiveHour?.resetAt, prevSesUtil);
     this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.sevenDay?.resetAt, prevWkUtil);
+    if (!usage.error) this.observeRoutingQuota(account, 'wk', usage.sevenDay, sentAt);
     // Utilization readings feed the capacity ESTIMATE. The probe path passes per-window
     // marks so the DELTA method can difference consecutive readings.
     this.capacity.noteUtilizationObserved(Date.now(), [
@@ -5514,31 +5689,8 @@ export class AccountManager {
     // omits the family, or reports the pre-429 level, would otherwise un-bench it
     // and trigger an immediate re-429 flap). _clearExpiredQuotas self-clears it at
     // resetAt even if probes die.
-    if (usage.scopedWeekly && typeof usage.scopedWeekly === 'object') {
-      const now = Date.now();
-      const prev = (q.scopedWeekly && typeof q.scopedWeekly === 'object') ? q.scopedWeekly : {};
-      const fresh = {};
-      for (const [fam, e] of Object.entries(usage.scopedWeekly)) {
-        if (!e) continue;
-        fresh[fam] = {
-          utilization: e.utilization != null ? clamp01(e.utilization) : null,
-          resetAt: e.resetAt != null ? e.resetAt : null,
-          severity: e.severity || null,
-          isActive: e.isActive !== false,
-        };
-      }
-      for (const [fam, pe] of Object.entries(prev)) {
-        if (!pe || !pe.reactive || pe.resetAt == null || pe.resetAt <= now) continue;
-        const f = fresh[fam];
-        // Probe absent, null, or LOWER than the reactive bench → keep the bench.
-        // Probe CONFIRMS >= the reactive level → take the fresh reading (still >=
-        // threshold, so still exhausted; no stickiness needed).
-        if (!f || f.utilization == null || f.utilization < (pe.utilization ?? 0)) {
-          fresh[fam] = { ...pe };
-        }
-      }
-      q.scopedWeekly = fresh;
-    }
+    if (usage.scopedWeekly) q.scopedWeekly = mergeScopedReadings(q.scopedWeekly, usage.scopedWeekly);
+    if (usage.codexScopedFiveHour) q.codexScopedFiveHour = mergeScopedReadings(q.codexScopedFiveHour, usage.codexScopedFiveHour);
 
     q.lastProbeOkAt = Date.now();
     // C1 (finding 1): the SEND time orders this reading against a claim — a probe
@@ -5588,23 +5740,42 @@ export class AccountManager {
       account.lastErrorAt = null;
     }
     account.codexQuotaSentAt = sentAt;
-    if (!partial && usage.sevenDay) account.quota.codexFiveHourAbsent = !usage.fiveHour;
+    const q = account.quota;
+    const emptyInventory = !partial && usage.quotaInventoryPresent !== false && Array.isArray(usage.modelBuckets)
+      && !usage.fiveHour && !usage.sevenDay && !usage.modelBuckets.length && !usage.modelFiveHourBuckets?.length;
+    const confirmsNoWeekly = emptyInventory && !q.unified5hReset && !q.unified7dReset;
+    if (usage.fiveHour) {
+      q.codexSharedFiveHourVerified = true;
+      q.codexFiveHourAbsent = false;
+    } else if (emptyInventory || (!partial && (usage.sevenDay || usage.modelFiveHourBuckets?.length || usage.modelBuckets?.length))) {
+      // A full provider snapshot supersedes the old parser's ambiguous shared value.
+      q.unified5h = q.unified5hReset = null;
+      q.codexSharedFiveHourVerified = true;
+      q.codexFiveHourAbsent = true;
+    }
     if (Number.isFinite(usage.sevenDay?.utilization) && Number.isFinite(usage.sevenDay?.resetAt)) {
       account.quota.codexWeeklyReadingAt = sentAt;
     }
-    const scopedWeekly = partial ? { ...account.quota.scopedWeekly } : {};
-    for (const bucket of usage.modelBuckets || []) {
-      const key = bucket.normalModelSlug || bucket.slug;
-      if (key) scopedWeekly[key] = { utilization: bucket.utilization, resetAt: bucket.resetAt, isActive: true };
-    }
-    if (!partial && Array.isArray(usage.modelBuckets) && !usage.fiveHour && !usage.sevenDay && !usage.modelBuckets.length) {
-      if (!account.quota.unified5hReset && !account.quota.unified7dReset) account.quota.weeklyAbsent = true;
-    }
+    const named = (buckets, previous) => {
+      const entries = partial ? { ...previous } : {};
+      for (const bucket of buckets || []) {
+        const key = bucket.normalModelSlug || bucket.slug;
+        if (!key) continue;
+        entries[key] = { utilization: bucket.utilization, resetAt: bucket.resetAt, isActive: true };
+        // Some probes label a meter with an exact catalog model (e.g. Spark).
+        // Observed active-limit headers are authoritative when both are present.
+        if (/^(gpt-|o[1-9])/i.test(bucket.name || '') && !Object.hasOwn(q.codexLimitByModel || {}, bucket.name)) {
+          q.codexLimitByModel = { ...q.codexLimitByModel, [bucket.name]: key };
+        }
+      }
+      return entries;
+    };
     this.applyUsageData(accountIndex, {
       fiveHour: usage.fiveHour,
       sevenDay: usage.sevenDay,
-      scopedWeekly,
-      ...(usage.sevenDay ? { weeklyAbsent: false } : {}),
+      scopedWeekly: named(usage.modelBuckets, q.scopedWeekly),
+      codexScopedFiveHour: named(usage.modelFiveHourBuckets, q.codexScopedFiveHour),
+      ...(usage.sevenDay ? { weeklyAbsent: false } : confirmsNoWeekly ? { weeklyAbsent: true } : {}),
     }, { sentAt });
     if (usage.resetCredits) {
       const summary = { ...usage.resetCredits, checkedAt: Date.now() };
@@ -5630,6 +5801,7 @@ export class AccountManager {
       fiveHour: window(parsed.unified5h, parsed.unified5hReset),
       sevenDay: window(parsed.unified7d, parsed.unified7dReset),
       modelBuckets: parsed.modelBuckets,
+      modelFiveHourBuckets: parsed.modelFiveHourBuckets,
     }, { sentAt, partial: true });
   }
 
@@ -5877,6 +6049,8 @@ export class AccountManager {
       q.weeklyAbsent = true;
     }
     q.lastProbeOkAt = Date.now();
+    const window = capacityKpiWindow(account);
+    this.observeRoutingQuota(account, window, window === 'ses' ? usage.ses : usage.wk);
     this.noteCapacityWindowAdvance(account.name, 'ses', prevSesReset, usage.ses?.resetAt, prevSesUtil);
     this.noteCapacityWindowAdvance(account.name, 'wk', prevWkReset, usage.wk?.resetAt, prevWkUtil);
     this.capacity.noteUtilizationObserved(Date.now(), [
@@ -5940,7 +6114,10 @@ export class AccountManager {
     const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
     if (r5h) account.quota.unified5hReset = parseResetHeader(r5h);
-    if (r7d) account.quota.unified7dReset = parseResetHeader(r7d);
+    if (r7d) {
+      account.quota.unified7dReset = parseResetHeader(r7d);
+      this.observeRoutingQuota(account, 'wk', { utilization: u7d, resetAt: account.quota.unified7dReset });
+    }
 
     // We switched to this account to discover its weekly quota; now that we
     // know it, flag for re-evaluation so selection can pick the best account.
@@ -6353,9 +6530,13 @@ export class AccountManager {
       if (!owners.has(key)) owners.set(key, []);
       owners.get(key).push(account.name);
     }
+    // Display names can be reassigned. Only the initial migration can use
+    // name-based legacy hours. New owner keys start with their own observations.
+    const legacy = this.capacity.legacyCacheImportComplete ? null : saved;
     for (const [key, aliases] of owners) {
-      this.capacity.restoreOwnerCache(key, aliases.filter(name => names.get(name) === 1), saved, now);
+      this.capacity.restoreOwnerCache(key, aliases.filter(name => names.get(name) === 1), legacy, now);
     }
+    this.capacity.legacyCacheImportComplete = true;
   }
 
   /** The vendor's CURRENT fullness reading for a window — the tank numerator's
@@ -6375,6 +6556,7 @@ export class AccountManager {
    *  window's tokens to it (pre-mortem M5; worst case is the no-weekly account whose
    *  probe latches refreshDead). Safe to call on every render tick and prober tick. */
   closeExpiredCapacityCycles(now = Date.now()) {
+    this.routingCapacity.advance(now);
     for (const a of this.accounts) {
       const q = a.quota || {};
       const pairs = a.type === 'provider'
@@ -6497,8 +6679,9 @@ export class AccountManager {
     // per-request excludedIndexes; future same-model requests are steered by the
     // scoped gate; future other-model requests keep using this account.
     if (options.modelScope) {
-      account.quota.scopedWeekly = account.quota.scopedWeekly || {};
-      account.quota.scopedWeekly[options.modelScope] = {
+      const field = account.provider === 'codex' && options.modelWindow === '5h' ? 'codexScopedFiveHour' : 'scopedWeekly';
+      account.quota[field] ||= {};
+      account.quota[field][options.modelScope] = {
         utilization: 1,
         resetAt: Date.now() + (retryAfter * 1000),
         severity: 'critical',
@@ -6510,7 +6693,7 @@ export class AccountManager {
       };
       account.lastStatus = options.status || 429;
       account.lastErrorAt = Date.now();
-      console.log(`[Maxpool] Account "${account.name}" ${options.modelScope} weekly limit hit — scoped bench ${retryAfter}s (account stays active for other models)`);
+      console.log(`[Maxpool] Account "${account.name}" ${options.modelScope} ${options.modelWindow || 'weekly'} limit hit — scoped bench ${retryAfter}s (account stays active for other models)`);
       return;
     }
 
@@ -7232,12 +7415,14 @@ export class AccountManager {
       // Drop restored scoped entries lacking a clearable reset window — they can't
       // be expired by _clearExpiredQuotas and would otherwise pin an account
       // unavailable-for-family until the first live probe.
-      if (account.quota.scopedWeekly && typeof account.quota.scopedWeekly === 'object') {
-        for (const [fam, e] of Object.entries(account.quota.scopedWeekly)) {
-          if (!e || e.resetAt == null) delete account.quota.scopedWeekly[fam];
+      if (account.provider === 'codex') expireLegacyCodexSession(account.quota, Date.now());
+      for (const field of ['scopedWeekly', 'codexScopedFiveHour']) {
+        const entries = account.quota[field];
+        if (entries && typeof entries === 'object') {
+          for (const [family, e] of Object.entries(entries)) {
+            if (!e || e.resetAt == null) delete entries[family];
+          }
         }
-      } else {
-        account.quota.scopedWeekly = {};
       }
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
@@ -7421,6 +7606,7 @@ export class AccountManager {
       const candidates = this.accounts.filter(x => x.remote?.linkName === link.name &&
         x.remote.remoteName === ra.name && x.provider === provider);
       let a = candidates.find(x => this.capacityIdentity(x) === identity);
+      const previousCodexQuota = identity && provider === 'codex' ? a?.quota : null;
       if (!a && identity) a = candidates.find(x => !this.capacityIdentity(x));
 
       if (!a) {
@@ -7449,8 +7635,17 @@ export class AccountManager {
       a.codexAuth = ra.codexAuth || null;
       a.codexModels = ra.codexModels || null;
       a.codexResetCredits = ra.codexResetCredits || null;
+      a.remoteCodexResetOpportunity = ra.codexResetOpportunity || null;
       a.autoRedeemReset = ra.autoRedeemReset;
-      a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
+      // On a rolling upgrade, an old worker can answer a poll after a newer
+      // worker already identified this account's meters. Compare provider-read
+      // times (not poll times) before replacing the newer quota snapshot.
+      const incoming = ra.quota || {};
+      const staleLegacy = previousCodexQuota?.codexSharedFiveHourVerified === true
+        && incoming.codexSharedFiveHourVerified !== true
+        && (previousCodexQuota.lastProbeOkSentAt || previousCodexQuota.lastProbeOkAt || 0) >= (incoming.lastProbeOkSentAt || incoming.lastProbeOkAt || 0);
+      if (!staleLegacy) a.quota = { ...emptyQuota(), ...incoming };
+      if (a.provider === 'codex') expireLegacyCodexSession(a.quota, Date.now());
       a.status = ra.status || 'active';
       a.refreshDead = Boolean(ra.refreshDead);
       // The CLOUD's cooldown (additive export; an older cloud omits it = none). Kept off
@@ -7681,7 +7876,10 @@ export class AccountManager {
         // counts as the general wall's claim (r3 #3, r4 #3: one claim per wall). Only
         // one that CLEARS it retires the hold (r5 #1): a give-back returns just what
         // the model used, and the live reading retires the hold once a probe sees it.
-        if (appliesTo(grant).includes('general')) account.lastGeneralClaimAt = account.lastClaimAt;
+        if (appliesTo(grant).includes('general')) {
+          account.lastGeneralClaimAt = account.lastClaimAt;
+          this.noteRoutingRefill?.(account, 'wk', account.lastClaimAt);
+        }
         if (clearsGeneralWeekly(grant)) account.lastFullGeneralClaimAt = account.lastClaimAt;
         this.noteGrantClaimed(account, grant.id);
         // Clear the wall this claim refills.
@@ -7706,11 +7904,39 @@ export class AccountManager {
     }
   }
 
+  // Record paired fields from this vendor observation; an older reset stamp in
+  // account.quota cannot establish which window a newly received reading covers.
+  observeRoutingQuota(account, window, reading, sentAt = null) {
+    if (account.remote || account.poolBenchedBy || !reading || window !== capacityKpiWindow(account)) return;
+    if (!Number.isFinite(reading.utilization) || !Number.isFinite(reading.resetAt)) return;
+    this.routingCapacity.observe({
+      owner: this._localCacheKeys(account)[0], window, resetAt: reading.resetAt,
+      utilization: reading.utilization, observedAt: sentAt ?? Date.now(),
+      enabled: account.enabled !== false,
+      lastClaimAt: account.lastGeneralClaimAt ?? account.lastFullGeneralClaimAt,
+      freshForMs: Math.max(180_000, 3 * (this.quotaProbeIntervalMs || 0)),
+    });
+  }
+
+  noteRoutingRefill(account, window, at = Date.now()) {
+    if (!account.remote && window === capacityKpiWindow(account)) {
+      this.routingCapacity.markRefill(this._localCacheKeys(account)[0], at);
+    }
+  }
+
+  routingReport(now = Date.now()) {
+    if (!this._routingReport || now - this._routingReport.asOf >= 1000 || now < this._routingReport.asOf) {
+      this._routingReport = buildRoutingReport(this, now);
+    }
+    return this._routingReport;
+  }
+
   getStatus() {
     const now = Date.now();
     return {
       // Owner-only means a linked pool never re-exports an upstream total.
       ownedProviderCache: this._ownedProviderCache(now),
+      routingAnalytics: this.routingReport(now),
       // Running version + npm update state (set at startup by maybeCheckForUpdate).
       // null until the check resolves; `current` is known even offline.
       version: this.versionInfo || null,
@@ -7747,6 +7973,7 @@ export class AccountManager {
         ...(a.provider === 'codex' ? { codexAuth: a.codexAuth,
           codexModels: a.quota?.codexModels ?? a.codexModels,
           autoRedeemReset: a.remote ? a.autoRedeemReset : a.autoRedeemReset === true,
+          codexResetOpportunity: a.remote ? null : this.codexResetOpportunity?.(a, now) || null,
           codexResetCredits: a.enabled === false ? null : a.quota?.codexResetCredits ?? a.codexResetCredits ?? null } : {}),
         enabled: a.enabled,
         poolBenchedBy: a.poolBenchedBy || null,

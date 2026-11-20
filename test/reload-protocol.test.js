@@ -8,9 +8,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   runReloadBaton,
-  RELOAD_SWAPPED, RELOAD_ROLLED_BACK, RELOAD_FALLBACK,
+  RELOAD_SWAPPED, RELOAD_ROLLED_BACK, RELOAD_FALLBACK, RELOAD_STOPPED,
   MSG_PROBE_READY, MSG_READY, MSG_FAILED, MSG_RELEASE, MSG_RELEASED,
-  MSG_TAKEOVER, MSG_PRIMARY, MSG_ROLLED_BACK,
+  MSG_TAKEOVER, MSG_PRIMARY, MSG_STOPPING, MSG_ROLLED_BACK,
 } from '../src/reload-protocol.js';
 
 // A scripted fake worker: records sent messages, and answers waitFor() from a
@@ -102,4 +102,14 @@ test('new worker will not take over after old released → FALLBACK', async () =
   assert.equal(outcome, RELOAD_FALLBACK);
   assert.ok(oldWorker.types.includes(MSG_RELEASE), 'old did release');
   assert.ok(newWorker.types.includes(MSG_TAKEOVER), 'new was asked to take over but timed out');
+});
+
+test('an operator stop before TAKEOVER or before PRIMARY never falls back to a new worker', async () => {
+  for (const alreadyStopping of [true, false]) {
+    const oldWorker = fakeWorker([{ type: MSG_RELEASED }]);
+    const newWorker = fakeWorker([{ type: MSG_READY }, { type: MSG_STOPPING }]);
+    const outcome = await runReloadBaton({ oldWorker, newWorker, handle: {}, shutdownRequested: () => alreadyStopping });
+    assert.equal(outcome, RELOAD_STOPPED);
+    assert.equal(newWorker.types.includes(MSG_TAKEOVER), !alreadyStopping);
+  }
 });

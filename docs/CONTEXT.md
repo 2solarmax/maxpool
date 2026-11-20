@@ -24,6 +24,22 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-20 · Quota attribution after a worker handoff
+
+Late coverage can establish that an unused window had no observed demand. A late request from a retiring worker can retract that conclusion. MaxPool saves corrections with the quota cycle so they survive the shorter demand-history retention. The terminal and status report share one demand summary across accounts. A malformed handoff stays on disk under its original ID and is retried when the file changes. Transient failures continue to retry.
+
+### 2026-11-20 · Measure routing outcomes at ingress and quota expiry at the holder
+
+Activity analytics opens routing with `v` then `r`. It reports terminal inference outcomes and router-controlled wait. Native and translated requests share the five-second queue budget. A forwarded hop is visible to the receiving account without adding another external arrival. Each worker reports its own observations and coverage through the versioned `routingAnalytics` field of the existing status response. The terminal can select an individual worker.
+
+Unused quota is a conservative estimate from peak observed utilization in each natural window. It requires a fresh paired vendor reading near the reset, including on idle accounts. Confirmed session-only z.ai plans use their five-hour window. The distinction between no observed demand, eligible demand served elsewhere and incomplete evidence matters when sizing subscriptions. Historical service or end-of-window readings cannot be reconstructed from cache totals. The six-request default protects forwarded requests that bypass ordinary admission. New-placement measurement keeps established conversations and cache ownership intact.
+
+During a rolling upgrade a legacy worker's unexpired five-hour reading continues to protect the account until an authoritative usage probe identifies its scope or the window expires. A request's explicit active meter determines which named quota can supply its retry time. Exhaustion on another model cannot lengthen that wait.
+
+### 2026-11-20 · Import historical cache data once per worker
+
+The first migration imports the old name-based hours into the accounts known at the time. An unmatched or ambiguous name is omitted from historical attribution, even if a matching name appears later, because later reuse cannot establish who served the old requests. Later identity and provider changes use owner-keyed observations. Imported hours from 1.24.116 have no source aliases or request IDs. Their affected windows carry an estimate warning. The original counters are preserved.
+
 ### 2026-11-20 · Account analytics and private subscription terms
 
 Cache percentages divide cache-read tokens by all input tokens, including cache writes. Accounts shows the last three hours. Activity analytics provides one hour, one day, one week and all measured history. Each worker counts the requests it served locally. A linked viewer uses the serving worker’s summaries. Codex reports cached tokens as part of input and the two request adapters normalize that once.

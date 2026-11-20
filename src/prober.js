@@ -428,6 +428,7 @@ export class Prober {
         // A4: remove the redeemed card from the stored list BEFORE the follow-up
         // read — if that read fails (or is drifted), the stale-kept list must not
         // keep counting a card that no longer exists (pre-mortem #17).
+        this.am.noteRoutingRefill?.(account, act.resetType === 'WEEK' ? 'wk' : 'ses');
         this.am.removeResetCard?.(account.index, act.card.recordId);
         if (this.am.applyResetCards) {
           const fresh = await this._withTimeout(listResetCards(account.credential));
@@ -493,7 +494,10 @@ export class Prober {
         // claimed at — is the general wall's claim (r3 #3, r4 #3); only one that
         // CLEARS it retires the hold (r5 #1, same rule as the 429 fast path). A
         // Fable-only grant refills nothing the hold is waiting on.
-        if (appliesTo(act.grant).includes('general')) account.lastGeneralClaimAt = account.lastClaimAt;
+        if (appliesTo(act.grant).includes('general')) {
+          account.lastGeneralClaimAt = account.lastClaimAt;
+          this.am.noteRoutingRefill?.(account, 'wk', account.lastClaimAt);
+        }
         if (clearsGeneralWeekly(act.grant)) account.lastFullGeneralClaimAt = account.lastClaimAt;
         // Spend it in the STORED listing too: until the next listing (≤5 min) the
         // held count, the lift and the reactive path must not see it as unspent.
