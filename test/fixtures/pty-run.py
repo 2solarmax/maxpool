@@ -11,6 +11,7 @@ Prints `PID <n>` once the child is running, then reads one command per stdin lin
     read                  start draining the terminal at full speed
     read-slow <n> <ms>    drain at most <n> bytes every <ms> ms (a terminal falling behind)
     pause                 stop reading (the terminal hangs again)
+    hangup                close the master of a controlling terminal
     keys <hex>            type bytes into the terminal (the child's stdin)
     wait <seconds>        wait for the child to exit -> `EXIT <code|TIMEOUT>`
     dump                  -> `OUT <base64 of every byte read so far>`
@@ -37,7 +38,8 @@ def main():
     cmd = sys.argv[sep + 1:]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
-    child = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+    claim_tty = (lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0)) if '--ctty' in sys.argv[3:sep] else None
+    child = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, start_new_session=True, preexec_fn=claim_tty)
     os.close(slave)
 
     out = bytearray()
@@ -49,10 +51,10 @@ def main():
             if not mode['on']:
                 time.sleep(0.01)
                 continue
-            r, _, _ = select.select([master], [], [], 0.05)
-            if not r:
-                continue
             try:
+                r, _, _ = select.select([master], [], [], 0.05)
+                if not r:
+                    continue
                 data = os.read(master, mode['chunk'] or 65536)
             except OSError:
                 return   # EIO: the child side closed (exited) and everything was read
@@ -81,6 +83,11 @@ def main():
             mode.update(chunk=int(parts[1]), every=int(parts[2]) / 1000.0, on=True)
         elif op == 'pause':
             mode['on'] = False
+        elif op == 'hangup':
+            assert claim_tty and os.tcgetpgrp(master) == child.pid
+            mode['on'] = False
+            os.close(master)   # kernel sends SIGHUP to this foreground process group
+            say('HUNGUP')
         elif op == 'keys':
             os.write(master, bytes.fromhex(parts[1]))
         elif op == 'wait':

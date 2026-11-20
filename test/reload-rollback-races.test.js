@@ -11,13 +11,35 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { bootPool, getFreePort, HAVE_PTY, proxyRequest, sleep } from './fixtures/reload-pty-harness.js';
 
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
+
+// As in reload-old-supervisor.test.js, exercise the shipped source from local
+// git history, offline. Here only the prospective successor runs v1.24.117.
+async function legacySuccessor(t) {
+  const repo = fileURLToPath(new URL('..', import.meta.url));
+  const rev = '52c488e0f22f6c3bdc4968de911247fdc3033b83';
+  if (spawnSync('git', ['-C', repo, 'cat-file', '-e', rev + '^{commit}']).status !== 0) {
+    t.skip('v1.24.117 source unavailable in shallow checkout');
+    return null;
+  }
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-legacy-successor-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = spawnSync('git', ['-C', repo, 'archive', rev, 'src', 'package.json'], { maxBuffer: 8 * 1024 * 1024 });
+  assert.equal(archive.status, 0, String(archive.stderr));
+  const extract = spawnSync('tar', ['-xf', '-', '-C', dir], { input: archive.stdout });
+  assert.equal(extract.status, 0, String(extract.stderr));
+  const entry = join(dir, 'dispatch.mjs');
+  await writeFile(entry, `await import(process.env.MAXPOOL_RELOAD_WORKER === '1'
+    ? ${JSON.stringify(pathToFileURL(join(dir, 'src', 'index.js')).href)}
+    : ${JSON.stringify(pathToFileURL(cliPath).href)});\n`);
+  return entry;
+}
 
 function startUpstream() {
   const server = http.createServer((req, res) => {
@@ -65,7 +87,7 @@ function waitForOutput(p, pattern, timeoutMs = 20_000) {
   });
 }
 
-async function boot(env) {
+async function boot(env, cli = cliPath) {
   const upstream = await startUpstream();
   const port = await getFreePort();
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-races-'));
@@ -80,7 +102,7 @@ async function boot(env) {
   delete fullEnv.MAXPOOL_SERVER_WORKER;
   delete fullEnv.MAXPOOL_RELOAD_WORKER;
   let out = '';
-  const child = spawn(process.execPath, [cliPath, 'server'], { env: fullEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  const child = spawn(process.execPath, [cli, 'server'], { env: fullEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
   child.stdout.on('data', d => { out += d; });
   child.stderr.on('data', d => { out += d; });
   let worker = null;
@@ -159,7 +181,11 @@ async function delayedPrimary() {
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-delay-primary-'));
   const preload = join(dir, 'delay-primary.cjs');
   const allowPrimary = join(dir, 'allow-primary');
+  const sawHup = join(dir, 'supervisor-saw-hup');
   await writeFile(preload, `
+    if (!process.env.MAXPOOL_SERVER_WORKER) {
+      process.on('SIGHUP', () => setImmediate(() => require('node:fs').writeFileSync(${JSON.stringify(sawHup)}, '1')));
+    }
     if (process.env.TEST_BATON_EVENTS === '1') {
       const mark = event => process.stderr.write('[fixture] ' + event + ' ' + process.pid + '\\n');
       if (!process.env.MAXPOOL_SERVER_WORKER) {
@@ -206,7 +232,7 @@ async function delayedPrimary() {
       };
     }
   `);
-  return { preload, allowPrimary };
+  return { preload, allowPrimary, sawHup };
 }
 
 test('an old worker exiting after release and before the new primary acknowledgement keeps supervision', { timeout: 120_000 }, async () => {
@@ -238,29 +264,36 @@ test('an old worker exiting after release and before the new primary acknowledge
   } finally { await p.stop(); }
 });
 
-test('confirmed terminal quit before PRIMARY stops the supervisor after the old worker has exited', { skip: !HAVE_PTY, timeout: 30_000 }, async () => {
-  const { preload } = await delayedPrimary();
-  const { pid, port, term, oldWorker, cleanup } = await bootPool({ readyMs: 20_000,
-    env: { NODE_OPTIONS: '--require=' + JSON.stringify(preload), MAXPOOL_TEST_RESTART_SIGNAL: '1' } });
-  try {
-    process.kill(oldWorker, 'SIGUSR2');
-    assert.ok(await until(() => !childPids(pid).includes(oldWorker), 10_000), 'predecessor drained');
-    assert.ok(await until(async () => (await proxyRequest(port)).worker, 5000), 'successor is serving');
-    term.cmd('keys 71');   // q
-    assert.ok(await until(async () => {
-      term.cmd('dump');
-      return Buffer.from((await term.next('OUT ')).slice(4), 'base64').toString().includes('Stop Maxpool?');
-    }, 5000), 'successor prompted to quit');
-    term.cmd('keys 79');   // y
-    term.cmd('wait 5');
-    assert.equal((await term.next('EXIT ', 8000)).trim(), 'EXIT 0');
-    assert.ok((await proxyRequest(port)).error, 'the listener is closed');
-  } finally { cleanup(); }
-});
+for (const version of ['current', 'v1.24.117']) {
+  test(`confirmed terminal quit before PRIMARY with a ${version} successor stops the supervisor`, { skip: !HAVE_PTY, timeout: 30_000 }, async t => {
+    const cli = version === 'current' ? cliPath : await legacySuccessor(t);
+    if (!cli) return;
+    const { preload } = await delayedPrimary();
+    const { pid, port, term, oldWorker, cleanup, log } = await bootPool({ cli, readyMs: 20_000,
+      env: { NODE_OPTIONS: '--require=' + JSON.stringify(preload), MAXPOOL_TEST_RESTART_SIGNAL: '1' } });
+    try {
+      process.kill(oldWorker, 'SIGUSR2');
+      assert.ok(await until(() => !childPids(pid).includes(oldWorker), 10_000), 'predecessor drained');
+      assert.ok(await until(async () => (await proxyRequest(port)).worker, 5000), 'successor is serving');
+      term.cmd('keys 71');   // q
+      assert.ok(await until(async () => {
+        term.cmd('dump');
+        return Buffer.from((await term.next('OUT ')).slice(4), 'base64').toString().includes('Stop Maxpool?');
+      }, 5000), 'successor prompted to quit');
+      term.cmd('keys 79');   // y
+      term.cmd('wait 5');
+      assert.equal((await term.next('EXIT ', 8000)).trim(), 'EXIT 0');
+      assert.ok((await proxyRequest(port)).error, 'the listener is closed');
+      assert.match(await log(), /reload: old worker exited at .*after swap, clean exit/, 'quit reaped the released worker');
+    } finally { cleanup(); }
+  });
+}
 
-for (const stop of [true, false]) {
-  test(stop ? 'foreground TERM before the successor listens stops the pool'
-    : 'an unexpected exit before listen still respawns, even after a signal to the supervisor alone', { timeout: 20_000 }, async () => {
+for (const [version, stop] of [['current', true], ['v1.24.117', true], ['current', false], ['v1.24.117', false]]) {
+  test(stop ? `foreground TERM before the ${version} successor listens stops the pool`
+    : `an unexpected ${version} successor exit before listen still respawns`, { timeout: 20_000 }, async t => {
+    const cli = version === 'current' ? cliPath : await legacySuccessor(t);
+    if (!cli) return;
     const dir = await mkdtemp(join(tmpdir(), 'maxpool-before-takeover-'));
     const preload = join(dir, 'hold.cjs');
     const held = join(dir, 'held');
@@ -277,7 +310,7 @@ for (const stop of [true, false]) {
         process.on('SIGUSR2', () => process.exit(1));
       }
     `);
-    const p = await boot({ NODE_OPTIONS: '--require=' + JSON.stringify(preload) });
+    const p = await boot({ NODE_OPTIONS: '--require=' + JSON.stringify(preload) }, cli);
     try {
       process.kill(p.worker, 'SIGHUP');
       let incoming;
@@ -290,7 +323,7 @@ for (const stop of [true, false]) {
         assert.ok(await until(() => p.child.exitCode === 0, 4000), 'operator shutdown completed');
         assert.ok((await proxyRequest(p.port)).error, 'no replacement listening');
       } else {
-        process.kill(p.child.pid, 'SIGTERM');
+        if (version === 'current') process.kill(p.child.pid, 'SIGTERM');
         process.kill(incoming, 'SIGUSR2');
         assert.ok(await until(async () => {
           const { worker } = await proxyRequest(p.port);
@@ -298,5 +331,74 @@ for (const stop of [true, false]) {
         }, 4000), 'a fresh worker is serving');
       }
     } finally { await p.stop(); }
+  });
+}
+
+test('a modern successor can announce shutdown before the supervisor starts waiting for PRIMARY', { timeout: 25_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-pause-relisten-'));
+  const preload = join(dir, 'relisten.cjs');
+  const release = join(dir, 'resume');
+  await writeFile(preload, `
+    if (!process.env.MAXPOOL_SERVER_WORKER) {
+      const proto = require('node:net').Server.prototype;
+      const emit = proto.emit;
+      let bindings = 0;
+      proto.emit = function (event, ...args) {
+        if (event !== 'listening' || ++bindings !== 2) return emit.call(this, event, ...args);
+        process.stderr.write('[fixture] master rebound\\n');
+        const timer = setInterval(() => {
+          if (!require('node:fs').existsSync(${JSON.stringify(release)})) return;
+          clearInterval(timer);
+          emit.call(this, event, ...args);
+        }, 10);
+      };
+    }
+  `);
+  const p = await boot({ NODE_OPTIONS: '--require=' + JSON.stringify(preload) });
+  try {
+    process.kill(p.worker, 'SIGHUP');
+    await waitForOutput(p, /\[fixture\] master rebound/);
+    const [incoming] = childPids(p.child.pid).filter(pid => pid !== p.worker);
+    assert.ok(incoming, 'new worker is waiting for TAKEOVER');
+    // The outgoing worker is already released. No signal is sent to the
+    // supervisor, so only this modern worker's own STOPPING explains its exit.
+    process.kill(incoming, 'SIGTERM');
+    assert.ok(await until(() => !childPids(p.child.pid).includes(incoming), 5000), 'successor stopped before takeover');
+    await writeFile(release, '');
+    assert.ok(await until(() => p.child.exitCode === 0, 5000), p.out());
+    assert.ok((await proxyRequest(p.port)).error, 'no cold replacement');
+  } finally { await p.stop(); }
+});
+
+for (const revoked of [false, true]) {
+  test(revoked ? 'closing the controlling terminal reaps an unresponsive successor after its drain'
+    : 'SIGHUP with the controlling terminal still writable lets the successor finish takeover',
+  { skip: !HAVE_PTY, timeout: 35_000 }, async () => {
+    const { preload, allowPrimary, sawHup } = await delayedPrimary();
+    const p = await bootPool({ controllingTerminal: true, drainTimeoutMs: 1500, readyMs: 20_000,
+      env: { NODE_OPTIONS: '--require=' + JSON.stringify(preload), MAXPOOL_TEST_RESTART_SIGNAL: '1' } });
+    try {
+      process.kill(p.oldWorker, 'SIGUSR2');
+      assert.ok(await until(() => !childPids(p.pid).includes(p.oldWorker), 10_000), 'predecessor drained');
+      const incoming = (await proxyRequest(p.port)).worker;
+      assert.ok(incoming && incoming !== p.oldWorker, 'successor serves while PRIMARY is withheld');
+      if (revoked) {
+        // Model the observed legacy worker frozen in open(/dev/tty). The
+        // kernel revokes the real pty; this worker cannot send STOPPING.
+        process.kill(incoming, 'SIGSTOP');
+        p.term.cmd('hangup');
+        await p.term.next('HUNGUP');
+        p.term.cmd('wait 8');
+        assert.equal((await p.term.next('EXIT ', 10_000)).trim(), 'EXIT 0', await p.log());
+        assert.throws(() => process.kill(incoming, 0), { code: 'ESRCH' });
+        assert.ok((await proxyRequest(p.port)).error, 'no cold replacement is listening');
+      } else {
+        process.kill(p.pid, 'SIGHUP');
+        assert.ok(await until(() => readFile(sawHup, 'utf8').catch(() => ''), 5000), 'supervisor handled the signal');
+        await writeFile(allowPrimary, '');
+        assert.ok(await until(async () => (await p.log()).includes('cutover complete'), 5000), await p.log());
+        assert.equal((await proxyRequest(p.port)).worker, incoming);
+      }
+    } finally { p.cleanup(); }
   });
 }
