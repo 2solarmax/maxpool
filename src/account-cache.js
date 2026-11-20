@@ -12,7 +12,7 @@ const add = (a, b) => { for (let i = 0; i < 4; i++) a[i] += b[i]; };
 const memo = new WeakMap();
 const pruned = new WeakMap();
 
-const validSource = id => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id);
+export const validCacheSource = id => typeof id === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id);
 
 export function emptyCacheHistory(since, source = randomUUID()) {
   return { source, since, total: zero(), minutes: {}, legacyHours: {} };
@@ -59,7 +59,7 @@ export function cacheHistoryFromHours(hours, now) {
 
 export function restoreCacheHistory(raw, now) {
   if (!raw || !Number.isFinite(raw.since) || !valid(raw.total)) return null;
-  const history = emptyCacheHistory(raw.since, validSource(raw.source) ? raw.source : undefined);
+  const history = emptyCacheHistory(raw.since, validCacheSource(raw.source) ? raw.source : undefined);
   if (typeof raw.assignedOwner === 'string') history.assignedOwner = raw.assignedOwner;
   history.total = [...raw.total];
   for (const key of ['minutes', 'legacyHours']) {
@@ -120,7 +120,7 @@ export function readCacheSnapshot(raw) {
     if (!valid(values)) return null;
     windows[key] = describe(values, w.partial === true);
   }
-  return { ...(validSource(raw.source) ? { source: raw.source } : {}), since: raw.since, asOf: raw.asOf, windows };
+  return { ...(validCacheSource(raw.source) ? { source: raw.source } : {}), since: raw.since, asOf: raw.asOf, windows };
 }
 
 export function combineCacheWindows(snapshots) {

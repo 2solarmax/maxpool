@@ -779,6 +779,7 @@ export class AccountManager {
     this.callerStats = new Map();
     // Team-pool links (owner D8): remote pools as accounts + duplicate benching.
     this.poolLinks = [];
+    this._remoteProviderCache = new Map();
     this._remoteIdentities = new Map();
     this._benchedByPool = [];
     this.poolUpSince = Date.now();
@@ -6290,19 +6291,55 @@ export class AccountManager {
     return combineCacheWindows(this.capacityGroupOf(account).map(a => this._ownerCacheWindows(a, now)));
   }
 
-  providerCacheWindows(now = Date.now()) {
+  _ownedProviderCache(now) {
     const by = new Map(), represented = new Set();
     const add = (provider, snapshot) => {
       if (!by.has(provider)) by.set(provider, []);
       by.get(provider).push(snapshot);
     };
     for (const account of this.accounts) {
-      if (!account.remote) for (const key of this._localCacheKeys(account)) represented.add(key);
+      if (account.remote) continue;
+      for (const key of this._localCacheKeys(account)) represented.add(key);
       add(cacheProvider(account), this._ownerCacheWindows(account, now));
     }
-    // A removed holder or old unresolved organization still has measured provider spend.
+    // Keep unassigned organizations and removed accounts in the holder's total.
     for (const key of this.capacity.ownerCacheKeys()) {
       if (!represented.has(key)) add(JSON.parse(key)[0], this.capacity.ownerCacheWindows(key, now));
+    }
+    return Object.fromEntries([...by].map(([provider, rows]) => {
+      const summary = combineCacheWindows(rows);
+      return [provider, summary && { ...summary, source: this.capacity.poolCacheSource }];
+    }));
+  }
+
+  providerCacheWindows(now = Date.now()) {
+    const by = new Map(Object.entries(this._ownedProviderCache(now)).map(([provider, snapshot]) => [provider, [snapshot]]));
+    const add = (provider, snapshot) => {
+      if (!by.has(provider)) by.set(provider, []);
+      by.get(provider).push(snapshot);
+    };
+    const coveredAccounts = new Set();
+    for (const [name, peer] of this._remoteProviderCache) {
+      for (const [provider, snap] of peer.providers) {
+        const stale = now - snap.asOf > STATUS_STALE_DOWN_MS;
+        add(provider, peer.offline || stale ? { ...snap, offline: true } : snap);
+      }
+      for (const a of this.accounts) {
+        if (a.remote?.linkName === name && peer.providers.has(cacheProvider(a)) && a._remoteCacheWindows?.source) {
+          coveredAccounts.add(a._remoteCacheWindows.source);
+        }
+      }
+    }
+    // Older peers have account snapshots only. Those cannot establish whether
+    // historical provider traffic remains unattributed. Show the observed part.
+    for (const account of this.accounts) {
+      if (!account.remote) continue;
+      const provider = cacheProvider(account);
+      if (this._remoteProviderCache.get(account.remote.linkName)?.providers.has(provider)) continue;
+      const snap = this._ownerCacheWindows(account, now);
+      if (snap?.source && coveredAccounts.has(snap.source)) continue;
+      add(provider, snap);
+      add(provider, null);
     }
     return Object.fromEntries([...by].map(([provider, rows]) => [provider, combineCacheWindows(rows)]));
   }
@@ -7349,7 +7386,19 @@ export class AccountManager {
   syncRemoteMirrors(link) {
     if (!link) return;
     // probeDown (the 5 s dead-link probe) benches the link exactly like a failed poll.
-    const rows = link.lastError || link.probeDown || link.lastOkAt == null ? [] : (link.status?.accounts || []);
+    const offline = Boolean(link.lastError || link.probeDown || link.lastOkAt == null);
+    const rows = offline ? [] : (link.status?.accounts || []);
+    if (offline) {
+      const peer = this._remoteProviderCache.get(link.name);
+      if (peer) peer.offline = true;
+    } else {
+      const providers = new Map();
+      for (const [name, raw] of Object.entries(link.status?.ownedProviderCache || {})) {
+        const snapshot = readCacheSnapshot(raw);
+        if (snapshot?.source) providers.set(name, snapshot);
+      }
+      this._remoteProviderCache.set(link.name, { providers, offline: false });
+    }
     const seen = new Set();
     for (const ra of rows) {
       if (ra.remote) continue;                 // never mirror a mirror (no chained hops)
@@ -7650,6 +7699,8 @@ export class AccountManager {
   getStatus() {
     const now = Date.now();
     return {
+      // Owner-only means a linked pool never re-exports an upstream total.
+      ownedProviderCache: this._ownedProviderCache(now),
       // Running version + npm update state (set at startup by maybeCheckForUpdate).
       // null until the check resolves; `current` is known even offline.
       version: this.versionInfo || null,

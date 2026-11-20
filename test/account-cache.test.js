@@ -75,6 +75,7 @@ test('serving owners export the only measured token counts; linked accounts, inc
   assert.deepEqual(total, { input: 70, cacheRead: 40, cacheWrite: 0, output: 30, hit: 40 / 110, partial: false });
   assert.equal(local.accountCacheWindows(mirror).windows.all.hit, 0.3);
   assert.equal(local.getStatus().accounts.find(a => a.remote).accountCache, null);
+  delete link.status.ownedProviderCache;
   delete link.status.accounts[0].accountCache;
   local.syncRemoteMirrors(link);
   assert.equal(local.accountCacheWindows(mirror), null);
@@ -267,4 +268,47 @@ test('previously unassigned user-only history is retained in provider totals whe
   assert.equal(resumed.accountCacheWindows(resumed.accounts[0], now).windows.all.input, 2);
   assert.equal(resumed.accountCacheWindows(resumed.accounts[1], now).windows.all.input, 30);
   assert.equal(resumed.providerCacheWindows(now).claude.windows.all.input, 41);
+});
+
+test('linked providers include owner-only unassigned usage exactly once, even across aliases or a holder restart', () => {
+  const before = new AccountManager([account('holder')]);
+  before.accrueCapacity(0, { input: 90 });
+  const rows = ['first', 'second'].map(organizationUuid => ({ ...account('holder'), organizationUuid }));
+  const holder = new AccountManager(rows);
+  holder.restoreCapacityState(before.capacity.serialize());
+  holder.restoreAccountCacheHours();
+  holder.accrueCapacity(0, { cacheRead: 10 });
+
+  const edge = new AccountManager([]);
+  const link = (name, status) => ({ name, url: 'http://' + name + '.invalid', lastOkAt: Date.now(), status });
+  const status = holder.getStatus();
+  const direct = holder.providerCacheWindows().claude.windows;
+  edge.syncRemoteMirrors(link('east', status));
+  for (const window of ['1h', '3h', '24h', '7d', 'all']) {
+    assert.equal(edge.providerCacheWindows().claude.windows[window].hit, 0.1);
+    assert.equal(edge.providerCacheWindows().claude.windows[window].partial, direct[window].partial);
+  }
+  const restarted = new AccountManager(rows);
+  restarted.restoreCapacityState(holder.capacity.serialize());
+  edge.syncRemoteMirrors(link('alias', restarted.getStatus()));
+  assert.equal(edge.providerCacheWindows().claude.windows.all.input, 90);
+  assert.equal(edge.providerCacheWindows().claude.windows.all.cacheRead, 10);
+  assert.equal(edge.accountCacheWindows(edge.accounts[0]).windows.all.input, 0);
+  assert.deepEqual(edge.getStatus().ownedProviderCache, {}, 'an edge does not forward linked totals to another edge');
+
+  const legacy = structuredClone(status);
+  delete legacy.ownedProviderCache;
+  edge.syncRemoteMirrors(link('older-alias', legacy));
+  assert.equal(edge.providerCacheWindows().claude.windows.all.hit, 0.1, 'mixed-version alias cannot duplicate account usage');
+  const oldOnly = new AccountManager([]);
+  oldOnly.syncRemoteMirrors(link('old', legacy));
+  assert.equal(oldOnly.providerCacheWindows().claude.windows.all.hit, 1, 'only the 10 reads are visible from an old peer');
+  assert.equal(oldOnly.providerCacheWindows().claude.windows.all.partial, true);
+
+  const removed = new AccountManager([]);
+  removed.restoreCapacityState(holder.capacity.serialize());
+  const removedEdge = new AccountManager([]);
+  removedEdge.syncRemoteMirrors(link('removed', removed.getStatus()));
+  assert.equal(removedEdge.accounts.length, 0);
+  assert.equal(removedEdge.providerCacheWindows().claude.windows.all.hit, 0.1, 'removed rows still contribute observed provider traffic');
 });
