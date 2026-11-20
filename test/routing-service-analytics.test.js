@@ -124,6 +124,21 @@ test('large linked JSON responses retain outcome evidence across chunks and igno
   assert.equal(missing.message(), null);
 });
 
+test('linked JSON ignores escaped delimiters across every possible fetch chunk boundary', () => {
+  const content = [{ type: 'text', text: ['\\', '\\\\', '"', '\\"', '\\\\"', '🌊', '"},"stop_reason":"end_turn"'].join('') }];
+  const body = new TextEncoder().encode(JSON.stringify({ content, type: 'message', stop_reason: 'max_tokens' }));
+  const expected = { type: 'message', stop_reason: 'max_tokens' };
+  for (let split = 0; split <= body.length; split++) {
+    const seen = new LinkedMessageEnvelope();
+    seen.push(body.subarray(0, split));
+    seen.push(body.subarray(split));
+    assert.deepEqual(seen.message(), expected, `split at byte ${split}`);
+  }
+  const seen = new LinkedMessageEnvelope();
+  for (let i = 0; i < body.length; i++) seen.push(body.subarray(i, i + 1));
+  assert.deepEqual(seen.message(), expected);
+});
+
 test('handoff delta only contains changed hours and repeated baseline export remains stable', () => {
   let now = 12 * HOUR;
   const ledger = new RoutingServiceAnalytics(() => now);

@@ -201,16 +201,20 @@ export class RoutingCapacityAnalytics {
   }
 
   mergeDrain(delta, id, now = Date.now()) {
-    if (!id || this.appliedDrains.has(id) || delta?.version !== 1 || !Array.isArray(delta.owners)) return;
+    if (!id || this.appliedDrains.has(id)) return;
+    if (delta?.version !== 1 || !Array.isArray(delta.owners)) throw Error('Invalid routing quota drain');
+    const updates = new Map();
     for (const entry of delta.owners) {
-      if (!Array.isArray(entry)) continue;
+      if (!Array.isArray(entry)) throw Error('Invalid quota drain owner');
       const [owner, changes] = entry;
-      if (typeof owner !== 'string' || !owner || !Array.isArray(changes)) continue;
-      const rec = this.owners.get(owner) || { open: null, cycles: [] };
+      if (typeof owner !== 'string' || !owner || !Array.isArray(changes) || updates.has(owner)) throw Error('Invalid quota drain owner');
+      const rec = structuredClone(this.owners.get(owner) || { open: null, cycles: [] });
       for (const change of changes) {
         const row = change?.row;
         if (!validObservation(row) || !usedFraction(row.peakUtilization) || !Number.isFinite(row.freshForMs)
-          || !Number.isSafeInteger(change.addedTurns) || change.addedTurns < 0 || row.resetAt < now - KEEP_MS) continue;
+          || !Number.isFinite(row.startAt) || !Number.isSafeInteger(row.alternativeTurns) || row.alternativeTurns < 0
+          || !Number.isSafeInteger(change.addedTurns) || change.addedTurns < 0) throw Error('Invalid quota drain observation');
+        if (row.resetAt < now - KEEP_MS) continue;
         const open = sameWindow(rec.open, row.window, row.resetAt);
         const existing = open ? rec.open : rec.cycles.find(c => sameWindow(c, row.window, row.resetAt));
         // Retain both branches' evidence, ordered by the time the reading was made.
@@ -237,8 +241,9 @@ export class RoutingCapacityAnalytics {
       }
       rec.cycles.sort((a, b) => a.endedAt - b.endedAt);
       if (rec.cycles.length > MAX_CYCLES) rec.cycles.splice(0, rec.cycles.length - MAX_CYCLES);
-      if (rec.open || rec.cycles.length) this.owners.set(owner, rec);
+      if (rec.open || rec.cycles.length) updates.set(owner, rec);
     }
+    for (const [owner, rec] of updates) this.owners.set(owner, rec);
     this.appliedDrains.set(id, now);
   }
 

@@ -269,6 +269,10 @@ export async function writeCapacityDrain(delta, statePath = getStatePath()) {
 
 export async function readCapacityDrains(ledger, statePath = getStatePath(), { routingService, routingCapacity } = {}) {
   const dir = statePath + '.drains';
+  // A concurrent reader can consume a newly published ID while readdir is in
+  // flight. Its receipt must survive until a later directory snapshot.
+  const previous = [ledger.appliedDrains, routingService?.appliedDrains, routingCapacity?.appliedDrains]
+    .filter(Boolean).map(receipts => [receipts, [...receipts.keys()]]);
   let files;
   try { files = await readdir(dir); }
   catch (e) {
@@ -280,15 +284,24 @@ export async function readCapacityDrains(ledger, statePath = getStatePath(), { r
   }
   const ids = files.filter(name => /^[a-f0-9]{24}$/.test(name));
   // A crash after deletion may leave an already-consumed id in the state.
-  for (const id of ledger.appliedDrains) if (!ids.includes(id)) ledger.appliedDrains.delete(id);
+  const present = new Set(ids);
+  for (const [receipts, known] of previous) {
+    for (const id of known) if (!present.has(id)) receipts.delete(id);
+  }
   for (const id of ids) {
     if (ledger.appliedDrains.has(id)) continue;
     try {
       const delta = JSON.parse(await readFile(join(dir, id), 'utf8'));
-      if (delta.routingService && routingService) {
-        routingService.mergeDrain(delta.routingService.before, delta.routingService.after);
+      // Every store checkpoints its own progress. The legacy ledger receipt is
+      // written last and acknowledges the complete drain in the shared state file.
+      if (delta.routingService) {
+        if (!routingService) throw Error('Routing service store unavailable');
+        routingService.mergeDrain(delta.routingService.before, delta.routingService.after, id);
       }
-      if (delta.routingCapacity) routingCapacity?.mergeDrain(delta.routingCapacity, id);
+      if (delta.routingCapacity) {
+        if (!routingCapacity) throw Error('Routing quota store unavailable');
+        routingCapacity.mergeDrain(delta.routingCapacity, id);
+      }
       ledger.applyDrain(delta, id);
     }
     catch (e) { console.error('[Maxpool] Could not read released worker capacity:', e.message); }

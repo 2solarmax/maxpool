@@ -30,6 +30,8 @@ Activity analytics opens routing with `v` then `r`. It reports terminal inferenc
 
 Unused quota is a conservative estimate from peak observed utilization in each natural window. It requires a fresh paired vendor reading near the reset, including on idle accounts. Confirmed session-only z.ai plans use their five-hour window. The distinction between no observed demand, eligible demand served elsewhere and incomplete evidence matters when sizing subscriptions. Historical service or end-of-window readings cannot be reconstructed from cache totals. The six-request default protects forwarded requests that bypass ordinary admission. New-placement measurement keeps established conversations and cache ownership intact.
 
+During a rolling upgrade a legacy worker's unexpired five-hour reading continues to protect the account until an authoritative usage probe identifies its scope or the window expires. A request's explicit active meter determines which named quota can supply its retry time. Exhaustion on another model cannot lengthen that wait.
+
 ### 2026-11-20 · Import historical cache data once per worker
 
 The first migration imports the old name-based hours into the accounts known at the time. An unmatched or ambiguous name is omitted from historical attribution, even if a matching name appears later, because later reuse cannot establish who served the old requests. Later identity and provider changes use owner-keyed observations. Imported hours from 1.24.116 have no source aliases or request IDs. Their affected windows carry an estimate warning. The original counters are preserved.

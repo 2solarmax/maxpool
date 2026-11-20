@@ -4,6 +4,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { normalizeCodexUsagePayload } from '../src/codex-usage.js';
 import { parseCodexQuota, codexRateLimit, codexSpentWindows } from '../src/codex-quota.js';
 import { ResetCreditRedeemer } from '../src/codex-reset-credits.js';
+import { capacityKpiWindow } from '../src/routing-capacity-analytics.js';
 
 const hour = 3600_000;
 const model = 'gpt-6.2-sol';
@@ -65,8 +66,81 @@ test('a named five-hour limit is scoped consistently across probe, headers, 429,
   legacy[0].quota.unified5hReset = reset;
   const boot = manager();
   boot.restoreQuotaState(legacy);
-  assert.equal(boot.accounts[0].quota.unified5h, null);
+  assert.equal(boot._isSessionQuotaUnavailable(boot.accounts[0]), true);
   assert.equal(boot.accounts[0].quota.unified7d, 0.2);
+  boot.applyCodexUsageData(0, data, { sentAt: now + 2 });
+  assert.equal(boot._isSessionQuotaUnavailable(boot.accounts[0]), false);
+  assert.equal(boot._scopedExhausted(boot.accounts[0], spark)?.session, true);
+  const noWindows = manager();
+  noWindows.restoreQuotaState(legacy);
+  noWindows.applyCodexUsageData(0, normalizeCodexUsagePayload({ rate_limit: null }), { sentAt: now + 3 });
+  assert.equal(noWindows._isSessionQuotaUnavailable(noWindows.accounts[0]), false);
+  assert.equal(noWindows.accounts[0].quota.weeklyAbsent, false, 'a previously known weekly reset still guards weekly absence');
+  legacy[0].quota.unified5hReset = now - 1;
+  const expired = manager();
+  expired.restoreQuotaState(legacy);
+  assert.equal(expired.accounts[0].quota.unified5h, null);
+});
+
+test('only a full, empty Codex quota inventory with no known reset confirms weekly absence', () => {
+  const am = manager();
+  const q = am.accounts[0].quota;
+  const now = Date.now();
+  const empty = normalizeCodexUsagePayload({ rate_limit: null, additional_rate_limits: [] });
+  am.applyCodexUsageData(0, empty, { sentAt: now, partial: true });
+  assert.equal(q.weeklyAbsent, false);
+  am.applyCodexUsageData(0, normalizeCodexUsagePayload({ plan_type: 'pro' }), { sentAt: now + 1 });
+  assert.equal(q.weeklyAbsent, false);
+  const scopedOnly = normalizeCodexUsagePayload({ additional_rate_limits: [
+    { limit_name: 'spark', rate_limit: { primary_window: window(10, 18000, now + hour) } },
+  ] });
+  am.applyCodexUsageData(0, scopedOnly, { sentAt: now + 2 });
+  assert.equal(q.weeklyAbsent, false);
+  am.applyCodexUsageData(0, empty, { sentAt: now + 3 });
+  assert.equal(q.weeklyAbsent, true);
+  assert.equal(capacityKpiWindow(am.accounts[0]), 'wk');
+  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.3, resetAt: now + hour } }, { sentAt: now + 4 });
+  assert.equal(q.weeklyAbsent, false);
+  am.applyCodexUsageData(0, empty, { sentAt: now + 5 });
+  assert.equal(q.weeklyAbsent, false);
+});
+
+test('mixed-version peers preserve a legacy 5h bench until expiry or authoritative fresh quota', () => {
+  const now = Date.now();
+  const cloud = manager();
+  const edge = new AccountManager([]);
+  const owner = cloud.getStatus().accounts[0];
+  const legacy = { ...owner, quota: { ...owner.quota, unified5h: 1, unified5hReset: now + hour,
+    lastProbeOkSentAt: now - 1000 } };
+  const poll = row => edge.syncRemoteMirrors({ name: 'test', url: 'http://example.invalid',
+    lastOkAt: Date.now(), status: { accounts: [row] } });
+  poll(legacy);
+  const mirror = edge.accounts[0];
+  assert.equal(edge._isSessionQuotaUnavailable(mirror), true);
+  const upgraded = { ...owner, quota: { ...owner.quota, codexSharedFiveHourVerified: true,
+    codexScopedFiveHour: { premium: { utilization: 1, resetAt: now + hour } },
+    codexLimitByModel: { [spark]: 'premium' }, lastProbeOkSentAt: now } };
+  poll(upgraded);
+  poll(legacy);
+  assert.equal(edge._isSessionQuotaUnavailable(mirror), false);
+  assert.equal(edge._scopedExhausted(mirror, spark)?.session, true);
+  assert.equal(edge._scopedExhausted(mirror, model), null);
+
+  const expired = { ...legacy, quota: { ...legacy.quota, unified5hReset: now - 2000, lastProbeOkSentAt: now + 1 } };
+  poll(expired);
+  poll(expired);
+  assert.equal(mirror.quota.unified5h, null);
+});
+
+test('an unrelated spent bucket cannot supply a retry when the active meter is absent', () => {
+  const now = Math.floor(Date.now() / 1000) * 1000;
+  const raw = headers(100, now + hour);
+  raw.set('x-codex-active-limit', 'another-meter');
+  const ordinary = { scope: 'account', modelScope: null, retryAfter: 0 };
+  assert.deepEqual(codexRateLimit(raw, spark, now, 'premium'), ordinary);
+  raw.delete('x-codex-active-limit');
+  assert.deepEqual(codexRateLimit(raw, spark, now, 'another-meter'), ordinary);
+  assert.equal(codexRateLimit(raw, spark, now).modelScope, 'premium');
 });
 
 test('general wall takes precedence without inheriting the longer named retry and two models sharing a meter both gate', () => {

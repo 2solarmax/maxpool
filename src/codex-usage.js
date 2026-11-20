@@ -137,6 +137,10 @@ export function normalizeCodexUsagePayload(data) {
   }
 
   return {
+    // A credits-only or unrecognised payload contains no quota inventory to
+    // interpret. Its empty normalised arrays cannot prove a weekly limit absent.
+    quotaInventoryPresent: ['rate_limit', 'rate_limits', 'additional_rate_limits']
+      .some(key => data && Object.hasOwn(data, key) && typeof data[key] === 'object'),
     modelFiveHourBuckets,
     fiveHour: shared.fiveHour && { utilization: shared.fiveHour.utilization, resetAt: shared.fiveHour.resetAt },
     sevenDay: shared.sevenDay && { utilization: shared.sevenDay.utilization, resetAt: shared.sevenDay.resetAt },

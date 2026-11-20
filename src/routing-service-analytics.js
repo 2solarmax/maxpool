@@ -83,6 +83,7 @@ export class RoutingServiceAnalytics {
   constructor(now = Date.now) {
     this.now = now;
     this.hours = new Map();
+    this.appliedDrains = new Set();
     this.coverage = [];
     this.observing = true;
     this.started = now();
@@ -274,7 +275,8 @@ export class RoutingServiceAnalytics {
       bucket.saved ??= { hour, total: pack(bucket.total), accounts: [...bucket.accounts].map(([name, row]) => [name, pack(row)]) };
       hours.push(bucket.saved);
     }
-    return { version: 1, coverage: this._intervals(now), hours };
+    return { version: 1, coverage: this._intervals(now), hours,
+      ...(this.appliedDrains.size ? { appliedDrains: [...this.appliedDrains] } : {}) };
   }
 
   static drainDelta(before, after) {
@@ -293,34 +295,59 @@ export class RoutingServiceAnalytics {
     return { before: { version: 1, hours: prior }, after: { version: 1, hours: changed, coverage } };
   }
 
-  // Caller deduplicates a worker's drain ID atomically with its saved state.
+  // Save each consumed ID with its counters, even if a later store needs a retry.
   // Only increments after its takeover baseline move between workers. Gauges
   // and session IDs are ephemeral; history retains observed concurrent peaks.
-  mergeDrain(baseline, final) {
-    if (final?.version !== 1 || !Array.isArray(final.hours)) return;
+  mergeDrain(baseline, final, id) {
+    if (id && this.appliedDrains.has(id)) return;
+    if (final?.version !== 1 || !Array.isArray(final.hours) || (baseline && !Array.isArray(baseline.hours))) {
+      if (id) throw Error('Invalid routing service drain');
+      return;
+    }
     const now = this.now();
     const firstHour = hourOf(now) - RETENTION + HOUR;
     const before = new Map((baseline?.hours || []).map(row => [row.hour, row]));
+    const updates = new Map();
     for (const row of final.hours) {
-      if (!row || !Number.isSafeInteger(row.hour) || row.hour % HOUR || row.hour < firstHour || row.hour > now) continue;
+      if (!row || !Number.isSafeInteger(row.hour) || row.hour % HOUR) throw Error('Invalid routing service hour');
+      if (row.hour < firstHour || row.hour > now) continue;
+      if (updates.has(row.hour)) throw Error('Duplicate routing service hour');
+      if (!row.total || typeof row.total !== 'object' || !Array.isArray(row.accounts)) throw Error('Invalid routing service counters');
       const old = before.get(row.hour);
-      if (!this.hours.has(row.hour)) this.hours.set(row.hour, { total: empty(), accounts: new Map() });
-      const bucket = this.hours.get(row.hour);
-      bucket.saved = null;
+      const existing = this.hours.get(row.hour);
+      // Only copy the affected hour's totals and account rows. Live request
+      // traces retain their own gauges and obtain the current hour on finish.
+      const bucket = { total: existing ? structuredClone(existing.total) : empty(), accounts: new Map(existing?.accounts) };
       combine(bucket.total, unpack(row.total), unpack(old?.total));
       const oldAccounts = new Map(old?.accounts || []);
       for (const item of row.accounts || []) {
-        if (!Array.isArray(item) || typeof item[0] !== 'string' || !item[0] || item[0].length > 256) continue;
-        combine(accountStats(bucket, item[0]), unpack(item[1]), unpack(oldAccounts.get(item[0])));
+        if (!Array.isArray(item) || typeof item[0] !== 'string' || !item[1] || typeof item[1] !== 'object') {
+          throw Error('Invalid routing service account counters');
+        }
+        if (!item[0] || item[0].length > 256) continue;
+        const stats = existing?.accounts.get(item[0]);
+        const merged = stats ? structuredClone(stats) : empty();
+        combine(merged, unpack(item[1]), unpack(oldAccounts.get(item[0])));
+        bucket.accounts.set(item[0], merged);
       }
+      updates.set(row.hour, bucket);
     }
-    this.coverage = union([...this.coverage, ...(final.coverage || [])], now - RETENTION, now);
+    const coverage = union([...this.coverage, ...(final.coverage || [])], now - RETENTION, now);
+    for (const [hour, bucket] of updates) this.hours.set(hour, bucket);
+    this.coverage = coverage;
+    if (id) this.appliedDrains.add(id);
   }
 
   restoreState(state) {
     this.hours.clear();
     this.coverage = [];
-    this.mergeDrain(null, state);
+    this.appliedDrains.clear();
+    try {
+      this.mergeDrain(null, state);
+      if (state?.version === 1 && Array.isArray(state.appliedDrains)) {
+        for (const id of state.appliedDrains) if (typeof id === 'string') this.appliedDrains.add(id);
+      }
+    } catch { /* Regenerable history with an unreadable shape starts empty. */ }
   }
 }
 
@@ -390,7 +417,22 @@ export class LinkedMessageEnvelope {
   stop_reason = null;
 
   push(chunk) {
-    for (const b of chunk) {
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+    for (let i = 0; i < text.length; i++) {
+      if (this.quoted && !this.capture && !this.escaped) {
+        // Text and tool arguments can fill megabytes. Seek directly to the next
+        // quote, inspecting only its adjacent backslashes to decide if it ends
+        // the string. Carry odd trailing backslashes across network chunks.
+        const quote = text.indexOf('"', i);
+        const end = quote < 0 ? text.length : quote;
+        let slash = end;
+        while (slash > i && text.charCodeAt(slash - 1) === 92) slash--;
+        const escaped = (end - slash) % 2 === 1;
+        if (quote < 0) { this.escaped = escaped; return; }
+        i = quote;
+        if (escaped) continue;
+      }
+      const b = text.charCodeAt(i);
       if (this.quoted) {
         if (this.escaped) { this.escaped = false; this.capture = false; continue; }
         if (b === 92) { this.escaped = true; continue; }

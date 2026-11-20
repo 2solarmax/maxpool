@@ -275,7 +275,11 @@ export function parseCodexActiveLimit(headers) {
   return value ? String(value).trim().toLowerCase() || null : null;
 }
 
-/** A 429 can exhaust one model while other models still have headroom. */
+/**
+ * A named reading is evidence for this request only if it matches its active
+ * meter. Headers often advertise other families too. If the active bucket is
+ * absent, use the ordinary 429 retry hint instead of another family's reset.
+ */
 export function codexRateLimit(headers, model, now = Date.now(), knownLimit = null) {
   const quota = parseCodexQuota(headers);
   const sessionSpent = isSpent(quota.unified5h);

@@ -5829,11 +5829,12 @@ function tapLinkUsage(chunk, requestInfo) {
   if (requestInfo.isCountTokens) return;
   if (!requestInfo.stream) {
     if (chunk) {
+      const text = Buffer.from(chunk).toString();
       if (requestInfo._service) {
         requestInfo._linkedEnvelope ??= new LinkedMessageEnvelope();
-        requestInfo._linkedEnvelope.push(chunk);
+        requestInfo._linkedEnvelope.push(text);
       }
-      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + Buffer.from(chunk).toString()).slice(-64 * 1024);
+      requestInfo._tapBuf = ((requestInfo._tapBuf || '') + text).slice(-64 * 1024);
       return;
     }
     if (requestInfo._linkedEnvelope) {

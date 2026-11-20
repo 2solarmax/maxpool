@@ -748,6 +748,15 @@ export function normalizeRemoteResets(ra) {
   return out;
 }
 
+// Before meter provenance was persisted a shared 5h reading could be genuine
+// or copied from a named meter. Preserve its protection only until the stated
+// reset or an authoritative replacement. Never resurrect an unbounded reading.
+function expireLegacyCodexSession(q, now) {
+  if (!q.codexSharedFiveHourVerified && !(Number.isFinite(q.unified5hReset) && q.unified5hReset > now)) {
+    q.unified5h = q.unified5hReset = null;
+  }
+}
+
 function mergeScopedReadings(previous, readings) {
   const now = Date.now();
   const fresh = {};
@@ -5130,6 +5139,7 @@ export class AccountManager {
   _placementOpportunity(account, model, now) {
     const q = account.quota;
     const window = capacityKpiWindow(account);
+    if (account.provider === 'codex' && q.unified5h != null && !q.codexSharedFiveHourVerified) return null;
     const readAt = account.provider === 'codex' ? q.codexWeeklyReadingAt : q.lastProbeOkAt;
     if (!(readAt > 0 && readAt <= now && now - readAt <= CLAIM_FRESH_MS)) return null;
     const resetAt = this._capWindowFields(account, window).resetAt;
@@ -5731,10 +5741,13 @@ export class AccountManager {
     }
     account.codexQuotaSentAt = sentAt;
     const q = account.quota;
+    const emptyInventory = !partial && usage.quotaInventoryPresent !== false && Array.isArray(usage.modelBuckets)
+      && !usage.fiveHour && !usage.sevenDay && !usage.modelBuckets.length && !usage.modelFiveHourBuckets?.length;
+    const confirmsNoWeekly = emptyInventory && !q.unified5hReset && !q.unified7dReset;
     if (usage.fiveHour) {
       q.codexSharedFiveHourVerified = true;
       q.codexFiveHourAbsent = false;
-    } else if (!partial && (usage.sevenDay || usage.modelFiveHourBuckets?.length || usage.modelBuckets?.length)) {
+    } else if (emptyInventory || (!partial && (usage.sevenDay || usage.modelFiveHourBuckets?.length || usage.modelBuckets?.length))) {
       // A full provider snapshot supersedes the old parser's ambiguous shared value.
       q.unified5h = q.unified5hReset = null;
       q.codexSharedFiveHourVerified = true;
@@ -5762,7 +5775,7 @@ export class AccountManager {
       sevenDay: usage.sevenDay,
       scopedWeekly: named(usage.modelBuckets, q.scopedWeekly),
       codexScopedFiveHour: named(usage.modelFiveHourBuckets, q.codexScopedFiveHour),
-      ...(usage.sevenDay ? { weeklyAbsent: false } : {}),
+      ...(usage.sevenDay ? { weeklyAbsent: false } : confirmsNoWeekly ? { weeklyAbsent: true } : {}),
     }, { sentAt });
     if (usage.resetCredits) {
       const summary = { ...usage.resetCredits, checkedAt: Date.now() };
@@ -7393,9 +7406,7 @@ export class AccountManager {
       // Drop restored scoped entries lacking a clearable reset window — they can't
       // be expired by _clearExpiredQuotas and would otherwise pin an account
       // unavailable-for-family until the first live probe.
-      if (account.provider === 'codex' && !account.quota.codexSharedFiveHourVerified) {
-        account.quota.unified5h = account.quota.unified5hReset = null;
-      }
+      if (account.provider === 'codex') expireLegacyCodexSession(account.quota, Date.now());
       for (const field of ['scopedWeekly', 'codexScopedFiveHour']) {
         const entries = account.quota[field];
         if (entries && typeof entries === 'object') {
@@ -7586,6 +7597,7 @@ export class AccountManager {
       const candidates = this.accounts.filter(x => x.remote?.linkName === link.name &&
         x.remote.remoteName === ra.name && x.provider === provider);
       let a = candidates.find(x => this.capacityIdentity(x) === identity);
+      const previousCodexQuota = identity && provider === 'codex' ? a?.quota : null;
       if (!a && identity) a = candidates.find(x => !this.capacityIdentity(x));
 
       if (!a) {
@@ -7616,8 +7628,15 @@ export class AccountManager {
       a.codexResetCredits = ra.codexResetCredits || null;
       a.remoteCodexResetOpportunity = ra.codexResetOpportunity || null;
       a.autoRedeemReset = ra.autoRedeemReset;
-      a.quota = { ...emptyQuota(), ...(ra.quota || {}) };
-      if (a.provider === 'codex' && !a.quota.codexSharedFiveHourVerified) a.quota.unified5h = a.quota.unified5hReset = null;
+      // On a rolling upgrade, an old worker can answer a poll after a newer
+      // worker already identified this account's meters. Compare provider-read
+      // times (not poll times) before replacing the newer quota snapshot.
+      const incoming = ra.quota || {};
+      const staleLegacy = previousCodexQuota?.codexSharedFiveHourVerified === true
+        && incoming.codexSharedFiveHourVerified !== true
+        && (previousCodexQuota.lastProbeOkSentAt || previousCodexQuota.lastProbeOkAt || 0) >= (incoming.lastProbeOkSentAt || incoming.lastProbeOkAt || 0);
+      if (!staleLegacy) a.quota = { ...emptyQuota(), ...incoming };
+      if (a.provider === 'codex') expireLegacyCodexSession(a.quota, Date.now());
       a.status = ra.status || 'active';
       a.refreshDead = Boolean(ra.refreshDead);
       // The CLOUD's cooldown (additive export; an older cloud omits it = none). Kept off

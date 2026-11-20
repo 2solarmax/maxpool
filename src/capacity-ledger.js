@@ -901,27 +901,57 @@ export class CapacityLedger {
 
   applyDrain(delta, id) {
     if (id && this.appliedDrains.has(id)) return;
+    const isRecord = value => value && typeof value === 'object' && !Array.isArray(value);
+    const validCounter = value => Number.isFinite(value) && value >= 0;
+    const updateCache = (current, change) => {
+      const vector = value => Array.isArray(value) && value.length === 4 && value.every(validCounter);
+      if (!isRecord(change) || !vector(change.total) || !Number.isFinite(change.since) || !isRecord(change.minutes)
+        || !Object.entries(change.minutes).every(([minute, counts]) => /^\d+$/.test(minute) && vector(counts))) {
+        throw Error('Invalid capacity cache drain');
+      }
+      // A cache history can span a week of minutes. Only the minute vectors
+      // named by the retiring worker can change.
+      const copy = current && { ...current, total: [...current.total], minutes: { ...current.minutes } };
+      if (copy) for (const minute of Object.keys(change.minutes)) {
+        if (copy.minutes[minute]) copy.minutes[minute] = [...copy.minutes[minute]];
+      }
+      return mergeCacheDelta(copy, null, change);
+    };
+    if (!isRecord(delta) || (delta.accounts != null && !isRecord(delta.accounts))
+      || (delta.owners != null && !isRecord(delta.owners))) throw Error('Invalid capacity drain');
+    const ownerUpdates = new Map(), accountUpdates = new Map();
     for (const [key, change] of Object.entries(delta.owners || {})) {
-      this._ownerCache.set(key, mergeCacheDelta(this._ownerCache.get(key), null, change));
+      ownerUpdates.set(key, updateCache(this._ownerCache.get(key), change));
     }
     for (const [name, changes] of Object.entries(delta.accounts || {})) {
-      const rec = this._rec(name);
-      if (changes.cacheHistory) {
-        rec.cacheHistory = mergeCacheDelta(rec.cacheHistory, null, changes.cacheHistory);
-      }
+      if (!isRecord(changes)) throw Error('Invalid capacity account drain');
+      const existing = this._accounts.get(name);
+      const rec = existing ? { ...existing } : { ses: { open: null, closed: [] }, wk: { open: null, closed: [] }, days: {} };
+      if (changes.cacheHistory) rec.cacheHistory = updateCache(rec.cacheHistory, changes.cacheHistory);
       for (const window of ['ses', 'wk']) {
         const open = rec[window].open;
         const change = changes[window];
         // A window that rolled during the drain must never be reopened or charged again.
-        if (!open || !change || change.startedAt !== open.startedAt) continue;
-        open.tokensSoFar += change.tokens;
-        open.lastAccrualAt = Math.max(open.lastAccrualAt || 0, change.lastAccrualAt || 0);
+        if (!change) continue;
+        if (!isRecord(change) || !validCounter(change.tokens) || !Number.isFinite(change.startedAt)
+          || (change.lastAccrualAt != null && !Number.isFinite(change.lastAccrualAt))) throw Error('Invalid capacity window drain');
+        if (!open || change.startedAt !== open.startedAt) continue;
+        rec[window] = { ...rec[window], open: { ...open, tokensSoFar: open.tokensSoFar + change.tokens,
+          lastAccrualAt: Math.max(open.lastAccrualAt || 0, change.lastAccrualAt || 0) } };
       }
-      for (const [day, tokens] of Object.entries(changes.days || {})) {
-        const bucket = rec.days[day] ||= { tokens: 0, partial: false };
-        bucket.tokens += tokens;
+      if (changes.days != null) {
+        if (!isRecord(changes.days)) throw Error('Invalid capacity day drain');
+        rec.days = { ...rec.days };
+        for (const [day, tokens] of Object.entries(changes.days)) {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !validCounter(tokens)) throw Error('Invalid capacity day drain');
+          const bucket = rec.days[day] || { tokens: 0, partial: false };
+          rec.days[day] = { ...bucket, tokens: bucket.tokens + tokens };
+        }
       }
+      accountUpdates.set(name, rec);
     }
+    for (const [key, history] of ownerUpdates) if (history) this._ownerCache.set(key, history);
+    for (const [name, rec] of accountUpdates) this._accounts.set(name, rec);
     if (id) this.appliedDrains.add(id);
   }
 
