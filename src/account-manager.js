@@ -1,10 +1,11 @@
+import { combineCacheWindows, readCacheSnapshot } from './account-cache.js';
 import { refreshOpenAIToken } from './openai-login.js';
-import { rememberNativeRefresh } from './account-config.js';
+import { isClaudeOAuthAccount, rememberNativeRefresh } from './account-config.js';
 import { nativeCodexOwnerIdentity, refreshNativeCodexToken } from './codex-native.js';
 import { codexModelFor } from './codex-model-routing.js';
 import { parseCodexActiveLimit, parseCodexQuota } from './codex-quota.js';
 import { refreshAccessToken, isTokenExpiringSoon, modelFamily, tokenFingerprint, sameUser, sameAccountIdentity } from './oauth.js';
-import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity } from './pool-link.js';
+import { computeDuplicates, credentialFp, accountIdentity, remoteAccountIdentity, STATUS_STALE_DOWN_MS } from './pool-link.js';
 import { appendEventLog } from './event-log.js';
 import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
@@ -544,6 +545,9 @@ const COLD_HOLD_MIN_BYTES = 150_000;
  *  family — z.ai's cache is shared across that provider's accounts, so a zai→zai hop
  *  re-writes ~nothing while a Claude↔provider hop re-writes the whole prompt. */
 const accountFamily = (a) => (isClaudeAccount(a) ? 'claude' : String(a?.provider || 'provider'));
+const cacheProvider = account => isClaudeAccount(account) ? 'claude' : account.provider === 'zai' ? 'glm' : account.provider;
+const cacheOwnerKey = account => JSON.stringify([cacheProvider(account),
+  nativeCodexOwnerIdentity(account) || accountIdentity(account) || (account.type === 'apikey' && credentialFp(account.credential)) || account.name]);
 const efficiencyProvider = account => isClaudeAccount(account) ? 'claude' : account.provider === 'codex' ? 'codex' : 'glm';
 const IDENTITY_WINDOW_MS = 15 * 60_000;
 const IDENTITY_MAX_SAMPLES = 4000;
@@ -613,7 +617,9 @@ const PLAN_CADENCE_MONTHS = { monthly: 1, quarterly: 3, annual: 12, annually: 12
  *  never a guessed value. billingMonths defaults from the cadence word. */
 export function sanitizePlan(plan) {
   if (!plan || typeof plan !== 'object') return null;
-  const priceUsd = Number(plan.priceUsd);
+  const rawPrice = plan.priceUsd;
+  const priceUsd = typeof rawPrice === 'number' || (typeof rawPrice === 'string' && rawPrice.trim())
+    ? Number(rawPrice) : NaN;
   const cadence = typeof plan.cadence === 'string' ? plan.cadence.toLowerCase() : null;
   let billingMonths = Number(plan.billingMonths);
   if (!(billingMonths > 0)) billingMonths = PLAN_CADENCE_MONTHS[cadence] || NaN;
@@ -773,6 +779,7 @@ export class AccountManager {
     this.callerStats = new Map();
     // Team-pool links (owner D8): remote pools as accounts + duplicate benching.
     this.poolLinks = [];
+    this._remoteProviderCache = new Map();
     this._remoteIdentities = new Map();
     this._benchedByPool = [];
     this.poolUpSince = Date.now();
@@ -5744,13 +5751,8 @@ export class AccountManager {
   }
 
   monthlyPriceFor(account) {
-    // A cloud mirror carries no credential, so this pool cannot read its subscription;
-    // the cloud pool reads it and exports it per row (remotePlan / remoteMonthlyPriceUSD).
-    if (account?.remote) {
-      const rp = planMonthlyUSD(account.remotePlan);
-      if (rp != null) return rp;
-      if (account.remoteMonthlyPriceUSD != null) return account.remoteMonthlyPriceUSD;
-    }
+    // Billing belongs to the operator. Never use a linked worker's prices.
+    if (account?.remote) return null;
     // GLM: the live z.ai subscription value (renewPrice ÷ cycle months, from the prober)
     // is authoritative; a configured `plan` (receipts) is only the fallback.
     if (account?.type === 'provider') return account.monthlyPriceUSD ?? planMonthlyUSD(account?.plan);
@@ -5762,7 +5764,7 @@ export class AccountManager {
       if (Number.isFinite(hit)) return hit;
     }
     // Owner 2026-11-06: every Anthropic account is monthly $200 — the default plan below.
-    return account?.type === 'oauth' ? DEFAULT_CLAUDE_PLAN.priceUsd / DEFAULT_CLAUDE_PLAN.billingMonths : null;
+    return account && isClaudeOAuthAccount(account) ? DEFAULT_CLAUDE_PLAN.priceUsd / DEFAULT_CLAUDE_PLAN.billingMonths : null;
   }
 
   applyResetCards(accountIndex, cards) {
@@ -6132,14 +6134,15 @@ export class AccountManager {
   capacityGroupOf(a) {
     const id = this.capacityIdentity(a);
     if (!id) return [a];
-    const same = this.accounts.filter(x => this.capacityIdentity(x) === id);
+    const familyRows = this.accounts.filter(x => cacheProvider(x) === cacheProvider(a));
+    const same = familyRows.filter(x => this.capacityIdentity(x) === id);
     // `uuid:<user>[:<org>]`: a row whose organization is unknown (saved before orgs
     // were recorded, or mirrored from an older pool) is still the same login as the
     // user's org-bearing row while that user has ONE known organization here. Two
     // known organizations are two subscriptions: then only exact ids group.
     if (!id.startsWith('uuid:')) return same;
     const user = id.split(':')[1];
-    const rows = this.accounts.filter(x => {
+    const rows = familyRows.filter(x => {
       const xid = this.capacityIdentity(x);
       return xid && xid.startsWith('uuid:') && xid.split(':')[1] === user;
     });
@@ -6219,13 +6222,13 @@ export class AccountManager {
       const { primary, group, id } = g;
       const localRow = group.find(x => !x.remote);
       const withPrice = [primary, ...group].find(x => x && this.monthlyPriceFor(x) != null) || primary;
-      const withPlan = [primary, ...group].find(x => x && (x.plan || x.remotePlan)) || null;
+      const withPlan = [primary, ...group].find(x => x && !x.remote && x.plan) || null;
       rows.push({
         index: primary.index, group: group.map(x => x.index), unresolved: !id,
         displayName: (localRow || primary).name.replace(/ ☁$/, ''),
         where: this.capacityWhere(primary),
         priceAccount: withPrice,
-        plan: withPlan ? sanitizePlan(withPlan.plan || withPlan.remotePlan) : (primary.type === 'oauth' ? DEFAULT_CLAUDE_PLAN : null),
+        plan: withPlan ? sanitizePlan(withPlan.plan) : (localRow && isClaudeOAuthAccount(localRow) ? DEFAULT_CLAUDE_PLAN : null),
       });
     }
     return rows;
@@ -6238,7 +6241,7 @@ export class AccountManager {
     return Boolean(hideDisabled && a && (a.enabled === false || a.poolBenchedBy));
   }
 
-  accrueCapacity(accountIndex, { input = 0, output = 0, cacheRead = 0, cacheCreation = 0, model = null } = {}) {
+  accrueCapacity(accountIndex, { input = 0, output = 0, cacheRead = 0, cacheCreation = 0, model = null } = {}, at) {
     const account = this.accounts[accountIndex];
     if (!account) return;
     // A no-weekly plan (z.ai legacy TOKENS_LIMIT, weeklyAbsent) has no weekly window to
@@ -6247,7 +6250,112 @@ export class AccountManager {
     // window + day buckets (the 7d volume) are the real signals for such accounts.
     const windows = account.type === 'provider' && account.quota?.weeklyAbsent
       ? ['ses'] : ['ses', 'wk'];
-    this.capacity.accrue(account.name, { input, output, cacheRead, cacheCreation, model }, undefined, windows);
+    this.capacity.accrue(account.name, { input, output, cacheRead, cacheCreation, model }, at, windows, account.remote ? false : this._localCacheKeys(account)[0]);
+  }
+
+  _localCacheKeys(account) {
+    const key = cacheOwnerKey(account);
+    if (account.type !== 'oauth' || !account.accountUuid || nativeCodexOwnerIdentity(account)) return [key];
+    // The account/organization pair is often learned after the first request.
+    // Scope the original observations once, only when one organization qualifies.
+    const orgs = new Set();
+    for (const a of this.accounts) {
+      if (cacheProvider(a) !== cacheProvider(account) || (a.remoteUuid || a.accountUuid) !== account.accountUuid) continue;
+      const org = a.remoteOrganizationUuid || a.organizationUuid;
+      if (org) orgs.add(org);
+    }
+    const bare = cacheOwnerKey({ ...account, organizationUuid: null });
+    const single = orgs.size === 1 ? cacheOwnerKey({ ...account, organizationUuid: [...orgs][0] }) : null;
+    const assigned = this.capacity.assignCacheOwner(bare, single);
+    const primary = account.organizationUuid ? key : single || (assigned
+      ? JSON.stringify([cacheProvider(account), 'unknown-organization:' + account.accountUuid]) : bare);
+    return assigned === primary ? [primary, bare] : [primary];
+  }
+
+  _ownerCacheWindows(account, now) {
+    if (account.remote) {
+      const snapshot = account._remoteCacheWindows;
+      if (!snapshot) return null;
+      // On link loss, retain the observed lifetime total. The remote's old
+      // rolling windows can no longer be evaluated at the current time.
+      const stale = now - snapshot.asOf > STATUS_STALE_DOWN_MS;
+      return account._remoteCacheOffline || stale ? { ...snapshot, offline: true } : snapshot;
+    }
+    const observations = this._localCacheKeys(account).map(key => this.capacity.ownerCacheWindows(key, now)).filter(Boolean);
+    if (observations.length <= 1) return observations[0] || null;
+    return { ...combineCacheWindows(observations), source: observations.at(-1).source };
+  }
+
+  accountCacheWindows(account, now = Date.now()) {
+    if (!account) return null;
+    return combineCacheWindows(this.capacityGroupOf(account).map(a => this._ownerCacheWindows(a, now)));
+  }
+
+  _ownedProviderCache(now) {
+    const by = new Map(), represented = new Set();
+    const add = (provider, snapshot) => {
+      if (!by.has(provider)) by.set(provider, []);
+      by.get(provider).push(snapshot);
+    };
+    for (const account of this.accounts) {
+      if (account.remote) continue;
+      for (const key of this._localCacheKeys(account)) represented.add(key);
+      add(cacheProvider(account), this._ownerCacheWindows(account, now));
+    }
+    // Keep unassigned organizations and removed accounts in the holder's total.
+    for (const key of this.capacity.ownerCacheKeys()) {
+      if (!represented.has(key)) add(JSON.parse(key)[0], this.capacity.ownerCacheWindows(key, now));
+    }
+    return Object.fromEntries([...by].map(([provider, rows]) => {
+      const summary = combineCacheWindows(rows);
+      return [provider, summary && { ...summary, source: this.capacity.poolCacheSource }];
+    }));
+  }
+
+  providerCacheWindows(now = Date.now()) {
+    const by = new Map(Object.entries(this._ownedProviderCache(now)).map(([provider, snapshot]) => [provider, [snapshot]]));
+    const add = (provider, snapshot) => {
+      if (!by.has(provider)) by.set(provider, []);
+      by.get(provider).push(snapshot);
+    };
+    const coveredAccounts = new Set();
+    for (const [name, peer] of this._remoteProviderCache) {
+      for (const [provider, snap] of peer.providers) {
+        const stale = now - snap.asOf > STATUS_STALE_DOWN_MS;
+        add(provider, peer.offline || stale ? { ...snap, offline: true } : snap);
+      }
+      for (const a of this.accounts) {
+        if (a.remote?.linkName === name && peer.providers.has(cacheProvider(a)) && a._remoteCacheWindows?.source) {
+          coveredAccounts.add(a._remoteCacheWindows.source);
+        }
+      }
+    }
+    // Older peers have account snapshots only. Those cannot establish whether
+    // historical provider traffic remains unattributed. Show the observed part.
+    for (const account of this.accounts) {
+      if (!account.remote) continue;
+      const provider = cacheProvider(account);
+      if (this._remoteProviderCache.get(account.remote.linkName)?.providers.has(provider)) continue;
+      const snap = this._ownerCacheWindows(account, now);
+      if (snap?.source && coveredAccounts.has(snap.source)) continue;
+      add(provider, snap);
+      add(provider, null);
+    }
+    return Object.fromEntries([...by].map(([provider, rows]) => [provider, combineCacheWindows(rows)]));
+  }
+
+  restoreAccountCacheHours(saved, now = Date.now()) {
+    const locals = this.accounts.filter(account => !account.remote);
+    const names = new Map(), owners = new Map();
+    for (const account of locals) {
+      names.set(account.name, (names.get(account.name) || 0) + 1);
+      const key = this._localCacheKeys(account)[0];
+      if (!owners.has(key)) owners.set(key, []);
+      owners.get(key).push(account.name);
+    }
+    for (const [key, aliases] of owners) {
+      this.capacity.restoreOwnerCache(key, aliases.filter(name => names.get(name) === 1), saved, now);
+    }
   }
 
   /** The vendor's CURRENT fullness reading for a window — the tank numerator's
@@ -7278,23 +7386,49 @@ export class AccountManager {
   syncRemoteMirrors(link) {
     if (!link) return;
     // probeDown (the 5 s dead-link probe) benches the link exactly like a failed poll.
-    const rows = link.lastError || link.probeDown || link.lastOkAt == null ? [] : (link.status?.accounts || []);
+    const offline = Boolean(link.lastError || link.probeDown || link.lastOkAt == null);
+    const rows = offline ? [] : (link.status?.accounts || []);
+    if (offline) {
+      const peer = this._remoteProviderCache.get(link.name);
+      if (peer) peer.offline = true;
+    } else {
+      const providers = new Map();
+      for (const [name, raw] of Object.entries(link.status?.ownedProviderCache || {})) {
+        const snapshot = readCacheSnapshot(raw);
+        if (snapshot?.source) providers.set(name, snapshot);
+      }
+      this._remoteProviderCache.set(link.name, { providers, offline: false });
+    }
     const seen = new Set();
     for (const ra of rows) {
       if (ra.remote) continue;                 // never mirror a mirror (no chained hops)
-      if (ra.enabled === false) continue;      // benched on the cloud = not offered
+      const cache = readCacheSnapshot(ra.accountCache);
+      // A disabled account with measured traffic still belongs in the historical
+      // view, but can never acquire a lease. Older peers omit these rows.
+      if (ra.enabled === false && !cache?.windows.all) continue;
       const name = `${ra.name} ☁`;
-      seen.add(name);
-      let a = this.accounts.find(x => x.remote && x.name === name);
+      const provider = ra.provider || (ra.type === 'provider' ? 'provider' : 'anthropic');
+      const identity = remoteAccountIdentity(ra);
+      const candidates = this.accounts.filter(x => x.remote?.linkName === link.name &&
+        x.remote.remoteName === ra.name && x.provider === provider);
+      let a = candidates.find(x => this.capacityIdentity(x) === identity);
+      if (!a && identity) a = candidates.find(x => !this.capacityIdentity(x));
+
       if (!a) {
+        let internalName = name;
+        if (this.accounts.some(row => row.name === name)) {
+          internalName = `${ra.name} (${link.name}) ☁`;
+          if (this.accounts.some(row => row.name === internalName)) internalName = `${ra.name} (${link.name} #${this.accounts.length + 1}) ☁`;
+        }
         this.addAccount({
-          name, type: ra.type === 'oauth' ? 'oauth' : (ra.type === 'provider' ? 'provider' : ra.type),
+          name: internalName, type: ra.type === 'oauth' ? 'oauth' : (ra.type === 'provider' ? 'provider' : ra.type),
           provider: ra.provider, profiles: ra.type === 'provider' ? ['all'] : ['claude', 'all'],
           priority: ra.provider === 'codex' ? 30 : undefined,
           configSourced: true, runtime: false,
         });
         a = this.accounts[this.accounts.length - 1];
       }
+      seen.add(a.index);
       a.remote = { linkName: link.name, remoteName: ra.name, url: link.url, key: link.key, link };
       a.credential = null; a.refreshToken = null;
       // M2: keep the cloud's uuid OFF accountUuid so uuid-first matchers (config
@@ -7329,12 +7463,10 @@ export class AccountManager {
       a.resetCards = rr.resetCards;
       a.resetGrants = rr.resetGrants;
       a.capLift = rr.capLift;
-      a.remoteMonthlyPriceUSD = Number.isFinite(ra.monthlyPriceUSD) ? ra.monthlyPriceUSD : null;
       a.remoteTank = ra.tank || null;
       a.remoteKeyFp = ra.keyFingerprint || null;
       a.remoteCycles = ra.cycles || null;
       a.remoteOpen = ra.open || null;
-      a.remotePlan = sanitizePlan(ra.plan);
       // Other teammates' live load on this cloud account (remote inFlight minus our
       // own leases) — so the balancer sees the account as busy as it really is.
       a._remoteOtherLoad = Math.max(0, (ra.inFlight || 0) - (a.inFlight || 0));
@@ -7347,9 +7479,11 @@ export class AccountManager {
       a._remoteOwnAtSync = a.inFlight || 0;
       a._remotePinLimit = Number.isFinite(ra.pinBusyAt) ? ra.pinBusyAt : null;
       a._remoteLoad = ra.load || null;
+      a._remoteCacheWindows = cache;
+      a._remoteCacheOffline = false;
       a._remoteWallHolding = ra.wallHolding === true;
       a.probing = false;
-      a.enabled = true;
+      a.enabled = ra.enabled !== false;
     }
     // A cloud account that left the cloud (or a down link): drop the mirror so
     // routing never targets it. Rows with in-flight leases drain first.
@@ -7358,7 +7492,10 @@ export class AccountManager {
     // is disabled in place (out of routing, hidden from the list) and revived when
     // it reappears.
     for (const a of this.accounts) {
-      if (a.remote && a.remote.linkName === link.name && !seen.has(a.name)) a.enabled = false;
+      if (a.remote && a.remote.linkName === link.name && !seen.has(a.index)) {
+        a.enabled = false;
+        a._remoteCacheOffline = true;
+      }
     }
   }
 
@@ -7562,6 +7699,8 @@ export class AccountManager {
   getStatus() {
     const now = Date.now();
     return {
+      // Owner-only means a linked pool never re-exports an upstream total.
+      ownedProviderCache: this._ownedProviderCache(now),
       // Running version + npm update state (set at startup by maybeCheckForUpdate).
       // null until the check resolves; `current` is known even offline.
       version: this.versionInfo || null,
@@ -7628,9 +7767,7 @@ export class AccountManager {
               ceiling: a.remote ? (a.capLift.ceiling ?? null) : this._capLiftCeiling(a, 'wk', now) }
           : { active: false },
         giveBack: a.giveBack ?? null,
-        // Capacity-page inputs for linked pools (a mirror has no credential and no
-        // local cycles): this pool's plan price and measured tanks, per window.
-        monthlyPriceUSD: a.remote ? null : this.monthlyPriceFor(a),
+        // Linked operators can observe utilization without receiving commercial terms.
         tank: a.remote ? null : (() => {
           const pick = w => { const t = this.capacity?.tankStats(a.name, w);
             return t ? { avg: t.avg, n: t.n, prev: t.prev, last: t.last, lowerBound: t.lowerBound } : null; };
@@ -7644,10 +7781,7 @@ export class AccountManager {
         accountUuid: a.type === 'oauth' ? (a.accountUuid || null) : null,
         organizationUuid: a.type === 'oauth' ? (a.organizationUuid || null) : null,
         keyFingerprint: (a.type === 'provider' && a.credential) ? credentialFp(a.credential) : null,
-        // Plan config (display-only) + this pool's closed cycles per window so a linked
-        // pool can UNION history instead of picking one ledger (bounded: 12 weekly /
-        // 60 session). 
-        plan: a.remote ? null : (a.plan || null),
+        // Share bounded cycle observations for merging both workers’ history.
         cycles: a.remote ? null : {
           wk: this.capacity?.exportCycles(a.name, 'wk', 12) || [],
           ses: this.capacity?.exportCycles(a.name, 'ses', 60) || [],
@@ -7686,6 +7820,7 @@ export class AccountManager {
         pinBusyAt: a.remote ? null : this._pinBusyLimit(a),
         // A cloud row's cache figures as the SERVING pool exported them (team-wide on
         // that account); null on an older cloud or a local row.
+        accountCache: a.remote ? null : this._ownerCacheWindows(a, now),
         teamEfficiency: a.remote ? {
           last15m: a._remoteLoad?.last15m?.efficiency ?? null,
           last1h: a._remoteLoad?.last1h?.efficiency ?? null,

@@ -164,6 +164,9 @@ test('Claude Code uses a cacheable Codex prefix and scopes the cache key to the 
     cache_creation_input_tokens: 200, output_tokens: 5 });
   const { cr, cc, promptTokens, hit } = am.efficiencyOverall().codex;
   assert.deepEqual({ cr, cc, promptTokens, hit }, { cr: 1500, cc: 400, promptTokens: 4000, hit: 0.375 });
+  const observed = am.accountCacheWindows(am.accounts[0]).windows.all;
+  assert.deepEqual([observed.input, observed.cacheRead, observed.cacheWrite, observed.output, observed.hit],
+    [2100, 1500, 400, 10, 0.375]);
 
   await ask({ extra: { metadata: { user_id: 'legacy_user_account_session_' + thread } } });
   assert.equal(calls.at(-1).session, cacheKey);

@@ -1,3 +1,6 @@
+import { randomUUID } from 'node:crypto';
+import { addCacheUsage, cacheHistoryFromHours, cacheWindows, emptyCacheHistory, mergeCacheDelta, restoreCacheHistory, validCacheSource } from './account-cache.js';
+
 /**
  * True-capacity ledger — observed tokens per completed window cycle.
  *
@@ -293,6 +296,9 @@ export class CapacityLedger {
     this._now = now;
     // accountName → { ses: {open?, closed: []}, wk: {open?, closed: []}, days: {utcDay: {tokens, partial}} }
     this._accounts = new Map();
+    this.appliedDrains = new Set();
+    this._ownerCache = new Map();
+    this.poolCacheSource = randomUUID();
     // True only for a ledger restored with no usable history — see fromSerialized.
     // Cleared per account+window once that window's first boundary is behind us.
     this._joinedMidWindow = false;
@@ -331,6 +337,12 @@ export class CapacityLedger {
       return l;
     }
     try {
+      if (validCacheSource(payload.poolCacheSource)) l.poolCacheSource = payload.poolCacheSource;
+      for (const [key, raw] of Object.entries(payload.ownerCache || {})) {
+        const history = restoreCacheHistory(raw, now());
+        if (history) l._ownerCache.set(key, history);
+      }
+      l.appliedDrains = new Set(Array.isArray(payload.appliedDrains) ? payload.appliedDrains : []);
       for (const [name, rec] of Object.entries(payload.accounts || {})) {
         const a = { ses: { open: null, closed: [] }, wk: { open: null, closed: [] }, days: {} };
         for (const w of ['ses', 'wk']) {
@@ -369,6 +381,7 @@ export class CapacityLedger {
         if (rec.days && typeof rec.days === 'object') {
           for (const [d, v] of Object.entries(rec.days)) a.days[d] = { ...v };
         }
+        if (rec.cacheHistory) a.cacheHistory = restoreCacheHistory(rec.cacheHistory, now());
         l._accounts.set(name, a);
       }
     } catch { return new CapacityLedger({ now }); }
@@ -382,9 +395,11 @@ export class CapacityLedger {
         ses: { open: rec.ses.open ? JSON.parse(JSON.stringify(rec.ses.open)) : null, closed: rec.ses.closed.slice() },
         wk: { open: rec.wk.open ? JSON.parse(JSON.stringify(rec.wk.open)) : null, closed: rec.wk.closed.slice() },
         days: Object.fromEntries(Object.entries(rec.days).map(([d, v]) => [d, { ...v }])),
+        ...(rec.cacheHistory ? { cacheHistory: structuredClone(rec.cacheHistory) } : {}),
       };
     }
-    return { schemaVersion: SCHEMA_VERSION, accounts };
+    const ownerCache = Object.fromEntries([...this._ownerCache].map(([key, history]) => [key, structuredClone(history)]));
+    return { schemaVersion: SCHEMA_VERSION, accounts, poolCacheSource: this.poolCacheSource, ...(this._ownerCache.size ? { ownerCache } : {}), ...(this.appliedDrains.size ? { appliedDrains: [...this.appliedDrains] } : {}) };
   }
 
   _rec(name) {
@@ -403,7 +418,7 @@ export class CapacityLedger {
    *  M3 in the pre-mortem — Anthropic interim deltas are CUMULATIVE, so the SSE seam
    *  passes the running max, and this adds it exactly once per request).
    *  count_tokens requests are the CALLER's job to skip (M4) — they never reach here. */
-  accrue(name, { input, output, cacheRead = 0, cacheCreation = 0, model = null }, at = this._now(), windows = ['ses', 'wk']) {
+  accrue(name, { input, output, cacheRead = 0, cacheCreation = 0, model = null }, at = this._now(), windows = ['ses', 'wk'], owner = true) {
     // TOKEN DEFINITION (v5, owner 2026-11-06): every token the provider processed =
     // input + cache_read + cache_creation + output, identical for Anthropic and z.ai so
     // both sit on one axis. NOTE (audit 2026-11-17): "one axis" means
@@ -416,6 +431,10 @@ export class CapacityLedger {
     // `model` is recorded as a per-family token breakdown (open.models), never used by the tank.
     const fam = capacityModelFamily(model);
     const rec = this._rec(name);
+    if (owner) {
+      const history = typeof owner === 'string' ? this._cacheForOwner(owner, at) : (rec.cacheHistory ||= emptyCacheHistory(at));
+      addCacheUsage(history, at, [input || 0, cr, cc, output || 0]);
+    }
     for (const w of windows) {
       // Open the window lazily if nothing is open (a mid-cycle boot or a window whose
       // reset stamp was never learned). startedAt is the accrual time then — the cycle
@@ -447,6 +466,47 @@ export class CapacityLedger {
     while (keys.length > MAX_DAY_BUCKETS) {
       delete rec.days[keys.shift()];
     }
+  }
+
+  cacheWindows(name, now = this._now()) {
+    return cacheWindows(this._accounts.get(name)?.cacheHistory, now);
+  }
+
+  _cacheForOwner(key, at) {
+    if (!this._ownerCache.has(key)) this._ownerCache.set(key, emptyCacheHistory(at));
+    return this._ownerCache.get(key);
+  }
+
+  ownerCacheKeys() { return this._ownerCache.keys(); }
+
+  // Once an org-less history is identified, keep it with that subscription
+  // even if another organization for the same user is configured later.
+  assignCacheOwner(key, target) {
+    const history = this._ownerCache.get(key);
+    if (history && target && !history.assignedOwner) history.assignedOwner = target;
+    return history?.assignedOwner;
+  }
+
+  ownerCacheWindows(key, now) {
+    return cacheWindows(this._ownerCache.get(key), now);
+  }
+
+  // The previous release stored efficiency by *display name*. Only a unique
+  // local name can seed a classified account. New data is keyed by provider
+  // and identity, independent of display order or aliases.
+  restoreOwnerCache(key, names, savedHours, now) {
+    if (this._ownerCache.has(key)) return;
+    // Previous releases persisted per-name hourly telemetry. Multiple different
+    // aliases of one holder each contributed separate requests to those buckets.
+    const hours = {};
+    for (const name of names) {
+      for (const [hour, sample] of Object.entries(savedHours?.[name] || {})) {
+        if (!sample || !['in', 'cr', 'cc', 'out'].every(f => Number.isFinite(sample[f]) && sample[f] >= 0)) continue;
+        const total = hours[hour] ||= { in: 0, cr: 0, cc: 0, out: 0 };
+        for (const field of ['in', 'cr', 'cc', 'out']) total[field] += sample[field];
+      }
+    }
+    this._ownerCache.set(key, cacheHistoryFromHours(hours, now));
   }
 
   // ── Cycle lifecycle ─────────────────────────────────────────────────────────
@@ -803,60 +863,65 @@ export class CapacityLedger {
     return d.toISOString().slice(0, 10);
   }
 
-  /**
-   * Merge a DELTA of accrual into a base payload (B2 drain-exit merge-flush).
-   *
-   * The released worker keeps serving in-flight requests for up to RELOAD_DRAIN_MS
-   * AFTER its final flush, and then exits bare — so every token delivered during the
-   * drain was measured and thrown away. It cannot simply re-write its own ledger:
-   * the NEW worker owns the file by then and has its own accrual. So at exit it
-   * computes what it accrued SINCE its final flush (after − before) and adds only
-   * that delta onto whatever the new worker has on disk.
-   *
-   * Adds to the OPEN cycles and the day buckets — the only places drain-time tokens
-   * can land. A cycle the new worker already closed is not re-opened (the tokens
-   * belonged to a window that has since rolled; dropping them is correct, and the
-   * cycle is a completed observation we must not mutate after the fact).
-   */
-  static mergeDelta(basePayload, beforePayload, afterPayload) {
-    const base = (basePayload && basePayload.schemaVersion === SCHEMA_VERSION)
-      ? JSON.parse(JSON.stringify(basePayload))
-      : { schemaVersion: SCHEMA_VERSION, accounts: {} };
-    const before = beforePayload?.accounts || {};
-    const after = afterPayload?.accounts || {};
-    for (const [name, aRec] of Object.entries(after)) {
-      const bRec = before[name] || {};
-      for (const w of ['ses', 'wk']) {
-        const aOpen = aRec[w]?.open, bOpen = bRec[w]?.open;
-        if (!aOpen) continue;
-        const target = base.accounts[name]?.[w];
-        // The BASE's open cycle is the one being amended, so the same-cycle check is
-        // against IT — not against our own before-snapshot (which trivially matches
-        // our own after-snapshot and so never fired). A different startedAt means the
-        // window rolled during the drain: the delta belongs to a window the new worker
-        // has already closed, and crediting it to the fresh cycle would inflate the
-        // very next capacity reading by a whole window of traffic (red-team F6-3).
-        if (!target?.open) continue;
-        if (target.open.startedAt !== aOpen.startedAt) continue;
-        const delta = (bOpen && bOpen.startedAt === aOpen.startedAt)
-          ? aOpen.tokensSoFar - bOpen.tokensSoFar
-          : aOpen.tokensSoFar;
-        if (!(delta > 0)) continue;
-        target.open.tokensSoFar += delta;
-        target.open.lastAccrualAt = Math.max(target.open.lastAccrualAt || 0, aOpen.lastAccrualAt || 0);
+  // A released worker reports only observations made after its final snapshot.
+  // No account identifiers outside the local state directory or closed cycles travel.
+  static drainDelta(beforePayload, afterPayload) {
+    const changed = {};
+    for (const [name, after] of Object.entries(afterPayload?.accounts || {})) {
+      const before = beforePayload?.accounts?.[name] || {};
+      const delta = {};
+      const cacheHistory = mergeCacheDelta(null, before.cacheHistory, after.cacheHistory);
+      if (cacheHistory) delta.cacheHistory = cacheHistory;
+      for (const window of ['ses', 'wk']) {
+        const current = after[window]?.open, prior = before[window]?.open;
+        if (!current) continue;
+        const tokens = current.tokensSoFar - (prior?.startedAt === current.startedAt ? prior.tokensSoFar : 0);
+        if (tokens > 0) delta[window] = { startedAt: current.startedAt, lastAccrualAt: current.lastAccrualAt, tokens };
       }
-      for (const [day, v] of Object.entries(aRec.days || {})) {
-        const bTok = bRec.days?.[day]?.tokens || 0;
-        const delta = (v.tokens || 0) - bTok;
-        if (!(delta > 0)) continue;
-        base.accounts[name] = base.accounts[name]
-          || { ses: { open: null, closed: [] }, wk: { open: null, closed: [] }, days: {} };
-        const days = base.accounts[name].days;
-        days[day] = days[day] || { tokens: 0, partial: false };
-        days[day].tokens += delta;
+      for (const [day, value] of Object.entries(after.days || {})) {
+        const tokens = value.tokens - (before.days?.[day]?.tokens || 0);
+        if (tokens > 0) (delta.days ||= {})[day] = tokens;
+      }
+      if (Object.keys(delta).length) changed[name] = delta;
+    }
+    const owners = {};
+    for (const [key, after] of Object.entries(afterPayload?.ownerCache || {})) {
+      const delta = mergeCacheDelta(null, beforePayload?.ownerCache?.[key], after);
+      if (delta) owners[key] = delta;
+    }
+    return { accounts: changed, owners };
+  }
+
+  applyDrain(delta, id) {
+    if (id && this.appliedDrains.has(id)) return;
+    for (const [key, change] of Object.entries(delta.owners || {})) {
+      this._ownerCache.set(key, mergeCacheDelta(this._ownerCache.get(key), null, change));
+    }
+    for (const [name, changes] of Object.entries(delta.accounts || {})) {
+      const rec = this._rec(name);
+      if (changes.cacheHistory) {
+        rec.cacheHistory = mergeCacheDelta(rec.cacheHistory, null, changes.cacheHistory);
+      }
+      for (const window of ['ses', 'wk']) {
+        const open = rec[window].open;
+        const change = changes[window];
+        // A window that rolled during the drain must never be reopened or charged again.
+        if (!open || !change || change.startedAt !== open.startedAt) continue;
+        open.tokensSoFar += change.tokens;
+        open.lastAccrualAt = Math.max(open.lastAccrualAt || 0, change.lastAccrualAt || 0);
+      }
+      for (const [day, tokens] of Object.entries(changes.days || {})) {
+        const bucket = rec.days[day] ||= { tokens: 0, partial: false };
+        bucket.tokens += tokens;
       }
     }
-    return base;
+    if (id) this.appliedDrains.add(id);
+  }
+
+  static mergeDelta(basePayload, beforePayload, afterPayload) {
+    const ledger = CapacityLedger.fromSerialized(basePayload);
+    ledger.applyDrain(CapacityLedger.drainDelta(beforePayload, afterPayload));
+    return ledger.serialize();
   }
 
   dayKeys(name) { return Object.keys(this._accounts.get(name)?.days || {}).sort(); }

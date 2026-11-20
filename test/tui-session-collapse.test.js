@@ -41,13 +41,13 @@ function frameRows(am, columns) {
   return strip(buf).split(/\r?\n/).filter(l => /^ {4}(home|work|glm) /.test(l));
 }
 
-test('barLayout without the session column: Wk alone under 103 columns, Fbl and Wk from 103', () => {
+test('barLayout without the session column: Wk alone under 112 columns, Fbl and Wk from 112', () => {
   assert.deepEqual(barLayout(69, false), { showSession: false, showBoth: true, showFable: false, bw: 5 });
-  assert.deepEqual(barLayout(95, false), { showSession: false, showBoth: true, showFable: false, bw: 16 });
-  assert.deepEqual(barLayout(102, false), { showSession: false, showBoth: true, showFable: false, bw: 20 });
-  assert.deepEqual(barLayout(103, false), { showSession: false, showBoth: true, showFable: true, bw: 9 });
-  assert.deepEqual(barLayout(125, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
-  assert.deepEqual(barLayout(140, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
+  assert.deepEqual(barLayout(104, false), { showSession: false, showBoth: true, showFable: false, bw: 16 });
+  assert.deepEqual(barLayout(111, false), { showSession: false, showBoth: true, showFable: false, bw: 20 });
+  assert.deepEqual(barLayout(112, false), { showSession: false, showBoth: true, showFable: true, bw: 9 });
+  assert.deepEqual(barLayout(134, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
+  assert.deepEqual(barLayout(149, false), { showSession: false, showBoth: true, showFable: true, bw: 20 });
 });
 
 // A GLM row has no Fable limit, so it carries no Fbl label (blank space keeps the
@@ -73,25 +73,25 @@ function assertBars(rows, claudeRe, providerRe, what) {
 test('a pool with no Fable readings anywhere: the GLM blank keeps Wk in the OAuth rows column', () => {
   const am = pool();                       // no applyUsageData with scopedWeekly on any row
   withSession(am, 0);
-  const rows = frameRows(am, 118);
+  const rows = frameRows(am, 127);
   assert.equal(rows.length, 3);
   const oauth = rows.find(l => /^ {4}home /.test(l));
   const glm = rows.find(l => /^ {4}glm /.test(l));
   assert.match(oauth, /Fbl /, 'OAuth rows keep the dashed Fbl column');
   assert.doesNotMatch(glm, /Fbl|Fable/, 'GLM row still shows no Fable label');
   assert.equal(glm.indexOf(' Wk '), oauth.indexOf(' Wk '), 'Wk column aligned');
-  for (const l of rows) assert.ok(l.length <= 118, `fits 118 columns: ${l.length}`);
+  for (const l of rows) assert.ok(l.length <= 127, `fits 127 columns: ${l.length}`);
 });
 
 test('no account reports a session window: rows show Fbl then Wk and no Ses column', () => {
   const am = pool();
   weeklyOnly(am, 0);
   weeklyOnly(am, 1);
-  const rows = frameRows(am, 120);
+  const rows = frameRows(am, 129);
   assert.equal(rows.length, 3);
   for (const l of rows) {
     assert.doesNotMatch(l, /\bSes\b|\bTok\b/, `no session column: ${l}`);
-    assert.ok(l.length <= 120, `fits 120 columns: ${l.length}`);
+    assert.ok(l.length <= 129, `fits 129 columns: ${l.length}`);
   }
   assertBars(rows, /Fbl .* Wk /, / Wk /, 'Fbl then Wk');
   assert.match(rows[0], /Fbl\s+45% 3d/);
@@ -101,7 +101,7 @@ test('one account still reports a session window: every row keeps the Ses column
   const am = pool();
   weeklyOnly(am, 0);
   withSession(am, 1);
-  const rows = frameRows(am, 120);
+  const rows = frameRows(am, 129);
   assertBars(rows, /Fbl .*(Ses|Tok) .* Wk /, /(Ses|Tok) .* Wk /, 'three bars');
 });
 
@@ -110,7 +110,7 @@ test('a provider session reading also keeps the Ses column', () => {
   weeklyOnly(am, 0);
   weeklyOnly(am, 1);
   am.applyProviderUsage(2, { source: 'zai', ses: { utilization: 0.42, resetAt: Date.now() + 3600_000 } });
-  const rows = frameRows(am, 120);
+  const rows = frameRows(am, 129);
   assertBars(rows, /Fbl .*Ses .* Wk /, /Ses .* Wk /, 'three bars');
 });
 
@@ -122,7 +122,7 @@ test('a session window that expires on an idle pool keeps the Ses column (no wid
   const render = () => {
     const saved = { columns: process.stdout.columns, rows: process.stdout.rows, write: process.stdout.write };
     let buf = '';
-    process.stdout.columns = 120; process.stdout.rows = 24;
+    process.stdout.columns = 129; process.stdout.rows = 24;
     process.stdout.write = s => { buf += s; return true; };
     try { tui._render(); } finally { Object.assign(process.stdout, saved); }
     return strip(buf).split(/\r?\n/).filter(l => /^ {4}(home|work|glm) /.test(l));

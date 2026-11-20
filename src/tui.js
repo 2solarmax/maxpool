@@ -16,6 +16,7 @@ import { normalizeRemoteResets, resolveStickyBusyBudget } from './account-manage
 import { appliesTo } from './claude-reset-grants.js';
 import { LISTING_FRESH_MS } from './reset-timing.js';
 import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
+import { subscriptionTermsFor } from './subscription-terms.js';
 
 // Running as the background service (tools/pool-service): set by its launchd plist.
 const serviceMode = () => process.env.MAXPOOL_SERVICE === '1';
@@ -155,6 +156,13 @@ const vw = s => strip(s).length;
 // Status/MRst/ARst/Quota start offsets are pure functions of these widths +
 // the 4-col row prefix, independent of the quota-bar width.
 const NAME_W = 20;         // a.name.slice(0, NAME_W).padEnd(NAME_W) — fits a full email like 2solarmax@gmail.com (19)
+const CACHE_W = 8;
+// On an 80-column display retain the reset and quota readings by shortening the name.
+// The analytics detail always displays the full name. Wider terminals show all 20 characters.
+function nameWidth(width) {
+  const compact = NAME_W - CACHE_W - 1;
+  return Math.min(NAME_W, compact + Math.max(0, width - 80));
+}
 const WHERE_W = 5;         // 'Local' / 'Cloud' — where the account is provisioned
 const PROVIDER_W = 9;      // providerLabel(a).padEnd(PROVIDER_W) — fits "Anthropic"
 const STATUS_W = 13;       // rpad(status, STATUS_W) — fits "throttled 59s"
@@ -193,7 +201,8 @@ function providerLabel(a) {
 function acctHeader(W) {
   const quota = W >= 88 ? 'Quota (used% · resets-in)' : 'Quota';
   return ROW_PREFIX
-    + 'Account'.padEnd(NAME_W) + ' '
+    + 'Account'.padEnd(nameWidth(W)) + ' '
+    + 'Cache 3h'.padStart(CACHE_W) + ' '
     + 'Where'.padEnd(WHERE_W) + ' '
     + 'Provider'.padEnd(PROVIDER_W) + ' '
     + 'Status'.padEnd(STATUS_W) + ' '
@@ -215,14 +224,14 @@ function lpadVis(s, w) {
  * Each extra bar costs its label gap ("  Fbl " or "  Wk  ") plus one bar width.
  * Under 70 columns only the session bar shows, 5 to 20 wide; from 70 the weekly
  * bar joins it, both 5 to 20 wide. The Fable bar joins only once all three can be
- * 9 wide (118 columns), the narrowest bar that still shows "100% 2d5h", and three
- * bars stop growing at 11 wide, so the row never passes column 124 and the tags
+ * 9 wide (127 columns), the narrowest bar that still shows "100% 2d5h", and three
+ * bars stop growing at 11 wide, so the row never passes column 133 and the tags
  * after the bars (cap, prefer, staleness) keep the room they have with two bars.
  * Narrower terminals keep today's two bars plus the "Fable NN%" tag.
  * When no account reports a session window, the session bar is left out: the
- * weekly bar always shows and the Fable bar joins it from 103 columns.
+ * weekly bar always shows and the Fable bar joins it from 112 columns.
  */
-const BAR_START = ROW_PREFIX.length + NAME_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + MRST_W + 1 + ARST_W + 1 + 'Ses '.length;
+const barStart = width => ROW_PREFIX.length + nameWidth(width) + 1 + CACHE_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + MRST_W + 1 + ARST_W + 1 + 'Ses '.length;
 const BAR_GAP = '  Wk  '.length;
 const BAR_MIN_W = 5;
 const BAR_MAX_W = 20;
@@ -231,9 +240,10 @@ const THREE_BAR_MAX_W = 11;
 function barLayout(W, showSession = true) {
   const showBoth = W >= 70 || !showSession;
   const others = (showSession ? 1 : 0) + (showBoth ? 1 : 0);
-  const showFable = W >= BAR_START + (others + 1) * FABLE_BAR_MIN_W + others * BAR_GAP;
+  const start = barStart(W);
+  const showFable = W >= start + (others + 1) * FABLE_BAR_MIN_W + others * BAR_GAP;
   const bars = others + (showFable ? 1 : 0);
-  const free = W - BAR_START - (bars - 1) * BAR_GAP;
+  const free = W - start - (bars - 1) * BAR_GAP;
   const fit = Math.floor(free / bars);
   const maxW = bars === 3 ? THREE_BAR_MAX_W : BAR_MAX_W;
   const bw = Math.max(BAR_MIN_W, Math.min(maxW, fit));
@@ -346,6 +356,18 @@ function formatTokens(n) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
   return String(n);
+}
+
+const ANALYTICS_PERIODS = ['1h', '24h', '7d', 'all'];
+
+function cachePercent(window) {
+  if (!Number.isFinite(window?.hit)) return '—';
+  return Math.round(window.hit * 100) + '%' + (window.partial ? '*' : '');
+}
+
+function analyticsProvider(key) {
+  return { claude: 'Claude', glm: 'GLM', kimi: 'Kimi', codex: 'Codex' }[key]
+    || PROVIDER_LABELS[key] || key;
 }
 
 function formatMs(ms) {
@@ -789,6 +811,7 @@ export class TUI {
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
     this.mode = 'normal';    // normal | accounts | routing | capacity | select | input | confirm | providers | addtype
+    this.analyticsMetrics = new WeakMap();
     this.capacityWindow = 'wk'; // default weekly — the true tank (owner 2026-10-31); 'w' toggles to 5h
     // Hide disabled accounts from the table. With 8 dead/disabled accounts the live
     // ones scroll off the top; `h` collapses them to a one-line summary.
@@ -1100,6 +1123,7 @@ export class TUI {
       case 'updates': this._keyUpdates(k); break;
       case 'capacity': this._keyCapacity(k); break;
       case 'people': this._keyPeople(k); break;
+      case 'analytics': this._keyAnalytics(k); break;
       case 'addtype': this._keyAddType(k); break;
       case 'select': this._keySelect(k); break;
       case 'input':  this._keyInput(k); break;
@@ -1155,6 +1179,8 @@ export class TUI {
       );
     } else if (k === 'u') {
       this.mode = 'updates';
+    } else if (k === 'v') {
+      this._openAnalytics();
     } else if (k === 'y') {
       this.mode = 'capacity';
     } else if (k === 'p') {
@@ -2883,6 +2909,11 @@ export class TUI {
       return;
     }
 
+    if (this.mode === 'analytics') {
+      this._writeScreen(this._renderAnalyticsPage(W, H), W, H);
+      return;
+    }
+
     const lines = [];
 
     // ── Header
@@ -3107,7 +3138,7 @@ export class TUI {
     const acTag = ac > 0
       ? `  ${cyan(ac + ' in-flight')}${sessions ? dim(` · ${sessions} session${sessions === 1 ? '' : 's'}`) : ''}`
       : '';
-    const aHdr = ` Activity${acTag} `;
+    const aHdr = ` Activity${acTag}   ${bold('v')} Analytics `;
     lines.push(aHdr + dim('─'.repeat(Math.max(1, W - vw(aHdr)))));
 
     // Active requests
@@ -3267,11 +3298,14 @@ export class TUI {
     // Name (bold if selected)
     // A cloud row is named exactly like the account (the Where column says Cloud);
     // its internal name carries a suffix only to stay unique next to a local copy.
-    const rawName = (a.remote ? a.remote.remoteName : a.name).slice(0, NAME_W).padEnd(NAME_W);
+    const nameW = nameWidth(width);
+    const rawName = (a.remote ? a.remote.remoteName : a.name).slice(0, nameW).padEnd(nameW);
     // A disabled account reads as "off" — dim the whole name. Applied as a SINGLE SGR
     // (never dim(bold(...)) — bold()'s trailing RESET would cancel the dim mid-string),
     // so a disabled row is never also bold-selected.
-    const name = a.enabled === false ? dim(rawName) : (isSel ? bold(rawName) : rawName);
+    const label = a.enabled === false ? dim(rawName) : (isSel ? bold(rawName) : rawName);
+    const cache = this._accountMetrics(this.am.accounts[idx])?.windows['3h'];
+    const name = label + ' ' + lpadVis(cachePercent(cache), CACHE_W);
 
     // Provider column — the real vendor (Anthropic / z.ai / Moonshot), padded to
     // PROVIDER_W so "Anthropic" (9 chars) never overflows and shifts the row (incl.
@@ -3513,7 +3547,7 @@ export class TUI {
     // The Fable bar comes first, before the session and weekly bars, on every row
     // type, so each bar starts at the same offset on OAuth, API-key and provider rows.
     const barCount = Number(showFable) + Number(showSession) + Number(showBoth);
-    const barsFit = width >= BAR_START + barCount * BAR_MIN_W + (barCount - 1) * BAR_GAP;
+    const barsFit = width >= barStart(width) + barCount * BAR_MIN_W + (barCount - 1) * BAR_GAP;
     if (a.provider === 'codex' && !barsFit) {
       // With the fixed account columns, an 80-column terminal only has five
       // cells for the reading. Put the percentage before an optional long label.
@@ -3521,7 +3555,7 @@ export class TUI {
       if (used != null) {
         const pct = `${Math.round(used * 100)}%`;
         const label = r2 != null ? 'Wk' : '5h';
-        const space = width - (BAR_START - 4);
+        const space = width - (barStart(width) - 4);
         bars.push(space >= pct.length + label.length ? label + pct : pct);
       } else bars.push(dim('—'));
     } else {
@@ -3815,8 +3849,151 @@ export class TUI {
     return out;
   }
 
+  // Ten terminal frames per second need only one refresh per account per second.
+  _accountMetrics(account, now = Date.now()) {
+    const cached = this.analyticsMetrics.get(account);
+    if (cached && now - cached.at < 1000) return cached.metrics;
+    const metrics = this.am.accountCacheWindows?.(account, now);
+    this.analyticsMetrics.set(account, { at: now, metrics });
+    return metrics;
+  }
+
+  _openAnalytics() {
+    this.analytics = { back: this.mode, providers: false, selected: 0, detail: false, scroll: 0 };
+    this.mode = 'analytics';
+  }
+
+  _analyticsRows(now = Date.now()) {
+    const state = this.analytics;
+    if (state.rows && now - state.rows.at < 1000 && state.rows.providers === state.providers) return state.rows.values;
+    let values;
+    if (state.providers) {
+      values = Object.entries(this.am.providerCacheWindows?.(now) || {}).map(([provider, metrics]) => ({
+        name: analyticsProvider(provider), metrics,
+      }));
+    } else {
+      // Disabled accounts can still have usage in the requested history.
+      values = this.am.capacityRows(this._displayOrder()).map(row => {
+        const account = this.am.accounts[row.index];
+        return {
+          name: row.displayName,
+          provider: providerLabel(account),
+          where: row.where,
+          account,
+          localAccount: account.remote && !row.unresolved
+            ? row.group.map(index => this.am.accounts[index]).find(member => !member.remote) : null,
+          metrics: this._accountMetrics(account, now),
+        };
+      });
+    }
+    state.rows = { values, at: now, providers: state.providers };
+    return values;
+  }
+
+  _keyAnalytics(k) {
+    const state = this.analytics;
+    if (k === 'esc' || k === 'q') {
+      if (state.detail) { state.detail = false; state.scroll = 0; }
+      else this.mode = state.back;
+    } else if (state.detail) {
+      if (k === 'down' || k === 'j') state.scroll++;
+      if (k === 'up' || k === 'k') state.scroll = Math.max(0, state.scroll - 1);
+    } else if (k === 'p') {
+      state.providers = !state.providers;
+      state.selected = 0;
+    } else if (k === 'enter') {
+      const row = this._analyticsRows()[state.selected];
+      state.detail = row?.account || row?.name || false;
+      state.scroll = 0;
+    } else if (k === 'up' || k === 'k') {
+      state.selected = Math.max(0, state.selected - 1);
+    } else if (k === 'down' || k === 'j') {
+      state.selected = Math.min(Math.max(0, this._analyticsRows().length - 1), state.selected + 1);
+    }
+  }
+
+  _renderAnalyticsPage(W, H) {
+    const state = this.analytics;
+    const rows = this._analyticsRows();
+    state.selected = Math.max(0, Math.min(state.selected, rows.length - 1));
+    const selected = state.detail && rows.find(row => (row.account || row.name) === state.detail);
+    const lines = [bold(' Activity analytics · ' + (state.providers ? 'Providers' : 'Accounts'))];
+    let footer;
+    if (state.detail && selected) {
+      const details = this._analyticsDetail(selected, W);
+      const available = H - lines.length - 1;
+      state.scroll = Math.max(0, Math.min(state.scroll, details.length - available));
+      lines.push(...details.slice(state.scroll, state.scroll + available));
+      footer = details.length > available ? ' ↑↓ Scroll   Esc Back' : ' Esc Back';
+    } else {
+      state.detail = false;
+      lines.push(dim(' Cache hit % of observed input tokens'));
+      const numericWidth = W >= 58 ? 7 : 5;
+      const providerWidth = !state.providers && W >= 65 ? PROVIDER_W + 2 : 0;
+      const nameW = Math.min(36, W - 3 - providerWidth - 4 * numericWidth);
+      const lead = (name, provider) => truncate(name, nameW)
+        + (providerWidth ? '  ' + truncate(provider || '', providerWidth - 2) : '');
+      lines.push(dimUnderline('   ' + lead(state.providers ? 'Provider' : 'Account', 'Provider')
+        + ['1h', '24h', '7d', 'All'].map(x => x.padStart(numericWidth)).join('')));
+      const visible = Math.max(1, H - lines.length - 3);
+      const top = Math.max(0, state.selected - visible + 1);
+      for (const [offset, row] of rows.slice(top, top + visible).entries()) {
+        const cursor = top + offset === state.selected ? cyan(' › ') : '   ';
+        lines.push(cursor + lead(row.name, row.provider)
+          + ANALYTICS_PERIODS.map(key => cachePercent(row.metrics?.windows[key]).padStart(numericWidth)).join(''));
+      }
+      if (!rows.length) lines.push(dim(' No usage data available.'));
+      lines.push(dim(' All = since tracking. * = partial.'));
+      if (rows.length > visible) lines.push(dim(` ${state.selected + 1} of ${rows.length}`));
+      footer = ` ↑↓ Select  Enter Detail  p ${state.providers ? 'Accounts' : 'Providers'}  Esc Back`;
+      if (W < footer.length) footer = ` ↑↓  Enter Detail  p ${state.providers ? 'Accounts' : 'Providers'}  Esc Back`;
+    }
+    while (lines.length < H - 1) lines.push('');
+    lines.push(footer);
+    return lines;
+  }
+
+  _analyticsDetail(row, W) {
+    const cellW = W >= 54 ? 9 : 7;
+    const labelW = W >= 54 ? 8 : 4;
+    const out = [` ${bold(row.name)}`];
+    if (row.account) out.push(' ' + [row.provider, row.where].filter(Boolean).join(' · '));
+    const head = ' ' + 'Time'.padEnd(labelW)
+      + ['Fresh', 'Read', 'Write', 'Output', 'Total'].map(k => k.padStart(cellW)).join('');
+    out.push(dimUnderline(head));
+    for (const period of ANALYTICS_PERIODS) {
+      const w = row.metrics?.windows[period];
+      const label = (period === 'all' ? 'All' : period) + (w?.partial ? '*' : '');
+      const vals = w ? [w.input, w.cacheRead, w.cacheWrite, w.output, w.input + w.cacheRead + w.cacheWrite + w.output] : [];
+      out.push(' ' + label.padEnd(labelW) + Array.from({ length: 5 }, (_, i) => formatTokens(vals[i]).padStart(cellW)).join(''));
+    }
+    out.push(dim(' Fresh = uncached input.'), dim(' Read/write = cache tokens.'));
+    if (Number.isFinite(row.metrics?.since)) out.push(dim(' Tracking since ' + new Date(row.metrics.since).toISOString().slice(0, 10) + ' UTC'));
+    if (Number.isFinite(row.metrics?.asOf) && Date.now() - row.metrics.asOf > 90_000) {
+      out.push(dim(' Last report ' + new Date(row.metrics.asOf).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'));
+    }
+    if (ANALYTICS_PERIODS.some(key => row.metrics?.windows[key]?.partial)) out.push(dim(' * Partial history in this period.'));
+    if (row.account) {
+      let terms = subscriptionTermsFor(this.config, row.account);
+      let heading = ' Subscription';
+      if (!terms.length && row.localAccount) {
+        terms = subscriptionTermsFor(this.config, row.localAccount);
+        if (terms.length) heading = ' Local subscription';
+      }
+      out.push('', bold(heading));
+      if (!terms.length) out.push(dim(' No subscription terms configured.'));
+      for (const term of terms) {
+        const amount = term.price != null ? [term.currency, term.price].filter(x => x != null).join(' ') : '';
+        if (amount || term.cadence) out.push(' ' + [amount, term.cadence].filter(Boolean).join(' · '));
+        if (term.nextRenewal) out.push(' Next renewal  ' + term.nextRenewal);
+      }
+    }
+    return out;
+  }
+
   _keyCapacity(k) {
-    if (k === 'w') { this.capacityWindow = this.capacityWindow === 'wk' ? 'ses' : 'wk'; }
+    if (k === 'v') { this._openAnalytics(); }
+    else if (k === 'w') { this.capacityWindow = this.capacityWindow === 'wk' ? 'ses' : 'wk'; }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
   }
 
@@ -4051,10 +4228,10 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('y')} Capacity  ${bold('p')} People  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} ${serviceMode() ? 'Close view' : 'Stop server'}`;
+        return ` ${bold('a')} Accounts  ${bold('m')} Routing  ${bold('v')} Analytics  ${bold('y')} Capacity  ${bold('p')} People  ${bold('h')} Hide disabled  ${dim('│')}  ${bold('u')} Updates  ${bold('r')} Restart  ${bold('q')} ${serviceMode() ? 'Close view' : 'Stop server'}`;
       case 'capacity': {
         const other = this.capacityWindow === 'wk' ? '5h session' : 'weekly (7d)';
-        return ` ${bold('w')} Show ${cyan(other)}  ${bold('Esc')} Back`;
+        return ` ${bold('w')} Show ${cyan(other)}  ${bold('v')} Activity analytics  ${bold('Esc')} Back`;
       }
       case 'people':
         return ` ${bold('Esc')} Back`;

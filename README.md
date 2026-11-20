@@ -139,10 +139,52 @@ When running from a TTY, shows an interactive TUI with:
 
 Falls back to plain log output when not a TTY (e.g. running as a service).
 
+#### Activity analytics
+
+The account table’s **Cache 3h** column shows the percentage of measured input tokens served from cache over the past three hours. Press **v** to open Activity analytics. Select an account and press **Enter** to inspect fresh input, cache reads, cache writes and output over the last hour, 24 hours, seven days and all tracked time. Press **p** to group by provider, including Codex.
+
+The percentage uses total cache-read tokens divided by all measured input tokens. A dash means a percentage is unavailable. A measured zero means none of that input came from cache. An asterisk marks incomplete history. The detail view shows when tracking began.
+
+#### Private subscription details
+
+Activity analytics can display the price per billing period, currency, cadence and next renewal for each account. A local z.ai account can supply this information through its existing subscription probe. For another provider, or for an account on a linked pool, the viewer can read an optional **private file on their own machine**. Unknown fields stay blank. A provider’s quota reset date does not establish a subscription renewal date.
+
+Add a `subscriptionRegistries` list under `ui` in your MaxPool config. Use an absolute file path. The optional `pool` is the exact name of a configured link. An entry without `pool` applies to local accounts. For each account, the first matching file supplies its terms.
+
+```json
+{
+  "ui": {
+    "subscriptionRegistries": [
+      { "file": "/absolute/private/local-subscriptions.json" },
+      { "pool": "team", "file": "/absolute/private/team-subscriptions.json" }
+    ]
+  }
+}
+```
+
+A registry contains rows scoped by provider and the account name on its credential-owning worker. A row may have several active subscriptions. This example uses fictional terms.
+
+```json
+[
+  {
+    "vendor": "codex",
+    "account": "example",
+    "subscriptions": [
+      { "price": 12, "currency": "EUR", "cycle": "quarterly", "next_renew": "2027-04-01" }
+    ]
+  }
+]
+```
+
+Use `monthly`, `quarterly` or `annual`. Specify the price for the whole billing period. Include the currency only when known. For a non-renewing subscription, `"auto_renew": false` suppresses the renewal date. Existing subscription tracker JSON exports with `vendor`, `maxpool_account` and `subscriptions` are also accepted. Export only the records the viewer is entitled to see and ensure the account alias matches the worker that serves it. A personal and a linked account with the same name have separate scopes.
+
+Keep the file outside your repository, owned by your operating-system user and mode `0600` or `0400`. When refreshing a private export, create a temporary file with `umask 077` in the same directory, complete the export, and rename it over the previous file only on success. MaxPool refreshes these files locally within 30 seconds. The file path and its contents stay off the pool link.
+
 #### TUI Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
+| `v` | Open Activity analytics |
 | `a` | Open account management |
 | `m` | Choose automatic routing or a preferred account |
 | `s` | Sync accounts and credentials from config now |

@@ -18,14 +18,17 @@
 
 ## Current focus
 
-MaxPool v1.24.112 serves Claude Code with Anthropic, GLM, and Kimi. On
-`codex/maxpool-openai`, ChatGPT plan usage is added as another inference
-provider behind the same Claude Code Messages API. Native Codex quota, resets,
-and provider-sticky routing are being qualified on an isolated listener.
+MaxPool serves Claude Code and native Codex. The account analytics change adds cache measurements by account and provider and an operator-only subscription view.
 
 ---
 
 ## Decisions
+
+### 2026-11-20 · Account analytics and private subscription terms
+
+Cache percentages divide cache-read tokens by all input tokens, including cache writes. Accounts shows the last three hours. Activity analytics provides one hour, one day, one week and all measured history. Each worker counts the requests it served locally. A linked viewer uses the serving worker’s summaries. Codex reports cached tokens as part of input and the two request adapters normalize that once.
+
+Price, billing period and next renewal come from the operator’s private registry or a supported provider reading. A linked worker shares usage measurements. Commercial terms stay with the operator who has their source. Missing records are displayed as unknown. Subscription prices are distinct from metered usage and invoice charges.
 
 ### 2026-11-19 · Local terminal request cap
 
