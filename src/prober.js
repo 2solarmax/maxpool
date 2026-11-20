@@ -154,9 +154,9 @@ export class Prober {
             // The usage endpoint is waiting. The independent claim endpoint can
             // still rescue an existing hold if other accounts have lost room.
             if (q.probeRetryAt > this._now() && !account.subscriptionGone) {
-              try { await this._rescueHeldWall(account); } catch { /* keep other accounts checking */ }
+              try { await this._rescueHeldWall(account, { refreshToken: true }); } catch { /* keep other accounts checking */ }
             }
-            continue; // no pacing slot, token refresh or grant listing for a deferred row
+            continue; // no usage pacing slot or grant listing for a deferred row
           }
           await this._paceUsage();
           if (this._stopping) break;
@@ -225,7 +225,7 @@ export class Prober {
 
   requestUsageRecheck(account) {
     if (account?.type !== 'oauth' || account.provider === 'codex' || account.remote || account.poolBenchedBy
-        || account.refreshDead || !account.credential) return 'Select an Anthropic subscription on its owning pool';
+        || account.refreshDead || !account.credential) return 'Select a local Claude subscription';
     if (this.intervalMs <= 0 || this._stopping || this.am.writerLease === false) return 'Quota checks are paused';
     const q = account.quota;
     if (q.probeRetryAt > this._now()) return 'Provider requested a wait before the next quota check';
@@ -235,7 +235,7 @@ export class Prober {
     }
     q.probeRecheckRequested = true;
     q.probeNextCheckAt = null;
-    return 'Quota check queued for the next sweep';
+    return `Quota check queued for the next scheduled check (~${Math.ceil(this.intervalMs / 1000)}s)`;
   }
 
   _subscriptionRecheckAt(account) {
@@ -711,11 +711,15 @@ export class Prober {
    *  A still-roomy pool keeps holding; a refill that moved past 24h (or a dying
    *  grant) makes wallClaimHeld itself release. Never claims a wall nobody held.
    *  General weekly wall only (red-team r3): no model wall is ever held. */
-  async _rescueHeldWall(account) {
+  async _rescueHeldWall(account, { refreshToken = false } = {}) {
     if (this._stopping || this.am.writerLease === false || !this.am.isHoldingWall?.(account)) return;   // never a wall nobody held
     // A listing-side cooldown is a server instruction the reactive route doesn't read.
     const cd = account.resetGrants?.cooldownUntil;
     if (cd != null && cd > Date.now()) return;
+    if (refreshToken) {
+      if (!await this.am.ensureTokenFresh(account.index)) return;
+      if (this._stopping || this.am.writerLease === false || this.am.accounts[account.index] !== account) return;
+    }
     await this.am.tryReactiveClaim(account, { kind: 'weekly' });
   }
 

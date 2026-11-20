@@ -396,9 +396,9 @@ for (const claimRateLimited of [false, true]) {
     const usageDeadline = first + (claimRateLimited ? 60 : 10) * minute;
     let peersFull = false;
     const wallReads = [], claims = [];
-    t.mock.method(globalThis, 'fetch', async url => {
+    t.mock.method(globalThis, 'fetch', async (url, options) => {
       if (String(url).endsWith('/api/oauth/profile')) return globalThis.Response.json({ organization: { uuid: 'test' } });
-      claims.push({ url: String(url), at: now });
+      claims.push({ url: String(url), at: now, authorization: new globalThis.Headers(options?.headers).get('authorization') });
       if (claimRateLimited && claims.length === 1) {
         return globalThis.Response.json({ error: { message: 'wait' } }, { status: 429, headers: { 'retry-after': '1800' } });
       }
@@ -427,9 +427,15 @@ for (const claimRateLimited of [false, true]) {
     await prober.probeAll();
     assert.equal(claims.length, 0, 'observer cannot rescue a held claim');
     am.setWriterLease(true);
+    // No usage request can refresh the held account while its deadline is active.
+    t.mock.method(am, 'ensureTokenFresh', async index => {
+      if (index === self.index) self.credential = 'renewed-fixture-token';
+      return true;
+    });
     await Promise.all([prober.probeAll(), prober.probeAll()]);
     assert.deepEqual(claims.map(c => c.at), [first + minute], 'the next owning sweep attempts one claim');
     assert.match(claims[0].url, /\/reset_rate_limits$/);
+    assert.equal(claims[0].authorization, 'Bearer renewed-fixture-token');
     if (claimRateLimited) {
       now += 29 * minute;
       await prober.probeAll();

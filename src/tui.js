@@ -2074,7 +2074,7 @@ export class TUI {
   _startSelection(action) {
     const selectable = this._selectableIndexes(action);
     if (!selectable.length) {
-      const unavailable = action === 'check quota' ? 'Check cloud accounts on their owning pool'
+      const unavailable = action === 'check quota' ? 'No local Claude subscription to check'
         : 'No configurable account is available for this action';
       this._addLog(action === 'prefer'
         ? 'No enabled Claude account is available for manual preference' : unavailable);

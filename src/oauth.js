@@ -2,6 +2,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
+import { MAX_QUOTA_RETRY_MS } from './reset-timing.js';
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 // Token endpoint is overridable via env so a stub OAuth server can be pointed at
@@ -307,7 +308,7 @@ export function retryAfterAt(value, now = Date.now()) {
   if (!value) return null;
   const at = /^\d+$/.test(value) ? now + Number(value) * 1000
     : /^[A-Za-z]{3}, /.test(value) ? Date.parse(value) : NaN;
-  return Number.isSafeInteger(at) && at > now ? at : null;
+  return Number.isSafeInteger(at) && at > now ? Math.min(at, now + MAX_QUOTA_RETRY_MS) : null;
 }
 
 /** Read an account's quota from the zero-spend /api/oauth/usage endpoint.

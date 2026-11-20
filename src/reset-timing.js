@@ -2,6 +2,9 @@
 // 5*60_000 literal had spread across account-manager.js, prober.js and tui.js).
 // Leaf by construction: imports nothing, so every consumer can share it.
 
+// A provider can defer the next quota read by at most one six-hour retry window.
+export const MAX_QUOTA_RETRY_MS = 6 * 3600_000;
+
 // A2: grants are listed at most this often per account (the call shares the
 // per-IP rate-limited /api/oauth/usage endpoint with the usage probe).
 export const GRANTS_EVERY_MS = 5 * 60_000;

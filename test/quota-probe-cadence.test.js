@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { Prober, GRANTS_EVERY_MS, SUB_RECHECK_MS } from '../src/prober.js';
 import { fetchUsage } from '../src/oauth.js';
+import { CLAIM_BACKOFF_CAP_MS, MAX_QUOTA_RETRY_MS } from '../src/reset-timing.js';
 import { listResetGrants } from '../src/claude-reset-grants.js';
 import { TUI, __tuiTest } from '../src/tui.js';
 
@@ -89,11 +90,33 @@ test('usage and grant reads capture delta seconds and HTTP dates, and leave abse
   const upstream = async () => new globalThis.Response('{}', { status: 429, headers: header == null ? {} : { 'retry-after': header } });
   t.mock.method(globalThis, 'fetch', upstream);
   for (const [value, due] of [['87', now + 87000], [new Date(now + 94000).toUTCString(), now + 94000],
+    [String(2 * MAX_QUOTA_RETRY_MS / 1000), now + MAX_QUOTA_RETRY_MS],
+    [new Date(now + 2 * MAX_QUOTA_RETRY_MS).toUTCString(), now + MAX_QUOTA_RETRY_MS],
     [null, undefined], ['8 seconds??', undefined]]) {
     header = value;
     assert.equal((await fetchUsage('synthetic')).retryAt, due);
     assert.equal((await listResetGrants('synthetic', { fetchImpl: upstream })).retryAt, due);
   }
+});
+
+test('restart and takeover bound older deadlines and preserve newer live waits', t => {
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const am = new AccountManager([account('full')]);
+  const saved = am.exportQuotaState();
+  saved[0].quota.probeRetryAt = now + MAX_QUOTA_RETRY_MS + 1;
+  am.restoreQuotaState(saved);
+  assert.equal(am.accounts[0].quota.probeRetryAt, now + MAX_QUOTA_RETRY_MS);
+  am.accounts[0].quota.probeRetryAt = null;
+  am.restoreProbeRetryDeadlines(saved);
+  assert.equal(am.accounts[0].quota.probeRetryAt, now + MAX_QUOTA_RETRY_MS);
+  for (const prior of [null, 'invalid', now - minute, now + minute]) {
+    saved[0].quota.probeRetryAt = prior;
+    am.restoreProbeRetryDeadlines(saved);
+    assert.equal(am.accounts[0].quota.probeRetryAt, now + MAX_QUOTA_RETRY_MS);
+  }
+  const backoff = am.noteClaimFailure('full', 'grant', now, now + 2 * CLAIM_BACKOFF_CAP_MS);
+  assert.equal(backoff.waitMs, CLAIM_BACKOFF_CAP_MS);
 });
 
 test('a mirror reports its owner’s next check, and a newer success clears an old throttle label', t => {
@@ -203,7 +226,7 @@ test('Accounts Check quota advances only the selected owning row, never bypasses
   am.accounts[0].quota.probeRetryAt = Date.now() + 120000;
   assert.match(prober.requestUsageRecheck(am.accounts[0]), /requested a wait/);
   assert.equal(am.accounts[0].quota.probeRecheckRequested, false);
-  assert.match(prober.requestUsageRecheck(am.accounts[1]), /owning pool/);
+  assert.match(prober.requestUsageRecheck(am.accounts[1]), /local Claude subscription/);
 });
 
 test('Check quota reports a latched subscription’s scheduled recheck, including a restored latch without a timestamp', async t => {
