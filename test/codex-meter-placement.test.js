@@ -117,6 +117,21 @@ test('first-placement shadow measures feasible, same-model alternatives and neve
   assert.equal(unknown.placementComparison().comparable, 0);
 });
 
+test('a compacted Messages conversation with a new prefix keeps its original first-placement count', () => {
+  const am = manager();
+  const makeTurn = affinityKey => ({ ...request('unused'), sessionKey: '', caller: 'test-client',
+    clientThreadId: 'stable-client-thread', affinityKey });
+  const first = makeTurn('first-prefix');
+  const lease = am.acquireAccount(first);
+  am.noteConversationServed(first, lease.account);
+  am.releaseAccount(lease, { status: 200, success: true });
+  assert.equal(am.placementComparison().observed, 1);
+  const compacted = am.acquireAccount(makeTurn('compacted-prefix'));
+  assert.ok(compacted);
+  assert.equal(am.placementComparison().observed, 1);
+  am.releaseAccount(compacted, { status: 200, success: true });
+});
+
 test('unsuccessful comparable attempts never book served-elsewhere evidence', () => {
   const am = manager();
   const now = Date.now();

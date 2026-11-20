@@ -1208,7 +1208,10 @@ export class AccountManager {
       : null;
     requestInfo.returnedHome = null;   // set by the selection loop when it sends the turn home
     const key = this._affinityKey(requestInfo);
-    const placement = key && (!requestInfo.nativeCodexClient || requestInfo.identifiedSession) && !prevCurrentName && !this.conversationLastAccount.has(key) && !excludedIndexes.size
+    // Compaction can replace the prompt-derived affinity key. Claude Code's
+    // caller-scoped thread still identifies a previously served conversation.
+    const knownThread = requestInfo.clientThreadId && this.conversationProvider.has(this._providerConversationKey(requestInfo));
+    const placement = key && !knownThread && (!requestInfo.nativeCodexClient || requestInfo.identifiedSession) && !prevCurrentName && !this.conversationLastAccount.has(key) && !excludedIndexes.size
       && !requestInfo.nativeCodexOwner && !requestInfo.pinnedAccountName && !requestInfo.pinAccount
       && !requestInfo.retrySameAccountName && !requestInfo.isCountTokens && !requestInfo._placementCompared
       ? { candidates: [] } : null;

@@ -162,7 +162,7 @@ export class RoutingCapacityAnalytics {
 
   snapshot(owner, now = Date.now(), demandBetween) {
     const rec = this.owners.get(owner);
-    const cycles = (rec?.cycles || []).filter(c => c.endedAt >= now - KEEP_MS).toReversed().map(c => {
+    const cycles = (rec?.cycles || []).filter(c => c.endedAt >= now - KEEP_MS).reverse().map(c => {
       // Worker coverage can catch up after a boundary or a link can be attached.
       if (c.attribution !== 'unattributed' || !demandBetween) return { ...c };
       return { ...c, attribution: classifyCapacityOpportunity(c, demandBetween(c.startAt, c.endedAt)) };
