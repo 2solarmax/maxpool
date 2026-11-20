@@ -1223,7 +1223,11 @@ export class AccountManager {
     let comparison = null;
     if (placement && placement.candidates.length) {
       requestInfo._placementCompared = true;
-      comparison = this._comparePlacement(account, placement.candidates, requestInfo, requestInfo.now ?? Date.now());
+      try {
+        comparison = this._comparePlacement(account, placement.candidates, requestInfo, requestInfo.now ?? Date.now());
+      } catch {
+        this._notePlacementFault();
+      }
     }
 
     const weight = Math.max(1, Number(requestInfo.weight) || 1);
@@ -1422,12 +1426,16 @@ export class AccountManager {
     this.settleSessionProviderAttempt(lease);
     if (lease.comparison) {
       const { alternative } = lease.comparison;
-      const trace = lease.requestInfo?._service;
-      const completed = (!trace || trace.terminal === 'completed') && outcome.success
-        && outcome.status >= 200 && outcome.status < 300 && !outcome.error && !outcome.refusal && !outcome.bounced && !outcome.linkFault;
-      this.placementCounts[completed ? 'successful' : 'failed']++;
-      if (completed && alternative?.owner) this.routingCapacity.noteAlternative(alternative);
       lease.comparison = null;
+      try {
+        const trace = lease.requestInfo?._service;
+        const completed = (!trace || trace.terminal === 'completed') && outcome.success
+          && outcome.status >= 200 && outcome.status < 300 && !outcome.error && !outcome.refusal && !outcome.bounced && !outcome.linkFault;
+        this.placementCounts[completed ? 'successful' : 'failed']++;
+        if (completed && alternative?.owner) this.routingCapacity.noteAlternative(alternative);
+      } catch {
+        this._notePlacementFault();
+      }
     }
     const account = lease.account;
 
@@ -5093,6 +5101,12 @@ export class AccountManager {
     const w = this._weeklyRawState(account, now);
     if (w !== 'normal' && w !== 'soft' && w !== 'unknown') return `weekly-${w}`;
     return account.status || 'other';
+  }
+
+  _notePlacementFault() {
+    if (this.placementFaultLogged) return;
+    this.placementFaultLogged = true;
+    console.log('[MaxPool] A placement comparison could not be recorded. Further comparison errors are suppressed for this worker.');
   }
 
   placementComparison() {

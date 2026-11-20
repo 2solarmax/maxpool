@@ -3997,14 +3997,14 @@ export class TUI {
         lines.push('   Weekly ' + number(m.weeklyDenied) + '   Session ' + number(m.sessionDenied)
           + '   Concurrency ' + number(m.concurrencyDenied) + '   Other ' + number(m.unclassifiedDenied));
       }
-      lines.push(dim(' Bucket range  ' + date(m.from) + ' to ' + date(m.to) + ' UTC'));
-      lines.push(dim(' Hour buckets · ' + (m.completeCoverage ? 'continuous coverage' : 'partial coverage') + ' · since ' + date(m.coverageSince) + ' UTC'));
+      lines.push(dim(' Observed hours  ' + date(m.from) + ' to ' + date(m.to) + ' UTC'));
+      lines.push(dim(' History · ' + (m.completeCoverage ? 'continuous coverage' : 'partial coverage') + ' · since ' + date(m.coverageSince) + ' UTC'));
       if (report.placement) {
         const p = report.placement;
         lines.push(' New-chat comparison since boot  ' + number(p.disagreed) + ' differed / ' + number(p.comparable) + ' comparable');
       }
       if (Array.isArray(m.accounts) && m.accounts.length) {
-        lines.push('', bold(' Finalized requests by account'));
+        lines.push('', bold(' Finalized requests by account'), dim(' Includes forwarded requests handled here.'));
         for (const a of m.accounts) {
           lines.push(' ' + safe(a.name) + '  ' + number(a.timelyCompleted) + '/' + number(a.requests)
             + ' timely  ·  p95 ≤' + time(a.waitP95Ms) + '  ·  peak ' + number(a.peakServing));
@@ -4014,17 +4014,19 @@ export class TUI {
       lines.push('', bold(' Unused quota at reset · by account'));
       const meaning = { 'eligible-demand-served-elsewhere': 'eligible work served elsewhere', 'no-observed-demand': 'no work observed here',
         'fully-used': 'fully used', 'unattributed': 'cause undetermined', 'unknown': 'insufficient evidence' };
+      const missing = { 'stale-reading': 'last reading too old', 'replaced-before-reset': 'window changed early',
+        'conflicting-reset': 'conflicting reset times', 'disabled': 'account disabled', 'refill': 'quota refilled' };
       for (const row of Array.isArray(report.quotas) ? report.quotas : []) {
         lines.push(' ' + safe(row.name) + '  ·  ' + (row.window === 'ses' ? '5h only' : row.window === 'wk' ? 'weekly' : 'window unknown'));
         const cycles = Array.isArray(row.cycles) ? row.cycles : [];
         if (!cycles.length) lines.push(dim('   Awaiting a measured reset.'));
         for (const c of cycles) {
-          const detail = c.unusedFraction == null ? safe(c.reason) : (meaning[c.attribution] || 'cause undetermined');
+          const detail = c.unusedFraction == null ? (missing[c.reason] || 'insufficient evidence') : (meaning[c.attribution] || 'cause undetermined');
           lines.push('   ' + date(c.resetAt) + ' UTC  ' + share(c.unusedFraction) + '  ' + detail
             + (c.alternativeTurns > 0 ? ' (' + number(c.alternativeTurns) + ')' : ''));
         }
       }
-      lines.push(dim(' Unused = 100% less peak usage, with a fresh reading at natural reset.'));
+      lines.push(dim(' Unused is estimated from peak usage and a fresh reading before reset.'));
       if (Array.isArray(report.daily) && report.daily.length) {
         lines.push('', bold(' Timely completions by UTC day'));
         for (const d of report.daily) {

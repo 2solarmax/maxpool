@@ -117,6 +117,31 @@ test('first-placement shadow measures feasible, same-model alternatives and neve
   assert.equal(unknown.placementComparison().comparable, 0);
 });
 
+for (const phase of ['acquire', 'release']) {
+  test(`a throwing capacity ledger during ${phase} preserves the selected route and frees its slot`, () => {
+    const am = manager();
+    const now = Date.now();
+    for (const a of am.accounts) am.applyCodexUsageData(a.index, {
+      sevenDay: { utilization: 0.2, resetAt: now + 24 * hour },
+    }, { sentAt: now });
+    let faults = 0;
+    const fail = () => { faults++; throw new Error('fixture ledger failure'); };
+    am.capacityTank = phase === 'acquire' ? fail
+      : index => ({ source: 'cycles', exact: 2, bounded: 0, recent: index ? 2000 : 1000 });
+    if (phase === 'release') am.routingCapacity.noteAlternative = fail;
+
+    const lease = am.acquireAccount({ ...request('new'), weight: 3 });
+    assert.equal(lease.account.index, 0);
+    assert.equal(lease.account.inFlight, 1);
+    assert.equal(lease.account.activeWeight, 3);
+    am.releaseAccount(lease, { success: true, status: 200 });
+    assert.equal(faults, 1);
+    assert.equal(lease.account.inFlight, 0);
+    assert.equal(lease.account.activeWeight, 0);
+    assert.equal(lease.account.completedRequests, 1);
+  });
+}
+
 test('a compacted Messages conversation with a new prefix keeps its original first-placement count', () => {
   const am = manager();
   const makeTurn = affinityKey => ({ ...request('unused'), sessionKey: '', caller: 'test-client',
