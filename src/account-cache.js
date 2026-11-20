@@ -57,10 +57,31 @@ export function cacheHistoryFromHours(hours, now) {
   return history;
 }
 
+// v1.24.116 could import a named legacy hour into two owner histories. The
+// original buckets contain no alias or request IDs, so preserve observed counts
+// and mark potentially affected totals as estimates instead of deleting usage.
+export function markLegacyOverlap(histories) {
+  const seen = new Map();
+  for (const history of histories.values()) {
+    const promoted = history.assignedOwner && histories.get(history.assignedOwner);
+    for (const [minute, counts] of Object.entries(history.legacyHours)) {
+      const signature = minute + ':' + counts.join(',');
+      const prior = seen.get(signature);
+      seen.set(signature, history);
+      const matches = [prior, promoted?.legacyHours?.[minute] && promoted].filter(Boolean);
+      if (matches.length) {
+        const end = (Number(minute) + 60) * MINUTE;
+        for (const entry of [history, ...matches]) entry.uncertainUntil = Math.max(entry.uncertainUntil || 0, end);
+      }
+    }
+  }
+}
+
 export function restoreCacheHistory(raw, now) {
   if (!raw || !Number.isFinite(raw.since) || !valid(raw.total)) return null;
   const history = emptyCacheHistory(raw.since, validCacheSource(raw.source) ? raw.source : undefined);
   if (typeof raw.assignedOwner === 'string') history.assignedOwner = raw.assignedOwner;
+  if (Number.isFinite(raw.uncertainUntil)) history.uncertainUntil = raw.uncertainUntil;
   history.total = [...raw.total];
   for (const key of ['minutes', 'legacyHours']) {
     for (const [minute, counts] of Object.entries(raw[key] || {})) {
@@ -87,7 +108,7 @@ export function cacheWindows(history, now) {
       if (key === 'all') continue;
       const first = minute - span + 1;
       finished[key] = zero();
-      partial[key] = history.since > first * MINUTE;
+      partial[key] = history.since > first * MINUTE || history.uncertainUntil > first * MINUTE;
       for (const [k, counts] of Object.entries(history.minutes)) {
         if (+k >= first && +k < minute) add(finished[key], counts);
       }
@@ -105,7 +126,7 @@ export function cacheWindows(history, now) {
     if (history.minutes[minute]) add(values, history.minutes[minute]);
     windows[key] = describe(values, base.partial[key]);
   }
-  windows.all = describe(history.total, false);
+  windows.all = describe(history.total, Boolean(history.uncertainUntil));
   return { source: history.source, since: history.since, asOf: now, windows };
 }
 

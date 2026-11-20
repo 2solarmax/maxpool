@@ -6353,9 +6353,13 @@ export class AccountManager {
       if (!owners.has(key)) owners.set(key, []);
       owners.get(key).push(account.name);
     }
+    // Display names can be reassigned. Only the initial migration can use
+    // name-based legacy hours. New owner keys start with their own observations.
+    const legacy = this.capacity.legacyCacheImportComplete ? null : saved;
     for (const [key, aliases] of owners) {
-      this.capacity.restoreOwnerCache(key, aliases.filter(name => names.get(name) === 1), saved, now);
+      this.capacity.restoreOwnerCache(key, aliases.filter(name => names.get(name) === 1), legacy, now);
     }
+    this.capacity.legacyCacheImportComplete = true;
   }
 
   /** The vendor's CURRENT fullness reading for a window — the tank numerator's

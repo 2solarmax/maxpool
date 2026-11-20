@@ -314,3 +314,46 @@ test('linked providers include owner-only unassigned usage exactly once, even ac
   assert.equal(removedEdge.accounts.length, 0);
   assert.equal(removedEdge.providerCacheWindows().claude.windows.all.hit, 0.1, 'removed rows still contribute observed provider traffic');
 });
+
+test('legacy hour import runs once per worker across reauthentication, provider changes and repeat restores', () => {
+  const legacy = { demo: { '2026-11-20T09': { in: 90, cr: 10, cc: 0, out: 2 } } };
+  const start = new AccountManager([account('demo')]);
+  start.restoreAccountCacheHours(legacy, now);
+  const checkpoint = start.capacity.serialize();
+  for (const updated of [{ ...account('demo'), organizationUuid: 'known' }, account('demo', 'codex')]) {
+    const worker = new AccountManager([updated]);
+    worker.restoreCapacityState(checkpoint);
+    worker.restoreAccountCacheHours(legacy, now);
+    const provider = updated.provider === 'codex' ? 'codex' : 'claude';
+    const previous = worker.providerCacheWindows(now).claude.windows.all;
+    assert.deepEqual([previous.input, previous.cacheRead, previous.output], [90, 10, 2]);
+    const accountUsage = worker.accountCacheWindows(worker.accounts[0], now).windows.all;
+    assert.equal(accountUsage.input, provider === 'claude' ? 90 : 0);
+    worker.accrueCapacity(0, { input: 7 }, now);
+    const restarted = new AccountManager([updated]);
+    restarted.restoreCapacityState(worker.capacity.serialize());
+    restarted.restoreAccountCacheHours(legacy, now);
+    assert.equal(restarted.providerCacheWindows(now)[provider].windows.all.input, provider === 'claude' ? 97 : 7);
+  }
+});
+
+test('v1.24.116 checkpoints keep ambiguous matching hours, mark them uncertain, and never import them again', () => {
+  const histories = () => ({ since: now - 10 * 86400000, total: [90, 10, 0, 2], minutes: {},
+    legacyHours: { [Math.floor((now - 5 * hour) / hour) * 60]: [90, 10, 0, 2] } });
+  const rows = [account('a'), account('b')];
+  const start = new AccountManager(rows);
+  for (const row of start.accounts) start.accrueCapacity(row.index, { input: 1 }, now);
+  const saved = start.capacity.serialize();
+  delete saved.legacyCacheImportComplete;
+  for (const key of Object.keys(saved.ownerCache)) saved.ownerCache[key] = histories();
+  const worker = new AccountManager(rows);
+  worker.restoreCapacityState(saved);
+  const windows = worker.providerCacheWindows(now).claude.windows;
+  assert.equal(windows.all.input, 180, 'old totals are preserved');
+  assert.equal(windows.all.partial, true);
+  assert.equal(windows['24h'].partial, true);
+  assert.equal(windows['1h'].partial, false);
+  const next = new AccountManager(rows);
+  next.restoreCapacityState(worker.capacity.serialize());
+  assert.equal(next.providerCacheWindows(now).claude.windows.all.partial, true);
+});

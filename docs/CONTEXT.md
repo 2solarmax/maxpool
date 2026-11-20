@@ -24,6 +24,10 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-20 · Import historical cache data once per worker
+
+The first migration imports the old name-based hours into the accounts known at the time. Later identity and provider changes use owner-keyed observations. When two saved 1.24.116 histories contain a matching legacy bucket, the affected windows display a coverage warning. The original counters are preserved.
+
 ### 2026-11-20 · Account analytics and private subscription terms
 
 Cache percentages divide cache-read tokens by all input tokens, including cache writes. Accounts shows the last three hours. Activity analytics provides one hour, one day, one week and all measured history. Each worker counts the requests it served locally. A linked viewer uses the serving worker’s summaries. Codex reports cached tokens as part of input and the two request adapters normalize that once.
