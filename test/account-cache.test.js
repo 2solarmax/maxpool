@@ -357,3 +357,23 @@ test('v1.24.116 checkpoints keep ambiguous matching hours, mark them uncertain, 
   next.restoreCapacityState(worker.capacity.serialize());
   assert.equal(next.providerCacheWindows(now).claude.windows.all.partial, true);
 });
+
+test('partially overlapping 1.24.116 imports from reused aliases stay visibly uncertain', () => {
+  const worker = new AccountManager([account('demo1'), account('demo2')]);
+  for (const a of worker.accounts) worker.accrueCapacity(a.index, { input: 1 }, now);
+  const disk = worker.capacity.serialize();
+  delete disk.legacyCacheImportComplete;
+  const hourKey = Math.floor(now / hour) * 60;
+  const old = Object.values(disk.ownerCache);
+  for (const [i, n] of [90, 30].entries()) {
+    old[i].since = now - 3 * hour;
+    old[i].legacyHours = { [hourKey]: [n, 0, 0, 0] };
+    old[i].minutes = {};
+    old[i].total = [n, 0, 0, 0];
+  }
+  worker.restoreCapacityState(disk);
+  const view = worker.providerCacheWindows(now).claude.windows;
+  assert.equal(view.all.input, 120);
+  assert.equal(view.all.partial, true);
+  assert.equal(view['1h'].partial, true);
+});

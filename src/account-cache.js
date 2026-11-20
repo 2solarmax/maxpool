@@ -57,27 +57,7 @@ export function cacheHistoryFromHours(hours, now) {
   return history;
 }
 
-// v1.24.116 could import a named legacy hour into two owner histories. The
-// original buckets contain no alias or request IDs, so preserve observed counts
-// and mark potentially affected totals as estimates instead of deleting usage.
-export function markLegacyOverlap(histories) {
-  const seen = new Map();
-  for (const history of histories.values()) {
-    const promoted = history.assignedOwner && histories.get(history.assignedOwner);
-    for (const [minute, counts] of Object.entries(history.legacyHours)) {
-      const signature = minute + ':' + counts.join(',');
-      const prior = seen.get(signature);
-      seen.set(signature, history);
-      const matches = [prior, promoted?.legacyHours?.[minute] && promoted].filter(Boolean);
-      if (matches.length) {
-        const end = (Number(minute) + 60) * MINUTE;
-        for (const entry of [history, ...matches]) entry.uncertainUntil = Math.max(entry.uncertainUntil || 0, end);
-      }
-    }
-  }
-}
-
-export function restoreCacheHistory(raw, now) {
+export function restoreCacheHistory(raw, now, { unverifiedLegacy = false } = {}) {
   if (!raw || !Number.isFinite(raw.since) || !valid(raw.total)) return null;
   const history = emptyCacheHistory(raw.since, validCacheSource(raw.source) ? raw.source : undefined);
   if (typeof raw.assignedOwner === 'string') history.assignedOwner = raw.assignedOwner;
@@ -86,6 +66,18 @@ export function restoreCacheHistory(raw, now) {
   for (const key of ['minutes', 'legacyHours']) {
     for (const [minute, counts] of Object.entries(raw[key] || {})) {
       if (/^\d+$/.test(minute) && valid(counts)) history[key][minute] = [...counts];
+    }
+  }
+  if (unverifiedLegacy) {
+    // 1.24.116 recorded no source aliases for its imported hours. Two imports
+    // of the same requests can even have different values (a combined alias
+    // and one component). New minute observations retain their own coverage.
+    for (const minute of Object.keys(history.legacyHours)) {
+      history.uncertainUntil = Math.max(history.uncertainUntil || 0, (Number(minute) + 60) * MINUTE);
+    }
+    // Pruning removes the hour but keeps it in the lifetime counter.
+    if (history.since < now - WEEK * MINUTE && history.total.some(Boolean)) {
+      history.uncertainUntil = Math.max(history.uncertainUntil || 0, history.since);
     }
   }
   prune(history, Math.floor(now / MINUTE));

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { addCacheUsage, cacheHistoryFromHours, cacheWindows, emptyCacheHistory, markLegacyOverlap, mergeCacheDelta, restoreCacheHistory, validCacheSource } from './account-cache.js';
+import { addCacheUsage, cacheHistoryFromHours, cacheWindows, emptyCacheHistory, mergeCacheDelta, restoreCacheHistory, validCacheSource } from './account-cache.js';
 
 /**
  * True-capacity ledger — observed tokens per completed window cycle.
@@ -344,12 +344,10 @@ export class CapacityLedger {
         // Its saved hourly totals are overlapping measurements on later boots.
         l.legacyCacheImportComplete = payload.legacyCacheImportComplete !== false;
       }
+      const unverifiedLegacy = l.legacyCacheImportComplete && payload.legacyCacheImportComplete == null;
       for (const [key, raw] of Object.entries(payload.ownerCache || {})) {
-        const history = restoreCacheHistory(raw, now());
+        const history = restoreCacheHistory(raw, now(), { unverifiedLegacy });
         if (history) l._ownerCache.set(key, history);
-      }
-      if (l.legacyCacheImportComplete && payload.legacyCacheImportComplete == null) {
-        markLegacyOverlap(l._ownerCache);
       }
       l.appliedDrains = new Set(Array.isArray(payload.appliedDrains) ? payload.appliedDrains : []);
       for (const [name, rec] of Object.entries(payload.accounts || {})) {
