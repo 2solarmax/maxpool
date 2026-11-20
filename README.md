@@ -143,7 +143,7 @@ Falls back to plain log output when not a TTY (e.g. running as a service).
 
 The account table’s **Cache 3h** column shows the percentage of measured input tokens served from cache over the past three hours. Press **v** to open Activity analytics. Select an account and press **Enter** to inspect fresh input, cache reads, cache writes and output over the last hour, 24 hours, seven days and all tracked time. Press **p** to group by provider, including Codex.
 
-The percentage uses total cache-read tokens divided by all measured input tokens. A dash means a percentage is unavailable. A measured zero means none of that input came from cache. An asterisk marks incomplete history. The detail view shows when tracking began.
+The percentage uses total cache-read tokens divided by all measured input tokens. A dash means a percentage is unavailable. A measured zero means none of that input came from cache. An asterisk marks incomplete or uncertain history. Version 1.24.116 could import a historical hour again after an account identity changed. Until these old hours leave a rolling window, its totals are estimates and can be too high. All-time totals retain that warning. The old records lack the account aliases and request IDs needed to reconstruct them. When upgrading from older versions, historical hours with an unmatched or ambiguous account name are omitted. New accounts begin with their own measured usage. The detail view shows when tracking began.
 
 #### Private subscription details
 

@@ -314,3 +314,119 @@ test('linked providers include owner-only unassigned usage exactly once, even ac
   assert.equal(removedEdge.accounts.length, 0);
   assert.equal(removedEdge.providerCacheWindows().claude.windows.all.hit, 0.1, 'removed rows still contribute observed provider traffic');
 });
+
+test('legacy hour import runs once per worker across reauthentication, provider changes and repeat restores', () => {
+  const legacy = { demo: { '2026-11-20T09': { in: 90, cr: 10, cc: 0, out: 2 } } };
+  const start = new AccountManager([account('demo')]);
+  start.restoreAccountCacheHours(legacy, now);
+  const checkpoint = start.capacity.serialize();
+  for (const updated of [{ ...account('demo'), organizationUuid: 'known' }, account('demo', 'codex')]) {
+    const worker = new AccountManager([updated]);
+    worker.restoreCapacityState(checkpoint);
+    worker.restoreAccountCacheHours(legacy, now);
+    const provider = updated.provider === 'codex' ? 'codex' : 'claude';
+    const previous = worker.providerCacheWindows(now).claude.windows.all;
+    assert.deepEqual([previous.input, previous.cacheRead, previous.output], [90, 10, 2]);
+    const accountUsage = worker.accountCacheWindows(worker.accounts[0], now).windows.all;
+    assert.equal(accountUsage.input, provider === 'claude' ? 90 : 0);
+    worker.accrueCapacity(0, { input: 7 }, now);
+    const restarted = new AccountManager([updated]);
+    restarted.restoreCapacityState(worker.capacity.serialize());
+    restarted.restoreAccountCacheHours(legacy, now);
+    assert.equal(restarted.providerCacheWindows(now)[provider].windows.all.input, provider === 'claude' ? 97 : 7);
+  }
+});
+
+test('v1.24.116 checkpoints keep ambiguous matching hours, mark them uncertain, and never import them again', () => {
+  const histories = () => ({ since: now - 10 * 86400000, total: [90, 10, 0, 2], minutes: {},
+    legacyHours: { [Math.floor((now - 5 * hour) / hour) * 60]: [90, 10, 0, 2] } });
+  const rows = [account('a'), account('b')];
+  const start = new AccountManager(rows);
+  for (const row of start.accounts) start.accrueCapacity(row.index, { input: 1 }, now);
+  const saved = start.capacity.serialize();
+  delete saved.legacyCacheImportComplete;
+  for (const key of Object.keys(saved.ownerCache)) saved.ownerCache[key] = histories();
+  const worker = new AccountManager(rows);
+  worker.restoreCapacityState(saved);
+  const windows = worker.providerCacheWindows(now).claude.windows;
+  assert.equal(windows.all.input, 180, 'old totals are preserved');
+  assert.equal(windows.all.partial, true);
+  assert.equal(windows['24h'].partial, true);
+  assert.equal(windows['1h'].partial, false);
+  const next = new AccountManager(rows);
+  next.restoreCapacityState(worker.capacity.serialize());
+  assert.equal(next.providerCacheWindows(now).claude.windows.all.partial, true);
+});
+
+test('partially overlapping 1.24.116 imports from reused aliases stay visibly uncertain', () => {
+  const worker = new AccountManager([account('demo1'), account('demo2')]);
+  for (const a of worker.accounts) worker.accrueCapacity(a.index, { input: 1 }, now);
+  const disk = worker.capacity.serialize();
+  delete disk.legacyCacheImportComplete;
+  const hourKey = Math.floor(now / hour) * 60;
+  const old = Object.values(disk.ownerCache);
+  for (const [i, n] of [90, 30].entries()) {
+    old[i].since = now - 3 * hour;
+    old[i].legacyHours = { [hourKey]: [n, 0, 0, 0] };
+    old[i].minutes = {};
+    old[i].total = [n, 0, 0, 0];
+  }
+  worker.restoreCapacityState(disk);
+  const view = worker.providerCacheWindows(now).claude.windows;
+  assert.equal(view.all.input, 120);
+  assert.equal(view.all.partial, true);
+  assert.equal(view['1h'].partial, true);
+});
+
+test('an unmatched legacy display name cannot seed an account first created after migration', () => {
+  const oldHours = { absent: { '2026-11-20T09': { in: 17, cr: 3, cc: 0, out: 1 } } };
+  const pool = new AccountManager([]);
+  pool.restoreAccountCacheHours(oldHours, now);
+  const later = new AccountManager([account('absent')]);
+  later.restoreCapacityState(pool.capacity.serialize());
+  later.restoreAccountCacheHours(oldHours, now);
+  assert.equal(later.accountCacheWindows(later.accounts[0], now).windows.all.input, 0);
+  assert.equal(later.providerCacheWindows(now).claude.windows.all.cacheRead, 0);
+});
+
+test('a current checkpoint saved before its first import preserves that pending migration', () => {
+  const oldHours = { demo: { '2026-11-20T09': { in: 27, cr: 3, cc: 0, out: 1 } } };
+  const unopened = new AccountManager([account('demo')]);
+  const disk = unopened.capacity.serialize();
+  assert.equal(disk.legacyCacheImportComplete, false);
+  const pool = new AccountManager([account('demo')]);
+  pool.restoreCapacityState(disk);
+  pool.restoreAccountCacheHours(oldHours, now);
+  const measured = pool.providerCacheWindows(now).claude.windows.all;
+  assert.equal(measured.input, 27);
+  assert.equal(measured.cacheRead, 3);
+  assert.equal(pool.capacity.serialize().legacyCacheImportComplete, true);
+});
+
+test('a clean current migration and restart preserve exact lifetime coverage', () => {
+  const oldHours = { demo: { '2026-11-20T09': { in: 21, cr: 4, cc: 1, out: 3 } } };
+  const pool = new AccountManager([account('demo')]);
+  pool.restoreAccountCacheHours(oldHours, now);
+  const again = new AccountManager([account('demo')]);
+  again.restoreCapacityState(pool.capacity.serialize());
+  again.restoreAccountCacheHours(oldHours, now);
+  const all = again.accountCacheWindows(again.accounts[0], now).windows.all;
+  assert.deepEqual([all.input, all.cacheRead, all.output, all.partial], [21, 4, 3, false]);
+});
+
+test('a legacy checkpoint with pruned old hours keeps uncertainty in lifetime only', () => {
+  const clock = Date.now();
+  const prior = new AccountManager([account('demo')]);
+  prior.accrueCapacity(0, { input: 31 }, clock - 10 * 24 * hour);
+  const disk = prior.capacity.serialize();
+  delete disk.legacyCacheImportComplete;
+  const history = Object.values(disk.ownerCache)[0];
+  history.minutes = {};
+  history.legacyHours = {};
+  const again = new AccountManager([account('demo')]);
+  again.restoreCapacityState(disk);
+  const periods = again.providerCacheWindows(clock).claude.windows;
+  assert.equal(periods.all.input, 31);
+  assert.equal(periods.all.partial, true);
+  for (const period of ['1h', '3h', '24h', '7d']) assert.equal(periods[period].partial, false);
+});

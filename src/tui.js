@@ -3943,7 +3943,7 @@ export class TUI {
           + ANALYTICS_PERIODS.map(key => cachePercent(row.metrics?.windows[key]).padStart(numericWidth)).join(''));
       }
       if (!rows.length) lines.push(dim(' No usage data available.'));
-      lines.push(dim(' All = since tracking. * = partial.'));
+      lines.push(dim(' All = since tracking. * = incomplete or estimated.'));
       if (rows.length > visible) lines.push(dim(` ${state.selected + 1} of ${rows.length}`));
       footer = ` ↑↓ Select  Enter Detail  p ${state.providers ? 'Accounts' : 'Providers'}  Esc Back`;
       if (W < footer.length) footer = ` ↑↓  Enter Detail  p ${state.providers ? 'Accounts' : 'Providers'}  Esc Back`;
@@ -3972,7 +3972,7 @@ export class TUI {
     if (Number.isFinite(row.metrics?.asOf) && Date.now() - row.metrics.asOf > 90_000) {
       out.push(dim(' Last report ' + new Date(row.metrics.asOf).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'));
     }
-    if (ANALYTICS_PERIODS.some(key => row.metrics?.windows[key]?.partial)) out.push(dim(' * Partial history in this period.'));
+    if (ANALYTICS_PERIODS.some(key => row.metrics?.windows[key]?.partial)) out.push(dim(' * Incomplete history or estimated historical totals.'));
     if (row.account) {
       let terms = subscriptionTermsFor(this.config, row.account);
       let heading = ' Subscription';

@@ -57,14 +57,27 @@ export function cacheHistoryFromHours(hours, now) {
   return history;
 }
 
-export function restoreCacheHistory(raw, now) {
+export function restoreCacheHistory(raw, now, { unverifiedLegacy = false } = {}) {
   if (!raw || !Number.isFinite(raw.since) || !valid(raw.total)) return null;
   const history = emptyCacheHistory(raw.since, validCacheSource(raw.source) ? raw.source : undefined);
   if (typeof raw.assignedOwner === 'string') history.assignedOwner = raw.assignedOwner;
+  if (Number.isFinite(raw.uncertainUntil)) history.uncertainUntil = raw.uncertainUntil;
   history.total = [...raw.total];
   for (const key of ['minutes', 'legacyHours']) {
     for (const [minute, counts] of Object.entries(raw[key] || {})) {
       if (/^\d+$/.test(minute) && valid(counts)) history[key][minute] = [...counts];
+    }
+  }
+  if (unverifiedLegacy) {
+    // 1.24.116 recorded no source aliases for its imported hours. Two imports
+    // of the same requests can even have different values (a combined alias
+    // and one component). New minute observations retain their own coverage.
+    for (const minute of Object.keys(history.legacyHours)) {
+      history.uncertainUntil = Math.max(history.uncertainUntil || 0, (Number(minute) + 60) * MINUTE);
+    }
+    // Pruning removes the hour but keeps it in the lifetime counter.
+    if (history.since < now - WEEK * MINUTE && history.total.some(Boolean)) {
+      history.uncertainUntil = Math.max(history.uncertainUntil || 0, history.since);
     }
   }
   prune(history, Math.floor(now / MINUTE));
@@ -87,7 +100,7 @@ export function cacheWindows(history, now) {
       if (key === 'all') continue;
       const first = minute - span + 1;
       finished[key] = zero();
-      partial[key] = history.since > first * MINUTE;
+      partial[key] = history.since > first * MINUTE || history.uncertainUntil > first * MINUTE;
       for (const [k, counts] of Object.entries(history.minutes)) {
         if (+k >= first && +k < minute) add(finished[key], counts);
       }
@@ -105,7 +118,7 @@ export function cacheWindows(history, now) {
     if (history.minutes[minute]) add(values, history.minutes[minute]);
     windows[key] = describe(values, base.partial[key]);
   }
-  windows.all = describe(history.total, false);
+  windows.all = describe(history.total, Boolean(history.uncertainUntil));
   return { source: history.source, since: history.since, asOf: now, windows };
 }
 

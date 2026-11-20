@@ -299,6 +299,7 @@ export class CapacityLedger {
     this.appliedDrains = new Set();
     this._ownerCache = new Map();
     this.poolCacheSource = randomUUID();
+    this.legacyCacheImportComplete = false;
     // True only for a ledger restored with no usable history — see fromSerialized.
     // Cleared per account+window once that window's first boundary is behind us.
     this._joinedMidWindow = false;
@@ -337,9 +338,15 @@ export class CapacityLedger {
       return l;
     }
     try {
-      if (validCacheSource(payload.poolCacheSource)) l.poolCacheSource = payload.poolCacheSource;
+      if (validCacheSource(payload.poolCacheSource)) {
+        l.poolCacheSource = payload.poolCacheSource;
+        // v1.24.116 wrote the source ID after switching to owner-keyed usage.
+        // Its saved hourly totals are overlapping measurements on later boots.
+        l.legacyCacheImportComplete = payload.legacyCacheImportComplete !== false;
+      }
+      const unverifiedLegacy = l.legacyCacheImportComplete && payload.legacyCacheImportComplete == null;
       for (const [key, raw] of Object.entries(payload.ownerCache || {})) {
-        const history = restoreCacheHistory(raw, now());
+        const history = restoreCacheHistory(raw, now(), { unverifiedLegacy });
         if (history) l._ownerCache.set(key, history);
       }
       l.appliedDrains = new Set(Array.isArray(payload.appliedDrains) ? payload.appliedDrains : []);
@@ -399,7 +406,7 @@ export class CapacityLedger {
       };
     }
     const ownerCache = Object.fromEntries([...this._ownerCache].map(([key, history]) => [key, structuredClone(history)]));
-    return { schemaVersion: SCHEMA_VERSION, accounts, poolCacheSource: this.poolCacheSource, ...(this._ownerCache.size ? { ownerCache } : {}), ...(this.appliedDrains.size ? { appliedDrains: [...this.appliedDrains] } : {}) };
+    return { schemaVersion: SCHEMA_VERSION, accounts, poolCacheSource: this.poolCacheSource, legacyCacheImportComplete: this.legacyCacheImportComplete, ...(this._ownerCache.size ? { ownerCache } : {}), ...(this.appliedDrains.size ? { appliedDrains: [...this.appliedDrains] } : {}) };
   }
 
   _rec(name) {
