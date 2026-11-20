@@ -8,13 +8,14 @@ const METRICS = ['arrivals', 'requests', 'completed', 'timelyCompleted', 'failed
   'active', 'serving', 'peakServing', 'activeSessions', 'peakSessions',
   'inputTokens', 'cachedInputTokens', 'coverageSince', 'completeCoverage', 'from', 'to'];
 const metrics = row => Object.fromEntries(METRICS.filter(k => Number.isFinite(row[k]) || typeof row[k] === 'boolean').map(k => [k, row[k]]));
+const dailyCounts = ({ requests, timelyCompleted, capacityDenied }) => ({ requests, timelyCompleted, capacityDenied });
 const PERIODS = { '1h': HOUR, '24h': 24 * HOUR, '7d': 168 * HOUR };
 
 export function buildRoutingReport(am, now) {
   const service = {};
   const daily = new Map();
   for (const [period, ms] of Object.entries(PERIODS)) {
-    const sample = am.routingService.snapshot(ms, now);
+    const sample = am.routingService.snapshot(ms, now, period === '7d' ? dailyCounts : null);
     // Hour buckets stay in the local store. A few fixed windows keep the regular
     // linked-worker poll small while still supporting period-to-period comparison.
     if (period === '7d') {

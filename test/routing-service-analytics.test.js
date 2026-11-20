@@ -181,3 +181,27 @@ test('reused demand summaries keep exact uptime bounds and separate partial, dis
   assert.equal(demand(from - 8 * HOUR, from - 4 * HOUR).arrivals, 0);
   assert.equal(demand(now, now).arrivals, 0);
 });
+
+test('demand coverage begins at the first full retained hour and advances when that hour expires', () => {
+  const retention = 35 * 24 * HOUR;
+  let now = 50 * 24 * HOUR + HOUR / 2;
+  const first = Math.floor(now / HOUR) * HOUR - retention + HOUR;
+  const ledger = new RoutingServiceAnalytics(() => now);
+  const bucket = (hour, arrivals) => ({ hour, total: { arrivals, peakOutstanding: arrivals }, accounts: [] });
+  ledger.restoreState({ version: 1, coverage: [[now - retention, now]],
+    hours: [bucket(first - HOUR, 90), bucket(first, 3), bucket(first + HOUR, 2)] });
+
+  const before = ledger.demandReader();
+  assert.equal(before(first - 1, first + HOUR).completeCoverage, false);
+  assert.equal(before(first, first + HOUR).completeCoverage, true);
+  assert.equal(before(first - HOUR, first).arrivals, 0);
+  assert.equal(before(first, first + HOUR).peakOutstanding, 3);
+
+  now += HOUR;
+  const after = ledger.demandReader();
+  const crossing = after(first, first + 2 * HOUR);
+  assert.equal(crossing.completeCoverage, false);
+  assert.equal(crossing.arrivals, 2);
+  assert.equal(crossing.peakOutstanding, 2);
+  assert.equal(after(first + HOUR, first + 2 * HOUR).completeCoverage, true);
+});
