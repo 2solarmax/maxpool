@@ -130,3 +130,40 @@ test('after an update-driven reload, a plain restart is not treated as an update
     assert.doesNotMatch(after, /Update NOT applied/);
   } finally { await p.stop(); }
 });
+
+test('an old worker exiting after release and before the new primary acknowledgement keeps supervision', { timeout: 30_000 }, async () => {
+  // Delay just the successor's PRIMARY acknowledgement. Its predecessor can
+  // now finish its normal drain and exit while the supervisor awaits takeover.
+  const dir = await mkdtemp(join(tmpdir(), 'maxpool-delay-primary-'));
+  const preload = join(dir, 'delay-primary.cjs');
+  const allowPrimary = join(dir, 'allow-primary');
+  await writeFile(preload, `
+    if (process.env.MAXPOOL_RELOAD_WORKER === '1') {
+      const send = process.send.bind(process);
+      process.send = (message, ...rest) => {
+        if (message?.type !== 'primary') return send(message, ...rest);
+        const check = setInterval(() => {
+          if (!require('node:fs').existsSync(${JSON.stringify(allowPrimary)})) return;
+          clearInterval(check);
+          send(message, ...rest);
+        }, 10);
+        return true;
+      };
+    }
+  `);
+  const p = await boot({ NODE_OPTIONS: '--require=' + JSON.stringify(preload),
+    MAXPOOL_TEST_RESTART_SIGNAL: '1', MAXPOOL_TEST_SIGNAL_COLD_RESTART: '1' });
+  try {
+    process.kill(p.worker, 'SIGHUP');
+    assert.ok(await until(() => !childPids(p.child.pid).includes(p.worker), 10_000), 'outgoing worker completed its drain');
+    await writeFile(allowPrimary, '');
+    assert.ok(await until(() => /cutover complete/.test(p.out()), 10_000), 'successor completed takeover');
+    const next = (await proxyRequest(p.port)).worker;
+    assert.ok(next && next !== p.worker);
+    process.kill(next, 'SIGUSR2');
+    assert.ok(await until(async () => {
+      const r = await proxyRequest(p.port);
+      return r.status === 200 && r.worker && r.worker !== next;
+    }, 5000), 'the supervisor respawned the successor after its explicit exit 75');
+  } finally { await p.stop(); }
+});

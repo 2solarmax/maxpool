@@ -416,12 +416,12 @@ async function supervisorCommand() {
     worker.child.once('exit', (code, signal) => {
       // Only the worker that is STILL active when it exits ends the turn. A
       // reaped old worker (already swapped out) exiting must be ignored here.
-      if (activeWorker === worker) endTurn?.({ code, signal });
+      if (activeWorker === worker && !worker.releasedForTakeover) endTurn?.({ code, signal });
     });
     // A spawn-time failure (EMFILE/EAGAIN under load) surfaces as 'error', not
     // 'exit' — treat it as a crashed turn so backoff handles it (M5).
     worker.child.once('error', err => {
-      if (activeWorker === worker) endTurn?.({ code: 1, signal: null, spawnError: err.message });
+      if (activeWorker === worker && !worker.releasedForTakeover) endTurn?.({ code: 1, signal: null, spawnError: err.message });
     });
   };
 
@@ -461,7 +461,15 @@ async function supervisorCommand() {
         // new worker. The new worker's MSG_PRIMARY then closes it again.
         // The old worker has released, so gap-accepted connections now belong to the
         // incoming worker (before this point the still-serving old one is the target).
-        prepareHandle: async () => { acceptTarget = newWorker; await relistenMaster(); return masterHandle(); },
+        prepareHandle: async () => {
+          // RELEASED is acknowledged before this callback. The old worker can
+          // finish its drain before PRIMARY arrives. The baton now owns recovery
+          // if takeover fails; that outgoing exit cannot end supervision.
+          oldWorker.releasedForTakeover = true;
+          acceptTarget = newWorker;
+          await relistenMaster();
+          return masterHandle();
+        },
         // Generous, env-tunable readiness/takeover budgets — the 10s default rolled back
         // on this user's loaded Mac (the update never landed). See RELOAD_READY_MS.
         readyTimeoutMs: RELOAD_READY_MS,
@@ -598,7 +606,8 @@ function reapOldWorker(worker, onExited = () => {}) {
     finish();
   }, cap);
   timer.unref?.();
-  worker.child.once('exit', finish);
+  if (worker.child.exitCode !== null || worker.child.signalCode !== null) finish();
+  else worker.child.once('exit', finish);
 }
 
 // Test seam (gated: inert unless a MAXPOOL_TEST_* variable is set). '1' fires every
