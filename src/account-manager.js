@@ -7456,15 +7456,16 @@ export class AccountManager {
   }
 
   /** C6: record a claim FAILURE — backoff per (account, grantId) 15m/30m/1h, cap 6h.
-   *  Shared state with the prober path (same maps). Returns the wait ms. */
-  noteClaimFailure(accountName, grantId, now = Date.now()) {
+   *  A later provider Retry-After takes precedence. Both claim paths share the deadline. */
+  noteClaimFailure(accountName, grantId, now = Date.now(), retryAt = 0) {
     const key = `${accountName}:${grantId}`;
     if (!this._claimTries) this._claimTries = new Map();
     if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
     const tries = (this._claimTries.get(key) || 0) + 1;
     this._claimTries.set(key, tries);
     const steps = CLAIM_BACKOFF_STEPS_MS;
-    const waitMs = Math.min(CLAIM_BACKOFF_CAP_MS, steps[Math.min(tries - 1, steps.length - 1)]);
+    const policyWait = Math.min(CLAIM_BACKOFF_CAP_MS, steps[Math.min(tries - 1, steps.length - 1)]);
+    const waitMs = Math.max(policyWait, (retryAt || 0) - now);
     this._claimRetryUntil.set(key, now + waitMs);
     return { tries, waitMs };
   }
@@ -7556,7 +7557,7 @@ export class AccountManager {
         console.log(`[reset-grant] ${account.name}: grant ${grant.id} claimed reactively (${kind === 'weekly' ? 'weekly 429 at the wall' : `${kind} scoped 429`})`);
         return true;
       }
-      const { tries, waitMs } = this.noteClaimFailure(account.name, grant.id, now);
+      const { tries, waitMs } = this.noteClaimFailure(account.name, grant.id, now, r?.retryAt);
       console.log(`[reset-grant] ${account.name}: reactive claim FAILED ${grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       this.endCapLift(account.index, 'reactive claim failed');
       return true;   // attempted

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { Prober, GRANTS_EVERY_MS } from '../src/prober.js';
+import { Prober, GRANTS_EVERY_MS, SUB_RECHECK_MS } from '../src/prober.js';
 import { fetchUsage } from '../src/oauth.js';
 import { listResetGrants } from '../src/claude-reset-grants.js';
 import { TUI, __tuiTest } from '../src/tui.js';
@@ -204,6 +204,27 @@ test('Accounts Check quota advances only the selected owning row, never bypasses
   assert.match(prober.requestUsageRecheck(am.accounts[0]), /requested a wait/);
   assert.equal(am.accounts[0].quota.probeRecheckRequested, false);
   assert.match(prober.requestUsageRecheck(am.accounts[1]), /owning pool/);
+});
+
+test('Check quota reports a latched subscription’s scheduled recheck, including a restored latch without a timestamp', async t => {
+  const { am, calls, prober, advance } = harness(t, { usage: () => ({ fiveHour: { utilization: 0.2 } }) });
+  const row = am.accounts[0];
+  row.subscriptionGone = true;
+  const started = Date.now();
+  const check = () => prober.requestUsageRecheck(row);
+  assert.match(check(), /Subscription unavailable.*scheduled quota recheck/);
+  assert.ok(!row.quota.probeRecheckRequested);
+  assert.equal(row._subRecheckAt, started);
+  advance(SUB_RECHECK_MS - 1);
+  await prober.probeAll();
+  assert.match(check(), /scheduled quota recheck/);
+  assert.equal(row.quota.probeNextCheckAt, started + SUB_RECHECK_MS);
+  assert.ok(!calls.includes('full'));
+  advance(1);
+  assert.match(check(), /queued/);
+  await prober.probeAll();
+  assert.equal(calls.filter(name => name === 'full').length, 1);
+  assert.equal(row.quota.probeRecheckRequested, false);
 });
 
 test('a fresh grant cooldown wakes an empty-listing account at its recorded deadline', async t => {

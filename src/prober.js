@@ -150,6 +150,11 @@ export class Prober {
           const due = this._usageDeferredUntil(account);
           if (due > this._now()) {
             q.probeNextCheckAt = due;
+            // The usage endpoint is waiting. The independent claim endpoint can
+            // still rescue an existing hold if other accounts have lost room.
+            if (q.probeRetryAt > this._now() && !account.subscriptionGone) {
+              try { await this._rescueHeldWall(account); } catch { /* keep other accounts checking */ }
+            }
             continue; // no pacing slot, token refresh or grant listing for a deferred row
           }
           await this._paceUsage();
@@ -224,9 +229,19 @@ export class Prober {
     const q = account.quota;
     if (q.probeRetryAt > this._now()) return 'Provider requested a wait before the next quota check';
     if (q.probeChecking) return 'Quota check already in progress';
+    if (this._subscriptionRecheckAt(account) > this._now()) {
+      return 'Subscription unavailable. Waiting for the scheduled quota recheck';
+    }
     q.probeRecheckRequested = true;
     q.probeNextCheckAt = null;
     return 'Quota check queued for the next sweep';
+  }
+
+  _subscriptionRecheckAt(account) {
+    if (!account.subscriptionGone) return 0;
+    // Restored/legacy latches may have no timestamp. Start their window once.
+    account._subRecheckAt ||= this._now();
+    return account._subRecheckAt + SUB_RECHECK_MS;
   }
 
   _usageDeferredUntil(account) {
@@ -234,6 +249,10 @@ export class Prober {
     const q = account.quota || {};
     // The provider's 429 deadline also applies to a one-shot/manual sweep.
     const retryAt = q.probeRetryAt > now ? q.probeRetryAt : 0;
+    if (account.subscriptionGone) {
+      const due = this._subscriptionRecheckAt(account);
+      return Math.max(retryAt, due > now ? due : 0);
+    }
     // A free reset can be used externally without moving the natural reset day.
     // Unknown/available grants stay on the grant-list cadence. An explicitly
     // empty listing can wait longer; the natural refill bounds either delay.
@@ -495,7 +514,7 @@ export class Prober {
         this.log(`[reset-grant] ${account.name}: grant ${act.grant.id} claimed${r.alreadyUsed ? ' (already used — idempotent)' : ''}`);
         return true;
       }
-      const { tries, waitMs } = this.am.noteClaimFailure?.(account.name, act.grant.id, now)
+      const { tries, waitMs } = this.am.noteClaimFailure?.(account.name, act.grant.id, now, r?.retryAt)
         || { tries: 1, waitMs: CLAIM_BACKOFF_STEPS_MS[0] };
       this.log(`[reset-grant] ${account.name}: claim FAILED ${act.grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       // A failed claim ENDS any cap lift (C3: "ends at once on a claim (success or failure)").
@@ -527,12 +546,8 @@ export class Prober {
     // subscription until manual re-auth. Recheck it at a low cadence: a 200 clears the
     // latch (applyUsageData), another org-403 keeps it benched.
     if (account.subscriptionGone) {
-      // A latch set outside recordProbeError (state restore, tests, older builds) has no
-      // stamp: treat NOW as the latch moment so the first recheck waits a full window.
-      if (!account._subRecheckAt) account._subRecheckAt = Date.now();
-      const since = Date.now() - account._subRecheckAt;
-      if (since < SUB_RECHECK_MS) return { ok: false, status: 403 };
-      account._subRecheckAt = Date.now();
+      if (this._subscriptionRecheckAt(account) > this._now()) return { ok: false, status: 403 };
+      account._subRecheckAt = this._now();
       account._subRecheck = true;
     }
     try {
@@ -688,7 +703,7 @@ export class Prober {
    *  grant) makes wallClaimHeld itself release. Never claims a wall nobody held.
    *  General weekly wall only (red-team r3): no model wall is ever held. */
   async _rescueHeldWall(account) {
-    if (!this.am.isHoldingWall?.(account)) return;   // never a wall nobody held
+    if (this._stopping || this.am.writerLease === false || !this.am.isHoldingWall?.(account)) return;   // never a wall nobody held
     // A listing-side cooldown is a server instruction the reactive route doesn't read.
     const cd = account.resetGrants?.cooldownUntil;
     if (cd != null && cd > Date.now()) return;
