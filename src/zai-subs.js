@@ -21,6 +21,10 @@ export async function listSubscriptions(token, { signal, fetchImpl = fetch } = {
       product: s.productName || null,
       billingCycle: s.billingCycle || null,
       price: Number(s.renewPrice ?? s.actualPrice ?? 0) || null,
+      actualPrice: s.actualPrice ?? null,
+      renewPrice: s.renewPrice ?? null,
+      nextRenewal: typeof s.nextRenewTime === 'string' ? s.nextRenewTime : null,
+      currency: typeof s.currency === 'string' ? s.currency : null,
       autoRenew: Number(s.autoRenew ?? 0) === 1,
       status: s.status || null,
     })) };

@@ -473,12 +473,12 @@ test('the column header sits exactly over the Account/Provider/Status/Quota colu
   const hdr = strip(__tuiTest.acctHeader(100));
   const row = strip(tui._renderAcct(0, 11, true));
   assert.equal(hdr.indexOf('Account'), 4, 'Account over the name column');
-  assert.equal(hdr.indexOf('Where'), 25, 'Where (Local/Cloud) right after the 20-wide Account col');
+  assert.equal(hdr.indexOf('Where'), 34, 'Where after Account and Cache 3h');
   assert.equal(hdr.indexOf('Where'), row.indexOf('Local'), 'Where header over the Local/Cloud cell');
-  assert.equal(hdr.indexOf('Provider'), 31, 'Provider over the provider column (after Where)');
-  assert.equal(hdr.indexOf('Status'), 41, 'Status over the status column');
-  assert.equal(hdr.indexOf('MRst'), 55, 'MRst (model resets) right after the 13-wide Status col');
-  assert.equal(hdr.indexOf('ARst'), 67, 'ARst (account resets) right after the 11-wide MRst col');
+  assert.equal(hdr.indexOf('Provider'), 40, 'Provider over the provider column (after Where)');
+  assert.equal(hdr.indexOf('Status'), 50, 'Status over the status column');
+  assert.equal(hdr.indexOf('MRst'), 64, 'MRst (model resets) right after the 13-wide Status col');
+  assert.equal(hdr.indexOf('ARst'), 76, 'ARst (account resets) right after the 11-wide MRst col');
   // Both reset cells sit exactly under their headers: the model cell is '-' (none),
   // the account cell is '0'.
   assert.equal(row.slice(hdr.indexOf('MRst'), hdr.indexOf('MRst') + 1), '-', 'MRst cell under its header');

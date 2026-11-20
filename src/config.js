@@ -258,6 +258,45 @@ async function atomicWrite(path, content) {
   }
 }
 
+// A draining worker may finish after the new worker has written several times.
+// Hand its increments to the single active writer in an atomic private file.
+// The applied id is committed with the counters before the file is removed.
+export async function writeCapacityDrain(delta, statePath = getStatePath()) {
+  if (!Object.keys(delta.accounts).length && !Object.keys(delta.owners).length) return;
+  const id = randomBytes(12).toString('hex');
+  await atomicWrite(join(statePath + '.drains', id), JSON.stringify(delta));
+}
+
+export async function readCapacityDrains(ledger, statePath = getStatePath()) {
+  const dir = statePath + '.drains';
+  let files;
+  try { files = await readdir(dir); }
+  catch (e) {
+    if (e.code !== 'ENOENT') {
+      console.error('[Maxpool] Could not read released worker capacity directory:', e.message);
+      return [];
+    }
+    files = [];
+  }
+  const ids = files.filter(name => /^[a-f0-9]{24}$/.test(name));
+  // A crash after deletion may leave an already-consumed id in the state.
+  for (const id of ledger.appliedDrains) if (!ids.includes(id)) ledger.appliedDrains.delete(id);
+  for (const id of ids) {
+    if (ledger.appliedDrains.has(id)) continue;
+    try { ledger.applyDrain(JSON.parse(await readFile(join(dir, id), 'utf8')), id); }
+    catch (e) { console.error('[Maxpool] Could not read released worker capacity:', e.message); }
+  }
+  return ids.filter(id => ledger.appliedDrains.has(id));
+}
+
+export async function acknowledgeCapacityDrains(ledger, ids, statePath = getStatePath()) {
+  for (const id of ids) {
+    try { await unlink(join(statePath + '.drains', id)); }
+    catch (e) { if (e.code !== 'ENOENT') throw e; }
+    ledger.appliedDrains.delete(id);
+  }
+}
+
 export async function saveConfig(config, path = getConfigPath()) {
   await atomicWrite(path, JSON.stringify(config, null, 2) + '\n');
 }
@@ -327,23 +366,6 @@ async function guardCapacitySchema(path, nextState) {
 }
 
 let _stateWriteChain = Promise.resolve();
-
-/**
- * Amended state write at an UNCHANGED generation (drain-exit capacity merge-flush).
- * saveState always bumps `_generation`; a released worker amending the file the NEW
- * lease-holder owns must NOT bump it, or the holder's `stateGeneration` is stale from
- * that instant and every guarded periodic write is refused for its entire tenure.
- * Serialized onto the same write chain; NEVER used for ordinary state updates.
- */
-export function saveStateUnbumped(state, generation) {
-  const run = async () => {
-    await guardCapacitySchema(getStatePath(), state);
-    await atomicWrite(getStatePath(), JSON.stringify({ ...state, _generation: generation }, null, 2) + '\n');
-  };
-  const result = _stateWriteChain.then(run, run);
-  _stateWriteChain = result.then(() => {}, () => {});
-  return result;
-}
 
 export function saveState(state, { expectedGeneration = null } = {}) {
   // Serialize state writes (a 60s interval flush can otherwise race the final
