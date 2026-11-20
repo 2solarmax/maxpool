@@ -6225,7 +6225,7 @@ export class AccountManager {
       const withPlan = [primary, ...group].find(x => x && !x.remote && x.plan) || null;
       rows.push({
         index: primary.index, group: group.map(x => x.index), unresolved: !id,
-        displayName: localRow?.name || primary.remote?.remoteName || primary.name,
+        displayName: (localRow || primary).name.replace(/ ☁$/, ''),
         where: this.capacityWhere(primary),
         priceAccount: withPrice,
         plan: withPlan ? sanitizePlan(withPlan.plan) : (localRow && isClaudeOAuthAccount(localRow) ? DEFAULT_CLAUDE_PLAN : null),
