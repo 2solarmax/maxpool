@@ -18,6 +18,8 @@ import { stat } from 'node:fs/promises';
 import { unlinkSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { RoutingServiceAnalytics } from './routing-service-analytics.js';
+import { RoutingCapacityAnalytics } from './routing-capacity-analytics.js';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, getStatePath, getLogPath, readGeneration, flushConfigWrites, flushStateWrites, writeCapacityDrain, readCapacityDrains, acknowledgeCapacityDrains } from './config.js';
 import { setEventLogPath, installConsoleMirror, setConsoleStdoutSuppressed, setConsoleNonBlocking, reassertConsoleNonBlocking, appendEventLog, printFatal } from './event-log.js';
 import { codexPoolEndpoint, sendLoginToPool, planCliLogin, resolveUsablePools } from './cloud-login.js';
@@ -665,6 +667,7 @@ async function serverWorkerCommand() {
 
   const threshold = config.switchThreshold || 0.90;
   const accountManager = new AccountManager(accounts, threshold, config.scheduler || {});
+  accountManager.routingService.setServing(false);
   // The EXECUTING build: a disk read taken NOW, before any self-install can rewrite
   // package.json. Fire-and-forget — the status endpoint reports null until it lands
   // (milliseconds), never a wrong number.
@@ -698,6 +701,8 @@ async function serverWorkerCommand() {
   // A reload worker restores quota IN-MEMORY only (state file handed via the
   // lease holder); a cold/direct worker reads the on-disk state file.
   const savedState = await loadState();
+  accountManager.routingService.restoreState(savedState?.routingService);
+  accountManager.routingCapacity.restore(savedState?.routingCapacity);
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
   accountManager.restoreSessionProviders(savedState?.sessionProviders);
   accountManager.restoreNativeCodexConversationOwners(savedState?.nativeCodexConversationOwners);
@@ -805,16 +810,24 @@ async function serverWorkerCommand() {
   // learned-quota flush is silently dropped — the new worker would boot from up-to-
   // 60s-stale quota and the state generation would never advance across a reload.
   let capacityFlushSnapshot = null;
+  let routingFlushSnapshot = null;
+  let quotaAnalyticsFlushSnapshot = null;
   let quotaPersistChain = Promise.resolve();
   const persistQuotaState = (force = false, snapshotForDrain = false) => {
     if (!hasLease && !force) return Promise.resolve();
     const persist = async () => {
       const ledger = accountManager.capacity;
-      const drains = await readCapacityDrains(ledger);
+      const drains = await readCapacityDrains(ledger, getStatePath(), accountManager);
       const capacity = ledger.serialize();
       // Use the exact snapshot passed to the disk writer. Requests can finish
       // while the asynchronous write is in flight.
-      if (snapshotForDrain) capacityFlushSnapshot = capacity;
+      const routingService = accountManager.routingService.exportState();
+      const routingCapacity = accountManager.routingCapacity.serialize();
+      if (snapshotForDrain) {
+        capacityFlushSnapshot = capacity;
+        routingFlushSnapshot = routingService;
+        quotaAnalyticsFlushSnapshot = routingCapacity;
+      }
       const expectedGeneration = force ? null : stateGeneration;
       const written = await saveState(
         {
@@ -830,6 +843,8 @@ async function serverWorkerCommand() {
           // OPEN cycle must persist or a mid-cycle restart records a near-empty cycle as
           // a real capacity observation and poisons the averages forever (B1).
           capacity,
+          routingService,
+          routingCapacity,
           // SC22 per-person analytics — same generation-guarded payload, survives
           // restarts and seamless reloads.
           callerStats: accountManager.exportCallerStats?.() || {},
@@ -854,7 +869,11 @@ async function serverWorkerCommand() {
   };
   const publishCapacityDrain = async () => {
     if (capacityFlushSnapshot) {
-      await writeCapacityDrain(CapacityLedger.drainDelta(capacityFlushSnapshot, accountManager.capacity.serialize()));
+      const delta = CapacityLedger.drainDelta(capacityFlushSnapshot, accountManager.capacity.serialize());
+      const after = accountManager.routingService.exportState();
+      delta.routingService = RoutingServiceAnalytics.drainDelta(routingFlushSnapshot, after);
+      delta.routingCapacity = RoutingCapacityAnalytics.drainDelta(quotaAnalyticsFlushSnapshot, accountManager.routingCapacity.serialize());
+      await writeCapacityDrain(delta);
     }
   };
 
@@ -889,6 +908,7 @@ async function serverWorkerCommand() {
       return value;
     },
   });
+  accountManager.codexResetOpportunity = (account, now) => codexReset.expiringOpportunity(account, now);
   const prober = new Prober(accountManager, {
     intervalMs: probeSeconds * 1000, log: uiLog,
     onCodexQuota: account => hasLease ? codexReset.maybeRedeemForPool([account]) : null,
@@ -1143,9 +1163,10 @@ async function serverWorkerCommand() {
     // the current on-disk generation.
     try { stateGeneration = await readGeneration(getStatePath()); } catch { /* keep prior */ }
     hasLease = true;
+    accountManager.routingService.setServing(true);
     accountManager.setWriterLease(true);
     // Recover any completed drain that survived a restart before the first repaint.
-    await readCapacityDrains(accountManager.capacity).catch(err => console.error('[Maxpool] Could not recover capacity drain:', err.message));
+    await readCapacityDrains(accountManager.capacity, getStatePath(), accountManager).catch(err => console.error('[Maxpool] Could not recover capacity drain:', err.message));
     if (!quotaSaveInterval) {
       quotaSaveInterval = setInterval(() => { persistQuotaState(); }, 60_000);
       quotaSaveInterval.unref?.();
@@ -1160,6 +1181,7 @@ async function serverWorkerCommand() {
   const releaseLease = async () => {
     if (!hasLease) return;
     hasLease = false;
+    accountManager.routingService.setServing(false);
     if (quotaSaveInterval) { clearInterval(quotaSaveInterval); quotaSaveInterval = null; }
     accountManager.setWriterLease(false);
     sleepGuard.stop(); // release the wake — only the active lease-holder keeps the Mac awake
@@ -1673,6 +1695,8 @@ async function serverWorkerCommand() {
     // The old worker could serve a first turn or evict an old conversation after
     // our headless boot. Adopt its final ownership maps before serving any socket.
     const finalState = await loadState();
+    accountManager.routingService.restoreState(finalState?.routingService);
+    accountManager.routingCapacity.restore(finalState?.routingCapacity);
     if (finalState?.capacity) {
       accountManager.restoreCapacityState(finalState.capacity);
       accountManager.restoreAccountCacheHours(finalState.efficiencyHours);

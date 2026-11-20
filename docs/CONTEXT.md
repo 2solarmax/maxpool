@@ -24,6 +24,12 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-20 · Measure routing outcomes at ingress and quota expiry at the holder
+
+Activity analytics opens routing with `v` then `r`. It reports terminal inference outcomes and router-controlled wait. Native and translated requests share the five-second queue budget. A forwarded hop is visible to the receiving account without adding another external arrival. Each worker reports its own observations and coverage through the versioned `routingAnalytics` field of the existing status response. The terminal can select an individual worker.
+
+Closing-week utilization comes from paired vendor readings taken near a natural reset, including on idle accounts. Confirmed session-only z.ai plans use their five-hour window. The distinction between no observed demand, eligible demand served elsewhere and incomplete evidence matters when sizing subscriptions. Historical service or end-of-window readings cannot be reconstructed from cache totals. The six-request default protects forwarded requests that bypass ordinary admission. New-placement measurement keeps established conversations and cache ownership intact.
+
 ### 2026-11-20 · Import historical cache data once per worker
 
 The first migration imports the old name-based hours into the accounts known at the time. An unmatched or ambiguous name is omitted from historical attribution, even if a matching name appears later, because later reuse cannot establish who served the old requests. Later identity and provider changes use owner-keyed observations. Imported hours from 1.24.116 have no source aliases or request IDs. Their affected windows carry an estimate warning. The original counters are preserved.

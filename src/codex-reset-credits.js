@@ -237,6 +237,7 @@ export class ResetCreditRedeemer {
     // scheduling data, separately from the account quota state.
     /** @type {WeakMap<object, RedeemState>} */
     this.state = new WeakMap();
+    this.opportunityDetails = new WeakMap();
     this.inFlight = null;
     this.manualInFlight = false;
     // An unresolved POST can have spent a credit, even when the response or
@@ -343,11 +344,32 @@ export class ResetCreditRedeemer {
   }
 
   async readDetails(account, opts = {}) {
+    const sentAt = this.now();
+    const credential = account?.credential;
     let read;
     try { read = await this.detailsFn(account, opts); } catch (/** @type {any} */ error) {
       read = { error: error?.message || String(error) };
     }
+    if (this._owns(account) && account.credential === credential && !(account.lastClaimAt >= sentAt)) {
+      if (sentAt >= (this.opportunityDetails.get(account)?.creditsAt || 0)) {
+        this.opportunityDetails.set(account, { credits: !read.error && Array.isArray(read.credits) ? read.credits : null, creditsAt: sentAt });
+      }
+    }
     return read;
+  }
+
+  // The placement comparison can read an existing decision, never fetch or spend a
+  // credit. Only the credential holder has the private detail rows needed for it.
+  expiringOpportunity(account, now = this.now()) {
+    const details = this.opportunityDetails.get(account);
+    if (!details?.credits || !this._owns(account) || !automaticFor(account)
+      || this.inFlight || this.manualInFlight || this.fleetCooldownUntil > now || (this.state.get(account)?.cooldownUntil || 0) > now
+      || now - details.creditsAt >= this.detailTtlMs) return null;
+    const action = this._decision(account, details, false, now).action;
+    const expiresAt = action?.grant?.endsAt;
+    if (!Number.isFinite(expiresAt) || expiresAt <= now || expiresAt - now >= POLICY.dyingWindowMs) return null;
+    return { expiresAt, validUntil: Math.min(expiresAt, details.creditsAt + this.detailTtlMs,
+      account.quota.codexWeeklyReadingAt + CLAIM_FRESH_MS, account.quota.unified7dReset) };
   }
 
   /**
@@ -588,6 +610,7 @@ export class ResetCreditRedeemer {
     const uncertain = !redeemed && !declined || Boolean(result?.error);
     await this._finish(reservation, { redeemed, uncertain, now: this.now() });
     state.credits = null;
+    this.opportunityDetails.delete(account);
     state.cooldownUntil = now + (redeemed ? SUCCESS_COOLDOWN_MS : RETRY_COOLDOWN_MS);
     if (uncertain) {
       const detail = safeLine(result?.error || 'no upstream verdict');
@@ -596,6 +619,8 @@ export class ResetCreditRedeemer {
     }
     if (redeemed) {
       account.lastClaimAt = this.now();
+      account.lastGeneralClaimAt = account.lastClaimAt;
+      this.am.noteRoutingRefill?.(account, 'wk', account.lastClaimAt);
       account.lastFullGeneralClaimAt = account.lastClaimAt;
       // A replay may confirm a spend that a previous usage read already counted.
       // Invalidate the old balance until OpenAI reports the post-reset inventory.

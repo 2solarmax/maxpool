@@ -6,6 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { nativeCodexHeaders, nativeCodexOwnerIdentity, normalizeNativeCodexModel, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
 import { codexRateLimit } from './codex-quota.js';
 import { HOP_HEADER } from './pool-link.js';
+import { finishInference, capacityDenial, noteRoutingUsage } from './routing-service-analytics.js';
 
 export const CODEX_CLIENT_BASE_PATH = '/maxpool/codex/v1';
 const NATIVE_MODELS_URL = new URL('models', NATIVE_CODEX_RESPONSES_URL);
@@ -267,6 +268,16 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
       return routeError(res, 400, 'invalid_request_error', 'Supply an entitled Codex model and a foreground request with store disabled.');
     }
     const key = threadKey(req, data, path);
+    let identifiedSession = false;
+    if (path === SEARCH_PATH) ctx.endAuxiliary = manager.routingService?.auxiliary();
+    else if (manager.routingService) {
+      // x-client-request-id and prompt_cache_key can change per call. Neither
+      // identifies a distinct active session for the parallelism KPI.
+      const session = [req.headers['thread-id'], withJsonBody(req.headers['x-codex-turn-metadata'] || '')?.thread_id,
+        req.headers.session_id, req.headers['session-id']].find(value => typeof value === 'string' && THREAD_ID.test(value));
+      identifiedSession = Boolean(session);
+      ctx.service = manager.routingService.begin({ session });
+    }
     const owner = key && manager.nativeCodexOwner(key);
     if (!owner && (path === SEARCH_PATH || accountBound(req, data))) {
       return routeError(res, 409, 'previous_response_not_found', 'This Codex state has no owner in MaxPool. Start a new conversation on this route.');
@@ -281,7 +292,7 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
     const info = { nativeCodexClient: true, onlyProvider: 'codex', profile: 'codex', codexCompatible: true,
       model: data.model, openAIModel: data.model, reasoningEffort: data.reasoning?.effort,
       path: CODEX_CLIENT_BASE_PATH + path, sessionKey: key, affinityKey: key, caller: 'local-codex',
-      stream: streaming, nativeCodexOwner: owner, nativeCodexCatalog: account => currentCatalog(account)?.normalized,
+      stream: streaming, _service: ctx.service, identifiedSession, nativeCodexOwner: owner, nativeCodexCatalog: account => currentCatalog(account)?.normalized,
       weight: Math.max(1, Math.ceil(body.length / 32768)) };
     const excluded = new Set();
     const controller = new AbortController();
@@ -302,9 +313,15 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
           const error = owner && !manager.accounts.some(account => nativeCodexOwnerIdentity(account) === owner)
             ? 'The owning local Codex account is no longer in the pool. Add it back to resume this conversation.'
             : 'No eligible local Codex account is available for this model or conversation.';
+          if (ctx.service) ctx.service.denied ||= capacityDenial(manager.nextRetryForRequest?.(info, excluded));
           return routeError(res, 429, 'rate_limit_exceeded', error, { 'retry-after': '5' });
         }
         const { account } = lease;
+        if (ctx.service) {
+          ctx.service.route(account.name);
+          ctx.service.denied = false;
+          ctx.service.usage = null;
+        }
         const identity = nativeCodexOwnerIdentity(account);
         const isCurrent = () => manager.accounts[account.index] === account && nativeCodexOwnerIdentity(account) === identity;
         const outcome = { neutral: true, scope: 'request' };
@@ -352,10 +369,14 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
           if (!upstream.ok) {
             const buffer = await boundedBody(upstream, controller);
             const error = withJsonBody(buffer);
-            const limit = upstream.status === 429 ? codexRateLimit(upstream.headers, data.model) : null;
+            const limit = upstream.status === 429 ? codexRateLimit(upstream.headers, data.model, Date.now(), account.quota.codexLimitByModel?.[data.model]) : null;
             const retry = limit ? retryAfter(upstream, limit.retryAfter) : null;
-            if (sameAttemptGrant() && limit) manager.markRateLimited(account.index, retry, { recordFailure: false, modelScope: limit.modelScope });
+            if (sameAttemptGrant() && limit) manager.markRateLimited(account.index, retry, { recordFailure: false, modelScope: limit.modelScope, modelWindow: limit.modelWindow });
             else if (sameAttemptGrant() && upstream.status === 401) manager.markAuthFailed(account.index, 401, 'native_codex_unauthorized');
+            if (ctx.service && limit) {
+              ctx.service.denied = limit.modelWindow === 'weekly' ? 'weeklyDenied'
+                : limit.modelWindow === '5h' ? 'sessionDenied' : 'unclassifiedDenied';
+            }
             outcome.status = upstream.status;
             if (!draining && !owner && shouldRetry(upstream.status, error)) {
               // No response was accepted on an explicit auth/quota/model
@@ -396,22 +417,34 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
               if (terminal) return;
               if (['response.completed', 'response.incomplete', 'response.failed', 'error'].includes(event.type)) {
                 terminal = event.type;
+                if (ctx.service) ctx.service.terminal = terminal === 'response.completed' ? 'completed'
+                  : terminal === 'response.incomplete' ? 'incomplete' : 'failed';
                 // Codex stops reading as soon as it sees its terminal event.
                 // The result is final before the downstream pipeline reaches EOF.
                 outcome.success = terminal === 'response.completed' || terminal === 'response.incomplete';
                 if (!outcome.success) outcome.error = 'native_codex_stream_failed';
                 if (isCurrent()) bookUsage(manager, account, info, event.response);
+                noteRoutingUsage(ctx.service, info);
               }
             });
             if (!terminal) outcome.error = 'native_codex_stream_incomplete';
           } else {
             const buffer = await boundedBody(upstream, controller);
-            if (isCurrent()) bookUsage(manager, account, info, withJsonBody(buffer));
+            const result = withJsonBody(buffer);
+            if (ctx.service) {
+              const compacted = path === '/responses/compact' && Array.isArray(result?.output)
+                && result.output.some(item => item?.type === 'compaction');
+              ctx.service.terminal = result?.error || result?.status === 'failed' ? 'failed'
+                : result?.status === 'completed' || compacted ? 'completed' : 'incomplete';
+            }
+            if (isCurrent()) bookUsage(manager, account, info, result);
+            noteRoutingUsage(ctx.service, info);
             res.end(buffer);
             outcome.success = true;
           }
           return upstream.status;
         } catch {
+          if (ctx.service && !terminal) ctx.service.terminal = controller.signal.reason === clientClosed ? 'cancelled' : 'failed';
           if (res.headersSent) {
             if (!terminal && controller.signal.reason === clientClosed) outcome.neutral = true;
             if (!res.destroyed) res.destroy();
@@ -456,7 +489,9 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
       ctx.status = await inference(req, res, path, reqId, ctx);
       return ctx.status;
     } finally {
-      hooks.onRequestEnd?.(reqId, { ...request, ...ctx });
+      ctx.endAuxiliary?.();
+      finishInference(ctx.service, ctx.status, res.destroyed && !res.writableFinished);
+      hooks.onRequestEnd?.(reqId, { ...request, account: ctx.account, status: ctx.status });
     }
   };
   route.beginDrain = () => { draining = true; };

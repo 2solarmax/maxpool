@@ -262,12 +262,12 @@ async function atomicWrite(path, content) {
 // Hand its increments to the single active writer in an atomic private file.
 // The applied id is committed with the counters before the file is removed.
 export async function writeCapacityDrain(delta, statePath = getStatePath()) {
-  if (!Object.keys(delta.accounts).length && !Object.keys(delta.owners).length) return;
+  if (!Object.keys(delta.accounts).length && !Object.keys(delta.owners).length && !delta.routingService && !delta.routingCapacity) return;
   const id = randomBytes(12).toString('hex');
   await atomicWrite(join(statePath + '.drains', id), JSON.stringify(delta));
 }
 
-export async function readCapacityDrains(ledger, statePath = getStatePath()) {
+export async function readCapacityDrains(ledger, statePath = getStatePath(), { routingService, routingCapacity } = {}) {
   const dir = statePath + '.drains';
   let files;
   try { files = await readdir(dir); }
@@ -283,7 +283,14 @@ export async function readCapacityDrains(ledger, statePath = getStatePath()) {
   for (const id of ledger.appliedDrains) if (!ids.includes(id)) ledger.appliedDrains.delete(id);
   for (const id of ids) {
     if (ledger.appliedDrains.has(id)) continue;
-    try { ledger.applyDrain(JSON.parse(await readFile(join(dir, id), 'utf8')), id); }
+    try {
+      const delta = JSON.parse(await readFile(join(dir, id), 'utf8'));
+      if (delta.routingService && routingService) {
+        routingService.mergeDrain(delta.routingService.before, delta.routingService.after);
+      }
+      if (delta.routingCapacity) routingCapacity?.mergeDrain(delta.routingCapacity, id);
+      ledger.applyDrain(delta, id);
+    }
     catch (e) { console.error('[Maxpool] Could not read released worker capacity:', e.message); }
   }
   return ids.filter(id => ledger.appliedDrains.has(id));
