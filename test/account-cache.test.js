@@ -180,12 +180,14 @@ test('two links to the same serving ledger contribute one snapshot, including af
   const cloud = new AccountManager([account('shared', 'codex')]);
   cloud.accrueCapacity(0, { input: 72, cacheRead: 18 });
   const state = cloud.capacity.serialize();
-  edge.syncRemoteMirrors({ name: 'first', url: 'http://first.invalid', lastOkAt: Date.now(), status: cloud.getStatus() });
+  const first = cloud.getStatus();
+  edge.syncRemoteMirrors({ name: 'first', url: 'http://first.invalid', lastOkAt: Date.now(), status: first });
   const restarted = new AccountManager([account('shared', 'codex')]);
   restarted.restoreCapacityState(state);
   restarted.accrueCapacity(0, { cacheRead: 5 });
   const status = restarted.getStatus();
-  status.accounts[0].accountCache.asOf += 1;
+  status.accounts[0].accountCache.asOf = first.accounts[0].accountCache.asOf;
+  status.ownedProviderCache.codex.asOf = first.ownedProviderCache.codex.asOf;
   edge.syncRemoteMirrors({ name: 'alias', url: 'http://alias.invalid', lastOkAt: Date.now(), status });
   assert.equal(edge.accounts.length, 2);
   assert.equal(edge.providerCacheWindows().codex.windows.all.cacheRead, 23);

@@ -127,12 +127,15 @@ export function combineCacheWindows(snapshots) {
   // The same serving ledger can appear through two aliases of one team pool.
   // Pick its latest live observation once; distinct credential holders still sum.
   const sources = new Map();
+  const lifetime = s => FIELDS.reduce((total, field) => total + s.windows.all[field], 0);
   for (const snapshot of snapshots) {
     if (!snapshot) continue;
     const key = snapshot.source || snapshot;
     const prior = sources.get(key);
+    const newer = prior && (snapshot.asOf > prior.asOf ||
+      (snapshot.asOf === prior.asOf && lifetime(snapshot) > lifetime(prior)));
     if (!prior || (prior.offline && !snapshot.offline) ||
-        (Boolean(prior.offline) === Boolean(snapshot.offline) && snapshot.asOf > prior.asOf)) sources.set(key, snapshot);
+        (Boolean(prior.offline) === Boolean(snapshot.offline) && newer)) sources.set(key, snapshot);
   }
   const known = [...sources.values()];
   if (!known.length) return null;
