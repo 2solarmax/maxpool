@@ -41,6 +41,30 @@ function childPids(pid) {
   return (r.stdout || '').split('\n').filter(Boolean).map(Number);
 }
 
+// Resolve on a subprocess event already in the transcript or arriving later.
+// The timer only bounds a broken fixture. A supervisor exit fails immediately.
+function waitForOutput(p, pattern, timeoutMs = 20_000) {
+  return new Promise((resolve, reject) => {
+    const finish = (err, match) => {
+      clearTimeout(timer);
+      p.child.stdout.off('data', inspect);
+      p.child.stderr.off('data', inspect);
+      p.child.off('exit', exited);
+      if (err) reject(err); else resolve(match);
+    };
+    const inspect = () => {
+      const match = pattern.exec(p.out());
+      if (match) finish(null, match);
+    };
+    const exited = () => finish(new Error(`supervisor exited while waiting for ${pattern}`));
+    const timer = setTimeout(() => finish(new Error(`timed out waiting for ${pattern}`)), timeoutMs);
+    p.child.stdout.on('data', inspect);
+    p.child.stderr.on('data', inspect);
+    p.child.once('exit', exited);
+    if (p.child.exitCode != null || p.child.signalCode != null) exited(); else inspect();
+  });
+}
+
 async function boot(env) {
   const upstream = await startUpstream();
   const port = await getFreePort();
@@ -136,6 +160,39 @@ async function delayedPrimary() {
   const preload = join(dir, 'delay-primary.cjs');
   const allowPrimary = join(dir, 'allow-primary');
   await writeFile(preload, `
+    if (process.env.TEST_BATON_EVENTS === '1') {
+      const mark = event => process.stderr.write('[fixture] ' + event + ' ' + process.pid + '\\n');
+      if (!process.env.MAXPOOL_SERVER_WORKER) {
+        // A worker that already released cannot fail to spawn, but sending to
+        // its closed IPC channel does produce a real ChildProcess 'error'.
+        const proto = require('node:child_process').ChildProcess.prototype;
+        const emit = proto.emit;
+        proto.emit = function (name, ...args) {
+          if (name === 'message' && args[0]?.type === 'released') {
+            this.once('exit', () => {
+              this.once('error', err => mark(err.code));
+              this.send({ type: 'probe-closed-channel' });
+            });
+          }
+          return emit.call(this, name, ...args);
+        };
+      } else if (process.env.MAXPOOL_RELOAD_WORKER === '1') {
+        // Observe delivery without attaching an early 'message' listener:
+        // Node buffers the first readiness probe until the application listens.
+        const emit = process.emit.bind(process);
+        process.emit = (name, ...args) => {
+          if (name === 'message' && args[0]?.type === 'tty-reassert') mark('tty-reassert');
+          return emit(name, ...args);
+        };
+      } else if (process.env.MAXPOOL_RESPAWNED_WORKER === '1') {
+        const send = process.send.bind(process);
+        process.send = (message, ...rest) => {
+          const result = send(message, ...rest);
+          if (message?.type === 'primary') mark('respawn-primary');
+          return result;
+        };
+      }
+    }
     if (process.env.MAXPOOL_RELOAD_WORKER === '1') {
       const send = process.send.bind(process);
       process.send = (message, ...rest) => {
@@ -152,22 +209,32 @@ async function delayedPrimary() {
   return { preload, allowPrimary };
 }
 
-test('an old worker exiting after release and before the new primary acknowledgement keeps supervision', { timeout: 30_000 }, async () => {
+test('an old worker exiting after release and before the new primary acknowledgement keeps supervision', { timeout: 120_000 }, async () => {
   const { preload, allowPrimary } = await delayedPrimary();
   const p = await boot({ NODE_OPTIONS: '--require=' + JSON.stringify(preload),
-    MAXPOOL_TEST_RESTART_SIGNAL: '1', MAXPOOL_TEST_SIGNAL_COLD_RESTART: '1' });
+    MAXPOOL_TEST_RESTART_SIGNAL: '1', MAXPOOL_TEST_SIGNAL_COLD_RESTART: '1', TEST_BATON_EVENTS: '1' });
   try {
     process.kill(p.worker, 'SIGHUP');
-    assert.ok(await until(() => !childPids(p.child.pid).includes(p.worker), 10_000), 'outgoing worker completed its drain');
+    await waitForOutput(p, /\[fixture\] ERR_IPC_CHANNEL_CLOSED/);
     await writeFile(allowPrimary, '');
-    assert.ok(await until(() => /cutover complete/.test(p.out()), 10_000), 'successor completed takeover');
-    const next = (await proxyRequest(p.port)).worker;
-    assert.ok(next && next !== p.worker);
+    await waitForOutput(p, /cutover complete/);
+    const [, reasserted] = await waitForOutput(p, /\[fixture\] tty-reassert (\d+)/, 10_000);
+    const next = Number(reasserted);
+    assert.notEqual(next, p.worker);
+    const response = await proxyRequest(p.port, 10_000);
+    assert.equal(response.status, 200);
+    assert.equal(response.worker, next, 'successor is serving');
+    assert.doesNotMatch(p.out(), /\[fixture\] respawn-primary/, 'no cold worker spawned during handoff');
     process.kill(next, 'SIGUSR2');
-    assert.ok(await until(async () => {
-      const r = await proxyRequest(p.port);
-      return r.status === 200 && r.worker && r.worker !== next;
-    }, 5000), 'the supervisor respawned the successor after its explicit exit 75');
+    const [, respawned] = await waitForOutput(p, /\[fixture\] respawn-primary (\d+)/);
+    assert.notEqual(Number(respawned), next);
+    const coldResponse = await proxyRequest(p.port, 10_000);
+    assert.equal(coldResponse.status, 200);
+    assert.equal(coldResponse.worker, Number(respawned), 'the cold replacement is serving');
+    assert.doesNotMatch(p.out(), /Backing off .*before respawn/, 'the closed IPC error did not end supervision');
+  } catch (err) {
+    const events = await readFile(join(p.dir, 'config.log'), 'utf8').catch(() => '');
+    throw new Error(`${err.message}\nsupervisor ${p.child.pid} exit=${p.child.exitCode} signal=${p.child.signalCode} children=${childPids(p.child.pid)}\n${p.out()}\nEvent log:\n${events}`, { cause: err });
   } finally { await p.stop(); }
 });
 
