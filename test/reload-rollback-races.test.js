@@ -182,9 +182,11 @@ async function delayedPrimary() {
   const preload = join(dir, 'delay-primary.cjs');
   const allowPrimary = join(dir, 'allow-primary');
   const sawHup = join(dir, 'supervisor-saw-hup');
+  const supervisorExit = join(dir, 'supervisor-exit');
   await writeFile(preload, `
     if (!process.env.MAXPOOL_SERVER_WORKER) {
       process.on('SIGHUP', () => setImmediate(() => require('node:fs').writeFileSync(${JSON.stringify(sawHup)}, '1')));
+      process.once('exit', code => require('node:fs').writeFileSync(${JSON.stringify(supervisorExit)}, String(code)));
     }
     if (process.env.TEST_BATON_EVENTS === '1') {
       const mark = event => process.stderr.write('[fixture] ' + event + ' ' + process.pid + '\\n');
@@ -232,7 +234,7 @@ async function delayedPrimary() {
       };
     }
   `);
-  return { preload, allowPrimary, sawHup };
+  return { preload, allowPrimary, sawHup, supervisorExit };
 }
 
 test('an old worker exiting after release and before the new primary acknowledgement keeps supervision', { timeout: 120_000 }, async () => {
@@ -374,7 +376,7 @@ for (const revoked of [false, true]) {
   test(revoked ? 'closing the controlling terminal reaps an unresponsive successor after its drain'
     : 'SIGHUP with the controlling terminal still writable lets the successor finish takeover',
   { skip: !HAVE_PTY, timeout: 35_000 }, async () => {
-    const { preload, allowPrimary, sawHup } = await delayedPrimary();
+    const { preload, allowPrimary, sawHup, supervisorExit } = await delayedPrimary();
     const p = await bootPool({ controllingTerminal: true, drainTimeoutMs: 1500, readyMs: 20_000,
       env: { NODE_OPTIONS: '--require=' + JSON.stringify(preload), MAXPOOL_TEST_RESTART_SIGNAL: '1' } });
     try {
@@ -389,7 +391,12 @@ for (const revoked of [false, true]) {
         p.term.cmd('hangup');
         await p.term.next('HUNGUP');
         p.term.cmd('wait 8');
-        assert.equal((await p.term.next('EXIT ', 10_000)).trim(), 'EXIT 0', await p.log());
+        const osExit = (await p.term.next('EXIT ', 10_000)).trim();
+        // Linux Node 18 can abort in native ResetStdio after its JS exit
+        // handlers complete when the pty is revoked. Check both layers.
+        const exits = process.platform === 'linux' ? ['EXIT 0', 'EXIT -6'] : ['EXIT 0'];
+        assert.ok(exits.includes(osExit), `${osExit}\n${await p.log()}`);
+        assert.equal(await readFile(supervisorExit, 'utf8'), '0', 'MaxPool chose a clean exit');
         assert.throws(() => process.kill(incoming, 0), { code: 'ESRCH' });
         assert.ok((await proxyRequest(p.port)).error, 'no cold replacement is listening');
       } else {
