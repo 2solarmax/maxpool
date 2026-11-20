@@ -854,9 +854,7 @@ async function serverWorkerCommand() {
   // write races this one). Without force, this no-ops post-release and the reload's
   // learned-quota flush is silently dropped — the new worker would boot from up-to-
   // 60s-stale quota and the state generation would never advance across a reload.
-  let capacityFlushSnapshot = null;
-  let routingFlushSnapshot = null;
-  let quotaAnalyticsFlushSnapshot = null;
+  let drainBaseline = null;
   let quotaPersistChain = Promise.resolve();
   const persistQuotaState = (force = false, snapshotForDrain = false) => {
     if (!hasLease && !force) return Promise.resolve();
@@ -868,11 +866,7 @@ async function serverWorkerCommand() {
       // while the asynchronous write is in flight.
       const routingService = accountManager.routingService.exportState();
       const routingCapacity = accountManager.routingCapacity.serialize();
-      if (snapshotForDrain) {
-        capacityFlushSnapshot = capacity;
-        routingFlushSnapshot = routingService;
-        quotaAnalyticsFlushSnapshot = routingCapacity;
-      }
+      if (snapshotForDrain) drainBaseline = { capacity, routingService, routingCapacity };
       const expectedGeneration = force ? null : stateGeneration;
       const written = await saveState(
         {
@@ -913,11 +907,11 @@ async function serverWorkerCommand() {
     return quotaPersistChain;
   };
   const publishCapacityDrain = async () => {
-    if (capacityFlushSnapshot) {
-      const delta = CapacityLedger.drainDelta(capacityFlushSnapshot, accountManager.capacity.serialize());
+    if (drainBaseline) {
+      const delta = CapacityLedger.drainDelta(drainBaseline.capacity, accountManager.capacity.serialize());
       const after = accountManager.routingService.exportState();
-      delta.routingService = RoutingServiceAnalytics.drainDelta(routingFlushSnapshot, after);
-      delta.routingCapacity = RoutingCapacityAnalytics.drainDelta(quotaAnalyticsFlushSnapshot, accountManager.routingCapacity.serialize());
+      delta.routingService = RoutingServiceAnalytics.drainDelta(drainBaseline.routingService, after);
+      delta.routingCapacity = RoutingCapacityAnalytics.drainDelta(drainBaseline.routingCapacity, accountManager.routingCapacity.serialize());
       await writeCapacityDrain(delta);
     }
   };

@@ -24,6 +24,10 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-20 · Reduce repeated analytics work
+
+The routing status reader asks for hourly data only when building its seven-day daily series. The complete hourly timeline remains available to other snapshot readers. Native Codex resolves the turn metadata once per request. A completion reuses the same wait bin and token counts for the worker and account, and a releasing worker retains one baseline for all three accounting stores.
+
 ### 2026-11-20 · Quota attribution after a worker handoff
 
 Late coverage can establish that an unused window had no observed demand. A late request from a retiring worker can retract that conclusion. MaxPool saves corrections with the quota cycle so they survive the shorter demand-history retention. The terminal and status report share one demand summary across accounts. A malformed handoff stays on disk under its original ID and is retried when the file changes. Transient failures continue to retry.
