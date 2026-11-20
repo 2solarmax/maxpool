@@ -143,14 +143,16 @@ test('both settings render together on one account', () => {
 
 // ── staleness says WHAT HAPPENS NEXT (owner, 2026-08-27) ─────────────────────
 
-test('an in-flight sweep reads "refreshing now", not a countdown', () => {
+test('only the account whose probe is in flight reads "refreshing now"', () => {
   const am = oauthAM();
   am.quotaProbeIntervalMs = 60_000;
   am.accounts[0].quota.unified5h = 0.4;
   am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
   am.quotaProbeSweeping = true;                       // the prober publishes this
-  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
-  assert.match(line, /refreshing now/, 'a running sweep is the answer to "what next"');
+  const tui = new TUI({ accountManager: am });
+  assert.doesNotMatch(strip(tui._renderAcct(0, 11, true)), /refreshing now/);
+  am.accounts[0].quota.probeChecking = true;
+  assert.match(strip(tui._renderAcct(0, 11, true)), /refreshing now/);
 });
 
 test('a quiet prober names the concrete next refresh time', () => {

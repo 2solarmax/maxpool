@@ -788,7 +788,7 @@ export function decideLoginTarget({ mirror, links, existing, accountUuid }) {
 }
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, onRestart, spawnDetached,
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuotaRecheck, onQuit, onRestart, spawnDetached,
     codexResetDetails, redeemCodexReset, onSetCodexAutoRedeem }) {
     this.am = accountManager;
     // Runs the tmux detach for q in service mode; a seam so tests never start tmux.
@@ -798,6 +798,7 @@ export class TUI {
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
+    this.onQuotaRecheck = onQuotaRecheck;
     this.onQuit = onQuit;
     this.onRestart = onRestart;
     this.codexResetDetails = codexResetDetails;
@@ -1513,6 +1514,8 @@ export class TUI {
       this._startSelection('codexLogin');
     } else if (k === 'r' && this.codexResetDetails && this.am.accounts.some(a => a.provider === 'codex' && !a.remote)) {
       this._startSelection('codexResets');
+    } else if (k === 'v' && this.onQuotaRecheck) {
+      this._startSelection('check quota');
     } else if (k === 'n' && this.am.accounts.length > 0) {
       this._startSelection('rename');
     } else if (k === 't' && this.am.accounts.length > 0) {
@@ -1992,7 +1995,10 @@ export class TUI {
         this.mode = 'normal';
         return;
       }
-      if (this.selAction === 'prefer') {
+      if (this.selAction === 'check quota') {
+        this.mode = 'accounts';
+        this._addLog(this.onQuotaRecheck(account));
+      } else if (this.selAction === 'prefer') {
         if (account.type === 'provider') {
           this._addLog('Manual preference is available only for Claude accounts');
           return;
@@ -2068,9 +2074,10 @@ export class TUI {
   _startSelection(action) {
     const selectable = this._selectableIndexes(action);
     if (!selectable.length) {
+      const unavailable = action === 'check quota' ? 'No local Claude subscription to check'
+        : 'No configurable account is available for this action';
       this._addLog(action === 'prefer'
-        ? 'No enabled Claude account is available for manual preference'
-        : 'No configurable account is available for this action');
+        ? 'No enabled Claude account is available for manual preference' : unavailable);
       return;
     }
     this.mode = 'select';
@@ -2115,6 +2122,8 @@ export class TUI {
     return this._displayOrder()
       .map(index => ({ account: this.am.accounts[index], index }))
       .filter(({ account }) => {
+        if (action === 'check quota') return account.type === 'oauth' && account.provider !== 'codex' && account.credential
+          && !account.remote && !account.poolBenchedBy && !account.refreshDead;
         if (action === 'prefer') return account.type !== 'provider' && account.enabled;
         if (action === 'codexLogin') return account.provider === 'codex';
         if (action === 'codexResets') return account.provider === 'codex' && !account.remote;
@@ -3269,7 +3278,7 @@ export class TUI {
       }
       a._twinResetsOverlay = resetsOverlay;   // remember for the next frame's fallback
       a = Object.assign(Object.create(Object.getPrototypeOf(a)), a, {
-        quota: { ...a.quota, ...(r.quota || {}) },
+        quota: r.quota || {},  // all quota fields must come from the same owner
         inFlight: r.inFlight ?? 0,
         completedRequests: r.completedRequests ?? a.completedRequests,
         refreshDead: Boolean(r.refreshDead),
@@ -3278,6 +3287,8 @@ export class TUI {
         resetCards: resetsOverlay.resetCards,
         capLift: resetsOverlay.capLift,
       });
+    } else if (a?.poolBenchedBy) {
+      a = { ...a, quota: {} }; // no cloud twin sample to display
     }
 
     // Highlight the ACTIVE account(s) — drives BOTH the ► marker and the green
@@ -3621,7 +3632,17 @@ export class TUI {
     // Only annotate probe-staleness for LIVE accounts, where a failing probe
     // (e.g. a 429) is a real, actionable signal.
     if (a?.refreshDead || a?.subscriptionGone || a?.enabled === false) return '';
-    if (!this.am._quotaProbeStale?.(a)) return '';   // probe fresh (or off) → nothing to flag; interval>0 after this
+    const q = a.quota || {};
+    const remote = Boolean(a.remote || a.poolBenchedBy);
+    const now = Date.now();
+    const weeklyWall = a.type === 'oauth' && a.provider !== 'codex' && q.unified7d >= 1
+      && (!q.unified7dReset || q.unified7dReset > now);
+    if (a.poolBenchedBy && !Object.keys(q).length) return `  ${dim('cloud quota unavailable')}`;
+    const interval = remote ? q.probeIntervalMs : this.am.quotaProbeIntervalMs;
+    const hasPlan = remote ? interval !== 0 : interval > 0;
+    const staleAfter = Math.max(3 * (interval || 0), 180_000);
+    const ageStale = remote ? q.lastProbeOkAt && now - q.lastProbeOkAt > staleAfter : this.am._quotaProbeStale?.(a);
+    if (!ageStale && !(hasPlan && (weeklyWall || q.probeRetryAt > now))) return '';
     // The background probe IS stale — but only flag it if something DISPLAYED is
     // actually stale. An OAuth account's Ses/Wk bars come from unified5h/7d, which
     // response headers refresh on every served request (updateQuota → lastHeaderQuotaAt);
@@ -3632,15 +3653,13 @@ export class TUI {
     // shows (at or above the reserve floor) or, for Fable, whenever the Fbl bar is on
     // screen: the bar draws the reading at any level, so a stale low Fbl value must
     // carry the age marker too.
-    const q = a.quota || {};
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85; // mirrors _renderAcct's scoped-tag gate
     const hasDisplayedScopedCap = Object.entries(q.scopedWeekly || {}).some(([family, e]) =>
       e && e.isActive !== false && e.utilization != null
       && (e.utilization >= reserveFloor || (showFable && family === 'fable')));
     if (a.type !== 'provider' && !hasDisplayedScopedCap) {
-      const interval = this.am.quotaProbeIntervalMs; // > 0 here (else _quotaProbeStale returned false)
-      const headerFresh = q.lastHeaderQuotaAt && (Date.now() - q.lastHeaderQuotaAt) <= Math.max(3 * interval, 180_000);
-      if (headerFresh) return '';
+      const headerFresh = q.lastHeaderQuotaAt && now - q.lastHeaderQuotaAt <= staleAfter;
+      if (headerFresh && !weeklyWall && !(q.probeRetryAt > now)) return '';
     }
     // SAY WHAT HAPPENS NEXT (owner, 2026-08-27): "stale" / "stale·probe throttled"
     // named an internal mechanism and left the user with nothing to do. Nothing IS
@@ -3649,25 +3668,26 @@ export class TUI {
     // the numbers are AND when they refresh, in that order.
     const age = q.lastProbeOkAt ? formatAge(Date.now() - q.lastProbeOkAt) : null;
     const ageText = age ? `quota ${age} old` : 'quota not read yet';
-    const next = this._probeNextText();
-    const throttled = q.lastProbeErrorStatus === 429;
-    // Throttled is the ONE case worth colouring: it is why the refresh is late, and
-    // it self-clears. Everything else is a plain dim statement of fact.
-    const body = throttled
-      ? `${ageText} · rate-limited, retrying ${next}`
-      : `${ageText} · refreshing ${next}`;
+    const throttled = q.probeRetryAt > now || (q.lastProbeErrorStatus === 429
+      && (q.lastProbeErrorAt ? q.lastProbeErrorAt >= (q.lastProbeOkAt || 0) : !remote));
+    const nextAt = Math.max(q.probeRetryAt || 0, q.probeNextCheckAt || 0);
+    let action;
+    if (q.probeChecking && !(q.probeRetryAt > now)) action = remote ? 'cloud reported a check in progress' : 'refreshing now';
+    else if (q.probeRecheckRequested) action = 'check queued';
+    else if (nextAt) action = nextAt > now ? `next check due in ${formatAge(nextAt - now)}` : 'check due';
+    else if (remote) action = interval === 0 ? 'cloud checks off' : 'cloud check time unavailable';
+    else action = `${throttled ? 'retrying' : 'refreshing'} ${this._probeNextText()}`;
+    const body = `${ageText} · ${throttled ? 'rate-limited, ' : ''}${action}`;
     return `  ${throttled ? yellow(body) : dim(body)}`;
   }
 
-  /** "now" while a sweep is in flight, else "in 45s" from the prober's next-tick
-   *  stamp. Falls back to the configured interval when no sweep has completed yet
-   *  (fresh boot), and to a bare "shortly" when the probe is manual/off. */
+  /** Legacy local rows without individual timing can only name their next sweep. */
   _probeNextText() {
-    if (this.am.quotaProbeSweeping) return 'now';
+    if (this.am.quotaProbeSweeping) return 'on this or the next sweep';
     const at = this.am.quotaProbeNextSweepAt;
     if (at) {
       const ms = at - Date.now();
-      return ms > 0 ? `in ${formatAge(ms)}` : 'now';
+      return ms > 0 ? `in ${formatAge(ms)}` : 'on the next sweep';
     }
     const interval = this.am.quotaProbeIntervalMs;
     return interval > 0 ? `every ${formatAge(interval)}` : 'shortly';
@@ -4339,7 +4359,7 @@ export class TUI {
         return ` ${bold('c')} Check & apply now  ${bold('t')} Automatic updates: ${state} ↻  ${bold('Esc')} Back`;
       }
       case 'accounts':
-        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('d')} Delete  ${bold('Esc')} Back`;
+        return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('v')} Check quota  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'codexResets': {
         const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset ? 'on' : 'off'}` : '';
         const state = this.codexResets;
@@ -4391,7 +4411,7 @@ export class TUI {
             ? 'enable/disable'
             : this.selAction === 'rename'
               ? 'rename'
-              : 'delete';
+              : this.selAction === 'check quota' ? 'check quota' : 'delete';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;
       }
       case 'input': {

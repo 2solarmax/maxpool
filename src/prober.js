@@ -22,6 +22,9 @@ export { GRANTS_EVERY_MS, GRANTS_RETRY_MS, CLAIM_BACKOFF_STEPS_MS, CLAIM_BACKOFF
 // How often a subscription-latched account is rechecked (one probe + at most one
 // token refresh per window — cheap, and bounded so a truly canceled plan isn't hammered).
 export const SUB_RECHECK_MS = 30 * 60_000;
+// With a confirmed empty grant listing there is no reset to act on. Sample
+// twice an hour for an unseen external refill or newly issued grant.
+export const EXHAUSTED_NO_GRANTS_MS = 30 * 60_000;
 
 // The sweep-decision skips that mean "this tick's LISTING can't be trusted" — the
 // only skips after a successful probe that hand a held wall to the rescue (r2 #1).
@@ -121,7 +124,7 @@ export class Prober {
         // token), so its access token is dead and every probe fails — each failure
         // widens the shared inter-probe gap and slows the HEALTHY rows. Its quota is
         // shown from the cloud mirror (am.remoteRowFor), not from a local probe.
-        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.provider !== 'codex' && a.credential && !a.refreshDead && !a.poolBenchedBy);
+        const oauth = this.am.accounts.filter(a => a.type === 'oauth' && a.provider !== 'codex' && a.credential && !a.refreshDead && !a.remote && !a.poolBenchedBy);
         const codex = this.am.accounts.filter(a => a.codexAuth === 'native' && a.credential && !a.refreshDead && !a.poolBenchedBy);
         // Pool links are probed by their own PoolLink status poll, not here.
         const providers = this.am.accounts.filter(a => a.type === 'provider' && a.credential);  // 'pool' rows are excluded by type
@@ -138,12 +141,34 @@ export class Prober {
         // Rotate the start account each sweep so no account is systematically the
         // oldest-refreshed (the serialized sweep would otherwise always probe the
         // last account last).
+        const nextSweep = this.intervalMs > 0 ? this._now() + this.intervalMs : null;
         const start = oauth.length ? (this._sweepStart++ % oauth.length) : 0;
         for (let i = 0; i < oauth.length; i++) {
           if (this._stopping) break;
+          const account = oauth[(start + i) % oauth.length];
+          const q = account.quota ||= {};
+          q.probeIntervalMs = this.intervalMs;
+          const due = this._usageDeferredUntil(account);
+          if (due > this._now()) {
+            q.probeNextCheckAt = due;
+            // The usage endpoint is waiting. The independent claim endpoint can
+            // still rescue an existing hold if other accounts have lost room.
+            if (q.probeRetryAt > this._now() && !account.subscriptionGone) {
+              try { await this._rescueHeldWall(account, { refreshToken: true }); } catch { /* keep other accounts checking */ }
+            }
+            continue; // no usage pacing slot or grant listing for a deferred row
+          }
           await this._paceUsage();
           if (this._stopping) break;
-          const r = await this.probeOne(oauth[(start + i) % oauth.length]);
+          q.probeRecheckRequested = false;
+          q.probeChecking = true;
+          let r;
+          try {
+            r = await this.probeOne(account);
+          } finally {
+            q.probeChecking = false;
+            q.probeNextCheckAt = this._usageDeferredUntil(account) || nextSweep;
+          }
           this._lastUsageProbeAt = Date.now();
           if (r && r.status === 429) this._bumpUsageGap();
           else if (r && r.ok) this._relaxUsageGap();
@@ -196,6 +221,53 @@ export class Prober {
         }
       } catch { /* Existing quota and entitlements remain available on transient errors. */ }
     }
+  }
+
+  requestUsageRecheck(account) {
+    if (account?.type !== 'oauth' || account.provider === 'codex' || account.remote || account.poolBenchedBy
+        || account.refreshDead || !account.credential) return 'Select a local Claude subscription';
+    if (this.intervalMs <= 0 || this._stopping || this.am.writerLease === false) return 'Quota checks are paused';
+    const q = account.quota;
+    if (q.probeRetryAt > this._now()) return 'Provider requested a wait before the next quota check';
+    if (q.probeChecking) return 'Quota check already in progress';
+    if (this._subscriptionRecheckAt(account) > this._now()) {
+      return 'Subscription unavailable. Waiting for the scheduled quota recheck';
+    }
+    q.probeRecheckRequested = true;
+    q.probeNextCheckAt = null;
+    return `Quota check queued for the next scheduled check (~${Math.ceil(this.intervalMs / 1000)}s)`;
+  }
+
+  _subscriptionRecheckAt(account) {
+    if (!account.subscriptionGone) return 0;
+    // Restored/legacy latches may have no timestamp. Start their window once.
+    account._subRecheckAt ||= this._now();
+    return account._subRecheckAt + SUB_RECHECK_MS;
+  }
+
+  _usageDeferredUntil(account) {
+    const now = this._now();
+    const q = account.quota || {};
+    // The provider's 429 deadline also applies to a one-shot/manual sweep.
+    const retryAt = q.probeRetryAt > now ? q.probeRetryAt : 0;
+    if (account.subscriptionGone) {
+      const due = this._subscriptionRecheckAt(account);
+      return Math.max(retryAt, due > now ? due : 0);
+    }
+    // A free reset can be used externally without moving the natural reset day.
+    // Unknown/available grants stay on the grant-list cadence. An explicitly
+    // empty listing can wait longer; the natural refill bounds either delay.
+    const recentClaim = account.lastClaimAt && account.lastClaimAt >= (q.lastProbeOkSentAt || q.lastProbeOkAt);
+    const pendingGrant = account.resetGrants?.stale || this.am.isHoldingWall?.(account, now);
+    const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
+      && !recentClaim && !pendingGrant && !q.probeRecheckRequested;
+    const listing = account.resetGrants;
+    const noGrants = listing?.checkedAt && Array.isArray(listing.grants) && listing.grants.length === 0
+      && !listing.nextGrantId;
+    const interval = noGrants ? EXHAUSTED_NO_GRANTS_MS : GRANTS_EVERY_MS;
+    const grantCooldown = listing?.cooldownUntil > q.lastProbeOkAt ? listing.cooldownUntil : Infinity;
+    const due = weekly ? Math.min(q.lastProbeOkAt + interval, q.unified7dReset ?? Infinity, grantCooldown) : 0;
+    return Math.max(retryAt, due > now ? due : 0);
   }
 
   /** Wait until the current usage-probe gap has elapsed since the last usage
@@ -451,7 +523,7 @@ export class Prober {
         this.log(`[reset-grant] ${account.name}: grant ${act.grant.id} claimed${r.alreadyUsed ? ' (already used — idempotent)' : ''}`);
         return true;
       }
-      const { tries, waitMs } = this.am.noteClaimFailure?.(account.name, act.grant.id, now)
+      const { tries, waitMs } = this.am.noteClaimFailure?.(account.name, act.grant.id, now, r?.retryAt)
         || { tries: 1, waitMs: CLAIM_BACKOFF_STEPS_MS[0] };
       this.log(`[reset-grant] ${account.name}: claim FAILED ${act.grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       // A failed claim ENDS any cap lift (C3: "ends at once on a claim (success or failure)").
@@ -472,7 +544,8 @@ export class Prober {
   async probeOne(account) {
     // Benched duplicate: never refreshed locally (see the sweep filter in probeAll),
     // so the token is dead — a probe can only fail. Quota comes from the cloud mirror.
-    if (account.poolBenchedBy) return { ok: false, status: null, skipped: 'benched' };
+    if (account.poolBenchedBy || account.remote) return { ok: false, status: null, skipped: 'benched' };
+    if (account.quota?.probeRetryAt > this._now()) return { ok: false, status: null, skipped: 'retry-after' };
     // Subscription latched org-disabled (account-manager recordProbeError): the quota
     // endpoint 403s before answering anything, so probing is pure waste until the org
     // accepts OAuth again. Skipping also stops the every-60s hammer that ran 700+ times
@@ -482,12 +555,8 @@ export class Prober {
     // subscription until manual re-auth. Recheck it at a low cadence: a 200 clears the
     // latch (applyUsageData), another org-403 keeps it benched.
     if (account.subscriptionGone) {
-      // A latch set outside recordProbeError (state restore, tests, older builds) has no
-      // stamp: treat NOW as the latch moment so the first recheck waits a full window.
-      if (!account._subRecheckAt) account._subRecheckAt = Date.now();
-      const since = Date.now() - account._subRecheckAt;
-      if (since < SUB_RECHECK_MS) return { ok: false, status: 403 };
-      account._subRecheckAt = Date.now();
+      if (this._subscriptionRecheckAt(account) > this._now()) return { ok: false, status: 403 };
+      account._subRecheckAt = this._now();
       account._subRecheck = true;
     }
     try {
@@ -521,6 +590,13 @@ export class Prober {
               account._grantsListedAt = nowMs;
               this.am.applyResetGrants(account.index, listing);
               this._logGrantListingTransition(account, listing);
+              // This listing and the usage read below hit the same endpoint.
+              if (listing.status === 429 && listing.retryAt > this._now()) {
+                (account.quota ||= {}).probeRetryAt = listing.retryAt;
+                this.am.recordProbeError?.(account.index, listing.error, 429);
+                try { await this._rescueHeldWall(account); } catch { /* the retry deadline still applies */ }
+                return { ok: false, status: 429 };
+              }
             }
           }
           // C1: decide AFTER this sweep's usage probe (below), never before it —
@@ -553,10 +629,14 @@ export class Prober {
       }
       if (usage == null || usage.error) { // timed out / HTTP error (e.g. 429) / fetch failure
         const e = usage == null ? 'probe timed out' : usage.error;
+        if (usage?.status === 429 && Number.isFinite(usage.retryAt) && usage.retryAt > this._now()) {
+          (account.quota ||= {}).probeRetryAt = usage.retryAt;
+        }
         this.am.recordProbeError?.(account.index, e, usage?.status ?? null);
         await this._rescueHeldWall(account);   // red-team r2 #1: a held wall must not strand
         return { ok: false, status: usage?.status ?? null };
       }
+      if (account.quota?.probeRetryAt) account.quota.probeRetryAt = null;
       this.am.applyUsageData(account.index, usage, { sentAt: probeSentAt }); // clears the error + stamps freshness
       // C1: decide the claim on the reading JUST stored (this sweep's probe), on
       // the listing stored this same sweep — never on a pre-probe reading.
@@ -631,11 +711,15 @@ export class Prober {
    *  A still-roomy pool keeps holding; a refill that moved past 24h (or a dying
    *  grant) makes wallClaimHeld itself release. Never claims a wall nobody held.
    *  General weekly wall only (red-team r3): no model wall is ever held. */
-  async _rescueHeldWall(account) {
-    if (!this.am.isHoldingWall?.(account)) return;   // never a wall nobody held
+  async _rescueHeldWall(account, { refreshToken = false } = {}) {
+    if (this._stopping || this.am.writerLease === false || !this.am.isHoldingWall?.(account)) return;   // never a wall nobody held
     // A listing-side cooldown is a server instruction the reactive route doesn't read.
     const cd = account.resetGrants?.cooldownUntil;
     if (cd != null && cd > Date.now()) return;
+    if (refreshToken) {
+      if (!await this.am.ensureTokenFresh(account.index)) return;
+      if (this._stopping || this.am.writerLease === false || this.am.accounts[account.index] !== account) return;
+    }
     await this.am.tryReactiveClaim(account, { kind: 'weekly' });
   }
 

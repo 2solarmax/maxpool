@@ -2,6 +2,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
+import { MAX_QUOTA_RETRY_MS } from './reset-timing.js';
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 // Token endpoint is overridable via env so a stub OAuth server can be pointed at
@@ -301,6 +302,15 @@ export function parseLimitEntry(l) {
   };
 }
 
+// HTTP Retry-After accepts delta-seconds or an HTTP date. Keep the absolute
+// deadline so a worker restart cannot shorten an instruction from the provider.
+export function retryAfterAt(value, now = Date.now()) {
+  if (!value) return null;
+  const at = /^\d+$/.test(value) ? now + Number(value) * 1000
+    : /^[A-Za-z]{3}, /.test(value) ? Date.parse(value) : NaN;
+  return Number.isSafeInteger(at) && at > now ? Math.min(at, now + MAX_QUOTA_RETRY_MS) : null;
+}
+
 /** Read an account's quota from the zero-spend /api/oauth/usage endpoint.
  *  Returns { fiveHour, sevenDay, scopedWeekly } buckets, or { error, status }.
  *  Per-model + unified limits now live in the `limits[]` array (the top-level
@@ -323,7 +333,9 @@ export async function fetchUsage(accessToken) {
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
+      const retryAt = res.status === 429 ? retryAfterAt(res.headers?.get?.('retry-after')) : null;
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status,
+        ...(retryAt && { retryAt }) };
     }
 
     const data = await res.json();

@@ -516,6 +516,8 @@ Weekly Claude quota is treated as long-horizon budget, not the same as the 5-hou
 - `critical`: avoided unless no healthier eligible route exists. This can be raw weekly usage or reset-aware pace pressure.
 - `exhausted`: unavailable until weekly reset or upstream recovery.
 
+For fully exhausted Claude accounts with a successful inventory check showing no resets available, MaxPool checks again after 30 minutes or at the natural reset, whichever comes first. Failed inventory checks use the regular polling schedule. An external refill can take that long to appear. In Accounts, press `v` and select a local account for an earlier check. A provider rate limit can defer that check for up to six hours.
+
 The weekly usage bar shows raw upstream utilization and reset timing. Reset-aware burn rate is a separate pace signal used for routing pressure; it can mark an account as `Pace critical`, but only raw near-exhaustion or upstream rejection can show/block as `Wk exhausted`.
 
 ## How It Works

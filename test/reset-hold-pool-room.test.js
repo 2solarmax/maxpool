@@ -380,6 +380,78 @@ test('RT2-1 (major): probe ANSWERS but the listing call fails (stale) → a held
   } finally { restore(); }
 });
 
+for (const claimRateLimited of [false, true]) {
+  test(`a held weekly wall is reconsidered during usage Retry-After (claim rate-limited: ${claimRateLimited})`, async t => {
+    const minute = 60_000;
+    const first = Date.now();
+    let now = first;
+    t.mock.method(Date, 'now', () => now);
+    const am = pool(3, now);
+    const self = am.accounts[0];
+    const grant = G();
+    am.applyResetGrants(0, listing({ grants: [grant] }));
+    assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly' }), false);
+    assert.equal(am.isHoldingWall(self), true);
+
+    const usageDeadline = first + (claimRateLimited ? 60 : 10) * minute;
+    let peersFull = false;
+    const wallReads = [], claims = [];
+    t.mock.method(globalThis, 'fetch', async (url, options) => {
+      if (String(url).endsWith('/api/oauth/profile')) return globalThis.Response.json({ organization: { uuid: 'test' } });
+      claims.push({ url: String(url), at: now, authorization: new globalThis.Headers(options?.headers).get('authorization') });
+      if (claimRateLimited && claims.length === 1) {
+        return globalThis.Response.json({ error: { message: 'wait' } }, { status: 429, headers: { 'retry-after': '1800' } });
+      }
+      return globalThis.Response.json({ success: true });
+    });
+    const prober = new Prober(am, { intervalMs: minute, usageGapMs: 0, now: Date.now, log: () => {},
+      grantsFn: async token => {
+        if (token === self.credential) wallReads.push('grants');
+        return listing({ grants: token === self.credential ? [grant] : [] });
+      },
+      probeFn: async token => {
+        if (token === self.credential) {
+          wallReads.push('usage');
+          return { status: 429, error: 'wait', retryAt: usageDeadline };
+        }
+        return { sevenDay: { utilization: peersFull ? 0.8 : 0.3, resetAt: first + DAY },
+          fiveHour: { utilization: 0.2, resetAt: first + H } };
+      } });
+    await prober.probeAll();
+    assert.equal(self.quota.probeRetryAt, usageDeadline);
+    assert.equal(claims.length, 0);
+    peersFull = true;
+    for (const peer of am.accounts.slice(1)) peer.quota.unified7d = 0.8;
+    now += minute;
+    am.setWriterLease(false);
+    await prober.probeAll();
+    assert.equal(claims.length, 0, 'observer cannot rescue a held claim');
+    am.setWriterLease(true);
+    // No usage request can refresh the held account while its deadline is active.
+    t.mock.method(am, 'ensureTokenFresh', async index => {
+      if (index === self.index) self.credential = 'renewed-fixture-token';
+      return true;
+    });
+    await Promise.all([prober.probeAll(), prober.probeAll()]);
+    assert.deepEqual(claims.map(c => c.at), [first + minute], 'the next owning sweep attempts one claim');
+    assert.match(claims[0].url, /\/reset_rate_limits$/);
+    assert.equal(claims[0].authorization, 'Bearer renewed-fixture-token');
+    if (claimRateLimited) {
+      now += 29 * minute;
+      await prober.probeAll();
+      assert.equal(claims.length, 1, 'explicit claim deadline survives the shorter local failure backoff');
+      now += minute;
+      await prober.probeAll();
+      assert.equal(claims.length, 2);
+    }
+    now += minute;
+    await prober.probeAll();
+    assert.equal(self.lastFullGeneralClaimAt, now - minute);
+    assert.deepEqual(wallReads, ['grants', 'usage'], 'both usage reads respect the original provider deadline');
+    assert.equal(claims.length, claimRateLimited ? 2 : 1, 'a completed wall is claimed exactly once');
+  });
+}
+
 test('RT2-1 (guard): the rescue honours a listing cooldown', async () => {
   const posts = [];
   const restore = stubFetch(posts);

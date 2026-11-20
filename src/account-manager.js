@@ -17,7 +17,7 @@ import { appliesTo, clearsGeneralWeekly, forgetClaimOrg } from './claude-reset-g
 import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM } from './reset-policy.js';
 import {
   LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
-  CLAIM_BACKOFF_CAP_MS, REACTIVE_CLAIM_TIMEOUT_MS, CLAIM_FRESH_MS,
+  CLAIM_BACKOFF_CAP_MS, MAX_QUOTA_RETRY_MS, REACTIVE_CLAIM_TIMEOUT_MS, CLAIM_FRESH_MS,
 } from './reset-timing.js';
 
 // Review r2 A: consecutive request-scoped faults before they count against the account.
@@ -415,6 +415,12 @@ const PEAK_TIER_STRIDE = 1_000_000;
 const _pressureCache = new WeakMap();
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
+// Older snapshots can contain an uncapped provider deadline. Save the bounded
+// absolute time on the next state write so future workers keep the same deadline.
+function restoredProbeRetryAt(deadline, now = Date.now()) {
+  return Number.isSafeInteger(deadline) && deadline > now ? Math.min(deadline, now + MAX_QUOTA_RETRY_MS) : null;
+}
+
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
 // (probing, requalify, rateLimitedUntil) and credentials are intentionally
@@ -428,7 +434,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // drops until the next probe sweep re-learns it. The probe still rewrites it on
   // every successful sweep, so a plan change heals on the same cadence.
   'weeklyAbsent', 'capSpanSes', 'capSpanWk', 'providerSes', 'providerSesReset', 'providerWk', 'providerWkReset',
-  'providerQuotaSource', 'lastProbeOkAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogVersion',
+  'providerQuotaSource', 'lastProbeOkAt', 'probeRetryAt', 'noPlan', 'codexModels', 'codexCatalogEtag', 'codexCatalogVersion',
   'codexCatalogCheckedAt', 'codexResetCredits', 'codexLimitByModel', 'codexScopedFiveHour', 'codexSharedFiveHourVerified', 'codexFiveHourAbsent', 'codexWeeklyReadingAt',
 ];
 
@@ -7385,6 +7391,20 @@ export class AccountManager {
     });
   }
 
+  restoreProbeRetryDeadlines(saved) {
+    if (!Array.isArray(saved)) return;
+    for (const account of this.accounts) {
+      if (account.remote) continue;
+      const prior = saved.find(row => this._sameIdentity(row, account))?.quota;
+      if (prior && Object.hasOwn(prior, 'probeRetryAt')) {
+        const now = Date.now();
+        const live = restoredProbeRetryAt(account.quota.probeRetryAt, now);
+        const final = restoredProbeRetryAt(prior.probeRetryAt, now);
+        account.quota.probeRetryAt = Math.max(live ?? 0, final ?? 0) || null;
+      }
+    }
+  }
+
   /**
    * Restore quota learned in a previous run, matched to accounts by identity.
    * Stale windows are not special-cased — _clearExpiredQuotas wipes any restored
@@ -7398,6 +7418,7 @@ export class AccountManager {
       for (const f of PERSISTED_QUOTA_FIELDS) {
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
       }
+      account.quota.probeRetryAt = restoredProbeRetryAt(account.quota.probeRetryAt);
       // Only keep a restored utilization that carries a clearable reset window.
       // A stale value with no reset can't be cleared by _clearExpiredQuotas and
       // could otherwise pin the account unavailable until the first live response.
@@ -7779,15 +7800,17 @@ export class AccountManager {
   }
 
   /** C6: record a claim FAILURE — backoff per (account, grantId) 15m/30m/1h, cap 6h.
-   *  Shared state with the prober path (same maps). Returns the wait ms. */
-  noteClaimFailure(accountName, grantId, now = Date.now()) {
+   *  A later provider Retry-After takes precedence within the six-hour cap. Both claim paths share the deadline. */
+  noteClaimFailure(accountName, grantId, now = Date.now(), retryAt = 0) {
     const key = `${accountName}:${grantId}`;
     if (!this._claimTries) this._claimTries = new Map();
     if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
     const tries = (this._claimTries.get(key) || 0) + 1;
     this._claimTries.set(key, tries);
     const steps = CLAIM_BACKOFF_STEPS_MS;
-    const waitMs = Math.min(CLAIM_BACKOFF_CAP_MS, steps[Math.min(tries - 1, steps.length - 1)]);
+    const policyWait = steps[Math.min(tries - 1, steps.length - 1)];
+    const providerWait = Number.isFinite(retryAt) ? retryAt - now : 0;
+    const waitMs = Math.min(CLAIM_BACKOFF_CAP_MS, Math.max(policyWait, providerWait));
     this._claimRetryUntil.set(key, now + waitMs);
     return { tries, waitMs };
   }
@@ -7882,7 +7905,7 @@ export class AccountManager {
         console.log(`[reset-grant] ${account.name}: grant ${grant.id} claimed reactively (${kind === 'weekly' ? 'weekly 429 at the wall' : `${kind} scoped 429`})`);
         return true;
       }
-      const { tries, waitMs } = this.noteClaimFailure(account.name, grant.id, now);
+      const { tries, waitMs } = this.noteClaimFailure(account.name, grant.id, now, r?.retryAt);
       console.log(`[reset-grant] ${account.name}: reactive claim FAILED ${grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       this.endCapLift(account.index, 'reactive claim failed');
       return true;   // attempted

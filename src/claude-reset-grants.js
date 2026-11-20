@@ -22,6 +22,7 @@
  * counts as success (idempotent) — request_id is the client's idempotency key.
  */
 import { randomUUID } from 'node:crypto';
+import { retryAfterAt } from './oauth.js';
 
 const USAGE_BASE = 'https://api.anthropic.com/api/oauth/usage';
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
@@ -170,7 +171,10 @@ export async function listResetGrants(accessToken, { signal, fetchImpl = (u, o) 
       headers: headers(accessToken), signal,
     });
     if (res.status === 401) return { error: 'unauthorized' };
-    if (!res.ok) return { error: `HTTP ${res.status}` };
+    if (!res.ok) {
+      const retryAt = res.status === 429 ? retryAfterAt(res.headers?.get?.('retry-after')) : null;
+      return { error: `HTTP ${res.status}`, ...(retryAt && { status: 429, retryAt }) };
+    }
     const body = await res.json();
     const ce = body?.cedar_ember;
     if (!ce || typeof ce !== 'object') {
@@ -255,8 +259,9 @@ export async function claimResetGrant(accessToken, grantId, { signal, requestId,
     // 403/404 on the org path: the cached org no longer belongs to this login —
     // drop it so the next claim re-reads the profile.
     if ((res.status === 403 || res.status === 404) && accountKey != null) _orgCache.delete(accountKey);
+    const retryAt = res.status === 429 ? retryAfterAt(res.headers?.get?.('retry-after')) : null;
     return { ok: false, error: data?.error?.message || JSON.stringify(data).slice(0, 200), code: data?.error?.type,
-      status: Number.isFinite(res.status) ? res.status : null };
+      status: Number.isFinite(res.status) ? res.status : null, ...(retryAt && { retryAt }) };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
   }

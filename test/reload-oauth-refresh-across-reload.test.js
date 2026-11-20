@@ -259,7 +259,7 @@ test('a native refresh can finish beyond a legacy supervisor release deadline wi
   }
 });
 
-test('an encrypted continuation arriving through the supervisor waits for the final owner snapshot', async () => {
+test('a replacement worker restores final quota and owner state before serving a forwarded continuation', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'maxpool-forwarded-native-'));
   const configPath = join(dir, 'config.json');
   const listener = net.createServer({ pauseOnConnect: true });
@@ -269,7 +269,8 @@ test('an encrypted continuation arriving through the supervisor waits for the fi
   const acct = { name: 'offline', enabled: false, type: 'oauth', provider: 'codex', codexAuth: 'native',
     accessToken: 'fake', accountUuid: 'user', codexAccountId: 'workspace', organizationUuid: 'workspace' };
   await writeFile(configPath, JSON.stringify({ proxy: { host: '127.0.0.1', port, apiKey: 'fixture-owner' },
-    accounts: [acct], updateCheck: false, preventSleep: false }));
+    accounts: [acct, { name: 'quota fixture', type: 'oauth', accessToken: 'test-token', enabled: false }],
+    updateCheck: false, preventSleep: false }));
   const child = fork(cliPath, ['server'], {
     env: { ...process.env, MAXPOOL_CONFIG: configPath, MAXPOOL_SERVER_WORKER: '1', MAXPOOL_RELOAD_WORKER: '1',
       MAXPOOL_DISABLE_QUOTA_PROBE: '1', MAXPOOL_DISABLE_SLEEP_GUARD: '1' },
@@ -288,13 +289,18 @@ test('an encrypted continuation arriving through the supervisor waits for the fi
     });
     await forwarded;
     const sha = str => createHash('sha256').update(str).digest('hex');
+    const retryAt = Date.now() + 120_000;
     await writeFile(join(dir, 'config.state.json'), JSON.stringify({
+      quota: [{ name: 'quota fixture', quota: { probeRetryAt: retryAt } }],
       nativeCodexConversationOwners: [['codex-wire:' + sha('thread-x'), sha(JSON.stringify(['user', 'workspace']))]],
     }));
     child.send({ type: 'takeover' }, listener);
     const reply = await followup;
     assert.equal(reply.status, 429, 'restored disabled owner is unavailable; an ownerless continuation would get 409');
     await reply.text();
+    listener.on('connection', socket => child.send({ type: 'conn' }, socket));
+    const state = await status(port, 'fixture-owner');
+    assert.equal(state.accounts.find(row => row.name === 'quota fixture')?.quota.probeRetryAt, retryAt);
   } finally {
     killGroup(child);
     await new Promise(r => listener.close(r));

@@ -1514,6 +1514,7 @@ async function serverWorkerCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config,
+      onQuotaRecheck: account => prober.requestUsageRecheck(account),
       codexResetDetails: name => codexReset.readDetails(owningCodex(name)),
       redeemCodexReset: (name, creditId) => codexReset.manualRedeem(owningCodex(name), creditId),
       onSetCodexAutoRedeem: async (name, enabled) => {
@@ -1743,6 +1744,7 @@ async function serverWorkerCommand() {
     // The old worker could serve a first turn or evict an old conversation after
     // our headless boot. Adopt its final ownership maps before serving any socket.
     const finalState = await loadState();
+    accountManager.restoreProbeRetryDeadlines(finalState?.quota);
     accountManager.routingService.restoreState(finalState?.routingService);
     accountManager.routingCapacity.restore(finalState?.routingCapacity);
     if (finalState?.capacity) {
