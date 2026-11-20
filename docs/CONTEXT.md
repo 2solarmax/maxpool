@@ -27,6 +27,10 @@ and provider-sticky routing are being qualified on an isolated listener.
 
 ## Decisions
 
+### 2026-11-19 · Local terminal request cap
+
+The local proxy checks the full terminal UUID and resolved caller before admitting a message. Operators can arm an existing terminal for a bounded task. Each incoming client attempt consumes one slot even when its eventual request fails. Slots persist across worker restarts. Cloud retries inside that request, generated tokens, and subscription quota use require separate measurement.
+
 ### 2026-11-19 · Account configuration writes
 
 Claude browser login matches only Claude OAuth accounts. Another provider can keep the requested name and grant while the new Claude account gets a distinct label. Local CLI enrollment updates the latest locked config, and terminal account actions apply the selected row and fields so concurrent enrollment, credential rotation, and deletion survive.

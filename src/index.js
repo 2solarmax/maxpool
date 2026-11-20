@@ -25,6 +25,7 @@ import { fetchRemoteStatus } from './pool-link.js';
 import { SleepGuard } from './sleep-guard.js';
 import { controllingTerminalAlive } from './terminal-alive.js';
 import { AccountManager, combineEfficiency } from './account-manager.js';
+import { sessionCapCommand } from './session-cap.js';
 import { cacheUsageLabel } from './usage-label.js';
 import { createProxyServer, REQUEST_IDLE_MAX_MS } from './server.js';
 
@@ -148,6 +149,14 @@ switch (command) {
   case 'pool':
     await poolCommand();
     process.exit(0);
+    break;
+  case 'session-cap':
+    try {
+      console.log(JSON.stringify(await sessionCapCommand(args.slice(1))));
+    } catch (err) {
+      console.error(err.message);
+      process.exitCode = 1;
+    }
     break;
   case 'route':
     await routeCommand();
@@ -2691,6 +2700,7 @@ Commands:
   pool shared <host> <key>  Point this machine at a shared team pool
   pool local          Point this machine back at its own local pool
   pool status         Show which pool this machine points at
+  session-cap         Arm, inspect, or disarm a local terminal request limit (session-cap for usage)
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
   accounts            List configured accounts
