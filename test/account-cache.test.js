@@ -377,3 +377,56 @@ test('partially overlapping 1.24.116 imports from reused aliases stay visibly un
   assert.equal(view.all.partial, true);
   assert.equal(view['1h'].partial, true);
 });
+
+test('an unmatched legacy display name cannot seed an account first created after migration', () => {
+  const oldHours = { absent: { '2026-11-20T09': { in: 17, cr: 3, cc: 0, out: 1 } } };
+  const pool = new AccountManager([]);
+  pool.restoreAccountCacheHours(oldHours, now);
+  const later = new AccountManager([account('absent')]);
+  later.restoreCapacityState(pool.capacity.serialize());
+  later.restoreAccountCacheHours(oldHours, now);
+  assert.equal(later.accountCacheWindows(later.accounts[0], now).windows.all.input, 0);
+  assert.equal(later.providerCacheWindows(now).claude.windows.all.cacheRead, 0);
+});
+
+test('a current checkpoint saved before its first import preserves that pending migration', () => {
+  const oldHours = { demo: { '2026-11-20T09': { in: 27, cr: 3, cc: 0, out: 1 } } };
+  const unopened = new AccountManager([account('demo')]);
+  const disk = unopened.capacity.serialize();
+  assert.equal(disk.legacyCacheImportComplete, false);
+  const pool = new AccountManager([account('demo')]);
+  pool.restoreCapacityState(disk);
+  pool.restoreAccountCacheHours(oldHours, now);
+  const measured = pool.providerCacheWindows(now).claude.windows.all;
+  assert.equal(measured.input, 27);
+  assert.equal(measured.cacheRead, 3);
+  assert.equal(pool.capacity.serialize().legacyCacheImportComplete, true);
+});
+
+test('a clean current migration and restart preserve exact lifetime coverage', () => {
+  const oldHours = { demo: { '2026-11-20T09': { in: 21, cr: 4, cc: 1, out: 3 } } };
+  const pool = new AccountManager([account('demo')]);
+  pool.restoreAccountCacheHours(oldHours, now);
+  const again = new AccountManager([account('demo')]);
+  again.restoreCapacityState(pool.capacity.serialize());
+  again.restoreAccountCacheHours(oldHours, now);
+  const all = again.accountCacheWindows(again.accounts[0], now).windows.all;
+  assert.deepEqual([all.input, all.cacheRead, all.output, all.partial], [21, 4, 3, false]);
+});
+
+test('a legacy checkpoint with pruned old hours keeps uncertainty in lifetime only', () => {
+  const clock = Date.now();
+  const prior = new AccountManager([account('demo')]);
+  prior.accrueCapacity(0, { input: 31 }, clock - 10 * 24 * hour);
+  const disk = prior.capacity.serialize();
+  delete disk.legacyCacheImportComplete;
+  const history = Object.values(disk.ownerCache)[0];
+  history.minutes = {};
+  history.legacyHours = {};
+  const again = new AccountManager([account('demo')]);
+  again.restoreCapacityState(disk);
+  const periods = again.providerCacheWindows(clock).claude.windows;
+  assert.equal(periods.all.input, 31);
+  assert.equal(periods.all.partial, true);
+  for (const period of ['1h', '3h', '24h', '7d']) assert.equal(periods[period].partial, false);
+});
