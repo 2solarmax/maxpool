@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.119] - 2026-11-20
+
+### Fixed
+
+- Bound quota retries and preserve valid waits through worker takeover
+
 ## [1.24.118] - 2026-11-20
 
 ### Added
@@ -44,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Preserve held reset decisions while quota reads are deferred
 - Verify terminal cleanup precedes asynchronous drain on exit
 
 ### Fixed
@@ -52,11 +59,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retain the newest usage when link reports share a timestamp
 - Preserve configured display names in capacity and activity
 
-## [1.24.114] - 2026-11-19
+## [1.24.115] - 2026-11-19
 
 ### Added
 
 - Cap client requests for a selected local terminal
+
+### Changed
+
+- Schedule exhausted Claude quota checks by account and report owner timing
+- Back off full weeks with no grants and allow an owner-requested recheck
+- Keep the Claude weekly check indicator scoped to Claude on the released pool
+- Verify named and legacy cap scope across retries
+- Fix the four baseline lint fixtures that block the terminal-cap checks
+
+### Fixed
+
+- Disarm a terminal cap with a missing run directory
+
+## [1.24.114] - 2026-11-19
+
+### Added
+
 - Route Claude Code through ChatGPT subscriptions
 - Route Claude Code through native Codex subscriptions
 - Show automatic reset preference in MaxPool account details
@@ -65,8 +89,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Verify named and legacy cap scope across retries
-- Fix the four baseline lint fixtures that block the terminal-cap checks
 - Align release checks with supported Node versions
 - Cover Codex quota ownership and banked reset routing
 - Support Claude Code web tools on native Codex accounts
@@ -102,7 +124,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Disarm a terminal cap with a missing run directory
 - Handle ChatGPT plan streams in the isolated provider pilot
 - Report unavailable Codex routes accurately
 - Follow stable Codex clients for model discovery
