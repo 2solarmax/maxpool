@@ -520,8 +520,9 @@ gateDescribe('rc-gate: a stalled upstream on session CREATE errors out (stall ti
 });
 
 gateDescribe('rc-gate: a long-poll path with slow headers is NEVER stall-destroyed', { timeout: 20_000 }, async () => {
-  // Upstream that answers /worker/heartbeat only after 4s — longer than the 1.5s
-  // stall window. v1 would have destroyed it; v2 must not.
+  // Upstream that answers /worker/events (a true long-poll) only after 4s — longer than the
+  // 1.5s stall window. v1 would have destroyed it; v2 must not. (This used to use
+  // /worker/heartbeat, which has since moved to its own short stall budget + hedge.)
   const up = tls.createServer({
     key: readFileSync(join(GATE_DIR, 'anthropic-mitm.key')),
     cert: readFileSync(join(GATE_DIR, 'anthropic-mitm.crt')),
@@ -542,9 +543,9 @@ gateDescribe('rc-gate: a long-poll path with slow headers is NEVER stall-destroy
       const to = setTimeout(() => reject(new Error('no response within 10s — long-poll was stall-destroyed or upstream broken')), 10_000);
       t.on('data', d => { buf += d.toString(); if (buf.includes('200 OK')) { clearTimeout(to); resolve('200'); } });
       t.on('close', () => { clearTimeout(to); reject(new Error('tunnel closed before headers — stall timeout destroyed a long-poll')); });
-      t.write('POST /v1/code/sessions/cse_x/worker/heartbeat HTTP/1.1\r\nhost: api.anthropic.com\r\ncontent-length: 2\r\n\r\n{}');
+      t.write('POST /v1/code/sessions/cse_x/worker/events HTTP/1.1\r\nhost: api.anthropic.com\r\ncontent-length: 2\r\n\r\n{}');
     });
-    assert.equal(got, '200', 'slow-headers heartbeat survives the stall window');
+    assert.equal(got, '200', 'slow-headers long-poll survives the stall window');
     gate.kill();
   } finally {
     up.close();

@@ -1,16 +1,16 @@
 // rc-gate: Remote Control heartbeats must survive a stalled upstream socket (2026-11-21).
 // The CLI gives POST /worker/heartbeat 13s; 3 failures => close 4093, the 4th in an hour
 // switches Remote Control off for that session for good. Measured mass give-ups came from
-// (M1) heartbeat attempts hanging on dead sockets (classed long-poll => no stall timer, and
-// stall-destroys were never retried) and (M2) a CPU-starved gate. Runs the REAL rc-gate.js
+// (M1) heartbeat attempts hanging on dead sockets (classed long-poll => no stall timer, so the
+// CLI's 13s budget expired silently) and (M2) a CPU-starved gate. Runs the REAL rc-gate.js
 // as a child process: CONNECT -> TLS (mkcert) -> HTTP, like the CLI.
-import test, { before } from 'node:test';
+import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
-import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,9 +26,12 @@ const HAVE_OPENSSL = spawnSync('openssl', ['version'], { stdio: 'ignore' }).stat
 if (!HAVE_OPENSSL) console.log('rc-gate-heartbeat-stall: SKIPPED - `openssl` not found on PATH, cannot mint the throwaway test CA');
 const gateTest = HAVE_OPENSSL ? test : test.skip;
 const pki = { dir: '', ca: '', cert: '', key: '' };
+// Every temp dir this file creates is enumerated here and removed in after().
+const tmpDirs = [];
+const tmp = prefix => { const d = mkdtempSync(join(tmpdir(), prefix)); tmpDirs.push(d); return d; };
 
 function mintPki() {
-  const dir = mkdtempSync(join(tmpdir(), 'rcgate-pki-'));
+  const dir = tmp('rcgate-pki-');
   const f = n => join(dir, n);
   const sh = (...args) => execFileSync('openssl', args, { stdio: 'pipe' });
   writeFileSync(f('ca.cnf'), [
@@ -47,6 +50,7 @@ function mintPki() {
   Object.assign(pki, { dir, ca: f('ca.crt'), cert: f('leaf.crt'), key: f('leaf.key') });
 }
 if (HAVE_OPENSSL) before(() => mintPki());
+after(() => { for (const d of tmpDirs) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } } });
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -57,17 +61,40 @@ function asTLS(httpServer) {
   }, sock => httpServer.emit('connection', sock));
 }
 
-async function startGate(env) {
+// A port nothing listens on: the default upstream, so a test that forgets to point the
+// gate at its fake can never reach the real api.anthropic.com.
+function deadPort() {
+  return new Promise(resolve => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => { const { port } = srv.address(); srv.close(() => resolve(port)); });
+  });
+}
+
+// ISOLATED gate: nothing inherited from the developer's shell or live setup may steer it.
+// Strips proxy vars and every RC_GATE_*; routing file absent; upstream = a dead port unless
+// the test overrides; its own force-evac flag file (never the live /tmp one).
+async function startGate(env = {}) {
+  const base = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (/^RC_GATE_/.test(k) || /^(https?_proxy|no_proxy)$/i.test(k)) continue;
+    base[k] = v;
+  }
+  const evacFlag = join(tmp('rcgate-evac-'), 'force-evac');
   const gate = spawn('node', ['rc-gate.js'], {
     cwd: GATE_DIR,
     env: {
-      ...process.env, NODE_EXTRA_CA_CERTS: pki.ca, RC_GATE_MITM_CERT: pki.cert, RC_GATE_MITM_KEY: pki.key,
-      RC_GATE_TITLE_SYNC: '0', ...env,
+      ...base, NODE_EXTRA_CA_CERTS: pki.ca, RC_GATE_MITM_CERT: pki.cert, RC_GATE_MITM_KEY: pki.key,
+      RC_GATE_TITLE_SYNC: '0', RC_GATE_PORT: '0', RC_GATE_MAXPOOL_PORT: '1',
+      RC_GATE_ROUTE_FILE: join(tmp('rcgate-route-'), 'no-such-route-file'),
+      RC_GATE_DIRECT_HOST: '127.0.0.1', RC_GATE_DIRECT_PORT: String(await deadPort()),
+      RC_GATE_FORCE_EVAC_FLAG: evacFlag,
+      ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let log = '';
   gate.port = null;
+  gate.evacFlag = evacFlag;
   gate.stdout.on('data', d => { log += d.toString(); });
   gate.stderr.on('data', d => { log += d.toString(); });
   gate.getLog = () => log;
@@ -98,8 +125,9 @@ function mitmConnect(gatePort, host = 'api.anthropic.com') {
 
 // Send one request over the tunnel (NO `connection: close`: that header is forwarded
 // upstream and would defeat the keep-alive agent). Resolves with what arrived once the
-// response head is complete and, for the JSON fakes below, the body marker has landed —
-// or on a 4xx/5xx head — or with { how: 'timeout' | 'closed' } so a failing run reports instead of hanging.
+// response head is complete and, for the JSON fakes below, the body marker has landed,
+// or on a 4xx/5xx head, or with { how: 'timeout' | 'closed' } so a failing run reports
+// instead of hanging.
 function request(t, method, path, budgetMs, body = '{}') {
   return new Promise(resolve => {
     let raw = '';
@@ -114,72 +142,167 @@ function request(t, method, path, budgetMs, body = '{}') {
 }
 
 const status = raw => (/^HTTP\/1\.1 (\d{3})/.exec(raw) || [])[1];
+const HB = '/v1/code/sessions/cse_hb/worker/heartbeat';
+const OK = '{"ok":true}';
+const json200 = (res, body = OK) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(body); };
+const track = sock => { const rec = { sock, closed: false }; sock.once('close', () => { rec.closed = true; }); return rec; };
 
-// ── (a) heartbeat whose first attempt black-holes is retried on a fresh connection ──
-// Bites: M1. Revert the `isHeartbeat` carve-out of `isLongPoll` (no stall timer: the first
-// attempt hangs forever -> no response in 13s) OR the `hbStallRetry` term in `replaySafe`
-// (the stall-destroy is not retried -> 502, never 2xx).
-gateTest('rc-gate: a heartbeat whose first upstream attempt hangs is retried on a fresh connection and answered 2xx inside the CLI 13s budget', { timeout: 30_000 }, async () => {
-  const hbSockets = [];
-  const up = http.createServer((req, res) => {
-    req.resume();
-    if (!req.url.endsWith('/worker/heartbeat')) { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); return; }
-    hbSockets.push(req.socket);
-    if (hbSockets.length === 1) return;                 // black hole: accept, never answer
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end('{"ok":true}');
-  });
+async function withUpstream(handler, fn, gateEnv) {
+  const up = http.createServer(handler);
+  up.keepAliveTimeout = 60_000;     // idle keep-alive sockets must outlive a test, only the gate may close them
   const ups = asTLS(up);
   await new Promise(r => ups.listen(0, '127.0.0.1', r));
-  // DEFAULT stall budget on purpose: the 6s default x 2 attempts must fit in 13s.
-  const gate = await startGate({
-    RC_GATE_PORT: '0', RC_GATE_MAXPOOL_PORT: '1',
-    RC_GATE_DIRECT_HOST: '127.0.0.1', RC_GATE_DIRECT_PORT: String(ups.address().port),
-  });
-  try {
+  const gate = await startGate({ RC_GATE_DIRECT_PORT: String(ups.address().port), ...gateEnv });
+  try { await fn(gate, up); } finally { gate.kill(); await new Promise(r => ups.close(r)); }
+}
+
+// ── (a) heartbeat whose first attempt black-holes is HEDGED on a fresh connection ──
+// Kills: dropping the `isHeartbeat` carve-out of `isLongPoll` (no stall timer: no hedge, the
+// request hangs past the CLI's 13s); `canHedge` never true / `dirSend(true)` removed (no second
+// attempt -> no 2xx).
+gateTest('rc-gate: a heartbeat whose first upstream attempt hangs is hedged on a fresh connection and answered 2xx inside the CLI 13s budget', { timeout: 30_000 }, async () => {
+  const hb = [];
+  await withUpstream((req, res) => {
+    req.resume();
+    if (!req.url.endsWith('/worker/heartbeat')) return json200(res);
+    hb.push(track(req.socket));
+    if (hb.length === 1) return;                         // black hole: accept, never answer
+    json200(res);
+  }, async gate => {
     const { tls: t } = await mitmConnect(gate.port);
-    const r = await request(t, 'POST', '/v1/code/sessions/cse_hb/worker/heartbeat', 13_000);
+    const r = await request(t, 'POST', HB, 13_000);       // DEFAULT 6s budget: hedge at 6s, answer ~6s
     assert.equal(r.how, 'response', `heartbeat must be answered inside 13s, got ${r.how} after ${r.ms}ms. Gate log:\n${gate.getLog().slice(-500)}`);
     assert.match(status(r.raw), /^2/, `2xx expected, got: ${r.raw.slice(0, 90)}`);
     assert.ok(r.ms < 13_000, `answered in ${r.ms}ms`);
-    assert.equal(hbSockets.length, 2, 'upstream saw exactly one retry');
-    assert.notEqual(hbSockets[0], hbSockets[1], 'the retry used a fresh upstream connection');
-    assert.match(gate.getLog(), /\[direct-stall\].*worker\/heartbeat/, 'the stall timer fired on the heartbeat');
-  } finally { gate.kill(); await new Promise(r => ups.close(r)); }
+    assert.equal(hb.length, 2, 'upstream saw exactly one extra attempt');
+    assert.notEqual(hb[0].sock, hb[1].sock, 'the hedge used a fresh upstream connection');
+    assert.match(gate.getLog(), /\[direct-stall\].*worker\/heartbeat.*hedging/, 'the stall timer fired and hedged');
+  });
 });
 
-// ── (b) a stall-destroyed session CREATE is still never retried ─────────────────
-// Guard (passes before AND after the fix). Bites if someone widens `hbStallRetry` to all
-// idempotent/own-stall paths: remove the `isHeartbeat &&` term (or the `!ownStall` guard)
-// and the create is replayed -> upstream sees 2 POSTs.
-gateTest('rc-gate: a stall-destroyed session create is NOT retried (a replayed create can double-create)', { timeout: 20_000 }, async () => {
+// ── (a2) hedge: the FIRST attempt answers late and the hedge never does -> client gets attempt 1 ──
+// Kills destroy-and-retry (the stall destroys attempt 1 at 6s; attempt 2 never answers; client
+// gets a 502 at ~12s instead of attempt 1's 2xx at 8s), and a winner rule that favours the newest
+// attempt. Also pins that the loser's connection is torn down.
+gateTest('rc-gate: hedged heartbeat - attempt 1 answering at ~8s (after the 6s hedge) wins; attempt 2 is torn down', { timeout: 30_000 }, async () => {
+  const hb = [];
+  await withUpstream((req, res) => {
+    req.resume();
+    hb.push(track(req.socket));
+    if (hb.length === 1) setTimeout(() => json200(res, '{"ok":true,"via":"first"}'), 8_000);
+    // attempt 2: never answers
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 13_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms. Gate log:\n${gate.getLog().slice(-500)}`);
+    assert.match(status(r.raw), /^2/, `attempt 1's 2xx expected, got: ${r.raw.slice(0, 90)}`);
+    assert.match(r.raw, /"via":"first"/, 'the body is attempt 1\'s');
+    assert.ok(r.ms >= 7_500 && r.ms < 12_000, `answered at attempt 1's time (~8s), got ${r.ms}ms`);
+    assert.equal(hb.length, 2, 'the hedge did fire (attempt 2 reached upstream)');
+    await sleep(500);
+    assert.equal(hb[1].closed, true, 'the losing attempt\'s connection was destroyed');
+  });
+});
+
+// ── (a3) two stalls: exactly two attempts, 502 before the CLI's 13s ──────────────
+// Kills: a third attempt (hedge not capped by `hbHedged`), no overall deadline (client hangs
+// past 13s), a deadline that is not 12.5s.
+gateTest('rc-gate: a heartbeat that stalls on BOTH attempts makes exactly two upstream attempts and gets a 502 before 13s', { timeout: 30_000 }, async () => {
+  let attempts = 0;
+  await withUpstream(req => { req.resume(); attempts++; }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 14_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms`);
+    assert.equal(status(r.raw), '502');
+    assert.match(r.raw, /rc_gate_direct_error/, 'the existing 502 shape');
+    assert.ok(r.ms < 13_000, `502 must beat the CLI's 13s budget, took ${r.ms}ms`);
+    await sleep(500);
+    assert.equal(attempts, 2, `exactly two upstream attempts, saw ${attempts}`);
+  });
+});
+
+// ── (a4) error retries share the overall deadline ───────────────────────────────
+// The upstream resets every heartbeat; retries back off ~3s*n. Kills: no deadline on error
+// retries (the client waits through all retries, tens of seconds -> 'timeout'), a retry timer
+// that outlives the 502 (attempt count keeps growing afterwards).
+gateTest('rc-gate: heartbeat error retries stop at the 12.5s overall deadline with a 502', { timeout: 30_000 }, async () => {
+  let attempts = 0;
+  await withUpstream(req => { attempts++; req.socket.destroy(); }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 14_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms. Gate log:\n${gate.getLog().slice(-400)}`);
+    assert.equal(status(r.raw), '502');
+    assert.ok(r.ms >= 11_500 && r.ms < 13_000, `502 at the 12.5s deadline, got ${r.ms}ms`);
+    const at502 = attempts;
+    assert.ok(at502 >= 2, 'retries really happened before the deadline');
+    await sleep(2_000);
+    assert.equal(attempts, at502, 'no retry fires after the deadline answered the client');
+  }, { RC_GATE_DIRECT_RETRY_MAX: '50', RC_GATE_DIRECT_RETRY_BACKOFF_MS: '3000' });
+});
+
+// ── (a5) client gone mid-hedge -> BOTH attempts destroyed ───────────────────────
+// Kills: the close handler tearing down only the latest attempt (`curDir`) and not every
+// live one (attempt 1 leaks until the process dies).
+gateTest('rc-gate: when the client closes mid-hedge, both upstream attempts are destroyed', { timeout: 20_000 }, async () => {
+  const hb = [];
+  await withUpstream(req => { req.resume(); hb.push(track(req.socket)); }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    t.on('error', () => {});
+    t.write(`POST ${HB} HTTP/1.1\r\nHost: api.anthropic.com\r\ncontent-length: 2\r\n\r\n{}`);
+    const until = Date.now() + 8_000;
+    while (hb.length < 2 && Date.now() < until) await sleep(50);
+    assert.equal(hb.length, 2, 'hedge fired (1s budget)');
+    t.destroy();
+    await sleep(1_000);
+    assert.deepEqual(hb.map(h => h.closed), [true, true], 'both attempts torn down');
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '1000' });
+});
+
+// ── (b) session CREATE: a stall is neither retried nor hedged ───────────────────
+// Guard that passes before AND after the fix: it pins that the heartbeat hedge is not applied
+// to other paths. Kills: dropping the `isHeartbeat` check in the stall branch (the create would
+// be hedged -> a second POST) and making an own-stall replay-safe for creates.
+gateTest('rc-gate: a stalled session create is neither retried nor hedged (a replayed create can double-create)', { timeout: 20_000 }, async () => {
   let creates = 0;
-  const up = http.createServer(req => {
+  await withUpstream(req => {
     req.resume();
     if (req.method === 'POST' && req.url === '/v1/code/sessions') creates++;   // never answers
-  });
-  const ups = asTLS(up);
-  await new Promise(r => ups.listen(0, '127.0.0.1', r));
-  const gate = await startGate({
-    RC_GATE_PORT: '0', RC_GATE_MAXPOOL_PORT: '1',
-    RC_GATE_DIRECT_HOST: '127.0.0.1', RC_GATE_DIRECT_PORT: String(ups.address().port),
-    RC_GATE_DIRECT_STALL_MS: '1000',
-  });
-  try {
+  }, async gate => {
     const { tls: t } = await mitmConnect(gate.port);
     const r = await request(t, 'POST', '/v1/code/sessions', 8_000);
     assert.notEqual(r.how, 'timeout', 'the stalled create must settle (502 / tunnel closed), not hang');
-    await sleep(2_500);                                  // well past any 500ms-backoff retry
+    await sleep(2_500);                                  // well past any 500ms-backoff retry or hedge
     assert.equal(creates, 1, `create must reach upstream exactly once, saw ${creates}`);
-    assert.match(gate.getLog(), /\[direct-stall\] \/v1\/code\/sessions/);
-  } finally { gate.kill(); await new Promise(r => ups.close(r)); }
+    assert.match(gate.getLog(), /\[direct-stall\] \/v1\/code\/sessions.*destroying/);
+  }, { RC_GATE_DIRECT_STALL_MS: '1000' });
+});
+
+// ── (b2) long-poll exemption: slow headers are neither stall-destroyed nor hedged ──
+// Runs in CI (rc-gate.test.js' twin of this skips there). The upstream sends headers at ~8s,
+// longer than BOTH the 1.5s direct stall budget and the 6s heartbeat budget. Kills: `if (!isLongPoll)`
+// -> `if (true)` (the 1.5s stall timer destroys it -> 502, no 2xx); classing /worker/events as a
+// heartbeat (hedged at 6s -> 2 upstream attempts).
+gateTest('rc-gate: a long-poll (/worker/events) with headers after ~8s is not stall-destroyed and not hedged', { timeout: 30_000 }, async () => {
+  let attempts = 0;
+  await withUpstream((req, res) => {
+    req.resume();
+    attempts++;
+    setTimeout(() => json200(res), 8_000);
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', '/v1/code/sessions/cse_x/worker/events', 13_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms. Gate log:\n${gate.getLog().slice(-400)}`);
+    assert.match(status(r.raw), /^2/, `2xx expected, got: ${r.raw.slice(0, 90)}`);
+    assert.ok(r.ms >= 7_500, `answered only when upstream sent headers (~8s), got ${r.ms}ms`);
+    assert.equal(attempts, 1, `exactly one upstream attempt, saw ${attempts}`);
+    assert.doesNotMatch(gate.getLog(), /\[direct-stall\]/, 'no stall timer fired on a long-poll');
+  }, { RC_GATE_DIRECT_STALL_MS: '1500' });
 });
 
 // ── (c) a forced net-evac must not reset an in-flight request to a LOOPBACK maxpool ──
-// Bites: R3. Revert the `if (!LOOPBACK_HOSTS.has(MAXPOOL_HOST))` guard around
-// poolAgent.destroy() and Agent.destroy() kills the in-use socket: the gate logs
-// `[resp-break] UPSTREAM ...` and the client body is truncated.
-// Uses the gate's own FORCE_EVAC seam (flag file, path made configurable for tests).
+// Kills: removing the `!LOOPBACK_HOSTS.has(MAXPOOL_HOST)` guard around poolAgent.destroy()
+// (Agent.destroy() kills the in-use socket: `[resp-break] UPSTREAM ...`, body truncated).
+// Uses the gate's own FORCE_EVAC seam (flag file path is per-gate in this file).
 gateTest('rc-gate: an in-flight /v1/messages to a loopback maxpool survives a net-evac', { timeout: 40_000 }, async () => {
   const HEAD = 'event: message_start\ndata: {}\n\n';
   const TAIL = 'event: message_stop\ndata: {}\n\n';
@@ -192,11 +315,7 @@ gateTest('rc-gate: an in-flight /v1/messages to a loopback maxpool survives a ne
     });
   });
   await new Promise(r => mp.listen(0, '127.0.0.1', r));
-  const flag = join(mkdtempSync(join(tmpdir(), 'rcgate-evac-')), 'force-evac');
-  const gate = await startGate({
-    RC_GATE_PORT: '0', RC_GATE_MAXPOOL_PORT: String(mp.address().port),
-    RC_GATE_PROFILE: 'claude', RC_GATE_FORCE_EVAC_FLAG: flag,
-  });
+  const gate = await startGate({ RC_GATE_MAXPOOL_PORT: String(mp.address().port), RC_GATE_PROFILE: 'claude' });
   try {
     const { tls: t } = await mitmConnect(gate.port);
     let raw = '';
@@ -208,7 +327,7 @@ gateTest('rc-gate: an in-flight /v1/messages to a loopback maxpool survives a ne
     const until = Date.now() + 5_000;
     while (!raw.includes('message_start') && Date.now() < until) await sleep(50);
     assert.ok(raw.includes('message_start'), 'stream is in flight before the evac');
-    writeFileSync(flag, '');
+    writeFileSync(gate.evacFlag, '');
     const evacBy = Date.now() + 8_000;
     while (!/\[net-evac\]/.test(gate.getLog()) && Date.now() < evacBy) await sleep(100);
     assert.match(gate.getLog(), /\[net-evac\]/, 'the seam really fired the evacuation (else this test proves nothing)');
@@ -219,45 +338,93 @@ gateTest('rc-gate: an in-flight /v1/messages to a loopback maxpool survives a ne
   } finally { gate.kill(); await new Promise(r => mp.close(r)); }
 });
 
-// ── (d) a telemetry retry must not destroy the DIRECT agent's idle sockets ──────
-// Bites: R2. Revert sweepIdleSockets' agent scoping / the `if (connectPhase)` condition
-// (old code: `for (const sock of Object.values(directAgent.freeSockets).flat()) sock.destroy()`
-// on every retry) and the idle direct keep-alive socket is destroyed -> server sees 'close'.
-gateTest('rc-gate: a telemetry retry leaves the direct agent\'s idle keep-alive sockets alone', { timeout: 20_000 }, async () => {
-  let directSock = null;
-  let directClosed = false;
+// ── (d) a telemetry retry after a reset on a FRESH socket sweeps nothing ─────────
+// The retry here is not a connect error and the failing socket was not reused, so no idle
+// socket anywhere may be swept. Kills: the old global sweep (`directAgent.freeSockets`
+// destroyed on every retry) - the idle direct keep-alive socket would close.
+gateTest('rc-gate: a telemetry retry (reset on a fresh socket) leaves the direct agent\'s idle keep-alive socket alone', { timeout: 20_000 }, async () => {
+  let direct = null;
   let telemetryAttempts = 0;
-  const up = http.createServer((req, res) => {
+  await withUpstream((req, res) => {
     req.resume();
     if (req.url.startsWith('/api/event_logging')) {
       telemetryAttempts++;
-      if (telemetryAttempts === 1) { req.socket.destroy(); return; }   // reset: retried (idempotent), not a connect error
+      if (telemetryAttempts === 1) { req.socket.destroy(); return; }
     } else {
-      directSock = req.socket;
-      req.socket.once('close', () => { directClosed = true; });
+      direct = track(req.socket);
     }
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end('{"ok":true}');
-  });
-  const ups = asTLS(up);
-  await new Promise(r => ups.listen(0, '127.0.0.1', r));
-  const gate = await startGate({
-    RC_GATE_PORT: '0', RC_GATE_MAXPOOL_PORT: '1',
-    RC_GATE_DIRECT_HOST: '127.0.0.1', RC_GATE_DIRECT_PORT: String(ups.address().port),
-  });
-  try {
-    // 1. park an idle keep-alive socket in directAgent
+    json200(res);
+  }, async gate => {
     const { tls: t1 } = await mitmConnect(gate.port);
     const r1 = await request(t1, 'POST', '/v1/code/sessions/cse_k/bridge', 5_000);
     assert.equal(status(r1.raw), '200');
-    assert.ok(directSock && !directClosed, 'direct socket parked idle upstream');
-    // 2. telemetry: first attempt reset, retried after its backoff
+    assert.ok(direct && !direct.closed, 'direct socket parked idle upstream');
     const { tls: t2 } = await mitmConnect(gate.port);
     const r2 = await request(t2, 'POST', '/api/event_logging/v2/batch', 8_000);
     assert.equal(status(r2.raw), '200', `telemetry retried to success, got: ${r2.raw.slice(0, 90)}`);
     assert.equal(telemetryAttempts, 2);
     assert.match(gate.getLog(), /\[direct-retry\] \/api\/event_logging/, 'the retry path ran');
     await sleep(300);
-    assert.equal(directClosed, false, 'the telemetry retry must not destroy the direct agent\'s idle socket');
-  } finally { gate.kill(); await new Promise(r => ups.close(r)); }
+    assert.equal(direct.closed, false, 'the telemetry retry must not destroy the direct agent\'s idle socket');
+  });
+});
+
+// ── (d2) scoped + debounced idle sweep ─────────────────────────────────────────
+// A connect-phase error cannot coexist with an idle socket of the SAME agent (the agent always
+// hands out an idle socket first), so this drives the other arm of the sweep condition,
+// `dir.reusedSocket`: park two idle sockets in an agent, let a third request reuse one and get
+// reset, and see whether the OTHER idle one is swept. Three phases, all within 5s:
+//   1. telemetry agent:  sweeps ITS idle socket                    (kills: never sweeping on reuse /
+//                                                                   `connectPhase`-only condition)
+//   2. direct agent, <5s after phase 1: sweeps its idle socket     (kills: ONE GLOBAL debounce stamp)
+//   3. telemetry agent again, <5s after phase 1: NOT swept         (kills: no debounce)
+// and in phases 1-2 the other agent's parked idle socket must survive (kills: sweeping the wrong
+// or every agent).
+gateTest('rc-gate: retry idle-sweep is scoped to the failing request\'s agent and debounced per agent', { timeout: 40_000 }, async () => {
+  const socks = { tel: [], dir: [] };
+  const mode = { tel: 'ok', dir: 'ok' };
+  const resetSock = { tel: null, dir: null };
+  const cls = url => (url.startsWith('/api/event_logging') ? 'tel' : 'dir');
+  await withUpstream((req, res) => {
+    req.resume();
+    const c = cls(req.url);
+    if (!socks[c].some(r => r.sock === req.socket)) socks[c].push(track(req.socket));
+    if (mode[c] === 'park') { setTimeout(() => json200(res), 150); return; }
+    if (mode[c] === 'reset') { mode[c] = 'ok'; resetSock[c] = req.socket; req.socket.destroy(); return; }
+    json200(res);
+  }, async gate => {
+    const PATH = { tel: '/api/event_logging/v2/batch', dir: '/v1/code/sessions/cse_k/client/presence' };
+    // park two idle sockets in the agent, then fail a reuse; return the parked sockets that were NOT the failing one
+    async function scenario(c) {
+      mode[c] = 'park';
+      const [a, b] = await Promise.all([mitmConnect(gate.port), mitmConnect(gate.port)]);
+      const [ra, rb] = await Promise.all([request(a.tls, 'POST', PATH[c], 5_000), request(b.tls, 'POST', PATH[c], 5_000)]);
+      assert.equal(status(ra.raw) + status(rb.raw), '200200', `${c} park requests`);
+      const parked = socks[c].filter(r => !r.closed);
+      assert.ok(parked.length >= 2, `${c}: two idle sockets parked (got ${parked.length})`);
+      mode[c] = 'reset';
+      const t = await mitmConnect(gate.port);
+      const r = await request(t.tls, 'POST', PATH[c], 8_000);
+      assert.equal(status(r.raw), '200', `${c}: the reset request is retried to success, got ${r.raw.slice(0, 80)}`);
+      await sleep(300);
+      return parked.filter(p => p.sock !== resetSock[c]);
+    }
+    // phase 0: park one idle socket in the DIRECT agent first, to watch it through phase 1
+    const dirIdle = await (async () => {
+      const t = await mitmConnect(gate.port);
+      const r = await request(t.tls, 'POST', PATH.dir, 5_000);
+      assert.equal(status(r.raw), '200');
+      return socks.dir[0];
+    })();
+    // phase 1
+    const others1 = await scenario('tel');
+    assert.ok(others1.length >= 1 && others1.every(p => p.closed), 'phase 1: telemetry\'s other idle socket was swept');
+    assert.equal(dirIdle.closed, false, 'phase 1: the direct agent\'s idle socket was NOT swept by a telemetry failure');
+    // phase 2 (direct agent, still inside telemetry's 5s window)
+    const others2 = await scenario('dir');
+    assert.ok(others2.length >= 1 && others2.every(p => p.closed), 'phase 2: the direct agent swept despite a telemetry sweep <5s ago (per-agent debounce)');
+    // phase 3 (telemetry again, inside ITS 5s window)
+    const others3 = await scenario('tel');
+    assert.ok(others3.length >= 1 && others3.every(p => !p.closed), 'phase 3: second telemetry sweep within 5s is debounced');
+  });
 });
