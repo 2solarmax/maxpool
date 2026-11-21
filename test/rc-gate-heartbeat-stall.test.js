@@ -6,11 +6,12 @@
 // as a child process: CONNECT -> TLS (mkcert) -> HTTP, like the CLI.
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
 import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { HAVE_OPENSSL, mintPki } from './helpers/rc-gate-pki.js';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,11 +19,10 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GATE_DIR = join(__dirname, '..', 'tools', 'rc-gate');
 
-// SELF-MINTED PKI. CI (ubuntu, no mkcert, no gitignored anthropic-mitm.key) used to SKIP the
-// whole rc-gate suite. This file instead mints a throwaway CA + an api.anthropic.com leaf with
-// openssl, points the gate at the leaf (RC_GATE_MITM_CERT/KEY), and has every client trust only
-// that CA. The real anthropic-mitm.key is never read. Skipped only when openssl is missing.
-const HAVE_OPENSSL = spawnSync('openssl', ['version'], { stdio: 'ignore' }).status === 0;
+// SELF-MINTED PKI (test/helpers/rc-gate-pki.js): CI has no mkcert and no gitignored
+// anthropic-mitm.key, so this file mints a throwaway CA + api.anthropic.com leaf with openssl,
+// points the gate at the leaf (RC_GATE_MITM_CERT/KEY) and trusts only that CA. The real
+// anthropic-mitm.key is never read. Skipped only when openssl is missing.
 if (!HAVE_OPENSSL) console.log('rc-gate-heartbeat-stall: SKIPPED - `openssl` not found on PATH, cannot mint the throwaway test CA');
 const gateTest = HAVE_OPENSSL ? test : test.skip;
 const pki = { dir: '', ca: '', cert: '', key: '' };
@@ -30,26 +30,7 @@ const pki = { dir: '', ca: '', cert: '', key: '' };
 const tmpDirs = [];
 const tmp = prefix => { const d = mkdtempSync(join(tmpdir(), prefix)); tmpDirs.push(d); return d; };
 
-function mintPki() {
-  const dir = tmp('rcgate-pki-');
-  const f = n => join(dir, n);
-  const sh = (...args) => execFileSync('openssl', args, { stdio: 'pipe' });
-  writeFileSync(f('ca.cnf'), [
-    '[req]', 'distinguished_name=dn', 'prompt=no', 'x509_extensions=v3_ca',
-    '[dn]', 'CN=rc-gate-test-ca',
-    '[v3_ca]', 'basicConstraints=critical,CA:TRUE', 'keyUsage=critical,keyCertSign,cRLSign', 'subjectKeyIdentifier=hash', '',
-  ].join('\n'));
-  writeFileSync(f('leaf.ext'), [
-    'subjectAltName=DNS:api.anthropic.com,DNS:localhost,IP:127.0.0.1',
-    'basicConstraints=CA:FALSE', 'keyUsage=digitalSignature,keyEncipherment', 'extendedKeyUsage=serverAuth', '',
-  ].join('\n'));
-  sh('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-config', f('ca.cnf'), '-keyout', f('ca.key'), '-out', f('ca.crt'));
-  sh('req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=api.anthropic.com', '-keyout', f('leaf.key'), '-out', f('leaf.csr'));
-  sh('x509', '-req', '-in', f('leaf.csr'), '-CA', f('ca.crt'), '-CAkey', f('ca.key'), '-CAcreateserial',
-    '-days', '2', '-extfile', f('leaf.ext'), '-out', f('leaf.crt'));
-  Object.assign(pki, { dir, ca: f('ca.crt'), cert: f('leaf.crt'), key: f('leaf.key') });
-}
-if (HAVE_OPENSSL) before(() => mintPki());
+if (HAVE_OPENSSL) before(() => { Object.assign(pki, mintPki(tmp('rcgate-pki-'))); });
 after(() => { for (const d of tmpDirs) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } } });
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -255,6 +236,154 @@ gateTest('rc-gate: when the client closes mid-hedge, both upstream attempts are 
     t.destroy();
     await sleep(1_000);
     assert.deepEqual(hb.map(h => h.closed), [true, true], 'both attempts torn down');
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '1000' });
+});
+
+// A TCP front for the fake upstream that lets a test fail chosen CONNECTIONS at connect time
+// (reset before any TLS) while the rest pass through to the real fake upstream.
+function front(upPort, failConn) {
+  let n = 0;
+  const srv = net.createServer(c => {
+    n++;
+    if (failConn.has(n)) { c.destroy(); return; }
+    const u = net.connect(upPort, '127.0.0.1');
+    c.pipe(u); u.pipe(c);
+    const kill = () => { c.destroy(); u.destroy(); };
+    c.on('error', kill); u.on('error', kill); c.on('close', kill); u.on('close', kill);
+  });
+  return new Promise(r => srv.listen(0, '127.0.0.1', () => r(srv)));
+}
+
+// ── (a6) hedge fails fast at connect while attempt 1 is hung -> replaced, client still gets 2xx ──
+// Kills: the swallowed error (`if (isHeartbeat && liveDirs.size > 0) return` with no replacement):
+// the request would wait for the 12.5s 502. Also kills a replacement that is not a fresh agent.
+gateTest('rc-gate: a hedge that fails at connect is replaced while attempt 1 stays hung; client gets 2xx < 13s', { timeout: 30_000 }, async () => {
+  const hb = [];
+  const up = http.createServer((req, res) => {
+    req.resume();
+    hb.push(track(req.socket));
+    if (hb.length === 1) return;                        // attempt 1 black-holes
+    json200(res);
+  });
+  up.keepAliveTimeout = 60_000;
+  const ups = asTLS(up);
+  await new Promise(r => ups.listen(0, '127.0.0.1', r));
+  const fr = await front(ups.address().port, new Set([2]));   // connection #2 (the first hedge) is reset
+  const gate = await startGate({ RC_GATE_DIRECT_PORT: String(fr.address().port), RC_GATE_HEARTBEAT_STALL_MS: '2000' });
+  try {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 13_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms. Gate log:\n${gate.getLog().slice(-500)}`);
+    assert.match(status(r.raw), /^2/, `2xx expected (not the 12.5s 502), got: ${r.raw.slice(0, 90)}`);
+    assert.ok(r.ms < 8_000, `answered by the replacement hedge, not the deadline: ${r.ms}ms`);
+    assert.equal(hb.length, 2, 'attempt 1 + the replacement reached upstream (the reset hedge never did)');
+    assert.match(gate.getLog(), /\[direct-retry\].*worker\/heartbeat/, 'the failed hedge went through the retry ladder');
+  } finally { gate.kill(); fr.close(); await new Promise(r => ups.close(r)); }
+});
+
+// ── (a7) status-aware winner: a fast non-2xx does not beat a slower 2xx ──────────
+// Kills: "first headers win" regardless of status (client would get the hedge's 503).
+gateTest('rc-gate: a hedge answering 503 fast does not win; attempt 1\'s 200 at ~8s is delivered', { timeout: 30_000 }, async () => {
+  const hb = [];
+  await withUpstream((req, res) => {
+    req.resume();
+    hb.push(track(req.socket));
+    if (hb.length === 1) { setTimeout(() => json200(res, '{"ok":true,"via":"first"}'), 8_000); return; }
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end('{"error":"overloaded"}');
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 13_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms. Gate log:\n${gate.getLog().slice(-400)}`);
+    assert.equal(status(r.raw), '200', `attempt 1's 200 expected, got: ${r.raw.slice(0, 90)}`);
+    assert.match(r.raw, /"via":"first"/);
+    assert.ok(r.ms >= 7_500, `waited for attempt 1 (~8s), got ${r.ms}ms`);
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '2000' });
+});
+
+// ── (a8) ... and when no sibling ever succeeds, the held upstream answer is delivered, not a gate 502 ──
+// Kills: dropping `deliverHeld()` at the deadline (client would get rc_gate_direct_error).
+gateTest('rc-gate: with attempt 1 hung forever, the hedge\'s held 503 is delivered at the deadline instead of a gate 502', { timeout: 30_000 }, async () => {
+  let n = 0;
+  await withUpstream((req, res) => {
+    req.resume();
+    n++;
+    if (n === 1) return;                                // attempt 1 hangs forever
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end('{"error":"overloaded"}');
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 14_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms`);
+    assert.equal(status(r.raw), '503', `the held upstream 503, got: ${r.raw.slice(0, 90)}`);
+    assert.match(r.raw, /overloaded/);
+    assert.doesNotMatch(r.raw, /rc_gate_direct_error/, 'not the gate\'s own 502');
+    assert.ok(r.ms >= 11_500 && r.ms < 13_000, `delivered at the 12.5s deadline, got ${r.ms}ms`);
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '1000' });
+});
+
+// Park two idle keep-alive sockets in the DIRECT agent (two concurrent bridge calls); returns them.
+async function parkTwoDirect(gate, socks) {
+  const [a, b] = await Promise.all([mitmConnect(gate.port), mitmConnect(gate.port)]);
+  const [ra, rb] = await Promise.all([
+    request(a.tls, 'POST', '/v1/code/sessions/cse_k/bridge', 5_000),
+    request(b.tls, 'POST', '/v1/code/sessions/cse_k/bridge', 5_000)]);
+  assert.equal(status(ra.raw) + status(rb.raw), '200200');
+  return socks.filter(r => !r.closed);
+}
+
+// ── (a9) a heartbeat stall sweeps the agent's OTHER idle sockets ────────────────
+// Kills: removing `sweepIdleSockets(reqAgent)` from the stall handler (the parked idle socket
+// survives).
+gateTest('rc-gate: a heartbeat stall sweeps the direct agent\'s other idle sockets', { timeout: 30_000 }, async () => {
+  const parkedSocks = [];
+  let hbN = 0;
+  await withUpstream((req, res) => {
+    req.resume();
+    if (!req.url.endsWith('/worker/heartbeat')) { parkedSocks.push(track(req.socket)); return json200(res); }
+    hbN++;
+    if (hbN === 1) return;                              // attempt 1 black-holes
+    json200(res);
+  }, async gate => {
+    const parked = await parkTwoDirect(gate, parkedSocks);
+    assert.equal(parked.length, 2, 'two idle sockets parked');
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 13_000);
+    assert.match(status(r.raw), /^2/, `hedge answered, got ${r.how}`);
+    await sleep(300);
+    // attempt 1 reused one parked socket (now closed with the dropped attempt); the other was idle
+    assert.equal(parked.filter(p => p.closed).length, 2, 'both parked sockets are gone: one with attempt 1, the other swept at the stall');
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '1500' });
+});
+
+// ── (a10) the hedge never lands on a POOLED idle socket ─────────────────────────
+// A heartbeat H0 stalls first (stamping the per-agent sweep debounce), so H1's stall sweep is
+// debounced and a parked idle socket is still free when H1 hedges. Kills:
+// `attemptAgent = hedge ? ... : reqAgent` -> `reqAgent` (the hedge would take the free pooled socket).
+gateTest('rc-gate: the hedge uses a fresh connection even when a pooled idle socket is free', { timeout: 30_000 }, async () => {
+  const parkedSocks = [];
+  const hb = [];
+  await withUpstream((req, res) => {
+    req.resume();
+    if (!req.url.endsWith('/worker/heartbeat')) { parkedSocks.push(track(req.socket)); return json200(res); }
+    hb.push(track(req.socket));
+    if (hb.length % 2 === 1) return;                    // odd heartbeat attempts black-hole
+    json200(res);
+  }, async gate => {
+    const { tls: t0 } = await mitmConnect(gate.port);
+    const r0 = await request(t0, 'POST', HB, 8_000);    // H0: stalls, hedges, sweeps (stamps the debounce)
+    assert.match(status(r0.raw), /^2/);
+    const parked = await parkTwoDirect(gate, parkedSocks);
+    assert.equal(parked.length, 2, 'two idle sockets parked after H0');
+    const { tls: t1 } = await mitmConnect(gate.port);
+    const r1 = await request(t1, 'POST', HB, 8_000);    // H1: attempt 1 takes a parked socket; stall sweep is debounced
+    assert.match(status(r1.raw), /^2/);
+    assert.equal(hb.length, 4);
+    const parkedSet = new Set(parked.map(p => p.sock));
+    assert.ok(parkedSet.has(hb[2].sock), 'H1 attempt 1 reused a pooled socket (premise)');
+    const free = parked.find(p => p.sock !== hb[2].sock);
+    assert.equal(free.closed, false, 'premise: the other pooled socket was not swept (debounced)');
+    assert.ok(!parkedSet.has(hb[3].sock), 'the hedge must NOT land on a pooled idle socket');
   }, { RC_GATE_HEARTBEAT_STALL_MS: '1000' });
 });
 
