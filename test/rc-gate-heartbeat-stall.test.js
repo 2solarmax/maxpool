@@ -395,6 +395,104 @@ gateTest('rc-gate: a held 503 whose body is still arriving when needed is delive
   }, { RC_GATE_HEARTBEAT_STALL_MS: '1000', RC_GATE_DIRECT_RETRY_MAX: '0' });
 });
 
+// ── (a14) starved loop: an already-buffered fast answer must not look like a stall ──
+// The gate's loop is blocked (test seam, once, right after the heartbeat is flushed) across the 300ms
+// stall point while the upstream answers in ~20ms. Without the setImmediate deferral the overdue timer
+// fires before the buffered response is read: a needless hedge + a sweep of the healthy idle socket.
+// Kills: removing the `setImmediate(... if (hbWinner || cres.headersSent ...) return ...)` deferral.
+gateTest('rc-gate: a loop starved across the stall point does not hedge or sweep when the answer was already buffered', { timeout: 30_000 }, async () => {
+  const parkedSocks = [];
+  let hbN = 0;
+  await withUpstream((req, res) => {
+    req.resume();
+    if (!req.url.endsWith('/worker/heartbeat')) { parkedSocks.push(track(req.socket)); return json200(res); }
+    hbN++;
+    setTimeout(() => json200(res), 20);                // fast, healthy upstream
+  }, async gate => {
+    const parked = await parkTwoDirect(gate, parkedSocks);
+    assert.equal(parked.length, 2);
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 10_000);
+    assert.match(status(r.raw), /^2/, `2xx expected, got ${r.how}: ${r.raw.slice(0, 80)}`);
+    await sleep(300);
+    assert.match(gate.getLog(), /\[loop-stall\]/, 'premise: the loop really was blocked');
+    assert.equal(hbN, 1, `no hedge connect, saw ${hbN} heartbeat attempts`);
+    assert.doesNotMatch(gate.getLog(), /hedging/);
+    assert.deepEqual(parked.map(p => p.closed), [false, false], 'no healthy idle socket was swept');
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '300', RC_GATE_TEST_BLOCK_LOOP_AFTER_SEND_MS: '900' });
+});
+
+// ── (a15) a LATE timer (own loop lag > 1s) may still hedge, but never sweeps ──
+// Attempt 1 really hangs; the loop is blocked 1.5s across the 300ms stall point. Kills: dropping the
+// `late` guard on sweepIdleSockets (the other idle socket would be destroyed).
+gateTest('rc-gate: a stall timer that fired >1s late hedges but does not sweep the pool', { timeout: 30_000 }, async () => {
+  const parkedSocks = [];
+  const hb = [];
+  await withUpstream((req, res) => {
+    req.resume();
+    if (!req.url.endsWith('/worker/heartbeat')) { parkedSocks.push(track(req.socket)); return json200(res); }
+    hb.push(track(req.socket));
+    if (hb.length === 1) return;                       // attempt 1 hangs for real
+    json200(res);
+  }, async gate => {
+    const parked = await parkTwoDirect(gate, parkedSocks);
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 10_000);
+    assert.match(status(r.raw), /^2/, `hedge answered, got ${r.how}`);
+    assert.equal(hb.length, 2, 'the hedge still happened');
+    assert.match(gate.getLog(), /\[direct-stall\] late timer \(loop lag ~\d+ms\) — not sweeping/);
+    const other = parked.find(p => p.sock !== hb[0].sock);
+    assert.equal(other.closed, false, 'the other idle socket was not swept');
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '300', RC_GATE_TEST_BLOCK_LOOP_AFTER_SEND_MS: '1500' });
+});
+
+// ── (a16) a final (non-transient) non-2xx wins at once; it is not held for a hung sibling ──
+// Attempt 1 answers 401 at ~3s while the hedge (started at 2s) hangs. Kills: holding every non-2xx
+// (the 401 would sit until the 12.5s deadline).
+gateTest('rc-gate: a 401 is final and delivered immediately, not held while the other attempt hangs', { timeout: 30_000 }, async () => {
+  let n = 0;
+  await withUpstream((req, res) => {
+    req.resume();
+    n++;
+    if (n === 1) { setTimeout(() => { res.writeHead(401, { 'content-type': 'application/json' }); res.end('{"error":"unauthorized"}'); }, 3_000); return; }
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 13_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms`);
+    assert.equal(status(r.raw), '401');
+    assert.match(r.raw, /unauthorized/);
+    assert.ok(r.ms < 4_500, `delivered right after the 401 arrived (~3s), got ${r.ms}ms`);
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '2000' });
+});
+
+// ── (a17) session-create response parsing must not throw (zlib was `require`d in an ES module) ──
+// A gzip create response used to hit `require is not defined`, and the catch then read a try-scoped
+// `body`: an uncaught exception on every create. Kills: the missing import / out-of-scope `body`.
+gateTest('rc-gate: a gzip session-create response is parsed into [create-status] with no uncaught exception', { timeout: 20_000 }, async () => {
+  const { gzipSync } = await import('node:zlib');
+  await withUpstream((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      if (req.headers['x-case'] === 'garbage') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('not json'); return; }
+      res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip' });
+      res.end(gzipSync(Buffer.from('{"id":"cse_gzip_000001","ok":true}')));
+    });
+  }, async gate => {
+    const send = async hdr => {
+      const { tls: t } = await mitmConnect(gate.port);
+      t.on('error', () => {});
+      t.write(`POST /v1/code/sessions HTTP/1.1\r\nHost: api.anthropic.com\r\n${hdr}content-length: 2\r\n\r\n{}`);
+    };
+    await send('');
+    await send('x-case: garbage\r\n');
+    const until = Date.now() + 6_000;
+    while (!(/\[create-status\] 200 id: cse_gzip_000/.test(gate.getLog()) && /PARSE-FAIL/.test(gate.getLog())) && Date.now() < until) await sleep(100);
+    assert.match(gate.getLog(), /\[create-status\] 200 id: cse_gzip_000/, 'gzip body decoded and parsed');
+    assert.match(gate.getLog(), /\[create-status\] 200 PARSE-FAIL: "not json"/, 'garbage body reported, not thrown');
+    assert.doesNotMatch(gate.getLog(), /rc-gate uncaught/, 'no uncaught exception');
+  });
+});
+
 // Park two idle keep-alive sockets in the DIRECT agent (two concurrent bridge calls); returns them.
 async function parkTwoDirect(gate, socks) {
   const [a, b] = await Promise.all([mitmConnect(gate.port), mitmConnect(gate.port)]);

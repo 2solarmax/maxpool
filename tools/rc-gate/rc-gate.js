@@ -322,6 +322,8 @@ const SECURE_CONTEXT = tls.createSecureContext({ cert, key });
 // sockets made every drain burn its full timeout (measured 2026-09-14: exited
 // after 20.1s with 1 permanently-active stream socket).
 let inflightInference = 0;
+const TEST_BLOCK_LOOP_MS = Number(process.env.RC_GATE_TEST_BLOCK_LOOP_AFTER_SEND_MS || 0);
+let _testBlocked = false;
 
 const mitmServer = http.createServer((creq, cres) => {
   const headers = { ...creq.headers };
@@ -707,6 +709,13 @@ const mitmServer = http.createServer((creq, cres) => {
           dir.on('error', () => clearTimeout(tQueue));
         }
         dir.on('error', () => { if (tStall) clearTimeout(tStall); });
+        // TEST SEAM (inert unless RC_GATE_TEST_BLOCK_LOOP_AFTER_SEND_MS is set): once, right after the
+        // FIRST heartbeat request has been flushed upstream, busy-wait so the gate's loop is starved
+        // across the stall point and the upstream's answer sits unread in the socket buffer.
+        if (isHeartbeat && TEST_BLOCK_LOOP_MS && !_testBlocked) {
+          _testBlocked = true;
+          dir.once('finish', () => { const end = Date.now() + TEST_BLOCK_LOOP_MS; while (Date.now() < end) { /* starve the loop */ } });
+        }
         dir.end(body);
       }).catch(e => { console.log('[direct-error]', creq.url, 'body-buffer', String(e)); try { cres.writeHead(400); } catch {} cres.end(); });
     };

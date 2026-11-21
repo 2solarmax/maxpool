@@ -35,3 +35,9 @@ test('rc-gate: the force-net-evac seam has no default path (armed only by RC_GAT
   assert.match(src, /const FORCE_EVAC_FLAG = process\.env\.RC_GATE_FORCE_EVAC_FLAG \|\| '';/);
   assert.match(src, /if \(FORCE_EVAC_FLAG\) setInterval\(/, 'no polling interval unless armed');
 });
+
+test('rc-gate: the loop-blocking test seam is inert unless its env var is set', () => {
+  const src = read('../tools/rc-gate/rc-gate.js');
+  assert.match(src, /const TEST_BLOCK_LOOP_MS = Number\(process\.env\.RC_GATE_TEST_BLOCK_LOOP_AFTER_SEND_MS \|\| 0\);/, 'defaults to 0');
+  assert.match(src, /if \(isHeartbeat && TEST_BLOCK_LOOP_MS && !_testBlocked\)/, 'guarded by the env value and by a once flag');
+});
