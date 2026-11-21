@@ -205,3 +205,46 @@ test('demand coverage begins at the first full retained hour and advances when t
   assert.equal(crossing.peakOutstanding, 2);
   assert.equal(after(first + HOUR, first + 2 * HOUR).completeCoverage, true);
 });
+
+test('live capacity headline: idle, healthy and saturated workers are judged from held requests only', () => {
+  let now = 100 * HOUR;
+  const ledger = new RoutingServiceAnalytics(() => now);
+  assert.equal(ledger.recent().state, 'quiet');
+  const finish = (n, wait = 0, outcome = 'completed', denial) => {
+    for (let i = 0; i < n; i++) {
+      const t = ledger.begin({ session: 's' + i });
+      t.route('a');
+      if (wait) { t.wait(); now += wait; t.resume(); t.route('a'); }
+      t.finish(outcome, {}, denial);
+    }
+  };
+  // Healthy: 200 requests, one held 2s.
+  finish(199);
+  finish(1, 2000);
+  let r = ledger.recent();
+  assert.deepEqual([r.requests, r.queuedRequests, r.pending, r.state], [200, 1, 0, 'ok']);
+  // A forwarded hop is not a second arrival and never counts as pending.
+  const peer = ledger.begin({ peer: true });
+  peer.wait(); now += 60_000;
+  assert.equal(ledger.recent().pending, 0);
+  peer.finish('completed');
+  assert.equal(ledger.recent().requests, 200);
+  // A request waiting right now shows pending and oldest wait, counted once across retries.
+  const held = ledger.begin({ session: 'held' });
+  held.wait(); now += 6000;
+  r = ledger.recent();
+  assert.deepEqual([r.pending, r.oldestWaitMs, r.state], [1, 6000, 'tight']);
+  now += 30_000;
+  assert.equal(ledger.recent().state, 'short');
+  held.resume(); held.wait(); now += 1000;
+  held.finish('capacityDenied', {}, 'weeklyDenied');
+  r = ledger.recent();
+  assert.deepEqual([r.pending, r.waitTimeouts, r.capacityDenied], [0, 1, 1]);
+  // Saturated: a backlog of long waits crosses the short band; old minutes age out of the window.
+  finish(30, 20_000);
+  assert.equal(ledger.recent().state, 'short');
+  now += 20 * 60_000;
+  assert.deepEqual([ledger.recent().requests, ledger.recent().state], [0, 'quiet']);
+  assert.equal(ledger.recent(60 * 60_000).requests > 0, true);
+  assert.doesNotMatch(JSON.stringify(ledger.exportState()), /waitTimeouts|oldestWaitMs/, 'headline is not persisted');
+});

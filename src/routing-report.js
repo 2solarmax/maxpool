@@ -8,6 +8,8 @@ const METRICS = ['arrivals', 'requests', 'completed', 'timelyCompleted', 'failed
   'active', 'serving', 'peakServing', 'activeSessions', 'peakSessions',
   'inputTokens', 'cachedInputTokens', 'coverageSince', 'completeCoverage', 'from', 'to'];
 const metrics = row => Object.fromEntries(METRICS.filter(k => Number.isFinite(row[k]) || typeof row[k] === 'boolean').map(k => [k, row[k]]));
+const RECENT_METRICS = ['requests', 'queuedRequests', 'capacityDenied', 'waitTimeouts', 'waitP90Ms', 'waitP95Ms',
+  'queuedWaitP95Ms', 'longestWaitMs', 'pending', 'oldestWaitMs', 'windowMs', 'observedMs'];
 const dailyCounts = ({ requests, timelyCompleted, capacityDenied }) => ({ requests, timelyCompleted, capacityDenied });
 const PERIODS = { '1h': HOUR, '24h': 24 * HOUR, '7d': 168 * HOUR };
 
@@ -31,6 +33,8 @@ export function buildRoutingReport(am, now) {
     service[period] = { ...metrics(sample),
       accounts: (sample.accounts || []).map(a => ({ name: a.name, ...metrics(a) })) };
   }
+  const live = am.routingService.recent(undefined, now);
+  const recent = { state: live.state, ...Object.fromEntries(RECENT_METRICS.filter(k => Number.isFinite(live[k])).map(k => [k, live[k]])) };
   const demandBetween = am.routingService.demandReader(now);
   const owners = new Set();
   const quotas = [];
@@ -52,7 +56,7 @@ export function buildRoutingReport(am, now) {
     });
   }
   return { version: 1, source: am.capacity.poolCacheSource, asOf: now,
-    service, daily: [...daily.values()], quotas, placement: am.placementComparison?.() || null,
+    service, recent, daily: [...daily.values()], quotas, placement: am.placementComparison?.() || null,
     provisioning: provisioningEvidence(demandBetween, now,
       quotas.filter(q => q.window === 'wk').reduce((sum, q) => sum + q.measuredCycles, 0)),
   };

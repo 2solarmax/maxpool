@@ -99,10 +99,12 @@ test('routing analytics is reachable via keys, distinguishes zero demand, and se
   tui._key('w');
   assert.match(screen(tui), /Routing analytics · Cloud · 24h/);
   assert.match(screen(tui), /100.0% +1 \/ 1/);
+  assert.match(screen(tui), /Headroom now +Little traffic/);
+  for (let i = 0; i < 4; i++) tui._key('down');
   assert.match(screen(tui), /Awaiting a measured reset/);
   tui._key('t');
   assert.match(screen(tui, 40, 8), /Cloud · 7d/);
-  for (let i = 0; i < 25; i++) tui._key('down');
+  for (let i = 0; i < 40; i++) tui._key('down');
   assert.match(screen(tui, 40, 8), /reset|yield|weeks/i);
   tui._key('w');
   assert.match(screen(tui), /unavailable/);

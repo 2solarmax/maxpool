@@ -1,5 +1,6 @@
 import { createInterface } from 'node:readline';
 import { routingSources } from './routing-report.js';
+import { CAPACITY_BANDS } from './routing-service-analytics.js';
 import { TANK_MIN_UTIL } from './capacity-ledger.js';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -1403,6 +1404,33 @@ export class TUI {
   }
 
   /** The Claude row with the lowest cache share in the window (enough volume only). */
+  /** Are the accounts keeping up right now? Reads the router's own hold of requests (waiting for
+   *  capacity), never upstream latency. Judged from the worst worker that reports it. */
+  _capacityLine(W = 80, now = Date.now()) {
+    let report;
+    try { report = routingSources(this.am, now); } catch { return null; }
+    const rank = { short: 3, tight: 2, ok: 1, quiet: 0 };
+    const rows = report.filter(s => s.report?.recent && !s.stale && s.report.recent.state in rank);
+    if (!rows.length) return null;
+    const worst = rows.reduce((a, b) => (rank[b.report.recent.state] > rank[a.report.recent.state] ? b : a));
+    const r = worst.report.recent;
+    const where = worst === report[0] ? '' : ` ${dim('on ' + worst.name)}`;
+    const mins = Math.round((r.windowMs || 900_000) / 60_000);
+    const time = n => !Number.isFinite(n) ? '—' : n < 1000 ? n + 'ms' : n < 60_000 ? (n / 1000).toFixed(n < 10_000 ? 1 : 0) + 's' : Math.round(n / 60_000) + 'm';
+    const label = `${dim('[' + mins + 'm]')}`;
+    if (r.state === 'quiet') return truncLine(` Headroom ${dim('— (little traffic)')}${where}`, W);
+    const parts = [(r.pending ? `${r.pending} waiting, oldest ${time(r.oldestWaitMs)}` : ''),
+      `${r.queuedRequests || 0} of ${r.requests || 0} waited`,
+      (r.queuedRequests ? `longest ≤${time(r.longestWaitMs)}` : ''),
+      (r.capacityDenied ? `${r.capacityDenied} refused` : '')].filter(Boolean);
+    const text = { ok: green('Keeping up'), tight: yellow('Getting tight'), short: red('Short of accounts') }[r.state];
+    const head = { ok: green('Headroom'), tight: yellow('Headroom'), short: red('Headroom') }[r.state];
+    const build = () => ` ${head}  ${text}  ${label}  ${parts.join(' · ')}${where}`;
+    // Keep the state and what is waiting; shed the least urgent figures when the terminal is narrow.
+    while (parts.length > 1 && vw(build()) > W) parts.pop();
+    return truncLine(build(), W);
+  }
+
   _worstCacheAccount() {
     let worst = null;
     for (const a of this.am.accounts) {
@@ -3028,6 +3056,8 @@ export class TUI {
     if (cacheLine != null) lines.push(cacheLine);
     const movesLine = this._movesLine(W, efficiencyNow);
     if (movesLine != null) lines.push(movesLine);
+    const capacityLine = this._capacityLine(W, efficiencyNow);
+    if (capacityLine != null) lines.push(capacityLine);
     lines.push(...this._cloudLinkLines(W));
     const queuedCount = this.am.queueState?.waiting?.length || 0;
     // Throttle and WAITING are different things and used to share one line labelled
@@ -4002,6 +4032,19 @@ export class TUI {
     const date = n => Number.isFinite(n) && n > 0 && n < 8.64e15 ? new Date(n).toISOString().slice(0, 16).replace('T', ' ') : '—';
     if (!m) lines.push(dim(' Routing telemetry unavailable from this worker.'));
     else {
+      const r = report.recent;
+      const le = (n, d) => d > 0 && Number.isFinite(n) ? '≤' + time(n) : '—';
+      if (r) {
+        const names = { ok: 'Keeping up', tight: 'Getting tight', short: 'Short of accounts', quiet: 'Little traffic' };
+        lines.push(bold(' Headroom now  ' + (names[r.state] || '—')) + dim('  last ' + Math.round((r.windowMs || 0) / 60_000) + ' min'
+          + (r.state === 'quiet' ? ' · ' + number(r.requests) + ' of ' + CAPACITY_BANDS.minRequests + ' requests needed' : '')));
+        lines.push(' Waited ' + number(r.queuedRequests) + ' of ' + number(r.requests) + ' requests (' + share(r.queuedRequests, r.requests)
+          + ')   Longest wait ' + le(r.longestWaitMs, r.requests) + '   p95 ' + le(r.waitP95Ms, r.requests));
+        lines.push(' Waiting now ' + number(r.pending) + (r.pending ? '   Oldest ' + time(r.oldestWaitMs) : '')
+          + '   Refused ' + number(r.capacityDenied) + '   Gave up after waiting ' + number(r.waitTimeouts));
+        lines.push(dim(' Requests, not sessions. Wait = held by the router, not model speed.'));
+        lines.push('');
+      }
       lines.push(bold(' Timely completions  ' + share(m.timelyCompleted, m.requests))
         + '  ' + number(m.timelyCompleted) + ' / ' + number(m.requests));
       lines.push(dim(' Completed successfully with ≤' + time(m.waitTargetMs) + ' router wait, per finalized request.'));
@@ -4053,6 +4096,12 @@ export class TUI {
           lines.push(' ' + date(d.day).slice(0, 10) + '   ' + number(d.timelyCompleted) + '/' + number(d.requests)
             + '   ' + share(d.timelyCompleted, d.requests) + '   denials ' + number(d.capacityDenied));
         }
+      }
+      if (report.recent) {
+        lines.push('', bold(' How headroom is judged'));
+        lines.push(dim(' Tight: over ' + Math.round(CAPACITY_BANDS.tightWaitedShare * 100) + '% of requests waited, any refusal, or a request held over ' + time(CAPACITY_BANDS.tightOldestMs) + '.'));
+        lines.push(dim(' Short: over ' + Math.round(CAPACITY_BANDS.shortWaitedShare * 100) + '% waited, or a request held over ' + time(CAPACITY_BANDS.shortOldestMs) + '.'));
+        lines.push(dim(' Provisional. Measured healthy load: about 0.1% of requests wait; no backlog sample yet.'));
       }
       const sizing = report.provisioning;
       if (sizing) {

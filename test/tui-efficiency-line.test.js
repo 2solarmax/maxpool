@@ -107,3 +107,30 @@ test('low volume says so instead of numbers, and both lines fit 65 columns', () 
   assert.match(full, /cross \d+\/100/, full);
   assert.ok(strip(tui._cacheLine(65)).length <= 65, 'Cache still fits 65 with numbers');
 });
+
+test('Headroom headline sits under Moves, names the state, and fits 80 columns', () => {
+  const m = am();
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  try {
+  const fresh = () => { m._routingReport = null; };
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  assert.match(strip(tui._capacityLine(80)), /Headroom .*little traffic/);
+  for (let i = 0; i < 30; i++) { const t = m.routingService.begin({}); t.route('c1'); t.finish('completed'); }
+  fresh();
+  assert.match(strip(tui._capacityLine(80)), /Headroom\s+Keeping up\s+\[15m\]\s+0 of 30 waited/);
+  const held = [0, 1, 2].map(() => { const t = m.routingService.begin({}); t.wait(); return t; });
+  clock += 42_000;
+  fresh();
+  const short = strip(tui._capacityLine(80));
+  assert.match(short, /Short of accounts/);
+  assert.match(short, /3 waiting, oldest 42s/);
+  assert.ok([...short].length <= 80, 'fits 80 columns');
+  const frame = frameAt(tui, 100);
+  const moves = frame.findIndex(l => l.trim().startsWith('Moves'));
+  const cap = frame.findIndex(l => l.trim().startsWith('Headroom'));
+  assert.ok(cap > 0 && (moves < 0 || cap === moves + 1), 'headline directly under Moves when present');
+  held.forEach(t => t.finish('cancelled'));
+  } finally { Date.now = realNow; }
+});

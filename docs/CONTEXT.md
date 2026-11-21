@@ -24,6 +24,12 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-21 · Headroom headline: are the accounts keeping up right now
+
+The overview shows a Headroom line under Moves, and Activity analytics → Routing opens with "Headroom now". Both read the router's own hold of requests (the existing wait start/end around the queue and the sticky-busy wait), never upstream latency, from a 15-minute in-memory ring of origin-only requests. A forwarded hop is not a second arrival and never counts as pending; retries accrue to one request. Native Codex has no queue and refuses at once, so its pressure shows as refusals. Counts are requests, not sessions.
+
+State is Keeping up, Getting tight or Short of accounts, with "little traffic" under 20 requests. Measured healthy load (20 hours, 46,281 requests): 0.1% waited, at most 0.8% in any hour, 99.97% within five seconds. The 2% and 10% bands, the 5s and 30s oldest-hold bands and the 5% refusal band are provisional until a saturated sample exists. No extra upstream probes or routing changes; no session identifiers leave the worker. A linked worker reports its own state in the same `routingAnalytics.recent` field and the headline shows the worst fresh one.
+
 ### 2026-11-20 · Reduce repeated analytics work
 
 The routing status reader asks for hourly data only when building its seven-day daily series. The complete hourly timeline remains available to other snapshot readers. Native Codex resolves the turn metadata once per request. A completion reuses the same wait bin and token counts for the worker and account, and a releasing worker retains one baseline for all three accounting stores.
