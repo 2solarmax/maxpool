@@ -3690,7 +3690,7 @@ export class TUI {
       return ms > 0 ? `in ${formatAge(ms)}` : 'on the next sweep';
     }
     const interval = this.am.quotaProbeIntervalMs;
-    return interval > 0 ? `every ${formatAge(interval)}` : 'shortly';
+    return interval > 0 ? 'on the next sweep' : 'shortly';
   }
 
   _renderProviderAcct(sel, cur, name, type, status, a, bw = 11, showBoth = true, showFable = showBoth, showSession = true) {

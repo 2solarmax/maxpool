@@ -174,3 +174,47 @@ test('a restored empty listing whose daily listing then fails goes back to the r
   await reborn.probeAll();
   assert.equal(h.usage.length, 3, 'read again on the next sweep');
 });
+
+test('a restored empty listing that is not yet due and fails on a manual check is retried on the next sweep, not at checkedAt + 1 day', async t => {
+  let fail = false;
+  const h = harness(t, { listing: () => (fail ? { error: 'HTTP 500' } : emptyListing) });
+  await h.prober.probeAll();
+  const saved = h.am.exportQuotaState();
+  h.advance(2 * hour);
+  fail = true;
+  const restored = new AccountManager([account('full')]);
+  restored.quotaProbeIntervalMs = minute;
+  restored.ensureTokenFresh = async () => true;
+  restored.restoreQuotaState(saved);
+  const reborn = h.make(restored);
+  assert.equal(reborn.requestUsageRecheck(restored.accounts[0]).startsWith('Quota check queued'), true);
+  await reborn.probeAll();
+  assert.equal(h.usage.length, 2, 'the manual check ran although the daily check is 22 hours away');
+  assert.equal(restored.accounts[0].resetGrants.lastError, 'HTTP 500');
+  assert.equal(restored.accounts[0].quota.probeNextCheckAt, h.now() + minute, 'next sweep, not the saved checkedAt + 1 day');
+  h.advance(minute);
+  await reborn.probeAll();
+  assert.equal(h.usage.length, 3, 'read again on the next sweep');
+});
+
+test('a disabled exhausted account whose listing already went stale is still read once a day, not on every sweep', async t => {
+  const h = harness(t, { names: ['off', 'on'] });
+  await h.prober.probeAll();
+  h.am.applyResetGrants(0, { error: 'HTTP 500' });   // its last listing failed: stale, with an error
+  h.am.accounts[0].enabled = false;
+  assert.equal(h.am.accounts[0].resetGrants.stale, true);
+  await sweepsFor(h, 50 * hour);
+  assert.equal(h.usage.filter(name => name === 'off').length, 3, 'first read plus one per day');
+});
+
+test('a clock that stepped back cannot defer the daily check by the skew plus a day', async t => {
+  const h = harness(t);
+  await h.prober.probeAll();
+  h.advance(-3 * day);                              // saved timestamps are now 3 days ahead of the clock
+  await h.prober.probeAll();
+  assert.equal(h.am.accounts[0].quota.probeNextCheckAt, h.now() + day, 'bounded to one day out');
+  await sweepsFor(h, day - hour);
+  assert.equal(h.usage.length, 1, 'not before the bounded deadline');
+  await sweepsFor(h, 2 * hour);
+  assert.equal(h.usage.length, 2, 'the pinned deadline comes due instead of sliding away');
+});

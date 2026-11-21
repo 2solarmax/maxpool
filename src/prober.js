@@ -288,12 +288,13 @@ export class Prober {
     return Boolean(account.lastClaimAt && account.lastClaimAt >= (q.lastProbeOkSentAt || q.lastProbeOkAt));
   }
 
-  _pendingGrant(account, now) {
+  _pendingGrant(account, now, ignoreListingStale = false) {
     const listing = account.resetGrants;
     // A snapshot restored at boot is stale only because it is old, not because a
     // read failed; for an empty listing the daily schedule below covers its age.
     const restoredOnly = listing?.restored === true && !listing.lastError;
-    return Boolean((listing?.stale && !restoredOnly) || this.am.isHoldingWall?.(account, now));
+    const listingPending = listing?.stale && !restoredOnly && !ignoreListingStale;
+    return Boolean(listingPending || this.am.isHoldingWall?.(account, now));
   }
 
   _cooldownAt(account) {
@@ -313,17 +314,31 @@ export class Prober {
     const confirmedEmpty = listing?.checkedAt && Array.isArray(listing.grants) && listing.grants.length === 0
       && !listing.nextGrantId;
     if (!confirmedEmpty) return null;
+    // A disabled account is never listed again, so its listing can only go stale
+    // once and stay that way; that must not keep it on the every-sweep cadence.
+    const disabled = account.enabled === false;
     const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
-      && !this._claimedSinceProbe(account) && !this._pendingGrant(account, now) && !q.probeRecheckRequested;
+      && !this._claimedSinceProbe(account) && !this._pendingGrant(account, now, disabled) && !q.probeRecheckRequested;
     if (!weekly) return null;
     // The daily sample is one listing plus one usage read, so it is anchored on the
     // OLDER of the two successes: a usage read that failed after a good listing must
     // not push the retry a day out, and a DISABLED account (never listed, so its
     // checkedAt never moves) is paced by its own successful usage reads instead of
     // being due on every sweep.
-    const anchor = account.enabled === false ? q.lastProbeOkAt : Math.min(listing.checkedAt, q.lastProbeOkAt);
+    const anchor = disabled ? q.lastProbeOkAt : Math.min(listing.checkedAt, q.lastProbeOkAt);
+    let inventoryAt = anchor + EXHAUSTED_NO_GRANTS_MS;
+    if (inventoryAt > now + EXHAUSTED_NO_GRANTS_MS) {
+      // The anchor is in the future (the clock stepped back, or the state was saved
+      // by a skewed clock). Pin ONE absolute deadline at most a day out, so the
+      // skew cannot defer the check by skew + 24 h; a sliding now + 24 h would
+      // never come due. A newer anchor (a successful read) replaces the pin.
+      if (account._inventoryPin?.anchor !== anchor) {
+        account._inventoryPin = { anchor, at: now + EXHAUSTED_NO_GRANTS_MS };
+      }
+      inventoryAt = account._inventoryPin.at;
+    }
     return {
-      inventoryAt: anchor + EXHAUSTED_NO_GRANTS_MS,
+      inventoryAt,
       resetAt: q.unified7dReset ?? Infinity,
       cooldownAt: this._cooldownAt(account),
     };
