@@ -33,6 +33,9 @@
 # RELEASE_WATCH_TIMEOUT (default 1800s) bounds the post-push wait for the Publish workflow.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/release-guards.sh"
+# The version is read from ./package.json after the bump; run from the repo root so a
+# call from a subdirectory cannot bump and tag, then fail the read.
+cd "$(git rev-parse --show-toplevel)"
 
 
 # ── Stage watchdog (2026-10-27, owner-approved) ────────────────────────────────
@@ -146,7 +149,8 @@ echo "    v$NEW_VERSION"
 
 echo "==> Pushing to $REMOTE/$BRANCH (with tag) — the tag triggers the Publish Action"
 RELEASE_STAGE_RECOVERY_FN=recovery_push
-run_stage "Push to $REMOTE/$BRANCH" 120 git push --atomic "$REMOTE" "$BRANCH" --follow-tags
+# Push the branch by its full ref so a tag also named "main" cannot make the source ambiguous.
+run_stage "Push to $REMOTE/$BRANCH" 120 git push --atomic "$REMOTE" "refs/heads/$BRANCH" --follow-tags
 RELEASE_STAGE_RECOVERY_FN=
 
 echo "==> npm publish runs on GitHub Actions (Trusted Publishing, OIDC — no token)."

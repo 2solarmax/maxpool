@@ -238,5 +238,6 @@ release_recovery_push() {
   local remote="$1" ver="${2#v}" base="$3"
   echo "FIRST check whether the push landed anyway:  git ls-remote --tags $remote v$ver"
   echo "    - if it prints a ref, the tag is on $remote and publishing: the release HAPPENED — do NOT undo anything (watch: gh run list --workflow publish.yml)."
-  echo "    - only if it prints nothing: git tag -d v$ver && git reset --hard $remote/$base"
+  echo "    - if it fails (network error), you cannot tell yet: retry the check before touching anything."
+  echo "    - only if it exits 0 and prints nothing: git tag -d v$ver && git reset --hard $remote/$base"
 }

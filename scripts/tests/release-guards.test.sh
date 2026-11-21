@@ -378,6 +378,10 @@ ls_at="$(echo "$hint" | grep -n 'ls-remote' | head -1 | cut -d: -f1)"
 undo_at="$(echo "$hint" | grep -n 'git tag -d v1.2.3 && git reset --hard origin/main' | head -1 | cut -d: -f1)"
 [[ -n "$ls_at" && -n "$undo_at" && "$ls_at" -lt "$undo_at" ]] && ok "push hint: ls-remote check comes BEFORE the undo command" || bad "push hint order wrong (ls=$ls_at undo=$undo_at)"
 expect_eq "push hint accepts a v-prefixed version" "$hint" "$(release_recovery_push origin v1.2.3 main)"
+echo "$hint" | grep -q 'only if it exits 0 and prints nothing' && ok "push hint gates the undo on a successful empty check" || bad "push hint undo not gated on exit 0"
+echo "$hint" | grep -q 'retry the check before touching anything' && ok "push hint says a failed check is not proof" || bad "push hint lacks the failed-check warning"
+grep -q 'git push --atomic "$REMOTE" "refs/heads/$BRANCH"' "$(dirname "$0")/../release.sh" && ok "release pushes the full branch ref" || bad "release push is not the full branch ref"
+grep -q 'cd "$(git rev-parse --show-toplevel)"' "$(dirname "$0")/../release.sh" && ok "release runs from the repo root" || bad "release does not cd to the repo root"
 
 echo "---- $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]
