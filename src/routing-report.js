@@ -8,7 +8,7 @@ const METRICS = ['arrivals', 'requests', 'completed', 'timelyCompleted', 'failed
   'active', 'serving', 'peakServing', 'activeSessions', 'peakSessions',
   'inputTokens', 'cachedInputTokens', 'coverageSince', 'completeCoverage', 'from', 'to'];
 const metrics = row => Object.fromEntries(METRICS.filter(k => Number.isFinite(row[k]) || typeof row[k] === 'boolean').map(k => [k, row[k]]));
-const RECENT_METRICS = ['requests', 'queuedRequests', 'capacityDenied', 'waitTimeouts', 'waitP90Ms', 'waitP95Ms',
+const RECENT_METRICS = ['requests', 'queuedRequests', 'capacityDenied', 'refusedAfterWait', 'waitP90Ms', 'waitP95Ms',
   'queuedWaitP95Ms', 'longestWaitMs', 'pending', 'oldestWaitMs', 'windowMs', 'observedMs'];
 const dailyCounts = ({ requests, timelyCompleted, capacityDenied }) => ({ requests, timelyCompleted, capacityDenied });
 const PERIODS = { '1h': HOUR, '24h': 24 * HOUR, '7d': 168 * HOUR };

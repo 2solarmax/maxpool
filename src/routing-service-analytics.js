@@ -20,7 +20,7 @@ const RECENT_WINDOW = 15 * MINUTE;
 // above 0.8% in an hour, 99.97% within the five-second target. No saturated sample exists yet, so
 // the 2% and 10% bands are placeholders until a real backlog is observed.
 export const CAPACITY_BANDS = { minRequests: 20, tightWaitedShare: 0.02, shortWaitedShare: 0.10,
-  tightOldestMs: WAIT_TARGET, shortOldestMs: 30_000, shortDeniedShare: 0.05 };
+  tightOldestMs: WAIT_TARGET, tightQueuedP95Ms: WAIT_TARGET, shortOldestMs: 30_000, shortDeniedShare: 0.05 };
 const hourOf = t => Math.floor(t / HOUR) * HOUR;
 const minuteOf = t => Math.floor(t / MINUTE) * MINUTE;
 const count = n => Number.isSafeInteger(n) && n >= 0 ? n : 0;
@@ -222,7 +222,7 @@ export class RoutingServiceAnalytics {
         const index = WAIT_BOUNDS.findIndex(max => waitMs <= max);
         const waitBin = index < 0 ? WAIT_BOUNDS.length : index;
         const recent = peer ? null : this._minute(now);
-        if (recent && waited && outcome === 'capacityDenied') recent.waitTimeouts++;
+        if (recent && waited && outcome === 'capacityDenied') recent.refusedAfterWait++;
         for (const stats of [peer ? null : bucket.total, accountStats(bucket, account), recent]) {
           if (!stats) continue;
           stats.requests++;
@@ -251,7 +251,7 @@ export class RoutingServiceAnalytics {
   _minute(now) {
     const minute = minuteOf(now);
     for (const m of this.recentMinutes.keys()) if (m <= minute - RECENT_KEEP * MINUTE) this.recentMinutes.delete(m);
-    if (!this.recentMinutes.has(minute)) this.recentMinutes.set(minute, { ...empty(), waitTimeouts: 0 });
+    if (!this.recentMinutes.has(minute)) this.recentMinutes.set(minute, { ...empty(), refusedAfterWait: 0 });
     return this.recentMinutes.get(minute);
   }
 
@@ -260,17 +260,19 @@ export class RoutingServiceAnalytics {
   recent(windowMs = RECENT_WINDOW, now = this.now()) {
     this.observe(now);
     const total = empty();
-    let waitTimeouts = 0;
-    const from = minuteOf(now - windowMs) + MINUTE;
+    let refusedAfterWait = 0;
+    // Whole minutes only: the minute holding the cutoff is kept, so nothing from the last windowMs is
+    // dropped and the oldest figures can be up to a minute older than the label.
+    const from = minuteOf(now - windowMs);
     for (const [minute, row] of this.recentMinutes) {
       if (minute < from || minute > now) continue;
       combine(total, row);
-      waitTimeouts += row.waitTimeouts;
+      refusedAfterWait += row.refusedAfterWait;
     }
     const waiting = [...this.waiters.values()];
     const oldestWaitMs = waiting.length ? Math.max(0, now - Math.min(...waiting)) : 0;
     const summary = summarize(total);
-    const result = { ...summary, longestWaitMs: total.longestWaitMs, waitTimeouts, pending: waiting.length, oldestWaitMs, windowMs,
+    const result = { ...summary, longestWaitMs: total.longestWaitMs, refusedAfterWait, pending: waiting.length, oldestWaitMs, windowMs,
       observedMs: Math.max(0, Math.min(windowMs, now - this.started)) };
     return { ...result, state: capacityState(result) };
   }
@@ -428,18 +430,20 @@ export class RoutingServiceAnalytics {
 }
 
 // Are the accounts keeping up right now? Judged on the share of requests the router held, how long
-// the oldest held request has waited, and any capacity refusal. Fewer than minRequests with nothing
-// pending is "quiet", never "ok": a healthy-looking zero needs traffic behind it.
+// the oldest held request has waited, and any capacity refusal. Shares and p95 need minRequests behind
+// them: one 1 ms wait among five requests is 20%, not a shortage. Under the minimum only direct
+// evidence escalates (a request held now, any refusal); otherwise the answer is "quiet", never "ok",
+// because a healthy-looking zero needs traffic behind it.
 export function capacityState(m) {
   const b = CAPACITY_BANDS;
   if (!m || !Number.isFinite(m.requests)) return 'unknown';
+  const enough = m.requests >= b.minRequests;
   const waited = m.requests ? m.queuedRequests / m.requests : 0;
   const denied = m.requests ? m.capacityDenied / m.requests : 0;
-  if (m.oldestWaitMs >= b.shortOldestMs || waited >= b.shortWaitedShare || denied >= b.shortDeniedShare) return 'short';
-  if (m.capacityDenied > 0 || m.pending > 0 && m.oldestWaitMs >= b.tightOldestMs
-    || waited >= b.tightWaitedShare || (m.queuedWaitP95Ms ?? 0) > WAIT_TARGET) return 'tight';
-  if (m.requests < b.minRequests && !m.pending) return 'quiet';
-  return 'ok';
+  if (m.oldestWaitMs >= b.shortOldestMs || (enough && (waited >= b.shortWaitedShare || denied >= b.shortDeniedShare))) return 'short';
+  if (m.capacityDenied > 0 || (m.pending > 0 && m.oldestWaitMs >= b.tightOldestMs)
+    || (enough && (waited >= b.tightWaitedShare || (m.queuedWaitP95Ms ?? 0) > b.tightQueuedP95Ms))) return 'tight';
+  return enough ? 'ok' : 'quiet';
 }
 
 const CAPACITY_CAUSES = new Set(['weekly_exhausted', 'weekly_reset_unknown', 'concurrency_cap', 'session_limit',

@@ -284,6 +284,13 @@ function truncate(s, w) {
   return visible < w ? out + ' '.repeat(w - visible) + RESET : out + RESET;
 }
 
+// How much history a Headroom figure really covers: the full window, or less just after a restart.
+function headroomSpan(r) {
+  const windowMs = r.windowMs || 900_000;
+  const span = Number.isFinite(r.observedMs) ? Math.min(windowMs, r.observedMs) : windowMs;
+  return span < 60_000 ? '<1m' : Math.round(span / 60_000) + 'm';
+}
+
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
 /** Truncate only when too wide (no padding) — for header lines. */
 function truncLine(s, w) {
@@ -1403,7 +1410,6 @@ export class TUI {
     return truncLine(` ${warn ? yellow('Moves') : green('Moves')}   ${parts.join(' · ')}  ${dim('[15m]')}`, W);
   }
 
-  /** The Claude row with the lowest cache share in the window (enough volume only). */
   /** Are the accounts keeping up right now? Reads the router's own hold of requests (waiting for
    *  capacity), never upstream latency. Judged from the worst worker that reports it. */
   _capacityLine(W = 80, now = Date.now()) {
@@ -1415,9 +1421,8 @@ export class TUI {
     const worst = rows.reduce((a, b) => (rank[b.report.recent.state] > rank[a.report.recent.state] ? b : a));
     const r = worst.report.recent;
     const where = worst === report[0] ? '' : ` ${dim('on ' + worst.name)}`;
-    const mins = Math.round((r.windowMs || 900_000) / 60_000);
     const time = n => !Number.isFinite(n) ? '—' : n < 1000 ? n + 'ms' : n < 60_000 ? (n / 1000).toFixed(n < 10_000 ? 1 : 0) + 's' : Math.round(n / 60_000) + 'm';
-    const label = `${dim('[' + mins + 'm]')}`;
+    const label = `${dim('[' + headroomSpan(r) + ']')}`;
     if (r.state === 'quiet') return truncLine(` Headroom ${dim('— (little traffic)')}${where}`, W);
     const parts = [(r.pending ? `${r.pending} waiting, oldest ${time(r.oldestWaitMs)}` : ''),
       `${r.queuedRequests || 0} of ${r.requests || 0} waited`,
@@ -1431,6 +1436,7 @@ export class TUI {
     return truncLine(build(), W);
   }
 
+  /** The Claude row with the lowest cache share in the window (enough volume only). */
   _worstCacheAccount() {
     let worst = null;
     for (const a of this.am.accounts) {
@@ -4036,12 +4042,12 @@ export class TUI {
       const le = (n, d) => d > 0 && Number.isFinite(n) ? '≤' + time(n) : '—';
       if (r) {
         const names = { ok: 'Keeping up', tight: 'Getting tight', short: 'Short of accounts', quiet: 'Little traffic' };
-        lines.push(bold(' Headroom now  ' + (names[r.state] || '—')) + dim('  last ' + Math.round((r.windowMs || 0) / 60_000) + ' min'
+        lines.push(bold(' Headroom now  ' + (names[r.state] || '—')) + dim('  last ' + headroomSpan(r).replace('m', ' min')
           + (r.state === 'quiet' ? ' · ' + number(r.requests) + ' of ' + CAPACITY_BANDS.minRequests + ' requests needed' : '')));
         lines.push(' Waited ' + number(r.queuedRequests) + ' of ' + number(r.requests) + ' requests (' + share(r.queuedRequests, r.requests)
           + ')   Longest wait ' + le(r.longestWaitMs, r.requests) + '   p95 ' + le(r.waitP95Ms, r.requests));
         lines.push(' Waiting now ' + number(r.pending) + (r.pending ? '   Oldest ' + time(r.oldestWaitMs) : '')
-          + '   Refused ' + number(r.capacityDenied) + '   Gave up after waiting ' + number(r.waitTimeouts));
+          + '   Refused ' + number(r.capacityDenied) + '   Refused after waiting ' + number(r.refusedAfterWait));
         lines.push(dim(' Requests, not sessions. Wait = held by the router, not model speed.'));
         lines.push('');
       }
@@ -4098,9 +4104,13 @@ export class TUI {
         }
       }
       if (report.recent) {
+        const B = CAPACITY_BANDS, pct = n => Math.round(n * 100) + '%';
         lines.push('', bold(' How headroom is judged'));
-        lines.push(dim(' Tight: over ' + Math.round(CAPACITY_BANDS.tightWaitedShare * 100) + '% of requests waited, any refusal, or a request held over ' + time(CAPACITY_BANDS.tightOldestMs) + '.'));
-        lines.push(dim(' Short: over ' + Math.round(CAPACITY_BANDS.shortWaitedShare * 100) + '% waited, or a request held over ' + time(CAPACITY_BANDS.shortOldestMs) + '.'));
+        lines.push(dim(' Tight: ' + pct(B.tightWaitedShare) + ' or more of requests waited, any refusal, a request held ' + time(B.tightOldestMs)
+          + ' or more, or the slowest 5% of waited requests over ' + time(B.tightQueuedP95Ms) + '.'));
+        lines.push(dim(' Short: ' + pct(B.shortWaitedShare) + ' or more waited, ' + pct(B.shortDeniedShare) + ' or more refused, or a request held '
+          + time(B.shortOldestMs) + ' or more.'));
+        lines.push(dim(' Shares need ' + B.minRequests + ' requests; a refusal or a long hold counts at any volume.'));
         lines.push(dim(' Provisional. Measured healthy load: about 0.1% of requests wait; no backlog sample yet.'));
       }
       const sizing = report.provisioning;

@@ -117,6 +117,9 @@ test('Headroom headline sits under Moves, names the state, and fits 80 columns',
   // Drive the ledger from the same controllable clock so every recorded request stays inside the
   // 15-minute window however long the test takes, and held requests age by exactly the advance.
   m.routingService.now = () => clock;
+  // A worker that has been watching for longer than the window, so the label shows the full 15m.
+  m.routingService.started = clock - 20 * 60_000;
+  for (let i = 0; i < 25; i++) served(m, m.accounts[0], { in: 1000, cr: 90_000, cc: 0, out: 10 });
   const fresh = () => { m._routingReport = null; };
   const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
   assert.match(strip(tui._capacityLine(80)), /Headroom .*little traffic/);
@@ -134,7 +137,41 @@ test('Headroom headline sits under Moves, names the state, and fits 80 columns',
   const frame = frameAt(tui, 100);
   const moves = frame.findIndex(l => l.trim().startsWith('Moves'));
   const cap = frame.findIndex(l => l.trim().startsWith('Headroom'));
-  assert.ok(cap > 0 && (moves < 0 || cap === moves + 1), 'headline directly under Moves when present');
+  assert.ok(moves > 0, 'the fixture produces a Moves row');
+  assert.equal(cap, moves + 1, 'headline directly under Moves');
   held.forEach(t => t.finish('cancelled'));
+  // Just after a restart the label says how little it has watched instead of claiming 15 minutes.
+  m.routingService.started = clock - 3 * 60_000;
+  fresh();
+  assert.match(strip(tui._capacityLine(80)), /\[3m\]/);
   } finally { Date.now = realNow; }
+});
+
+test('Headroom headline shows the worst fresh worker by name and ignores a stale or older one', () => {
+  const m = am();
+  const now = Date.now();
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  const recent = (state, extra = {}) => ({ state, requests: 40, queuedRequests: 0, capacityDenied: 0, longestWaitMs: 0,
+    pending: 0, oldestWaitMs: 0, windowMs: 900_000, observedMs: 900_000, ...extra });
+  const link = (name, source, rec, extra = {}) => ({ name, lastOkAt: now, ...extra,
+    status: { routingAnalytics: { version: 1, source, asOf: now, ...(rec ? { recent: rec } : {}) } } });
+  const show = links => { m.poolLinks = links; m._routingReport = null; return strip(tui._capacityLine(100, now)); };
+  // Local is quiet and so is the remote: a tie stays local, so no worker name.
+  assert.doesNotMatch(show([link('Cloud', 'src-cloud', { state: 'quiet' })]), / on /);
+  // A fresh remote in a worse state wins and is named; a stale one in a worse state is skipped.
+  const tight = show([link('Cloud', 'src-cloud', recent('tight', { queuedRequests: 3, longestWaitMs: 7000 })),
+    link('Stale', 'src-stale', recent('short', { queuedRequests: 20 }), { lastError: 'unreachable' }),
+    { name: 'Older', status: {} }, link('NoHeadline', 'src-old', null)]);
+  assert.match(tight, /Getting tight/);
+  assert.match(tight, /3 of 40 waited/);
+  assert.match(tight, /on Cloud/);
+  assert.doesNotMatch(tight, /Stale|Short of accounts/);
+  // Two fresh workers: the shorter-of-accounts one is shown.
+  const short = show([link('Cloud', 'src-cloud', recent('tight', { queuedRequests: 3 })),
+    link('Cloud2', 'src-cloud2', recent('short', { queuedRequests: 8 }))]);
+  assert.match(short, /Short of accounts/);
+  assert.match(short, /8 of 40 waited/);
+  assert.match(short, /on Cloud2/);
+  // Only stale workers report: nothing to say beyond this worker's own quiet line.
+  assert.doesNotMatch(show([link('Stale', 'src-stale', recent('short'), { lastError: 'unreachable' })]), /Short of accounts| on /);
 });

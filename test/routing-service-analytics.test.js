@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { __serverTest } from '../src/server.js';
-import { LinkedMessageEnvelope, capacityDenial, finishInference, noteMessageEvent, RoutingServiceAnalytics } from '../src/routing-service-analytics.js';
+import { CAPACITY_BANDS, LinkedMessageEnvelope, capacityDenial, capacityState, finishInference, noteMessageEvent, RoutingServiceAnalytics } from '../src/routing-service-analytics.js';
 
 const HOUR = 3_600_000;
 
@@ -239,12 +239,95 @@ test('live capacity headline: idle, healthy and saturated workers are judged fro
   held.resume(); held.wait(); now += 1000;
   held.finish('capacityDenied', {}, 'weeklyDenied');
   r = ledger.recent();
-  assert.deepEqual([r.pending, r.waitTimeouts, r.capacityDenied], [0, 1, 1]);
+  assert.deepEqual([r.pending, r.refusedAfterWait, r.capacityDenied], [0, 1, 1]);
   // Saturated: a backlog of long waits crosses the short band; old minutes age out of the window.
   finish(30, 20_000);
   assert.equal(ledger.recent().state, 'short');
   now += 20 * 60_000;
   assert.deepEqual([ledger.recent().requests, ledger.recent().state], [0, 'quiet']);
   assert.equal(ledger.recent(60 * 60_000).requests > 0, true);
-  assert.doesNotMatch(JSON.stringify(ledger.exportState()), /waitTimeouts|oldestWaitMs/, 'headline is not persisted');
+  assert.doesNotMatch(JSON.stringify(ledger.exportState()), /refusedAfterWait|oldestWaitMs/, 'headline is not persisted');
+});
+
+test('headline needs 20 requests before a share can raise it; only a hold or a refusal counts at low volume', () => {
+  let now = 100 * HOUR;
+  const ledger = new RoutingServiceAnalytics(() => now);
+  // One 1 ms wait among five requests is 20% of a handful, not a shortage.
+  for (let i = 0; i < 4; i++) { const t = ledger.begin({}); t.route('a'); t.finish('completed'); }
+  const waited = ledger.begin({});
+  waited.wait(); now += 1; waited.resume(); waited.route('a'); waited.finish('completed');
+  let r = ledger.recent();
+  assert.deepEqual([r.requests, r.queuedRequests, r.state], [5, 1, 'quiet']);
+  // Nothing finished and one request held for 1 s: still too little to say anything.
+  const fresh = new RoutingServiceAnalytics(() => now);
+  const held = fresh.begin({});
+  held.wait(); now += 1000;
+  r = fresh.recent();
+  assert.deepEqual([r.requests, r.pending, r.oldestWaitMs, r.state], [0, 1, 1000, 'quiet']);
+  // A hold is direct evidence at any volume.
+  now += CAPACITY_BANDS.tightOldestMs;
+  assert.equal(fresh.recent().state, 'tight');
+  now += CAPACITY_BANDS.shortOldestMs;
+  assert.equal(fresh.recent().state, 'short');
+  held.finish('cancelled');
+  // So is a refusal.
+  const refused = fresh.begin({});
+  refused.finish('capacityDenied', {}, 'weeklyDenied');
+  assert.deepEqual([fresh.recent().requests, fresh.recent().state], [2, 'tight']);
+});
+
+test('capacityState boundaries match the documented bands', () => {
+  const base = { requests: 100, queuedRequests: 0, capacityDenied: 0, pending: 0, oldestWaitMs: 0, queuedWaitP95Ms: null };
+  const state = over => capacityState({ ...base, ...over });
+  assert.equal(state({}), 'ok');
+  // Waited share: tight at 2% and above, short at 10% and above.
+  assert.equal(state({ queuedRequests: 1 }), 'ok');
+  assert.equal(state({ queuedRequests: 2 }), 'tight');
+  assert.equal(state({ queuedRequests: 9 }), 'tight');
+  assert.equal(state({ queuedRequests: 10 }), 'short');
+  // Refused share: any refusal is tight, 5% and above is short.
+  assert.equal(state({ capacityDenied: 1 }), 'tight');
+  assert.equal(state({ capacityDenied: 4 }), 'tight');
+  assert.equal(state({ capacityDenied: 5 }), 'short');
+  // A request held now: tight at 5 s and above, short at 30 s and above.
+  assert.equal(state({ pending: 1, oldestWaitMs: 4999 }), 'ok');
+  assert.equal(state({ pending: 1, oldestWaitMs: 5000 }), 'tight');
+  assert.equal(state({ pending: 1, oldestWaitMs: 29_999 }), 'tight');
+  assert.equal(state({ pending: 1, oldestWaitMs: 30_000 }), 'short');
+  // p95 of waited requests: over 5 s only.
+  assert.equal(state({ queuedRequests: 1, queuedWaitP95Ms: 5000 }), 'ok');
+  assert.equal(state({ queuedRequests: 1, queuedWaitP95Ms: 5001 }), 'tight');
+  // The 20-request minimum: shares and p95 are ignored below it, a hold or refusal is not.
+  assert.equal(state({ requests: 19 }), 'quiet');
+  assert.equal(state({ requests: 20 }), 'ok');
+  assert.equal(state({ requests: 19, queuedRequests: 19, queuedWaitP95Ms: 60_000 }), 'quiet');
+  assert.equal(state({ requests: 20, queuedRequests: 1 }), 'tight');
+  assert.equal(state({ requests: 1, capacityDenied: 1 }), 'tight');
+  assert.equal(state({ requests: 0, pending: 1, oldestWaitMs: 1000 }), 'quiet');
+  assert.equal(state({ requests: 0, pending: 1, oldestWaitMs: 5000 }), 'tight');
+  assert.equal(state({ requests: 0, pending: 1, oldestWaitMs: 30_000 }), 'short');
+  assert.equal(capacityState(null), 'unknown');
+});
+
+test('the recent window keeps the minute holding its cutoff and reports how much it has actually watched', () => {
+  const start = 100 * HOUR;
+  let now = start;
+  const ledger = new RoutingServiceAnalytics(() => now);
+  now = start + 45_000;                    // inside the first minute
+  const early = ledger.begin({});
+  early.route('a'); early.finish('capacityDenied', {}, 'weeklyDenied');
+  // 14m30s later the refusal is 14m30s old and must still count in a 15-minute window. Heartbeat
+  // every minute so the ledger keeps watching continuously, as a running worker does.
+  for (let i = 0; i < 14; i++) { now += 60_000; ledger.observe(); }
+  now += 30_000;
+  assert.equal(ledger.recent().capacityDenied, 1);
+  assert.equal(ledger.recent().observedMs, 15 * 60_000);
+  // Past 15 minutes plus the rest of its minute, the refusal ages out.
+  now = start + 45_000 + 16 * 60_000 + 1;
+  assert.equal(ledger.recent().capacityDenied, 0);
+  // Just after a restart the window says how little it has seen.
+  const restarted = new RoutingServiceAnalytics(() => now);
+  now += 2 * 60_000;
+  const r = restarted.recent();
+  assert.deepEqual([r.windowMs, r.observedMs], [15 * 60_000, 2 * 60_000]);
 });
