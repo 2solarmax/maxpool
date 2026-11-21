@@ -130,13 +130,19 @@ setInterval(() => netEvacTick(), 5_000).unref();
 //   touch /tmp/rc-gate-force-net-evac
 // Injects a snapshot missing one current address so the REAL "address
 // disappeared" predicate + destroy() path run on the REAL agents. Self-clears.
-const FORCE_EVAC_FLAG = '/tmp/rc-gate-force-net-evac';
+const FORCE_EVAC_FLAG = process.env.RC_GATE_FORCE_EVAC_FLAG || '/tmp/rc-gate-force-net-evac';
 setInterval(() => {
   try {
     if (!existsSync(FORCE_EVAC_FLAG)) return;
     rmSync(FORCE_EVAC_FLAG);
+    // No external IPv4 (CI runner, offline laptop): inject a synthetic one so the seam
+    // still exercises the real destroy path.
+    if (!_netIPv4.size) _netIPv4 = new Set(['192.0.2.1']);
     const dropped = [..._netIPv4];
-    if (dropped.length) dropped.pop();
+    dropped.pop();
+    // Two ticks: the persistence debounce above needs the loss in 2 consecutive samples,
+    // so a single injected snapshot never confirmed anything.
+    netEvacTick(new Set(dropped));
     netEvacTick(new Set(dropped));
   } catch {}
 }, 5_000).unref();
@@ -269,8 +275,10 @@ setInterval(() => {
   _accepts = 0; _acceptsByHost = {};
 }, 600_000).unref?.();
 
-const cert = readFileSync(path.join(__dirname, 'anthropic-mitm.crt'));
-const key = readFileSync(path.join(__dirname, 'anthropic-mitm.key'));
+// RC_GATE_MITM_CERT / RC_GATE_MITM_KEY: test seam (CI has no mkcert leaf, so the suite mints a
+// throwaway one). Production leaves both unset and uses the mkcert files beside this script.
+const cert = readFileSync(process.env.RC_GATE_MITM_CERT || path.join(__dirname, 'anthropic-mitm.crt'));
+const key = readFileSync(process.env.RC_GATE_MITM_KEY || path.join(__dirname, 'anthropic-mitm.key'));
 
 // ONE shared secure context for every tunnel (2026-09-07). This was previously built
 // per connection — tls.createSecureContext() re-parsed the cert and key on EVERY
