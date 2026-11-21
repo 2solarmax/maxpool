@@ -27,8 +27,10 @@
 # CI run is the proof that carries. ci.yml runs AGAIN on the pushed tag itself; publish
 # waits for neither, exactly as before.
 #
-# Override the git remote with RELEASE_REMOTE; the checked-out branch must BE the base
-# branch (main).
+# Override the git remote with RELEASE_REMOTE. The base branch is NOT overridable: it is
+# always `main` (the checked-out branch must BE main, and the CI proof must be the run on
+# main) — an env override would let a side branch at main's tip pass both guards.
+# RELEASE_WATCH_TIMEOUT (default 1800s) bounds the post-push wait for the Publish workflow.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/release-guards.sh"
 
@@ -42,11 +44,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/release-guards.sh"
 # it stopped, and exits non-zero so no later stage (tag, push, publish-watch) can run
 # on a half-finished release.
 run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — fails LOUD. Banner and stage
-  # output go to STDERR so a captured stage ("$NEW_VERSION=$(run_stage ...)") yields
-  # only the command's own stdout (npm version prints just "vX.Y.Z").
-  # On failure, $RELEASE_STAGE_RECOVERY (set per call site) prints the exact undo steps —
-  # otherwise the next run's "AHEAD" message would tell the operator to push the
-  # untested bump to main.
+  # output go to STDERR so a captured stage still yields only the command's own stdout.
+  # On failure, the function named by $RELEASE_STAGE_RECOVERY_FN (set per call site) prints
+  # the exact undo steps, computed at failure time — otherwise the next run's "AHEAD"
+  # message would tell the operator to push the untested bump to main.
   local name="$1" ceiling="$2"; shift 2
   local rc=0
   echo "==> $name (ceiling ${ceiling}s)" >&2
@@ -57,8 +58,9 @@ run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — fails LOUD. Banne
   fi
   if [ "$rc" -ne 0 ]; then
     echo "✗ STAGE FAILED: $name (rc=$rc${rc:+, }ceiling ${ceiling}s — frozen or errored; release aborted before any later stage)" >&2
-    if [[ -n "${RELEASE_STAGE_RECOVERY:-}" ]]; then
-      echo "    To undo this attempt: ${RELEASE_STAGE_RECOVERY}" >&2
+    if [[ -n "${RELEASE_STAGE_RECOVERY_FN:-}" ]]; then
+      echo "    To undo this attempt:" >&2
+      "$RELEASE_STAGE_RECOVERY_FN" 2>&1 | sed 's/^/      /' >&2
     fi
     exit "$rc"
   fi
@@ -69,19 +71,22 @@ BUMP="${1:-patch}"
 # missing remote fails in seconds, not after a CI wait and a local version bump.
 if git remote get-url private >/dev/null 2>&1; then DEFAULT_REMOTE=private; else DEFAULT_REMOTE=origin; fi
 REMOTE="${RELEASE_REMOTE:-$DEFAULT_REMOTE}"
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+# Fixed, never read from the environment: guards and the CI lookup both key on it.
+BASE_BRANCH=main
+BRANCH="$BASE_BRANCH"   # the on-base-branch guard below proves HEAD IS refs/heads/main
 if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   echo "✗ Git remote '$REMOTE' does not exist in this clone (remotes: $(git remote | tr '\n' ' ')). Set RELEASE_REMOTE." >&2
   exit 1
 fi
 
 # The CI proof must come from the repository that receives the push. The GitHub repo is
-# DERIVED from the chosen remote (github.com URLs only) — an unparseable or non-GitHub
+# DERIVED from the remote's PUSH url (github.com URLs only) — an unparseable or non-GitHub
 # remote is refused outright; MAXPOOL_GH_REPO may only confirm it, never supply or
 # override it (a wrong-repo CI proof is worse than no release).
-REMOTE_GH_REPO="$(release_github_repo_from_url "$(git remote get-url "$REMOTE")" || true)"
+PUSH_URL="$(git remote get-url --push "$REMOTE")"
+REMOTE_GH_REPO="$(release_github_repo_from_url "$PUSH_URL" || true)"
 if [[ -z "$REMOTE_GH_REPO" ]]; then
-  echo "✗ Cannot derive a GitHub owner/repo from remote '$REMOTE' ($(git remote get-url "$REMOTE")) — it must be a github.com URL. Release refused." >&2
+  echo "✗ Cannot derive a GitHub owner/repo from remote '$REMOTE' ($PUSH_URL) — it must be a github.com URL. Release refused." >&2
   exit 1
 fi
 GH_REPO="$REMOTE_GH_REPO"
@@ -93,7 +98,6 @@ fi
 
 # Stale-copy guard first, before any other work (fetches, then refuses unless HEAD
 # equals remote main). Runs before the dirty-tree check on purpose: it only reads refs.
-BASE_BRANCH="${RELEASE_BASE_BRANCH:-main}"
 release_require_on_base_branch "$BASE_BRANCH"
 release_require_synced_with_remote "$REMOTE" "$BASE_BRANCH"
 
@@ -108,7 +112,7 @@ fi
 # when CI passed for this exact commit. RELEASE_CI_CEILING (default 1800s) bounds the
 # wait for a still-running CI.
 CI_SHA="$(git rev-parse HEAD)"
-release_require_ci_green "$GH_REPO" "$CI_SHA"
+release_require_ci_green "$GH_REPO" "$CI_SHA" "$BASE_BRANCH"
 
 # main can move during the CI wait; re-prove the copy is still current (and unchanged)
 # right before the bump so no stray bump commit/tag is created on an old base.
@@ -119,34 +123,53 @@ if [[ "$(git rev-parse HEAD)" != "$CI_SHA" ]]; then
 fi
 
 echo "==> Bumping version ($BUMP) — creates a commit + tag"
-# Recovery after a failed bump/push: delete the tag this attempt created and reset to
-# the pre-bump SHA (bump) / remote main tip (push). Printed by run_stage on failure so
-# the operator never follows the next run's "AHEAD" hint and pushes an untested bump.
+# Recovery after a failed bump/push, printed by run_stage on failure so the operator never
+# follows the next run's "AHEAD" hint and pushes an untested bump. Tags to delete are the
+# ones THIS attempt created: the v* tag list is snapshotted before the bump and diffed at
+# failure time (never "all unmerged tags" — this clone carries dozens of those, and main's
+# tip usually already carries the previous release's own tag).
 OLD_SHA="$(git rev-parse HEAD)"
-# (Tags are selected by reachability, never `--points-at HEAD`: main's tip is often the
-# previous release commit and already carries its own vX.Y.Z tag, which must survive.)
-RELEASE_STAGE_RECOVERY="git tag -d \$(git tag -l 'v*' --no-merged $OLD_SHA); git reset --hard $OLD_SHA"
-NEW_VERSION="$(run_stage "Version bump" 120 npm version "$BUMP" -m "chore: release v%s")"
-echo "    $NEW_VERSION"
+TAGS_BEFORE="$(git tag -l 'v*')"
+recovery_bump() { release_recovery_bump "$OLD_SHA" "$TAGS_BEFORE"; }
+recovery_push() { release_recovery_push "$REMOTE" "$NEW_VERSION" "$BASE_BRANCH"; }
+RELEASE_STAGE_RECOVERY_FN=recovery_bump
+run_stage "Version bump" 120 npm version "$BUMP" -m "chore: release v%s"
+# Read the version from package.json, not from npm's stdout: the `version` hook
+# (update-changelog.sh) prints to the same stdout and polluted the captured value.
+NEW_VERSION="$(release_package_version)" || {
+  echo "✗ Could not read the new version from package.json after the bump." >&2
+  echo "    To undo this attempt:" >&2
+  recovery_bump | sed 's/^/      /' >&2
+  exit 1
+}
+echo "    v$NEW_VERSION"
 
 echo "==> Pushing to $REMOTE/$BRANCH (with tag) — the tag triggers the Publish Action"
-RELEASE_STAGE_RECOVERY="git tag -d v${NEW_VERSION#v} && git reset --hard $REMOTE/$BASE_BRANCH"
+RELEASE_STAGE_RECOVERY_FN=recovery_push
 run_stage "Push to $REMOTE/$BRANCH" 120 git push --atomic "$REMOTE" "$BRANCH" --follow-tags
+RELEASE_STAGE_RECOVERY_FN=
 
 echo "==> npm publish runs on GitHub Actions (Trusted Publishing, OIDC — no token)."
-TAG="v${NEW_VERSION#v}"
+TAG="v$NEW_VERSION"
 if command -v gh >/dev/null 2>&1; then
   echo "    Watching the Publish workflow for $TAG ..."
   sleep 6  # let GitHub register the tag-triggered run
   RUN_ID="$(release_gh run list --repo "$GH_REPO" --workflow publish.yml -L 5 \
     --json databaseId,headBranch -q "[.[] | select(.headBranch==\"$TAG\")][0].databaseId" 2>/dev/null || true)"
   if [[ -n "$RUN_ID" ]]; then
-    release_gh run watch "$RUN_ID" --repo "$GH_REPO" --exit-status && \
-      echo "==> Published maxpool $NEW_VERSION to npm via Trusted Publishing." || \
-      { echo "✗ Publish workflow failed — see: gh run view $RUN_ID --repo $GH_REPO --log-failed" >&2; exit 1; }
+    # Own ceiling (RELEASE_WATCH_TIMEOUT, default 1800s): the Publish workflow takes minutes,
+    # far past the 60s that bounds the short list/view calls.
+    watch_rc=0
+    release_gh_watch run watch "$RUN_ID" --repo "$GH_REPO" --exit-status || watch_rc=$?
+    if [[ "$watch_rc" -eq 0 ]]; then
+      echo "==> Published maxpool v$NEW_VERSION to npm via Trusted Publishing."
+    else
+      echo "✗ Publish workflow watch ended rc=$watch_rc (124 = exceeded RELEASE_WATCH_TIMEOUT). The tag $TAG IS pushed — do NOT undo it. See: gh run view $RUN_ID --repo $GH_REPO --log-failed" >&2
+      exit 1
+    fi
   else
     echo "    (Could not locate the run yet — check: gh run list --repo $GH_REPO --workflow publish.yml)"
   fi
 fi
 
-echo "==> Released maxpool $NEW_VERSION → GitHub ($REMOTE/$BRANCH); npm via Actions."
+echo "==> Released maxpool v$NEW_VERSION → GitHub ($REMOTE/$BRANCH); npm via Actions."
