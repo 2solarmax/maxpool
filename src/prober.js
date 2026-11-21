@@ -316,8 +316,14 @@ export class Prober {
     const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
       && !this._claimedSinceProbe(account) && !this._pendingGrant(account, now) && !q.probeRecheckRequested;
     if (!weekly) return null;
+    // The daily sample is one listing plus one usage read, so it is anchored on the
+    // OLDER of the two successes: a usage read that failed after a good listing must
+    // not push the retry a day out, and a DISABLED account (never listed, so its
+    // checkedAt never moves) is paced by its own successful usage reads instead of
+    // being due on every sweep.
+    const anchor = account.enabled === false ? q.lastProbeOkAt : Math.min(listing.checkedAt, q.lastProbeOkAt);
     return {
-      inventoryAt: listing.checkedAt + EXHAUSTED_NO_GRANTS_MS,
+      inventoryAt: anchor + EXHAUSTED_NO_GRANTS_MS,
       resetAt: q.unified7dReset ?? Infinity,
       cooldownAt: this._cooldownAt(account),
     };

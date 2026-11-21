@@ -17,10 +17,11 @@ function harness(t, { names = ['full'], reset = Date.now() + 10 * day, listing =
   am.quotaProbeIntervalMs = minute;
   am.ensureTokenFresh = async () => true;
   const usage = [], lists = [];
-  const probeFn = async name => { usage.push(name); return now >= reset ? { sevenDay: { utilization: 0.1, resetAt: now + 7 * day } } : { sevenDay: { utilization: 1, resetAt: reset } }; };
+  const state = { usageFails: false };
+  const probeFn = async name => { usage.push(name); if (state.usageFails) return { error: 'HTTP 500', status: 500 }; return now >= reset ? { sevenDay: { utilization: 0.1, resetAt: now + 7 * day } } : { sevenDay: { utilization: 1, resetAt: reset } }; };
   const grantsFn = async name => { lists.push(name); return listing(name); };
   const make = target => new Prober(target, { intervalMs: minute, now: () => now, usageGapMs: 0, log: () => {}, probeFn, grantsFn });
-  return { am, usage, lists, make, prober: make(am), advance: ms => { now += ms; }, now: () => now };
+  return { am, usage, lists, state, make, prober: make(am), advance: ms => { now += ms; }, now: () => now };
 }
 const sweepsFor = async (h, ms, step = 30 * minute) => {
   for (let spent = 0; spent < ms; spent += step) { h.advance(step); await h.prober.probeAll(); }
@@ -124,4 +125,52 @@ test('after long downtime overdue daily checks drain one account per sweep', asy
     assert.equal(h.usage.length - base, sweep, `sweep ${sweep}`);
     h.advance(minute);
   }
+});
+
+test('a failed usage read right after a good empty listing is retried on the next sweep, not a day later', async t => {
+  const h = harness(t);
+  await h.prober.probeAll();
+  await sweepsFor(h, day - 30 * minute);
+  assert.deepEqual([h.lists.length, h.usage.length], [1, 1]);
+  h.state.usageFails = true;
+  h.advance(30 * minute);
+  await h.prober.probeAll();                     // the daily check: listing ok, usage read fails
+  assert.deepEqual([h.lists.length, h.usage.length], [2, 2]);
+  h.state.usageFails = false;
+  h.advance(30 * minute);
+  await h.prober.probeAll();
+  assert.equal(h.usage.length, 3, 'the failed read is retried on the next sweep');
+});
+
+test('a disabled exhausted account with an empty listing is read once a day, not on every sweep', async t => {
+  const h = harness(t, { names: ['off', 'on'] });
+  await h.prober.probeAll();
+  h.am.accounts[0].enabled = false;              // listing is skipped for it from now on
+  const listsBefore = h.lists.length;
+  await sweepsFor(h, 50 * hour);
+  const reads = h.usage.filter(name => name === 'off').length;
+  assert.equal(reads, 3, 'first read plus one per day');
+  assert.equal(h.lists.filter(name => name === 'off').length, 1, 'never listed again');
+  assert.ok(h.lists.length > listsBefore, 'the enabled account still gets its daily listing');
+});
+
+test('a restored empty listing whose daily listing then fails goes back to the regular sweep cadence', async t => {
+  let fail = false;
+  const h = harness(t, { listing: () => (fail ? { error: 'HTTP 500' } : emptyListing) });
+  await h.prober.probeAll();
+  const saved = h.am.exportQuotaState();
+  h.advance(day + hour);
+  fail = true;
+  const restored = new AccountManager([account('full')]);
+  restored.quotaProbeIntervalMs = minute;
+  restored.ensureTokenFresh = async () => true;
+  restored.restoreQuotaState(saved);
+  const reborn = h.make(restored);
+  await reborn.probeAll();
+  assert.equal(h.usage.length, 2, 'the overdue daily check ran');
+  assert.equal(restored.accounts[0].resetGrants.lastError, 'HTTP 500');
+  assert.equal(restored.accounts[0].quota.probeNextCheckAt, h.now() + minute, 'next regular sweep, not another day');
+  h.advance(minute);
+  await reborn.probeAll();
+  assert.equal(h.usage.length, 3, 'read again on the next sweep');
 });
