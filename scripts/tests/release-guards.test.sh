@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Bash test for scripts/release-guards.sh. Stubs `gh` and `sleep` on PATH; the
-# sync guard uses real throwaway git repos in a temp dir (no network).
+# Bash test for scripts/release-guards.sh. Stubs `gh` and `sleep` on PATH; the `gh`
+# stub emits RAW --json fixtures and runs the REAL jq with the `-q` program the guard
+# passes, so the push-event / newest-run / job-row filters are exercised for real
+# (needs `jq`, present on GitHub runners). The sync guard uses real throwaway git
+# repos in a temp dir (no network).
 # Run: bash scripts/tests/release-guards.test.sh   (exit 0 = all pass)
+# CI: .github/workflows/ci.yml runs it in the `test` job.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/../release-guards.sh"
+
+command -v jq >/dev/null 2>&1 || { echo "FAIL - jq is required by this test" >&2; exit 1; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/release-guards-test.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
@@ -14,17 +20,37 @@ bad()  { FAIL=$((FAIL+1)); echo "FAIL - $1"; }
 expect_rc() {  # name expected_rc actual_rc
   if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (want rc=$2 got rc=$3)"; fi
 }
+expect_eq() {  # name expected actual
+  if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (want '$2' got '$3')"; fi
+}
 
 # ── stubs ──────────────────────────────────────────────────────────────────────
-mkdir -p "$T/bin"
+mkdir -p "$T/bin" "$T/fx" "$T/empty"
 cat >"$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-# `gh run list ...`  -> prints $GH_LIST_OUT (already in "<id> <status> <conclusion>" shape)
-# `gh run view ...`  -> prints $GH_JOBS_OUT (tab-separated "<job>\t<conclusion>" lines)
+# gh auth status   -> rc 1 when $GH_AUTH_FAIL is set
+# gh run list ...  -> Nth call prints the Nth file of $GH_LIST_FILES (last one repeats),
+#                     filtered through real jq with the guard's own -q program
+# gh run view ...  -> prints $GH_VIEW_FILE filtered the same way
+# $GH_LIST_FAIL / $GH_VIEW_FAIL make that call exit 1 with a message on stderr.
 echo "gh $*" >>"$GH_CALLS"
+q=""; prev=""
+for a in "$@"; do [[ "$prev" == "-q" ]] && q="$a"; prev="$a"; done
 case "$1 $2" in
-  "run list") [[ -n "${GH_LIST_OUT:-}" ]] && printf '%s\n' "$GH_LIST_OUT"; exit 0 ;;
-  "run view") printf '%b\n' "${GH_JOBS_OUT:-}"; exit 0 ;;
+  "auth status")
+    if [[ -n "${GH_AUTH_FAIL:-}" ]]; then echo "You are not logged into any GitHub hosts" >&2; exit 1; fi
+    exit 0 ;;
+  "run list")
+    if [[ -n "${GH_LIST_FAIL:-}" ]]; then echo "gh: HTTP 403 rate limit exceeded" >&2; exit 1; fi
+    n="$(cat "$GH_COUNTER" 2>/dev/null || echo 0)"; n=$((n+1)); echo "$n" >"$GH_COUNTER"
+    read -ra files <<<"$GH_LIST_FILES"
+    idx=$((n-1)); (( idx >= ${#files[@]} )) && idx=$((${#files[@]}-1))
+    jq -r "$q" "${files[$idx]}"
+    exit $? ;;
+  "run view")
+    if [[ -n "${GH_VIEW_FAIL:-}" ]]; then echo "gh: HTTP 502" >&2; exit 1; fi
+    jq -r "$q" "$GH_VIEW_FILE"
+    exit $? ;;
 esac
 exit 1
 STUB
@@ -34,47 +60,148 @@ echo "sleep $*" >>"$GH_CALLS"
 exit 0
 STUB
 chmod +x "$T/bin/gh" "$T/bin/sleep"
-export GH_CALLS="$T/calls.log"
+export GH_CALLS="$T/calls.log" GH_COUNTER="$T/counter"
 PATH="$T/bin:$PATH"
+
+# ── fixtures: raw `gh ... --json` shapes ───────────────────────────────────────
+FX="$T/fx"
+echo '[]' >"$FX/none.json"
+echo '[{"databaseId":4242,"status":"completed","conclusion":"success","event":"push"}]' >"$FX/ok.json"
+echo '[{"databaseId":4242,"status":"completed","conclusion":"failure","event":"push"}]' >"$FX/fail.json"
+echo '[{"databaseId":4242,"status":"in_progress","conclusion":"","event":"push"}]' >"$FX/inprog.json"
+echo '[{"databaseId":4242,"status":"queued","conclusion":"","event":"push"}]' >"$FX/queued.json"
+# Only a pull_request run, even a green one, must never count.
+echo '[{"databaseId":777,"status":"completed","conclusion":"success","event":"pull_request"}]' >"$FX/pr-only.json"
+# Newest-first: a green pull_request run on top of a FAILED push run -> the push run decides.
+echo '[{"databaseId":777,"status":"completed","conclusion":"success","event":"pull_request"},{"databaseId":4242,"status":"completed","conclusion":"failure","event":"push"}]' >"$FX/pr-over-push-fail.json"
+# Two push runs (a re-run): the newest (first) one decides.
+echo '[{"databaseId":9000,"status":"completed","conclusion":"success","event":"push"},{"databaseId":4242,"status":"completed","conclusion":"failure","event":"push"}]' >"$FX/push-newest-ok.json"
+
+jobs_json() {  # jobs_json name:conclusion ... -> raw `gh run view --json jobs` shape
+  local out='{"jobs":[' first=1 kv
+  for kv in "$@"; do
+    [[ "$first" -eq 1 ]] || out+=','
+    first=0
+    out+="{\"name\":\"${kv%%:*}\",\"conclusion\":\"${kv#*:}\"}"
+  done
+  printf '%s]}\n' "$out"
+}
+jobs_json "test (18):success" "test (20):success" "test (22):success" "ci-gate:success" >"$FX/jobs-green.json"
+jobs_json "test (18):success" "test (20):failure" "ci-gate:success" >"$FX/jobs-test-fail.json"
+jobs_json "test (18):success" "ci-gate:skipped" >"$FX/jobs-gate-skipped.json"
+jobs_json "ci-gate:success" >"$FX/jobs-no-test.json"
+# A job merely PREFIXED "test" (not the matrix `test` job) is not required.
+jobs_json "test (18):success" "testbed:failure" "test-docs:cancelled" "ci-gate:success" >"$FX/jobs-prefix-only.json"
+jobs_json "test:success" "ci-gate:success" >"$FX/jobs-bare-test.json"
 
 # ── CI guard ───────────────────────────────────────────────────────────────────
 SHA=0123456789abcdef0123456789abcdef01234567
-GREEN_JOBS='test (18)\tsuccess\ntest (20)\tsuccess\ntest (22)\tsuccess\nci-gate\tsuccess'
 
-run_ci() {  # run_ci <gh run list line> <gh jobs lines> [ceiling]; prints rc
-  : >"$GH_CALLS"
-  ( export GH_LIST_OUT="$1" GH_JOBS_OUT="$2"; RELEASE_CI_CEILING="${3:-0}" RELEASE_CI_POLL=1 \
+run_ci() {  # run_ci "<list fixtures, space separated>" <jobs fixture> [ceiling] ; prints rc
+  : >"$GH_CALLS"; rm -f "$GH_COUNTER"
+  ( export GH_LIST_FILES="$1" GH_VIEW_FILE="$2"; RELEASE_CI_CEILING="${3:-0}" RELEASE_CI_POLL=1 \
     release_require_ci_green o/r "$SHA" ) >"$T/out" 2>"$T/err"
   echo $?
 }
+count_calls() { grep -c -- "$1" "$GH_CALLS" || true; }
 
-rc="$(run_ci "4242 completed success" "$GREEN_JOBS")"
+rc="$(run_ci "$FX/ok.json" "$FX/jobs-green.json")"
 expect_rc "ci success for exact SHA passes" 0 "$rc"
 grep -q -- "--commit $SHA" "$GH_CALLS" && ok "gh queried with --commit <exact sha>" || bad "gh not queried with --commit sha"
 
-rc="$(run_ci "4242 completed failure" "$GREEN_JOBS")"
+rc="$(run_ci "$FX/fail.json" "$FX/jobs-green.json")"
 expect_rc "ci run concluded failure is refused" 1 "$rc"
 grep -q "concluded 'failure'" "$T/err" && ok "failure message is clear" || bad "failure message missing"
 
-rc="$(run_ci "" "")"
+rc="$(run_ci "$FX/none.json" "$FX/jobs-green.json")"
 expect_rc "no CI run for SHA is refused after ceiling" 1 "$rc"
 grep -q "within 0s" "$T/err" && ok "missing-run message names the ceiling" || bad "missing-run message missing"
 
-rc="$(run_ci "4242 in_progress " "")"
+rc="$(run_ci "$FX/inprog.json" "$FX/jobs-green.json")"
 expect_rc "still-running CI at ceiling is refused" 1 "$rc"
 
-rc="$(run_ci "4242 completed success" 'test (18)\tsuccess\ntest (20)\tfailure\nci-gate\tsuccess')"
+# push-event / newest-run selection through the REAL jq filters
+rc="$(run_ci "$FX/pr-only.json" "$FX/jobs-green.json")"
+expect_rc "a pull_request-only run is NOT accepted as CI proof" 1 "$rc"
+grep -q "No CI push run" "$T/out" && ok "pull_request-only is reported as no push run" || bad "pull_request-only not reported as no push run"
+
+rc="$(run_ci "$FX/pr-over-push-fail.json" "$FX/jobs-green.json")"
+expect_rc "green pull_request run does not mask a failed push run" 1 "$rc"
+grep -q "run 4242\|CI run 4242" "$T/err" && ok "the push run (4242) was the one judged" || bad "push run was not the one judged"
+
+rc="$(run_ci "$FX/push-newest-ok.json" "$FX/jobs-green.json")"
+expect_rc "newest push run decides (older failed re-run ignored)" 0 "$rc"
+grep -q "run 9000" "$T/out" && ok "newest push run id (9000) selected" || bad "newest push run not selected"
+
+# job-row filter + matching
+rc="$(run_ci "$FX/ok.json" "$FX/jobs-test-fail.json")"
 expect_rc "a failed test job refuses even if run says success" 1 "$rc"
 
-rc="$(run_ci "4242 completed success" 'test (18)\tsuccess\nci-gate\tskipped')"
+rc="$(run_ci "$FX/ok.json" "$FX/jobs-gate-skipped.json")"
 expect_rc "ci-gate not success is refused" 1 "$rc"
 
-rc="$(run_ci "4242 completed success" 'ci-gate\tsuccess')"
+rc="$(run_ci "$FX/ok.json" "$FX/jobs-no-test.json")"
 expect_rc "no test job present is refused" 1 "$rc"
+
+rc="$(run_ci "$FX/ok.json" "$FX/jobs-prefix-only.json")"
+expect_rc "jobs only PREFIXED test (testbed, test-docs) are not required" 0 "$rc"
+
+rc="$(run_ci "$FX/ok.json" "$FX/jobs-bare-test.json")"
+expect_rc "a bare 'test' job (no matrix) counts as the test job" 0 "$rc"
+
+# poll / retry path (ceiling > 0; the sleep stub does not advance time, so only
+# scenarios that END within the loop are used here)
+rc="$(run_ci "$FX/queued.json $FX/inprog.json $FX/ok.json" "$FX/jobs-green.json" 100)"
+expect_rc "queued, then in progress, then success passes" 0 "$rc"
+expect_eq "  polled gh run list 3 times" 3 "$(count_calls 'gh run list')"
+expect_eq "  slept twice between polls" 2 "$(count_calls '^sleep')"
+
+rc="$(run_ci "$FX/none.json $FX/ok.json" "$FX/jobs-green.json" 100)"
+expect_rc "no run yet, then run found, passes" 0 "$rc"
+expect_eq "  polled gh run list twice" 2 "$(count_calls 'gh run list')"
+expect_eq "  slept once" 1 "$(count_calls '^sleep')"
+
+rc="$(run_ci "$FX/inprog.json $FX/fail.json" "$FX/jobs-green.json" 100)"
+expect_rc "in progress, then failure, is refused" 1 "$rc"
+expect_eq "  slept once before the failure showed up" 1 "$(count_calls '^sleep')"
+
+# gh failures stop at once with the real cause (never "no run yet", never a 30-min wait)
+: >"$GH_CALLS"; rm -f "$GH_COUNTER"
+rc="$( ( export GH_LIST_FILES="$FX/ok.json" GH_VIEW_FILE="$FX/jobs-green.json" GH_LIST_FAIL=1; \
+  RELEASE_CI_CEILING=100 RELEASE_CI_POLL=1 release_require_ci_green o/r "$SHA" ) >"$T/out" 2>"$T/err"; echo $? )"
+expect_rc "gh run list exiting non-zero refuses immediately" 1 "$rc"
+grep -q "'gh run list' failed" "$T/err" && ok "  names the failing gh call" || bad "  failing gh call not named"
+grep -q "rate limit" "$T/err" && ok "  gh's own message reaches the operator" || bad "  gh's own message hidden"
+expect_eq "  did not sleep/poll" 0 "$(count_calls '^sleep')"
+
+: >"$GH_CALLS"; rm -f "$GH_COUNTER"
+rc="$( ( export GH_LIST_FILES="$FX/ok.json" GH_VIEW_FILE="$FX/jobs-green.json" GH_VIEW_FAIL=1; \
+  RELEASE_CI_CEILING=0 RELEASE_CI_POLL=1 release_require_ci_green o/r "$SHA" ) >"$T/out" 2>"$T/err"; echo $? )"
+expect_rc "gh run view exiting non-zero refuses with its own cause" 1 "$rc"
+grep -q "'gh run view" "$T/err" && ok "  names gh run view, not 'jobs not all green'" || bad "  gh run view failure misreported"
+
+: >"$GH_CALLS"; rm -f "$GH_COUNTER"
+rc="$( ( export GH_LIST_FILES="$FX/ok.json" GH_VIEW_FILE="$FX/jobs-green.json" GH_AUTH_FAIL=1; \
+  RELEASE_CI_CEILING=100 RELEASE_CI_POLL=1 release_require_ci_green o/r "$SHA" ) >"$T/out" 2>"$T/err"; echo $? )"
+expect_rc "gh not logged in refuses up front" 1 "$rc"
+grep -q "gh auth status" "$T/err" && ok "  names gh auth" || bad "  gh auth failure not named"
+expect_eq "  never queried runs" 0 "$(count_calls 'gh run list')"
+
+rc="$( ( PATH="$T/empty"; release_require_gh_ready ) >"$T/out" 2>"$T/err"; echo $? )"
+expect_rc "gh missing refuses up front" 1 "$rc"
+grep -q "not found" "$T/err" && ok "  names the missing gh" || bad "  missing gh not named"
+
+# ── repo derivation from a remote URL ──────────────────────────────────────────
+expect_eq "https url -> owner/repo" "2solarmax/maxpool" "$(release_github_repo_from_url https://github.com/2solarmax/maxpool.git)"
+expect_eq "https url without .git" "2solarmax/maxpool" "$(release_github_repo_from_url https://github.com/2solarmax/maxpool)"
+expect_eq "scp-style ssh url" "2solarmax/maxpool" "$(release_github_repo_from_url git@github.com:2solarmax/maxpool.git)"
+expect_eq "ssh:// url" "2solarmax/maxpool" "$(release_github_repo_from_url ssh://git@github.com/2solarmax/maxpool.git)"
+expect_eq "fork remote resolves to ITS repo, not the default" "dragosdobro/maxpool" "$(release_github_repo_from_url https://github.com/dragosdobro/maxpool.git)"
+release_github_repo_from_url "not-a-url" >/dev/null 2>&1; expect_rc "unparseable url returns non-zero" 1 "$?"
 
 # ── sync guard (real throwaway repos) ──────────────────────────────────────────
 G="git -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
-git init -q --bare "$T/remote.git"
+git init -q --bare -b main "$T/remote.git"
 git init -q -b main "$T/work"
 ( cd "$T/work" && git remote add origin "$T/remote.git" \
   && echo a >f && git add f && $G commit -qm one && git push -q origin main )
@@ -84,12 +211,18 @@ run_sync() { ( cd "$T/work" && release_require_synced_with_remote origin main ) 
 rc="$(run_sync)"; expect_rc "HEAD equal to remote main passes" 0 "$rc"
 
 ( cd "$T/work" && echo b >f && $G commit -qam two )
-rc="$(run_sync)"; expect_rc "HEAD ahead (fast-forward of remote main) passes" 0 "$rc"
+rc="$(run_sync)"; expect_rc "HEAD ahead of remote main is refused (no CI can exist for it)" 1 "$rc"
+grep -q "AHEAD" "$T/err" && ok "ahead message is clear" || bad "ahead message missing"
 
 ( cd "$T/work" && git push -q origin main )
-git clone -q "$T/remote.git" "$T/other"
+rc="$(run_sync)"; expect_rc "HEAD equal again after push passes" 0 "$rc"
+
+# A remote whose fetch refspec does NOT cover main: a plain `git fetch origin main` would
+# only write FETCH_HEAD and leave a stale remote-tracking ref (== HEAD here) to be trusted.
+( cd "$T/work" && git config remote.origin.fetch "+refs/heads/other:refs/remotes/origin/other" )
+git clone -q -b main "$T/remote.git" "$T/other"
 ( cd "$T/other" && echo c >f && $G commit -qam three && git push -q origin main )
-rc="$(run_sync)"; expect_rc "HEAD behind remote main is refused" 1 "$rc"
+rc="$(run_sync)"; expect_rc "HEAD behind remote main is refused (even when the refspec excludes main)" 1 "$rc"
 grep -q "BEHIND" "$T/err" && ok "behind message is clear" || bad "behind message missing"
 
 ( cd "$T/work" && echo d >f && $G commit -qam local-only )

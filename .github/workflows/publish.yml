@@ -13,9 +13,10 @@ name: Publish
 #
 # Trigger: a `vX.Y.Z` tag push (release.sh does this) OR a manual run
 # (workflow_dispatch → publishes the version currently in package.json on main).
-# Tests are NOT re-run here on purpose: release.sh runs the full suite locally
-# before it creates the tag, and ci.yml runs it again on the same push — a third
-# run here would only add a flaky-block between a green tag and its publish.
+# Tests are NOT re-run here on purpose: release.sh refuses to tag unless ci.yml already
+# passed for the exact commit on main (scripts/release-guards.sh), and ci.yml runs again on
+# the tag push — a third run here would only add a flaky-block between a green tag and its
+# publish. A manual tag push or workflow_dispatch skips that release.sh check.
 
 on:
   push:

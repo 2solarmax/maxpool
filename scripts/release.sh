@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # release.sh — ship a new maxpool version across the board in one step:
-#   remote-sync check → CI-verified check → version bump (commit + tag) → push to GitHub → Actions publishes to npm.
+#   remote-sync check → CI-verified check → re-sync → version bump (commit + tag) → atomic push to GitHub → Actions publishes to npm.
 #
 # Usage:
 #   scripts/release.sh                # patch release (default)
@@ -17,9 +17,10 @@
 # One-time npm-side setup lives in .github/workflows/publish.yml. There is NO
 # local npm auth or NPM_TOKEN anymore — the old bypass-2FA token path is dead.
 #
-# Tests are NOT run on this machine: the GitHub CI workflow (ci.yml: jobs `test`
-# and `ci-gate`) must have passed for the exact HEAD commit (guards live in
-# scripts/release-guards.sh). Lint runs in CI only.
+# Tests are NOT run on this machine: HEAD must equal remote main, and the GitHub CI
+# workflow (ci.yml: jobs `test` and `ci-gate`) must have passed for that exact commit
+# (guards live in scripts/release-guards.sh). Lint runs in CI only. A manual tag push or
+# publish.yml workflow_dispatch skips these checks, as it always did.
 #
 # Override the git remote/branch with RELEASE_REMOTE / current branch.
 set -euo pipefail
@@ -27,12 +28,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/release-guards.sh"
 
 
 # ── Stage watchdog (2026-10-27, owner-approved) ────────────────────────────────
-# v1.24.31's release stalled SILENTLY after "Running tests": no tag, no error,
+# v1.24.31's release stalled SILENTLY (then in the local test stage): no tag, no error,
 # nothing for minutes — the operator only noticed because nothing happened. A
-# frozen stage must FAIL LOUDLY, not hang. Every stage below runs under `timeout`
-# with a generous per-stage ceiling (tests can legitimately take ~8 min locally);
-# a timeout names the stage, prints where it stopped, and exits non-zero so no
-# later stage (tag, push, publish-watch) can run on a half-finished release.
+# frozen stage must FAIL LOUDLY, not hang. The stages run through here (version bump,
+# push) go under `timeout` with a per-stage ceiling; the guards bound their own waits
+# (RELEASE_FETCH_TIMEOUT, RELEASE_CI_CEILING). A timeout names the stage, prints where
+# it stopped, and exits non-zero so no later stage (tag, push, publish-watch) can run
+# on a half-finished release.
 run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — prints output, fails LOUD
   local name="$1" ceiling="$2"; shift 2
   local rc=0
@@ -49,8 +51,8 @@ run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — prints output, fa
 }
 BUMP="${1:-patch}"
 # Clones name the GitHub remote differently ('private' on some, 'origin' on others):
-# prefer 'private' when it exists, else 'origin'. Checked BEFORE the test stage so a
-# missing remote fails in seconds, not after the suite and a local version bump.
+# prefer 'private' when it exists, else 'origin'. Checked before anything else so a
+# missing remote fails in seconds, not after a CI wait and a local version bump.
 if git remote get-url private >/dev/null 2>&1; then DEFAULT_REMOTE=private; else DEFAULT_REMOTE=origin; fi
 REMOTE="${RELEASE_REMOTE:-$DEFAULT_REMOTE}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
@@ -59,9 +61,24 @@ if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   exit 1
 fi
 
+# The CI proof must come from the repository that receives the push. Derive the GitHub
+# repo from the chosen remote; MAXPOOL_GH_REPO may only confirm it, never point elsewhere.
+REMOTE_GH_REPO="$(release_github_repo_from_url "$(git remote get-url "$REMOTE")" || true)"
+GH_REPO="${MAXPOOL_GH_REPO:-$REMOTE_GH_REPO}"
+if [[ -z "$GH_REPO" ]]; then
+  echo "✗ Cannot derive a GitHub owner/repo from remote '$REMOTE' ($(git remote get-url "$REMOTE")). Set MAXPOOL_GH_REPO." >&2
+  exit 1
+fi
+if [[ -n "$REMOTE_GH_REPO" ]] && \
+   [[ "$(printf '%s' "$GH_REPO" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$REMOTE_GH_REPO" | tr 'A-Z' 'a-z')" ]]; then
+  echo "✗ MAXPOOL_GH_REPO ($GH_REPO) differs from remote '$REMOTE' ($REMOTE_GH_REPO): the CI proof would come from a different repository than the one receiving the push. Release refused." >&2
+  exit 1
+fi
+
 # Stale-copy guard first, before any other work (fetches, then refuses unless HEAD
-# equals or fast-forwards remote main).
-release_require_synced_with_remote "$REMOTE" "${RELEASE_BASE_BRANCH:-main}"
+# equals remote main). Runs before the dirty-tree check on purpose: it only reads refs.
+BASE_BRANCH="${RELEASE_BASE_BRANCH:-main}"
+release_require_synced_with_remote "$REMOTE" "$BASE_BRANCH"
 
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "✗ Working tree is dirty. Commit your changes first, then release." >&2
@@ -70,18 +87,26 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 # 2026-11-21: local test + lint stages removed. Release proceeds only from a copy that
-# equals (or fast-forwards) remote main — a stale copy once published v1.24.120
-# without PR 14 — and only when CI passed for this exact commit. RELEASE_CI_CEILING
-# (default 1800s) bounds the wait for a still-running CI.
-GH_REPO="${MAXPOOL_GH_REPO:-2solarmax/maxpool}"
-release_require_ci_green "$GH_REPO" "$(git rev-parse HEAD)"
+# equals remote main — a stale copy once published v1.24.120 without PR 14 — and only
+# when CI passed for this exact commit. RELEASE_CI_CEILING (default 1800s) bounds the
+# wait for a still-running CI.
+CI_SHA="$(git rev-parse HEAD)"
+release_require_ci_green "$GH_REPO" "$CI_SHA"
+
+# main can move during the CI wait; re-prove the copy is still current (and unchanged)
+# right before the bump so no stray bump commit/tag is created on an old base.
+release_require_synced_with_remote "$REMOTE" "$BASE_BRANCH"
+if [[ "$(git rev-parse HEAD)" != "$CI_SHA" ]]; then
+  echo "✗ HEAD changed while waiting for CI (was ${CI_SHA:0:9}, now $(git rev-parse --short=9 HEAD)). Release refused." >&2
+  exit 1
+fi
 
 echo "==> Bumping version ($BUMP) — creates a commit + tag"
 NEW_VERSION="$(run_stage "Version bump" 120 npm version "$BUMP" -m "chore: release v%s")"
 echo "    $NEW_VERSION"
 
 echo "==> Pushing to $REMOTE/$BRANCH (with tag) — the tag triggers the Publish Action"
-run_stage "Push to $REMOTE/$BRANCH" 120 git push "$REMOTE" "$BRANCH" --follow-tags
+run_stage "Push to $REMOTE/$BRANCH" 120 git push --atomic "$REMOTE" "$BRANCH" --follow-tags
 
 echo "==> npm publish runs on GitHub Actions (Trusted Publishing, OIDC — no token)."
 TAG="v${NEW_VERSION#v}"
