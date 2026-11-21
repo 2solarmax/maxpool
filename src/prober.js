@@ -22,9 +22,17 @@ export { GRANTS_EVERY_MS, GRANTS_RETRY_MS, CLAIM_BACKOFF_STEPS_MS, CLAIM_BACKOFF
 // How often a subscription-latched account is rechecked (one probe + at most one
 // token refresh per window — cheap, and bounded so a truly canceled plan isn't hammered).
 export const SUB_RECHECK_MS = 30 * 60_000;
-// With a confirmed empty grant listing there is no reset to act on. Sample
-// twice an hour for an unseen external refill or newly issued grant.
-export const EXHAUSTED_NO_GRANTS_MS = 30 * 60_000;
+// A full week with a confirmed EMPTY grant listing has nothing to act on until
+// one of: the natural reset, the listing's cooldown expiring, a locally observed
+// claim, or an owner-requested check (all handled in _usageDeferredUntil). The
+// only thing those can't see is a grant issued, or a reset redeemed, outside this
+// pool, so that is sampled once a day: one listing plus one usage read, both on
+// the shared /api/oauth/usage endpoint. An external refill is therefore visible
+// up to this long after it happens.
+export const EXHAUSTED_NO_GRANTS_MS = 24 * 60 * 60_000;
+// After downtime many accounts can be overdue for that daily check at once. At
+// most this many run per sweep; the rest follow one sweep apart.
+export const EMPTY_INVENTORY_CHECKS_PER_SWEEP = 1;
 
 // The sweep-decision skips that mean "this tick's LISTING can't be trusted" — the
 // only skips after a successful probe that hand a held wall to the rescue (r2 #1).
@@ -143,6 +151,7 @@ export class Prober {
         // last account last).
         const nextSweep = this.intervalMs > 0 ? this._now() + this.intervalMs : null;
         const start = oauth.length ? (this._sweepStart++ % oauth.length) : 0;
+        let inventoryChecks = 0;
         for (let i = 0; i < oauth.length; i++) {
           if (this._stopping) break;
           const account = oauth[(start + i) % oauth.length];
@@ -157,6 +166,13 @@ export class Prober {
               try { await this._rescueHeldWall(account, { refreshToken: true }); } catch { /* keep other accounts checking */ }
             }
             continue; // no usage pacing slot or grant listing for a deferred row
+          }
+          if (this._emptyInventoryCheckOnly(account)) {
+            if (inventoryChecks >= EMPTY_INVENTORY_CHECKS_PER_SWEEP) {
+              q.probeNextCheckAt = nextSweep;   // overdue daily check, next sweep's turn
+              continue;
+            }
+            inventoryChecks++;
           }
           await this._paceUsage();
           if (this._stopping) break;
@@ -254,20 +270,94 @@ export class Prober {
       const due = this._subscriptionRecheckAt(account);
       return Math.max(retryAt, due > now ? due : 0);
     }
-    // A free reset can be used externally without moving the natural reset day.
-    // Unknown/available grants stay on the grant-list cadence. An explicitly
-    // empty listing can wait longer; the natural refill bounds either delay.
-    const recentClaim = account.lastClaimAt && account.lastClaimAt >= (q.lastProbeOkSentAt || q.lastProbeOkAt);
-    const pendingGrant = account.resetGrants?.stale || this.am.isHoldingWall?.(account, now);
-    const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
-      && !recentClaim && !pendingGrant && !q.probeRecheckRequested;
-    const listing = account.resetGrants;
-    const noGrants = listing?.checkedAt && Array.isArray(listing.grants) && listing.grants.length === 0
-      && !listing.nextGrantId;
-    const interval = noGrants ? EXHAUSTED_NO_GRANTS_MS : GRANTS_EVERY_MS;
-    const grantCooldown = listing?.cooldownUntil > q.lastProbeOkAt ? listing.cooldownUntil : Infinity;
-    const due = weekly ? Math.min(q.lastProbeOkAt + interval, q.unified7dReset ?? Infinity, grantCooldown) : 0;
+    const empty = this._emptyInventoryWait(account);
+    if (!empty) {
+      // Unknown, pending, stale-by-failure or non-empty inventory (and a recent
+      // claim or requested check) stays on the grant-list cadence.
+      const weekly = this._weeklyIdle(account, now);
+      const due = weekly ? Math.min(q.lastProbeOkAt + GRANTS_EVERY_MS, q.unified7dReset ?? Infinity, this._cooldownAt(account)) : 0;
+      return Math.max(retryAt, due > now ? due : 0);
+    }
+    const due = Math.min(empty.inventoryAt, empty.resetAt, empty.cooldownAt);
     return Math.max(retryAt, due > now ? due : 0);
+  }
+
+  _claimedSinceProbe(account) {
+    const q = account.quota || {};
+    return Boolean(account.lastClaimAt && account.lastClaimAt >= (q.lastProbeOkSentAt || q.lastProbeOkAt));
+  }
+
+  _pendingGrant(account, now, { emptyListing = false, ignoreListingStale = false } = {}) {
+    const listing = account.resetGrants;
+    // A snapshot restored at boot is stale only because it is old, not because a
+    // read failed; for a confirmed-empty listing the daily schedule covers its age.
+    // Only that path is exempt: a restored non-empty listing stays pending, so its
+    // first live listing is not delayed past the first sweep after boot.
+    const restoredOnly = emptyListing && listing?.restored === true && !listing.lastError;
+    const listingPending = listing?.stale && !restoredOnly && !ignoreListingStale;
+    return Boolean(listingPending || this.am.isHoldingWall?.(account, now));
+  }
+
+  /** A full week with a successful read and nothing asking for an earlier probe:
+   *  no claim since it, no pending grant, no requested check. */
+  _weeklyIdle(account, now, pendingOpts) {
+    const q = account.quota || {};
+    return Boolean(this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
+      && !this._claimedSinceProbe(account) && !this._pendingGrant(account, now, pendingOpts) && !q.probeRecheckRequested);
+  }
+
+  _cooldownAt(account) {
+    const listing = account.resetGrants;
+    const q = account.quota || {};
+    return listing?.cooldownUntil > q.lastProbeOkAt ? listing.cooldownUntil : Infinity;
+  }
+
+  /** A full week whose grant listing is CONFIRMED empty (a successful read, no
+   *  pending next grant) has no reason to be read before its natural reset, the
+   *  listing's cooldown, an observed claim or a manual check, plus the daily
+   *  inventory sample. Returns those wake times, or null for any other state. */
+  _emptyInventoryWait(account) {
+    const q = account.quota || {};
+    const listing = account.resetGrants;
+    const now = this._now();
+    const confirmedEmpty = listing?.checkedAt && Array.isArray(listing.grants) && listing.grants.length === 0
+      && !listing.nextGrantId;
+    if (!confirmedEmpty) return null;
+    // A disabled account is never listed again, so its listing can only go stale
+    // once and stay that way; that must not keep it on the every-sweep cadence.
+    const disabled = account.enabled === false;
+    const weekly = this._weeklyIdle(account, now, { emptyListing: true, ignoreListingStale: disabled });
+    if (!weekly) return null;
+    // The daily sample is one listing plus one usage read, so it is anchored on the
+    // OLDER of the two successes: a usage read that failed after a good listing must
+    // not push the retry a day out, and a DISABLED account (never listed, so its
+    // checkedAt never moves) is paced by its own successful usage reads instead of
+    // being due on every sweep.
+    const anchor = disabled ? q.lastProbeOkAt : Math.min(listing.checkedAt, q.lastProbeOkAt);
+    let inventoryAt = anchor + EXHAUSTED_NO_GRANTS_MS;
+    if (inventoryAt > now + EXHAUSTED_NO_GRANTS_MS) {
+      // The anchor is in the future (the clock stepped back, or the state was saved
+      // by a skewed clock). Pin ONE absolute deadline at most a day out, so the
+      // skew cannot defer the check by skew + 24 h; a sliding now + 24 h would
+      // never come due. A newer anchor (a successful read) replaces the pin.
+      if (account._inventoryPin?.anchor !== anchor) {
+        account._inventoryPin = { anchor, at: now + EXHAUSTED_NO_GRANTS_MS };
+      }
+      inventoryAt = account._inventoryPin.at;
+    }
+    return {
+      inventoryAt,
+      resetAt: q.unified7dReset ?? Infinity,
+      cooldownAt: this._cooldownAt(account),
+    };
+  }
+
+  /** Due only because the daily inventory sample came up (not the reset, a
+   *  cooldown, a claim or a manual check): the checks the per-sweep cap spaces out. */
+  _emptyInventoryCheckOnly(account) {
+    const empty = this._emptyInventoryWait(account);
+    const now = this._now();
+    return Boolean(empty && empty.inventoryAt <= now && empty.resetAt > now && empty.cooldownAt > now);
   }
 
   /** Wait until the current usage-probe gap has elapsed since the last usage
