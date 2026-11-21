@@ -32,7 +32,7 @@ test('rc-gate install: a missing spawn-type line parses to nothing (the script t
 // PATH. Safety: the script's only filesystem write is `$HOME/Library/LaunchAgents/...` (HOME is the
 // temp dir), `launchctl` resolves to the stub (it is not called by absolute path anywhere in the
 // script or the sourced lib), and the stub only appends to a log inside the temp dir.
-function runInstall(spawnTypeLine, { plistEdit = x => x } = {}) {
+function runInstall(spawnTypeLine, { plistEdit = x => x, seedDest = null } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'rcgate-install-'));
   try {
     const home = join(root, 'home');
@@ -47,6 +47,8 @@ function runInstall(spawnTypeLine, { plistEdit = x => x } = {}) {
     copyFileSync(join(srcDir, 'launchd-spawn-type.sh'), join(tools, 'launchd-spawn-type.sh'));
     writeFileSync(join(tools, 'launchd', 'com.mokka.rc-gate.plist'),
       plistEdit(readFileSync(join(srcDir, 'launchd', 'com.mokka.rc-gate.plist'), 'utf8')));
+    const destFile = join(home, 'Library', 'LaunchAgents', 'com.mokka.rc-gate.plist');
+    if (seedDest !== null) writeFileSync(destFile, seedDest);
     const log = join(root, 'launchctl.log');
     writeFileSync(join(root, 'print.txt'), `gui/501/com.mokka.rc-gate = {\n\tstate = running\n${spawnTypeLine}\n}\n`);
     const stub = (name, body) => { const f = join(bin, name); writeFileSync(f, `#!/bin/bash\n${body}\n`); chmodSync(f, 0o755); };
@@ -59,7 +61,8 @@ function runInstall(spawnTypeLine, { plistEdit = x => x } = {}) {
     });
     const calls = existsSync(log) ? readFileSync(log, 'utf8') : '';
     const installed = existsSync(join(home, 'Library', 'LaunchAgents', 'com.mokka.rc-gate.plist'));
-    return { ...r, calls, installed, home };
+    const destAfter = existsSync(destFile) ? readFileSync(destFile, 'utf8') : null;
+    return { ...r, calls, installed, home, destAfter, newLeft: existsSync(`${destFile}.new`) };
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
@@ -81,14 +84,20 @@ test('rc-gate install (behavioural): spawn type interactive -> exit 0, no WARN',
 });
 
 test('rc-gate install (behavioural): a plist without ProcessType=Interactive stops with exit 3 BEFORE any launchctl call', () => {
-  const r = runInstall('\tspawn type = interactive (4)', { plistEdit: x => x.replace(/<key>ProcessType<\/key>\s*<string>Interactive<\/string>/, '') });
+  const SEED = '<!-- previous good plist, must survive byte-identical -->\n';
+  const r = runInstall('\tspawn type = interactive (4)', { plistEdit: x => x.replace(/<key>ProcessType<\/key>\s*<string>Interactive<\/string>/, ''), seedDest: SEED });
+  assert.equal(r.destAfter, SEED, 'the previously installed plist is byte-identical (the bad one never reached LaunchAgents)');
+  assert.equal(r.newLeft, false, 'no .new temp file left behind');
   assert.equal(r.status, 3, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
-  assert.match(r.stderr, /does not have ProcessType=Interactive and ExitTimeOut>=25\. Nothing was reloaded/);
+  assert.match(r.stderr, /does not have ProcessType=Interactive and ExitTimeOut>=25\. Nothing was changed/);
   assert.equal(r.calls, '', 'launchctl (stub) was never called: no unload, no load');
 });
 
 test('rc-gate install (behavioural): a plist with ExitTimeOut below 25 also stops with exit 3', () => {
-  const r = runInstall('\tspawn type = interactive (4)', { plistEdit: x => x.replace(/(<key>ExitTimeOut<\/key>\s*<integer>)\d+/, (_m, head) => head + '5') });
+  const SEED = 'KNOWN-BYTES\n';
+  const r = runInstall('\tspawn type = interactive (4)', { plistEdit: x => x.replace(/(<key>ExitTimeOut<\/key>\s*<integer>)\d+/, (_m, head) => head + '5'), seedDest: SEED });
   assert.equal(r.status, 3, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+  assert.equal(r.destAfter, SEED, 'previous plist untouched');
+  assert.equal(r.newLeft, false);
   assert.equal(r.calls, '');
 });

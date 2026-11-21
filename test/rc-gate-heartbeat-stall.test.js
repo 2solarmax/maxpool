@@ -446,6 +446,28 @@ gateTest('rc-gate: a stall timer that fired >1s late hedges but does not sweep t
   }, { RC_GATE_HEARTBEAT_STALL_MS: '300', RC_GATE_TEST_BLOCK_LOOP_AFTER_SEND_MS: '1500' });
 });
 
+// ── (a14b) the stalled attempt already FAILED in the same turn: no extra hedge on top of its retry ──
+// Same starved-loop seam as (a14), but the upstream resets the connection straight away, so when the
+// loop resumes the overdue stall timer and the connection error arrive together; the error schedules
+// a retry. Kills: dropping the `retryTimer !== null || !liveDirs.has(dir)` guard in the stall deferral
+// (a needless hedge is logged on top of the retry).
+gateTest('rc-gate: when the stalled attempt already failed and a retry is scheduled, the stall does not also hedge', { timeout: 30_000 }, async () => {
+  let n = 0;
+  await withUpstream((req, res) => {
+    req.resume();
+    n++;
+    if (n === 1) { req.socket.destroy(); return; }     // attempt 1: reset immediately (during the block)
+    json200(res);
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 10_000);
+    assert.match(status(r.raw), /^2/, `2xx expected, got ${r.how}: ${r.raw.slice(0, 80)}`);
+    assert.match(gate.getLog(), /\[loop-stall\]/, 'premise: the loop really was blocked');
+    assert.match(gate.getLog(), /\[direct-retry\].*worker\/heartbeat/, 'premise: the failed attempt went through the retry ladder');
+    assert.doesNotMatch(gate.getLog(), /hedging a second attempt/, 'no needless hedge beside the scheduled retry');
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '300', RC_GATE_TEST_BLOCK_LOOP_AFTER_SEND_MS: '900' });
+});
+
 // ── (a16) a final (non-transient) non-2xx wins at once; it is not held for a hung sibling ──
 // Attempt 1 answers 401 at ~3s while the hedge (started at 2s) hangs. Kills: holding every non-2xx
 // (the 401 would sit until the 12.5s deadline).
