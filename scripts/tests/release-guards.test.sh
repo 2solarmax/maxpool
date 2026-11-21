@@ -213,6 +213,9 @@ grep -q 'timeout 60 gh run list' "$GH_CALLS" && ok "default RELEASE_GH_TIMEOUT i
 RELEASE_GH_TIMEOUT=9 release_gh run list >/dev/null 2>&1 || true
 grep -q 'timeout 9 ' "$GH_CALLS" && ok "RELEASE_GH_TIMEOUT overrides the ceiling" || bad "RELEASE_GH_TIMEOUT ignored"
 rm -f "$T/bin/timeout"
+# bash cached the stub's path when it ran; without this, every later `timeout ...` (the
+# real one on CI runners, used by the sync guard's fetch) fails 127 "No such file".
+hash -r
 
 # ── repo derivation from a remote URL ──────────────────────────────────────────
 expect_eq "https url -> owner/repo" "2solarmax/maxpool" "$(release_github_repo_from_url https://github.com/2solarmax/maxpool.git)"
