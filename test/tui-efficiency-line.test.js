@@ -114,18 +114,22 @@ test('Headroom headline sits under Moves, names the state, and fits 80 columns',
   let clock = realNow();
   Date.now = () => clock;
   try {
+  // Drive the ledger from the same controllable clock so every recorded request stays inside the
+  // 15-minute window however long the test takes, and held requests age by exactly the advance.
+  m.routingService.now = () => clock;
   const fresh = () => { m._routingReport = null; };
   const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
   assert.match(strip(tui._capacityLine(80)), /Headroom .*little traffic/);
-  for (let i = 0; i < 30; i++) { const t = m.routingService.begin({}); t.route('c1'); t.finish('completed'); }
+  for (let i = 0; i < 35; i++) { const t = m.routingService.begin({}); t.route('c1'); t.finish('completed'); }
   fresh();
-  assert.match(strip(tui._capacityLine(80)), /Headroom\s+Keeping up\s+\[15m\]\s+0 of 30 waited/);
+  assert.match(strip(tui._capacityLine(80)), /Headroom\s+Keeping up\s+\[15m\]\s+0 of 35 waited/);
   const held = [0, 1, 2].map(() => { const t = m.routingService.begin({}); t.wait(); return t; });
   clock += 42_000;
   fresh();
   const short = strip(tui._capacityLine(80));
   assert.match(short, /Short of accounts/);
   assert.match(short, /3 waiting, oldest 42s/);
+  assert.equal(m.routingService.recent(undefined, clock).requests, 35, 'all 35 unwaited requests are still in the window');
   assert.ok([...short].length <= 80, 'fits 80 columns');
   const frame = frameAt(tui, 100);
   const moves = frame.findIndex(l => l.trim().startsWith('Moves'));
