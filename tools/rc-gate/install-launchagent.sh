@@ -31,3 +31,14 @@ else
   echo "ERROR: rc-gate did not come up — check tools/rc-gate/gate.log" >&2
   exit 1
 fi
+
+# Report what launchd itself says about the job (field names vary by macOS version, so this
+# prints what it finds and never fails the install).
+JOB="gui/$(id -u)/com.mokka.rc-gate"
+if PRINT="$(launchctl print "$JOB" 2>&1)"; then
+  echo "launchd job $JOB: $(printf '%s\n' "$PRINT" | grep -m1 -E '^[[:space:]]*state = ' | sed 's/^[[:space:]]*//' || true)"
+  PT="$(printf '%s\n' "$PRINT" | grep -m1 -i -E 'process type|ProcessType' | sed 's/^[[:space:]]*//' || true)"
+  echo "launchd process type: ${PT:-<no process-type line printed by launchctl on this macOS>}"
+else
+  echo "note: 'launchctl print $JOB' failed: $(printf '%s' "$PRINT" | head -1)" >&2
+fi

@@ -21,12 +21,16 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>5</integer>
-  <!-- launchd.plist(5): a job with NO ProcessType gets "light resource limits ...
+  <!-- launchd.plist(5) says a job with NO ProcessType gets "light resource limits ...
        throttling its CPU usage and I/O bandwidth". This process carries every Claude Code
-       session's traffic, so the 2026-11-21 freeze storms starved its event loop until
-       Remote Control heartbeats missed the CLI's 13s budget. Interactive = not throttled. -->
+       session's traffic and was starved during the 2026-11-21 freeze storms, so Interactive is
+       EXPECTED to remove that throttle (per the man page; not a measured fix). -->
   <key>ProcessType</key>
   <string>Interactive</string>
+  <!-- The gate drains in-flight responses for up to 20s on SIGTERM (DRAIN_MS in rc-gate.js);
+       launchd's default ExitTimeOut would SIGKILL it first. Keep this >= 25. -->
+  <key>ExitTimeOut</key>
+  <integer>25</integer>
   <key>StandardOutPath</key>
   <string>/Users/maxkrasnykh/maxpool/tools/rc-gate/gate.log</string>
   <key>StandardErrorPath</key>
