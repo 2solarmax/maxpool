@@ -286,7 +286,7 @@ function truncate(s, w) {
 
 // How much history a Headroom figure really covers: the full window, or less just after a restart.
 function headroomSpan(r) {
-  const windowMs = r.windowMs || 900_000;
+  const windowMs = Number.isFinite(r.windowMs) && r.windowMs > 0 ? r.windowMs : 900_000;
   const span = Number.isFinite(r.observedMs) ? Math.min(windowMs, r.observedMs) : windowMs;
   return span < 60_000 ? '<1m' : Math.round(span / 60_000) + 'm';
 }
@@ -1416,21 +1416,40 @@ export class TUI {
     let report;
     try { report = routingSources(this.am, now); } catch { return null; }
     const rank = { short: 3, tight: 2, ok: 1, quiet: 0 };
-    const rows = report.filter(s => s.report?.recent && !s.stale && s.report.recent.state in rank);
+    // Sanitized at ingress (routingSources): numbers are finite, states are members of the set,
+    // and a worker whose report carries no usable recent block is excluded here.
+    const rows = report.filter(s => s.report?.recent && !s.stale && Object.hasOwn(rank, s.report.recent.state));
     if (!rows.length) return null;
     const worst = rows.reduce((a, b) => (rank[b.report.recent.state] > rank[a.report.recent.state] ? b : a));
     const r = worst.report.recent;
-    const where = worst === report[0] ? '' : ` ${dim('on ' + worst.name)}`;
+    // A worker that reports no headroom (older link, malformed block) must not vanish silently:
+    // name how many are excluded so "Keeping up" is never read as all-workers-all-clear.
+    const missing = report.length - rows.length;
+    const hint = missing > 0 ? ` ${dim('· ' + missing + ' not reporting')}` : '';
+    const where = (worst === report[0] ? '' : ` ${dim('on ' + worst.name)}`) + hint;
+    // A remote verdict can be up to the 5-minute freshness cutoff old, and its oldest-wait figure
+    // only moves when that worker sends a new report.
+    const age = worst === report[0] ? 0 : Math.max(0, now - worst.report.asOf);
+    const aged = age > 60_000 ? ` ${dim(Math.round(age / 60_000) + 'm old')}` : '';
     const time = n => !Number.isFinite(n) ? '—' : n < 1000 ? n + 'ms' : n < 60_000 ? (n / 1000).toFixed(n < 10_000 ? 1 : 0) + 's' : Math.round(n / 60_000) + 'm';
     const label = `${dim('[' + headroomSpan(r) + ']')}`;
-    if (r.state === 'quiet') return truncLine(` Headroom ${dim('— (little traffic)')}${where}`, W);
+    if (r.state === 'quiet') {
+      // Quiet still says what is held right now (a hold is direct evidence at any volume), carries
+      // the span, and says how many workers reported no headline.
+      const bits = [];
+      if (r.pending) bits.push(`${r.pending} waiting, oldest ${time(r.oldestWaitMs)}`);
+      if (missing > 0) bits.push(`${missing} not reporting`);
+      const inner = bits.length ? ' · ' + bits.join(' · ') : '';
+      const on = worst === report[0] ? '' : ` ${dim('on ' + worst.name)}`;
+      return truncLine(` ${dim('Headroom')}  ${dim('— (little traffic' + inner + ')')}  ${label}${on}`, W);
+    }
     const parts = [(r.pending ? `${r.pending} waiting, oldest ${time(r.oldestWaitMs)}` : ''),
       `${r.queuedRequests || 0} of ${r.requests || 0} waited`,
       (r.queuedRequests ? `longest ≤${time(r.longestWaitMs)}` : ''),
       (r.capacityDenied ? `${r.capacityDenied} refused` : '')].filter(Boolean);
     const text = { ok: green('Keeping up'), tight: yellow('Getting tight'), short: red('Short of accounts') }[r.state];
     const head = { ok: green('Headroom'), tight: yellow('Headroom'), short: red('Headroom') }[r.state];
-    const build = () => ` ${head}  ${text}  ${label}  ${parts.join(' · ')}${where}`;
+    const build = () => ` ${head}  ${text}  ${label}${aged}  ${parts.join(' · ')}${where}`;
     // Keep the state and what is waiting; shed the least urgent figures when the terminal is narrow.
     while (parts.length > 1 && vw(build()) > W) parts.pop();
     return truncLine(build(), W);
@@ -4106,11 +4125,12 @@ export class TUI {
       if (report.recent) {
         const B = CAPACITY_BANDS, pct = n => Math.round(n * 100) + '%';
         lines.push('', bold(' How headroom is judged'));
-        lines.push(dim(' Tight: ' + pct(B.tightWaitedShare) + ' or more of requests waited, any refusal, a request held ' + time(B.tightOldestMs)
-          + ' or more, or the slowest 5% of waited requests over ' + time(B.tightQueuedP95Ms) + '.'));
-        lines.push(dim(' Short: ' + pct(B.shortWaitedShare) + ' or more waited, ' + pct(B.shortDeniedShare) + ' or more refused, or a request held '
+        lines.push(dim(' Tight: ' + pct(B.tightWaitedShare) + ' or more of requests waited over ' + time(B.notableWaitMs) + ', any refusal, a request held '
+          + time(B.tightOldestMs) + ' or more, or the slowest 5% of waited requests over ' + time(B.tightQueuedP95Ms) + '.'));
+        lines.push(dim(' Short: ' + pct(B.shortWaitedShare) + ' or more waited over ' + time(B.notableWaitMs) + ', ' + pct(B.shortDeniedShare) + ' or more refused, or a request held '
           + time(B.shortOldestMs) + ' or more.'));
-        lines.push(dim(' Shares need ' + B.minRequests + ' requests; a refusal or a long hold counts at any volume.'));
+        lines.push(dim(' Shares and the slowest-5% rule need ' + B.minRequests + ' requests and ' + B.minWaited
+          + ' waits over ' + time(B.notableWaitMs) + '; a refusal or a long hold counts at any volume.'));
         lines.push(dim(' Provisional. Measured healthy load: about 0.1% of requests wait; no backlog sample yet.'));
       }
       const sizing = report.provisioning;

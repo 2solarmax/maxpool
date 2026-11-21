@@ -175,3 +175,58 @@ test('Headroom headline shows the worst fresh worker by name and ignores a stale
   // Only stale workers report: nothing to say beyond this worker's own quiet line.
   assert.doesNotMatch(show([link('Stale', 'src-stale', recent('short'), { lastError: 'unreachable' })]), /Short of accounts| on /);
 });
+
+test('Headroom headline coerces a linked worker\'s figures and rejects inherited state names', () => {
+  const m = am();
+  const now = Date.now();
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  const show = recent => {
+    m.poolLinks = [{ name: 'Cloud', lastOkAt: now, status: { routingAnalytics: { version: 1, source: 'src-cloud', asOf: now, recent } } }];
+    m._routingReport = null;
+    return strip(tui._capacityLine(100, now));
+  };
+  // Text, objects and huge numbers in a remote block never reach the screen as raw values.
+  const hostile = show({ state: 'short', requests: '40 \u001b[31mRED', queuedRequests: '9', pending: '3', oldestWaitMs: { x: 1 },
+    capacityDenied: [7], longestWaitMs: 'forever', windowMs: 'x', observedMs: 'y' });
+  assert.match(hostile, /Short of accounts/);
+  assert.match(hostile, /0 of 0 waited/);
+  assert.doesNotMatch(hostile, /RED|forever|\[object|NaN|undefined/);
+  // `toString` is on every object's prototype: it is not a state.
+  const inherited = show({ state: 'toString', requests: 40, queuedRequests: 12 });
+  assert.doesNotMatch(inherited, /Keeping up|Getting tight|Short of accounts|waited/);
+  assert.match(inherited, /1 not reporting/);
+});
+
+test('Headroom headline says how many linked workers report no headroom, and how old a remote verdict is', () => {
+  const m = am();
+  const now = Date.now();
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  const recent = (state, extra = {}) => ({ state, requests: 40, queuedRequests: 0, capacityDenied: 0, longestWaitMs: 0,
+    pending: 0, oldestWaitMs: 0, windowMs: 900_000, observedMs: 900_000, ...extra });
+  const link = (name, source, rec, asOf = now) => ({ name, lastOkAt: now,
+    status: { routingAnalytics: { version: 1, source, asOf, ...(rec ? { recent: rec } : {}) } } });
+  const show = links => { m.poolLinks = links; m._routingReport = null; return strip(tui._capacityLine(100, now)); };
+  // A worker that sends no headroom must not leave "Keeping up" reading as all-clear.
+  const silent = show([link('Cloud', 'src-cloud', recent('ok')), link('Old', 'src-old', null), { name: 'Older', status: {} }]);
+  assert.match(silent, /Keeping up/);
+  assert.match(silent, /on Cloud · 2 not reporting/);
+  // No linked worker, nothing missing: no hint.
+  assert.doesNotMatch(show([link('Cloud', 'src-cloud', recent('ok'))]), /not reporting/);
+  // A remote verdict says how old it is; a fresh one does not.
+  assert.match(show([link('Cloud', 'src-cloud', recent('tight', { queuedRequests: 3 }), now - 4 * 60_000)]), /Getting tight\s+\[15m\] 4m old/);
+  assert.doesNotMatch(show([link('Cloud', 'src-cloud', recent('tight', { queuedRequests: 3 }), now - 20_000)]), /old/);
+});
+
+test('quiet Headroom still shows a request being held and the span it covers', () => {
+  const m = am();
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  m.routingService.started = Date.now() - 20 * 60_000;
+  const trace = m.routingService.begin({});
+  trace.wait();
+  m._routingReport = null;
+  const line = strip(tui._capacityLine(100, Date.now() + 3000));
+  assert.match(line, /little traffic · 1 waiting, oldest 3\.\ds\)\s+\[15m\]/);
+  trace.finish('cancelled');
+  m._routingReport = null;
+  assert.match(strip(tui._capacityLine(100, Date.now())), /little traffic\)\s+\[15m\]/);
+});

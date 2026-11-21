@@ -227,6 +227,8 @@ test('live capacity headline: idle, healthy and saturated workers are judged fro
   const peer = ledger.begin({ peer: true });
   peer.wait(); now += 60_000;
   assert.equal(ledger.recent().pending, 0);
+  peer.resume();
+  assert.equal(ledger.recent().pending, 0, 'not even between its wait segments');
   peer.finish('completed');
   assert.equal(ledger.recent().requests, 200);
   // A request waiting right now shows pending and oldest wait, counted once across retries.
@@ -243,7 +245,7 @@ test('live capacity headline: idle, healthy and saturated workers are judged fro
   // Saturated: a backlog of long waits crosses the short band; old minutes age out of the window.
   finish(30, 20_000);
   assert.equal(ledger.recent().state, 'short');
-  now += 20 * 60_000;
+  for (let i = 0; i < 20; i++) { now += 60_000; ledger.observe(); }   // a running worker heartbeats
   assert.deepEqual([ledger.recent().requests, ledger.recent().state], [0, 'quiet']);
   assert.equal(ledger.recent(60 * 60_000).requests > 0, true);
   assert.doesNotMatch(JSON.stringify(ledger.exportState()), /refusedAfterWait|oldestWaitMs/, 'headline is not persisted');
@@ -277,36 +279,110 @@ test('headline needs 20 requests before a share can raise it; only a hold or a r
 });
 
 test('capacityState boundaries match the documented bands', () => {
-  const base = { requests: 100, queuedRequests: 0, capacityDenied: 0, pending: 0, oldestWaitMs: 0, queuedWaitP95Ms: null };
+  const base = { requests: 200, queuedRequests: 0, notableWaits: 0, capacityDenied: 0, pending: 0, oldestWaitMs: 0, queuedWaitP95Ms: null };
   const state = over => capacityState({ ...base, ...over });
   assert.equal(state({}), 'ok');
-  // Waited share: tight at 2% and above, short at 10% and above.
-  assert.equal(state({ queuedRequests: 1 }), 'ok');
-  assert.equal(state({ queuedRequests: 2 }), 'tight');
-  assert.equal(state({ queuedRequests: 9 }), 'tight');
-  assert.equal(state({ queuedRequests: 10 }), 'short');
-  // Refused share: any refusal is tight, 5% and above is short.
+  // Waited share counts lasting waits only: tight at 2% and above, short at 10% and above, three at least.
+  assert.equal(state({ notableWaits: 3 }), 'ok');
+  assert.equal(state({ notableWaits: 4 }), 'tight');
+  assert.equal(state({ notableWaits: 19 }), 'tight');
+  assert.equal(state({ notableWaits: 20 }), 'short');
+  // Waits at or below the floor never count, however many there are.
+  assert.equal(state({ queuedRequests: 150, notableWaits: 0 }), 'ok');
+  // Refused share: any refusal is tight, 5% and above is short (and needs the minimum volume + three lasting waits to count as a share).
   assert.equal(state({ capacityDenied: 1 }), 'tight');
-  assert.equal(state({ capacityDenied: 4 }), 'tight');
-  assert.equal(state({ capacityDenied: 5 }), 'short');
+  assert.equal(state({ capacityDenied: 9 }), 'tight');
+  assert.equal(state({ capacityDenied: 10 }), 'tight', 'a refusal share alone is not three lasting waits');
+  assert.equal(state({ capacityDenied: 10, notableWaits: 3 }), 'short');
   // A request held now: tight at 5 s and above, short at 30 s and above.
   assert.equal(state({ pending: 1, oldestWaitMs: 4999 }), 'ok');
   assert.equal(state({ pending: 1, oldestWaitMs: 5000 }), 'tight');
   assert.equal(state({ pending: 1, oldestWaitMs: 29_999 }), 'tight');
   assert.equal(state({ pending: 1, oldestWaitMs: 30_000 }), 'short');
-  // p95 of waited requests: over 5 s only.
-  assert.equal(state({ queuedRequests: 1, queuedWaitP95Ms: 5000 }), 'ok');
-  assert.equal(state({ queuedRequests: 1, queuedWaitP95Ms: 5001 }), 'tight');
+  // p95 of waited requests: over 5 s only, and only with three lasting waits behind it.
+  assert.equal(state({ notableWaits: 3, queuedWaitP95Ms: 5000 }), 'ok');
+  assert.equal(state({ notableWaits: 3, queuedWaitP95Ms: 5001 }), 'tight');
+  assert.equal(state({ notableWaits: 2, queuedWaitP95Ms: 60_000 }), 'ok');
   // The 20-request minimum: shares and p95 are ignored below it, a hold or refusal is not.
   assert.equal(state({ requests: 19 }), 'quiet');
   assert.equal(state({ requests: 20 }), 'ok');
-  assert.equal(state({ requests: 19, queuedRequests: 19, queuedWaitP95Ms: 60_000 }), 'quiet');
-  assert.equal(state({ requests: 20, queuedRequests: 1 }), 'tight');
+  assert.equal(state({ requests: 19, notableWaits: 19, queuedWaitP95Ms: 60_000 }), 'quiet');
+  assert.equal(state({ requests: 20, notableWaits: 3 }), 'short');
+  assert.equal(state({ requests: 20, notableWaits: 2 }), 'ok', 'two lasting waits in 20 requests cannot decide the headline');
   assert.equal(state({ requests: 1, capacityDenied: 1 }), 'tight');
   assert.equal(state({ requests: 0, pending: 1, oldestWaitMs: 1000 }), 'quiet');
   assert.equal(state({ requests: 0, pending: 1, oldestWaitMs: 5000 }), 'tight');
   assert.equal(state({ requests: 0, pending: 1, oldestWaitMs: 30_000 }), 'short');
   assert.equal(capacityState(null), 'unknown');
+});
+
+test('trivial waits cannot decide the headline at low volume', () => {
+  let now = 100 * HOUR;
+  const ledger = new RoutingServiceAnalytics(() => now);
+  const waitedFor = ms => { const t = ledger.begin({}); t.route('a'); t.wait(); now += ms; t.resume(); t.route('a'); t.finish('completed'); };
+  for (let i = 0; i < 17; i++) { const t = ledger.begin({}); t.route('a'); t.finish('completed'); }
+  // Exactly 20 requests, one 1 ms wait: that is 5% of the share, and it must not read as tight.
+  waitedFor(1);
+  waitedFor(250);
+  waitedFor(250);
+  let r = ledger.recent();
+  assert.deepEqual([r.requests, r.queuedRequests, r.notableWaits, r.state], [20, 3, 0, 'ok']);
+  // Waits over the floor count, but two of them in twenty requests still do not.
+  const more = new RoutingServiceAnalytics(() => now);
+  const after = ms => { const t = more.begin({}); t.route('a'); t.wait(); now += ms; t.resume(); t.route('a'); t.finish('completed'); };
+  for (let i = 0; i < 18; i++) { const t = more.begin({}); t.route('a'); t.finish('completed'); }
+  after(251);
+  after(900);
+  r = more.recent();
+  assert.deepEqual([r.requests, r.notableWaits, r.state], [20, 2, 'ok']);
+  // A third lasting wait is a pattern: 3 of 21 is 14%, short.
+  after(300);
+  r = more.recent();
+  assert.deepEqual([r.requests, r.notableWaits, r.state], [21, 3, 'short']);
+});
+
+test('a hold keeps its first wait across the retry segments of the sticky-busy loop', () => {
+  let now = 100 * HOUR;
+  const ledger = new RoutingServiceAnalytics(() => now);
+  const held = ledger.begin({ session: 'held' });
+  // wait → resume → bounce → wait, as the sticky-busy loop does: 1 s, 2 s, then 4 s segments.
+  held.route('a');
+  held.wait(); now += 1000; held.resume();
+  assert.equal(ledger.recent().pending, 1, 'still held between a resume and the next lease');
+  held.route('a'); now += 100;
+  held.wait(); now += 2000; held.resume(); held.route('a'); now += 100;
+  held.wait(); now += 1000;
+  let r = ledger.recent();
+  assert.deepEqual([r.pending, r.oldestWaitMs, r.state], [1, 4200, 'quiet']);
+  now += 1000;
+  r = ledger.recent();
+  assert.deepEqual([r.pending, r.oldestWaitMs, r.state], [1, 5200, 'tight'], 'a hold of 5 s across segments shows as held');
+  held.resume(); held.route('a');
+  assert.equal(ledger.recent().pending, 0, 'served: not held any more');
+  held.finish('completed');
+  const done = ledger.recent();
+  assert.deepEqual([done.pending, done.requests, done.queuedRequests, done.longestWaitMs], [0, 1, 1, 5000]);
+  // A request served for a minute and then held again is a new hold, not one 60 s old.
+  const again = ledger.begin({});
+  again.route('a'); again.wait(); now += 1000; again.resume(); again.route('a');
+  now += 60_000; ledger.observe();
+  again.wait(); now += 2000;
+  assert.deepEqual([ledger.recent().pending, ledger.recent().oldestWaitMs], [1, 2000]);
+  again.finish('cancelled');
+});
+
+test('after a heartbeat gap the recent window starts empty and says so', () => {
+  let now = 100 * HOUR;
+  const ledger = new RoutingServiceAnalytics(() => now);
+  for (let i = 0; i < 5; i++) { const t = ledger.begin({}); t.route('a'); t.finish('capacityDenied', {}, 'weeklyDenied'); }
+  assert.equal(ledger.recent().capacityDenied, 5);
+  // The laptop slept for ten minutes: the ledger saw none of it, so older counts must not read as "last 15 minutes".
+  now += 10 * 60_000;
+  const r = ledger.recent();
+  assert.deepEqual([r.requests, r.capacityDenied, r.observedMs], [0, 0, 0]);
+  const t = ledger.begin({}); t.route('a'); t.finish('completed');
+  now += 60_000;
+  assert.deepEqual([ledger.recent().requests, ledger.recent().observedMs], [1, 60_000]);
 });
 
 test('the recent window keeps the minute holding its cutoff and reports how much it has actually watched', () => {
@@ -323,7 +399,8 @@ test('the recent window keeps the minute holding its cutoff and reports how much
   assert.equal(ledger.recent().capacityDenied, 1);
   assert.equal(ledger.recent().observedMs, 15 * 60_000);
   // Past 15 minutes plus the rest of its minute, the refusal ages out.
-  now = start + 45_000 + 16 * 60_000 + 1;
+  now += 45_000; ledger.observe();
+  now += 45_001;
   assert.equal(ledger.recent().capacityDenied, 0);
   // Just after a restart the window says how little it has seen.
   const restarted = new RoutingServiceAnalytics(() => now);

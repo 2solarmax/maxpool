@@ -8,8 +8,22 @@ const METRICS = ['arrivals', 'requests', 'completed', 'timelyCompleted', 'failed
   'active', 'serving', 'peakServing', 'activeSessions', 'peakSessions',
   'inputTokens', 'cachedInputTokens', 'coverageSince', 'completeCoverage', 'from', 'to'];
 const metrics = row => Object.fromEntries(METRICS.filter(k => Number.isFinite(row[k]) || typeof row[k] === 'boolean').map(k => [k, row[k]]));
-const RECENT_METRICS = ['requests', 'queuedRequests', 'capacityDenied', 'refusedAfterWait', 'waitP90Ms', 'waitP95Ms',
+const RECENT_METRICS = ['requests', 'queuedRequests', 'notableWaits', 'capacityDenied', 'refusedAfterWait', 'waitP90Ms', 'waitP95Ms',
   'queuedWaitP95Ms', 'longestWaitMs', 'pending', 'oldestWaitMs', 'windowMs', 'observedMs'];
+const RECENT_STATES = new Set(['quiet', 'ok', 'tight', 'short']);
+const num = (v, min = 0) => Number.isFinite(v) && v >= min ? v : 0;
+
+// A linked worker's recent block is remote input: re-derive every figure from coerced numbers so
+// a malformed or older report can neither throw the render nor smuggle a value in as a string.
+function sanitizeRecent(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const recent = { state: RECENT_STATES.has(raw.state) ? raw.state : null };
+  if (!recent.state) return null;
+  for (const key of RECENT_METRICS) recent[key] = num(raw[key]);
+  recent.windowMs = num(raw.windowMs, 1) || 900_000;
+  if (recent.observedMs > recent.windowMs) recent.observedMs = recent.windowMs;
+  return recent;
+}
 const dailyCounts = ({ requests, timelyCompleted, capacityDenied }) => ({ requests, timelyCompleted, capacityDenied });
 const PERIODS = { '1h': HOUR, '24h': 24 * HOUR, '7d': 168 * HOUR };
 
@@ -34,7 +48,7 @@ export function buildRoutingReport(am, now) {
       accounts: (sample.accounts || []).map(a => ({ name: a.name, ...metrics(a) })) };
   }
   const live = am.routingService.recent(undefined, now);
-  const recent = { state: live.state, ...Object.fromEntries(RECENT_METRICS.filter(k => Number.isFinite(live[k])).map(k => [k, live[k]])) };
+  const recent = sanitizeRecent({ state: live.state, ...Object.fromEntries(RECENT_METRICS.filter(k => Number.isFinite(live[k])).map(k => [k, live[k]])) });
   const demandBetween = am.routingService.demandReader(now);
   const owners = new Set();
   const quotas = [];
@@ -71,7 +85,10 @@ export function routingSources(am, now) {
     if (report?.version === 1 && typeof report.source === 'string') {
       if (seen.has(report.source)) continue;
       seen.add(report.source);
-      sources.push({ name: link.name, report, stale: Boolean(link.lastError) || !Number.isFinite(report.asOf) || now - report.asOf > 300_000 });
+      // The recent block decides the overview headline: sanitize it at ingress so a malformed
+      // or older remote cannot inject raw values (or string-coerced states) into the render.
+      sources.push({ name: link.name, report: { ...report, recent: sanitizeRecent(report.recent) },
+        stale: Boolean(link.lastError) || !Number.isFinite(report.asOf) || now - report.asOf > 300_000 });
     } else {
       sources.push({ name: link.name, report: null, stale: true });
     }

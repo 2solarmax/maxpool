@@ -16,11 +16,17 @@ const PEAKS = ['peakOutstanding', 'peakServing', 'peakSessions', 'longestWaitMs'
 const MINUTE = 60_000;
 const RECENT_KEEP = 60;
 const RECENT_WINDOW = 15 * MINUTE;
+// A bounce back into a wait within this long of a lease is the same hold; a request that was served
+// for longer and waits again is a new hold.
+const HOLD_CONTINUITY_MS = 10_000;
 // Provisional bands. Measured healthy traffic (20 hours, 46,281 requests): 0.1% waited at all, never
 // above 0.8% in an hour, 99.97% within the five-second target. No saturated sample exists yet, so
-// the 2% and 10% bands are placeholders until a real backlog is observed.
-export const CAPACITY_BANDS = { minRequests: 20, tightWaitedShare: 0.02, shortWaitedShare: 0.10,
+// the 2% and 10% bands are placeholders until a real backlog is observed. A wait of 250 ms or less
+// is balancing, not pressure: only lasting waits feed the shares, and at least three of them.
+export const CAPACITY_BANDS = { minRequests: 20, minWaited: 3, notableWaitMs: 250, tightWaitedShare: 0.02, shortWaitedShare: 0.10,
   tightOldestMs: WAIT_TARGET, tightQueuedP95Ms: WAIT_TARGET, shortOldestMs: 30_000, shortDeniedShare: 0.05 };
+// Histogram bins holding waits at or below the notable floor.
+const TRIVIAL_WAIT_BINS = WAIT_BOUNDS.findIndex(max => max >= CAPACITY_BANDS.notableWaitMs) + 1;
 const hourOf = t => Math.floor(t / HOUR) * HOUR;
 const minuteOf = t => Math.floor(t / MINUTE) * MINUTE;
 const count = n => Number.isSafeInteger(n) && n >= 0 ? n : 0;
@@ -70,7 +76,11 @@ function summarize(stats) {
     const index = waits.findIndex(n => (rank -= n) <= 0);
     return Math.min(WAIT_BOUNDS[index] ?? longestWaitMs, longestWaitMs);
   }
-  return { ...result, waitP90Ms: quantile(0.90), waitP95Ms: quantile(0.95), queuedWaitP95Ms: quantile(0.95, true) };
+  // Waits at or below the floor are balancing, not pressure: the share headline counts only the
+  // lasting ones, so one 1 ms wait cannot call a low-volume window tight.
+  let notable = 0;
+  for (let i = TRIVIAL_WAIT_BINS; i < waits.length; i++) notable += waits[i];
+  return { ...result, notableWaits: notable, waitP90Ms: quantile(0.90), waitP95Ms: quantile(0.95), queuedWaitP95Ms: quantile(0.95, true) };
 }
 
 function accountStats(bucket, name) {
@@ -128,6 +138,10 @@ export class RoutingServiceAnalytics {
     if (this.observing && (now < this.lastObserved || now - this.lastObserved > HEARTBEAT_GAP)) {
       this.coverage = union([...this.coverage, [this.started, this.lastObserved]], now - RETENTION, now);
       this.started = now;
+      // The live headline counts minutes the worker did NOT watch: after a heartbeat gap the
+      // short window restarts empty, so its figures are honestly only what was seen since.
+      // (Held requests stay pending — a wait that spans the gap is still a wait.)
+      this.recentMinutes.clear();
     }
     if (this.observing) this.lastObserved = now;
     const hour = hourOf(now);
@@ -161,7 +175,7 @@ export class RoutingServiceAnalytics {
     if (peer) { arrived.total.peerArrivals++; this.activePeer++; }
     else { arrived.total.arrivals++; this.active++; }
     arrived.total.peakOutstanding = Math.max(arrived.total.peakOutstanding, this.active + this.activePeer);
-    let account = null, serving = false, waitingSince = null, waitMs = 0, waited = false, ended = false;
+    let account = null, serving = false, waitingSince = null, waitMs = 0, waited = false, ended = false, firstWaitAt = null, routedAt = null;
     const waiterKey = {};
     const leave = () => {
       if (!serving) return;
@@ -178,6 +192,14 @@ export class RoutingServiceAnalytics {
     const stopWait = now => {
       if (waitingSince !== null) waitMs += Math.max(0, now - waitingSince);
       waitingSince = null;
+      // Pending keeps the FIRST wait of the still-open request: the sticky-busy loop is
+      // wait → resume → bounce → wait, and the router has held this request since the
+      // first wait even through the retry gaps between segments.
+      if (firstWaitAt !== null && !peer) this.waiters.set(waiterKey, firstWaitAt);
+      else this.waiters.delete(waiterKey);
+    };
+    const endWaiter = () => {
+      firstWaitAt = null;
       this.waiters.delete(waiterKey);
     };
     return {
@@ -190,6 +212,10 @@ export class RoutingServiceAnalytics {
         if (ended || !name) return;
         const now = this.now();
         stopWait(now);
+        // A lease is acquired: the router is not holding this request now. firstWaitAt stays,
+        // so if the attempt bounces straight back into a wait the original hold clock resumes.
+        this.waiters.delete(waiterKey);
+        routedAt = now;
         leave();
         account = name;
         serving = true;
@@ -205,7 +231,9 @@ export class RoutingServiceAnalytics {
         leave();
         waited = true;
         waitingSince = this.now();
-        if (!peer) this.waiters.set(waiterKey, waitingSince);
+        if (firstWaitAt !== null && routedAt !== null && waitingSince - routedAt > HOLD_CONTINUITY_MS) firstWaitAt = null;
+        firstWaitAt ??= waitingSince;
+        if (!peer) this.waiters.set(waiterKey, firstWaitAt);
       },
       resume: () => stopWait(this.now()),
       finish: (outcome, usage = {}, denial) => {
@@ -214,6 +242,7 @@ export class RoutingServiceAnalytics {
         const now = this.now();
         const bucket = this.observe(now);
         stopWait(now);
+        endWaiter();
         leave();
         if (peer) this.activePeer--;
         else this.active--;
@@ -429,20 +458,23 @@ export class RoutingServiceAnalytics {
   }
 }
 
-// Are the accounts keeping up right now? Judged on the share of requests the router held, how long
-// the oldest held request has waited, and any capacity refusal. Shares and p95 need minRequests behind
-// them: one 1 ms wait among five requests is 20%, not a shortage. Under the minimum only direct
-// evidence escalates (a request held now, any refusal); otherwise the answer is "quiet", never "ok",
-// because a healthy-looking zero needs traffic behind it.
+// Are the accounts keeping up right now? Judged on the share of requests the router held for a
+// lasting wait, how long the oldest held request has waited, and any capacity refusal. Shares and
+// p95 need minRequests behind them AND at least minWaited lasting waits: one 1 ms wait among twenty
+// requests is 5%, not a shortage. Under those minimums only direct evidence escalates (a request
+// held now, any refusal); otherwise the answer is "quiet", never "ok", because a healthy-looking
+// zero needs traffic behind it.
 export function capacityState(m) {
   const b = CAPACITY_BANDS;
   if (!m || !Number.isFinite(m.requests)) return 'unknown';
   const enough = m.requests >= b.minRequests;
-  const waited = m.requests ? m.queuedRequests / m.requests : 0;
+  const notable = count(m.notableWaits);
+  const lasting = notable >= b.minWaited;
+  const waitedShare = m.requests ? notable / m.requests : 0;
   const denied = m.requests ? m.capacityDenied / m.requests : 0;
-  if (m.oldestWaitMs >= b.shortOldestMs || (enough && (waited >= b.shortWaitedShare || denied >= b.shortDeniedShare))) return 'short';
+  if (m.oldestWaitMs >= b.shortOldestMs || (enough && lasting && (waitedShare >= b.shortWaitedShare || denied >= b.shortDeniedShare))) return 'short';
   if (m.capacityDenied > 0 || (m.pending > 0 && m.oldestWaitMs >= b.tightOldestMs)
-    || (enough && (waited >= b.tightWaitedShare || (m.queuedWaitP95Ms ?? 0) > b.tightQueuedP95Ms))) return 'tight';
+    || (enough && lasting && (waitedShare >= b.tightWaitedShare || (m.queuedWaitP95Ms ?? 0) > b.tightQueuedP95Ms))) return 'tight';
   return enough ? 'ok' : 'quiet';
 }
 
