@@ -274,8 +274,7 @@ export class Prober {
     if (!empty) {
       // Unknown, pending, stale-by-failure or non-empty inventory (and a recent
       // claim or requested check) stays on the grant-list cadence.
-      const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
-        && !this._claimedSinceProbe(account) && !this._pendingGrant(account, now) && !q.probeRecheckRequested;
+      const weekly = this._weeklyIdle(account, now);
       const due = weekly ? Math.min(q.lastProbeOkAt + GRANTS_EVERY_MS, q.unified7dReset ?? Infinity, this._cooldownAt(account)) : 0;
       return Math.max(retryAt, due > now ? due : 0);
     }
@@ -288,13 +287,23 @@ export class Prober {
     return Boolean(account.lastClaimAt && account.lastClaimAt >= (q.lastProbeOkSentAt || q.lastProbeOkAt));
   }
 
-  _pendingGrant(account, now, ignoreListingStale = false) {
+  _pendingGrant(account, now, { emptyListing = false, ignoreListingStale = false } = {}) {
     const listing = account.resetGrants;
     // A snapshot restored at boot is stale only because it is old, not because a
-    // read failed; for an empty listing the daily schedule below covers its age.
-    const restoredOnly = listing?.restored === true && !listing.lastError;
+    // read failed; for a confirmed-empty listing the daily schedule covers its age.
+    // Only that path is exempt: a restored non-empty listing stays pending, so its
+    // first live listing is not delayed past the first sweep after boot.
+    const restoredOnly = emptyListing && listing?.restored === true && !listing.lastError;
     const listingPending = listing?.stale && !restoredOnly && !ignoreListingStale;
     return Boolean(listingPending || this.am.isHoldingWall?.(account, now));
+  }
+
+  /** A full week with a successful read and nothing asking for an earlier probe:
+   *  no claim since it, no pending grant, no requested check. */
+  _weeklyIdle(account, now, pendingOpts) {
+    const q = account.quota || {};
+    return Boolean(this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
+      && !this._claimedSinceProbe(account) && !this._pendingGrant(account, now, pendingOpts) && !q.probeRecheckRequested);
   }
 
   _cooldownAt(account) {
@@ -317,8 +326,7 @@ export class Prober {
     // A disabled account is never listed again, so its listing can only go stale
     // once and stay that way; that must not keep it on the every-sweep cadence.
     const disabled = account.enabled === false;
-    const weekly = this.intervalMs > 0 && q.unified7d >= 1 && q.lastProbeOkAt
-      && !this._claimedSinceProbe(account) && !this._pendingGrant(account, now, disabled) && !q.probeRecheckRequested;
+    const weekly = this._weeklyIdle(account, now, { emptyListing: true, ignoreListingStale: disabled });
     if (!weekly) return null;
     // The daily sample is one listing plus one usage read, so it is anchored on the
     // OLDER of the two successes: a usage read that failed after a good listing must
