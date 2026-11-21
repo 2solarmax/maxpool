@@ -905,13 +905,15 @@ gate.listen(GATE_PORT, GATE_HOST, () => {
   console.log(`  everything else: blind tunnel`);
 });
 
-// GRACEFUL SHUTDOWN (2026-09-14). launchd restarts the gate on deploys (`kickstart -k`
-// → SIGTERM, ExitTimeOut=5s) and the default Node behavior kills every open CONNECT tunnel
+// GRACEFUL SHUTDOWN (2026-09-14). launchd restarts the gate on deploys (SIGTERM, and with
+// the launchd default ExitTimeOut=5s) and the default Node behavior kills every open CONNECT tunnel
 // and in-flight MITM response instantly — surfacing in sessions as "API Error: Connection
 // lost mid-response". Measured: 12 of 12 all-time mid-response breaks coincide with a
 // proxy-layer restart (2 with maxpool's config reload, 10 with gate restarts); zero
 // spontaneous. On SIGTERM: stop accepting, close both servers, and wait (bounded 20s) for
-// the in-flight responses the [resp-break] tracker counts. com.mokka.rc-gate.plist
+// the in-flight responses the [resp-break] tracker counts. ProcessType and ExitTimeOut reach launchd
+// ONLY through tools/rc-gate/install-launchagent.sh (unload/load of the installed plist);
+// `launchctl kickstart -k` restarts the job but keeps its OLD spawn type and ExitTimeOut. com.mokka.rc-gate.plist
 // ExitTimeOut must stay ≥ 25s: it is set in tools/rc-gate/launchd/com.mokka.rc-gate.plist and
 // pinned by test/rc-gate-plist.test.js (nothing checks it at startup).
 const DRAIN_MS = 20_000;

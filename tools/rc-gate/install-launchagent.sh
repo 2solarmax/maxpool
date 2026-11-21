@@ -6,6 +6,8 @@
 # auto-start, restart-stormed the gate, and bricked every live session. launchd has
 # one owner, KeepAlive restart-on-crash, and a throttle. Do not reintroduce a
 # userspace supervisor.
+# ProcessType / ExitTimeOut land ONLY through this script (unload/load); `launchctl kickstart -k`
+# restarts the job but keeps its old spawn type and ExitTimeOut.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)/launchd/com.mokka.rc-gate.plist"
 DEST="$HOME/Library/LaunchAgents/com.mokka.rc-gate.plist"
