@@ -22,7 +22,13 @@
 # (guards live in scripts/release-guards.sh). Lint runs in CI only. A manual tag push or
 # publish.yml workflow_dispatch skips these checks, as it always did.
 #
-# Override the git remote/branch with RELEASE_REMOTE / current branch.
+# Note: the CI proof is for the commit BEFORE the bump — `npm version` + the changelog
+# hook add ONLY package.json and CHANGELOG.md (no runtime code), so the parent's green
+# CI run is the proof that carries. ci.yml runs AGAIN on the pushed tag itself; publish
+# waits for neither, exactly as before.
+#
+# Override the git remote with RELEASE_REMOTE; the checked-out branch must BE the base
+# branch (main).
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/release-guards.sh"
 
@@ -35,10 +41,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/release-guards.sh"
 # (RELEASE_FETCH_TIMEOUT, RELEASE_CI_CEILING). A timeout names the stage, prints where
 # it stopped, and exits non-zero so no later stage (tag, push, publish-watch) can run
 # on a half-finished release.
-run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — prints output, fails LOUD
+run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — fails LOUD. Banner and stage
+  # output go to STDERR so a captured stage ("$NEW_VERSION=$(run_stage ...)") yields
+  # only the command's own stdout (npm version prints just "vX.Y.Z").
+  # On failure, $RELEASE_STAGE_RECOVERY (set per call site) prints the exact undo steps —
+  # otherwise the next run's "AHEAD" message would tell the operator to push the
+  # untested bump to main.
   local name="$1" ceiling="$2"; shift 2
   local rc=0
-  echo "==> $name (ceiling ${ceiling}s)"
+  echo "==> $name (ceiling ${ceiling}s)" >&2
   if command -v timeout >/dev/null 2>&1; then
     timeout "$ceiling" "$@" || rc=$?
   else
@@ -46,6 +57,9 @@ run_stage() {  # $1=name  $2=ceiling_seconds  rest=command — prints output, fa
   fi
   if [ "$rc" -ne 0 ]; then
     echo "✗ STAGE FAILED: $name (rc=$rc${rc:+, }ceiling ${ceiling}s — frozen or errored; release aborted before any later stage)" >&2
+    if [[ -n "${RELEASE_STAGE_RECOVERY:-}" ]]; then
+      echo "    To undo this attempt: ${RELEASE_STAGE_RECOVERY}" >&2
+    fi
     exit "$rc"
   fi
 }
@@ -61,23 +75,26 @@ if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   exit 1
 fi
 
-# The CI proof must come from the repository that receives the push. Derive the GitHub
-# repo from the chosen remote; MAXPOOL_GH_REPO may only confirm it, never point elsewhere.
+# The CI proof must come from the repository that receives the push. The GitHub repo is
+# DERIVED from the chosen remote (github.com URLs only) — an unparseable or non-GitHub
+# remote is refused outright; MAXPOOL_GH_REPO may only confirm it, never supply or
+# override it (a wrong-repo CI proof is worse than no release).
 REMOTE_GH_REPO="$(release_github_repo_from_url "$(git remote get-url "$REMOTE")" || true)"
-GH_REPO="${MAXPOOL_GH_REPO:-$REMOTE_GH_REPO}"
-if [[ -z "$GH_REPO" ]]; then
-  echo "✗ Cannot derive a GitHub owner/repo from remote '$REMOTE' ($(git remote get-url "$REMOTE")). Set MAXPOOL_GH_REPO." >&2
+if [[ -z "$REMOTE_GH_REPO" ]]; then
+  echo "✗ Cannot derive a GitHub owner/repo from remote '$REMOTE' ($(git remote get-url "$REMOTE")) — it must be a github.com URL. Release refused." >&2
   exit 1
 fi
-if [[ -n "$REMOTE_GH_REPO" ]] && \
-   [[ "$(printf '%s' "$GH_REPO" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$REMOTE_GH_REPO" | tr 'A-Z' 'a-z')" ]]; then
-  echo "✗ MAXPOOL_GH_REPO ($GH_REPO) differs from remote '$REMOTE' ($REMOTE_GH_REPO): the CI proof would come from a different repository than the one receiving the push. Release refused." >&2
+GH_REPO="$REMOTE_GH_REPO"
+if [[ -n "${MAXPOOL_GH_REPO:-}" ]] && \
+   [[ "$(printf '%s' "$MAXPOOL_GH_REPO" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$REMOTE_GH_REPO" | tr 'A-Z' 'a-z')" ]]; then
+  echo "✗ MAXPOOL_GH_REPO ($MAXPOOL_GH_REPO) differs from remote '$REMOTE' ($REMOTE_GH_REPO): the CI proof would come from a different repository than the one receiving the push. Release refused." >&2
   exit 1
 fi
 
 # Stale-copy guard first, before any other work (fetches, then refuses unless HEAD
 # equals remote main). Runs before the dirty-tree check on purpose: it only reads refs.
 BASE_BRANCH="${RELEASE_BASE_BRANCH:-main}"
+release_require_on_base_branch "$BASE_BRANCH"
 release_require_synced_with_remote "$REMOTE" "$BASE_BRANCH"
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -102,10 +119,18 @@ if [[ "$(git rev-parse HEAD)" != "$CI_SHA" ]]; then
 fi
 
 echo "==> Bumping version ($BUMP) — creates a commit + tag"
+# Recovery after a failed bump/push: delete the tag this attempt created and reset to
+# the pre-bump SHA (bump) / remote main tip (push). Printed by run_stage on failure so
+# the operator never follows the next run's "AHEAD" hint and pushes an untested bump.
+OLD_SHA="$(git rev-parse HEAD)"
+# (Tags are selected by reachability, never `--points-at HEAD`: main's tip is often the
+# previous release commit and already carries its own vX.Y.Z tag, which must survive.)
+RELEASE_STAGE_RECOVERY="git tag -d \$(git tag -l 'v*' --no-merged $OLD_SHA); git reset --hard $OLD_SHA"
 NEW_VERSION="$(run_stage "Version bump" 120 npm version "$BUMP" -m "chore: release v%s")"
 echo "    $NEW_VERSION"
 
 echo "==> Pushing to $REMOTE/$BRANCH (with tag) — the tag triggers the Publish Action"
+RELEASE_STAGE_RECOVERY="git tag -d v${NEW_VERSION#v} && git reset --hard $REMOTE/$BASE_BRANCH"
 run_stage "Push to $REMOTE/$BRANCH" 120 git push --atomic "$REMOTE" "$BRANCH" --follow-tags
 
 echo "==> npm publish runs on GitHub Actions (Trusted Publishing, OIDC — no token)."
@@ -113,10 +138,10 @@ TAG="v${NEW_VERSION#v}"
 if command -v gh >/dev/null 2>&1; then
   echo "    Watching the Publish workflow for $TAG ..."
   sleep 6  # let GitHub register the tag-triggered run
-  RUN_ID="$(gh run list --repo "$GH_REPO" --workflow publish.yml -L 5 \
+  RUN_ID="$(release_gh run list --repo "$GH_REPO" --workflow publish.yml -L 5 \
     --json databaseId,headBranch -q "[.[] | select(.headBranch==\"$TAG\")][0].databaseId" 2>/dev/null || true)"
   if [[ -n "$RUN_ID" ]]; then
-    gh run watch "$RUN_ID" --repo "$GH_REPO" --exit-status && \
+    release_gh run watch "$RUN_ID" --repo "$GH_REPO" --exit-status && \
       echo "==> Published maxpool $NEW_VERSION to npm via Trusted Publishing." || \
       { echo "✗ Publish workflow failed — see: gh run view $RUN_ID --repo $GH_REPO --log-failed" >&2; exit 1; }
   else

@@ -13,14 +13,40 @@
 
 # release_github_repo_from_url URL  -> prints "owner/repo" (no .git); rc 1 when unparseable.
 # Handles https://github.com/o/r(.git), git@github.com:o/r(.git), ssh://git@github.com/o/r(.git).
+# GitHub-hosted only: the repo feeds `gh` calls (and OIDC publish), so a URL pointing at
+# another host (gitlab.com, a LAN mirror) parses but is refused — MAXPOOL_GH_REPO may not
+# override it into a different repository.
 release_github_repo_from_url() {
   local url="${1%/}" owner repo
-  local re='^(https?://|ssh://|git://)?([^@/]+@)?[^/:]+[:/]+([^/]+)/([^/]+)$'
+  local re='^(https?://|ssh://|git://)?([^@/]+@)?([^/:]+)[:/]+([^/]+)/([^/]+)$'
   [[ "$url" =~ $re ]] || return 1
-  owner="${BASH_REMATCH[3]}"
-  repo="${BASH_REMATCH[4]%.git}"
+  local host
+  host="$(printf '%s' "${BASH_REMATCH[3]}" | tr 'A-Z' 'a-z')"   # no ${,,}: stock macOS bash is 3.2
+  [[ "$host" == "github.com" ]] || return 1
+  owner="${BASH_REMATCH[4]}"
+  repo="${BASH_REMATCH[5]%.git}"
   [[ -n "$owner" && -n "$repo" ]] || return 1
   printf '%s/%s\n' "$owner" "$repo"
+}
+
+# release_require_on_base_branch [BASE_BRANCH]
+# The checked-out branch must BE the base branch. A local branch pinned at main's tip
+# passes the sync guard, `npm version` bumps on it, and the atomic push would send that
+# branch + its v* tag — publish.yml then publishes from the tag, putting on npm a
+# version that is not on main and wedging main's next release on the existing tag.
+# A detached HEAD has no branch to push; refuse it too.
+release_require_on_base_branch() {
+  local base="${1:-main}" branch
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  if [[ "$branch" == "HEAD" ]]; then
+    echo "✗ Detached HEAD — release needs a checked-out '$base' branch to bump and push. Run: git checkout $base. Release refused." >&2
+    return 1
+  fi
+  if [[ "$branch" != "$base" ]]; then
+    echo "✗ On branch '$branch', not '$base'. A bump here would publish a version that is not on $base. Run: git checkout $base. Release refused." >&2
+    return 1
+  fi
+  return 0
 }
 
 # release_require_synced_with_remote REMOTE [BASE_BRANCH]
@@ -30,14 +56,15 @@ release_require_synced_with_remote() {
   # Explicit destination refspec: a plain `git fetch REMOTE BASE` only writes FETCH_HEAD when
   # the remote's configured fetch refspec does not cover BASE (single-branch clone, custom
   # refspec), and we would then compare against a stale remote-tracking ref — the exact
-  # staleness this guard exists to catch.
+  # staleness this guard exists to catch. `--` ends the option list so a remote or branch
+  # name can never be read as a flag.
   local refspec="+refs/heads/$base:refs/remotes/$remote/$base"
   # A stalled network must fail loudly, not hang (timeout is absent on stock macOS; then
   # the plain fetch runs and release.sh's own stage watchdog is the only bound).
   if command -v timeout >/dev/null 2>&1; then
-    if timeout "$fetch_timeout" git fetch -q "$remote" "$refspec" >/dev/null 2>&1; then fetch_ok=1; fi
+    if timeout "$fetch_timeout" git fetch -q "$remote" -- "$refspec" >/dev/null 2>&1; then fetch_ok=1; fi
   else
-    if git fetch -q "$remote" "$refspec" >/dev/null 2>&1; then fetch_ok=1; fi
+    if git fetch -q "$remote" -- "$refspec" >/dev/null 2>&1; then fetch_ok=1; fi
   fi
   if [[ "$fetch_ok" -ne 1 ]]; then
     echo "✗ Could not fetch $remote/$base (failed or exceeded ${fetch_timeout}s) — cannot prove this copy is current. Release refused." >&2
@@ -63,15 +90,31 @@ release_require_synced_with_remote() {
 }
 
 # release_require_gh_ready — gh must exist and be logged in, checked ONCE up front so a
-# broken gh stops with its real cause instead of looking like "no CI run yet".
+# broken gh stops with its real cause instead of looking like "no CI run yet". Uses
+# `--active` so a stale SECOND logged-in account failing its auth check cannot block the
+# release; only the active account's health matters.
 release_require_gh_ready() {
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "    (no 'timeout' on this machine — gh calls are unbounded; install coreutils for per-call ceilings)" >&2
+  fi
   if ! command -v gh >/dev/null 2>&1; then
     echo "✗ GitHub CLI 'gh' not found — releases now require it to check CI. Install it (https://cli.github.com). Release refused." >&2
     return 1
   fi
-  if ! gh auth status >/dev/null 2>&1; then
-    echo "✗ 'gh auth status' failed (not logged in, or GitHub unreachable) — cannot check CI. Run: gh auth login. Release refused." >&2
+  if ! gh auth status --active >/dev/null 2>&1; then
+    echo "✗ 'gh auth status --active' failed (not logged in, or GitHub unreachable) — cannot check CI. Run: gh auth login. Release refused." >&2
     return 1
+  fi
+}
+
+# release_gh ARG... — run gh with a per-call ceiling when `timeout` exists (macOS lacks
+# it stock; there the release.sh stage watchdog is the only bound and we said so once
+# above in release_require_gh_ready).
+release_gh() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${RELEASE_GH_TIMEOUT:-60}" gh "$@"
+  else
+    gh "$@"
   fi
 }
 
@@ -87,7 +130,7 @@ release_require_ci_green() {
   release_require_gh_ready || return 1
   echo "==> Checking GitHub CI for ${sha:0:9} (ceiling ${ceiling}s)"
   while true; do
-    if ! line="$(gh run list --repo "$repo" --workflow ci.yml --commit "$sha" -L 10 \
+    if ! line="$(release_gh run list --repo "$repo" --workflow ci.yml --commit "$sha" -L 10 \
       --json databaseId,status,conclusion,event \
       -q '[.[] | select(.event=="push")][0] | select(. != null) | "\(.databaseId) \(.status) \(.conclusion)"')"; then
       echo "✗ 'gh run list' failed (gh's message is above) — cannot determine CI state for ${sha:0:9}. Release refused." >&2
@@ -100,7 +143,7 @@ release_require_ci_green() {
           echo "✗ CI run $run_id for ${sha:0:9} concluded '$conclusion'. Release refused. See: gh run view $run_id --repo $repo --log-failed" >&2
           return 1
         fi
-        if ! job_rows="$(gh run view "$run_id" --repo "$repo" --json jobs \
+        if ! job_rows="$(release_gh run view "$run_id" --repo "$repo" --json jobs \
           -q '.jobs[] | "\(.name)\t\(.conclusion)"')"; then
           echo "✗ 'gh run view $run_id' failed (gh's message is above) — cannot read CI jobs. Release refused." >&2
           return 1

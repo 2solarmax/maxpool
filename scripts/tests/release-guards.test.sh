@@ -28,7 +28,8 @@ expect_eq() {  # name expected actual
 mkdir -p "$T/bin" "$T/fx" "$T/empty"
 cat >"$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-# gh auth status   -> rc 1 when $GH_AUTH_FAIL is set
+# gh auth status   -> rc 1 when $GH_AUTH_FAIL is set (mirrors real gh: exits 1 when the
+#                     checked account has auth issues)
 # gh run list ...  -> Nth call prints the Nth file of $GH_LIST_FILES (last one repeats),
 #                     filtered through real jq with the guard's own -q program
 # gh run view ...  -> prints $GH_VIEW_FILE filtered the same way
@@ -186,10 +187,32 @@ rc="$( ( export GH_LIST_FILES="$FX/ok.json" GH_VIEW_FILE="$FX/jobs-green.json" G
 expect_rc "gh not logged in refuses up front" 1 "$rc"
 grep -q "gh auth status" "$T/err" && ok "  names gh auth" || bad "  gh auth failure not named"
 expect_eq "  never queried runs" 0 "$(count_calls 'gh run list')"
+# --active: a stale SECOND logged-in account failing its auth check must not block the
+# release; only the active account is checked (round-2 advisory).
+grep -q -- "--active" "$GH_CALLS" && ok "  auth check uses --active (active account only)" || bad "  auth check not scoped to the active account"
 
 rc="$( ( PATH="$T/empty"; release_require_gh_ready ) >"$T/out" 2>"$T/err"; echo $? )"
 expect_rc "gh missing refuses up front" 1 "$rc"
 grep -q "not found" "$T/err" && ok "  names the missing gh" || bad "  missing gh not named"
+
+# release_gh bounds every gh call with `timeout` when available (round-2 advisory): a
+# stubbed `timeout` records that gh ran THROUGH it, with the default ceiling.
+cat >"$T/bin/timeout" <<'STUB'
+#!/usr/bin/env bash
+echo "timeout $*" >>"$GH_CALLS"
+shift   # drop the duration, run the wrapped command
+exec "$@"
+STUB
+chmod +x "$T/bin/timeout"
+: >"$GH_CALLS"
+( export GH_LIST_FILES="$FX/ok.json" GH_VIEW_FILE="$FX/jobs-green.json"; \
+  RELEASE_CI_CEILING=0 RELEASE_CI_POLL=1 release_require_ci_green o/r "$SHA" ) >"$T/out" 2>"$T/err" || true
+expect_eq "gh run list went through timeout" 1 "$(grep -c 'timeout .* gh run list' "$GH_CALLS" || true)"
+expect_eq "gh run view went through timeout" 1 "$(grep -c 'timeout .* gh run view' "$GH_CALLS" || true)"
+grep -q 'timeout 60 gh run list' "$GH_CALLS" && ok "default RELEASE_GH_TIMEOUT is 60s" || bad "default gh ceiling not 60s"
+RELEASE_GH_TIMEOUT=9 release_gh run list >/dev/null 2>&1 || true
+grep -q 'timeout 9 ' "$GH_CALLS" && ok "RELEASE_GH_TIMEOUT overrides the ceiling" || bad "RELEASE_GH_TIMEOUT ignored"
+rm -f "$T/bin/timeout"
 
 # ── repo derivation from a remote URL ──────────────────────────────────────────
 expect_eq "https url -> owner/repo" "2solarmax/maxpool" "$(release_github_repo_from_url https://github.com/2solarmax/maxpool.git)"
@@ -198,9 +221,38 @@ expect_eq "scp-style ssh url" "2solarmax/maxpool" "$(release_github_repo_from_ur
 expect_eq "ssh:// url" "2solarmax/maxpool" "$(release_github_repo_from_url ssh://git@github.com/2solarmax/maxpool.git)"
 expect_eq "fork remote resolves to ITS repo, not the default" "dragosdobro/maxpool" "$(release_github_repo_from_url https://github.com/dragosdobro/maxpool.git)"
 release_github_repo_from_url "not-a-url" >/dev/null 2>&1; expect_rc "unparseable url returns non-zero" 1 "$?"
+# Non-GitHub hosts parse as URLs but must be REFUSED: the derived repo feeds `gh` (and
+# OIDC publish) — a gitlab.com or LAN-mirror remote would point the CI proof elsewhere.
+release_github_repo_from_url "https://gitlab.com/o/r.git" >/dev/null 2>&1; expect_rc "gitlab.com url is refused" 1 "$?"
+release_github_repo_from_url "git@gitlab.com:o/r.git" >/dev/null 2>&1; expect_rc "gitlab.com scp url is refused" 1 "$?"
+release_github_repo_from_url "https://ghe.corp.local/o/r.git" >/dev/null 2>&1; expect_rc "a GitHub Enterprise host is refused" 1 "$?"
+release_github_repo_from_url "ssh://git@github.com/o/r" >/dev/null 2>&1; expect_rc "ssh:// github url still parses" 0 "$?"
+expect_eq "uppercase host is still github" "o/r" "$(release_github_repo_from_url 'https://GitHub.com/o/r.git')"
+
+# ── branch guard (real throwaway repo; round-2 must-fix) ───────────────────────
+# A local branch pinned at main's tip passes the sync guard, `npm version` bumps on it,
+# and the atomic push sends that branch + the v* tag → publish.yml publishes from the
+# tag → npm gets a version not on main and main's next release wedges on the tag.
+G="git -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
+git init -q -b main "$T/branchwork"
+( cd "$T/branchwork" && echo a >f && git add f && $G commit -qm one )
+run_branch() { ( cd "$T/branchwork" && release_require_on_base_branch main ) >"$T/out" 2>"$T/err"; echo $?; }
+
+rc="$(run_branch)"; expect_rc "on main passes" 0 "$rc"
+
+( cd "$T/branchwork" && git checkout -q -b release/1.2.3 )
+rc="$(run_branch)"; expect_rc "a branch AT main's tip is refused (must-fix)" 1 "$rc"
+grep -q "not 'main'" "$T/err" && ok "wrong-branch message names the branch and fix" || bad "wrong-branch message missing"
+grep -q "git checkout main" "$T/err" && ok "wrong-branch message gives the checkout command" || bad "no checkout command in message"
+
+( cd "$T/branchwork" && git checkout -q --detach HEAD )
+rc="$(run_branch)"; expect_rc "detached HEAD is refused" 1 "$rc"
+grep -q "Detached HEAD" "$T/err" && ok "detached-HEAD message is clear" || bad "detached-HEAD message missing"
+
+( cd "$T/branchwork" && git checkout -q main )
+rc="$(run_branch)"; expect_rc "back on main passes again" 0 "$rc"
 
 # ── sync guard (real throwaway repos) ──────────────────────────────────────────
-G="git -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
 git init -q --bare -b main "$T/remote.git"
 git init -q -b main "$T/work"
 ( cd "$T/work" && git remote add origin "$T/remote.git" \
