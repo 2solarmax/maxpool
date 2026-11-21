@@ -36,6 +36,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+      - run: bash scripts/tests/release-guards.test.sh   # release guards (stubbed gh + real jq/git)
       - run: npm test
       - run: npx eslint src/ test/
 

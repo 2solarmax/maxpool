@@ -67,8 +67,14 @@ lines) — it loads in full every session.
 
 **Release pipeline** (details: `scripts/release.sh`, `.github/workflows/publish.yml`):
 - Ship with `npm run release` (patch) / `scripts/release.sh minor|major|X.Y.Z`.
-  It runs tests → lint → `npm version` (commit + `vX.Y.Z` tag) → push → GitHub
-  Actions publishes to npm. **Never `npm publish` by hand.**
+  It runs NO local tests/lint: it refuses unless the checked-out branch IS main,
+  HEAD equals remote main, and CI passed for that exact commit
+  (`scripts/release-guards.sh`), then `npm version` (commit + `vX.Y.Z` tag) →
+  atomic push → GitHub Actions publishes to npm. A manual tag push or
+  `publish.yml` dispatch skips those checks. **Never `npm publish` by hand.**
+- The CI proof is for the commit BEFORE the bump: `npm version` + the changelog
+  hook add ONLY `package.json` and `CHANGELOG.md` (no runtime code), so the
+  parent's green run carries. ci.yml runs again on the pushed tag itself.
 - **A manual `npm version --no-git-tag-version` + commit publishes NOTHING** —
   publish.yml fires on TAG push only. This exact bypass left npm 6 versions
   behind git (1.5.80 vs 1.5.86, 2026-08-17). A commit-msg hook (.githooks/)
