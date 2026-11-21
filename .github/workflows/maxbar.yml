@@ -1,0 +1,56 @@
+name: Maxbar
+
+# Maxbar is Swift and only builds on macOS, so ci.yml (ubuntu, Node) never
+# compiles it. This workflow runs the Wi-Fi exclusion checks and the app build
+# (ad-hoc signed by build.sh, no signing identity needed). Path-filtered on
+# purpose: it is NOT a required check, so skipping it cannot block a merge.
+# maxpool is public, so the standard macOS runner bills nothing; never
+# switch to a larger macOS label (those bill even on public repos) and never
+# attach a self-hosted runner. The runner image is pinned (macos-15) so a
+# macos-latest rollover cannot turn the check red with no code change.
+
+on:
+  push:
+    branches: [main]
+    paths: ['tools/maxbar/**', '.github/workflows/maxbar.yml']
+  pull_request:
+    paths: ['tools/maxbar/**', '.github/workflows/maxbar.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxbar-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  maxbar:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Wi-Fi exclusion checks
+        run: bash tools/maxbar/test_wifi_exclusions.sh
+      - name: Checks fail on a broken matcher (mutation)
+        run: |
+          # Prove the checks can fail: a copy whose filter lets everything through must die.
+          mutant="$RUNNER_TEMP/WiFiExclusionsMutant.swift"
+          python3 - "$mutant" <<'PY'
+          import pathlib, sys
+          src = pathlib.Path("tools/maxbar/WiFiExclusions.swift").read_text(encoding="utf-8")
+          old = "return inRange.filter { !held.contains($0) && !cooldown.contains($0) && $0 != current }"
+          if src.count(old) != 1:
+              sys.exit("mutation did not apply: update the pattern in maxbar.yml")
+          pathlib.Path(sys.argv[1]).write_text(src.replace(old, "return inRange"), encoding="utf-8")
+          PY
+          if out=$(bash tools/maxbar/test_wifi_exclusions.sh "$mutant" 2>&1); then
+            echo "$out"; echo "mutant survived: the checks cannot fail"; exit 1
+          fi
+          echo "$out" | grep -q '^FAIL ' || { echo "$out"; echo "mutant died without a failed check (compile error?)"; exit 1; }
+          echo "mutant killed by a failed check"
+      - name: Build Maxbar.app (ad-hoc signed)
+        run: bash tools/maxbar/build.sh
+      - name: Built app exists
+        run: test -x tools/maxbar/Maxbar.app/Contents/MacOS/Maxbar
