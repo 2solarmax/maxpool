@@ -219,14 +219,25 @@ test('Headroom headline says how many linked workers report no headroom, and how
 
 test('quiet Headroom still shows a request being held and the span it covers', () => {
   const m = am();
-  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
-  m.routingService.started = Date.now() - 20 * 60_000;
-  const trace = m.routingService.begin({});
-  trace.wait();
-  m._routingReport = null;
-  const line = strip(tui._capacityLine(100, Date.now() + 3000));
-  assert.match(line, /little traffic · 1 waiting, oldest 3\.\ds\)\s+\[15m\]/);
-  trace.finish('cancelled');
-  m._routingReport = null;
-  assert.match(strip(tui._capacityLine(100, Date.now())), /little traffic\)\s+\[15m\]/);
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  try {
+    // One controllable clock for the ledger AND the render. Reading the ledger at a made-up future
+    // time and then at the real time runs the clock backwards, which the ledger treats (correctly)
+    // as an observation gap and restarts the span.
+    m.routingService.now = () => clock;
+    m.routingService.started = clock - 20 * 60_000;
+    const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+    const trace = m.routingService.begin({});
+    trace.wait();
+    clock += 3000;
+    m._routingReport = null;
+    assert.match(strip(tui._capacityLine(100, clock)), /little traffic · 1 waiting, oldest 3\.0s\)\s+\[15m\]/);
+    trace.finish('cancelled');
+    m._routingReport = null;
+    const released = strip(tui._capacityLine(100, clock));
+    assert.match(released, /little traffic\)\s+\[15m\]/);
+    assert.doesNotMatch(released, /waiting/);
+  } finally { Date.now = realNow; }
 });
