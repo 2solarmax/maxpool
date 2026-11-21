@@ -5,6 +5,37 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.122] - 2026-11-21
+
+### Added
+
+- Saved exclusion list for automatic Wi-Fi selection
+- Headroom headline and analytics for request wait vs capacity
+
+### Changed
+
+- Build and test Maxbar on macOS
+- Drive the headroom fixture ledger from the controlled clock so all 35 requests stay in window
+- Drive the quiet-Headroom span test from one clock
+- Check exhausted accounts with confirmed empty reset inventory once a day
+- Document daily exhausted-account inventory check in README
+- Anchor the daily empty-inventory check on the older of listing and usage success
+- Pin the restored-listing guard, bound skewed clocks, pace stale disabled accounts, plainer wording
+- Share the weekly-idle gate, keep restored non-empty listings pending, split README wake triggers
+- Require synced main and CI success for HEAD instead of local tests
+- Release guards: review round 1 fixes
+- Release guards: review round 2 fixes
+- Release guards test: clear bash's command hash after removing the timeout stub
+- Publish watch gets its own ceiling; CI proof must be main's run; precise recovery hints
+- Run from repo root, push the full branch ref, gate the push-undo on a successful empty check
+
+### Fixed
+
+- Review round 1 for Wi-Fi exclusions
+- Review round 2 for Wi-Fi exclusions
+- Headroom headline respects the 20-request minimum, honest window, help text and labels
+- Headroom headline ignores trivial waits, times holds from the first wait, and coerces linked-worker figures
+
 ## [1.24.121] - 2026-11-20
 
 ### Changed
