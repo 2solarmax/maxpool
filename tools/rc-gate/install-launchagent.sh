@@ -32,13 +32,22 @@ else
   exit 1
 fi
 
-# Report what launchd itself says about the job (field names vary by macOS version, so this
-# prints what it finds and never fails the install).
+# Verify what launchd itself says about the job. `launchctl print` reports ProcessType as
+# `spawn type = <daemon|interactive|background> (N)`; anything but interactive means the plist's
+# ProcessType did not apply (e.g. a stale copy or an old agent still loaded). The gate stays up,
+# but the install is reported as FAILED (exit 2) so the operator notices.
+# shellcheck source=launchd-spawn-type.sh
+. "$(cd "$(dirname "$0")" && pwd)/launchd-spawn-type.sh"
 JOB="gui/$(id -u)/com.mokka.rc-gate"
 if PRINT="$(launchctl print "$JOB" 2>&1)"; then
   echo "launchd job $JOB: $(printf '%s\n' "$PRINT" | grep -m1 -E '^[[:space:]]*state = ' | sed 's/^[[:space:]]*//' || true)"
-  PT="$(printf '%s\n' "$PRINT" | grep -m1 -i -E 'process type|ProcessType' | sed 's/^[[:space:]]*//' || true)"
-  echo "launchd process type: ${PT:-<no process-type line printed by launchctl on this macOS>}"
+  SPAWN="$(printf '%s\n' "$PRINT" | rc_gate_spawn_type)"
+  echo "launchd spawn type: ${SPAWN:-<not printed>}"
+  if [ "$SPAWN" != "interactive" ]; then
+    echo "WARN: rc-gate is not running as an Interactive job (spawn type = ${SPAWN:-unknown}) — ProcessType did not apply" >&2
+    exit 2
+  fi
 else
-  echo "note: 'launchctl print $JOB' failed: $(printf '%s' "$PRINT" | head -1)" >&2
+  echo "WARN: 'launchctl print $JOB' failed, cannot verify ProcessType: $(printf '%s' "$PRINT" | head -1)" >&2
+  exit 2
 fi

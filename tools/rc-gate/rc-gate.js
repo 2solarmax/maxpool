@@ -410,19 +410,32 @@ const mitmServer = http.createServer((creq, cres) => {
     // that delivered the answer, a non-2xx answer held back while a sibling may still
     // succeed, and the overall deadline.
     const liveDirs = new Set();
-    let hbWinner = null, hbHedged = false, hbDeadlineTimer = null, held = null;
+    let hbWinner = null, hbHedged = false, hbDeadlineTimer = null, held = null, heldDir = null;
     const clearHbDeadline = () => { if (hbDeadlineTimer) { clearTimeout(hbDeadlineTimer); hbDeadlineTimer = null; } };
     const dropAttempt = d => { liveDirs.delete(d); d.superseded = true; try { d.destroy(); } catch {} };
+    // The held attempt left liveDirs when it answered; keep a handle so it can be torn down.
+    const destroyHeld = () => {
+      const d = heldDir; heldDir = null; held = null;
+      if (d) { d.superseded = true; try { d.destroy(); } catch {} }
+    };
     const send502 = message => {
+      destroyHeld();
       console.log('[direct-error]', creq.url, message);
       try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
       cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message } }));
     };
     // Deliver the held non-2xx answer (the best the upstream gave us) instead of a gate 502.
-    const deliverHeld = () => {
+    // If its body is still arriving: before the deadline, deliver the moment it completes
+    // (returns true = handled, pending); at the deadline (`final`) there is no time, so false.
+    const deliverHeld = (final = false) => {
       const h = held;
-      if (!h || h.body === null || cres.headersSent || cres.destroyed) return false;
-      held = null; hbWinner = h; clearHbDeadline();
+      if (!h || cres.headersSent || cres.destroyed) return false;
+      if (h.body === null) {
+        if (final) return false;
+        h.wanted = true;
+        return true;
+      }
+      held = null; heldDir = null; hbWinner = h; clearHbDeadline();
       const hh = { ...h.headers };
       delete hh['transfer-encoding'];
       hh['content-length'] = String(h.body.length);
@@ -435,6 +448,7 @@ const mitmServer = http.createServer((creq, cres) => {
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
       clearHbDeadline();
       for (const d of [...liveDirs]) dropAttempt(d);
+      destroyHeld();
     });
     // Body is buffered ONCE, outside dirSend: a retry re-runs the upstream request,
     // but creq's 'data'/'end' events only fire the first time. Waiting for them again
@@ -502,16 +516,25 @@ const mitmServer = http.createServer((creq, cres) => {
           if (tStall) { clearTimeout(tStall); tStall = null; }
           liveDirs.delete(dir);
           if (held) { try { ures.destroy(); } catch {} return; }
-          const mine = { status: ures.statusCode, headers: ures.headers, body: null };
-          held = mine;
+          const mine = { status: ures.statusCode, headers: ures.headers, body: null, wanted: false };
+          held = mine; heldDir = dir;
           const chunks = [];
           ures.on('data', c => chunks.push(c));
-          ures.on('end', () => { mine.body = Buffer.concat(chunks); });
-          ures.on('error', () => { if (held === mine) held = null; });
+          ures.on('end', () => {
+            mine.body = Buffer.concat(chunks);
+            if (mine.wanted && held === mine) deliverHeld();     // someone was waiting for it
+          });
+          const broke = () => {
+            if (held !== mine) return;
+            held = null; heldDir = null;
+            if (mine.wanted && !hbWinner && !cres.headersSent) { clearHbDeadline(); send502('rc-gate: held upstream response failed mid-body'); }
+          };
+          ures.on('error', broke);
+          ures.on('aborted', broke);
           return;
         }
         hbWinner = dir;
-        held = null;
+        destroyHeld();
         if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
         clearHbDeadline();
         for (const d of [...liveDirs]) if (d !== dir) dropAttempt(d);
@@ -570,7 +593,7 @@ const mitmServer = http.createServer((creq, cres) => {
             if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
             for (const d of [...liveDirs]) dropAttempt(d);
             if (hbWinner || cres.headersSent || cres.destroyed) return;
-            if (deliverHeld()) return;
+            if (deliverHeld(true)) return;
             send502(`rc-gate: heartbeat deadline ${HEARTBEAT_DEADLINE_MS}ms exceeded`);
           }, Math.max(0, HEARTBEAT_DEADLINE_MS - (Date.now() - reqStart)));
         }
@@ -584,10 +607,8 @@ const mitmServer = http.createServer((creq, cres) => {
           // will not end (see the ures handlers above): end it with an error instead.
           if (cres.headersSent) { if (!cres.writableFinished) cres.destroy(err); return; }
           const sibling = isHeartbeat && liveDirs.size > 0;
-          if (isHeartbeat) {
-            if (sibling && !dir.isHedge) return;       // attempt 1 died, the hedge may still answer
-            if (!sibling && retryTimer) return;        // a replacement attempt is already scheduled
-          }
+          // A replacement attempt is already scheduled (and nothing else is running): wait for it.
+          if (isHeartbeat && !sibling && retryTimer) return;
           // REPLAY SAFETY (2026-10-05, corrects 29b58e7). A replayed /bridge or bare
           // /worker registration makes the server evict the live connection (close
           // 4090 — the header comment above; pinned by rc-gate.test.js "4090
@@ -614,8 +635,8 @@ const mitmServer = http.createServer((creq, cres) => {
             console.log('[direct-retry]', creq.url, `attempt ${retryN}/${DIRECT_RETRY_MAX} after`, String(err?.message || err), `— waiting ${wait}ms`);
             // never reuse a socket from the dead network: this request's agent only (see sweepIdleSockets)
             if (connectPhase || dir.reusedSocket) sweepIdleSockets(reqAgent);
-            // A hedge that failed while attempt 1 is still running is replaced by a new hedge
-            // (fresh one-shot agent), never by a third concurrent attempt.
+            // A failed attempt (the hedge, or attempt 1) whose sibling is still running is replaced
+            // by a new hedge (fresh one-shot agent), never by a third concurrent attempt.
             const replacementIsHedge = sibling;
             retryTimer = setTimeout(() => {
               retryTimer = null;
@@ -624,9 +645,9 @@ const mitmServer = http.createServer((creq, cres) => {
             }, wait);
             return;
           }
-          if (sibling) return;                         // attempt 1 still running; the deadline answers
+          if (sibling) return;                         // the other attempt is still running; the deadline answers
+          if (isHeartbeat && deliverHeld()) return;    // (may wait for a held body; the deadline still bounds it)
           clearHbDeadline();
-          if (isHeartbeat && deliverHeld()) return;
           send502(String(err?.message || err));
         });
         if (!isLongPoll) {
