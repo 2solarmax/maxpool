@@ -15,20 +15,22 @@ NODE_BIN="$(command -v node)"
 
 # The plist pins an absolute node path (launchd has no PATH); rewrite it to whatever
 # node this machine actually has, so the agent never silently fails to exec.
-python3 - "$SRC" "$DEST" "$NODE_BIN" <<'PY'
+# Written to "$DEST.new" first: the installed plist is replaced only after the pre-check below passes,
+# so a bad source can never end up in ~/Library/LaunchAgents (it would load at the next login).
+python3 - "$SRC" "$DEST.new" "$NODE_BIN" <<'PY'
 import sys, re, pathlib
 src, dest, node = sys.argv[1], sys.argv[2], sys.argv[3]
 xml = pathlib.Path(src).read_text()
 xml = re.sub(r'<string>[^<]*/bin/node</string>', f'<string>{node}</string>', xml, count=1)
 pathlib.Path(dest).write_text(xml)
-print(f'installed {dest} (node: {node})')
+print(f'prepared {dest} (node: {node})')
 PY
 
 # PRE-CHECK before touching launchd: the plist just written must carry ProcessType=Interactive and
 # ExitTimeOut>=25 (a stale or hand-edited source would otherwise be loaded, and every reload costs
 # each Remote Control session one of its 4 hourly reconnects). python3's plistlib is used because it
 # exists on both macOS and Linux CI (plutil does not).
-if ! python3 - "$DEST" <<'PY'
+if ! python3 - "$DEST.new" <<'PY'
 import plistlib, sys
 d = plistlib.load(open(sys.argv[1], 'rb'))
 pt, et = d.get('ProcessType'), d.get('ExitTimeOut')
@@ -37,9 +39,12 @@ if pt != 'Interactive' or not isinstance(et, int) or et < 25:
     sys.exit(1)
 PY
 then
-  echo "ERROR: the plist written to $DEST does not have ProcessType=Interactive and ExitTimeOut>=25. Nothing was reloaded; the running relay is untouched. Fix tools/rc-gate/launchd/com.mokka.rc-gate.plist and re-run." >&2
+  rm -f "$DEST.new"
+  echo "ERROR: the new plist does not have ProcessType=Interactive and ExitTimeOut>=25. Nothing was changed: $DEST is as it was, nothing was reloaded, the running relay is untouched. Fix tools/rc-gate/launchd/com.mokka.rc-gate.plist and re-run." >&2
   exit 3
 fi
+mv -f "$DEST.new" "$DEST"
+echo "installed $DEST"
 
 launchctl unload "$DEST" 2>/dev/null || true
 launchctl load "$DEST"

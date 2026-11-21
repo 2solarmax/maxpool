@@ -27,6 +27,7 @@ import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
 import zlib from 'node:zlib';
+import { performance } from 'node:perf_hooks';
 import { readFileSync, existsSync, rmSync, watchFile } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -670,19 +671,22 @@ const mitmServer = http.createServer((creq, cres) => {
           dir.on('socket', sock => { try { sock.setKeepAlive(true, 30_000); } catch {} });  // half-open reaper (see armUpstreamKeepalive)
           dir.on('socket', () => {
             if (tStall) return;                     // already armed (retry/reuse)
-            const armedAt = Date.now();
+            const armedAt = performance.now();           // monotonic: a wall-clock step must not fake a loop lag
             tStall = setTimeout(() => {
             if (isHeartbeat) {
               // HEDGE, never destroy: attempt 1 may still answer (a slow but live upstream). At
               // most one extra attempt, only while the client is waiting and the deadline allows.
               tStall = null;
-              const lagMs = Date.now() - armedAt - stallMs;
+              const lagMs = Math.round(performance.now() - armedAt - stallMs);
               // LOOP-LAG RACE (2026-11-21, probe-confirmed): when the gate's own loop is starved the
               // timers phase runs this callback BEFORE the poll phase reads a response that is
               // already buffered, so the stall looks real. Decide one turn later, after pending
               // I/O (and so the response callback) has run.
               setImmediate(() => {
                 if (hbWinner || cres.headersSent || cres.destroyed) return;
+                // The stalled attempt already failed in this same turn and a replacement is scheduled:
+                // hedging on top would add a needless third attempt.
+                if (retryTimer !== null || !liveDirs.has(dir)) return;
                 const canHedge = !hbHedged && Date.now() - reqStart < HEARTBEAT_DEADLINE_MS;
                 const late = lagMs > 1_000;
                 console.log('[direct-stall]', creq.url, 'no response headers in', stallMs + 'ms —',
