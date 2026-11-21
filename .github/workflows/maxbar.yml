@@ -1,0 +1,36 @@
+name: Maxbar
+
+# Maxbar is Swift and only builds on macOS, so ci.yml (ubuntu, Node) never
+# compiles it. This workflow runs the Wi-Fi exclusion checks and the app build
+# (ad-hoc signed by build.sh, no signing identity needed). Path-filtered on
+# purpose: it is NOT a required check, so skipping it cannot block a merge.
+# maxpool is public, so the standard macos-latest runner bills nothing; never
+# switch to a larger macOS label (those bill even on public repos) and never
+# attach a self-hosted runner.
+
+on:
+  push:
+    branches: [main]
+    paths: ['tools/maxbar/**', '.github/workflows/maxbar.yml']
+  pull_request:
+    paths: ['tools/maxbar/**', '.github/workflows/maxbar.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxbar-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  maxbar:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wi-Fi exclusion checks
+        run: bash tools/maxbar/test_wifi_exclusions.sh
+      - name: Build Maxbar.app (ad-hoc signed)
+        run: bash tools/maxbar/build.sh
+      - name: Built app exists
+        run: test -x tools/maxbar/Maxbar.app/Contents/MacOS/Maxbar
