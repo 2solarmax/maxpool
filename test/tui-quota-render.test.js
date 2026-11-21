@@ -167,6 +167,20 @@ test('a quiet prober names the concrete next refresh time', () => {
   assert.doesNotMatch(line, /stale/, 'never the old bare jargon');
 });
 
+test('right after a restart a row with no timing says its next check is on the next sweep, not a fixed interval', () => {
+  const am = oauthAM();
+  am.quotaProbeIntervalMs = 30 * 60_000;
+  am.accounts[0].quota.unified5h = 0.4;
+  am.accounts[0].quota.unified7d = 1;                  // a full week: the row carries the probe-age echo
+  am.accounts[0].quota.unified7dReset = Date.now() + 3 * DAY;
+  am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
+  am.quotaProbeSweeping = false;
+  am.quotaProbeNextSweepAt = null;
+  const line = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  assert.match(line, /quota \d+m old · refreshing on the next sweep/);
+  assert.doesNotMatch(line, /every/, 'a daily-cadence account is not refreshed every interval');
+});
+
 test('the age is a real elapsed reading, not a fixed string', () => {
   const am = oauthAM();
   am.quotaProbeIntervalMs = 60_000;

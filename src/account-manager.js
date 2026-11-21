@@ -7445,7 +7445,7 @@ export class AccountManager {
       // usability is re-derived by the next live check (C5 gates on usableNow
       // from the LIVE response; a restored entry may be hours old).
       if (match.resetGrants && !account.resetGrants) {
-        account.resetGrants = { ...match.resetGrants, stale: true };
+        account.resetGrants = { ...match.resetGrants, stale: true, restored: true };
       }
       if (match.resetCards && !account.resetCards) {
         account.resetCards = { ...match.resetCards, stale: true };

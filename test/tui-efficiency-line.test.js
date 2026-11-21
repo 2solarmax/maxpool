@@ -107,3 +107,137 @@ test('low volume says so instead of numbers, and both lines fit 65 columns', () 
   assert.match(full, /cross \d+\/100/, full);
   assert.ok(strip(tui._cacheLine(65)).length <= 65, 'Cache still fits 65 with numbers');
 });
+
+test('Headroom headline sits under Moves, names the state, and fits 80 columns', () => {
+  const m = am();
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  try {
+  // Drive the ledger from the same controllable clock so every recorded request stays inside the
+  // 15-minute window however long the test takes, and held requests age by exactly the advance.
+  m.routingService.now = () => clock;
+  // A worker that has been watching for longer than the window, so the label shows the full 15m.
+  m.routingService.started = clock - 20 * 60_000;
+  for (let i = 0; i < 25; i++) served(m, m.accounts[0], { in: 1000, cr: 90_000, cc: 0, out: 10 });
+  const fresh = () => { m._routingReport = null; };
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  assert.match(strip(tui._capacityLine(80)), /Headroom .*little traffic/);
+  for (let i = 0; i < 35; i++) { const t = m.routingService.begin({}); t.route('c1'); t.finish('completed'); }
+  fresh();
+  assert.match(strip(tui._capacityLine(80)), /Headroom\s+Keeping up\s+\[15m\]\s+0 of 35 waited/);
+  const held = [0, 1, 2].map(() => { const t = m.routingService.begin({}); t.wait(); return t; });
+  clock += 42_000;
+  fresh();
+  const short = strip(tui._capacityLine(80));
+  assert.match(short, /Short of accounts/);
+  assert.match(short, /3 waiting, oldest 42s/);
+  assert.equal(m.routingService.recent(undefined, clock).requests, 35, 'all 35 unwaited requests are still in the window');
+  assert.ok([...short].length <= 80, 'fits 80 columns');
+  const frame = frameAt(tui, 100);
+  const moves = frame.findIndex(l => l.trim().startsWith('Moves'));
+  const cap = frame.findIndex(l => l.trim().startsWith('Headroom'));
+  assert.ok(moves > 0, 'the fixture produces a Moves row');
+  assert.equal(cap, moves + 1, 'headline directly under Moves');
+  held.forEach(t => t.finish('cancelled'));
+  // Just after a restart the label says how little it has watched instead of claiming 15 minutes.
+  m.routingService.started = clock - 3 * 60_000;
+  fresh();
+  assert.match(strip(tui._capacityLine(80)), /\[3m\]/);
+  } finally { Date.now = realNow; }
+});
+
+test('Headroom headline shows the worst fresh worker by name and ignores a stale or older one', () => {
+  const m = am();
+  const now = Date.now();
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  const recent = (state, extra = {}) => ({ state, requests: 40, queuedRequests: 0, capacityDenied: 0, longestWaitMs: 0,
+    pending: 0, oldestWaitMs: 0, windowMs: 900_000, observedMs: 900_000, ...extra });
+  const link = (name, source, rec, extra = {}) => ({ name, lastOkAt: now, ...extra,
+    status: { routingAnalytics: { version: 1, source, asOf: now, ...(rec ? { recent: rec } : {}) } } });
+  const show = links => { m.poolLinks = links; m._routingReport = null; return strip(tui._capacityLine(100, now)); };
+  // Local is quiet and so is the remote: a tie stays local, so no worker name.
+  assert.doesNotMatch(show([link('Cloud', 'src-cloud', { state: 'quiet' })]), / on /);
+  // A fresh remote in a worse state wins and is named; a stale one in a worse state is skipped.
+  const tight = show([link('Cloud', 'src-cloud', recent('tight', { queuedRequests: 3, longestWaitMs: 7000 })),
+    link('Stale', 'src-stale', recent('short', { queuedRequests: 20 }), { lastError: 'unreachable' }),
+    { name: 'Older', status: {} }, link('NoHeadline', 'src-old', null)]);
+  assert.match(tight, /Getting tight/);
+  assert.match(tight, /3 of 40 waited/);
+  assert.match(tight, /on Cloud/);
+  assert.doesNotMatch(tight, /Stale|Short of accounts/);
+  // Two fresh workers: the shorter-of-accounts one is shown.
+  const short = show([link('Cloud', 'src-cloud', recent('tight', { queuedRequests: 3 })),
+    link('Cloud2', 'src-cloud2', recent('short', { queuedRequests: 8 }))]);
+  assert.match(short, /Short of accounts/);
+  assert.match(short, /8 of 40 waited/);
+  assert.match(short, /on Cloud2/);
+  // Only stale workers report: nothing to say beyond this worker's own quiet line.
+  assert.doesNotMatch(show([link('Stale', 'src-stale', recent('short'), { lastError: 'unreachable' })]), /Short of accounts| on /);
+});
+
+test('Headroom headline coerces a linked worker\'s figures and rejects inherited state names', () => {
+  const m = am();
+  const now = Date.now();
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  const show = recent => {
+    m.poolLinks = [{ name: 'Cloud', lastOkAt: now, status: { routingAnalytics: { version: 1, source: 'src-cloud', asOf: now, recent } } }];
+    m._routingReport = null;
+    return strip(tui._capacityLine(100, now));
+  };
+  // Text, objects and huge numbers in a remote block never reach the screen as raw values.
+  const hostile = show({ state: 'short', requests: '40 \u001b[31mRED', queuedRequests: '9', pending: '3', oldestWaitMs: { x: 1 },
+    capacityDenied: [7], longestWaitMs: 'forever', windowMs: 'x', observedMs: 'y' });
+  assert.match(hostile, /Short of accounts/);
+  assert.match(hostile, /0 of 0 waited/);
+  assert.doesNotMatch(hostile, /RED|forever|\[object|NaN|undefined/);
+  // `toString` is on every object's prototype: it is not a state.
+  const inherited = show({ state: 'toString', requests: 40, queuedRequests: 12 });
+  assert.doesNotMatch(inherited, /Keeping up|Getting tight|Short of accounts|waited/);
+  assert.match(inherited, /1 not reporting/);
+});
+
+test('Headroom headline says how many linked workers report no headroom, and how old a remote verdict is', () => {
+  const m = am();
+  const now = Date.now();
+  const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+  const recent = (state, extra = {}) => ({ state, requests: 40, queuedRequests: 0, capacityDenied: 0, longestWaitMs: 0,
+    pending: 0, oldestWaitMs: 0, windowMs: 900_000, observedMs: 900_000, ...extra });
+  const link = (name, source, rec, asOf = now) => ({ name, lastOkAt: now,
+    status: { routingAnalytics: { version: 1, source, asOf, ...(rec ? { recent: rec } : {}) } } });
+  const show = links => { m.poolLinks = links; m._routingReport = null; return strip(tui._capacityLine(100, now)); };
+  // A worker that sends no headroom must not leave "Keeping up" reading as all-clear.
+  const silent = show([link('Cloud', 'src-cloud', recent('ok')), link('Old', 'src-old', null), { name: 'Older', status: {} }]);
+  assert.match(silent, /Keeping up/);
+  assert.match(silent, /on Cloud · 2 not reporting/);
+  // No linked worker, nothing missing: no hint.
+  assert.doesNotMatch(show([link('Cloud', 'src-cloud', recent('ok'))]), /not reporting/);
+  // A remote verdict says how old it is; a fresh one does not.
+  assert.match(show([link('Cloud', 'src-cloud', recent('tight', { queuedRequests: 3 }), now - 4 * 60_000)]), /Getting tight\s+\[15m\] 4m old/);
+  assert.doesNotMatch(show([link('Cloud', 'src-cloud', recent('tight', { queuedRequests: 3 }), now - 20_000)]), /old/);
+});
+
+test('quiet Headroom still shows a request being held and the span it covers', () => {
+  const m = am();
+  const realNow = Date.now;
+  let clock = realNow();
+  Date.now = () => clock;
+  try {
+    // One controllable clock for the ledger AND the render. Reading the ledger at a made-up future
+    // time and then at the real time runs the clock backwards, which the ledger treats (correctly)
+    // as an observation gap and restarts the span.
+    m.routingService.now = () => clock;
+    m.routingService.started = clock - 20 * 60_000;
+    const tui = new TUI({ accountManager: m, config: { proxy: { port: 3456 } } });
+    const trace = m.routingService.begin({});
+    trace.wait();
+    clock += 3000;
+    m._routingReport = null;
+    assert.match(strip(tui._capacityLine(100, clock)), /little traffic · 1 waiting, oldest 3\.0s\)\s+\[15m\]/);
+    trace.finish('cancelled');
+    m._routingReport = null;
+    const released = strip(tui._capacityLine(100, clock));
+    assert.match(released, /little traffic\)\s+\[15m\]/);
+    assert.doesNotMatch(released, /waiting/);
+  } finally { Date.now = realNow; }
+});
