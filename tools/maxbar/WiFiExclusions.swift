@@ -16,17 +16,18 @@ func normalizedSSID(_ raw: String) -> String? {
     return s
 }
 
-/// Names compare without regard to case or accents, so "My Car" typed by hand still
-/// matches the remembered "my car".
+/// Names compare without regard to case, so "My Car" typed by hand still matches the
+/// remembered "my car". Accents are NOT folded: "Café" and "Cafe" are different
+/// networks, and excluding one must not block the other.
 private func foldedSSID(_ s: String) -> String {
-    s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    s.folding(options: .caseInsensitive, locale: nil)
 }
 
 enum ExclusionAdd: Equatable {
     case added(String)
     case alreadyExcluded(String)
     case invalid
-    case isHotspot      // the phone hotspot has its own dial path; excluding it would break that
+    case isHotspot      // the hotspot is dialed by its own path, which never reads this list: an entry would do nothing and mislead
 }
 
 struct WiFiExclusionStore {
@@ -63,14 +64,20 @@ struct WiFiExclusionStore {
     }
 }
 
+/// The in-range networks the exclusion list holds back. The one predicate behind both
+/// the filter below and the "not joining N excluded" log line, so they cannot disagree.
+func excludedInRange(inRange: [String], excluded: [String]) -> [String] {
+    let blocked = Set(excluded.map(foldedSSID))
+    return inRange.filter { blocked.contains(foldedSSID($0)) }
+}
+
 /// Networks Maxbar may join, best first: in range, not the one we are on, not cooling
 /// down after a failure, and not excluded. Every automatic or backup pick goes through
 /// here; an empty result means "no eligible network" and the caller falls through to
-/// the phone hotspot.
+/// the phone hotspot. Cooldown and current-network matches stay exact (as before this
+/// list existed); only the exclusion list is case-folded.
 func eligibleWiFiCandidates(inRange: [String], current: String?, cooldown: Set<String>,
                             excluded: [String]) -> [String] {
-    let blocked = Set(excluded.map(foldedSSID))
-        .union(cooldown.map(foldedSSID))
-        .union(current.map { [foldedSSID($0)] } ?? [])
-    return inRange.filter { !blocked.contains(foldedSSID($0)) }
+    let held = Set(excludedInRange(inRange: inRange, excluded: excluded))
+    return inRange.filter { !held.contains($0) && !cooldown.contains($0) && $0 != current }
 }

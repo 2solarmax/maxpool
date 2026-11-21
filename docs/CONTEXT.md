@@ -26,7 +26,7 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ### 2026-11-21 · Maxbar excluded Wi-Fi networks
 
-Maxbar chose backup Wi-Fi from every remembered network in range, skipping only a temporary cooldown, so a car network that joins without internet could be retried. It now has a saved exclusion list (menu, manual add for a network not in range) that filters every automatic or backup pick, re-checked just before joining. It does not touch macOS's own auto-join and never leaves a network already joined. Qualification of the selection logic and the signed build is pending a rented runner.
+Maxbar chose backup Wi-Fi from every remembered network in range, skipping only a temporary cooldown, so a car network that joins without internet could be retried. It now has a saved exclusion list (menu, manual add for a network not in range) that filters every automatic or backup pick, re-checked just before joining. It does not touch macOS's own auto-join and never leaves a network already joined. CI on a macOS runner runs the unit checks and an ad-hoc-signed build; the selection has not yet been tried against a real car network or a real radio.
 
 ### 2026-11-20 · Reduce repeated analytics work
 

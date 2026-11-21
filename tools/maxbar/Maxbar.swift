@@ -221,6 +221,10 @@ func surveyKnownWiFi(onPhone: Bool) -> WiFiSurvey {
     // looking after the budget — the networks you use most are checked first.
     let deadline = Date() + kSurveyBudgetSeconds
     var cutShort = false
+    // Excluded names are scanned on purpose: spotting the network we are on (the lone
+    // on-channel match) needs them, and skipping an excluded current network would let
+    // a neighbour on our channel be mistaken for it and benched. They are filtered out
+    // of the join candidates afterwards (eligibleWiFiCandidates), never from the scan.
     for name in preferredWiFiNetworks() {
         if Date() > deadline { cutShort = true; break }
         guard let hits = try? iface.scanForNetworks(withName: name), !hits.isEmpty else { continue }
@@ -476,6 +480,7 @@ final class MaxbarController: NSObject, NSMenuDelegate {
     private var hotspotOutageLogged = false  // one "not re-dialing" line per hotspot outage
     private var hotspotOnlineChecks = 0      // polls on the phone with internet (Wi-Fi look-back pacing)
     private var trialWiFi: (ssid: String, at: Date, fromPhone: Bool)?  // just joined; must show internet
+    private var renderedExclusions: [String]?               // list the exclusion submenu was built from
     private var wifiCooldown: [String: Date] = [:]          // Wi-Fi that had no internet → retry after
     private var wifiFailures: [String: Int] = [:]           // repeat failures → longer cooldown
     private var handJoined = false          // "Join hotspot now" chose the phone: stay until the Mac leaves it
@@ -667,6 +672,10 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         hotspot = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The hotspot is dialed by its own path and cannot be excluded: drop a stale entry.
+        if !hotspot.isEmpty, WiFiExclusionStore().remove(hotspot) {
+            log("Wi-Fi exclusion dropped: it is now the hotspot name")
+        }
         offlineChecks = 0
         lastError = nil
         log("Hotspot name set to \"\(hotspot)\"")
@@ -902,7 +911,7 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         let candidates = eligibleWiFiCandidates(
             inRange: survey.inRange, current: survey.current,
             cooldown: Set(wifiCooldown.keys), excluded: excluded)
-        let heldBack = survey.inRange.filter { r in excluded.contains { $0.caseInsensitiveCompare(r) == .orderedSame } }
+        let heldBack = excludedInRange(inRange: survey.inRange, excluded: excluded)
         if !heldBack.isEmpty {
             log("Not joining \(heldBack.count) excluded Wi-Fi network(s) in range (\(reason))")
         }
@@ -1151,11 +1160,16 @@ final class MaxbarController: NSObject, NSMenuDelegate {
     }
 
     private func renderExcludedWiFiMenu() {
+        let names = WiFiExclusionStore().list()
+        excludedWiFiItem.title = names.isEmpty ? "Excluded Wi-Fi networks" : "Excluded Wi-Fi networks (\(names.count))"
+        // renderMenu runs on every poll; swapping the submenu then could reset it while
+        // it is open, so only rebuild when the list actually changed.
+        if excludedWiFiItem.submenu != nil, renderedExclusions == names { return }
+        renderedExclusions = names
         let sub = NSMenu()
         let add = NSMenuItem(title: "Add network…", action: #selector(addExcludedWiFi), keyEquivalent: "")
         add.target = self
         sub.addItem(add)
-        let names = WiFiExclusionStore().list()
         if names.isEmpty {
             let none = NSMenuItem(title: "None — Maxbar may pick any remembered network", action: nil, keyEquivalent: "")
             none.isEnabled = false
@@ -1189,7 +1203,7 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         switch WiFiExclusionStore().add(box.stringValue, hotspot: hotspot) {
         case .added: lastError = nil; log("Wi-Fi exclusion added (\(WiFiExclusionStore().list().count) total)")
-        case .alreadyExcluded: lastError = "That network is already excluded"
+        case .alreadyExcluded: log("Wi-Fi exclusion already present; nothing to add")   // harmless: no error banner
         case .isHotspot: lastError = "That is your hotspot — it can't be excluded"
         case .invalid: lastError = "Not a valid Wi-Fi name"
         }
