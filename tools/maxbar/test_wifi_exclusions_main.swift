@@ -73,6 +73,55 @@ do {
     let empty = WiFiExclusionStore(defaults: freshDefaults())
     check(empty.list().isEmpty && !empty.contains(car), "nothing stored: empty list, contains false")
 }
+// damaged preference data: bad elements are dropped one by one, never the whole list
+do {
+    let d = freshDefaults()
+    d.set([car, 42, ["nested"], Data([1, 2]), true, "  Keep Me ", "   "] as [Any], forKey: kPrefsExcludedWiFi)
+    let s = WiFiExclusionStore(defaults: d)
+    check(s.list() == [car, "Keep Me"], "non-string and blank elements dropped, valid strings kept")
+    check(s.read().dropped == 5, "dropped entries are counted")
+    check(s.contains(car.lowercased()) && s.contains("keep me"), "valid names still match beside damaged ones")
+    let r = eligibleWiFiCandidates(inRange: [car, home], current: nil, cooldown: [], excluded: s.list())
+    check(r == [home], "a damaged element does not make an excluded network joinable")
+    check(s.add(home) == .added(home), "add works on damaged data")
+    check(s.list() == [car, "Keep Me", home], "add keeps the valid names and discards only the damaged elements")
+    check(s.read().dropped == 0, "nothing left damaged after a save")
+    let notList = freshDefaults()
+    notList.set("not a list", forKey: kPrefsExcludedWiFi)
+    let n = WiFiExclusionStore(defaults: notList)
+    check(n.list().isEmpty && n.read().dropped == 1 && !n.contains(car), "a stored value that is not a list reads as empty and reported")
+    check(n.add(car) == .added(car) && n.list() == [car], "add recovers from a non-list value")
+    let none = WiFiExclusionStore(defaults: freshDefaults()).read()
+    check(none.names.isEmpty && none.dropped == 0, "nothing stored is not damage")
+}
+// size cap
+do {
+    let s = freshStore()
+    var allAdded = true
+    for i in 0..<kMaxExcludedNetworks where s.add("Net-\(i)") != .added("Net-\(i)") { allAdded = false }
+    check(allAdded && s.list().count == kMaxExcludedNetworks, "list fills up to the cap")
+    check(s.add("One-Too-Many") == .listFull, "add beyond the cap is refused")
+    check(s.list().count == kMaxExcludedNetworks && !s.contains("One-Too-Many"), "refused name not stored")
+    check(s.add("NET-0") == .alreadyExcluded("NET-0"), "duplicate at the cap is a duplicate, not a full-list error")
+    check(s.remove("Net-1") && s.add("One-Too-Many") == .added("One-Too-Many"), "removal frees a slot")
+    // a list already over the cap (older or damaged data) is still honoured in full
+    let over = freshDefaults()
+    over.set((0..<(kMaxExcludedNetworks + 5)).map { "Over-\($0)" }, forKey: kPrefsExcludedWiFi)
+    let o = WiFiExclusionStore(defaults: over)
+    check(o.list().count == kMaxExcludedNetworks + 5 && o.contains("over-\(kMaxExcludedNetworks + 4)"), "an oversized stored list is never truncated on read")
+}
+// menu labels: control and bidirectional characters are written out, stored value untouched
+do {
+    check(displaySSID("Café-Guest 🚗") == "Café-Guest 🚗", "ordinary names, accents and emoji unchanged")
+    check(displaySSID("Net\u{202E}evil") == "Net\\u{202E}evil", "right-to-left override escaped")
+    check(displaySSID("a\nb\tc") == "a\\u{A}b\\u{9}c", "newline and tab escaped")
+    check(displaySSID("x\u{2066}y\u{2069}\u{200F}") == "x\\u{2066}y\\u{2069}\\u{200F}", "bidi isolates and marks escaped")
+    check(displaySSID("l\u{2028}p\u{2029}") == "l\\u{2028}p\\u{2029}", "line and paragraph separators escaped")
+    let s = freshStore()
+    let odd = "Net\u{202E}evil"
+    check(s.add(odd) == .added(odd) && s.list() == [odd], "stored value keeps the raw characters")
+    check(s.contains(odd) && s.remove(odd) && s.list().isEmpty, "matching and removal use the stored value")
+}
 // removal
 do {
     let s = freshStore()

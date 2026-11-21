@@ -3,11 +3,28 @@ import Foundation
 // Wi-Fi networks Maxbar must never pick on its own (a car's Wi-Fi, a printer, a
 // captive hotel network). This is Maxbar's own list, kept in UserDefaults. It only
 // filters the networks Maxbar chooses; macOS's own auto-join and the Wi-Fi menu are
-// untouched, and a network the Mac is already on is never left because of it.
+// untouched, and an exclusion by itself never disconnects the Mac from a network.
 // Pure logic: no scanning, no joining, so it can be tested without a radio.
 
 let kPrefsExcludedWiFi = "excludedWiFiNetworks"
 let kMaxSSIDBytes = 32   // an SSID is at most 32 bytes (IEEE 802.11)
+let kMaxExcludedNetworks = 256   // far above any real list; bounds the work done per poll and per join
+
+/// A name shown in a menu: control, line-break and bidirectional-format characters are
+/// written out as \u{XXXX} so a hostile or odd network name cannot reorder or hide the
+/// surrounding menu text. Only for display: matching and removal use the stored name.
+func displaySSID(_ s: String) -> String {
+    var out = ""
+    for scalar in s.unicodeScalars {
+        switch scalar.properties.generalCategory {
+        case .control, .format, .lineSeparator, .paragraphSeparator:
+            out += "\\u{" + String(scalar.value, radix: 16, uppercase: true) + "}"
+        default:
+            out.unicodeScalars.append(scalar)
+        }
+    }
+    return out
+}
 
 /// Trimmed network name, or nil when it cannot be a valid name.
 func normalizedSSID(_ raw: String) -> String? {
@@ -27,21 +44,45 @@ enum ExclusionAdd: Equatable {
     case added(String)
     case alreadyExcluded(String)
     case invalid
+    case listFull       // kMaxExcludedNetworks reached: nothing more is stored
     case isHotspot      // the hotspot is dialed by its own path, which never reads this list: an entry would do nothing and mislead
+}
+
+/// What was read back from preferences. `dropped` counts stored entries that could not
+/// be used (not a string, blank, over 32 bytes) or a stored value that is not a list at
+/// all, so damaged data is reported instead of silently emptying the list.
+struct ExclusionRead: Equatable {
+    let names: [String]
+    let dropped: Int
 }
 
 struct WiFiExclusionStore {
     let defaults: UserDefaults
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
-    /// Saved names in the order they were added.
-    func list() -> [String] {
-        (defaults.array(forKey: kPrefsExcludedWiFi) as? [String] ?? []).compactMap(normalizedSSID)
+    private static func valid(_ element: Any) -> String? {
+        (element as? String).flatMap(normalizedSSID)
     }
 
+    /// Element by element: one damaged entry must not make every other excluded network
+    /// joinable. Valid names are kept in the order they were added.
+    func read() -> ExclusionRead {
+        guard let stored = defaults.object(forKey: kPrefsExcludedWiFi) else {
+            return ExclusionRead(names: [], dropped: 0)
+        }
+        guard let elements = stored as? [Any] else { return ExclusionRead(names: [], dropped: 1) }
+        let names = elements.compactMap(Self.valid)
+        return ExclusionRead(names: names, dropped: elements.count - names.count)
+    }
+
+    /// Saved names in the order they were added.
+    func list() -> [String] { read().names }
+
+    /// One pass, stops at the first match, builds no list: cheap enough to ask per candidate.
     func contains(_ ssid: String) -> Bool {
         let key = foldedSSID(ssid.trimmingCharacters(in: .whitespacesAndNewlines))
-        return list().contains { foldedSSID($0) == key }
+        guard let elements = defaults.array(forKey: kPrefsExcludedWiFi) else { return false }
+        return elements.lazy.compactMap(Self.valid).contains { foldedSSID($0) == key }
     }
 
     /// Works for a network that is not in range or not remembered: nothing is scanned.
@@ -49,16 +90,20 @@ struct WiFiExclusionStore {
     func add(_ raw: String, hotspot: String = "") -> ExclusionAdd {
         guard let ssid = normalizedSSID(raw) else { return .invalid }
         if !hotspot.isEmpty, foldedSSID(hotspot) == foldedSSID(ssid) { return .isHotspot }
-        if contains(ssid) { return .alreadyExcluded(ssid) }
-        defaults.set(list() + [ssid], forKey: kPrefsExcludedWiFi)
+        let current = read().names
+        let key = foldedSSID(ssid)
+        if current.contains(where: { foldedSSID($0) == key }) { return .alreadyExcluded(ssid) }
+        if current.count >= kMaxExcludedNetworks { return .listFull }
+        defaults.set(current + [ssid], forKey: kPrefsExcludedWiFi)
         return .added(ssid)
     }
 
     @discardableResult
     func remove(_ raw: String) -> Bool {
         let key = foldedSSID(raw.trimmingCharacters(in: .whitespacesAndNewlines))
-        let kept = list().filter { foldedSSID($0) != key }
-        guard kept.count != list().count else { return false }
+        let current = read().names
+        let kept = current.filter { foldedSSID($0) != key }
+        guard kept.count != current.count else { return false }
         defaults.set(kept, forKey: kPrefsExcludedWiFi)
         return true
     }

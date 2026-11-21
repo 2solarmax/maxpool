@@ -481,6 +481,7 @@ final class MaxbarController: NSObject, NSMenuDelegate {
     private var hotspotOnlineChecks = 0      // polls on the phone with internet (Wi-Fi look-back pacing)
     private var trialWiFi: (ssid: String, at: Date, fromPhone: Bool)?  // just joined; must show internet
     private var renderedExclusions: [String]?               // list the exclusion submenu was built from
+    private var addingExclusion = false                     // "Add network…" is loading names or showing its dialog
     private var wifiCooldown: [String: Date] = [:]          // Wi-Fi that had no internet → retry after
     private var wifiFailures: [String: Int] = [:]           // repeat failures → longer cooldown
     private var handJoined = false          // "Join hotspot now" chose the phone: stay until the Mac leaves it
@@ -673,13 +674,31 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         hotspot = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         // The hotspot is dialed by its own path and cannot be excluded: drop a stale entry.
+        var droppedExclusion = false
         if !hotspot.isEmpty, WiFiExclusionStore().remove(hotspot) {
+            droppedExclusion = true
             log("Wi-Fi exclusion dropped: it is now the hotspot name")
         }
         offlineChecks = 0
         lastError = nil
         log("Hotspot name set to \"\(hotspot)\"")
         renderMenu()
+        if droppedExclusion {
+            showInfo("Exclusion removed",
+                     "\(displaySSID(hotspot)) is your hotspot now. Maxbar dials the hotspot on its own, " +
+                     "so it can't be on the excluded list; the exclusion was removed.")
+        }
+    }
+
+    /// A plain "FYI" dialog for outcomes that are neither errors nor worth a banner.
+    private func showInfo(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func toggleAutoJoin() {
@@ -907,7 +926,9 @@ final class MaxbarController: NSObject, NSMenuDelegate {
             bench(current, now: Date())
             benchedCurrent = current
         }
-        let excluded = WiFiExclusionStore().list()
+        let stored = WiFiExclusionStore().read()
+        if stored.dropped > 0 { log("Wi-Fi exclusion list: \(stored.dropped) unreadable entr(ies) ignored") }
+        let excluded = stored.names
         let candidates = eligibleWiFiCandidates(
             inRange: survey.inRange, current: survey.current,
             cooldown: Set(wifiCooldown.keys), excluded: excluded)
@@ -1177,7 +1198,7 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         } else {
             sub.addItem(.separator())
             for name in names {
-                let item = NSMenuItem(title: "Remove \(name)", action: #selector(removeExcludedWiFi(_:)), keyEquivalent: "")
+                let item = NSMenuItem(title: "Remove \(displaySSID(name))", action: #selector(removeExcludedWiFi(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = name
                 sub.addItem(item)
@@ -1187,6 +1208,17 @@ final class MaxbarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func addExcludedWiFi() {
+        guard !addingExclusion else { return }
+        addingExclusion = true
+        Task {
+            // networksetup can take up to 8s: never on the main actor, or the menu bar freezes.
+            let remembered = await offMain { preferredWiFiNetworks() }
+            showAddExclusionDialog(remembered: remembered)
+            addingExclusion = false
+        }
+    }
+
+    private func showAddExclusionDialog(remembered: [String]) {
         let alert = NSAlert()
         alert.messageText = "Exclude a Wi-Fi network"
         alert.informativeText = "Maxbar will never join this network on its own (backup or switch-over). " +
@@ -1194,16 +1226,23 @@ final class MaxbarController: NSObject, NSMenuDelegate {
             "Your Mac's own auto-join and the Wi-Fi menu are not changed."
         let box = NSComboBox(frame: NSRect(x: 0, y: 0, width: 280, height: 26))
         box.completes = true
-        box.addItems(withObjectValues: preferredWiFiNetworks())
+        box.addItems(withObjectValues: remembered)
         alert.accessoryView = box
         alert.addButton(withTitle: "Exclude")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = box
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        switch WiFiExclusionStore().add(box.stringValue, hotspot: hotspot) {
-        case .added: lastError = nil; log("Wi-Fi exclusion added (\(WiFiExclusionStore().list().count) total)")
-        case .alreadyExcluded: log("Wi-Fi exclusion already present; nothing to add")   // harmless: no error banner
+        let store = WiFiExclusionStore()
+        let unreadable = store.read().dropped
+        if unreadable > 0 { log("Wi-Fi exclusion list: \(unreadable) unreadable entr(ies) discarded on save") }
+        switch store.add(box.stringValue, hotspot: hotspot) {
+        case .added: lastError = nil; log("Wi-Fi exclusion added (\(store.list().count) total)")
+        case .alreadyExcluded(let name):
+            log("Wi-Fi exclusion already present; nothing to add")
+            lastError = nil
+            showInfo("Already excluded", "\(displaySSID(name)) is already on the excluded list.")
+        case .listFull: lastError = "Excluded list is full (\(kMaxExcludedNetworks) networks) — remove one first"
         case .isHotspot: lastError = "That is your hotspot — it can't be excluded"
         case .invalid: lastError = "Not a valid Wi-Fi name"
         }

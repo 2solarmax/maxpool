@@ -28,7 +28,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Wi-Fi exclusion checks
         run: bash tools/maxbar/test_wifi_exclusions.sh
       - name: Checks fail on a broken matcher (mutation)
