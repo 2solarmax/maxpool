@@ -53,10 +53,10 @@ const poolAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxS
 // by keepAlive reuse + the CLOSED-socket reaping that commit added, not by a low cap.
 const DIRECT_MAX_SOCKETS = Number(process.env.RC_GATE_DIRECT_MAX_SOCKETS || 512);
 const directAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: DIRECT_MAX_SOCKETS, maxFreeSockets: 64 });
-// HALF-OPEN SOCKET REAPER (2026-09-30). Agent.destroy() only kills IDLE sockets, so
-// a socket checked out across a NAT-lease death survives both the outage and the
-// net-evac sweep — no FIN/RST ever arrives, the request never errors, and the slot
-// stays 'in use' forever. Measured after the 15:28Z outage: pool pinned at 512/512,
+// HALF-OPEN SOCKET REAPER (2026-09-30). A socket checked out across a NAT-lease death
+// is invisible to anything that only sweeps IDLE sockets (agent.freeSockets) — no
+// FIN/RST ever arrives, the request never errors, and the slot stays 'in use' forever.
+// (Agent.destroy(), by contrast, DOES kill in-use sockets too: see the net-evac note.) Measured after the 15:28Z outage: pool pinned at 512/512,
 // 2,224 [direct-queued] lines, zero recoveries. TCP keepalive probes detect the dead
 // peer (default probe cadence ~75s, ~8 retries -> dead in <15min; initialDelay 30s)
 // and surface ECONNRESET/ETIMEDOUT to the request, freeing the slot. Applied on the
@@ -71,6 +71,18 @@ function armUpstreamKeepalive(req) {
 // saturate its own 8 sockets and RC never notices.
 const telemetryAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30_000, maxSockets: 8, maxFreeSockets: 2 });
 const TELEMETRY_RE = /^\/api\/(event_logging|eval\/sdk-)/;
+// Idle-socket sweep for the retry path: ONLY the agent the failing request used, and at
+// most once per 5s PER AGENT (a telemetry sweep must not suppress a direct one). A network
+// blip fails hundreds of requests at once; each used to sweep EVERY idle direct socket, so
+// the fleet's healthy keep-alive sockets were destroyed N times over and every follow-up
+// request paid a fresh TLS handshake.
+const _lastIdleSweep = new WeakMap();
+function sweepIdleSockets(agent) {
+  const now = Date.now();
+  if (now - (_lastIdleSweep.get(agent) || 0) < 5_000) return;
+  _lastIdleSweep.set(agent, now);
+  for (const sock of Object.values(agent.freeSockets).flat()) sock.destroy();
+}
 
 // NETWORK-CHANGE SOCKET EVACUATION (2026-09-14). When the machine changes network
 // (laptop moves: 192.168.10.x → 172.16.222.x → 172.16.0.x measured over two days),
@@ -117,7 +129,11 @@ function netEvacTick(sampleSet) {
   const lost = confirmedLost;
   if (!lost.length) return false;
   console.log(`[net-evac] IPv4 source address(es) ${lost.join(', ')} gone for 2 consecutive samples — destroying pooled sockets`);
-  poolAgent.destroy();
+  // Agent.destroy() kills IN-USE sockets as well as idle ones, i.e. it RESETS in-flight
+  // responses. The gate->maxpool leg to a LOOPBACK pool cannot be stranded by a network
+  // change (127.0.0.1 never changes source address), so leave it alone — destroying it
+  // only reset healthy in-flight /v1/messages streams (2026-11-21 freeze storms).
+  if (!LOOPBACK_HOSTS.has(MAXPOOL_HOST)) poolAgent.destroy();
   telemetryAgent.destroy();
   directAgent.destroy();
   _pendingLost = new Set();
@@ -354,6 +370,10 @@ const mitmServer = http.createServer((creq, cres) => {
     // session CRUD, settings — all <64KB typical); buffer fully and send with explicit length.
     // headers-phase timeout for SHORT-RPC direct paths (see the arm site below).
     const DIRECT_STALL_MS = Number(process.env.RC_GATE_DIRECT_STALL_MS || 30_000);
+    const HEARTBEAT_STALL_MS = Number(process.env.RC_GATE_HEARTBEAT_STALL_MS || 6_000);
+    // The CLI abandons a heartbeat after 13s; retries must finish inside this.
+    const HEARTBEAT_DEADLINE_MS = 12_500;
+    const reqStart = Date.now();
     // PRE-RESPONSE RETRY (2026-10-03). The CLI's Remote Control anti-flap budget
     // ("kept dropping after each reconnect": 3 drops in 1h -> session disconnects,
     // measured in the 2.1.288 binary: ro=3/no=3600000) charges a DROP whenever a
@@ -382,8 +402,16 @@ const mitmServer = http.createServer((creq, cres) => {
     // upstream request AND the pending retry timer. (TCP keepalive cannot reap these:
     // the upstream peer ACKs probes because the long-poll is genuinely open.)
     let curDir = null, retryTimer = null;
+    // HEARTBEAT HEDGE state (2026-11-21): every upstream attempt still running for this
+    // client request, the attempt that delivered headers first, and the overall deadline.
+    const liveDirs = new Set();
+    let hbWinner = null, hbHedged = false, hbDeadlineTimer = null;
+    const clearHbDeadline = () => { if (hbDeadlineTimer) { clearTimeout(hbDeadlineTimer); hbDeadlineTimer = null; } };
+    const dropAttempt = d => { liveDirs.delete(d); d.superseded = true; try { d.destroy(); } catch {} };
     cres.on('close', () => {
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      clearHbDeadline();
+      for (const d of [...liveDirs]) dropAttempt(d);
       if (curDir) { try { curDir.destroy(); } catch {} }
     });
     // Body is buffered ONCE, outside dirSend: a retry re-runs the upstream request,
@@ -393,7 +421,7 @@ const mitmServer = http.createServer((creq, cres) => {
     let bodyDone = false;
     creq.on('data', c => bodyBufs.push(c));
     creq.on('end', () => { bodyDone = true; });
-    const dirSend = () => {
+    const dirSend = (hedge = false) => {
       const wait = bodyDone ? Promise.resolve(Buffer.concat(bodyBufs))
         : new Promise(res => creq.on('end', () => res(Buffer.concat(bodyBufs))));
       wait.then(body => {
@@ -417,14 +445,34 @@ const mitmServer = http.createServer((creq, cres) => {
         // within 30s by design). /worker bare POST: register/status — the soak showed
         // one session's repeats (4x) with the CLI retrying; treating it as RPC is
         // fine (the CLI re-registers), but see gate.log 16:06-16:13 before touching.
-        const isLongPoll = /\/worker\/events|\/heartbeat|\/events\/stream|\/client\/presence/.test(creq.url);
+        // HEARTBEAT IS NOT A LONG-POLL (2026-11-21). POST /worker/heartbeat answers in
+        // milliseconds, and the CLI gives it 13s; 3 failures => close 4093, and the 4th in an
+        // hour switches Remote Control off for that session for good. Classed long-poll it had
+        // no stall timer, so on a black-holed socket it hung silently until the CLI's budget
+        // expired. It now has its own short stall budget; on a stall a SECOND attempt is
+        // HEDGED on a fresh connection while the first keeps running (first headers win).
+        const isHeartbeat = /\/worker\/heartbeat/.test(creq.url);
+        const isLongPoll = !isHeartbeat && /\/worker\/events|\/heartbeat|\/events\/stream|\/client\/presence/.test(creq.url);
+        const stallMs = isHeartbeat ? HEARTBEAT_STALL_MS : DIRECT_STALL_MS;
+        const reqAgent = TELEMETRY_RE.test(creq.url) ? telemetryAgent : directAgent;
+        // The hedge attempt gets a one-shot non-keepalive agent: guaranteed brand-new TCP+TLS
+        // connection (never a socket from the suspect idle pool), so there is nothing to sweep.
+        const attemptAgent = hedge ? new https.Agent({ keepAlive: false }) : reqAgent;
         let tStall = null;
         const dir = https.request({
           host: DIRECT_HOST, port: DIRECT_PORT,
           servername: 'api.anthropic.com',   // SNI/cert name stays first-party even for a test-routed upstream
           method: creq.method, path: creq.url,
-          headers: hdrs, agent: TELEMETRY_RE.test(creq.url) ? telemetryAgent : directAgent,
+          headers: hdrs, agent: attemptAgent,
         }, ures => {
+      if (isHeartbeat) {
+        // FIRST HEADERS WIN. A loser that answers late is dropped unread; nothing is ever
+        // written to the client twice.
+        if (hbWinner && hbWinner !== dir) { try { ures.destroy(); } catch {} return; }
+        hbWinner = dir;
+        clearHbDeadline();
+        for (const d of [...liveDirs]) if (d !== dir) dropAttempt(d);
+      }
       if (/\/v1\/code\/sessions$/.test(creq.url)) {
         const chunks = [];
         ures.on('data', c => chunks.push(c));
@@ -469,8 +517,28 @@ const mitmServer = http.createServer((creq, cres) => {
       ures.pipe(cres);
     });
         curDir = dir;
+        liveDirs.add(dir);
+        dir.on('close', () => { liveDirs.delete(dir); });
+        if (isHeartbeat && !hbDeadlineTimer && !hbWinner) {
+          // OVERALL DEADLINE for every heartbeat retry kind (hedge, error retries): the CLI
+          // gives up at 13s, so after 12.5s from request start answer with the usual 502.
+          hbDeadlineTimer = setTimeout(() => {
+            hbDeadlineTimer = null;
+            if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+            for (const d of [...liveDirs]) dropAttempt(d);
+            if (hbWinner || cres.headersSent || cres.destroyed) return;
+            console.log('[direct-error]', creq.url, `heartbeat deadline ${HEARTBEAT_DEADLINE_MS}ms exceeded`);
+            try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
+            cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: `rc-gate: heartbeat deadline ${HEARTBEAT_DEADLINE_MS}ms exceeded` } }));
+          }, Math.max(0, HEARTBEAT_DEADLINE_MS - (Date.now() - reqStart)));
+        }
         dir.on('error', err => {
           if (tStall) { clearTimeout(tStall); tStall = null; }
+          liveDirs.delete(dir);
+          // A hedge loser we destroyed ourselves, or a late failure of an attempt that lost
+          // the race: silent. And while a sibling attempt is still running, it may yet answer.
+          if (dir.superseded || (hbWinner && hbWinner !== dir)) return;
+          if (isHeartbeat && liveDirs.size > 0) return;
           // mid-stream: never duplicate bytes — and never leave the client on a stream that
           // will not end (see the ures handlers above): end it with an error instead.
           if (cres.headersSent) { if (!cres.writableFinished) cres.destroy(err); return; }
@@ -489,15 +557,21 @@ const mitmServer = http.createServer((creq, cres) => {
             || ['ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'EADDRNOTAVAIL', 'ENOTFOUND', 'EAI_AGAIN'].includes(err?.code);
           const idempotent = /\/worker\/heartbeat|\/worker\/events|\/client\/presence|\/api\/event_logging/.test(creq.url);
           const ownStall = msg.startsWith('rc-gate: no response headers');
-          const replaySafe = !ownStall && (connectPhase || idempotent);
+          // A heartbeat's own stall never errors (it is HEDGED, not destroyed); its retries on
+          // real errors must still finish inside the overall deadline.
+          const pastDeadline = isHeartbeat && Date.now() - reqStart >= HEARTBEAT_DEADLINE_MS;
+          const replaySafe = !ownStall && !pastDeadline && (connectPhase || idempotent);
           if (replaySafe && retryN < DIRECT_RETRY_MAX) {
             retryN++;
-            const wait = DIRECT_RETRY_BACKOFF_MS * Math.min(retryN, 8);
+            // jitter: a network blip fails every session at once; un-jittered, they all retry in lockstep
+            const wait = Math.round(DIRECT_RETRY_BACKOFF_MS * Math.min(retryN, 8) * (0.5 + Math.random()));
             console.log('[direct-retry]', creq.url, `attempt ${retryN}/${DIRECT_RETRY_MAX} after`, String(err?.message || err), `— waiting ${wait}ms`);
-            for (const sock of Object.values(directAgent.freeSockets).flat()) sock.destroy();  // never reuse a socket from the dead network
+            // never reuse a socket from the dead network: this request's agent only (see sweepIdleSockets)
+            if (connectPhase || dir.reusedSocket) sweepIdleSockets(reqAgent);
             retryTimer = setTimeout(() => { retryTimer = null; if (!cres.destroyed && !cres.headersSent) dirSend(); }, wait);
             return;
           }
+          clearHbDeadline();
           console.log('[direct-error]', creq.url, String(err?.message || err));
           try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
           cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message: String(err?.message || err) } }));
@@ -517,7 +591,18 @@ const mitmServer = http.createServer((creq, cres) => {
           dir.on('socket', () => {
             if (tStall) return;                     // already armed (retry/reuse)
             tStall = setTimeout(() => {
-            console.log('[direct-stall]', creq.url, 'no response headers in', DIRECT_STALL_MS + 'ms — destroying');
+            if (isHeartbeat) {
+              // HEDGE, never destroy: attempt 1 may still answer (a slow but live upstream). At
+              // most one extra attempt, only while the client is waiting and the deadline allows.
+              tStall = null;
+              const canHedge = !hbHedged && !hbWinner && !cres.destroyed && !cres.headersSent
+                && Date.now() - reqStart < HEARTBEAT_DEADLINE_MS;
+              console.log('[direct-stall]', creq.url, 'no response headers in', stallMs + 'ms —',
+                canHedge ? 'hedging a second attempt, first left running' : 'no further hedge, leaving attempt running');
+              if (canHedge) { hbHedged = true; dirSend(true); }
+              return;
+            }
+            console.log('[direct-stall]', creq.url, 'no response headers in', stallMs + 'ms — destroying');
             // SESSION-CREATE specifically: when the upstream stalls a create, the CLI's
             // ONLY recovery is its ~3 retries on a FRESH connection. Destroying just this
             // request leaves the pooled socket half-open server-side, and measured
@@ -528,8 +613,8 @@ const mitmServer = http.createServer((creq, cres) => {
             if (creq.url === '/v1/code/sessions' && creq.method === 'POST') {
               for (const sock of Object.values(directAgent.freeSockets).flat()) sock.destroy();
             }
-            dir.destroy(new Error('rc-gate: no response headers within ' + DIRECT_STALL_MS + 'ms'));
-            }, DIRECT_STALL_MS);
+            dir.destroy(new Error('rc-gate: no response headers within ' + stallMs + 'ms'));
+            }, stallMs);
           });
           // CAPACITY VISIBILITY: if the agent cannot hand out a socket promptly, say so —
           // otherwise saturation is indistinguishable from a silent upstream in the log.

@@ -21,6 +21,12 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>5</integer>
+  <!-- launchd.plist(5): a job with NO ProcessType gets "light resource limits ...
+       throttling its CPU usage and I/O bandwidth". This process carries every Claude Code
+       session's traffic, so the 2026-11-21 freeze storms starved its event loop until
+       Remote Control heartbeats missed the CLI's 13s budget. Interactive = not throttled. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>/Users/maxkrasnykh/maxpool/tools/rc-gate/gate.log</string>
   <key>StandardErrorPath</key>

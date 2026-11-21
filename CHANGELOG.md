@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- rc-gate: Remote Control heartbeats get a short stall budget (6s, RC_GATE_HEARTBEAT_STALL_MS) and are retried on a fresh connection, so a dead socket no longer burns the CLI's 13s budget
+- rc-gate: the retry path sweeps only the failing request's agent, only on connect errors, at most once per 5s, and jitters its backoff
+- rc-gate: a network-change evacuation no longer resets in-flight requests to a loopback maxpool
+- rc-gate: LaunchAgent runs as ProcessType Interactive so launchd stops throttling its CPU and I/O
+- rc-gate: the forced net-evac test seam now confirms the loss (two ticks) and its flag path is configurable
+
 ## [1.24.122] - 2026-11-21
 
 ### Added
