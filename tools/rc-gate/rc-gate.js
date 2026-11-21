@@ -26,6 +26,7 @@ import os from 'node:os';
 import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
+import zlib from 'node:zlib';
 import { readFileSync, existsSync, rmSync, watchFile } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -512,8 +513,11 @@ const mitmServer = http.createServer((creq, cres) => {
         // written to the client twice.
         if (hbWinner && hbWinner !== dir) { try { ures.destroy(); } catch {} return; }
         const sibling = liveDirs.size > 1 || retryTimer !== null;   // liveDirs still holds `dir`
-        if (!(ures.statusCode >= 200 && ures.statusCode < 300) && sibling) {
-          // A non-2xx while another attempt may still succeed is NOT a winner: hold the first
+        // Only a possibly-TRANSIENT failure (5xx, 429) is worth holding while a sibling may still
+        // succeed. Any other non-2xx (401/403/404/409/other 4xx) is a final answer: deliver it now.
+        const transient = ures.statusCode >= 500 || ures.statusCode === 429;
+        if (!(ures.statusCode >= 200 && ures.statusCode < 300) && transient && sibling) {
+          // A transient non-2xx while another attempt may still succeed is NOT a winner: hold the first
           // one as the fallback (delivered if every sibling fails or the deadline hits).
           if (tStall) { clearTimeout(tStall); tStall = null; }
           liveDirs.delete(dir);
@@ -546,10 +550,10 @@ const mitmServer = http.createServer((creq, cres) => {
         ures.on('data', c => chunks.push(c));
         ures.on('end', () => {
           const raw = Buffer.concat(chunks);
+          let body = raw;                  // declared outside the try: the catch below reads it
           try {
-            const zlib = require('node:zlib');
             const enc = String(ures.headers['content-encoding'] || '');
-            const body = enc.includes('gzip') ? zlib.gunzipSync(raw)
+            body = enc.includes('gzip') ? zlib.gunzipSync(raw)
               : enc.includes('br') ? zlib.brotliDecompressSync(raw)
               : enc.includes('deflate') ? zlib.inflateSync(raw) : raw;
             const j = JSON.parse(body.toString('utf8'));
@@ -666,22 +670,33 @@ const mitmServer = http.createServer((creq, cres) => {
           dir.on('socket', sock => { try { sock.setKeepAlive(true, 30_000); } catch {} });  // half-open reaper (see armUpstreamKeepalive)
           dir.on('socket', () => {
             if (tStall) return;                     // already armed (retry/reuse)
+            const armedAt = Date.now();
             tStall = setTimeout(() => {
             if (isHeartbeat) {
               // HEDGE, never destroy: attempt 1 may still answer (a slow but live upstream). At
               // most one extra attempt, only while the client is waiting and the deadline allows.
               tStall = null;
-              const canHedge = !hbHedged && !hbWinner && !cres.destroyed && !cres.headersSent
-                && Date.now() - reqStart < HEARTBEAT_DEADLINE_MS;
-              console.log('[direct-stall]', creq.url, 'no response headers in', stallMs + 'ms —',
-                canHedge ? 'hedging a second attempt, first left running' : 'no further hedge, leaving attempt running');
-              if (canHedge) {
-                hbHedged = true;
-                // the pool this stalled request came from is suspect: drop its OTHER idle sockets too
-                // (already debounced per agent; the hedge itself uses a fresh one-shot agent)
-                sweepIdleSockets(reqAgent);
-                dirSend(true);
-              }
+              const lagMs = Date.now() - armedAt - stallMs;
+              // LOOP-LAG RACE (2026-11-21, probe-confirmed): when the gate's own loop is starved the
+              // timers phase runs this callback BEFORE the poll phase reads a response that is
+              // already buffered, so the stall looks real. Decide one turn later, after pending
+              // I/O (and so the response callback) has run.
+              setImmediate(() => {
+                if (hbWinner || cres.headersSent || cres.destroyed) return;
+                const canHedge = !hbHedged && Date.now() - reqStart < HEARTBEAT_DEADLINE_MS;
+                const late = lagMs > 1_000;
+                console.log('[direct-stall]', creq.url, 'no response headers in', stallMs + 'ms —',
+                  canHedge ? 'hedging a second attempt, first left running' : 'no further hedge, leaving attempt running');
+                if (late) console.log('[direct-stall] late timer (loop lag ~' + lagMs + 'ms) — not sweeping');
+                if (canHedge) {
+                  hbHedged = true;
+                  // the pool this stalled request came from is suspect: drop its OTHER idle sockets too
+                  // (already debounced per agent; the hedge itself uses a fresh one-shot agent). Not on a
+                  // late timer: that is our own lag, not evidence the pool is bad.
+                  if (!late) sweepIdleSockets(reqAgent);
+                  dirSend(true);
+                }
+              });
               return;
             }
             console.log('[direct-stall]', creq.url, 'no response headers in', stallMs + 'ms — destroying');

@@ -24,6 +24,23 @@ pathlib.Path(dest).write_text(xml)
 print(f'installed {dest} (node: {node})')
 PY
 
+# PRE-CHECK before touching launchd: the plist just written must carry ProcessType=Interactive and
+# ExitTimeOut>=25 (a stale or hand-edited source would otherwise be loaded, and every reload costs
+# each Remote Control session one of its 4 hourly reconnects). python3's plistlib is used because it
+# exists on both macOS and Linux CI (plutil does not).
+if ! python3 - "$DEST" <<'PY'
+import plistlib, sys
+d = plistlib.load(open(sys.argv[1], 'rb'))
+pt, et = d.get('ProcessType'), d.get('ExitTimeOut')
+if pt != 'Interactive' or not isinstance(et, int) or et < 25:
+    print(f"ProcessType={pt!r} ExitTimeOut={et!r}", file=sys.stderr)
+    sys.exit(1)
+PY
+then
+  echo "ERROR: the plist written to $DEST does not have ProcessType=Interactive and ExitTimeOut>=25. Nothing was reloaded; the running relay is untouched. Fix tools/rc-gate/launchd/com.mokka.rc-gate.plist and re-run." >&2
+  exit 3
+fi
+
 launchctl unload "$DEST" 2>/dev/null || true
 launchctl load "$DEST"
 sleep 3
@@ -46,7 +63,7 @@ if PRINT="$(launchctl print "$JOB" 2>&1)"; then
   SPAWN="$(printf '%s\n' "$PRINT" | rc_gate_spawn_type)"
   echo "launchd spawn type: ${SPAWN:-<not printed>}"
   if [ "$SPAWN" != "interactive" ]; then
-    echo "WARN: rc-gate is not running as an Interactive job (spawn type = ${SPAWN:-unknown}) — ProcessType did not apply" >&2
+    echo "FAILED: the relay is running and serving the new code, but macOS did not apply the new CPU priority (spawn type = ${SPAWN:-unknown}). Do NOT re-run or kickstart within the next hour — each reload costs every Remote Control session one of its 4 hourly reconnects. Tell the agent." >&2
     exit 2
   fi
 else
