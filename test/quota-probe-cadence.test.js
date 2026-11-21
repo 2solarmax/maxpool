@@ -181,7 +181,7 @@ test('a held reset or stale grant listing still gets the normal decision cadence
   assert.equal(calls.length, 4);
 });
 
-test('a confirmed empty grant listing cuts both usage reads to one per half-hour, then discovers an unseen refill', async t => {
+test('a confirmed empty grant listing is read once a day, then an unseen refill is discovered', async t => {
   let full = true;
   const reset = Date.now() + 4 * 86400_000, listings = [];
   const { am, calls, prober, advance } = harness(t, {
@@ -189,13 +189,13 @@ test('a confirmed empty grant listing cuts both usage reads to one per half-hour
     grants: async name => { listings.push(name); return { grants: [], eligible: true }; },
   });
   await prober.probeAll();
-  assert.equal(am.accounts[0].quota.probeNextCheckAt, Date.now() + 30 * minute);
+  assert.equal(am.accounts[0].quota.probeNextCheckAt, Date.now() + 24 * 60 * minute);
   full = false;
-  for (let i = 0; i < 29; i++) { advance(minute); await prober.probeAll(); }
+  for (let i = 0; i < 23; i++) { advance(60 * minute); await prober.probeAll(); }
   const count = rows => rows.filter(name => name === 'full').length;
   assert.equal(count(calls), 1);
   assert.equal(count(listings), 1);
-  advance(minute); await prober.probeAll();
+  advance(60 * minute); await prober.probeAll();
   assert.equal(count(calls), 2);
   assert.equal(count(listings), 2);
   assert.equal(am.accounts[0].quota.unified7d, 0.3);
@@ -262,7 +262,7 @@ test('a fresh grant cooldown wakes an empty-listing account at its recorded dead
   assert.equal(calls.length, 2);
   advance(minute); await prober.probeAll();
   assert.equal(calls.length, 4);
-  assert.equal(am.accounts[0].quota.probeNextCheckAt, Date.now() + 30 * minute);
+  assert.equal(am.accounts[0].quota.probeNextCheckAt, Date.now() + 24 * 60 * minute);
 });
 
 test('Claude quota check selection and exhausted cadence leave a fresh Codex account alone', () => {
