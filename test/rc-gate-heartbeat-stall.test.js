@@ -256,7 +256,7 @@ function front(upPort, failConn) {
 
 // ── (a6) hedge fails fast at connect while attempt 1 is hung -> replaced, client still gets 2xx ──
 // Kills: the swallowed error (`if (isHeartbeat && liveDirs.size > 0) return` with no replacement):
-// the request would wait for the 12.5s 502. Also kills a replacement that is not a fresh agent.
+// the request would wait for the 12.5s 502.
 gateTest('rc-gate: a hedge that fails at connect is replaced while attempt 1 stays hung; client gets 2xx < 13s', { timeout: 30_000 }, async () => {
   const hb = [];
   const up = http.createServer((req, res) => {
@@ -320,6 +320,79 @@ gateTest('rc-gate: with attempt 1 hung forever, the hedge\'s held 503 is deliver
     assert.doesNotMatch(r.raw, /rc_gate_direct_error/, 'not the gate\'s own 502');
     assert.ok(r.ms >= 11_500 && r.ms < 13_000, `delivered at the 12.5s deadline, got ${r.ms}ms`);
   }, { RC_GATE_HEARTBEAT_STALL_MS: '1000' });
+});
+
+// ── (a11) attempt 1 dies while the hedge is still running -> replaced, client gets 2xx ──
+// Attempt 1 is reset at ~3s while the hedge (started at 2s) hangs. Kills: swallowing attempt 1's
+// failure when a sibling is live (`sibling && !dir.isHedge` -> return): the hung hedge would leave
+// the client waiting for the 12.5s 502.
+gateTest('rc-gate: when attempt 1 dies while the hedge is still hung, a replacement is started and the client gets 2xx', { timeout: 30_000 }, async () => {
+  let n = 0;
+  await withUpstream((req, res) => {
+    req.resume();
+    n++;
+    if (n === 1) { const s1 = req.socket; setTimeout(() => s1.destroy(), 3_000); return; }   // attempt 1: reset at 3s
+    if (n === 2) return;                                                                      // the hedge hangs
+    json200(res);                                                                             // the replacement answers
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 13_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms. Gate log:\n${gate.getLog().slice(-500)}`);
+    assert.match(status(r.raw), /^2/, `2xx expected (not the 12.5s 502), got: ${r.raw.slice(0, 90)}`);
+    assert.ok(r.ms < 8_000, `answered by the replacement, not the deadline: ${r.ms}ms`);
+    assert.equal(n, 3, 'attempt 1, the hedge and exactly one replacement');
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '2000' });
+});
+
+// ── (a12) a held non-2xx whose body never finishes is destroyed, and the client still gets an answer ──
+// The hedge sends 503 headers and never ends the body; attempt 1 hangs. At the deadline the gate
+// has no complete held answer, so it destroys the held connection and sends its own 502 (chosen over
+// waiting past the deadline). Kills: forgetting the held attempt after it leaves liveDirs (its
+// upstream connection would stay open forever).
+gateTest('rc-gate: a held 503 whose body never ends is destroyed at the deadline and the client gets an answer', { timeout: 30_000 }, async () => {
+  const hb = [];
+  await withUpstream((req, res) => {
+    req.resume();
+    hb.push(track(req.socket));
+    if (hb.length === 1) return;                                   // attempt 1 hangs
+    res.writeHead(503, { 'content-type': 'application/json', 'content-length': '100' });
+    res.write('{"error":');                                        // ...and never finishes
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 14_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms`);
+    assert.equal(status(r.raw), '502', `the gate's own 502 (held body incomplete), got: ${r.raw.slice(0, 90)}`);
+    assert.ok(r.ms >= 11_500 && r.ms < 13_000, `answered at the deadline, got ${r.ms}ms`);
+    await sleep(500);
+    assert.equal(hb.length, 2);
+    assert.equal(hb[1].closed, true, 'the held attempt\'s upstream connection was destroyed');
+    assert.equal(hb[0].closed, true, 'attempt 1 too');
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '1000' });
+});
+
+// ── (a13) a held body that completes late is delivered as soon as it is needed ──
+// The hedge's 503 headers arrive at ~1s, its body at ~3.5s; attempt 1 is reset at 3s with retries
+// disabled, so the gate needs the held answer while its body is still arriving. It must wait for the
+// body and deliver the upstream 503 (~3.5s), not send a 502 at 3s. Kills: `deliverHeld` returning
+// false for an incomplete body.
+gateTest('rc-gate: a held 503 whose body is still arriving when needed is delivered once complete, not replaced by a 502', { timeout: 30_000 }, async () => {
+  let n = 0;
+  await withUpstream((req, res) => {
+    req.resume();
+    n++;
+    if (n === 1) { const s1 = req.socket; setTimeout(() => s1.destroy(), 3_000); return; }
+    res.writeHead(503, { 'content-type': 'application/json', 'content-length': '22' });
+    res.write('{"error":');
+    setTimeout(() => res.end('"overloaded"}'), 2_500);
+  }, async gate => {
+    const { tls: t } = await mitmConnect(gate.port);
+    const r = await request(t, 'POST', HB, 13_000);
+    assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms`);
+    assert.equal(status(r.raw), '503', `the upstream 503, got: ${r.raw.slice(0, 90)}`);
+    assert.doesNotMatch(r.raw, /rc_gate_direct_error/);
+    assert.match(r.raw, /overloaded/);
+    assert.ok(r.ms >= 3_200 && r.ms < 8_000, `delivered when the body completed (~3.5s), got ${r.ms}ms`);
+  }, { RC_GATE_HEARTBEAT_STALL_MS: '1000', RC_GATE_DIRECT_RETRY_MAX: '0' });
 });
 
 // Park two idle keep-alive sockets in the DIRECT agent (two concurrent bridge calls); returns them.
