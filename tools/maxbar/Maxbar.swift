@@ -530,7 +530,7 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         menu.items = [
             stateItem, .separator(),
             toggleSleepItem, .separator(),
-            setHotspotItem, autoJoinItem, joinNowItem, wifiStatusItem, errorItem,
+            setHotspotItem, autoJoinItem, joinNowItem, excludedWiFiItem, wifiStatusItem, errorItem,
             .separator(),
             screenLockItem,
             .separator(),
@@ -586,6 +586,9 @@ final class MaxbarController: NSObject, NSMenuDelegate {
 
     private lazy var joinNowItem = NSMenuItem(
         title: "Join hotspot now", action: #selector(joinNow), keyEquivalent: "")
+
+    private lazy var excludedWiFiItem = NSMenuItem(
+        title: "Excluded Wi-Fi networks", action: nil, keyEquivalent: "")
 
     private lazy var wifiStatusItem: NSMenuItem = {
         let i = NSMenuItem(title: "Internet: …", action: nil, keyEquivalent: "")
@@ -895,9 +898,18 @@ final class MaxbarController: NSObject, NSMenuDelegate {
             bench(current, now: Date())
             benchedCurrent = current
         }
-        let skip = Set(wifiCooldown.keys).union(survey.current.map { [$0] } ?? [])
-        for ssid in survey.inRange where !skip.contains(ssid) {
+        let excluded = WiFiExclusionStore().list()
+        let candidates = eligibleWiFiCandidates(
+            inRange: survey.inRange, current: survey.current,
+            cooldown: Set(wifiCooldown.keys), excluded: excluded)
+        let heldBack = survey.inRange.filter { r in excluded.contains { $0.caseInsensitiveCompare(r) == .orderedSame } }
+        if !heldBack.isEmpty {
+            log("Not joining \(heldBack.count) excluded Wi-Fi network(s) in range (\(reason))")
+        }
+        for ssid in candidates {
             if manualJoining { return false }          // "Join now" started meanwhile
+            // The list can change during the ~25s search: look again right before joining.
+            if WiFiExclusionStore().contains(ssid) { continue }
             if let err = await offMain({ joinWiFi(ssid) }) {
                 log("Known Wi-Fi \(ssid) in range (\(reason)) but join failed: \(err.prefix(120))")
                 bench(ssid, now: Date(), why: "didn't join")
@@ -1135,6 +1147,59 @@ final class MaxbarController: NSObject, NSMenuDelegate {
         default:       codexRoutingItem.title = codexRoutingReadID != nil ? "Checking Codex routing…" : "Codex routing unavailable"
         }
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        renderExcludedWiFiMenu()
+    }
+
+    private func renderExcludedWiFiMenu() {
+        let sub = NSMenu()
+        let add = NSMenuItem(title: "Add network…", action: #selector(addExcludedWiFi), keyEquivalent: "")
+        add.target = self
+        sub.addItem(add)
+        let names = WiFiExclusionStore().list()
+        if names.isEmpty {
+            let none = NSMenuItem(title: "None — Maxbar may pick any remembered network", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            sub.addItem(none)
+        } else {
+            sub.addItem(.separator())
+            for name in names {
+                let item = NSMenuItem(title: "Remove \(name)", action: #selector(removeExcludedWiFi(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = name
+                sub.addItem(item)
+            }
+        }
+        excludedWiFiItem.submenu = sub
+    }
+
+    @objc private func addExcludedWiFi() {
+        let alert = NSAlert()
+        alert.messageText = "Exclude a Wi-Fi network"
+        alert.informativeText = "Maxbar will never join this network on its own (backup or switch-over). " +
+            "Type the exact name, or pick one macOS remembers. It does not need to be in range. " +
+            "Your Mac's own auto-join and the Wi-Fi menu are not changed."
+        let box = NSComboBox(frame: NSRect(x: 0, y: 0, width: 280, height: 26))
+        box.completes = true
+        box.addItems(withObjectValues: preferredWiFiNetworks())
+        alert.accessoryView = box
+        alert.addButton(withTitle: "Exclude")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = box
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        switch WiFiExclusionStore().add(box.stringValue, hotspot: hotspot) {
+        case .added: lastError = nil; log("Wi-Fi exclusion added (\(WiFiExclusionStore().list().count) total)")
+        case .alreadyExcluded: lastError = "That network is already excluded"
+        case .isHotspot: lastError = "That is your hotspot — it can't be excluded"
+        case .invalid: lastError = "Not a valid Wi-Fi name"
+        }
+        renderMenu()
+    }
+
+    @objc private func removeExcludedWiFi(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        if WiFiExclusionStore().remove(name) { log("Wi-Fi exclusion removed (\(WiFiExclusionStore().list().count) left)") }
+        renderMenu()
     }
 
     // MARK: - NSMenuDelegate — show fresh sleep state every time the menu opens

@@ -24,6 +24,10 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-21 · Maxbar excluded Wi-Fi networks
+
+Maxbar chose backup Wi-Fi from every remembered network in range, skipping only a temporary cooldown, so a car network that joins without internet could be retried. It now has a saved exclusion list (menu, manual add for a network not in range) that filters every automatic or backup pick, re-checked just before joining. It does not touch macOS's own auto-join and never leaves a network already joined. Qualification of the selection logic and the signed build is pending a rented runner.
+
 ### 2026-11-20 · Reduce repeated analytics work
 
 The routing status reader asks for hourly data only when building its seven-day daily series. The complete hourly timeline remains available to other snapshot readers. Native Codex resolves the turn metadata once per request. A completion reuses the same wait bin and token counts for the worker and account, and a releasing worker retains one baseline for all three accounting stores.

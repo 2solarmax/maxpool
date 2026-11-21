@@ -19,7 +19,7 @@ rm -rf "$APP"
 mkdir -p "$MACOS" "$RESOURCES"
 
 swiftc -O -parse-as-library -swift-version 6 -target arm64-apple-macos13.0 \
-  -o "$MACOS/Maxbar" Maxbar.swift \
+  -o "$MACOS/Maxbar" Maxbar.swift WiFiExclusions.swift \
   -framework SwiftUI -framework AppKit
 
 cp Info.plist "$CONTENTS/Info.plist"
