@@ -24,6 +24,10 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-21 · Release is verified by CI, not by a local test run
+
+`scripts/release.sh` no longer runs the test suite or lint on the releasing machine. It first fetches the remote and refuses unless local HEAD equals or fast-forwards remote main, which prevents the stale-copy release that published v1.24.120 without PR 14. It then requires the GitHub CI workflow (`ci.yml`, jobs `test` and `ci-gate`) to have concluded success for the exact HEAD commit, waiting up to `RELEASE_CI_CEILING` seconds (default 1800) and refusing when the run failed or never appeared. Lint stays in CI only. The checks live in `scripts/release-guards.sh`; `scripts/tests/release-guards.test.sh` covers them with stubbed `gh` and throwaway git repos. Every other release stage is unchanged.
+
 ### 2026-11-20 · Reduce repeated analytics work
 
 The routing status reader asks for hourly data only when building its seven-day daily series. The complete hourly timeline remains available to other snapshot readers. Native Codex resolves the turn metadata once per request. A completion reuses the same wait bin and token counts for the worker and account, and a releasing worker retains one baseline for all three accounting stores.

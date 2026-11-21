@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # release.sh — ship a new maxpool version across the board in one step:
-#   tests → lint → version bump (commit + tag) → push to GitHub → Actions publishes to npm.
+#   remote-sync check → CI-verified check → version bump (commit + tag) → push to GitHub → Actions publishes to npm.
 #
 # Usage:
 #   scripts/release.sh                # patch release (default)
@@ -17,8 +17,13 @@
 # One-time npm-side setup lives in .github/workflows/publish.yml. There is NO
 # local npm auth or NPM_TOKEN anymore — the old bypass-2FA token path is dead.
 #
+# Tests are NOT run on this machine: the GitHub CI workflow (ci.yml: jobs `test`
+# and `ci-gate`) must have passed for the exact HEAD commit (guards live in
+# scripts/release-guards.sh). Lint runs in CI only.
+#
 # Override the git remote/branch with RELEASE_REMOTE / current branch.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/release-guards.sh"
 
 
 # ── Stage watchdog (2026-10-27, owner-approved) ────────────────────────────────
@@ -54,18 +59,22 @@ if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Stale-copy guard first, before any other work (fetches, then refuses unless HEAD
+# equals or fast-forwards remote main).
+release_require_synced_with_remote "$REMOTE" "${RELEASE_BASE_BRANCH:-main}"
+
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "✗ Working tree is dirty. Commit your changes first, then release." >&2
   git status --short >&2
   exit 1
 fi
 
-# Ceiling raised 2026-11-06: the suite outgrew 900s (1462 tests, ~20-25 min on this
-# Mac) and the v1.24.68 release aborted at rc=124 with 770 green, 0 failed. Override
-# with RELEASE_TEST_CEILING.
-run_stage "Running tests" "${RELEASE_TEST_CEILING:-2400}" bash scripts/run-tests.sh
-
-run_stage "Linting" 120 npx eslint src/ || true   # warnings do not block a release
+# 2026-11-21: local test + lint stages removed. Release proceeds only from a copy that
+# equals (or fast-forwards) remote main — a stale copy once published v1.24.120
+# without PR 14 — and only when CI passed for this exact commit. RELEASE_CI_CEILING
+# (default 1800s) bounds the wait for a still-running CI.
+GH_REPO="${MAXPOOL_GH_REPO:-2solarmax/maxpool}"
+release_require_ci_green "$GH_REPO" "$(git rev-parse HEAD)"
 
 echo "==> Bumping version ($BUMP) — creates a commit + tag"
 NEW_VERSION="$(run_stage "Version bump" 120 npm version "$BUMP" -m "chore: release v%s")"
@@ -76,7 +85,6 @@ run_stage "Push to $REMOTE/$BRANCH" 120 git push "$REMOTE" "$BRANCH" --follow-ta
 
 echo "==> npm publish runs on GitHub Actions (Trusted Publishing, OIDC — no token)."
 TAG="v${NEW_VERSION#v}"
-GH_REPO="${MAXPOOL_GH_REPO:-2solarmax/maxpool}"
 if command -v gh >/dev/null 2>&1; then
   echo "    Watching the Publish workflow for $TAG ..."
   sleep 6  # let GitHub register the tag-triggered run
