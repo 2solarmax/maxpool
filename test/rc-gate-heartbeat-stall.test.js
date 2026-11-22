@@ -354,6 +354,7 @@ gateTest('rc-gate: when attempt 1 dies while the hedge is still hung, a replacem
     assert.match(status(r.raw), /^2/, `2xx expected (not the 12.5s 502), got: ${r.raw.slice(0, 90)}`);
     assert.ok(r.ms < 8_000, `answered by the replacement, not the deadline: ${r.ms}ms`);
     assert.equal(n, 3, 'attempt 1, the hedge and exactly one replacement');
+    await assertHedgeOutcome(gate, 200, 'retry');
   }, { RC_GATE_HEARTBEAT_STALL_MS: '2000' });
 });
 
@@ -502,6 +503,7 @@ gateTest('rc-gate: a 401 is final and delivered immediately, not held while the 
     assert.equal(status(r.raw), '401');
     assert.match(r.raw, /unauthorized/);
     assert.ok(r.ms < 4_500, `delivered right after the 401 arrived (~3s), got ${r.ms}ms`);
+    await assertHedgeOutcome(gate, 401, 'first');
   }, { RC_GATE_HEARTBEAT_STALL_MS: '2000' });
 });
 

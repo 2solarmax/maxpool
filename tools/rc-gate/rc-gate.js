@@ -468,7 +468,8 @@ const mitmServer = http.createServer((creq, cres) => {
     let bodyDone = false;
     creq.on('data', c => bodyBufs.push(c));
     creq.on('end', () => { bodyDone = true; });
-    const dirSend = (hedge = false) => {
+    // `hedge` = use a fresh one-shot connection; `launch` = WHY this attempt exists (first | hedge (stall) | retry (error replacement)).
+    const dirSend = (hedge = false, launch = 'first') => {
       const wait = bodyDone ? Promise.resolve(Buffer.concat(bodyBufs))
         : new Promise(res => creq.on('end', () => res(Buffer.concat(bodyBufs))));
       wait.then(body => {
@@ -509,7 +510,7 @@ const mitmServer = http.createServer((creq, cres) => {
         // The hedge attempt gets a one-shot non-keepalive agent: guaranteed brand-new TCP+TLS
         // connection, never a pooled socket (the stall also sweeps the pool; see below).
         const attemptAgent = hedge ? new https.Agent({ keepAlive: false }) : reqAgent;
-        const winner = hedge ? 'hedge' : retryN > 0 ? 'retry' : 'first';
+        const winner = launch;
         let tStall = null;
         const dir = https.request({
           host: DIRECT_HOST, port: DIRECT_PORT,
@@ -657,7 +658,7 @@ const mitmServer = http.createServer((creq, cres) => {
             retryTimer = setTimeout(() => {
               retryTimer = null;
               if (cres.destroyed || cres.headersSent || (replacementIsHedge && liveDirs.size >= 2)) return;
-              dirSend(replacementIsHedge);
+              dirSend(replacementIsHedge, 'retry');
             }, wait);
             return;
           }
@@ -707,7 +708,7 @@ const mitmServer = http.createServer((creq, cres) => {
                   // (already debounced per agent; the hedge itself uses a fresh one-shot agent). Not on a
                   // late timer: that is our own lag, not evidence the pool is bad.
                   if (!late) sweepIdleSockets(reqAgent);
-                  dirSend(true);
+                  dirSend(true, 'hedge');
                 }
               });
               return;
