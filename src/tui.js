@@ -430,11 +430,11 @@ function countdown(ts) {
  *  "how long each request takes" is not something the owner acts on. An idle
  *  account renders NOTHING.
  *
- *    2 live · 17 req/hr · 1 failed · 3 slow cloud
+ *    2 live · 17 req/hr · 1 failed · 3 slow connections to cloud
  *    17 req/hr                 working, idle this second
  *    (blank)                   resting — nothing to say
  *
- *  "slow cloud" (renamed from "link drops", 2026-11-22): the connection to the
+ *  "slow connection(s) to cloud" (renamed from "link drops", 2026-11-22, owner wording): the connection to the
  *  team pool in the cloud gave out mid-request — the Mac's network, not the
  *  account. Yellow, never folded into "failed", fades 15m after it clears.
  */
@@ -457,7 +457,7 @@ function loadText(load) {
   if (cache) parts.push(cache);
   if (bounced) parts.push(dim(`${bounced} bounced`));
   if (failed) parts.push(red(`${failed} failed`));
-  if (linkFailed) parts.push(yellow(`${linkFailed} slow cloud${linkFailed === 1 ? '' : 's'}`));
+  if (linkFailed) parts.push(yellow(`${linkFailed} slow connection${linkFailed === 1 ? '' : 's'} to cloud`));
   return parts.join(' · ');
 }
 

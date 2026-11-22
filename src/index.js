@@ -3047,7 +3047,7 @@ function efficiencyLines(data, key = 'last15m') {
     `  24h cache:    ${cache24h}`,
     `  Moves:        ${served ? `${Math.round(sum('moved') * 100 / served)}/100 served` : '—'} (cross-family ${n(sum('movedCross'))} · same-family ${n(sum('movedSame'))} · why: outscored ${n(why('outscored'))} · hold-ceiling ${n(why('holdCeiling'))} · released ${n(why('released'))} · other ${n(why('other'))})`,
     `  Move causes:  busy ${n(cause('busy'))} · balance ${n(cause('balance'))} · wall ${n(cause('wall'))} · link ${n(cause('link'))} · other ${n(cause('other'))}`,
-    `  Bounced:      ${n(sum('bounced'))} (refused ${n(sum('refused'))}) · failed ${failed} · slow cloud ${linkDrops}`,
+    `  Bounced:      ${n(sum('bounced'))} (refused ${n(sum('refused'))}) · failed ${failed} · slow connections to cloud ${linkDrops}`,
     `  Busy waits:   ${n(sum('waited'))}${sum('waited') ? ` (avg ${s(sum('waitMs') / sum('waited'))})` : ''} · waited then moved ${n(sum('waitThenMoved'))} (busy-bounce waits only; queue holds show in first-byte p95)`,
     `  Client errors: ${co ? `${co.poolErrors + co.requestErrors} of ${co.total} (pool ${co.poolErrors} · request ${co.requestErrors})` : '—'}`,
     `  First byte:   p50 ${s(overall.e2eP50)} · p95 ${s(overall.e2eP95)} (this pool's clients, waits included)`,
@@ -3058,6 +3058,6 @@ function efficiencyLines(data, key = 'last15m') {
 function formatLoadWindow(load = {}) {
   const avg = load.avgMs != null ? ` avg ${formatDurationMs(load.avgMs)}` : '';
   const failed = load.failed ? `, ${load.failed} failed` : '';
-  const linkFailed = load.linkFailed ? `, ${load.linkFailed} slow cloud${load.linkFailed === 1 ? '' : 's'}` : '';
+  const linkFailed = load.linkFailed ? `, ${load.linkFailed} slow connection${load.linkFailed === 1 ? '' : 's'} to cloud` : '';
   return `${load.requests || 0} req${avg}${failed}${linkFailed}`;
 }

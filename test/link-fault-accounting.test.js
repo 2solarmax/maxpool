@@ -2,7 +2,7 @@
 // on nearly every cloud (☁) row while the cloud's own failure rate was ≈6 of ~2,100
 // requests: every give-up on the Mac↔cloud link (link_ttfb / link_idle /
 // pool_link_unreachable) was booked as the cloud ACCOUNT failing. They are now tallied
-// as slow-cloud counts (renamed from link drops), shown separately; a client leaving counts as neither.
+// as "slow connection to cloud" (user-facing rename of link drops; code keeps linkFailed), shown separately; a client leaving counts as neither.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -52,10 +52,10 @@ test('a real account failure still counts as failed (not a link drop)', () => {
 });
 
 test('TUI row shows slow-cloud counts beside failures, and alone', () => {
-  assert.equal(strip(loadText({ last1h: { requests: 4 }, last15m: { failed: 1, linkFailed: 2 } })), '4 req/hr · 1 failed · 2 slow clouds');
+  assert.equal(strip(loadText({ last1h: { requests: 4 }, last15m: { failed: 1, linkFailed: 2 } })), '4 req/hr · 1 failed · 2 slow connections to cloud');
   // A row whose only recent activity is link drops must not render blank.
-  assert.equal(strip(loadText({ last15m: { linkFailed: 1 } })), '1 slow cloud');
-  assert.match(loadText({ last15m: { linkFailed: 3 } }), /\x1b\[33m3 slow clouds/, 'slow-cloud count is yellow');
+  assert.equal(strip(loadText({ last15m: { linkFailed: 1 } })), '1 slow connection to cloud');
+  assert.match(loadText({ last15m: { linkFailed: 3 } }), /\x1b\[33m3 slow connections to cloud/, 'slow-cloud count is yellow');
   assert.equal(loadText({ last15m: { failed: 0, linkFailed: 0 } }), '', 'idle row stays blank');
 });
 
@@ -128,6 +128,6 @@ test('`maxpool status` shows slow-cloud counts beside failures', async () => {
       child.on('error', reject);
       child.on('exit', () => resolve(buf));
     });
-    assert.match(out, /15m 3 req avg [^,]+, 1 failed, 2 slow clouds/, out);
+    assert.match(out, /15m 3 req avg [^,]+, 1 failed, 2 slow connections to cloud/, out);
   } finally { await close(proxy); }
 });

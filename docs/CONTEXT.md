@@ -16,11 +16,11 @@
 
 ---
 
-## 2026-11-22 — dashboard: rename "link drops" → "slow cloud" (user-facing label only)
+## 2026-11-22 — dashboard: rename "link drops" → "slow connection(s) to cloud" (user-facing label only)
 
 Owner could not tell what "2 link drops" meant (2026-11-22); every cloud row showed
 them at once because the Mac→cloud Wi-Fi tunnel was flapping. Renamed the TUI row
-suffix and the `maxpool status` window text to "slow cloud(s)" — same counter
+suffix and the `maxpool status` window text to the owner's wording "slow connection(s) to cloud" — same counter
 (`last15m.linkFailed`), same yellow, same exclusion from "failed". Internal field
 names and log strings keep `link drop`; tests updated to the new wording.
 Branch: fix/cloud-drops-label.
