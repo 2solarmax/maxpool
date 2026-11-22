@@ -5,15 +5,30 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.24.123] - 2026-11-22
+
+### Changed
+
+- Pin heartbeat-stall retry, loopback pool survival on net-evac, scoped idle sweep
+- Pin heartbeat hedge, 12.5s deadline, scoped/debounced sweep, long-poll exemption
+- Pin council findings - hedge replacement, held non-2xx, stall sweep, fresh hedge socket, plist ExitTimeOut, seam opt-in
+- Pin delta-round findings - held attempt teardown, held body delivery, attempt-1 replacement, spawn-type check
+- Pin merge-head council findings - loop-lag stall race, final 4xx delivery, create-status parse, install pre-check
+- Pin the final delta - DEST untouched on pre-check failure, no hedge beside a scheduled retry
+- Rename dashboard 'link drops' label to 'slow cloud'
+- Use the owner's exact wording: 'slow connection(s) to cloud'
+
+### Documentation
+
+- Deploy comment names the real reload path; install test goes behavioural
 
 ### Fixed
 
-- rc-gate: Remote Control heartbeats no longer hang on a dead socket. After 6s without response headers (RC_GATE_HEARTBEAT_STALL_MS) a second attempt is hedged on a fresh connection while the first keeps running; the first 2xx to answer wins and the other is closed. A non-2xx answer while the other attempt is still running is held back and delivered only if nothing better arrives, and a hedge that fails fast is replaced by a new one. At most two attempts run at once, and every heartbeat retry (hedge or error) stops at 12.5s with the usual 502, inside the CLI's 13s budget
-- rc-gate: network-change evacuation no longer resets in-flight /v1/messages streams to a loopback maxpool (behaviour change on the inference leg: replies are no longer cut when the network changes; routing is unchanged)
-- rc-gate: the retry path sweeps idle sockets only for the failing request's own agent, only after a connect error or a reused-socket failure, at most once per 5s per agent, and jitters its backoff
-- rc-gate: the LaunchAgent plist sets ProcessType Interactive, expected to remove launchd's light CPU and I/O throttling for background jobs (per man launchd.plist; not a measured fix), and ExitTimeOut 25 so a SIGTERM drain is not killed early
-- rc-gate: the forced net-evac test seam is armed only when RC_GATE_FORCE_EVAC_FLAG is set (no default /tmp path); other test seams: MITM cert/key paths. The heartbeat suite mints its own CA so it runs in CI
+- Keep Remote Control heartbeats alive through network blips and CPU starvation
+- Council round - keep pursuing a 2xx heartbeat, opt-in evac seam, safe reload
+- Delta round - tear down the held attempt, wait for its body, replace a dead attempt 1, verify spawn type
+- Merge-head council - no hedge/sweep on a late stall timer, final 4xx at once, create-status parse, install pre-check
+- Final delta - verify the plist before it replaces the installed one; no hedge beside a scheduled retry; monotonic lag clock
 
 ## [1.24.122] - 2026-11-21
 
