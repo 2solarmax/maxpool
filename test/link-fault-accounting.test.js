@@ -2,7 +2,7 @@
 // on nearly every cloud (☁) row while the cloud's own failure rate was ≈6 of ~2,100
 // requests: every give-up on the Mac↔cloud link (link_ttfb / link_idle /
 // pool_link_unreachable) was booked as the cloud ACCOUNT failing. They are now tallied
-// as link drops, shown separately; a client leaving counts as neither.
+// as "slow connection to cloud" (user-facing rename of link drops; code keeps linkFailed), shown separately; a client leaving counts as neither.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -24,7 +24,7 @@ function oneAccount() {
 }
 const lease = (account, heldMs) => { account.inFlight++; return { account, weight: 1, startedAt: Date.now() - heldMs }; };
 
-test('a link-transport fault is a link drop, not an account failure', () => {
+test('a link-transport fault is a slow-cloud event, not an account failure', () => {
   const { am, a } = oneAccount();
   am.releaseAccount(lease(a, 1000), { success: true, status: 200 });
   const before = { lastStatus: a.lastStatus, lastError: a.lastError, consecutiveFailures: a.consecutiveFailures };
@@ -36,7 +36,7 @@ test('a link-transport fault is a link drop, not an account failure', () => {
   assert.equal(a.inFlight, 0, 'the lease is still released');
   const w = am._loadSummary(a, 15 * 60_000);
   assert.equal(w.failed, 0, 'not in the 15m failed count');
-  assert.equal(w.linkFailed, 1, 'counted as a link drop');
+  assert.equal(w.linkFailed, 1, 'counted as a slow-cloud event');
   assert.equal(w.requests, 2, 'still an attempt on this row');
   assert.ok(w.avgMs >= 900 && w.avgMs < 5000, `a 120s give-up does not drag the average (avgMs=${w.avgMs})`);
 });
@@ -51,11 +51,11 @@ test('a real account failure still counts as failed (not a link drop)', () => {
   assert.equal(w.linkFailed, 0);
 });
 
-test('TUI row shows link drops beside failures, and alone', () => {
-  assert.equal(strip(loadText({ last1h: { requests: 4 }, last15m: { failed: 1, linkFailed: 2 } })), '4 req/hr · 1 failed · 2 link drops');
+test('TUI row shows slow-cloud counts beside failures, and alone', () => {
+  assert.equal(strip(loadText({ last1h: { requests: 4 }, last15m: { failed: 1, linkFailed: 2 } })), '4 req/hr · 1 failed · 2 slow connections to cloud');
   // A row whose only recent activity is link drops must not render blank.
-  assert.equal(strip(loadText({ last15m: { linkFailed: 1 } })), '1 link drop');
-  assert.match(loadText({ last15m: { linkFailed: 3 } }), /\x1b\[33m3 link drops/, 'link drops are yellow');
+  assert.equal(strip(loadText({ last15m: { linkFailed: 1 } })), '1 slow connection to cloud');
+  assert.match(loadText({ last15m: { linkFailed: 3 } }), /\x1b\[33m3 slow connections to cloud/, 'slow-cloud count is yellow');
   assert.equal(loadText({ last15m: { failed: 0, linkFailed: 0 } }), '', 'idle row stays blank');
 });
 
@@ -87,7 +87,7 @@ test('a link connection drop: cloud row not failed, counted as a link drop, line
   }
 });
 
-test('a client that leaves mid-answer on the link counts as neither a failure nor a link drop', async () => {
+test('a client that leaves mid-answer on the link counts as neither a failure nor a slow-cloud event', async () => {
   const remote = remotePool(() => 'partial');
   const { am, port, cleanup } = await bootLink(remote);
   try {
@@ -105,11 +105,11 @@ test('a client that leaves mid-answer on the link counts as neither a failure no
     const w = am._loadSummary(row, 15 * 60_000);
     assert.equal(row.failedRequests, 0, 'not a failure');
     assert.equal(w.failed, 0);
-    assert.equal(w.linkFailed, 0, 'not a link drop either');
+    assert.equal(w.linkFailed, 0, 'not a slow-cloud event either');
   } finally { await cleanup(); }
 });
 
-test('`maxpool status` shows link drops beside failures', async () => {
+test('`maxpool status` shows slow-cloud counts beside failures', async () => {
   const { am, a } = oneAccount();
   am.releaseAccount(lease(a, 1000), { linkFault: true, status: 502, error: 'link_idle', scope: 'request' });
   am.releaseAccount(lease(a, 1000), { linkFault: true, status: 502, error: 'link_ttfb', scope: 'request' });
@@ -128,6 +128,6 @@ test('`maxpool status` shows link drops beside failures', async () => {
       child.on('error', reject);
       child.on('exit', () => resolve(buf));
     });
-    assert.match(out, /15m 3 req avg [^,]+, 1 failed, 2 link drops/, out);
+    assert.match(out, /15m 3 req avg [^,]+, 1 failed, 2 slow connections to cloud/, out);
   } finally { await close(proxy); }
 });
