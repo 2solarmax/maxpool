@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as nodeChildProcess from 'node:child_process';
+import { HAVE_OPENSSL, mintPki } from './helpers/rc-gate-pki.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GATE_DIR = join(__dirname, '..', 'tools', 'rc-gate');
@@ -154,7 +155,7 @@ function gateFds(gate) {
 }
 
 // Open a CONNECT tunnel + TLS through the gate, like Claude Code does.
-function mitmConnect(gatePort, host = 'api.anthropic.com') {
+function mitmConnect(gatePort, host = 'api.anthropic.com', caPem) {
   return new Promise((resolve, reject) => {
     const sock = net.connect(gatePort, '127.0.0.1', () => {
       sock.write(`CONNECT ${host}:443 HTTP/1.1\r\nHost: ${host}:443\r\n\r\n`);
@@ -163,7 +164,7 @@ function mitmConnect(gatePort, host = 'api.anthropic.com') {
       if (!d.toString().includes('200')) return reject(new Error('CONNECT failed: ' + d.toString().slice(0, 80)));
       const t = tls.connect({
         socket: sock, servername: host,
-        ca: readFileSync(CA), rejectUnauthorized: true,
+        ca: caPem ?? readFileSync(CA), rejectUnauthorized: true,
       }, () => resolve({ tls: t, sock }));
       t.on('error', reject);
     });
@@ -519,12 +520,19 @@ gateDescribe('rc-gate: a stalled upstream on session CREATE errors out (stall ti
   }
 });
 
-gateDescribe('rc-gate: a long-poll path with slow headers is NEVER stall-destroyed', { timeout: 20_000 }, async () => {
-  // Upstream that answers /worker/heartbeat only after 4s — longer than the 1.5s
-  // stall window. v1 would have destroyed it; v2 must not.
+// Self-minted PKI (test/helpers/rc-gate-pki.js): runs in CI and never reads the real mitm key.
+// The rest of this file still needs the mkcert fixtures; swapping them wholesale would newly run
+// ~25 never-CI-run tests (macOS-only helpers, lsof, RST/FIN mbuf pins) that I could not verify.
+const pkiTest = HAVE_OPENSSL ? test : test.skip;
+pkiTest('rc-gate: a long-poll path with slow headers is NEVER stall-destroyed', { timeout: 20_000 }, async () => {
+  const pkiDir = mkdtempSync(join(tmpdir(), 'rcgate-pki-'));
+  const pki = mintPki(pkiDir);
+  // Upstream that answers /worker/events (a true long-poll) only after 4s — longer than the
+  // 1.5s stall window. v1 would have destroyed it; v2 must not. (This used to use
+  // /worker/heartbeat, which has since moved to its own short stall budget + hedge.)
   const up = tls.createServer({
-    key: readFileSync(join(GATE_DIR, 'anthropic-mitm.key')),
-    cert: readFileSync(join(GATE_DIR, 'anthropic-mitm.crt')),
+    key: readFileSync(pki.key),
+    cert: readFileSync(pki.cert),
   }, sock => {
     sock.on('data', () => {
       setTimeout(() => {
@@ -535,19 +543,23 @@ gateDescribe('rc-gate: a long-poll path with slow headers is NEVER stall-destroy
   await new Promise(r => up.listen(0, '127.0.0.1', r));
   const { port: upPort } = up.address();
   try {
-    const gate = await startGate({ RC_GATE_PORT: '0', RC_GATE_DIRECT_HOST: '127.0.0.1', RC_GATE_DIRECT_PORT: String(upPort), RC_GATE_DIRECT_STALL_MS: '1500' });
-    const { tls: t } = await mitmConnect(gate.port);
+    const gate = await startGate({
+      RC_GATE_PORT: '0', RC_GATE_DIRECT_HOST: '127.0.0.1', RC_GATE_DIRECT_PORT: String(upPort), RC_GATE_DIRECT_STALL_MS: '1500',
+      NODE_EXTRA_CA_CERTS: pki.ca, RC_GATE_MITM_CERT: pki.cert, RC_GATE_MITM_KEY: pki.key,
+    });
+    const { tls: t } = await mitmConnect(gate.port, 'api.anthropic.com', readFileSync(pki.ca));
     const got = await new Promise((resolve, reject) => {
       let buf = '';
       const to = setTimeout(() => reject(new Error('no response within 10s — long-poll was stall-destroyed or upstream broken')), 10_000);
       t.on('data', d => { buf += d.toString(); if (buf.includes('200 OK')) { clearTimeout(to); resolve('200'); } });
       t.on('close', () => { clearTimeout(to); reject(new Error('tunnel closed before headers — stall timeout destroyed a long-poll')); });
-      t.write('POST /v1/code/sessions/cse_x/worker/heartbeat HTTP/1.1\r\nhost: api.anthropic.com\r\ncontent-length: 2\r\n\r\n{}');
+      t.write('POST /v1/code/sessions/cse_x/worker/events HTTP/1.1\r\nhost: api.anthropic.com\r\ncontent-length: 2\r\n\r\n{}');
     });
-    assert.equal(got, '200', 'slow-headers heartbeat survives the stall window');
+    assert.equal(got, '200', 'slow-headers long-poll survives the stall window');
     gate.kill();
   } finally {
     up.close();
+    rmSync(pkiDir, { recursive: true, force: true });
   }
 });
 

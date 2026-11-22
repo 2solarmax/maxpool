@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- rc-gate: Remote Control heartbeats no longer hang on a dead socket. After 6s without response headers (RC_GATE_HEARTBEAT_STALL_MS) a second attempt is hedged on a fresh connection while the first keeps running; the first 2xx to answer wins and the other is closed. A non-2xx answer while the other attempt is still running is held back and delivered only if nothing better arrives, and a hedge that fails fast is replaced by a new one. At most two attempts run at once, and every heartbeat retry (hedge or error) stops at 12.5s with the usual 502, inside the CLI's 13s budget
+- rc-gate: network-change evacuation no longer resets in-flight /v1/messages streams to a loopback maxpool (behaviour change on the inference leg: replies are no longer cut when the network changes; routing is unchanged)
+- rc-gate: the retry path sweeps idle sockets only for the failing request's own agent, only after a connect error or a reused-socket failure, at most once per 5s per agent, and jitters its backoff
+- rc-gate: the LaunchAgent plist sets ProcessType Interactive, expected to remove launchd's light CPU and I/O throttling for background jobs (per man launchd.plist; not a measured fix), and ExitTimeOut 25 so a SIGTERM drain is not killed early
+- rc-gate: the forced net-evac test seam is armed only when RC_GATE_FORCE_EVAC_FLAG is set (no default /tmp path); other test seams: MITM cert/key paths. The heartbeat suite mints its own CA so it runs in CI
+
 ## [1.24.122] - 2026-11-21
 
 ### Added

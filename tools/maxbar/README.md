@@ -106,6 +106,13 @@ title-sync writer. Omit `RC_GATE_PROFILE` so the explicit Maxbar Pool choice and
 client profile determine routing. Give the second gate its own route switch file
 if the original gate uses a separate Direct/Pool control.
 
+Copy these two keys from `tools/rc-gate/launchd/com.mokka.rc-gate.plist` into the
+second gate's plist so it gets the same fixes as the original: `ProcessType` =
+`Interactive` (expected to remove launchd's light CPU and I/O throttling for jobs
+with no process type, per `man launchd.plist`) and `ExitTimeOut` = `25` (the
+gate drains in-flight responses for up to 20 seconds on shutdown; the launchd
+default would kill it first).
+
 With Claude routing set to Direct, select the new port for Maxbar. For example:
 
 ```sh
