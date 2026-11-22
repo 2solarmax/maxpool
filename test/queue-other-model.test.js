@@ -2,9 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 
-/** A queued request stuck on its own model's weekly sub-limit (Fable at 100% on every
- *  account it can use) must not hold requests for other models. Everything that really
- *  competes keeps strict FIFO. */
+/** A queued request stuck on its own model's weekly sub-limit must not hold requests for
+ *  other models. Stuck means:
+ *  - Fable is at 100% on at least one account the request can use, and
+ *  - every other one is at its Fable limit too, or closed to every request (weekly window
+ *    used up, 5-hour window full, cooldown, rate limit).
+ *  Everything that really competes keeps strict FIFO (first in, first out). */
 
 function manager(count = 2) {
   const accounts = Array.from({ length: count }, (_, i) => ({
@@ -25,19 +28,33 @@ function managerWithGlm() {
   ], 0.90, { routingMode: 'balance' });
 }
 
-const DAY = 24 * 60 * 60 * 1000;
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
 const fable = (extra = {}) => ({ model: 'claude-fable-5', profile: 'claude', ...extra });
 const opus = (extra = {}) => ({ model: 'claude-opus-4-8', profile: 'claude', ...extra });
 /** A signed-thinking request: behind the queue, the retry oracle gives it a short
  *  queued_behind_fairness hold instead of dropping it. */
 const thinkingOpus = () => opus({ requiresAnthropicThinkingIntegrity: true });
 
-function benchFable(am, index) {
-  am.applyUsageData(index, { scopedWeekly: { fable: { utilization: 1, severity: 'critical', isActive: true, resetAt: Date.now() + 6 * DAY } } });
+function benchFable(am, index, resetAt = Date.now() + 6 * DAY) {
+  am.applyUsageData(index, { scopedWeekly: { fable: { utilization: 1, severity: 'critical', isActive: true, resetAt } } });
 }
 
 function benchFableEverywhere(am) {
   am.accounts.forEach((_, index) => benchFable(am, index));
+}
+
+/** The weekly window all models share is used up. Anthropic then marks the Fable limit
+ *  as not active, though it reads 100%. */
+function useUpWeekly(am, index) {
+  am.applyUsageData(index, {
+    sevenDay: { utilization: 1, resetAt: Date.now() + 2 * DAY },
+    scopedWeekly: { fable: { utilization: 1, severity: 'critical', isActive: false, resetAt: Date.now() + 2 * DAY } },
+  });
+}
+
+function fillFiveHourWindow(am, index) {
+  am.applyUsageData(index, { fiveHour: { utilization: 1, resetAt: Date.now() + 2 * HOUR } });
 }
 
 function enqueue(am, requestInfo) {
@@ -183,4 +200,118 @@ test('the hold comes back once the Fable limit lifts', () => {
 
   const lease = am.acquireAccount(opus());
   assert.equal(lease, null);
+});
+
+test('Fable maxed on one account and the weekly window used up on the others does not hold Opus', () => {
+  const am = manager(3);
+  benchFable(am, 0);
+  useUpWeekly(am, 1);
+  useUpWeekly(am, 2);
+  enqueue(am, fable());
+
+  const plan = am.nextRetryForRequest(thinkingOpus());
+  const lease = am.acquireAccount(opus());
+  const other = enqueue(am, opus());
+  const admitted = am.canAdmitQueuedRequest(other);
+  assert.equal(plan.available, true);
+  assert.equal(lease?.account.name, 'a1');
+  assert.equal(admitted, true);
+});
+
+/** Accounts closed to every request for a short while, and how each one opens again. */
+const accountsClosedForAWhile = [
+  {
+    name: 'an account with a full 5h window',
+    close: am => fillFiveHourWindow(am, 1),
+    open: am => am.applyUsageData(1, { fiveHour: { utilization: 0, resetAt: Date.now() + 5 * HOUR } }),
+  },
+  {
+    name: 'an account in a cooldown',
+    close: am => { am.accounts[1].cooldownUntil = Date.now() + 30_000; },
+    open: am => { am.accounts[1].cooldownUntil = Date.now() - 1; },
+  },
+  {
+    name: 'a rate limited account',
+    close: am => am.markRateLimited(1, 60),
+    open: am => { am.accounts[1].rateLimitedUntil = Date.now() - 1; },
+  },
+  {
+    name: 'an account at its usage cap',
+    close: am => {
+      Object.assign(am.accounts[1], { capUtilization: 0.4, capMode: 'reserve', capCeiling: 0.3 });
+      am.applyUsageData(1, { sevenDay: { utilization: 0.5, resetAt: Date.now() + 2 * DAY } });
+    },
+    open: am => { am.accounts[1].capUtilization = null; },
+  },
+];
+
+for (const { name, close, open } of accountsClosedForAWhile) {
+  test(`${name} does not keep the benched Fable ticket in Opus's way until it opens again`, () => {
+    const am = manager();
+    benchFable(am, 0);
+    close(am);
+    enqueue(am, fable());
+
+    const lease = am.acquireAccount(opus());
+    const other = enqueue(am, opus());
+    const admitted = am.canAdmitQueuedRequest(other);
+    open(am);
+    const leaseOnceOpen = am.acquireAccount(opus());
+    assert.equal(lease?.account.name, 'a1');
+    assert.equal(admitted, true);
+    assert.equal(leaseOnceOpen, null);
+  });
+}
+
+test('a Fable ticket held only by limits every model shares stays in the way', () => {
+  const am = manager();
+  useUpWeekly(am, 0);
+  fillFiveHourWindow(am, 1);
+  enqueue(am, fable());
+
+  const other = enqueue(am, opus());
+  const admitted = am.canAdmitQueuedRequest(other);
+  assert.equal(admitted, false);
+});
+
+test('a busy account is room the Fable ticket competes for', () => {
+  const am = manager();
+  benchFable(am, 0);
+  am.accounts[1].inFlight = am.scheduler.safetyMaxActivePerAccount;
+  enqueue(am, fable());
+
+  const lease = am.acquireAccount(opus());
+  assert.equal(lease, null);
+});
+
+test('a weekly-critical account is room the Fable ticket competes for', () => {
+  const am = manager();
+  benchFable(am, 0);
+  am.applyUsageData(1, { sevenDay: { utilization: 0.97, resetAt: Date.now() + 2 * DAY } });
+  enqueue(am, fable());
+
+  const lease = am.acquireAccount(opus());
+  assert.equal(lease, null);
+});
+
+test('a provider row out of its own request counter is room the Fable ticket competes for', () => {
+  const am = managerWithGlm();
+  benchFable(am, 0);
+  Object.assign(am.accounts[1].quota, { genericLimit: 100, genericRemaining: 0 });
+  enqueue(am, fable({ profile: 'all' }));
+
+  const other = enqueue(am, opus({ profile: 'all' }));
+  const admitted = am.canAdmitQueuedRequest(other);
+  assert.equal(admitted, false);
+});
+
+test('a Fable limit past its reset puts the Fable ticket back in Opus\'s way', () => {
+  const am = manager();
+  benchFable(am, 0, Date.now() - 1);
+  am.accounts[1].cooldownUntil = Date.now() + 30_000;
+  enqueue(am, fable());
+
+  const other = enqueue(am, opus());
+  const admitted = am.canAdmitQueuedRequest(other);
+  assert.equal(admitted, false);
 });
