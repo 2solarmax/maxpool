@@ -123,7 +123,8 @@ function request(t, method, path, budgetMs, body = '{}') {
 }
 
 const status = raw => (/^HTTP\/1\.1 (\d{3})/.exec(raw) || [])[1];
-const hedgeOutcomes = gate => gate.getLog().split('\n').filter(line => line.includes('[hedge-outcome]'));
+// The gate prefixes every log line with an ISO timestamp; compare from the tag on.
+const hedgeOutcomes = gate => gate.getLog().split('\n').filter(line => line.includes('[hedge-outcome]')).map(line => line.slice(line.indexOf('[hedge-outcome]')));
 async function assertHedgeOutcome(gate, code, winner) {
   // Child stdout and the client socket are consumed independently.
   const until = Date.now() + 2_000;
