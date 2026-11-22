@@ -1936,13 +1936,19 @@ export class AccountManager {
     return q.codexLimitByModel?.[resolved] || resolved;
   }
 
+  /** This request's model limit on the account ({ resetAt, family }, plus session: true
+   *  for a Codex 5-hour limit), or null when the model may still run here. An inactive
+   *  limit never counts. A limit past its reset counts as lifted even before
+   *  _clearExpiredQuotas drops it, so a caller that reads it first agrees with routing. */
   _scopedExhausted(account, model) {
     const family = this._quotaScope(account, model);
     if (!family) return null;
     const q = account.quota;
+    const now = Date.now();
     const weekly = q.scopedWeekly?.[family];
     const session = q.codexScopedFiveHour?.[family];
-    const exhausted = e => e && e.isActive !== false && e.utilization >= this.scheduler.weeklyExhaustedThreshold;
+    const pastReset = e => Boolean(e.resetAt) && now >= e.resetAt;
+    const exhausted = e => e && e.isActive !== false && e.utilization >= this.scheduler.weeklyExhaustedThreshold && !pastReset(e);
     if (exhausted(weekly)) return { resetAt: Math.max(weekly.resetAt || 0, exhausted(session) ? session.resetAt || 0 : 0) || null, family };
     if (exhausted(session)) return { resetAt: session.resetAt || null, family, session: true };
     return null;
@@ -2332,21 +2338,27 @@ export class AccountManager {
 
   /** A queued request is in another request's way, unless both hold:
    *  - the two ask for different model families (Fable and Opus, say), and
-   *  - the queued one hit its own model's weekly limit on every account it could use.
-   *  Such a request cannot be served before that limit resets, so it does not compete. */
+   *  - no account can serve the queued one right now, and its own model's weekly limit
+   *    is part of the reason (_stuckOnItsModelLimit).
+   *  Such a request does not compete for now. It is back in the way as soon as an
+   *  account it could use opens again. */
   _isInTheWay(queuedInfo, requestInfo) {
     const family = modelFamily(requestInfo.model);
     const queuedFamily = modelFamily(queuedInfo.model);
     if (!family || family === queuedFamily) return true;
-    return !this._benchedOnEveryUsableAccount(queuedInfo);
+    return !this._stuckOnItsModelLimit(queuedInfo);
   }
 
-  /** True when the request's model family hit its weekly sub-limit on every account
-   *  that could serve it. False when no account could serve it at all: that is not a
-   *  model limit. */
-  _benchedOnEveryUsableAccount(requestInfo) {
+  /** True when the request is stuck on its own model's weekly sub-limit:
+   *  - at least one account that could serve it is at that limit, and
+   *  - every other one is at that limit too, or is closed to every request.
+   *  False when no account could serve it at all: that is not a model limit. */
+  _stuckOnItsModelLimit(requestInfo) {
+    const now = Date.now();
     const usable = this._accountsThatCouldServe(requestInfo);
-    return usable.length > 0 && usable.every(account => this._scopedExhausted(account, requestInfo.model));
+    const benched = account => this._scopedExhausted(account, requestInfo.model);
+    return usable.some(benched)
+      && usable.every(account => benched(account) || this._closedToEveryRequest(account, now));
   }
 
   /** Enabled accounts whose profile and provider rules accept this request. Accounts
@@ -2362,6 +2374,21 @@ export class AccountManager {
    *  the same rule refreshCapLift uses for an account that cannot serve. */
   _neverServes(account) {
     return Boolean(account.poolBenchedBy || account.refreshDead || account.subscriptionGone);
+  }
+
+  /** True when the account serves no request right now, whatever its model:
+   *  - the weekly window all models share is used up, or held back by the owner's usage
+   *    cap, or
+   *  - a short-term block the retry oracle reports is on: rate limit, cooldown, upstream
+   *    failure, full 5-hour window, or an API key's token or request limit.
+   *  A provider's generic request counter (provider_limit) is left out: routing does not
+   *  block on it. A busy account is not closed either: its next free slot is room every
+   *  request competes for. */
+  _closedToEveryRequest(account, now) {
+    const weekly = this._weeklyRawState(account, now);
+    const shortTerm = this._shortTermRetry(account, now, account.quota);
+    return ['exhausted', 'capped'].includes(weekly)
+      || (shortTerm !== null && shortTerm.cause !== 'provider_limit');
   }
 
   removeQueuedRequest(requestInfo = {}) {
