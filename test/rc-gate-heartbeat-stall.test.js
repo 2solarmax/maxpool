@@ -123,6 +123,16 @@ function request(t, method, path, budgetMs, body = '{}') {
 }
 
 const status = raw => (/^HTTP\/1\.1 (\d{3})/.exec(raw) || [])[1];
+const hedgeOutcomes = gate => gate.getLog().split('\n').filter(line => line.includes('[hedge-outcome]'));
+async function assertHedgeOutcome(gate, code, winner) {
+  // Child stdout and the client socket are consumed independently.
+  const until = Date.now() + 2_000;
+  while (hedgeOutcomes(gate).length === 0 && Date.now() < until) await sleep(20);
+  assert.deepEqual(
+    hedgeOutcomes(gate).map(line => line.replace(/ after \d+ms$/, ' after <elapsed>')),
+    [`[hedge-outcome] status=${code} won=${winner} after <elapsed>`],
+  );
+}
 const HB = '/v1/code/sessions/cse_hb/worker/heartbeat';
 const OK = '{"ok":true}';
 const json200 = (res, body = OK) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(body); };
@@ -158,6 +168,7 @@ gateTest('rc-gate: a heartbeat whose first upstream attempt hangs is hedged on a
     assert.equal(hb.length, 2, 'upstream saw exactly one extra attempt');
     assert.notEqual(hb[0].sock, hb[1].sock, 'the hedge used a fresh upstream connection');
     assert.match(gate.getLog(), /\[direct-stall\].*worker\/heartbeat.*hedging/, 'the stall timer fired and hedged');
+    await assertHedgeOutcome(gate, 200, 'hedge');
   });
 });
 
@@ -182,6 +193,7 @@ gateTest('rc-gate: hedged heartbeat - attempt 1 answering at ~8s (after the 6s h
     assert.equal(hb.length, 2, 'the hedge did fire (attempt 2 reached upstream)');
     await sleep(500);
     assert.equal(hb[1].closed, true, 'the losing attempt\'s connection was destroyed');
+    await assertHedgeOutcome(gate, 200, 'first');
   });
 });
 
@@ -319,6 +331,7 @@ gateTest('rc-gate: with attempt 1 hung forever, the hedge\'s held 503 is deliver
     assert.match(r.raw, /overloaded/);
     assert.doesNotMatch(r.raw, /rc_gate_direct_error/, 'not the gate\'s own 502');
     assert.ok(r.ms >= 11_500 && r.ms < 13_000, `delivered at the 12.5s deadline, got ${r.ms}ms`);
+    await assertHedgeOutcome(gate, 503, 'hedge');
   }, { RC_GATE_HEARTBEAT_STALL_MS: '1000' });
 });
 
@@ -363,6 +376,7 @@ gateTest('rc-gate: a held 503 whose body never ends is destroyed at the deadline
     assert.equal(r.how, 'response', `got ${r.how} after ${r.ms}ms`);
     assert.equal(status(r.raw), '502', `the gate's own 502 (held body incomplete), got: ${r.raw.slice(0, 90)}`);
     assert.ok(r.ms >= 11_500 && r.ms < 13_000, `answered at the deadline, got ${r.ms}ms`);
+    await assertHedgeOutcome(gate, 502, 'none');
     await sleep(500);
     assert.equal(hb.length, 2);
     assert.equal(hb[1].closed, true, 'the held attempt\'s upstream connection was destroyed');
@@ -392,6 +406,7 @@ gateTest('rc-gate: a held 503 whose body is still arriving when needed is delive
     assert.doesNotMatch(r.raw, /rc_gate_direct_error/);
     assert.match(r.raw, /overloaded/);
     assert.ok(r.ms >= 3_200 && r.ms < 8_000, `delivered when the body completed (~3.5s), got ${r.ms}ms`);
+    await assertHedgeOutcome(gate, 503, 'hedge');
   }, { RC_GATE_HEARTBEAT_STALL_MS: '1000', RC_GATE_DIRECT_RETRY_MAX: '0' });
 });
 
@@ -419,6 +434,9 @@ gateTest('rc-gate: a loop starved across the stall point does not hedge or sweep
     assert.equal(hbN, 1, `no hedge connect, saw ${hbN} heartbeat attempts`);
     assert.doesNotMatch(gate.getLog(), /hedging/);
     assert.deepEqual(parked.map(p => p.closed), [false, false], 'no healthy idle socket was swept');
+    // healthy fast answer, no hedge: nothing is ever logged as an outcome
+    await sleep(300);
+    assert.equal(hedgeOutcomes(gate).length, 0, 'no [hedge-outcome] without a hedge');
   }, { RC_GATE_HEARTBEAT_STALL_MS: '300', RC_GATE_TEST_BLOCK_LOOP_AFTER_SEND_MS: '900' });
 });
 

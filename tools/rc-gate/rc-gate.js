@@ -415,6 +415,9 @@ const mitmServer = http.createServer((creq, cres) => {
     // succeed, and the overall deadline.
     const liveDirs = new Set();
     let hbWinner = null, hbHedged = false, hbDeadlineTimer = null, held = null, heldDir = null;
+    const logHedgeOutcome = (status, winner) => {
+      if (hbHedged) console.log(`[hedge-outcome] status=${status} won=${winner} after ${Date.now() - reqStart}ms`);
+    };
     const clearHbDeadline = () => { if (hbDeadlineTimer) { clearTimeout(hbDeadlineTimer); hbDeadlineTimer = null; } };
     const dropAttempt = d => { liveDirs.delete(d); d.superseded = true; try { d.destroy(); } catch {} };
     // The held attempt left liveDirs when it answered; keep a handle so it can be torn down.
@@ -425,7 +428,10 @@ const mitmServer = http.createServer((creq, cres) => {
     const send502 = message => {
       destroyHeld();
       console.log('[direct-error]', creq.url, message);
-      try { cres.writeHead(502, { 'content-type': 'application/json' }); } catch {}
+      try {
+        cres.writeHead(502, { 'content-type': 'application/json' });
+        logHedgeOutcome(502, 'none');
+      } catch {}
       cres.end(JSON.stringify({ type: 'error', error: { type: 'rc_gate_direct_error', message } }));
     };
     // Deliver the held non-2xx answer (the best the upstream gave us) instead of a gate 502.
@@ -445,6 +451,7 @@ const mitmServer = http.createServer((creq, cres) => {
       hh['content-length'] = String(h.body.length);
       console.log('[direct-held]', creq.url, `delivering held ${h.status} (no sibling attempt succeeded)`);
       cres.writeHead(h.status, hh);
+      logHedgeOutcome(h.status, h.winner);
       cres.end(h.body);
       return true;
     };
@@ -502,6 +509,7 @@ const mitmServer = http.createServer((creq, cres) => {
         // The hedge attempt gets a one-shot non-keepalive agent: guaranteed brand-new TCP+TLS
         // connection, never a pooled socket (the stall also sweeps the pool; see below).
         const attemptAgent = hedge ? new https.Agent({ keepAlive: false }) : reqAgent;
+        const winner = hedge ? 'hedge' : retryN > 0 ? 'retry' : 'first';
         let tStall = null;
         const dir = https.request({
           host: DIRECT_HOST, port: DIRECT_PORT,
@@ -523,7 +531,7 @@ const mitmServer = http.createServer((creq, cres) => {
           if (tStall) { clearTimeout(tStall); tStall = null; }
           liveDirs.delete(dir);
           if (held) { try { ures.destroy(); } catch {} return; }
-          const mine = { status: ures.statusCode, headers: ures.headers, body: null, wanted: false };
+          const mine = { status: ures.statusCode, winner, headers: ures.headers, body: null, wanted: false };
           held = mine; heldDir = dir;
           const chunks = [];
           ures.on('data', c => chunks.push(c));
@@ -572,6 +580,7 @@ const mitmServer = http.createServer((creq, cres) => {
       // [direct-stall] on a request that owned its socket the whole time.
       if (tStall) { clearTimeout(tStall); tStall = null; }
       cres.writeHead(ures.statusCode, ures.headers);
+      if (isHeartbeat) logHedgeOutcome(ures.statusCode, winner);
       // UPSTREAM DIED MID-RESPONSE => END THE CLIENT LEG TOO (2026-11-14). Same shape as the
       // pool leg below: this response had NO error handling at all, so a long-poll /events
       // stream (or any body) that died upstream after headers left the CLI on an open 200
