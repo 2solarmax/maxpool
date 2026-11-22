@@ -125,7 +125,7 @@ test('link blip releases request-scoped: the failed mirror row keeps consecutive
     assert.equal(res.status, 200, 'moved to the other row and served');
     assert.equal(n, 2, 'one blip, one successful hop');
     const rows = am.accounts.filter(a => a.remote);
-    // 2026-11-12 (link drops): a link blip is no longer an account failure at all —
+    // 2026-11-12 (slow cloud, was "link drops"): a link blip is no longer an account failure at all —
     // it is recorded as a LINK DROP on its row (failedRequests stays 0).
     const failedRow = rows.find(a => am._loadSummary(a, 15 * 60_000).linkFailed > 0);
     assert.ok(failedRow, 'the blip is recorded as a link drop on its row');
