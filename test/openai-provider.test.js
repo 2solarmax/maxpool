@@ -95,20 +95,19 @@ test('Claude Code Messages route falls back to ChatGPT and replays a full tool r
   assert.equal(am.accounts[2].completedRequests, 2);
 });
 
-test('per-provider cross routing leaves a ChatGPT thread eligible for Claude', () => {
-  const am = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9, {
-    providers: { codex: { sessionRouting: 'cross-provider' } },
-  });
+test('a ChatGPT thread is eligible for Claude by default and sticky only when configured', () => {
+  const am = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9);
   const request = { profile: 'all', codexCompatible: true, affinityKey: 'a', path: '/v1/messages' };
   am.noteConversationServed(request, am.accounts[0]);
   assert.equal(am.pinnedSessionProvider(request), null);
   assert.equal(am.getActiveAccount(request, new Set([0]))?.name, 'claude');
-  am.scheduler.providers.codex.sessionRouting = 'same-provider';
-  am.noteConversationServed({ ...request, _notedServed: undefined }, am.accounts[0]);
+  am.scheduler.providers = { codex: { sessionRouting: 'same-provider' } };
+  assert.equal(am.pinnedSessionProvider(request), 'codex');
   assert.equal(am.getActiveAccount(request, new Set([0])), null);
-  const restored = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9);
+  const restored = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9,
+    { providers: { codex: { sessionRouting: 'same-provider' } } });
   restored.restoreSessionProviders(am.exportSessionProviders());
-  assert.equal(restored.pinnedSessionProvider(request), 'codex');
+  assert.equal(restored.pinnedSessionProvider(request), 'codex', 'the recorded pin applies once the provider asks for stickiness');
 });
 
 test('an early Responses quota error rotates to the next ChatGPT account', async t => {
@@ -289,7 +288,7 @@ test('an early OpenAI 401 forces one refresh and retries on the same account', a
 });
 
 test('the final provider snapshot replaces boot pins and honors current scheduler policy', () => {
-  const manager = new AccountManager([codex()]);
+  const manager = new AccountManager([codex()], 0.9, { providers: { codex: { sessionRouting: 'same-provider' } } });
   const thread = { clientThreadId: 'shared', caller: 'owner' };
   manager.restoreSessionProviders([['owner:cc:evicted', 'codex']]);
   for (const legacy of [null, undefined, {}]) manager.restoreSessionProviders(legacy);
@@ -302,12 +301,15 @@ test('the final provider snapshot replaces boot pins and honors current schedule
   assert.equal(manager.pinnedSessionProvider({ ...thread, clientThreadId: 'evicted' }), null);
   manager.scheduler.providers = { codex: { sessionRouting: 'cross-provider' } };
   assert.equal(manager.pinnedSessionProvider(thread), null);
+  manager.scheduler.providers = { codex: { sessionRouting: 'same-provider' } };
+  assert.equal(manager.pinnedSessionProvider(thread), 'codex');
   manager.restoreSessionProviders([]);
   assert.deepEqual(manager.exportSessionProviders(), []);
 });
 
 test('only unresolved sticky family sends enter the final snapshot', () => {
-  const am = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }]);
+  const am = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9,
+    { providers: { codex: { sessionRouting: 'same-provider' } } });
   function attempt(thread, family = 'codex', extra = {}) {
     const info = { clientThreadId: thread, onlyProvider: family, profile: 'all', path: '/v1/messages',
       codexCompatible: true, model: 'claude-sonnet-5', ...extra };

@@ -343,6 +343,7 @@ test('a Claude Code first turn on Codex after replacement boot stays on Codex th
   const host = 'http://127.0.0.1:' + upstream;
   await writeFile(configPath, JSON.stringify({ proxy: { host: '127.0.0.1', port, apiKey: 'fixture' },
     updateCheck: false, preventSleep: false, queue: { enabled: false },
+    scheduler: { providers: { codex: { sessionRouting: 'same-provider' } } },
     accounts: [
       { name: 'Claude', type: 'apikey', apiKey: 'fake', upstream: host },
       { name: 'Codex', type: 'oauth', provider: 'codex', codexAuth: 'native', accountUuid: 'user',

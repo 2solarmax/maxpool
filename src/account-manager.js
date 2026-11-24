@@ -4815,7 +4815,7 @@ export class AccountManager {
   _sessionRoutingFor(providerKey) {
     const mode = this.scheduler.providers?.[providerKey]?.sessionRouting ?? this.scheduler.sessionRouting;
     if (mode === 'same-provider' || mode === 'cross-provider') return mode;
-    return providerKey === 'codex' ? 'same-provider' : 'cross-provider';
+    return 'cross-provider';
   }
 
   _providerConversationKey(requestInfo) {
