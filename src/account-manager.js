@@ -545,6 +545,11 @@ const sharesProviderCache = (a, b) => Boolean(a && b && a.type === 'provider' &&
 // 0.5M), later ones re-wrote nearly in full (median dead-copy age 519 s; a detour pushes
 // the prefix past the cache lookback, so the 1-hour copy does not survive it).
 const COLD_CLAUDE_AFTER_MS = 300_000;
+// A same-provider session pin is released while every account of that provider is
+// out for longer than this. No client holds a request that long (Claude Code's
+// absolute stream ceiling is 30 min), so keeping the pin only returns "try again in
+// about 5d" until a weekly reset.
+const STRANDED_PIN_MS = 30 * 60_000;
 // How long a paid cold GLM->Claude hop marks the conversation as a repeat offender.
 const COLD_HOP_MEMORY_MS = 6 * 3_600_000;
 // Only conversations big enough that a re-write matters (~40k+ tokens).
@@ -4824,9 +4829,24 @@ export class AccountManager {
     return key && caller && caller !== 'legacy-key' ? caller + ':' + key : key;
   }
 
-  pinnedSessionProvider(requestInfo) {
+  pinnedSessionProvider(requestInfo, now = Date.now()) {
     const provider = this.conversationProvider.get(this._providerConversationKey(requestInfo));
-    return provider && this._sessionRoutingFor(provider) === 'same-provider' ? provider : null;
+    if (!provider || this._sessionRoutingFor(provider) !== 'same-provider') return null;
+    return this._stickyProviderStranded(provider, now) ? null : provider;
+  }
+
+  /** True when no account of `provider` can serve within STRANDED_PIN_MS: none is
+   *  usable, or each is weekly exhausted or capped with a KNOWN reset beyond that.
+   *  An unknown reset keeps the pin. Cross-provider routing still applies its own
+   *  transcript-compatibility checks to the released conversation. */
+  _stickyProviderStranded(provider, now = Date.now()) {
+    const family = this.accounts.filter(a => accountFamily(a) === provider && a.enabled !== false
+      && !a.poolBenchedBy && !a.refreshDead && !a.subscriptionGone);
+    return family.every(a => {
+      const state = this._weeklyTier(a, now);
+      const reset = a.quota?.unified7dReset;
+      return (state === 'exhausted' || state === 'capped') && Number.isFinite(reset) && reset - now > STRANDED_PIN_MS;
+    });
   }
 
   nativeCodexOwner(key) {
