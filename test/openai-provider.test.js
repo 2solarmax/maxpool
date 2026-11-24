@@ -104,7 +104,8 @@ test('a ChatGPT thread is eligible for Claude by default and sticky only when co
   am.scheduler.providers = { codex: { sessionRouting: 'same-provider' } };
   assert.equal(am.pinnedSessionProvider(request), 'codex');
   assert.equal(am.getActiveAccount(request, new Set([0])), null);
-  const restored = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9);
+  const restored = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9,
+    { providers: { codex: { sessionRouting: 'same-provider' } } });
   restored.restoreSessionProviders(am.exportSessionProviders());
   assert.equal(restored.pinnedSessionProvider(request), 'codex', 'the recorded pin applies once the provider asks for stickiness');
 });
