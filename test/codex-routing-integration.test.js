@@ -110,14 +110,14 @@ test('native requests, quota, attribution and provider affinity survive compacti
   assert.equal(hits[1].body.model, 'gpt-6-luna');
   assert.notEqual(hits[1].workspace, hits[0].workspace);
   am.accounts.filter(account => account.provider === 'codex').forEach(account => { account.enabled = false; });
-  const blocked = await request(url, 'claude-haiku-5', session, 'another turn');
-  assert.equal(blocked.status, 429);
-  assert.match(await blocked.text(), /No Codex account can serve this request/);
-  assert.equal(hits.length, 2, 'the healthy Claude account must not serve an OpenAI-origin session');
+  const released = await request(url, 'claude-haiku-5', session, 'another turn');
+  assert.equal(released.status, 200);
+  await released.text();
+  assert.equal(hits[2].provider, 'claude', 'with no Codex account able to serve, the session continues on Claude');
   const newThread = await request(url, 'claude-sonnet-5-2', 'thread-0002', 'new session');
   assert.equal(newThread.status, 200);
   await newThread.text();
-  assert.equal(hits[2].provider, 'claude');
+  assert.equal(hits[3].provider, 'claude');
 });
 
 test('Claude Code uses a cacheable Codex prefix and scopes the cache key to the caller, thread, model and account', async t => {

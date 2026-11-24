@@ -281,7 +281,10 @@ eligible account or reports that none is available. Claude Code's status line
 shows the serving model and effort. An omitted effort uses the model default.
 
 **Session routing.** A session that starts on Codex stays on that provider
-by default and can move to another eligible Codex account. Other
+by default and can move to another eligible Codex account. While no
+account of the pinned provider can serve within 30 minutes (each is
+disabled, or out until a known weekly reset), the session may continue on
+another provider; the pin applies again once one can serve. Other
 providers keep their configured fallback behavior. In the Routing menu,
 press **o** to toggle the ChatGPT policy. Set `scheduler.sessionRouting` to
 `same-provider` or `cross-provider` for a pool-wide default, or override that

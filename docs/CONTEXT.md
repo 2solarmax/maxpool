@@ -85,6 +85,10 @@ Claude browser login matches only Claude OAuth accounts. Another provider can ke
 
 Show a named pair of 15-minute and 24-hour cache hit rates for Claude, GLM, and Codex when provisioned. A dash marks an idle or unmeasured window. Routing details show per-provider misses on their own line, and `maxpool status` keeps the existing quota-burn wording.
 
+### 2026-11-24 · A stranded Codex session pin is released
+
+Every Codex account reached its weekly limit and 187 Claude Code conversations that had started on Codex received "try again in about 5d" while Claude accounts had room. The same-provider pin is now ignored while no usable account of the pinned provider can serve within 30 minutes (Claude Code's absolute stream ceiling). An unknown reset keeps the pin, and the pin applies again after a reset. Cross-provider routing keeps its transcript-compatibility checks.
+
 ### 2026-11-19 · Codex prompt cache from Claude Code
 
 The Codex Messages adapter sends stable Claude Code system text as the first developer input and drops the per-request Anthropic billing header. The native transport gives OpenAI matching prompt and session cache keys scoped to the authenticated caller, Claude Code thread and agent, serving account and resolved model. The dashboard continues to measure upstream cache-read tokens over total input tokens.
