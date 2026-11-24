@@ -259,6 +259,40 @@ test('a native model-specific limit follows the account’s selected effort-comp
   assert.equal(am.hasAvailableRoute({ ...info, reasoningEffort: 'high' }), true);
 });
 
+test('a Codex-origin session continues on Claude through the proxy when every Codex account is out', async t => {
+  const hits = [];
+  const claudeUpstream = await listen(t, http.createServer((req, res) => {
+    hits.push('claude');
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_claude","model":"claude-haiku-5"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n');
+  }));
+  const reset = Math.floor(Date.now() / 1000) + 9000;
+  const codexUpstream = await listen(t, http.createServer(async (req, res) => {
+    for await (const chunk of req) { void chunk; }
+    hits.push('codex');
+    res.writeHead(200, { 'x-codex-primary-used-percent': '52',
+      'x-codex-primary-window-minutes': '10080', 'x-codex-primary-reset-at': String(reset) });
+    res.end('event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1","model":"gpt-6-luna"}}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}\n\n');
+  }));
+  const am = new AccountManager([
+    { name: 'healthy Claude', type: 'apikey', apiKey: 'fake-claude', upstream: claudeUpstream },
+    native('one', codexUpstream + '/v1/responses'),
+  ], 0.95, { routingMode: 'balance' });
+  const url = await listen(t, createProxyServer(am, { proxy: { apiKey: 'fixture' }, queue: { enabled: false } }));
+  const session = 'default-fallback-thread';
+  const first = await request(url, 'claude-haiku-5', session, 'start on codex', {}, { 'x-maxpool-provider': 'codex' });
+  assert.equal(first.status, 200);
+  await first.text();
+  assert.deepEqual(hits, ['codex']);
+  const codex = am.accounts[1];
+  codex.quota.unified7d = 1;
+  codex.quota.unified7dReset = Date.now() + 5 * 86_400_000;
+  const second = await request(url, 'claude-haiku-5', session, 'codex is out for days');
+  assert.equal(second.status, 200);
+  assert.match(await second.text(), /msg_claude/);
+  assert.deepEqual(hits, ['codex', 'claude'], 'the default routing continues the Codex-origin session on Claude');
+});
+
 test('a named pin cannot override a sticky Codex provider on the same caller and session', () => {
   const am = new AccountManager([native('codex', null), { name: 'claude', type: 'apikey', apiKey: 'fake' }], 0.9,
     { providers: { codex: { sessionRouting: 'same-provider' } } });
