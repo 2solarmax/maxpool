@@ -280,13 +280,10 @@ no eligible class match exists, the configured routing policy selects another
 eligible account or reports that none is available. Claude Code's status line
 shows the serving model and effort. An omitted effort uses the model default.
 
-**Session routing.** A session that starts on Codex stays on that provider
-by default and can move to another eligible Codex account. While no
-account of the pinned provider can serve within 30 minutes (each is
-disabled, or out until a known weekly reset), the session may continue on
-another provider; the pin applies again once one can serve. Other
-providers keep their configured fallback behavior. In the Routing menu,
-press **o** to toggle the ChatGPT policy. Set `scheduler.sessionRouting` to
+**Session routing.** A session that starts on Codex follows the same
+fallback rules as Claude, GLM and Kimi sessions: when no Codex account can
+serve it, another eligible provider can. In the Routing menu, press **o**
+to keep ChatGPT sessions on ChatGPT instead. Set `scheduler.sessionRouting` to
 `same-provider` or `cross-provider` for a pool-wide default, or override that
 default in `scheduler.providers.<name>.sessionRouting`. Provider names are
 `claude`, `zai`, `kimi`, and `codex`. Cross-provider routing still checks

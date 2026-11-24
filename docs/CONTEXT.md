@@ -85,9 +85,9 @@ Claude browser login matches only Claude OAuth accounts. Another provider can ke
 
 Show a named pair of 15-minute and 24-hour cache hit rates for Claude, GLM, and Codex when provisioned. A dash marks an idle or unmeasured window. Routing details show per-provider misses on their own line, and `maxpool status` keeps the existing quota-burn wording.
 
-### 2026-11-24 · A stranded Codex session pin is released
+### 2026-11-24 · Codex sessions use the shared provider fallback by default
 
-Every Codex account reached its weekly limit and 187 Claude Code conversations that had started on Codex received "try again in about 5d" while Claude accounts had room. The same-provider pin is now ignored while no usable account of the pinned provider can serve within 30 minutes (Claude Code's absolute stream ceiling). An unknown reset keeps the pin, and the pin applies again after a reset. Cross-provider routing keeps its transcript-compatibility checks.
+Every Codex account reached its weekly limit, and 187 Claude Code conversations that had started on Codex received "try again in about 5d" while Claude accounts had room. Codex was the only provider whose sessions were pinned by default (decision #10 below gave no reason beyond the default). Codex now defaults to `cross-provider`, like Claude, GLM and Kimi; the existing transcript-compatibility checks and `crossProviderFallbackPolicy` apply unchanged. `scheduler.providers.codex.sessionRouting: "same-provider"` (Routing menu **o**) restores the pin.
 
 ### 2026-11-19 · Codex prompt cache from Claude Code
 

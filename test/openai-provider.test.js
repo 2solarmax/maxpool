@@ -95,20 +95,18 @@ test('Claude Code Messages route falls back to ChatGPT and replays a full tool r
   assert.equal(am.accounts[2].completedRequests, 2);
 });
 
-test('per-provider cross routing leaves a ChatGPT thread eligible for Claude', () => {
-  const am = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9, {
-    providers: { codex: { sessionRouting: 'cross-provider' } },
-  });
+test('a ChatGPT thread is eligible for Claude by default and sticky only when configured', () => {
+  const am = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9);
   const request = { profile: 'all', codexCompatible: true, affinityKey: 'a', path: '/v1/messages' };
   am.noteConversationServed(request, am.accounts[0]);
   assert.equal(am.pinnedSessionProvider(request), null);
   assert.equal(am.getActiveAccount(request, new Set([0]))?.name, 'claude');
   am.scheduler.providers.codex.sessionRouting = 'same-provider';
-  am.noteConversationServed({ ...request, _notedServed: undefined }, am.accounts[0]);
+  assert.equal(am.pinnedSessionProvider(request), 'codex');
   assert.equal(am.getActiveAccount(request, new Set([0])), null);
   const restored = new AccountManager([codex(), { name: 'claude', type: 'apikey', apiKey: 'dummy' }], 0.9);
   restored.restoreSessionProviders(am.exportSessionProviders());
-  assert.equal(restored.pinnedSessionProvider(request), 'codex');
+  assert.equal(restored.pinnedSessionProvider(request), 'codex', 'the recorded pin applies once the provider asks for stickiness');
 });
 
 test('an early Responses quota error rotates to the next ChatGPT account', async t => {
@@ -304,35 +302,6 @@ test('the final provider snapshot replaces boot pins and honors current schedule
   assert.equal(manager.pinnedSessionProvider(thread), null);
   manager.restoreSessionProviders([]);
   assert.deepEqual(manager.exportSessionProviders(), []);
-});
-
-test('a Codex session pin is released while every Codex account is out past the longest client wait', () => {
-  const now = Date.now();
-  const manager = new AccountManager([codex(), codex({ name: 'chatgpt-2' }), { name: 'claude', type: 'apikey', apiKey: 'dummy' }]);
-  const thread = { clientThreadId: 'stuck', caller: 'owner' };
-  manager.restoreSessionProviders([['owner:cc:stuck', 'codex']]);
-  const [first, second] = manager.accounts;
-  const spend = (account, resetInMs) => {
-    account.quota.unified7d = 1;
-    account.quota.unified7dReset = now + resetInMs;
-  };
-  assert.equal(manager.pinnedSessionProvider(thread, now), 'codex');
-  spend(first, 5 * 86_400_000);
-  assert.equal(manager.pinnedSessionProvider(thread, now), 'codex', 'another Codex account can still serve');
-  spend(second, 20 * 60_000);
-  assert.equal(manager.pinnedSessionProvider(thread, now), 'codex', 'a reset within 30 minutes keeps the pin');
-  spend(second, 5 * 86_400_000);
-  assert.equal(manager.pinnedSessionProvider(thread, now), null, 'both Codex accounts are out for days');
-  second.quota.unified7dReset = null;
-  assert.equal(manager.pinnedSessionProvider(thread, now), 'codex', 'an unknown reset keeps the pin');
-  second.enabled = false;
-  assert.equal(manager.pinnedSessionProvider(thread, now), null, 'a disabled account cannot serve');
-  second.enabled = true;
-  second.quota.unified7dReset = now + 5 * 86_400_000;
-  const claude = manager.accounts[2];
-  const request = { ...thread, profile: 'all', codexCompatible: true, path: '/v1/messages', model: 'claude-sonnet-5' };
-  assert.equal(manager._isRequestCompatible(claude, 'all', request), true, 'Claude may serve the released conversation');
-  assert.equal(manager.exportSessionProviders().length, 1, 'the pin is not erased; it applies again after a reset');
 });
 
 test('only unresolved sticky family sends enter the final snapshot', () => {

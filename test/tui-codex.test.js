@@ -158,13 +158,13 @@ test('Codex routing toggle persists the live config before applying it', async (
     config,
     async saveConfig() { saved.push(config.scheduler.providers.codex.sessionRouting); },
   });
-  assert.equal(tui.am._sessionRoutingFor('codex'), 'same-provider');
-  await tui._toggleChatGPTSessionRouting();
-  assert.deepEqual(saved, ['cross-provider']);
   assert.equal(tui.am._sessionRoutingFor('codex'), 'cross-provider');
+  await tui._toggleChatGPTSessionRouting();
+  assert.deepEqual(saved, ['same-provider']);
+  assert.equal(tui.am._sessionRoutingFor('codex'), 'same-provider');
   assert.equal(config.scheduler.providers.zai.claudeFallback, 'always');
   tui.saveConfig = async () => { throw new Error('disk unavailable'); };
   await assert.rejects(tui._toggleChatGPTSessionRouting(), /disk unavailable/);
-  assert.equal(config.scheduler.providers.codex.sessionRouting, 'cross-provider');
-  assert.equal(tui.am._sessionRoutingFor('codex'), 'cross-provider');
+  assert.equal(config.scheduler.providers.codex.sessionRouting, 'same-provider');
+  assert.equal(tui.am._sessionRoutingFor('codex'), 'same-provider');
 });
