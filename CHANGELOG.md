@@ -5,6 +5,26 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.124] - 2026-11-24
+
+### Changed
+
+- Log heartbeat hedge outcomes with HTTP status and winner
+- Label hedge outcome by why the attempt launched, not by connection kind
+- Compare hedge-outcome lines from the tag, past the gate's timestamp
+- A Codex session pin must not outlive every Codex account's weekly limit
+- A Codex session with no servable Codex account continues on Claude
+- Sticky-provider tests opt into same-provider explicitly
+- Construct the sticky Codex policy the snapshot tests exercise
+- The restored manager also opts into sticky Codex routing
+- The takeover handoff test opts into sticky Codex routing
+- Codex-origin session continues on Claude by default when Codex is out
+
+### Fixed
+
+- Release a Codex session pin while every Codex account is out for days
+- Codex sessions use the shared provider fallback by default
+
 ## [1.24.123] - 2026-11-22
 
 ### Changed
