@@ -260,7 +260,8 @@ test('a native model-specific limit follows the account’s selected effort-comp
 });
 
 test('a named pin cannot override a sticky Codex provider on the same caller and session', () => {
-  const am = new AccountManager([native('codex', null), { name: 'claude', type: 'apikey', apiKey: 'fake' }]);
+  const am = new AccountManager([native('codex', null), { name: 'claude', type: 'apikey', apiKey: 'fake' }], 0.9,
+    { providers: { codex: { sessionRouting: 'same-provider' } } });
   const info = { clientThreadId: 'session-1', caller: 'sam', profile: 'all',
     path: '/v1/messages', model: 'claude-sonnet-5-2', codexCompatible: true };
   am.noteConversationServed(info, am.accounts[0]);
