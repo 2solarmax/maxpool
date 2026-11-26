@@ -1761,9 +1761,14 @@ async function forwardRequest(
       // client's requested Claude name. An older serving pool sends no provider header:
       // fall back to this mirror row's own provider.
       if (upRes.status < 300 && requestInfo._linkMessageId) {
+        // The serving pool answers in a header, or in-band when its keep-alive had already
+        // committed the headers (a slow first byte).
+        const inBand = requestInfo._linkServed || {};
         const servedProvider = upRes.headers.get(SERVED_PROVIDER_HEADER)
+          || (typeof inBand.provider === 'string' ? inBand.provider : null)
           || (SERVED_ROUTE_PROVIDERS.has(account.provider) ? account.provider : null);
-        const servedModel = upRes.headers.get(SERVED_MODEL_HEADER);
+        const servedModel = upRes.headers.get(SERVED_MODEL_HEADER)
+          || (typeof inBand.model === 'string' ? inBand.model : null);
         if (servedProvider && servedModel) accountManager.rememberMessageRoute?.(requestInfo._linkMessageId, servedProvider, servedModel);
       }
       if (refusalTap) {
@@ -5479,6 +5484,13 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
   const decoder = new TextDecoder();
   let sseBuffer = '';
   let committed = res.headersSent;
+  // SERVED ROUTE IN-BAND (2026-11-26): when a keep-alive already committed the headers
+  // (a slow provider first byte past the stream-forward grace), the served-route headers
+  // can no longer be sent. Carry them in one keep-alive-shaped ping instead, before the
+  // first real byte; clients already ignore pings, and a relaying pool reads it.
+  let servedRoutePing = committed && responseHeaders?.[SERVED_PROVIDER_HEADER] && responseHeaders?.[SERVED_MODEL_HEADER]
+    ? `event: ping\ndata: ${JSON.stringify({ type: 'ping', maxpool_served: { provider: responseHeaders[SERVED_PROVIDER_HEADER], model: responseHeaders[SERVED_MODEL_HEADER] } })}\n\n`
+    : null;
   let readFailed = false;
 
 
@@ -5605,6 +5617,10 @@ async function streamResponse(webStream, res, status, responseHeaders, accountIn
       if (!committed) {
         res.writeHead(status, responseHeaders);
         committed = true;
+      }
+      if (servedRoutePing) {
+        try { res.write(servedRoutePing); } catch { /* peer gone — nothing to tell */ }
+        servedRoutePing = null;
       }
 
       // MODEL ECHO NORMALIZATION (2026-08-31): provider upstreams echo their own model
@@ -5897,6 +5913,7 @@ function tapLinkUsage(chunk, requestInfo) {
     try { data = JSON.parse(dataLine.slice(6)); } catch { continue; }
     noteMessageEvent(requestInfo, data);
     if (data?.type === 'message_start' && typeof data.message?.id === 'string') requestInfo._linkMessageId ??= data.message.id;
+    if (data?.type === 'ping' && data.maxpool_served && typeof data.maxpool_served === 'object') requestInfo._linkServed ??= data.maxpool_served;
     const u = usageFromSseData(data);
     if (u) noteCapacityUsage(requestInfo, u, data.type === 'message_delta');
   }

@@ -19,12 +19,13 @@ const nonStream = id => JSON.stringify({ id, type: 'message', model: 'glm-5.4', 
 
 /** laptop proxy → linked pool → z.ai stub. The linked pool is a real maxpool proxy with one
  *  z.ai provider row (modelMap opus → glm-5.4), the same shape as the cloud pool. */
-async function rig(t, { local = false, stream = true } = {}) {
+async function rig(t, { local = false, stream = true, slowMs = 0, cloudGraceMs = null } = {}) {
   let served = 0;
   const ids = [];
   const zai = http.createServer((req, res) => {
     req.resume();
-    req.on('end', () => {
+    req.on('end', async () => {
+      if (slowMs) await new Promise(r => setTimeout(r, slowMs));
       served++;
       const id = 'msg_20261126fixture' + served;
       ids.push(id);
@@ -37,7 +38,7 @@ async function rig(t, { local = false, stream = true } = {}) {
     authHeader: 'authorization', profiles: ['all'], priority: 0, modelMap: { opus: 'glm-5.4', sonnet: 'glm-5.4', haiku: 'glm-5.3-flash', default: 'glm-5.4' }, stripBetaHeaders: true });
   const cloudAm = new AccountManager([glmRow()], 0.9, { crossProviderFallbackPolicy: 'when-exhausted' });
   // The link authenticates with the linked pool's key, exactly as the laptop does.
-  const cloud = createProxyServer(cloudAm, { proxy: { apiKey: 'mp-max' }, queue: { enabled: false } });
+  const cloud = createProxyServer(cloudAm, { proxy: { apiKey: 'mp-max' }, queue: { enabled: false, ...(cloudGraceMs == null ? {} : { streamForwardGraceMs: cloudGraceMs }) } });
   const cloudPort = await listen(cloud);
   // local: the row lives on THIS pool and no link exists (a linked twin would be benched
   // by the duplicate guard). Otherwise this pool has no rows of its own, only the link.
@@ -80,6 +81,19 @@ test('a GLM turn served by a LOCAL provider row is remembered (scope check: the 
   const res = await turn(r.port, true, 'local-stream');
   assert.equal(res.status, 200);
   assert.ok(r.am.accounts.some(a => !a.remote), 'a local row exists');
+  const got = await (await route(r.port, r.ids[0])).json();
+  assert.deepEqual(got, { provider: 'zai', model: 'glm-5.4' });
+});
+
+test('a slow GLM turn whose linked pool committed its keep-alive before the answer is still remembered', { timeout: 20_000 }, async t => {
+  // GLM thinking turns often sit silent past the stream-forward grace, so the linked
+  // pool commits SSE headers + keep-alive BEFORE the provider answers; its served-route
+  // headers can no longer be sent. Live share 2026-11-26: about 1 in 10 GLM turns.
+  const r = await rig(t, { slowMs: 400, cloudGraceMs: 50 });
+  const res = await turn(r.port, true, 'link-slow');
+  assert.equal(res.status, 200);
+  assert.match(res.text, /event: ping/, 'the linked pool committed its keep-alive first');
+  assert.match(res.text, /"model":"claude-opus-5-5"/);
   const got = await (await route(r.port, r.ids[0])).json();
   assert.deepEqual(got, { provider: 'zai', model: 'glm-5.4' });
 });
