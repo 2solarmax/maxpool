@@ -5,6 +5,12 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.125] - 2026-11-26
+
+### Fixed
+
+- Last-route answers for GLM/Kimi turns served through a linked pool
+
 ## [1.24.124] - 2026-11-24
 
 ### Changed
