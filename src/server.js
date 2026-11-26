@@ -1755,6 +1755,17 @@ async function forwardRequest(
         } finally { try { await reader.cancel(); } catch { /* already done */ } }
         if (upRes.status < 300) tapLinkUsage(null, requestInfo);   // flush the non-stream tail
       }
+      // LINK LAST-ROUTE (2026-11-26): remember which provider/model served this relayed
+      // reply, from the serving pool's served-route headers. Without it every link-served
+      // GLM/Kimi turn answered /maxpool/last-route with 404 and the status line showed the
+      // client's requested Claude name. An older serving pool sends no provider header:
+      // fall back to this mirror row's own provider.
+      if (upRes.status < 300 && requestInfo._linkMessageId) {
+        const servedProvider = upRes.headers.get(SERVED_PROVIDER_HEADER)
+          || (SERVED_ROUTE_PROVIDERS.has(account.provider) ? account.provider : null);
+        const servedModel = upRes.headers.get(SERVED_MODEL_HEADER);
+        if (servedProvider && servedModel) accountManager.rememberMessageRoute?.(requestInfo._linkMessageId, servedProvider, servedModel);
+      }
       if (refusalTap) {
         const text = Buffer.concat(refusalTap).toString('utf8');
         let why = text;
@@ -2976,6 +2987,18 @@ async function forwardRequest(
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
+    }
+    // SERVED-ROUTE HEADERS (2026-11-26): the model echo below is normalized back to the
+    // client's requested Claude name, so a pool that only RELAYS this answer (a laptop
+    // forwarding over a pool link) cannot see which model really served it. Name the
+    // provider and the model this pool sent upstream, so the relaying pool can answer
+    // /maxpool/last-route for the reply. Codex already sets the model header itself.
+    if (SERVED_ROUTE_PROVIDERS.has(account.provider)) {
+      responseHeaders[SERVED_PROVIDER_HEADER] = account.provider;
+      if (!responseHeaders[SERVED_MODEL_HEADER]) {
+        const sent = servedModelFor(account, requestInfo.model);
+        if (sent) responseHeaders[SERVED_MODEL_HEADER] = sent;
+      }
     }
 
     if (!upstreamRes.body) {
@@ -5349,6 +5372,18 @@ function sanitizeBlocksForProvider(json) {
   }
 }
 
+const SERVED_ROUTE_PROVIDERS = new Set(['codex', 'zai', 'kimi']);
+const SERVED_PROVIDER_HEADER = 'x-maxpool-served-provider';
+const SERVED_MODEL_HEADER = 'x-maxpool-served-model';
+
+/** The model id this pool sends upstream for a provider row — the same mapping the body
+ *  rewrite applies. Null when the row has no mapping (the client's name passes through). */
+function servedModelFor(account, requestedModel) {
+  if (account.model) return account.model;
+  if (account.modelMap && requestedModel) return mappedModel(requestedModel, account);
+  return null;
+}
+
 function mappedModel(originalModel, account) {
   if (account.model) return account.model;
   const map = account.modelMap || {};
@@ -5830,6 +5865,12 @@ function tapLinkUsage(chunk, requestInfo) {
   if (!requestInfo.stream) {
     if (chunk) {
       const text = Buffer.from(chunk).toString();
+      // The reply id leads a non-streaming message body; keep only the head to find it.
+      if (requestInfo._linkMessageId === undefined) {
+        requestInfo._linkHead = ((requestInfo._linkHead || '') + text).slice(0, 4096);
+        const m = /^\s*\{[^{}]*?"id"\s*:\s*"([^"\\]{1,300})"/.exec(requestInfo._linkHead);
+        if (m) { requestInfo._linkMessageId = m[1]; delete requestInfo._linkHead; }
+      }
       if (requestInfo._service) {
         requestInfo._linkedEnvelope ??= new LinkedMessageEnvelope();
         requestInfo._linkedEnvelope.push(text);
@@ -5855,6 +5896,7 @@ function tapLinkUsage(chunk, requestInfo) {
     let data;
     try { data = JSON.parse(dataLine.slice(6)); } catch { continue; }
     noteMessageEvent(requestInfo, data);
+    if (data?.type === 'message_start' && typeof data.message?.id === 'string') requestInfo._linkMessageId ??= data.message.id;
     const u = usageFromSseData(data);
     if (u) noteCapacityUsage(requestInfo, u, data.type === 'message_delta');
   }
