@@ -331,9 +331,14 @@ shared weekly reset policy after a fresh quota reading:
   accounts per held reset with ample weekly and session headroom carry the load
   instead, however far the free refill is. The hold ends the moment that room is
   gone.
+- **An expiring credit gets its account filled first.** Within a week of a
+  spendable credit's expiry the pool stops pricing that account on its weekly
+  usage, so work goes to it instead of to emptier accounts and it reaches the
+  point where the credit is worth spending. A short burst cannot spend a credit,
+  and a credit with weeks left changes nothing.
 - **A credit about to expire is spent rather than wasted**, unless it still has
-  half a day left after the free refill — the last resort, which the cap lift is
-  there to make rare.
+  half a day left after the free refill. This is the last resort; filling the
+  account ahead of time is what makes it rare.
 
 Token counts requested on the ChatGPT route are estimates. Claude Code
 Remote Control can steer the same running terminal session from a browser

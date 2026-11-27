@@ -371,6 +371,15 @@ export class ResetCreditRedeemer {
    *  available, plan-supported and unexpired, on an account this pool owns and may
    *  spend on its own, with no redeem attempt cooling down. Null when there are none or
    *  the rows are not known. Never the upstream count. */
+  /** The soonest expiry among the credits that could be spent on `account` (same rows
+   *  as liftRows), or null when there are none. */
+  spendableExpiry(account, now = this.now()) {
+    const rows = this.liftRows(account, now);
+    if (!rows) return null;
+    const dated = rows.map(credit => credit.expiresAt).filter(at => Number.isFinite(at));
+    return dated.length ? Math.min(...dated) : null;
+  }
+
   liftRows(account, now = this.now()) {
     const details = this.opportunityDetails.get(account);
     if (!details?.credits || !this._owns(account) || !automaticFor(account)) return null;

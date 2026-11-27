@@ -98,6 +98,16 @@ export const POLICY = {
   earlyHoldFloor: 0.01,
   // The average burn needs a meaningful slice of the week behind it.
   earlyMinElapsedMs: 3600 * 1000,
+  // R8.3 PLAN AHEAD (owner, 2026-11-27: spending an expiring reset on an account that
+  // is not full is "the final precaution ... really stupid if we ever end up in this
+  // situation"): once a spendable credit has this long left, work is steered to its
+  // account so it reaches the point where the reset is worth spending — on a full
+  // account, well before expiry — instead of dying unused on an idle one.
+  steerBeforeExpiryMs: 7 * 24 * 3600 * 1000,
+  // How much of a head start the steering needs, as a share of the week: the account
+  // must be able to reach the spend point (its ceiling less the 3% margin) from where
+  // it is, at the pool's recent demand, with this much of the credit's life to spare.
+  steerLeadShare: 0.25,
 };
 
 // The plain-words decision reason for an R7 hold — exported so status/log surfaces
@@ -179,6 +189,18 @@ export function earlyClaimVerdict({ util, ceiling, refillAt, returnAt, now }) {
     return { kind: 'hold', reason: HOLD_CAPACITY_RETURNS };
   }
   return { kind: 'due' };
+}
+
+/** R8.3 PLAN AHEAD: should work be steered to `account` now, so the spendable credit
+ *  it holds is used on a full account before it expires? True when a confirmed credit
+ *  expires within POLICY.steerBeforeExpiryMs, the pool may spend it on its own, and the
+ *  account still has room to fill first (at or past the spend point the early claim
+ *  takes over). The caller decides whether there is demand to steer; this only says
+ *  the credit is worth filling the account for. */
+export function codexSteerForExpiry({ expiresAt, util, ceiling, now } = {}) {
+  if (!Number.isFinite(expiresAt) || !(expiresAt > now) || expiresAt - now > POLICY.steerBeforeExpiryMs) return false;
+  if (!Number.isFinite(util) || !Number.isFinite(ceiling)) return false;
+  return util < ceiling - POLICY.earlyMargin;
 }
 
 /** Is this the account whose banked Codex resets the pool may spend on its own? The

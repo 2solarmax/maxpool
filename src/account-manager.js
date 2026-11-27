@@ -14,7 +14,7 @@ import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 // A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
 import { appliesTo, clearsGeneralWeekly, forgetClaimOrg } from './claude-reset-grants.js';
-import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM, codexAutoResetOn } from './reset-policy.js';
+import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM, codexAutoResetOn, codexSteerForExpiry } from './reset-policy.js';
 import {
   LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
   CLAIM_BACKOFF_CAP_MS, MAX_QUOTA_RETRY_MS, REACTIVE_CLAIM_TIMEOUT_MS, CLAIM_FRESH_MS,
@@ -4572,6 +4572,10 @@ export class AccountManager {
     for (const p of this.accounts) {
       if (selfGroup.has(p) || p.provider !== 'codex' || p.type !== 'oauth' || p.enabled === false) continue;
       if (p.poolBenchedBy || p.refreshDead || p.subscriptionGone || this.capacityIdentity(p) == null) continue;
+      // Same health bar as countPeersWithRoom: an account that is throttled, in error,
+      // exhausted or cooling down is not a refill about to land (review 2026-11-27).
+      if (p.status === 'throttled' || p.status === 'error' || p.status === 'exhausted') continue;
+      if (p.cooldownUntil && p.cooldownUntil > now) continue;
       const peerModels = p.quota?.codexModels ?? p.codexModels;
       if (!peerModels?.length || ownModels.some(model => !peerModels.some(peer => peer.slug === model.slug))) continue;
       const q = p.quota || {};
@@ -4718,7 +4722,7 @@ export class AccountManager {
     // A FULL lift refilled the week: like every other weekly term, the tie-break must
     // not price it on its pre-refill usage (else a lifted 0.97 is worst-of-pool again).
     const absUsed = this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)
-      ? this._absWeeklyUsed(account) : 0;
+      && !this._steersForExpiringCredit(account, now) ? this._absWeeklyUsed(account) : 0;
     const utilizationCost = (this._rawUtilization(account) + ABS_UTIL_WEIGHT * absUsed) * this.scheduler.utilizationWeight * refillMult * resetMult;
 
     // Per-model weekly de-preference: an account whose scoped weekly for THIS
@@ -5332,6 +5336,11 @@ export class AccountManager {
     if (q.providerWk != null && !weeklyFree) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.providerWk, q.providerWkReset, WEEK_MS, now));
     }
+    // R8.3 PLAN AHEAD: an account holding a soon-expiring spendable credit must be
+    // FILLED before the credit dies, so its weekly usage must not make it dearer than
+    // its siblings. The weekly terms are dropped (as for a lifted account); the 5h
+    // window and load terms still apply, so this never overloads one account.
+    if (scarcity > 0 && this._steersForExpiringCredit(account, now)) scarcity = 0;
     return scarcity;
   }
 
@@ -5365,7 +5374,8 @@ export class AccountManager {
     // signal (the actual fix) while capacity dying at reset stays free (the
     // invariant the older tests pin). Unknown/absent reset → face value, same as
     // _accountScarcity. Turn the flag off to restore session-only exactly.
-    if (this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)) {
+    if (this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)
+      && !this._steersForExpiringCredit(account, now)) {
       if (q.unified7d != null) {
         util = Math.max(util, this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now));
       }
@@ -5381,6 +5391,21 @@ export class AccountManager {
     const q = account?.quota;
     if (!q) return 0;
     return Math.max(q.unified7d != null ? clamp01(q.unified7d) : 0, q.providerWk != null ? clamp01(q.providerWk) : 0);
+  }
+
+  /** R8.3 PLAN AHEAD: is `account` holding a spendable credit that will expire soon
+   *  enough that the pool should fill this account first, so the credit is spent on a
+   *  full account instead of dying unused? Confirmed rows only (codexResetSpendableExpiry
+   *  → liftRows), a current weekly reading, and room left to fill. */
+  _steersForExpiringCredit(account, now = Date.now()) {
+    if (account?.provider !== 'codex' || account.remote || account.poolBenchedBy) return false;
+    if (!codexAutoResetOn(account)) return false;
+    const q = account.quota || {};
+    if (!(now - q.codexWeeklyReadingAt <= CLAIM_FRESH_MS)) return false;
+    const expiresAt = this.codexResetSpendableExpiry?.(account, now);
+    if (expiresAt == null) return false;
+    return codexSteerForExpiry({ expiresAt, util: q.unified7d,
+      ceiling: Math.min(CLAUDE_WALL_WEEKLY, this._effectiveCap(account, 'wk', now) ?? 1), now });
   }
 
   _windowScarcity(util, resetMs, windowLen, now = Date.now()) {
