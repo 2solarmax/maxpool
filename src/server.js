@@ -3,6 +3,7 @@ import { createCodexClientRoute, isCodexClientPath } from './codex-client-route.
 import { fetchBoundedOpenAIResponse, fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest, webSearchesInTurn } from './openai-responses.js';
 import { nativeCodexHeaders, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
 import { codexModelFor, validCodexCatalog } from './codex-model-routing.js';
+import { weeklyLimitReached } from './reset-policy.js';
 import { codexRateLimit } from './codex-quota.js';
 import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
@@ -2322,7 +2323,7 @@ async function forwardRequest(
       // account for the NEXT request when it lands. Never awaited here.
       if (accountManager.tryReactiveClaim && !account.remote) {
         const weeklyHdr = Number(rateLimitHeaders['anthropic-ratelimit-unified-7d-utilization']);
-        const weeklyWall = Number.isFinite(weeklyHdr) && weeklyHdr >= 0.999;
+        const weeklyWall = weeklyLimitReached(weeklyHdr);
         const kind = weeklyWall ? 'weekly' : (rateLimit.modelScope || null);
         if (kind) {
           try {

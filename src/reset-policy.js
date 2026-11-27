@@ -1,78 +1,14 @@
-/**
- * WHEN to redeem a limit-reset: the deliberate decision layer.
- *
- * Sources normalized into the shared reset policy:
- *  - z.ai reset cards: { fiveHour:[{recordId,expiresAt,expired}], weekly:[...] }
- *  - Claude cedar_ember grants: { grants:[{id,resetsLeft,endsAt,usableNow,paused,
- *    requiresLimit,clears}], nextGrantId, cooldownUntil, eligible }
- *  - Codex banked credits: general-weekly grants after plan and expiry checks
- *
- * Rules (owner, 2026-09-30 — "account not just for exhaustion, but also the time
- * left until expiry of the reset"):
- *
- * R0  ENABLED GATE — the caller must never even ask about a disabled account. The
- *     policy asserts it too: a disabled account's cards/grants are someone else's.
- *     (privacy@gomokka.com: owner uses it elsewhere; readable key is not authority.)
- *
- * R1  AT-THE-WALL — redeem when the window the reset clears is effectively spent:
- *     weekly >= 0.90, or (no weekly-clearing reset and 5h >= 0.95). Wall, not 100%:
- *     routing benches an account before the bar reads full.
- *
- * R2  DYING VALUE — a reset expiring soon is worth MORE than waiting: redeem when
- *     expiry < 24h AND the account has consumed enough that the refill buys real
- *     capacity (utilization > 0.30 for weekly-clearing; > 0.50 for 5h-only). At
- *     expiry the reset is worth zero, so "save it for a worse moment" is the
- *     false economy — the worse moment must occur BEFORE expiry or never.
- *
- * R3  EXPIRED — never redeem an expired reset (idempotent keys protect retries,
- *     but a redeem against an expired card is just a guaranteed API error).
- *
- * R4  ORDER — prefer the reset that clears the MOST (weekly clears both windows);
- *     among equals, the soonest-expiring first. Never spend a weekly-clearing
- *     reset when a 5h-only one would do — EXCEPT under R2 with <24h left on the
- *     weekly reset and no 5h reset at all.
- *
- * R5  PACE — at most ONE redeem per account per evaluation. The caller invokes the
- *     policy each poll cycle; the deterministic z.ai requestId makes an accidental
- *     double-fire harmless, but the policy still returns a single action.
- *
- * R8  EXACT LIMIT (owner, 2026-11-27, superseding the near-full decisions): "It should
- *     fire once the limit is reached!" A weekly reset — Codex credit, Claude grant or
- *     z.ai card — is spent when the limit it clears is REACHED, never at a routine
- *     96/99/90%. An OPERATOR usage cap is not provider exhaustion: a cap that binds is
- *     never a reason to spend (a full reset lifts the cap instead — see the cap lift).
- *     The ONE spend below the limit is R2, the final precaution for a reset that is
- *     genuinely dying before the free refill. The R7 capacity hold still applies at the
- *     limit, and a weekly reset is never spent for a session limit alone.
- *
- *     (This replaces the earlier "early claim": a confirmed credit spent at 3% of room
- *     left to its ceiling, with a burn-rate wait for a compatible account. That spent
- *     resets ahead of the limit, and measured its margin to the operator's cap.)
- *
- * R6  WAIT FOR THE FREE REFILL (owner, 2026-10-23) — a wall redeem (R1) burns a card
- *     that z.ai's free weekly refill is about to make redundant: when the refill
- *     lands <24h away and weekly util < 0.98, HOLD the card. At >= 0.98 redeem
- *     immediately — the owner is never blocked waiting for a free refill that is
- *     merely hours away. Dying-value redeems (R2) are exempt: an expiring card's
- *     value cannot survive a wait.
+/** Automatic resets require a measured 100% on the window the reset clears.
+ * Expiry affects card ordering and routing, never whether partial use is full.
+ * A free refill with spare capacity can make spending unnecessary even at 100%.
  */
 import { appliesTo as defaultAppliesTo } from './claude-reset-grants.js';
 import { CLAIM_FRESH_MS, CLAIM_STALE_LISTING_MAX_MS } from './reset-timing.js';
 
 export const POLICY = {
-  // z.ai weekly card wall = the limit (owner, 2026-11-27: "No reset should fire until
-  // the account has been fully utilized. 100%."). It was 0.90 with a 0.98 release
-  // valve; both were artefacts of spending before the limit and are gone. The
-  // free-refill hold (R6) now applies AT the limit.
   wallWeekly: 1,
-  wallSes: 0.95,          // 5h at 95% = at the wall
-  dyingWindowMs: 24 * 3600 * 1000, // redeem-don't-save horizon
-  dyingMinUtilWeekly: 0.30, // below this a dying weekly refill buys too little
-  dyingMinUtilSes: 0.50,    // 5h refills are cheap capacity; demand more waste first
-  freeRefillWaitMs: 24 * 3600 * 1000, // R6: hold a wall redeem this close to the free refill
-  // R6 release valve (was freeRefillImmediate 0.98): only needed when the spend point
-  // sat below the limit. At the limit the hold itself is bounded — it ends the moment
-  // the account has no roomy peers, or the grant would die before the refill.
+  dyingWindowMs: 24 * 3600 * 1000, // Expiry affects routing, never the spend threshold.
+  freeRefillWaitMs: 24 * 3600 * 1000,
   // R7 (owner, 2026-11-13): the Claude GENERAL weekly wall claim also waits for the
   // free refill when OTHER accounts can absorb the load. Room per peer: probe-fresh
   // (≤5 min) readings, weekly util with ≥ 35% headroom left, 5h util with ≥ 25%
@@ -90,40 +26,14 @@ export const POLICY = {
   // before that bound (red-team r4 #6), while the reset is still claimable — a dark
   // listing is unknown state, and unknown means claim. The rescue runs every sweep.
   holdListingMarginMs: 30 * 60 * 1000,
-  // A dying reset is only worth holding for the free refill when enough of its life is
-  // left AFTER the refill for the account to climb back to dyingMinUtilWeekly and spend
-  // it usefully. One that dies sooner than this after the refill (or before it) would
-  // sit at ~0% used until it expires, so it is spent now.
-  refillSurvivalMs: 12 * 3600 * 1000,
-  // EXACT LIMIT (owner, 2026-11-27, superseding the near-full decisions): "It should
-  // fully utilized. 100%." — 2026-11-27). A reset is spent when the account's own
-  // reading says its limit is REACHED (a probe that reports 100%), or at the moment
-  // the provider refuses a request for that limit (the reactive 429 path). Nothing is
-  // spent before that on a routine 96/99/99.9% reading. The ONE spend below the limit
-  // is the final precaution for a genuinely dying reset (R2 + D4).
   limitReached: 1,
-  // The provider (z.ai) 5h window serves to 100% of itself (PROVIDER_SES_WALL), so a
-  // dedicated five-hour card is spent at exactly that wall and not before.
   sessionLimitReached: 1,
-  // PLAN AHEAD (owner, 2026-11-27: spending an expiring reset on an account that is
-  // not full is "the final precaution"): the final precaution is the LAST resort, so
-  // work is steered to the account of a DYING reset (dyingWindowMs) to give it a
-  // chance to reach the limit honestly first. It never steers for a reset with longer
-  // to live — a 7-day horizon filled accounts that were nowhere near their limit
-  // (review 2026-11-27), and it removed the SESSION cost of a busy account.
 };
 
 // The plain-words decision reason for an R7 hold — exported so status/log surfaces
 // and tests share one string.
 export const HOLD_POOL_HAS_ROOM = 'other accounts have room';
 
-// Claude cedar_ember claims read their OWN wall — deliberately NOT POLICY.wallWeekly
-// (0.90) which z.ai shares; moving the shared constant would redeem GLM cards at a
-// different point. EXACT LIMIT (owner, 2026-11-27): the claim wall IS the limit —
-// POLICY.limitReached, the same 0.999 the router benches a weekly at. The earlier 0.99
-// ("the weekly is effectively spent") was a near-full decision: it spent a reset while
-// the account still had a day of its week to serve. One constant, so the claim and the
-// bench can never disagree.
 export const CLAUDE_WALL_WEEKLY = POLICY.limitReached;
 
 // Claim freshness bound (C1, pre-mortem #5): the usage reading the claim decides on
@@ -131,20 +41,6 @@ export const CLAUDE_WALL_WEEKLY = POLICY.limitReached;
 // ~36 min stale after failed probes) would spend a reset right after a free refill.
 // The value lives in the shared timing leaf; re-exported for existing callers.
 export { CLAIM_FRESH_MS };
-
-function msLeft(t, now) { return t == null ? Infinity : t - now; }
-
-/** Whether a reset lives long enough past the free refill of the limit it clears to be
- *  worth holding for it (D4). The refill makes a held reset redundant only then. A reset
- *  that dies BEFORE the refill is worth zero at expiry (reported 2026-11-27: a Codex
- *  credit with 12h left, the refill 20h out), and one that dies just AFTER it meets the
- *  refilled account at ~0% used and expires unspent: both are spent now. The z.ai card
- *  rule never held a dying card (W5); Claude grants and Codex credits answer the same
- *  way, with POLICY.refillSurvivalMs as the life that must be left after the refill.
- *  No end date = never expires = survives it. */
-function outlivesRefill(grant, refillAt) {
-  return grant?.endsAt == null || grant.endsAt - refillAt >= POLICY.refillSurvivalMs;
-}
 
 /** A scoped (per-model) bucket reading the decision can act on: a reading that is not
  *  the authority of a 429 (`reactive`), is still an active limit, has a utilization and
@@ -224,14 +120,14 @@ export function wallClaimHeld(refillAt, grant, now, { peersWithRoom, holdersInPo
 }
 
 /** Decide the z.ai action. Returns {kind:'card', card, resetType} | null. */
-export function decideZai(account, cards, now = Date.now()) {
-  if (account?.enabled === false) return null;               // R0
+export function decideZai(account, cards, now = Date.now(), { peersWithRoom } = {}) {
+  if (!account || account.enabled === false || account.poolBenchedBy || account.remote || account.subscriptionGone || account.refreshDead || account.quota?.noPlan) return null;               // R0
   if (!cards || cards.error) return null;
   if (account?.outsideUsage?.outside) return null;          // R7: key used by someone else — a card would feed the leak
   const q = account.quota || {};
   const wkUtil = q.weeklyAbsent ? null : (q.providerWk ?? null);
 
-  const weeklyCards = (cards.weekly || []).filter(c => !c.expired && c.recordId != null);
+  const weeklyCards = (cards.weekly || []).filter(c => c && !c.expired && c.recordId != null && (c.expiresAt == null || c.expiresAt > now));
   // R4: soonest expiry first inside each class.
   weeklyCards.sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity));
 
@@ -239,22 +135,15 @@ export function decideZai(account, cards, now = Date.now()) {
 
   // --- weekly card: clears BOTH windows (z.ai docs; measured: glm1 100%->0% both)
   if (weeklyCard) {
-    const atWall = wkUtil != null && wkUtil >= POLICY.wallWeekly;
-    // Dying gate reads the WEEKLY window alone (owner 2026-10-30: resets are never
-    // spent on session limits). The old Math.max(wk,ses) let a 96% 5h window redeem
-    // a scarce weekly card — the exact trade the owner banned.
-    const dying = msLeft(weeklyCard.expiresAt, now) < POLICY.dyingWindowMs
-      && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;
-    if (atWall || dying) {
-      // R6: a wall redeem waits when the FREE weekly refill is imminent and the
-      // account isn't critically full (dying-value redeems stay exempt above).
-      if (atWall && !dying && q.providerWkReset != null
-          && msLeft(q.providerWkReset, now) < POLICY.freeRefillWaitMs) {
-        /* HELD for the free refill — do not redeem */
-      } else {
-        return { kind: 'card', card: weeklyCard, resetType: 'WEEK',
-                 reason: atWall ? 'weekly at wall' : 'dying value' };
-      }
+    if (weeklyLimitReached(wkUtil)) {
+      const refill = q.providerWkReset;
+      const remaining = refill - now;
+      if (Number.isFinite(refill) && remaining <= 0) return null;
+      const canWait = remaining > 0 && remaining < POLICY.freeRefillWaitMs
+        && (weeklyCard.expiresAt == null || weeklyCard.expiresAt > refill)
+        && peersWithRoom?.() >= POLICY.holdMinPeers;
+      if (!canWait) return { kind: 'card', card: weeklyCard, resetType: 'WEEK', reason: 'weekly at wall' };
+      return null; // A session-only card cannot clear the weekly limit.
     }
   }
 
@@ -274,7 +163,7 @@ export function decideZai(account, cards, now = Date.now()) {
   if (fiveHourCards.length) {
     const sesUtil = q.providerSes;
     const sessionOnlyBlocker = account.poolBenchedBy == null && !account.subscriptionGone && !account.refreshDead;
-    if (sessionOnlyBlocker && Number.isFinite(sesUtil) && sesUtil >= POLICY.sessionLimitReached) {
+    if (sessionOnlyBlocker && !weeklyLimitReached(wkUtil) && (q.providerSesReset == null || q.providerSesReset > now) && Number.isFinite(sesUtil) && sesUtil >= POLICY.sessionLimitReached) {
       return { kind: 'card', card: fiveHourCards[0], resetType: 'FIVE_HOUR', reason: 'session at limit' };
     }
   }
@@ -295,39 +184,7 @@ export function probeSentAt(q) {
   return q?.lastProbeOkSentAt ?? q?.lastProbeOkAt ?? null;
 }
 
-/** Decide the Claude action AND say why when there is none.
- *  Returns { action: {kind:'grant', grant, scope, giveBack?, reason} | null,
- *            reason: string | null, heldScope?: string | null }  — `reason` names
- *  the rejection when action is null (C5: the skip log prints exactly this), or the
- *  claim reason; `heldScope` is 'general' whenever the R7 hold kept the general
- *  weekly wall unclaimed on this decision — on EVERY return after that point, a claim
- *  of a dying model grant included, so the caller always registers the hold (null: none).
- *
- *  C1 (amended, 2026-11-10): the claim is decided per grant by appliesTo (D1),
- *  NEVER by the server's nextGrantId order alone (pre-mortem #8: a Fable 429 could
- *  pick the general grant through that order). Freshness gates (pre-mortem #5):
- *  lastProbeOkAt within CLAIM_FRESH_MS, unified7dReset in the future (a window
- *  that just rolled means 0% used — don't spend on it), and a probe SENT after
- *  any claim we already made (no second claim for one wall).
- *  D4: a dying-value claim (not at the wall) waits when the free refill of the
- *  limit it clears is < 24h away AND the grant still has POLICY.refillSurvivalMs of life
- *  after that refill (outlivesRefill); one that dies before, or just after, the refill is
- *  claimed now. A wall claim never waits (limit effectively full). Scoped readings that
- *  are inactive or already rolled over are ignored (liveScopedReading).
- *  Session-only grants are NEVER claimed (owner 2026-10-30).
- *  R7 (owner, 2026-11-13, task-2026-11-13-maxpool-hold-resets-when-pool-has-room):
- *  the GENERAL weekly WALL claim is HELD when its free refill is < 24h away
- *  (freeRefillWaitMs) AND opts.peersWithRoom() answers at least POLICY.holdMinPeers
- *  × opts.holdersInPool() — other accounts in THIS pool can absorb the load. Model
- *  (Fable) walls are never held (red-team r3) — but while the general wall is held the
- *  model WALL claim is skipped too: the account is benched by its general wall, so a
- *  Fable reset would buy nothing until the general refill lands — unless that grant
- *  would expire before (or within dyingWindowMs after) the refill: then it is claimed. The hold
- *  re-evaluates every decision tick (the caller supplies a live count), and fails
- *  CLAIM-side: capacity unknown (no counter, non-number answer) or a grant that
- *  would expire before the refill (or within a day after it — it would sit unspent
- *  at ~0% used) is claimed as today. Dying-value claims stay exempt: an expiring
- *  grant's value cannot survive any wait. */
+/** Returns a claim or the reason it is held; scoped windows require a measured, active reading. */
 function decideSubscriptionWithReason(account, listing, now, opts) {
   const skip = reason => ({ action: null, reason });
   if (account?.enabled === false) return skip('account disabled');   // R0
@@ -365,14 +222,7 @@ function decideSubscriptionWithReason(account, listing, now, opts) {
   const wkUtil = q.unified7d ?? null;
   // EXACT LIMIT: the wall IS the limit (CLAUDE_WALL_WEEKLY === POLICY.limitReached).
   const weeklyWall = weeklyLimitReached(wkUtil);
-  // D4: the free refill of a limit < 24h away makes a not-at-the-wall spend redundant.
-  const refillSoon = resetAt => resetAt != null && msLeft(resetAt, now) < POLICY.freeRefillWaitMs;
-  // R7: hold the GENERAL wall claim for the imminent free refill while other accounts
-  // in this pool can absorb the load (wallClaimHeld). A hold NOTES its reason and
-  // moves on (red-team #2): the model-scoped loop below must still run, so a dying
-  // model grant is spent. `generalHeld` rides on every return after it (red-team r3
-  // #2) so the caller registers the hold even when this decision claims a dying model
-  // grant — it feeds the pool-wide budget and the held-wall rescue (r2 #1/#2).
+  // Record the general hold even if a separate model window is also full.
   let generalHeld = false;
   const out = (action, why) => ({ action, reason: why, heldScope: generalHeld ? 'general' : null });
   let reason = null;
@@ -394,27 +244,13 @@ function decideSubscriptionWithReason(account, listing, now, opts) {
       // used — the claim snapshots unified7d so the next probe measures the drop.
       return out({ kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'weekly at wall' }, 'weekly at wall');
     }
-    // THE FINAL PRECAUTION (owner, 2026-11-27: kept for a genuinely dying reset): a reset
-    // that dies soon is spent below the limit, because at expiry it is worth nothing.
-    // This is the ONE spend before the limit, and it needs the week to be far enough
-    // along that the refill buys real capacity.
-    const dying = msLeft(g.endsAt, now) < POLICY.dyingWindowMs
-      && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;  // weekly window only (owner 2026-10-30)
-    if (g.requiresLimit && dying) { note('requires limit'); continue; }
-    if (dying) {
-      if (refillSoon(q.unified7dReset) && outlivesRefill(g, q.unified7dReset)) {
-        note('free refill <24h away'); continue;
-      }
-      return out({ kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'dying value' }, 'dying value');
-    }
   }
   if (weeklyWall && !general.length) note('general not held');
 
   // MODEL-SCOPED (D3): claim when THAT model's probe-measured weekly bucket is at
   // its wall. `reactive` entries (a 429's authoritative-high mark) do NOT count —
   // only the probe's own measurement (pre-mortem #3/#8: a scoped 429 classified by
-  // guesswork must not spend a reset). D4 dying-value is evaluated per bucket
-  // BEFORE the below-the-wall skip (it applies exactly there).
+  // guesswork must not spend a reset).
   const scopedFams = new Set();
   for (const g of grants) for (const s of appliesTo(g)) if (s !== 'general' && s !== 'session') scopedFams.add(s);
   for (const fam of scopedFams) {
@@ -432,12 +268,6 @@ function decideSubscriptionWithReason(account, listing, now, opts) {
       if (generalHeld && (cand.endsAt == null || cand.endsAt - q.unified7dReset >= POLICY.dyingWindowMs)) continue;
       return out({ kind: 'grant', grant: cand, scope: fam, reason: `${fam} weekly at wall` }, `${fam} weekly at wall`);
     }
-    const dying = msLeft(cand.endsAt, now) < POLICY.dyingWindowMs
-      && e.utilization >= POLICY.dyingMinUtilWeekly;
-    if (!dying) continue;
-    if (cand.requiresLimit) { note('requires limit'); continue; }
-    if (refillSoon(e.resetAt) && outlivesRefill(cand, e.resetAt)) { note('free refill <24h away'); continue; }
-    return out({ kind: 'grant', grant: cand, scope: fam, reason: 'dying value' }, 'dying value');
   }
   // A scoped bucket measured at the wall with no grant for it.
   for (const [fam, e] of Object.entries(q.scopedWeekly || {})) {
@@ -457,10 +287,6 @@ export function decideClaudeWithReason(account, listing, now = Date.now(), opts 
 // actual weekly data can support the decision: an unrelated 5h/model reading
 // refreshing the account's generic probe timestamp is insufficient.
 //
-// The decision is the limit / dying rule (R8 EXACT LIMIT, R2 final precaution, R7
-// capacity hold). `opts.early` is accepted and IGNORED: the early claim it asked for
-// was removed (it spent a credit ahead of the limit, measured to the operator's cap).
-// Passing it is harmless, so no caller has to change to stop spending early.
 export function decideCodexWithReason(account, credits, now = Date.now(), opts = {}) {
   const q = account.quota || {};
   if (!(q.unified7dReset > now)) return { action: null, reason: 'weekly window unknown or elapsed' };

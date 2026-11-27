@@ -445,7 +445,11 @@ export class Prober {
             if (cards) {
               this.am.applyResetCards(account.index, cards);
               this._logCardListingTransition(account, cards);
-              const act = decideZai(account, cards);
+              // A failed or partial quota read can leave the cached 100% from an old window.
+              const measured = { ...account, quota: { ...account.quota,
+                providerSes: usage.ses?.utilization, providerWk: usage.wk?.utilization } };
+              const act = usage.error || usage.noPlan ? null : decideZai(measured, cards, this._now(),
+                { peersWithRoom: () => this.am.countPeersWithRoom?.(account, this._now()) });
               if (act) await this._redeemZaiCard(account, act);
             }
           } catch { /* cards are best-effort */ }

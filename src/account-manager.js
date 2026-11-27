@@ -148,7 +148,7 @@ const DEFAULT_SCHEDULER = {
   // remaining guard: don't fire a request at an account whose own header already says
   // it's essentially full (a near-guaranteed-waste hard-429). A real 429 sets util≈1.0
   // and still benches here. Critical (0.95-0.999) stays last-resort-only (pass 2).
-  weeklyExhaustedThreshold: 0.999,
+  weeklyExhaustedThreshold: POLICY.limitReached,
   // ── Situational CRITICAL unlock (2026-08-24) ────────────────────────────────
   // An account at critical (≥0.95 weekly) used to be pass-2-only: spent ONLY during
   // a total-fleet outage for the exact request, so its last ~5% usually died unused
@@ -4451,6 +4451,24 @@ export class AccountManager {
    *  Returns a plain integer (the minimum over self's profiles); the POLICY decides
    *  sufficiency (holdMinPeers × holders). */
   countPeersWithRoom(self, now = Date.now()) {
+    if (self?.provider === 'zai') {
+      const selfGroup = new Set(this.capacityGroupOf(self));
+      const groups = new Set();
+      for (const peer of this.accounts) {
+        if (peer.provider !== 'zai' || selfGroup.has(peer) || !peer.enabled || peer.poolBenchedBy
+          || peer.status !== 'active' || peer.refreshDead || peer.subscriptionGone || peer.quota?.noPlan
+          || peer.cooldownUntil > now || peer.remoteCooldownUntil > now || !this.capacityIdentity(peer)) continue;
+        if (peer.remote && (!peer.remote.link?.lastOkAt || peer.remote.link.lastError)) continue;
+        if (Object.entries(self.modelMap || {}).some(([slot, model]) => peer.modelMap?.[slot] !== model)) continue;
+        const q = peer.quota || {};
+        if (!(q.lastProbeOkAt > 0 && q.lastProbeOkAt <= now && now - q.lastProbeOkAt <= CLAIM_FRESH_MS)) continue;
+        if ((!q.weeklyAbsent && !(Number.isFinite(q.providerWk) && q.providerWk <= (this._effectiveCap(peer, 'wk', now) ?? 1) - POLICY.holdPeerWeeklyRoom))
+          || !(Number.isFinite(q.providerSes) && q.providerSes <= this._sessionBenchThreshold(peer, now) - POLICY.holdPeerSessionRoom)
+          || !this._isAvailable(peer, { now })) continue;
+        groups.add(Math.min(...this.capacityGroupOf(peer).map(a => a.index)));
+      }
+      return groups.size;
+    }
     // Peers are deduped by capacity GROUP, not identity string: an org-less twin
     // of the same subscription (uuid:U vs uuid:U:org) groups with self and must
     // never count as a second roomy member of the pool.
@@ -7928,6 +7946,7 @@ export class AccountManager {
     if (lastClaimAt != null && !((probeSentAt(account.quota) ?? -Infinity) > lastClaimAt)) return false;
     // No grant (or a scoped 429 without a probe-measured bucket) → the next sweep
     // decides on its own fresh reading.
+    if (kind === 'weekly' && !((Number.isFinite(_weeklyUtil) ? _weeklyUtil : account.quota?.unified7d) >= CLAUDE_WALL_WEEKLY)) return false;
     const grant = this._reactiveClaimGrant(account, kind, now);
     if (!grant) return false;
     // R7 (owner, 2026-11-13): a wall 429 claims a held reset only when the free

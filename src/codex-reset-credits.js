@@ -484,13 +484,9 @@ export class ResetCreditRedeemer {
       // Keep the cap lift in step with the stored rows on every sweep (no network): it
       // ends as soon as they age out, a redeem backs off, or automatic resets go off.
       this.am.refreshCapLift?.(account.index, now, 'credits refreshed');
-      // Which accounts are worth a decision. EXACT LIMIT (owner, 2026-11-27): the weekly
-      // reading must be at the limit (CLAUDE_WALL_WEEKLY === POLICY.limitReached), or far
-      // enough along that a DYING credit is the final precaution. Never the operator's
-      // usage cap: a cap that binds is a reservation, not provider exhaustion, so it is
-      // not a reason to read credits and spend one. A request refusal acts at the limit
-      // only.
-      const minimum = reactive ? CLAUDE_WALL_WEEKLY : Math.min(POLICY.dyingMinUtilWeekly, CLAUDE_WALL_WEEKLY);
+      // A cap or an expiring credit is not a full weekly window. Keep the listing
+      // current below the limit, without authorizing consumption.
+      const minimum = CLAUDE_WALL_WEEKLY;
       if (!(q.unified7d >= minimum) || !(q.unified7dReset > now)
         || !(now - q.codexWeeklyReadingAt <= CLAIM_FRESH_MS)) {
         // Nothing to decide on this account now. A sweep may still refresh the expiry
