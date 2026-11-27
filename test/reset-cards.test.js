@@ -499,6 +499,12 @@ test('a redeemed z.ai card puts a rate-limited account back in service at once',
     assert.notEqual(account.status, 'throttled', 'a fresh week must not stay behind a stale park');
     assert.equal(am._isAvailable(account, { model: 'glm-5.4' }), true, 'the account can serve again');
     assert.ok(account.quota.providerWk < 0.1, `usage re-read after the reset (wk=${account.quota.providerWk})`);
+    // A later, unrelated failure on a parked account must not keep it parked: an in-flight
+    // request that ends in a timeout or a 5xx rewrites lastError while the bench stays.
+    am.markRateLimited(0, 24 * 3600, { status: 429 });
+    account.lastError = 'upstream_error'; account.lastErrorAt = Date.now();
+    assert.equal(am.clearRateLimited(0), true, 'lifted on status alone');
+    assert.equal(account.status, 'active');
     // A non-quota bench is NOT lifted: an auth error or a cooldown is not about quota.
     am.markRateLimited(0, 60, { status: 429 });
     am.markAuthFailed(0, 403);

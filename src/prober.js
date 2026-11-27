@@ -516,9 +516,10 @@ export class Prober {
         this._cardTries?.set(key, 0);                   // ...and the failure count (red-team 2026-10-23)
         this.log(`[reset-card] ${account.name}: card ${act.card.recordId} redeemed`);
         // The reset opened a new window: a "rate limited" bench from the old one is
-        // stale now. Lift it before the follow-up read, so the account serves at once
-        // even if that read fails (live 2026-11-27: three z.ai accounts sat parked up
-        // to 24h behind a bench set before their weekly card was redeemed).
+        // stale now (live 2026-11-27: three z.ai accounts sat parked up to 24h behind a
+        // bench set before their weekly card was redeemed). The usage bars still show the
+        // old window until the re-read below, so an account whose week reads full stays
+        // refused until that read lands.
         if (this.am.clearRateLimited?.(account.index)) {
           this.log(`[reset-card] ${account.name}: rate-limit bench lifted by the reset`);
         }

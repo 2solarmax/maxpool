@@ -6670,9 +6670,6 @@ export class AccountManager {
     if (paidAdd) account.usage.totalPaidTokens = (account.usage.totalPaidTokens || 0) + paidAdd;
   }
 
-  /**
-   * Mark an account as rate-limited for a given duration.
-   */
   /** Put an account back in service after its limit was RESET (a banked reset was
    *  spent on it). The "rate limited" bench recorded the OLD window; the reset opened a
    *  new one, so keeping the bench parks a freshly paid-for week (live 2026-11-27: a
@@ -6681,7 +6678,10 @@ export class AccountManager {
    *  upstream failure is not about quota and stays. */
   clearRateLimited(accountIndex) {
     const account = this.accounts[accountIndex];
-    if (!account || account.status !== 'throttled' || account.lastError !== 'rate_limited') return false;
+    // Status alone: a 429 burst benches with status 'throttled', and an in-flight request
+    // that then fails with a timeout or a 5xx rewrites lastError while the bench stays.
+    // Auth failures set status 'error', so they are not lifted.
+    if (!account || account.status !== 'throttled') return false;
     account.status = 'active';
     account.rateLimitedUntil = null;
     account.lastError = null;
@@ -6691,6 +6691,7 @@ export class AccountManager {
     return true;
   }
 
+  /** Mark an account as rate-limited for a given duration. */
   markRateLimited(accountIndex, retryAfterSeconds, options = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
