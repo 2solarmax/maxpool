@@ -193,7 +193,8 @@ test('an explicit off keeps resets unspent, and a race or reload cannot consume 
   let now = resetNow;
   const owner = account({ quota: { unified7d: 1, unified7dReset: now + 1440 * minutes,
     codexWeeklyReadingAt: now } });
-  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  const lifts = [];
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true, clearRateLimited: i => { lifts.push(i); return true; } };
   const fixture = resetFixture();
   const requests = [];
   const options = {
@@ -232,7 +233,8 @@ test('an explicit off keeps resets unspent, and a race or reload cannot consume 
 test('uncertain reset attempts survive restart and replay their original idempotency key', async () => {
   let now = resetNow;
   const owner = account();
-  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  const lifts = [];
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true, clearRateLimited: i => { lifts.push(i); return true; } };
   const fixture = resetFixture();
   const requests = [];
   const options = {
@@ -330,7 +332,8 @@ test('banked Pro resets are held during low usage and claimed when the weekly po
     unified7d: 0.15, unified7dReset: resetNow + 48 * 60 * minutes,
     codexWeeklyReadingAt: resetNow, codexResetCredits: summary,
   } });
-  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  const lifts = [];
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true, clearRateLimited: i => { lifts.push(i); return true; } };
   const attempts = [];
   const redeemer = new ResetCreditRedeemer(manager, {
     now: () => resetNow, log() {}, transactState: resetFixture().transactState,
@@ -356,7 +359,8 @@ test('Codex automatic expiry redemption uses the sweep while a request only reac
   const owner = account({ autoRedeemReset: true, quota: { unified7d: 0.4,
     unified7dReset: resetNow + 30 * 60 * minutes, codexWeeklyReadingAt: resetNow } });
   const expiring = { ...availableCredit, expiresAt: resetNow + 60 * minutes };
-  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  const lifts = [];
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true, clearRateLimited: i => { lifts.push(i); return true; } };
   let consumed = 0;
   let listed = 0;
   const redeemer = new ResetCreditRedeemer(manager, {
@@ -375,7 +379,8 @@ test('Codex automatic expiry redemption uses the sweep while a request only reac
 test('Codex revalidates weekly usage after reserving and before consuming a credit', async () => {
   const owner = account({ autoRedeemReset: true, quota: { unified7d: 1,
     unified7dReset: resetNow + 30 * 60 * minutes, codexWeeklyReadingAt: resetNow } });
-  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  const lifts = [];
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true, clearRateLimited: i => { lifts.push(i); return true; } };
   const fixture = resetFixture();
   let consumed = 0;
   const redeemer = new ResetCreditRedeemer(manager, {
@@ -492,7 +497,8 @@ test('through the sweep: the old "wait for a compatible account" inputs change n
 test('the expiry the table shows is counts and times only, distinguishes unknown from non-expiring, and is refreshed by a sweep', async () => {
   const owner = account({ quota: { unified7d: 0.1, unified7dReset: resetNow + 40 * 60 * minutes,
     codexWeeklyReadingAt: resetNow, codexResetCredits: { available: 2, checkedAt: resetNow } } });
-  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  const lifts = [];
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true, clearRateLimited: i => { lifts.push(i); return true; } };
   let rows = [
     { id: 'secret-credit-a', title: 'Private title', status: 'available', supportedByPlan: true, expiresAt: resetNow + 5 * 60 * minutes },
     { id: 'secret-credit-b', status: 'available', supportedByPlan: true, expiresAt: null },
@@ -722,4 +728,29 @@ test('a Fable grant dying before the Fable refill is claimed too', () => {
   const listing = g => ({ grants: [g], nextGrantId: null, cooldownUntil: null, eligible: true, stale: false, checkedAt: now });
   assert.equal(decideClaudeWithReason(base, listing(grant(now + 10 * 60 * minutes)), now).action?.reason, 'dying value');
   assert.equal(decideClaudeWithReason(base, listing(grant(now + 42 * 60 * minutes)), now).action, null);
+});
+
+// Live 2026-11-27: the Codex path called clearRateLimited(), which did not exist, so a
+// spent credit never lifted a "rate limited" bench. Through a REAL AccountManager.
+test('a spent Codex credit puts a rate-limited account back in service', async () => {
+  const owner = account({ autoRedeemReset: true });
+  const am = new AccountManager([{ ...owner, type: 'oauth', accessToken: 't' }], 0.95);
+  const real = am.accounts[0];
+  am.autoRedeemReset = true; real.autoRedeemReset = true;
+  real.quota.unified7d = 1;
+  real.quota.unified7dReset = Date.now() + 20 * 60 * minutes;
+  real.quota.codexWeeklyReadingAt = Date.now();
+  am.markRateLimited(0, 24 * 60 * minutes, { status: 429 });
+  assert.equal(real.status, 'throttled');
+  const redeemer = new ResetCreditRedeemer(am, {
+    transactState: resetFixture().transactState, log() {},
+    detailsFn: async () => ({ credits: [availableCredit] }),
+    consumeFn: async () => ({ code: 'reset', windowsReset: 1 }),
+    usageFn: async () => ({ sevenDay: { utilization: 0.05, resetAt: Date.now() + 1440 * minutes } }),
+  });
+  const result = await redeemer.maybeRedeemForPool([real]);
+  assert.equal(result.redeemed, true, result.reason);
+  assert.notEqual(real.status, 'throttled', 'the bench is lifted by the real method');
+  assert.ok(real.quota.unified7d < 0.1, `usage re-read after the reset (wk=${real.quota.unified7d})`);
+  assert.equal(am._isAvailable(real, { model: 'gpt-6.2-sol' }), true, 'the account can serve again');
 });

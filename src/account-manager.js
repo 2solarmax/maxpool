@@ -6746,7 +6746,10 @@ export class AccountManager {
    *  upstream failure is not about quota and stays. */
   clearRateLimited(accountIndex) {
     const account = this.accounts[accountIndex];
-    if (!account || account.status !== 'throttled' || account.lastError !== 'rate_limited') return false;
+    // Status alone: a 429 burst benches with status 'throttled', and an in-flight request
+    // that then fails with a timeout or a 5xx rewrites lastError while the bench stays.
+    // Auth failures set status 'error', so they are not lifted.
+    if (!account || account.status !== 'throttled') return false;
     account.status = 'active';
     account.rateLimitedUntil = null;
     account.lastError = null;

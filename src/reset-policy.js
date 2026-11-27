@@ -60,20 +60,19 @@ import { appliesTo as defaultAppliesTo } from './claude-reset-grants.js';
 import { CLAIM_FRESH_MS, CLAIM_STALE_LISTING_MAX_MS } from './reset-timing.js';
 
 export const POLICY = {
-  // z.ai weekly card wall. KEPT at 0.90 on purpose (disclosed, 2026-11-27): EXACT LIMIT
-  // ("not a routine 96/99/90% spend") would move this to POLICY.limitReached, but the R6
-  // free-refill hold below only has a window BETWEEN this wall and freeRefillImmediate
-  // (0.98). At 0.999 every at-wall reading is already past 0.98, so the hold could never
-  // fire — moving the wall would silently delete a capacity-aware hold the owner wants
-  // kept. Resolve the two together (a hold that reads "refill soon" without a 0.98
-  // release valve) before moving this; it is a GLM production path this PR did not touch.
-  wallWeekly: 0.90,
+  // z.ai weekly card wall = the limit (owner, 2026-11-27: "No reset should fire until
+  // the account has been fully utilized. 100%."). It was 0.90 with a 0.98 release
+  // valve; both were artefacts of spending before the limit and are gone. The
+  // free-refill hold (R6) now applies AT the limit.
+  wallWeekly: 1,
   wallSes: 0.95,          // 5h at 95% = at the wall
   dyingWindowMs: 24 * 3600 * 1000, // redeem-don't-save horizon
   dyingMinUtilWeekly: 0.30, // below this a dying weekly refill buys too little
   dyingMinUtilSes: 0.50,    // 5h refills are cheap capacity; demand more waste first
   freeRefillWaitMs: 24 * 3600 * 1000, // R6: hold a wall redeem this close to the free refill
-  freeRefillImmediate: 0.98,          // R6: ...unless this full — never block the owner
+  // R6 release valve (was freeRefillImmediate 0.98): only needed when the spend point
+  // sat below the limit. At the limit the hold itself is bounded — it ends the moment
+  // the account has no roomy peers, or the grant would die before the refill.
   // R7 (owner, 2026-11-13): the Claude GENERAL weekly wall claim also waits for the
   // free refill when OTHER accounts can absorb the load. Room per peer: probe-fresh
   // (≤5 min) readings, weekly util with ≥ 35% headroom left, 5h util with ≥ 25%
@@ -97,14 +96,12 @@ export const POLICY = {
   // sit at ~0% used until it expires, so it is spent now.
   refillSurvivalMs: 12 * 3600 * 1000,
   // EXACT LIMIT (owner, 2026-11-27, superseding the near-full decisions): "It should
-  // fire once the limit is reached!" A reset is spent when the limit it clears is
-  // REACHED — the point the router already benches the account at, so no request is
-  // refused for a reset the pool could have spent. Nothing is spent before that on a
-  // routine 96/99/90% reading. The ONE spend below the limit is the final precaution
-  // for a genuinely dying reset (R2 + D4). The router's own exhausted floor is the
-  // weekly limit (account-manager weeklyExhaustedThreshold, 0.999): it is what already
-  // stops the account serving, and the two must never disagree.
-  limitReached: 0.999,
+  // fully utilized. 100%." — 2026-11-27). A reset is spent when the account's own
+  // reading says its limit is REACHED (a probe that reports 100%), or at the moment
+  // the provider refuses a request for that limit (the reactive 429 path). Nothing is
+  // spent before that on a routine 96/99/99.9% reading. The ONE spend below the limit
+  // is the final precaution for a genuinely dying reset (R2 + D4).
+  limitReached: 1,
   // The provider (z.ai) 5h window serves to 100% of itself (PROVIDER_SES_WALL), so a
   // dedicated five-hour card is spent at exactly that wall and not before.
   sessionLimitReached: 1,
@@ -252,8 +249,7 @@ export function decideZai(account, cards, now = Date.now()) {
       // R6: a wall redeem waits when the FREE weekly refill is imminent and the
       // account isn't critically full (dying-value redeems stay exempt above).
       if (atWall && !dying && q.providerWkReset != null
-          && msLeft(q.providerWkReset, now) < POLICY.freeRefillWaitMs
-          && wkUtil < POLICY.freeRefillImmediate) {
+          && msLeft(q.providerWkReset, now) < POLICY.freeRefillWaitMs) {
         /* HELD for the free refill — do not redeem */
       } else {
         return { kind: 'card', card: weeklyCard, resetType: 'WEEK',

@@ -64,9 +64,9 @@ test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal,
   assert.equal(am._isSessionQuotaUnavailable(a), false, 'the session bench reads no cap either');
   // Climb to the claim point; the PROBER claims (the real end-of-lift path —
   // judge #12: ending it via an empty listing never exercised the claim).
-  setUsage(a, { wk: 0.995 });
+  setUsage(a, { wk: 0.999 });
   const act = decideClaude(a, a.resetGrants);
-  assert.ok(act, 'the claim fires at the limit (0.995 used >= 0.999)');
+  assert.ok(act, 'the claim fires at the limit (0.999 used, limit 0.999)');
   const restore = stubClaimFetch({ ok: true });
   try { assert.equal(await quietProber(am)._claimClaudeGrant(a, act), true, 'claimed'); }
   finally { restore(); }
@@ -153,7 +153,7 @@ test('SC10: fresh→stale→fresh at 60s cadence = at most 2 state changes; no w
 test('SC10: a claim failure while lifted applies the cap again on the next evaluation', async () => {
   const am = cappedAm({ cap: 0.75 });
   const a = am.accounts[0];
-  setUsage(a, { wk: 0.995 });
+  setUsage(a, { wk: 0.999 });
   am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
   assert.equal(am.capLiftActive(a), true);
   // Drive the REAL claim path with a failing claim (judge #12: calling endCapLift
