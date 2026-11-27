@@ -49,8 +49,8 @@ function setUsage(a, { wk, ses, wkReset = 3 * DAY, sesReset = 3 * H, scoped = nu
   if (scoped) a.quota.scopedWeekly = scoped;
 }
 
-// ── TEST 21: the lift suspends the cap; the claim fires at 0.99; cap returns ──
-test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal, claim at 0.99, capped returns after the claim', async () => {
+// ── TEST 21: the lift suspends the cap; the claim fires at the 0.999 limit; cap returns ──
+test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal, claim at the 0.999 limit, capped returns after the claim', async () => {
   const am = cappedAm({ cap: 0.75 });
   const a = am.accounts[0];
   setUsage(a, { wk: 0.93 });
@@ -66,7 +66,7 @@ test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal,
   // judge #12: ending it via an empty listing never exercised the claim).
   setUsage(a, { wk: 0.995 });
   const act = decideClaude(a, a.resetGrants);
-  assert.ok(act, 'the claim fires at 0.99');
+  assert.ok(act, 'the claim fires at the limit (0.995 used >= 0.999)');
   const restore = stubClaimFetch({ ok: true });
   try { assert.equal(await quietProber(am)._claimClaudeGrant(a, act), true, 'claimed'); }
   finally { restore(); }

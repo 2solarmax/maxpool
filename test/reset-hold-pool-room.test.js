@@ -12,7 +12,7 @@ import { Prober } from '../src/prober.js';
 
 const DAY = 86400_000;
 const H = 3600_000;
-const HOLD = 'free refill <24h away, other accounts have room';
+const HOLD = 'other accounts have room';
 
 // Every helper takes an explicit `now` (red-team #5): a boundary test reads ONE
 // clock value for building its fixture AND for the decision, so it can't drift by
@@ -37,9 +37,10 @@ test('HOLD: at wall + refill 18h away + 2 peers with room → no claim, plain-wo
   assert.equal(policy.HOLD_POOL_HAS_ROOM, HOLD, 'the reason is exported for the log/status');
 });
 
-test('CLAIM: at wall + refill 30h away (≥ 24h) + ample peers → claims as today', () => {
+test('HOLD: a far refill no longer spends a reset while ample peers carry the work (R8, 2026-11-27)', () => {
   const r = why(acct({ resetIn: 30 * H }), listing({ grants: [G()] }), peers(5));
-  assert.equal(r.action?.reason, 'weekly at wall');
+  assert.equal(r.action, null);
+  assert.equal(r.reason, HOLD);
 });
 
 test('CLAIM: at wall + refill 18h + only ONE peer with room → claims (needs ≥ 2)', () => {
@@ -100,7 +101,7 @@ test('UNCHANGED: every existing skip keeps precedence over the hold', () => {
   for (const [want, a, l] of cases) assert.equal(why(a, l, peers(5)).reason, want);
 });
 
-test('RE-EVALUATED every tick: capacity gone → the very next decision claims; refill pushed past 24h → claims', () => {
+test('RE-EVALUATED every tick: capacity gone → claims; room back even with refill past 24h → held (R8)', () => {
   const a = acct();
   let room = 2;
   const opts = { peersWithRoom: () => room };
@@ -109,7 +110,7 @@ test('RE-EVALUATED every tick: capacity gone → the very next decision claims; 
   assert.equal(why(a, listing({ grants: [G()] }), opts).action?.reason, 'weekly at wall', 'tick 2: one peer left → claim');
   room = 3;
   a.quota.unified7dReset = Date.now() + 25 * H;
-  assert.equal(why(a, listing({ grants: [G()] }), opts).action?.reason, 'weekly at wall', 'tick 3: refill ≥ 24h → claim');
+  assert.equal(why(a, listing({ grants: [G()] }), opts).reason, HOLD, 'tick 3: room is back, the far refill does not spend the reset');
 });
 
 // ── "has room": the per-peer predicate through a REAL AccountManager ─────────
@@ -185,9 +186,9 @@ test('ROOM: boundaries — 0.645 weekly / 0.645 5h still count', () => {
   assert.equal(count(am), 2);
 });
 
-test('BOUNDARIES: refill exactly 24h away → claim; a grant ending exactly 24h AFTER the refill → held', () => {
+test('BOUNDARIES: refill exactly 24h away still holds with room (R8); a grant ending exactly 24h AFTER → held', () => {
   const now = Date.now();
-  assert.equal(why(acct({ resetIn: 24 * H, now }), listing({ grants: [G({}, now)], now }), peers(5), now).action?.reason, 'weekly at wall');
+  assert.equal(why(acct({ resetIn: 24 * H, now }), listing({ grants: [G({}, now)], now }), peers(5), now).reason, HOLD);
   const endsAtRefillPlus24 = now + 18 * H + 24 * H;
   const h = why(acct({ resetIn: 18 * H, now }), listing({ grants: [G({ endsAt: endsAtRefillPlus24 }, now)], now }), peers(5), now);
   assert.equal(h.action, null);
@@ -275,7 +276,7 @@ test('RT3 (major): the reactive weekly-429 path holds even when the walled accou
   } finally { restore(); }
 });
 
-test('RT3 (major): reactive refill ≥ 24h → claims; peers stale → claims', async () => {
+test('RT3 (major): reactive refill ≥ 24h holds while peers have room (R8); peers stale → claims', async () => {
   for (const [name, setup] of Object.entries({
     'refill 30h away': am => { am.accounts[0].quota.unified7dReset = Date.now() + 30 * H; },
     'peer probes stale': am => { for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000; },
@@ -287,7 +288,7 @@ test('RT3 (major): reactive refill ≥ 24h → claims; peers stale → claims', 
       am.applyResetGrants(0, listing({ grants: [G()] }));
       setup(am);
       await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 });
-      assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, name);
+      assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, name === 'refill 30h away' ? 0 : 1, name);
     } finally { restore(); }
   }
 });
@@ -315,7 +316,7 @@ test('RT2-3 (server order): a Fable 429 never spends a Fable reset on the fast p
 });
 
 test('RT2-3 (server order): a WEEKLY 429\'s retry-after never stands in for the refill — the 7d reset stamp decides', async () => {
-  for (const [name, resetIn, want] of [['7d reset 30h away, retry-after 60s', 30 * H, 1], ['7d reset 18h away, retry-after 60s', 18 * H, 0]]) {
+  for (const [name, resetIn, want] of [['7d reset 30h away, retry-after 60s, peers roomy (R8)', 30 * H, 0], ['7d reset 18h away, retry-after 60s', 18 * H, 0]]) {
     const posts = [];
     const restore = stubFetch(posts);
     try {

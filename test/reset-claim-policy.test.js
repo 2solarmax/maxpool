@@ -1,7 +1,7 @@
 // TEST PLAN 12, 13, 14, 30 (success criteria 5, 8, C5): the claim decision table.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decideClaude, decideClaudeWithReason, decideZai, CLAUDE_WALL_WEEKLY } from '../src/reset-policy.js';
+import { decideClaude, decideClaudeWithReason, decideZai, CLAUDE_WALL_WEEKLY, POLICY } from '../src/reset-policy.js';
 import { Prober } from '../src/prober.js';
 import { AccountManager } from '../src/account-manager.js';
 
@@ -49,7 +49,10 @@ test('SC5 (GLM): (f) z.ai at 0.90 claims — POLICY.wallWeekly UNCHANGED at 0.90
   const zaiAcct = { enabled: true, quota: { providerSes: 0.2, providerWk: 0.905 } };
   const act = decideZai(zaiAcct, cards);
   assert.ok(act, 'z.ai still redeems at its own 0.90 wall');
-  assert.equal(CLAUDE_WALL_WEEKLY, 0.99, 'the Claude constant is separate');
+  // EXACT LIMIT (2026-11-27): the Claude constant is the router's bench. It stays
+  // separate from z.ai's, which is KEPT at 0.90 (see POLICY.wallWeekly).
+  assert.equal(CLAUDE_WALL_WEEKLY, 0.999, 'the Claude constant is the limit');
+  assert.notEqual(CLAUDE_WALL_WEEKLY, POLICY.wallWeekly, 'the Claude constant is separate');
 });
 
 // ── TEST 13: `rejected` + 5h 1.0 + 7d 0.3 holding a general grant → no claim ──
@@ -169,8 +172,15 @@ test('SC5 (judge #8): a DYING Fable grant claims below the wall (was dead code);
   assert.ok(r.action, `dying value claims (got reason ${r.reason})`);
   assert.equal(r.action.reason, 'dying value');
   assert.equal(r.action.scope, 'fable');
-  const held = acct({ wk: 0.4, scoped: { fable: { utilization: 0.5, resetAt: Date.now() + 18 * H } } });
-  const h = decideClaudeWithReason(held, listing({ grants: [dyingFable] }));
+  // A 10h grant with the Fable refill 18h out dies BEFORE the refill: spending it now is
+  // right (2026-11-27), so the hold is asserted with a grant that outlives the refill.
+  const diesFirst = acct({ wk: 0.4, scoped: { fable: { utilization: 0.5, resetAt: Date.now() + 18 * H } } });
+  assert.equal(decideClaudeWithReason(diesFirst, listing({ grants: [dyingFable] })).action?.reason, 'dying value',
+    'a grant that expires before the refill is spent, not held');
+  // The hold itself: refill 6h out, grant with 20h left — it survives the free
+  // refill, so the refill makes it redundant and waiting for it is right.
+  const held = acct({ wk: 0.4, scoped: { fable: { utilization: 0.5, resetAt: Date.now() + 6 * H } } });
+  const h = decideClaudeWithReason(held, listing({ grants: [G({ id: 'f2', clears: ['seven_day_overage_included'], endsAt: Date.now() + 20 * H })] }));
   assert.equal(h.action, null);
   assert.equal(h.reason, 'free refill <24h away');
   // Below the 30% floor a dying refill buys too little.
@@ -181,7 +191,13 @@ test('SC5 (judge #8): a DYING Fable grant claims below the wall (was dead code);
 test('SC5 (judge #8): a dying GENERAL grant is held inside 24h of the free weekly refill; a WALL claim never waits', () => {
   const dying = G({ endsAt: Date.now() + 10 * H });
   assert.equal(decideClaude(acct({ wk: 0.5, resetIn: 3 * DAY }), listing({ grants: [dying] }))?.reason, 'dying value', 'control: far refill → dying value claims');
-  const h = decideClaudeWithReason(acct({ wk: 0.5, resetIn: 18 * H }), listing({ grants: [dying] }));
+  // The 10h grant dies before an 18h-away refill: it is spent now (2026-11-27). The
+  // hold is asserted with a grant that still has a full day left when the refill lands.
+  assert.equal(decideClaudeWithReason(acct({ wk: 0.5, resetIn: 18 * H }), listing({ grants: [dying] })).action?.reason, 'dying value',
+    'a grant that expires before the refill is spent, not held');
+  // The hold itself: refill 6h out, grant with 20h left — it survives the free
+  // refill, so the refill makes it redundant and waiting for it is right.
+  const h = decideClaudeWithReason(acct({ wk: 0.5, resetIn: 6 * H }), listing({ grants: [G({ endsAt: Date.now() + 20 * H })] }));
   assert.equal(h.action, null);
   assert.equal(h.reason, 'free refill <24h away');
   assert.equal(decideClaude(acct({ wk: 0.995, resetIn: 18 * H }), listing({ grants: [dying] }))?.reason, 'weekly at wall',

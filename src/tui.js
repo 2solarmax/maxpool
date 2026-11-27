@@ -172,6 +172,13 @@ const MRST_W = 11;         // 'MRst' column (model resets) — FIXED width (fits
                            // a variable width ('0' vs '1~21d') shifted every quota bar per row.
 const ARST_W = 7;          // 'ARst' column (account-level resets) — FIXED width (fits '1~118d?'); owner 2026-11-15: model and
                            // account resets in ONE mixed cell read as confusing, so they are two aligned columns.
+// '5hR' column (five-hour reset cards) — FIXED width (fits '2~3d?'). Owner 2026-11-27:
+// five-hour cards may be spent, "and they should probably have their own column". The
+// cell is BLANK for every account the column does not apply to (anything but a z.ai
+// account); a z.ai account with a fresh listing and no card shows a dim 0, and one
+// whose listing is missing or stale shows nothing green. It is shown only where it fits
+// (see show5hColumn): from 139 columns, so it never squeezes a quota bar.
+const FIVE_HOUR_RST_W = 5;
 const ROW_PREFIX = '    '; // ' ' + sel(1) + cur(1) + ' ' — 4 cols before the name
 
 // Human provider name for the accounts-table "Provider" column. account.provider
@@ -200,6 +207,16 @@ function providerLabel(a) {
  * load fields (Now/15m/1h) stay inline per row — they're row-type-dependent and
  * begin at a variable offset — so the header stops after the Quota group label.
  */
+/** Whether the five-hour-card column is shown at this terminal width. It takes its own
+ *  fixed width plus the gap after it, so it is shown only where that costs nothing
+ *  else: MEASURED against barLayout — below 139 columns it would shrink the quota bars
+ *  (120: 13→10) or drop the Fable bar outright (127), and an 80-column terminal already
+ *  has no spare cell. From 139 every bar keeps its full width with the column present.
+ *  Below it the accounts table is exactly what it was. */
+const FIVE_HOUR_COL_FITS_W = 139;
+const show5hColumn = W => W >= FIVE_HOUR_COL_FITS_W;
+const fiveHourColSpan = W => (show5hColumn(W) ? FIVE_HOUR_RST_W + 1 : 0);
+
 function acctHeader(W) {
   const quota = W >= 88 ? 'Quota (used% · resets-in)' : 'Quota';
   return ROW_PREFIX
@@ -210,6 +227,7 @@ function acctHeader(W) {
     + 'Status'.padEnd(STATUS_W) + ' '
     + 'MRst'.padEnd(MRST_W) + ' '
     + 'ARst'.padEnd(ARST_W) + ' '
+    + (show5hColumn(W) ? '5hR'.padEnd(FIVE_HOUR_RST_W) + ' ' : '')
     + quota;
 }
 
@@ -233,7 +251,7 @@ function lpadVis(s, w) {
  * When no account reports a session window, the session bar is left out: the
  * weekly bar always shows and the Fable bar joins it from 112 columns.
  */
-const barStart = width => ROW_PREFIX.length + nameWidth(width) + 1 + CACHE_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + MRST_W + 1 + ARST_W + 1 + 'Ses '.length;
+const barStart = width => ROW_PREFIX.length + nameWidth(width) + 1 + CACHE_W + 1 + WHERE_W + 1 + PROVIDER_W + 1 + STATUS_W + 1 + MRST_W + 1 + ARST_W + fiveHourColSpan(width) + 1 + 'Ses '.length;
 const BAR_GAP = '  Wk  '.length;
 const BAR_MIN_W = 5;
 const BAR_MAX_W = 20;
@@ -322,17 +340,69 @@ function resetSummary(account) {
   return account.quota?.codexResetCredits ?? account.codexResetCredits;
 }
 
-function codexResetCells(account, now = Date.now()) {
+/** The expiry part of a Codex reset cell: `~11h` / `~3d` for the soonest expiring
+ *  credit, `~never` when every credit is confirmed non-expiring, nothing when the pool
+ *  does not know (no recent read of the credit rows). Unknown and non-expiring must
+ *  never look alike. `expiry` is the sanitized summary — counts and times only. */
+function codexExpirySuffix(expiry, now) {
+  if (!expiry || !(expiry.count > 0)) return '';
+  if (expiry.earliestExpiresAt == null) return '~never';
+  const left = expiry.earliestExpiresAt - now;
+  if (!(left > 0)) return '';
+  const days = left / 86400_000;
+  return days < 1 ? `~${Math.max(1, Math.round(days * 24))}h` : `~${Math.max(1, Math.round(days))}d`;
+}
+
+function codexResetCells(account, now = Date.now(), expiry = null) {
   const reset = resetSummary(account);
   let label = '-';
   if (account.enabled !== false && Number.isInteger(reset?.available) && reset.available >= 0) {
     label = String(reset.available);
+    // Only a count that exists can have an expiry; a count of none shows none.
+    const suffix = reset.available > 0 ? codexExpirySuffix(expiry, now) : '';
+    if ((label + suffix).length <= ARST_W) label += suffix;
     const stale = reset.stale || account.refreshDead || account.subscriptionGone
       || (reset.checkedAt != null && now - reset.checkedAt > LISTING_FRESH_MS);
-    if (stale) label += '?';
+    if (stale && (label + '?').length <= ARST_W) label += '?';
+    if (stale) label = gray(label);
     else label = reset.available > 0 ? green(label) : gray(label);
   }
   return rpad(gray('-'), MRST_W) + ' ' + rpad(label, ARST_W);
+}
+
+/** The five-hour-card cell ('5hR') — owner 2026-11-27: five-hour cards "should have
+ *  their own column, and they should show nothing where they don't apply".
+ *  Four DIFFERENT facts, never shown alike:
+ *    blank        the column does not apply — anything but a z.ai account
+ *    dim 0        a z.ai account whose card listing is fresh and shows NO 5h card
+ *    n~3d green   n live five-hour cards, soonest expiry first (spendable now)
+ *    n? grey      cards seen, but the listing is stale or old: a count we cannot vouch for
+ *    ? grey       a z.ai account whose card listing was never read (unknown — NOT a zero)
+ *  A disabled account shows blank too: its cards are not ours to spend, so a count would
+ *  imply otherwise. */
+function fiveHourResetCell(account, now = Date.now()) {
+  const blank = ' '.repeat(FIVE_HOUR_RST_W);
+  if (!account || account.provider !== 'zai' || account.enabled === false) return blank;
+  const rc = account.resetCards;
+  if (!rc || !Array.isArray(rc.fiveHour)) return rpad(gray('?'), FIVE_HOUR_RST_W);
+  const stale = rc.stale === true || account.refreshDead || account.subscriptionGone
+    || (rc.checkedAt != null && now - rc.checkedAt > LISTING_FRESH_MS);
+  const live = rc.fiveHour.filter(c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now));
+  if (!live.length) {
+    // No card. A stale "no card" is still a zero worth showing, but never in green.
+    const text = rpad(stale ? gray('0?') : gray('0'), FIVE_HOUR_RST_W);
+    return text;
+  }
+  let soonest = Infinity;
+  for (const c of live) if (c.expiresAt != null && c.expiresAt < soonest) soonest = c.expiresAt;
+  let text = String(live.length);
+  if (soonest !== Infinity) {
+    const days = (soonest - now) / 86400_000;
+    text += days < 1 ? `~${Math.max(1, Math.round(days * 24))}h` : `~${Math.max(1, Math.round(days))}d`;
+  }
+  if (text.length > FIVE_HOUR_RST_W) text = String(live.length);
+  if (stale && (text + '?').length <= FIVE_HOUR_RST_W) text += '?';
+  return rpad(stale ? gray(text) : green(text), FIVE_HOUR_RST_W);
 }
 
 function codexLoginArgs(cli, name, account) {
@@ -758,7 +828,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct, codexLoginArgs };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct, codexLoginArgs, codexResetCells, codexExpirySuffix, fiveHourResetCell, show5hColumn, barStart };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -2324,7 +2394,8 @@ export class TUI {
           if (this.codexResets === state) await this._showCodexResets(state.account, notice);
         }, 'codexResets');
     } else if (k === 'a' && this.onSetCodexAutoRedeem) {
-      const enabled = state.account.autoRedeemReset === true;
+      // On unless the owner turned it off (an unset account is enrolled by default).
+      const enabled = state.account.autoRedeemReset !== false;
       this._confirm(enabled ? 'Turn off automatic resets?' : 'Allow automatic resets?',
         enabled ? 'Banked resets remain available for manual use.' : 'Allow the pool to redeem eligible resets for this account.',
         async () => {
@@ -3496,8 +3567,11 @@ export class TUI {
     // (expiresAt==null || expiresAt>now) — a frozen `expired` flag never keeps a
     // dead reset on screen (pre-mortem #18).
     let resetsCell;
+    // The five-hour-card column rides at the end of the reset cells on EVERY row, so all
+    // row types stay aligned. Blank (padded) where it does not apply or does not fit.
+    const fiveHourCol = show5hColumn(width) ? ' ' + fiveHourResetCell(a, Date.now()) : '';
     if (a.provider === 'codex') {
-      resetsCell = codexResetCells(a);
+      resetsCell = codexResetCells(a, Date.now(), this.am.codexResetExpiryFor?.(a, Date.now())) + fiveHourCol;
     } else {
       const now = Date.now();
       let general = 0;       // resetsLeft of general-weekly grants + live cards
@@ -3509,7 +3583,9 @@ export class TUI {
         const liveCard = c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now);
         const rc = a.resetCards;
         if (rc) {
-          for (const c of [...(rc.fiveHour || []), ...(rc.weekly || [])]) {
+          // WEEKLY cards only. Five-hour cards have their OWN column (5hR, owner
+          // 2026-11-27) and are no longer folded into this account-level count.
+          for (const c of (rc.weekly || [])) {
             if (liveCard(c)) { general += 1; if (c.expiresAt != null && c.expiresAt < soonestG) soonestG = c.expiresAt; }
           }
         }
@@ -3548,10 +3624,15 @@ export class TUI {
       // Not-fresh (pre-mortem #15): stale listing, a dead account, or a check older
       // than 3x the grants cadence. An account that stopped being probed never gets
       // re-listed, so checkedAt alone would show a green count forever.
-      const freshGrants = a.resetGrants && a.resetGrants.stale !== true
-        && (a.resetGrants.checkedAt == null || now - a.resetGrants.checkedAt <= LISTING_FRESH_MS);
-      const freshCards = !a.resetCards || (a.resetCards.stale !== true
-        && (a.resetCards.checkedAt == null || now - a.resetCards.checkedAt <= LISTING_FRESH_MS));
+      // EACH listing is judged by what the account HAS (fixed 2026-11-27): a z.ai
+      // account holds CARDS and never a Claude grant listing, so `a.resetGrants` is
+      // null for it. The old `freshGrants = a.resetGrants && ...` was therefore false
+      // for every z.ai account, and a card listed this very sweep rendered grey with
+      // '?' — a fresh card that looked stale. A listing that does not apply to this
+      // provider is fresh by definition; one that exists and is old is not.
+      const listingFresh = l => !l || (l.stale !== true && (l.checkedAt == null || now - l.checkedAt <= LISTING_FRESH_MS));
+      const freshGrants = listingFresh(a.resetGrants);
+      const freshCards = listingFresh(a.resetCards);
       const notFresh = total > 0 && (!freshGrants || !freshCards || a.refreshDead || a.subscriptionGone);
 
       // Two cells (owner 2026-11-15): MRst = model-scoped resets, ARst = account-level.
@@ -3584,7 +3665,7 @@ export class TUI {
       const aCell = aN > 0
         ? renderCell(aCore, expirySuffix(aN, soonestG), aN, ARST_W, unknownOnly)
         : rpad(gray('0'), ARST_W);
-      resetsCell = mCell + ' ' + aCell;
+      resetsCell = mCell + ' ' + aCell + fiveHourCol;
     }
 
     if (a.type === 'provider') {
@@ -4441,7 +4522,7 @@ export class TUI {
       case 'accounts':
         return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('v')} Check quota  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'codexResets': {
-        const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset ? 'on' : 'off'}` : '';
+        const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset !== false ? 'on' : 'off'}` : '';
         const state = this.codexResets;
         const selectable = state.account.enabled !== false
           && canRedeemCodexCredit(state.credits[state.selected]);

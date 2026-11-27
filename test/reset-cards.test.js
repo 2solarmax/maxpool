@@ -44,11 +44,66 @@ test('R1: below the wall does NOT fire (save the card)', () => {
   assert.equal(decideZai(acct({ wk: 0.5 }), cards), null);
 });
 
-test('R1 (owner 2026-10-30): 5h cards are NEVER spent — not at the 5h wall, even dying', () => {
+// ── 5-hour cards (owner 2026-11-27: "it's okay to spend 5-hour cards too") ───────
+// This REPLACES the 2026-10-30 "never spent" rule. EXACT LIMIT applies to them too: a
+// DEDICATED five-hour card is spent only once the 5h window has reached its own limit
+// (it serves to 100%, so the limit is 100%) — never at a routine 96/99/90% — and never
+// on an account that is blocked for some other reason (the card would lift nothing).
+test('5h card: spent ONLY once the 5h window has reached its limit (100%)', () => {
   const cards = { weekly: [], fiveHour: [{ recordId: 5, expiresAt: soon(20 * DAY), expired: false }] };
-  assert.equal(decideZai(acct({ wk: 0.2, ses: 0.96 }), cards), null, 'session wall never spends a card');
+  for (const ses of [0.50, 0.90, 0.95, 0.96, 0.99, 0.999]) {
+    assert.equal(decideZai(acct({ wk: 0.2, ses }), cards), null, `session at ${ses}: below the limit, nothing spent`);
+  }
+  const act = decideZai(acct({ wk: 0.2, ses: 1 }), cards);
+  assert.equal(act?.resetType, 'FIVE_HOUR', 'the 5h limit is reached');
+  assert.equal(act?.card?.recordId, 5);
+  assert.equal(act?.reason, 'session at limit');
+});
+
+test('5h card: a DEDICATED card for the session limit — the weekly card is never spent for it, and vice versa', () => {
+  const onlyWeekly = { weekly: [{ recordId: 9, expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] };
+  assert.equal(decideZai(acct({ wk: 0.2, ses: 1 }), onlyWeekly), null,
+    'session at its limit, no 5h card: the WEEKLY card is kept (owner 2026-10-30, weekly never spent for a session limit)');
+  // Both held, weekly NOT at its wall, session at its limit: the 5h card goes, the weekly stays.
+  const both = { weekly: [{ recordId: 9, expiresAt: soon(20 * DAY), expired: false }],
+    fiveHour: [{ recordId: 6, expiresAt: soon(20 * DAY), expired: false }] };
+  const act = decideZai(acct({ wk: 0.5, ses: 1 }), both);
+  assert.equal(act?.resetType, 'FIVE_HOUR', 'the dedicated card clears the session limit');
+  assert.equal(act?.card?.recordId, 6);
+  // R4 (order) still holds: the weekly card at ITS wall clears BOTH windows, so it goes
+  // first even when the session is also at its limit.
+  const atWeeklyWall = decideZai(acct({ wk: 0.95, ses: 1 }), both);
+  assert.equal(atWeeklyWall?.resetType, 'WEEK', 'the weekly card clears both, so it goes first');
+  assert.equal(atWeeklyWall?.card?.recordId, 9);
+});
+
+test('5h card: never spent on an account blocked for ANOTHER reason (it would lift nothing)', () => {
+  const cards = { weekly: [], fiveHour: [{ recordId: 5, expiresAt: soon(20 * DAY), expired: false }] };
+  const at = extra => decideZai({ ...acct({ wk: 0.2, ses: 1 }), ...extra }, cards);
+  assert.equal(at({})?.resetType, 'FIVE_HOUR', 'control: the session limit alone spends it');
+  assert.equal(at({ poolBenchedBy: 'cloud' }), null, 'benched to another pool');
+  assert.equal(at({ subscriptionGone: true }), null, 'out of plan');
+  assert.equal(at({ refreshDead: true }), null, 'dead credential');
+  assert.equal(at({ enabled: false }), null, 'disabled (R0)');
+  assert.equal(at({ outsideUsage: { outside: true } }), null, 'key used outside the pool (R7)');
+});
+
+test('5h card: not on a dying basis, and expired/undated cards are handled', () => {
+  // The weekly rule's final precaution is NOT worth a 5h card: one dying unused costs
+  // minutes of capacity, so a 5h card is only ever spent at the session limit.
   const dying = { weekly: [], fiveHour: [{ recordId: 5, expiresAt: soon(2 * H), expired: false }] };
-  assert.equal(decideZai(acct({ wk: 0.2, ses: 0.9 }), dying), null, 'dying 5h card also never spent');
+  assert.equal(decideZai(acct({ wk: 0.2, ses: 0.9 }), dying), null, 'dying 5h card below the limit: not spent');
+  assert.equal(decideZai(acct({ wk: 0.2, ses: 1 }), dying)?.resetType, 'FIVE_HOUR', 'at the limit it is spent, dying or not');
+  // An expired 5h card is never chosen (R3).
+  const expired = { weekly: [], fiveHour: [{ recordId: 5, expiresAt: soon(-1 * H), expired: true }] };
+  assert.equal(decideZai(acct({ wk: 0.2, ses: 1 }), expired), null);
+  // A card with no expiry date (null) is live and sorts after dated ones.
+  const undated = { weekly: [], fiveHour: [{ recordId: 7, expiresAt: null, expired: false }] };
+  assert.equal(decideZai(acct({ wk: 0.2, ses: 1 }), undated)?.card?.recordId, 7);
+  // Soonest-expiring first when two are held (R4).
+  const two = { weekly: [], fiveHour: [{ recordId: 8, expiresAt: soon(9 * DAY), expired: false },
+    { recordId: 3, expiresAt: soon(2 * DAY), expired: false }] };
+  assert.equal(decideZai(acct({ wk: 0.2, ses: 1 }), two)?.card?.recordId, 3, 'soonest expiry is spent first');
 });
 
 // ── R2: dying value ───────────────────────────────────────────────────────────
@@ -74,10 +129,13 @@ function grant({ endsAt = soon(20 * DAY), resetsLeft = 1, usableNow = true, paus
     givesBackWeekly: false, blocking: false, unavailableReason: null, label: null, expired: endsAt <= Date.now(), ...rest };
 }
 
-test('claude: general grant fires at the Claude weekly wall (0.99, NOT the z.ai 0.90)', () => {
+test('claude: general grant fires at the Claude weekly wall (the 0.999 limit, NOT the z.ai 0.90)', () => {
   const g = grant();
   assert.equal(decideClaude(acct({ wk: 0.98 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null }), null,
     'below CLAUDE_WALL_WEEKLY: no claim (z.ai 0.90 wall must NOT move)');
+  // EXACT LIMIT (2026-11-27): 0.99 used to BE the Claude wall and claim; it is now below it.
+  assert.equal(decideClaude(acct({ wk: 0.99 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null }), null,
+    '0.99 is under the limit: no claim');
   const act = decideClaude(acct({ wk: 0.995 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
   assert.equal(act?.grant?.id, 'g1');
   assert.equal(act?.scope, 'general');
@@ -308,7 +366,7 @@ test('W4: unknown refill time (null) → existing behavior unchanged', () => {
   assert.equal(decideZai(a, cards)?.card?.recordId, 9, 'no refill info → redeem as today');
 });
 
-test('W5: hold does not affect 5h cards or dying-value weekly redeems', () => {
+test('W5: hold does not affect dying-value weekly redeems', () => {
   // dying-value (<24h on the CARD) still fires even with free refill imminent
   const cards = { weekly: [{ recordId: 5, grantType: 'GLOBAL', expiresAt: Date.now() + 2 * H, expired: false }], fiveHour: [] };
   const a = acct({ ses: 0.6, wk: 0.4 });
@@ -328,18 +386,25 @@ test('W6: wall AND dying together with imminent free refill — dying wins over 
 });
 
 // ── R6 hold does not starve the 5h wall (red-team concern 1, 2026-10-23) ──────
-test('W7 (owner 2026-10-30): during a weekly hold, a 5h wall still redeems NOTHING', () => {
+test('W7: during a weekly hold, a 5h card is spent only once the 5h LIMIT is reached', () => {
   const cards = {
     weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
     fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
   };
   const a = acct({ ses: 0.97, wk: 0.93 });
   a.quota.providerWkReset = Date.now() + 12 * 3600_000;   // free refill in 12h → weekly HELD
+  // Session at 97%: below the 5h limit. The weekly is held AND the 5h card is not due.
+  assert.equal(decideZai(a, cards), null, 'weekly held, and 97% of the 5h window is not its limit');
+  // The 5h limit is reached while the weekly is still held: the DEDICATED 5h card goes.
+  // The weekly hold is about the WEEKLY refill; it says nothing about a full 5h window,
+  // which the free weekly refill would also clear but which is blocking the account NOW.
+  a.quota.providerSes = 1;
   const act = decideZai(a, cards);
-  assert.equal(act, null, '5h cards never spend; held weekly stays held');
+  assert.equal(act?.resetType, 'FIVE_HOUR', 'the 5h limit is reached: its own card is spent');
+  assert.equal(act?.card?.recordId, 6, 'never the held weekly card');
 });
 
-test('W8: R4 intact — 5h wall does NOT spend the 5h card when the weekly card is redeemable', () => {
+test('W8: R4 intact — a 5h window below its limit never takes a card while the weekly card is redeemable', () => {
   const cards = {
     weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
     fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
@@ -348,6 +413,10 @@ test('W8: R4 intact — 5h wall does NOT spend the 5h card when the weekly card 
   a.quota.providerWkReset = Date.now() + 30 * 3600_000;   // refill far → weekly redeemable → R4 rules
   const act = decideZai(a, cards);
   assert.equal(act?.resetType, 'WEEK', 'weekly card still preferred when not held');
+  // And with the weekly card at its wall, a 5h window AT its limit changes nothing: the
+  // weekly card clears both windows, so it is the one card that is spent.
+  a.quota.providerSes = 1;
+  assert.equal(decideZai(a, cards)?.resetType, 'WEEK');
 });
 
 test('W9: 24h boundary — refill exactly 24h+1s away redeems at the wall', () => {
@@ -499,16 +568,165 @@ test('a redeemed z.ai card puts a rate-limited account back in service at once',
     assert.notEqual(account.status, 'throttled', 'a fresh week must not stay behind a stale park');
     assert.equal(am._isAvailable(account, { model: 'glm-5.4' }), true, 'the account can serve again');
     assert.ok(account.quota.providerWk < 0.1, `usage re-read after the reset (wk=${account.quota.providerWk})`);
-    // A later, unrelated failure on a parked account must not keep it parked: an in-flight
-    // request that ends in a timeout or a 5xx rewrites lastError while the bench stays.
-    am.markRateLimited(0, 24 * 3600, { status: 429 });
-    account.lastError = 'upstream_error'; account.lastErrorAt = Date.now();
-    assert.equal(am.clearRateLimited(0), true, 'lifted on status alone');
-    assert.equal(account.status, 'active');
     // A non-quota bench is NOT lifted: an auth error or a cooldown is not about quota.
     am.markRateLimited(0, 60, { status: 429 });
     am.markAuthFailed(0, 403);
     assert.equal(am.clearRateLimited(0), false);
     assert.equal(account.status, 'error', 'an auth error stays benched');
+  } finally { globalThis.fetch = realFetch; console.log = realLog; }
+});
+
+// ── The Z.ai card column: a FRESH card must not read as stale (fixed 2026-11-27) ──────
+// Live symptom: a z.ai account's card, listed this very sweep, rendered GREY with a
+// trailing '?'. The reset cell judged freshness off the Claude GRANT listing, which a
+// z.ai account never has (resetGrants is null), so `freshGrants` was false for every
+// z.ai account whenever it held a card. Goes through the real row renderer.
+test('the z.ai reset column shows a freshly listed card as fresh (green, no ?) — no Claude grants needed', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { TUI, __tuiTest } = await import('../src/tui.js');
+  const strip = __tuiTest.strip;
+  const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', apiKey: 'k', credential: 'k' }], 0.9);
+  const card = () => ({ weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] });
+  am.applyResetCards(0, card());
+  assert.equal(am.accounts[0].resetGrants, undefined, 'precondition: a z.ai account has NO Claude grant listing');
+  assert.equal(am.accounts[0].resetCards.stale, false, 'precondition: the card listing is fresh');
+  const tui = new TUI({ accountManager: am });
+  const row = strip(tui._renderAcct(0, 11, true, true, true, 200));
+  // The account-level reset cell: the count with its expiry, and NOT the stale marker.
+  assert.match(row, /1~\d+d/, 'the weekly card count and expiry are shown');
+  assert.doesNotMatch(row, /1~\d+d\?/, 'a fresh card carries no "?"');
+  // NEGATIVE CONTROL — the same row, listing marked stale: the "?" must appear. This is
+  // what proves the fix did not simply stop drawing the marker.
+  am.accounts[0].resetCards = { ...am.accounts[0].resetCards, stale: true };
+  const staleRow = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true, true, true, 200));
+  assert.match(staleRow, /1~\d+d\?/, 'a stale card listing still reads stale');
+  // ...and an OLD listing (past LISTING_FRESH_MS) reads stale too.
+  am.applyResetCards(0, card());
+  am.accounts[0].resetCards.checkedAt = Date.now() - 60 * 60 * 1000;
+  const oldRow = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true, true, true, 200));
+  assert.match(oldRow, /1~\d+d\?/, 'an old card listing reads stale');
+});
+
+// ── The five-hour-card column (owner 2026-11-27) ───────────────────────────────────
+// "they should probably have their own column. And they should show nothing where they
+// don't apply." Blank where it does not apply; a fresh zero, an unknown and a stale
+// reading are three DIFFERENT things and never look alike.
+test('the 5h column: blank where it does not apply; 0, unknown and stale are distinct', async () => {
+  const { __tuiTest } = await import('../src/tui.js');
+  const { fiveHourResetCell, strip } = __tuiTest;
+  const t = Date.now();
+  const cell = (account, now = t) => strip(fiveHourResetCell(account, now));
+  const W = strip(fiveHourResetCell({ provider: 'zai' })).length;
+  assert.ok(W >= 4 && W <= 5, `the cell is a fixed narrow width (${W})`);
+  // BLANK: every account the column does not apply to.
+  for (const a of [{ provider: 'anthropic' }, { provider: 'codex' }, { provider: 'kimi' }, {}]) {
+    assert.equal(cell(a), ' '.repeat(W), `${JSON.stringify(a)}: blank`);
+  }
+  // BLANK too: a DISABLED z.ai account — its cards are not ours to spend.
+  assert.equal(cell({ provider: 'zai', enabled: false, resetCards: { fiveHour: [{ recordId: 1, expiresAt: t + 9 * DAY, expired: false }], checkedAt: t } }),
+    ' '.repeat(W), 'disabled: blank, a count would imply we may spend it');
+  // A dim 0: a z.ai account whose FRESH listing shows no 5h card.
+  assert.equal(cell({ provider: 'zai', resetCards: { fiveHour: [], checkedAt: t } }).trim(), '0', 'a fresh zero is a zero');
+  // UNKNOWN: a z.ai account whose card listing was never read. NOT a zero.
+  assert.equal(cell({ provider: 'zai' }).trim(), '?', 'no listing is unknown');
+  assert.equal(cell({ provider: 'zai', resetCards: { weekly: [], checkedAt: t } }).trim(), '?', 'a listing without the 5h array is unknown');
+  // STALE: cards seen, but the listing cannot be vouched for — grey with '?', never green.
+  const stale = cell({ provider: 'zai', resetCards: { fiveHour: [{ recordId: 1, expiresAt: t + 3 * DAY, expired: false }], checkedAt: t, stale: true } });
+  assert.equal(stale.trim(), '1~3d?', 'a stale count keeps its "?"');
+  const old = cell({ provider: 'zai', resetCards: { fiveHour: [{ recordId: 1, expiresAt: t + 3 * DAY, expired: false }], checkedAt: t - 60 * 60 * 1000 } });
+  assert.equal(old.trim(), '1~3d?', 'an old listing reads stale');
+  assert.equal(cell({ provider: 'zai', refreshDead: true, resetCards: { fiveHour: [], checkedAt: t } }).trim(), '0?', 'a stale zero is marked, never plain');
+  // A FRESH card: the count and its expiry, soonest first.
+  const live = { provider: 'zai', resetCards: { fiveHour: [
+    { recordId: 2, expiresAt: t + 9 * DAY, expired: false }, { recordId: 1, expiresAt: t + 11 * 3600_000, expired: false }], checkedAt: t } };
+  assert.equal(cell(live).trim(), '2~11h', 'count and soonest expiry');
+  assert.equal(cell(live).includes('\x1b[32m'), true, 'a live card is GREEN');
+  // Expired cards on the listing do not count.
+  const withExpired = { provider: 'zai', resetCards: { fiveHour: [
+    { recordId: 1, expiresAt: t + 3 * DAY, expired: false }, { recordId: 2, expiresAt: t - DAY, expired: true }], checkedAt: t } };
+  assert.equal(cell(withExpired).trim(), '1~3d', 'an expired card is not a card');
+});
+
+test('the 5h column: the account-level count no longer folds five-hour cards in', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { TUI, __tuiTest } = await import('../src/tui.js');
+  const strip = __tuiTest.strip;
+  const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', apiKey: 'k', credential: 'k' }], 0.9);
+  // One weekly card and two five-hour cards.
+  am.applyResetCards(0, { weekly: [{ recordId: 9, expiresAt: soon(20 * DAY), expired: false }],
+    fiveHour: [{ recordId: 5, expiresAt: soon(3 * DAY), expired: false }, { recordId: 6, expiresAt: soon(4 * DAY), expired: false }] });
+  const wide = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true, true, true, 200));
+  // ARst counts the WEEKLY card alone (it used to read 3); the 5h column carries the two.
+  assert.match(wide, /1~\d+d +2~3d/, 'account-level = 1 weekly; five-hour column = 2~3d');
+  // Below the width the column fits, the row carries NO five-hour cell at all.
+  assert.equal(__tuiTest.show5hColumn(200), true);
+  assert.equal(__tuiTest.show5hColumn(139), true, 'first width where the column costs no bar width');
+  assert.equal(__tuiTest.show5hColumn(138), false);
+  assert.equal(__tuiTest.show5hColumn(80), false);
+  const narrow = strip(new TUI({ accountManager: am })._renderAcct(0, 11, true, true, true, 120));
+  assert.doesNotMatch(narrow, /2~3d/, 'the five-hour cell is absent on a narrow terminal');
+  assert.match(narrow, /1~\d+d/, 'the weekly card is still shown');
+});
+
+test('the 5h column never squeezes a quota bar: it is shown only where it costs no bar width', async () => {
+  const { __tuiTest } = await import('../src/tui.js');
+  const { barStart, barLayout, show5hColumn } = __tuiTest;
+  // The column is shown from exactly one width, and adds exactly its own span there.
+  assert.equal(show5hColumn(138), false);
+  assert.equal(show5hColumn(139), true, 'the first width where the column costs nothing');
+  // At a width where the name column has stopped growing (>=100), the ONLY thing that
+  // can move barStart between 138 and 139 is the column itself.
+  const span = barStart(139) - barStart(138);
+  assert.equal(span, 6, 'the column is 5 cells plus its gap');
+  // MEASURED against the real layout: at 139 and above, every bar keeps its full width
+  // (three bars at 11). Below 139 the column is not shown, so that layout is unchanged
+  // from before the column existed (barStart there has no column span in it).
+  for (const W of [139, 140, 160, 200]) {
+    const l = barLayout(W);
+    assert.equal(l.showFable, true, `W=${W}: the Fable bar still shows`);
+    assert.equal(l.bw, 11, `W=${W}: bars keep their full width (bw=${l.bw})`);
+  }
+  // Just below: no column, and the layout is the one that shipped before (Fable shows
+  // from 127 with the column absent). This is the proof the column never REMOVES a bar.
+  assert.equal(barLayout(127).showFable, true, '127 keeps its Fable bar (no column there)');
+  assert.equal(barLayout(120).bw, 13, '120 keeps its 13-wide bars (no column there)');
+});
+
+// ── The 5h card through the REAL prober (the wiring a decideZai unit test cannot see) ──
+// The decision reads the session usage from THIS sweep's probe (applyProviderUsage runs
+// before decideZai), and the prober sends the policy's resetType on the wire.
+test('REAL WIRING: a 5h card is redeemed through the prober only once the probed session window is at its limit', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { Prober } = await import('../src/prober.js');
+  const realFetch = globalThis.fetch;
+  const realLog = console.log;
+  console.log = () => {};
+  try {
+    for (const [sesUtil, expectSpent] of [[1.0, true], [0.999, false], [0.96, false], [0.02, false]]) {
+      const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', apiKey: 'k', credential: 'k' }], 0.9);
+      const a = am.accounts[0];
+      const posts = [];
+      globalThis.fetch = async (_u, init) => {
+        if (init?.method === 'POST') { posts.push(JSON.parse(init.body)); return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) }; }
+        return { status: 200, json: async () => ({ code: 200, data: { fiveHourResets: [], weekResets: [] } }) };
+      };
+      const logs = [];
+      const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m),
+        // The probe reports the session window; the decision reads THAT, this sweep.
+        providerProbeFn: async () => ({ source: 'zai', ses: { utilization: sesUtil, resetAt: Date.now() + 2 * H },
+          wk: { utilization: 0.2, resetAt: Date.now() + 3 * DAY } }),
+        cardsFn: async () => ({ weekly: [], fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 20 * DAY, expired: false }] }) });
+      await prober.probeProvider(a);
+      assert.equal(a.quota.providerSes, sesUtil, 'precondition: the probe reading is what the decision sees');
+      if (expectSpent) {
+        assert.equal(posts.length, 1, `session ${sesUtil}: the card is redeemed`);
+        assert.equal(posts[0].resetType, 'FIVE_HOUR', 'the DEDICATED five-hour card is what is sent');
+        assert.equal(posts[0].recordId, 6);
+        assert.equal(posts[0].grantType, 'GLOBAL');
+        assert.ok(logs.some(l => /redeeming FIVE_HOUR card 6 \(session at limit/.test(l)), 'logged with its reason');
+      } else {
+        assert.equal(posts.length, 0, `session ${sesUtil}: below the 5h limit, no card is spent`);
+      }
+    }
   } finally { globalThis.fetch = realFetch; console.log = realLog; }
 });

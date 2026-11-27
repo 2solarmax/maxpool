@@ -96,7 +96,8 @@ test('free reset inventory requires confirmation and refreshes after manual rede
   await tui._showCodexResets(account);
   assert.match(tui._renderCodexResets(10).map(strip).join('\n'), /3 banked resets/);
   assert.ok(strip(tui._renderFooter()).length <= 80);
-  assert.match(strip(tui._renderFooter()), /Auto: off/);
+  // Automatic resets are on unless the owner turned them off.
+  assert.match(strip(tui._renderFooter()), /Auto: on/);
 
   assert.doesNotMatch(tui._renderCodexResets(10).map(strip).join(' '), /Expired reset|Spent reset/);
   account.codexResetCredits.applicable = 0;
@@ -118,10 +119,18 @@ test('free reset inventory requires confirmation and refreshes after manual rede
   assert.equal(tui.mode, 'confirm');
   tui._key('y');
   await new Promise(resolve => setImmediate(resolve));
+  assert.equal(account.autoRedeemReset, false, 'turning it off is saved as an explicit off');
+  assert.deepEqual(calls.at(-1), ['auto', account.name, false]);
+  assert.match(strip(tui._renderFooter()), /Auto: off/);
+  tui._key('a');
+  tui._key('y');
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(account.autoRedeemReset, true);
   assert.deepEqual(calls.at(-1), ['auto', account.name, true]);
   assert.match(strip(tui._renderFooter()), /Auto: on/);
   await tui._showCodexResets(codex('Separate account', { quota: {} }));
+  assert.match(strip(tui._renderFooter()), /Auto: on/);
+  await tui._showCodexResets(codex('Opted out', { quota: {}, autoRedeemReset: false }));
   assert.match(strip(tui._renderFooter()), /Auto: off/);
   tui._key('esc');
   assert.equal(tui.mode, 'accounts');

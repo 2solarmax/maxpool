@@ -64,7 +64,7 @@ test('a stale listing never triggers a claim decision', () => {
 test('prober: failing listing never claims and the stored count is kept', async () => {
   const am = am1();
   am.applyResetGrants(0, GOOD());
-  am.accounts[0].quota.unified7d = 0.99;
+  am.accounts[0].quota.unified7d = 0.999;   // the limit (EXACT LIMIT, 2026-11-27)
   const logs = [];
   const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
     probeFn: async () => ({ status: 500, error: 'x' }), grantsFn: async () => ({ error: 'HTTP 500' }) });
