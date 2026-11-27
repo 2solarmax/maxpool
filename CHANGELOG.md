@@ -5,6 +5,13 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.127] - 2026-11-27
+
+### Fixed
+
+- A spent reset puts a parked account back in service
+- Lift a park on status alone, and cover the Codex path with a real-pool test
+
 ## [1.24.126] - 2026-11-26
 
 ### Fixed
