@@ -6673,6 +6673,24 @@ export class AccountManager {
   /**
    * Mark an account as rate-limited for a given duration.
    */
+  /** Put an account back in service after its limit was RESET (a banked reset was
+   *  spent on it). The "rate limited" bench recorded the OLD window; the reset opened a
+   *  new one, so keeping the bench parks a freshly paid-for week (live 2026-11-27: a
+   *  weekly card was redeemed on three z.ai accounts that then sat idle up to 24h).
+   *  Only a rate-limit bench is lifted — an auth error, a cooldown or a provisional
+   *  upstream failure is not about quota and stays. */
+  clearRateLimited(accountIndex) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.status !== 'throttled' || account.lastError !== 'rate_limited') return false;
+    account.status = 'active';
+    account.rateLimitedUntil = null;
+    account.lastError = null;
+    account.lastErrorAt = null;
+    account.provisionalRateLimitFingerprint = null;
+    account.recoveredAt = Date.now();
+    return true;
+  }
+
   markRateLimited(accountIndex, retryAfterSeconds, options = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;

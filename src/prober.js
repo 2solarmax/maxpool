@@ -515,6 +515,13 @@ export class Prober {
         this._cardRetryUntil.set(key, 0);               // success clears any backoff
         this._cardTries?.set(key, 0);                   // ...and the failure count (red-team 2026-10-23)
         this.log(`[reset-card] ${account.name}: card ${act.card.recordId} redeemed`);
+        // The reset opened a new window: a "rate limited" bench from the old one is
+        // stale now. Lift it before the follow-up read, so the account serves at once
+        // even if that read fails (live 2026-11-27: three z.ai accounts sat parked up
+        // to 24h behind a bench set before their weekly card was redeemed).
+        if (this.am.clearRateLimited?.(account.index)) {
+          this.log(`[reset-card] ${account.name}: rate-limit bench lifted by the reset`);
+        }
         // A4: remove the redeemed card from the stored list BEFORE the follow-up
         // read — if that read fails (or is drifted), the stale-kept list must not
         // keep counting a card that no longer exists (pre-mortem #17).
@@ -523,6 +530,16 @@ export class Prober {
         if (this.am.applyResetCards) {
           const fresh = await this._withTimeout(listResetCards(account.credential));
           if (fresh && !fresh.error) this.am.applyResetCards(account.index, fresh);
+        }
+        // The usage bars still show the OLD window (100%) until the next sweep, and
+        // routing refuses an account whose week reads full — so the fresh week above
+        // would stay unusable for up to a minute. Re-read this account's usage now.
+        // A failed or missing read changes nothing: the sweep refreshes it as before.
+        if (this.providerProbeFn) {
+          try {
+            const usage = await this._withTimeout(this.providerProbeFn(account));
+            if (usage && !usage.error) this.am.applyProviderUsage(account.index, usage);
+          } catch { /* the sweep re-reads it */ }
         }
       } else {
         const tries = (this._cardTries?.get(key) || 0) + 1;
