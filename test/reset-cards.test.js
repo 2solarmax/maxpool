@@ -467,3 +467,48 @@ test('A4/SC5: a successful redeem removes the recordId locally; a FAILED follow-
     assert.equal(am._holdsUsableReset(am.accounts[0]), false, 'no stale discount for a spent card');
   } finally { globalThis.fetch = realFetch; }
 });
+
+// ── A spent reset must put a PARKED account back in service ───────────────────
+// Live 2026-11-27 09:00Z on the cloud pool: the weekly card was redeemed on glm6,
+// glm7 and privacy while each was still parked for a 24h "rate limited" bench set
+// earlier; the accounts then sat idle for up to 24h with a fresh week paid for.
+test('a redeemed z.ai card puts a rate-limited account back in service at once', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { Prober } = await import('../src/prober.js');
+  const realFetch = globalThis.fetch;
+  const realLog = console.log;
+  const logs = [];
+  console.log = () => {};
+  globalThis.fetch = async () => ({ status: 200, json: async () => ({ code: 200, success: true }) });
+  try {
+    const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', authToken: 'k', apiKey: 'k', credential: 'k' }], 0.95);
+    const account = am.accounts[0];
+    account.quota.providerWk = 1; account.quota.providerWkReset = Date.now() + 2 * 24 * 3600_000;
+    account.quota.providerSes = 0; account.quota.providerSesReset = Date.now() + 3 * H;
+    am.markRateLimited(0, 24 * 3600, { status: 429 });
+    assert.equal(account.status, 'throttled');
+    assert.ok(account.rateLimitedUntil - Date.now() > 23 * 3600_000, 'precondition: parked for most of a day');
+    const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m),
+      // z.ai's usage read AFTER the reset: the week is 2% used again.
+      // Same shape as the real reader (fetchProviderUsage): {utilization, resetAt} per window.
+      providerProbeFn: async () => ({ source: 'zai', ses: { utilization: 0.02, resetAt: Date.now() + 3 * H },
+        wk: { utilization: 0.02, resetAt: Date.now() + 7 * 24 * 3600_000 } }),
+      usageGapMs: 0 });
+    await prober._redeemZaiCard(account, { card: { recordId: 9, grantType: 'GLOBAL' }, resetType: 'WEEK', reason: 'weekly at wall' });
+    assert.ok(logs.some(l => /card 9 redeemed/.test(l)), 'precondition: the card was spent');
+    assert.notEqual(account.status, 'throttled', 'a fresh week must not stay behind a stale park');
+    assert.equal(am._isAvailable(account, { model: 'glm-5.4' }), true, 'the account can serve again');
+    assert.ok(account.quota.providerWk < 0.1, `usage re-read after the reset (wk=${account.quota.providerWk})`);
+    // A later, unrelated failure on a parked account must not keep it parked: an in-flight
+    // request that ends in a timeout or a 5xx rewrites lastError while the bench stays.
+    am.markRateLimited(0, 24 * 3600, { status: 429 });
+    account.lastError = 'upstream_error'; account.lastErrorAt = Date.now();
+    assert.equal(am.clearRateLimited(0), true, 'lifted on status alone');
+    assert.equal(account.status, 'active');
+    // A non-quota bench is NOT lifted: an auth error or a cooldown is not about quota.
+    am.markRateLimited(0, 60, { status: 429 });
+    am.markAuthFailed(0, 403);
+    assert.equal(am.clearRateLimited(0), false);
+    assert.equal(account.status, 'error', 'an auth error stays benched');
+  } finally { globalThis.fetch = realFetch; console.log = realLog; }
+});

@@ -629,6 +629,9 @@ export class ResetCreditRedeemer {
       account.codexQuotaSentAt = Math.max(account.codexQuotaSentAt || 0, account.lastClaimAt);
       const windowsReset = result.windowsReset || 0;
       this.log(`[MaxPool] Redeemed a free Codex reset on "${name}" — ${windowsReset} window(s) reset (${result.code})`);
+      if (this.am.clearRateLimited(account.index)) {
+        this.log(`[MaxPool] Rate-limit bench lifted on "${name}" by the reset`);
+      }
       try { await this._refresh(account, name, deadline); } catch {
         this.log(`[MaxPool] Could not re-read Codex quota for "${name}" after the reset`);
       }
@@ -682,7 +685,7 @@ export class ResetCreditRedeemer {
    */
   async _refresh(account, name, deadline) {
     if (!this._owns(account)) return;
-    this.am.clearRateLimited?.(account.index);
+    this.am.clearRateLimited(account.index);
     const timeoutMs = this._timeLeft(deadline);
     if (timeoutMs <= 0) {
       this.log(`[MaxPool] Out of time to re-read Codex quota for "${name}" after the reset — it will be re-learned from traffic`);
