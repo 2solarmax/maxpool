@@ -169,8 +169,15 @@ test('SC5 (judge #8): a DYING Fable grant claims below the wall (was dead code);
   assert.ok(r.action, `dying value claims (got reason ${r.reason})`);
   assert.equal(r.action.reason, 'dying value');
   assert.equal(r.action.scope, 'fable');
-  const held = acct({ wk: 0.4, scoped: { fable: { utilization: 0.5, resetAt: Date.now() + 18 * H } } });
-  const h = decideClaudeWithReason(held, listing({ grants: [dyingFable] }));
+  // A 10h grant with the Fable refill 18h out dies BEFORE the refill: spending it now is
+  // right (2026-11-27), so the hold is asserted with a grant that outlives the refill.
+  const diesFirst = acct({ wk: 0.4, scoped: { fable: { utilization: 0.5, resetAt: Date.now() + 18 * H } } });
+  assert.equal(decideClaudeWithReason(diesFirst, listing({ grants: [dyingFable] })).action?.reason, 'dying value',
+    'a grant that expires before the refill is spent, not held');
+  // The hold itself: refill 6h out, grant with 20h left — it survives the free
+  // refill, so the refill makes it redundant and waiting for it is right.
+  const held = acct({ wk: 0.4, scoped: { fable: { utilization: 0.5, resetAt: Date.now() + 6 * H } } });
+  const h = decideClaudeWithReason(held, listing({ grants: [G({ id: 'f2', clears: ['seven_day_overage_included'], endsAt: Date.now() + 20 * H })] }));
   assert.equal(h.action, null);
   assert.equal(h.reason, 'free refill <24h away');
   // Below the 30% floor a dying refill buys too little.
@@ -181,7 +188,13 @@ test('SC5 (judge #8): a DYING Fable grant claims below the wall (was dead code);
 test('SC5 (judge #8): a dying GENERAL grant is held inside 24h of the free weekly refill; a WALL claim never waits', () => {
   const dying = G({ endsAt: Date.now() + 10 * H });
   assert.equal(decideClaude(acct({ wk: 0.5, resetIn: 3 * DAY }), listing({ grants: [dying] }))?.reason, 'dying value', 'control: far refill → dying value claims');
-  const h = decideClaudeWithReason(acct({ wk: 0.5, resetIn: 18 * H }), listing({ grants: [dying] }));
+  // The 10h grant dies before an 18h-away refill: it is spent now (2026-11-27). The
+  // hold is asserted with a grant that still has a full day left when the refill lands.
+  assert.equal(decideClaudeWithReason(acct({ wk: 0.5, resetIn: 18 * H }), listing({ grants: [dying] })).action?.reason, 'dying value',
+    'a grant that expires before the refill is spent, not held');
+  // The hold itself: refill 6h out, grant with 20h left — it survives the free
+  // refill, so the refill makes it redundant and waiting for it is right.
+  const h = decideClaudeWithReason(acct({ wk: 0.5, resetIn: 6 * H }), listing({ grants: [G({ endsAt: Date.now() + 20 * H })] }));
   assert.equal(h.action, null);
   assert.equal(h.reason, 'free refill <24h away');
   assert.equal(decideClaude(acct({ wk: 0.995, resetIn: 18 * H }), listing({ grants: [dying] }))?.reason, 'weekly at wall',

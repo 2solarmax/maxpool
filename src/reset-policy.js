@@ -91,6 +91,17 @@ export { CLAIM_FRESH_MS };
 
 function msLeft(t, now) { return t == null ? Infinity : t - now; }
 
+/** Whether a reset lives to see the free refill of the limit it clears (D4). The
+ *  refill makes a held reset redundant only then: a reset that dies first is worth
+ *  zero at expiry, so waiting for the refill throws it away (reported 2026-11-27: a
+ *  Codex credit with 12h left, the refill 20h out). Any time left after the refill
+ *  is real value the refill does not give back, so surviving it is enough. The z.ai
+ *  card rule never held a dying card (W5); this gives Claude grants and Codex
+ *  credits the same answer. No end date = never expires = survives it. */
+function outlivesRefill(grant, refillAt) {
+  return grant?.endsAt == null || grant.endsAt > refillAt;
+}
+
 /** R7 (owner, 2026-11-13): should a GENERAL weekly WALL claim of `grant` wait for the
  *  free refill at `refillAt`? GENERAL ONLY (red-team r3, orchestrator decision): a
  *  per-model (Fable) wall and a dying-value grant claim exactly as before R7. The ONE
@@ -275,7 +286,9 @@ function decideSubscriptionWithReason(account, listing, now, opts) {
       && wkUtil != null && wkUtil >= POLICY.dyingMinUtilWeekly;  // weekly window only (owner 2026-10-30)
     if (!dying) continue;
     if (g.requiresLimit) { note('requires limit'); continue; }
-    if (refillSoon(q.unified7dReset)) { note('free refill <24h away'); continue; }
+    if (refillSoon(q.unified7dReset) && outlivesRefill(g, q.unified7dReset)) {
+      note('free refill <24h away'); continue;
+    }
     return out({ kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'dying value' }, 'dying value');
   }
   if (weeklyWall && !general.length) note('general not held');
@@ -307,7 +320,7 @@ function decideSubscriptionWithReason(account, listing, now, opts) {
       && e.utilization >= POLICY.dyingMinUtilWeekly;
     if (!dying) continue;
     if (cand.requiresLimit) { note('requires limit'); continue; }
-    if (refillSoon(e.resetAt)) { note('free refill <24h away'); continue; }
+    if (refillSoon(e.resetAt) && outlivesRefill(cand, e.resetAt)) { note('free refill <24h away'); continue; }
     return out({ kind: 'grant', grant: cand, scope: fam, reason: 'dying value' }, 'dying value');
   }
   // A scoped bucket measured at the wall with no grant for it.

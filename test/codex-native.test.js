@@ -278,11 +278,29 @@ test('Codex credits use the subscription weekly wall, expiry, and natural-refill
   }).action.reason, 'weekly at wall');
 
   owner.quota.unified7d = 0.3;
+  // 2h left on the credit, 23h to the refill: it dies first, so it is spent now (it
+  // used to be held for a refill it would never see).
   const expiring = { ...availableCredit, expiresAt: resetNow + 2 * 60 * minutes };
-  assert.equal(decideCodexWithReason(owner, [expiring], resetNow).reason, 'free refill <24h away');
+  assert.equal(decideCodexWithReason(owner, [expiring], resetNow).action.reason, 'dying value');
+  // Refill 6h out. A credit with 20h left survives the free refill, so the refill
+  // makes it redundant: it waits. One that dies 3h before the refill is spent now.
+  owner.quota.unified7dReset = resetNow + 6 * 60 * minutes;
+  assert.equal(decideCodexWithReason(owner, [{ ...availableCredit, expiresAt: resetNow + 20 * 60 * minutes }],
+    resetNow).reason, 'free refill <24h away');
+  assert.equal(decideCodexWithReason(owner, [{ ...availableCredit, expiresAt: resetNow + 3 * 60 * minutes }],
+    resetNow).action.reason, 'dying value');
+  // Boundary: expiring AT the refill moment leaves nothing after it — spent now, not held.
+  assert.equal(decideCodexWithReason(owner, [{ ...availableCredit, expiresAt: resetNow + 6 * 60 * minutes }],
+    resetNow).action.reason, 'dying value');
+  // One second past the refill: it survives, so the free refill makes it redundant.
+  assert.equal(decideCodexWithReason(owner, [{ ...availableCredit, expiresAt: resetNow + 6 * 60 * minutes + 1000 }],
+    resetNow).reason, 'free refill <24h away');
+  owner.quota.unified7dReset = resetNow + 23 * 60 * minutes;
   owner.quota.unified7dReset = resetNow + 28 * 60 * minutes;
   assert.equal(decideCodexWithReason(owner, [expiring], resetNow).action.reason, 'dying value');
-  assert.equal(decideCodexWithReason(owner, [heldCredit], resetNow).action, null);
+  // At the wall the expiring credit is claimed outright (the hold is for long-lived credits).
+  owner.quota.unified7d = 0.99;
+  assert.equal(decideCodexWithReason(owner, [expiring], resetNow, sharedRoom).action.reason, 'weekly at wall');
   owner.quota.codexWeeklyReadingAt = resetNow - 6 * minutes;
   assert.equal(decideCodexWithReason(owner, [expiring], resetNow).reason, 'probe not fresh');
 });
@@ -496,4 +514,46 @@ test('a failed persist followed by another native rotation keeps the older disk 
   assert.equal(await am.ensureTokenFresh(0, true), true);
   assert.equal(disk.refreshToken, afterBrowser.refreshToken);
   assert.equal(canPersistOAuthRefresh(account(old), afterBrowser, latestRotation), false, 'browser authorization starts a new lineage');
+});
+
+// A credit that dies BEFORE the free refill must be spent, not held for a refill it
+// will never see. Reported 2026-11-27: a reset dies in 12h, the refill lands in 20h,
+// and the "free refill <24h away" skip threw the credit away.
+test('a Codex credit dying before the free refill is claimed; one that outlives the refill still waits for it', () => {
+  const owner = account({ quota: { unified7d: 0.3, unified7dReset: resetNow + 23 * 60 * minutes,
+    codexWeeklyReadingAt: resetNow, lastProbeOkAt: resetNow } });
+  const diesBeforeRefill = { ...availableCredit, expiresAt: resetNow + 2 * 60 * minutes };
+  assert.equal(decideCodexWithReason(owner, [diesBeforeRefill], resetNow).action?.reason, 'dying value');
+  // Control: the same credit, weekly under the 30% floor, buys too little to spend.
+  owner.quota.unified7d = 0.29;
+  assert.equal(decideCodexWithReason(owner, [diesBeforeRefill], resetNow).action, null);
+  // Control: with the free refill far away the rule never applied — nothing changes.
+  owner.quota.unified7d = 0.3;
+  owner.quota.unified7dReset = resetNow + 3 * 86400000;
+  assert.equal(decideCodexWithReason(owner, [diesBeforeRefill], resetNow).action?.reason, 'dying value');
+});
+
+test('a Claude general grant dying before the free weekly refill is claimed too', () => {
+  const now = 1800000000000;
+  const base = { name: 'a', enabled: true,
+    quota: { unified7d: 0.5, unified7dReset: now + 18 * 60 * minutes, unified5h: 0.2, lastProbeOkAt: now } };
+  const grant = ends => ({ id: 'g1', usableNow: true, paused: false, expired: false, resetsLeft: 1, resetsTotal: 1,
+    endsAt: ends, clears: ['seven_day'], givesBackWeekly: false, blocking: false, unavailableReason: null, requiresLimit: false });
+  const listing = g => ({ grants: [g], nextGrantId: null, cooldownUntil: null, eligible: true, stale: false, checkedAt: now });
+  // Dies in 10h; the refill lands in 18h — the grant would expire unused.
+  assert.equal(decideClaudeWithReason(base, listing(grant(now + 10 * 60 * minutes)), now).action?.reason, 'dying value');
+  // Control: outlives the refill by a day — waiting is right, the refill is free.
+  assert.equal(decideClaudeWithReason(base, listing(grant(now + 42 * 60 * minutes)), now).action, null);
+});
+
+test('a Fable grant dying before the Fable refill is claimed too', () => {
+  const now = 1800000000000;
+  const base = { name: 'a', enabled: true,
+    quota: { unified7d: 0.4, unified7dReset: now + 4 * 86400000, unified5h: 0.2, lastProbeOkAt: now,
+      scopedWeekly: { fable: { utilization: 0.5, resetAt: now + 18 * 60 * minutes, isActive: true } } } };
+  const grant = ends => ({ id: 'f1', usableNow: true, paused: false, expired: false, resetsLeft: 1, resetsTotal: 1,
+    endsAt: ends, clears: ['seven_day_overage_included'], givesBackWeekly: false, blocking: false, unavailableReason: null, requiresLimit: false });
+  const listing = g => ({ grants: [g], nextGrantId: null, cooldownUntil: null, eligible: true, stale: false, checkedAt: now });
+  assert.equal(decideClaudeWithReason(base, listing(grant(now + 10 * 60 * minutes)), now).action?.reason, 'dying value');
+  assert.equal(decideClaudeWithReason(base, listing(grant(now + 42 * 60 * minutes)), now).action, null);
 });
