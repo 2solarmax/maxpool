@@ -948,6 +948,8 @@ async function serverWorkerCommand() {
     },
   });
   accountManager.codexResetOpportunity = (account, now) => codexReset.expiringOpportunity(account, now);
+  accountManager.codexResetExpiry = (account, now) => codexReset.expirySummary(account, now);
+  accountManager.codexResetLiftRows = (account, now) => codexReset.liftRows(account, now);
   const prober = new Prober(accountManager, {
     intervalMs: probeSeconds * 1000, log: uiLog,
     onCodexQuota: account => hasLease ? codexReset.maybeRedeemForPool([account]) : null,

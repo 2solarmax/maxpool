@@ -245,7 +245,8 @@ test('browser account screen shows native quota and banked reset inventory', asy
   assert.match(app.innerHTML, /45%/);
   assert.match(app.innerHTML, /Weekly reset/);
   assert.match(app.innerHTML, /3 banked resets/);
-  assert.match(app.innerHTML, /Automatic resets off/);
+  // Unset means on for a locally owned native account; only an explicit off reads off.
+  assert.match(app.innerHTML, /Automatic resets on/);
 });
 
 test('a native model-specific limit follows the account’s selected effort-compatible model', () => {

@@ -266,10 +266,22 @@ test('expiring credit shadow needs fresh detail, opted-in ownership and a curren
   await redeemer.readDetails(account);
   assert.equal(redeemer.expiringOpportunity(account, now)?.expiresAt, expiresAt);
   assert.equal(redeemer.expiringOpportunity(account, now + hour), null);
+  // The free refill lands in 2h, but this credit dies in 1h: the refill never reaches it,
+  // so it is still a decision to spend (the refill used to hide it).
   account.quota.unified7dReset = now + 2 * hour;
-  assert.equal(redeemer.expiringOpportunity(account, now), null);
+  assert.equal(redeemer.expiringOpportunity(account, now)?.expiresAt, expiresAt);
+  // A credit that outlives the refill by half a day is held for it: no opportunity.
+  const longLived = new ResetCreditRedeemer(am, { now: () => now, detailsFn: async () => ({ credits: [
+    { id: 'long', status: 'available', supportedByPlan: true, expiresAt: now + 20 * hour }] }),
+  consumeFn: () => assert.fail('a shadow observation must not spend') });
+  account.quota.unified7dReset = now + 2 * hour;
+  await longLived.readDetails(account);
+  assert.equal(longLived.expiringOpportunity(account, now), null);
+  // Control: with the refill far away the same credit is a dying one worth reporting.
   account.quota.unified7dReset = now + 72 * hour;
+  assert.equal(longLived.expiringOpportunity(account, now)?.expiresAt, now + 20 * hour);
   account.autoRedeemReset = false;
   assert.equal(redeemer.expiringOpportunity(account, now), null);
+  assert.equal(longLived.expiringOpportunity(account, now), null);
   assert.equal(calls, 1);
 });

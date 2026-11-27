@@ -9,7 +9,9 @@ import {
 import { codexSpentWindows, parseCodexPlanType, parseCodexQuota } from '../src/codex-quota.js';
 import { fetchCodexUsage, normalizeCodexUsagePayload } from '../src/codex-usage.js';
 import { ResetCreditRedeemer, fetchResetCreditDetails, redeemableCredit } from '../src/codex-reset-credits.js';
-import { decideClaudeWithReason, decideCodexWithReason, HOLD_POOL_HAS_ROOM } from '../src/reset-policy.js';
+import {
+  decideClaudeWithReason, decideCodexWithReason, HOLD_POOL_HAS_ROOM, HOLD_CAPACITY_RETURNS,
+} from '../src/reset-policy.js';
 import { AccountManager } from '../src/account-manager.js';
 
 const authKey = 'https://api.openai.com/auth';
@@ -187,7 +189,7 @@ function resetFixture() {
   };
 }
 
-test('reset redemption is opt-in and a race or reload cannot consume a second credit', async () => {
+test('an explicit off keeps resets unspent, and a race or reload cannot consume a second credit', async () => {
   let now = resetNow;
   const owner = account({ quota: { unified7d: 1, unified7dReset: now + 1440 * minutes,
     codexWeeklyReadingAt: now } });
@@ -203,6 +205,8 @@ test('reset redemption is opt-in and a race or reload cannot consume a second cr
       return { code: 'reset', windowsReset: 1 };
     },
   };
+  // Automatic redemption is ON unless the owner turned it off; an explicit off wins.
+  owner.autoRedeemReset = false;
   const disarmed = new ResetCreditRedeemer(manager, options);
   assert.equal((await disarmed.maybeRedeemForPool([owner])).redeemed, false);
   assert.equal(requests.length, 0);
@@ -282,22 +286,30 @@ test('Codex credits use the subscription weekly wall, expiry, and natural-refill
   // used to be held for a refill it would never see).
   const expiring = { ...availableCredit, expiresAt: resetNow + 2 * 60 * minutes };
   assert.equal(decideCodexWithReason(owner, [expiring], resetNow).action.reason, 'dying value');
-  // Refill 6h out. A credit with 20h left survives the free refill, so the refill
-  // makes it redundant: it waits. One that dies 3h before the refill is spent now.
+  // Refill 6h out. A credit with 20h left still has 14h after the refill, enough for the
+  // account to climb back and use it: the free refill makes a spend redundant, it waits.
+  // One that dies 3h before the refill is spent now.
   owner.quota.unified7dReset = resetNow + 6 * 60 * minutes;
+  const after = hours => ({ ...availableCredit, expiresAt: resetNow + 6 * 60 * minutes + hours * 60 * minutes });
   assert.equal(decideCodexWithReason(owner, [{ ...availableCredit, expiresAt: resetNow + 20 * 60 * minutes }],
     resetNow).reason, 'free refill <24h away');
   assert.equal(decideCodexWithReason(owner, [{ ...availableCredit, expiresAt: resetNow + 3 * 60 * minutes }],
     resetNow).action.reason, 'dying value');
-  // Boundary: expiring AT the refill moment leaves nothing after it — spent now, not held.
-  assert.equal(decideCodexWithReason(owner, [{ ...availableCredit, expiresAt: resetNow + 6 * 60 * minutes }],
+  // Boundaries around the refill: expiring AT it leaves nothing after it, and one that
+  // dies just after it meets an empty-again account and expires unspent — both are
+  // spent now. A credit keeps its hold only with POLICY.refillSurvivalMs (12h) left after
+  // the refill: 1s short of that is spent, exactly that waits.
+  assert.equal(decideCodexWithReason(owner, [after(0)], resetNow).action.reason, 'dying value');
+  assert.equal(decideCodexWithReason(owner, [after(10 / 60)], resetNow).action.reason, 'dying value',
+    'a credit dying 10 minutes after the refill is spent before it');
+  assert.equal(decideCodexWithReason(owner, [{ ...after(12), expiresAt: after(12).expiresAt - 1000 }],
     resetNow).action.reason, 'dying value');
-  // One second past the refill: it survives, so the free refill makes it redundant.
-  assert.equal(decideCodexWithReason(owner, [{ ...availableCredit, expiresAt: resetNow + 6 * 60 * minutes + 1000 }],
-    resetNow).reason, 'free refill <24h away');
-  owner.quota.unified7dReset = resetNow + 23 * 60 * minutes;
+  assert.equal(decideCodexWithReason(owner, [after(12)], resetNow).reason, 'free refill <24h away');
   owner.quota.unified7dReset = resetNow + 28 * 60 * minutes;
   assert.equal(decideCodexWithReason(owner, [expiring], resetNow).action.reason, 'dying value');
+  // Control: a credit with 60h left is not dying, and the account is nowhere near its
+  // wall: it is not spent at 30% used.
+  assert.equal(decideCodexWithReason(owner, [heldCredit], resetNow).action, null);
   // At the wall the expiring credit is claimed outright (the hold is for long-lived credits).
   owner.quota.unified7d = 0.99;
   assert.equal(decideCodexWithReason(owner, [expiring], resetNow, sharedRoom).action.reason, 'weekly at wall');
@@ -377,6 +389,141 @@ test('Codex revalidates weekly usage after reserving and before consuming a cred
   assert.match(result.reason, /eligibility changed/);
   assert.equal(consumed, 0);
   assert.equal(fixture.value.pending, null);
+});
+
+// A credit that does not expire for a long time: only the early rule can spend it.
+const longCredit = { ...availableCredit, id: 'banked-credit-long', expiresAt: resetNow + 90 * 60 * minutes };
+
+function earlySweep(owner, { inputs = { weeklyCap: null, peerReturnAt: null }, rows = [longCredit], consumed = [] } = {}) {
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true, codexResetEarlyInputs: () => inputs,
+    noteWallHold() {}, countPeersWithRoom: () => 0 };
+  const redeemer = new ResetCreditRedeemer(manager, {
+    now: () => resetNow, log() {}, transactState: resetFixture().transactState,
+    detailsFn: async () => ({ credits: rows }),
+    usageFn: async () => ({ sevenDay: { utilization: 0.05, resetAt: owner.quota.unified7dReset } }),
+    consumeFn: async (_account, attempt) => { consumed.push(attempt.creditId); return { code: 'reset', windowsReset: 1 }; },
+  });
+  return { redeemer, consumed };
+}
+const nearOwner = (extra = {}, quota = {}) => account({ quota: { unified7d: 0.97,
+  unified7dReset: resetNow + 5 * 60 * minutes, codexWeeklyReadingAt: resetNow,
+  codexResetCredits: { available: 2, applicable: 1, checkedAt: resetNow }, ...quota }, ...extra });
+
+test('a sweep spends a confirmed credit before the wall, enrolled by default, and an explicit off wins', async () => {
+  const off = nearOwner({ autoRedeemReset: false });
+  const declined = earlySweep(off);
+  assert.equal((await declined.redeemer.maybeRedeemForPool([off])).redeemed, false);
+  assert.deepEqual(declined.consumed, [], 'an explicit off is never overridden');
+
+  const owner = nearOwner();                       // autoRedeemReset unset = on
+  assert.equal(owner.autoRedeemReset, undefined);
+  const spent = earlySweep(owner);
+  const result = await spent.redeemer.maybeRedeemForPool([owner]);
+  assert.equal(result.redeemed, true);
+  assert.equal(result.reason, 'weekly nearing limit');
+  assert.deepEqual(spent.consumed, [longCredit.id]);
+
+  // The count says credits exist, the rows say none can be spent: nothing is redeemed.
+  const countOnly = nearOwner();
+  const none = earlySweep(countOnly, { rows: [] });
+  assert.equal((await none.redeemer.maybeRedeemForPool([countOnly])).redeemed, false);
+  assert.deepEqual(none.consumed, []);
+  // A manager that cannot supply the early inputs keeps the wall-only rule.
+  const plain = nearOwner();
+  const wallOnly = earlySweep(plain, { inputs: null });
+  assert.equal((await wallOnly.redeemer.maybeRedeemForPool([plain])).redeemed, false);
+  assert.deepEqual(wallOnly.consumed, []);
+});
+
+test('a sweep honours the cap the account is held to and never acts on the request-refusal path early', async () => {
+  const capped = nearOwner({}, { unified7d: 0.68 });
+  const underCap = earlySweep(capped, { inputs: { weeklyCap: 0.7, peerReturnAt: null } });
+  assert.equal((await underCap.redeemer.maybeRedeemForPool([capped])).redeemed, true);
+
+  const uncapped = nearOwner({}, { unified7d: 0.68 });
+  const noCap = earlySweep(uncapped);
+  assert.equal((await noCap.redeemer.maybeRedeemForPool([uncapped])).redeemed, false);
+
+  const refused = nearOwner();
+  const reactive = earlySweep(refused);
+  assert.equal((await reactive.redeemer.maybeRedeemForPool([refused], { reactive: true })).redeemed, false,
+    'a refusal acts at the weekly wall only');
+});
+
+test('through the sweep: waits for a compatible account freeing up soon while room lasts, spends when it will not', async () => {
+  // 97.5% used, the week's refill 40h away: an average pace of ~0.76%/h.
+  const owner = () => nearOwner({}, { unified7d: 0.975, unified7dReset: resetNow + 40 * 60 * minutes });
+  const soon = owner();
+  const waiting = earlySweep(soon, { inputs: { weeklyCap: null, peerReturnAt: resetNow + 30 * minutes } });
+  const held = await waiting.redeemer.maybeRedeemForPool([soon]);
+  assert.equal(held.redeemed, false);
+  assert.equal(held.reason, HOLD_CAPACITY_RETURNS);
+  assert.deepEqual(waiting.consumed, []);
+
+  const late = owner();
+  const spends = earlySweep(late, { inputs: { weeklyCap: null, peerReturnAt: resetNow + 90 * minutes } });
+  assert.equal((await spends.redeemer.maybeRedeemForPool([late])).redeemed, true, 'room will not last 90 minutes');
+  assert.deepEqual(spends.consumed, [longCredit.id]);
+
+  const far = owner();
+  const beyond = earlySweep(far, { inputs: { weeklyCap: null, peerReturnAt: resetNow + 4 * 60 * minutes } });
+  assert.equal((await beyond.redeemer.maybeRedeemForPool([far])).redeemed, true, 'four hours is not "soon"');
+});
+
+test('the expiry the table shows is counts and times only, distinguishes unknown from non-expiring, and is refreshed by a sweep', async () => {
+  const owner = account({ quota: { unified7d: 0.1, unified7dReset: resetNow + 40 * 60 * minutes,
+    codexWeeklyReadingAt: resetNow, codexResetCredits: { available: 2, checkedAt: resetNow } } });
+  const manager = { accounts: [owner], ensureTokenFresh: async () => true };
+  let rows = [
+    { id: 'secret-credit-a', title: 'Private title', status: 'available', supportedByPlan: true, expiresAt: resetNow + 5 * 60 * minutes },
+    { id: 'secret-credit-b', status: 'available', supportedByPlan: true, expiresAt: null },
+    { id: 'secret-spent', status: 'redeemed', supportedByPlan: true, expiresAt: resetNow + 60 * minutes },
+    { id: 'secret-unsupported', status: 'available', supportedByPlan: false, expiresAt: resetNow + 60 * minutes },
+  ];
+  let reads = 0;
+  const make = () => new ResetCreditRedeemer(manager, { now: () => resetNow, log() {}, usageFn: async () => ({}),
+    transactState: resetFixture().transactState,
+    detailsFn: async () => { reads++; return { credits: rows }; },
+    consumeFn: () => assert.fail('refreshing the table must not spend') });
+  const redeemer = make();
+  assert.equal(redeemer.expirySummary(owner), null, 'unknown before any read');
+  await redeemer.maybeRedeemForPool([owner]);     // 10% used: nothing to decide, the table still learns the dates
+  assert.equal(reads, 1);
+  const summary = redeemer.expirySummary(owner);
+  assert.deepEqual(summary, { checkedAt: resetNow, count: 2, earliestExpiresAt: resetNow + 5 * 60 * minutes });
+  assert.equal(JSON.stringify(summary).includes('secret'), false);
+  await redeemer.maybeRedeemForPool([owner]);
+  assert.equal(reads, 1, 'a fresh reading is not read again');
+  assert.equal(redeemer.expirySummary(owner, resetNow + 16 * minutes), null, 'an old reading is unknown again');
+
+  rows = [{ id: 'secret-never', status: 'available', supportedByPlan: true, expiresAt: null }];
+  const never = make();
+  await never.maybeRedeemForPool([owner]);
+  assert.deepEqual(never.expirySummary(owner), { checkedAt: resetNow, count: 1, earliestExpiresAt: null },
+    'confirmed non-expiring is a fact, not an unknown');
+  rows = [];
+  const empty = make();
+  await empty.maybeRedeemForPool([owner]);
+  assert.deepEqual(empty.expirySummary(owner), { checkedAt: resetNow, count: 0, earliestExpiresAt: null });
+
+  // No count of banked resets, no read; a failed read is retried later, not on every sweep.
+  const quiet = account({ quota: { ...owner.quota, codexResetCredits: { available: 0, checkedAt: resetNow } } });
+  let quietReads = 0;
+  const unread = new ResetCreditRedeemer({ accounts: [quiet], ensureTokenFresh: async () => true }, {
+    now: () => resetNow, log() {}, transactState: resetFixture().transactState,
+    detailsFn: async () => { quietReads++; return { credits: rows }; }, consumeFn: () => assert.fail('no spend') });
+  await unread.maybeRedeemForPool([quiet]);
+  assert.equal(quietReads, 0);
+  assert.equal(unread.expirySummary(quiet), null);
+  const failing = account({ quota: { ...owner.quota } });
+  let failures = 0;
+  const flaky = new ResetCreditRedeemer({ accounts: [failing], ensureTokenFresh: async () => true }, {
+    now: () => resetNow, log() {}, transactState: resetFixture().transactState,
+    detailsFn: async () => { failures++; return { error: 'HTTP 500' }; }, consumeFn: () => assert.fail('no spend') });
+  await flaky.maybeRedeemForPool([failing]);
+  await flaky.maybeRedeemForPool([failing]);
+  assert.equal(failures, 1);
+  assert.equal(flaky.expirySummary(failing), null);
 });
 
 test('Codex can hold for natural refill only when a fresh, entitled Codex peer has room', () => {

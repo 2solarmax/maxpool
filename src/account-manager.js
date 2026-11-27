@@ -14,7 +14,7 @@ import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 // A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
 import { appliesTo, clearsGeneralWeekly, forgetClaimOrg } from './claude-reset-grants.js';
-import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM } from './reset-policy.js';
+import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM, codexAutoResetOn } from './reset-policy.js';
 import {
   LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
   CLAIM_BACKOFF_CAP_MS, MAX_QUOTA_RETRY_MS, REACTIVE_CLAIM_TIMEOUT_MS, CLAIM_FRESH_MS,
@@ -753,6 +753,19 @@ export function normalizeRemoteResets(ra) {
   }
   return out;
 }
+
+/** A linked pool's banked-reset expiry summary (status field `codexResetExpiry`), cut
+ *  down to three numbers. Anything else in the payload is dropped, so a credit id or
+ *  title can never reach this pool's table, status or logs by this route. `null` =
+ *  unknown, which is a different fact from `earliestExpiresAt: null` (non-expiring). */
+export function normalizeCodexResetExpiry(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const { checkedAt, count, earliestExpiresAt } = raw;
+  if (!Number.isFinite(checkedAt) || !Number.isInteger(count) || count < 0 || count > 999) return null;
+  if (earliestExpiresAt != null && !Number.isFinite(earliestExpiresAt)) return null;
+  return { checkedAt, count, earliestExpiresAt: earliestExpiresAt ?? null };
+}
+
 
 // Before meter provenance was persisted a shared 5h reading could be genuine
 // or copied from a named meter. Preserve its protection only until the stated
@@ -2700,6 +2713,16 @@ export class AccountManager {
         const liveWeekly = (cards.weekly || []).filter(c => c && !c.expired && (c.expiresAt == null || c.expiresAt > now));
         if (hasWeeklyLimit && liveWeekly.length) { active = true; mode = 'full'; sources = liveWeekly.map(c => c.expiresAt); }
       }
+      // Codex banked credit (owner, 2026-11-27: "an available reset should alter the
+      // cap"): the same full lift while a CONFIRMED redeemable credit is held and the
+      // pool may spend it on its own. Rows come from the credit detail read (fresh,
+      // plan-supported, unexpired, not in a redeem backoff) — never from the upstream
+      // count, and never with automatic resets off: a reset nobody will spend must not
+      // eat the reservation the cap keeps.
+      if (!active && account.provider === 'codex' && codexAutoResetOn(account)) {
+        const live = this.codexResetLiftRows?.(account, now);
+        if (Array.isArray(live) && live.length) { active = true; mode = 'full'; sources = live.map(c => c.expiresAt ?? null); }
+      }
     }
     // The soonest-expiring source is the one a claim would spend first.
     const known = sources.filter(t => t != null);
@@ -4488,8 +4511,8 @@ export class AccountManager {
 
   /** Record that `account`'s general weekly wall claim was held, and WHICH refill
    *  it waits for (red-team r4 #4). */
-  noteWallHold(account, now = Date.now()) {
-    if (account) account._wallHold = { at: now, refillAt: account.quota?.unified7dReset ?? null };
+  noteWallHold(account, now = Date.now(), { early = false } = {}) {
+    if (account) account._wallHold = { at: now, refillAt: account.quota?.unified7dReset ?? null, early: early === true };
   }
 
   /** Is `account` holding its general weekly wall RIGHT NOW? A stamped hold that no
@@ -4507,7 +4530,11 @@ export class AccountManager {
     if (account.lastFullGeneralClaimAt != null && account.lastFullGeneralClaimAt >= h.at) return false;
     const q = account.quota || {};
     if (!(q.unified7dReset <= h.refillAt + POLICY.holdRefillSlackMs)) return false;
-    return Number.isFinite(q.unified7d) && q.unified7d >= CLAUDE_WALL_WEEKLY && q.unified7dReset > now;
+    // An EARLY hold (a Codex credit kept for the free refill while the account is still
+    // below the wall) is live from the stamp, not from the wall: it already draws on the
+    // spare accounts, and the budget must count it before the account is full.
+    return Number.isFinite(q.unified7d) && (q.unified7d >= CLAUDE_WALL_WEEKLY || h.early === true)
+      && q.unified7dReset > now;
   }
 
   /** The walls a hold must budget for: every OTHER account holding now, plus
@@ -4523,6 +4550,52 @@ export class AccountManager {
     const remoteHolders = this.accounts.filter(a => a !== self && accountFamily(a) === family && a.remote && a.enabled !== false
       && a._remoteWallHolding === true && !selfGroup.has(a.index)).length;
     return 1 + this.accounts.filter(a => a !== self && accountFamily(a) === family && this.isHoldingWall(a, now)).length + remoteHolders;
+  }
+
+  // ── EARLY CLAIM inputs (Codex banked resets, owner 2026-11-27) ──────────────
+  // The reset policy spends a confirmed full credit before the account is exhausted. It
+  // needs two facts from here: the ceiling the account is held to (its usage cap — a
+  // capped account never reaches the claim wall) and how fast it is using its week.
+
+  /** R8 (owner, 2026-11-27: wait "unless another account is going to free up soon"):
+   *  the soonest free weekly refill of another account that could take this account's
+   *  work — same family, enabled, live, routable models covering self's, a distinct
+   *  subscription, and a reading recent enough that its refill stamp is current. Null
+   *  when there is none. The refill is a time the capacity RETURNS, never capacity the
+   *  pool counts as available before it happens. */
+  codexSoonestPeerReturn(self, now = Date.now()) {
+    if (self?.provider !== 'codex') return null;
+    const selfGroup = new Set(this.capacityGroupOf(self));
+    const ownModels = self.quota?.codexModels ?? self.codexModels;
+    if (!ownModels?.length) return null;
+    let soonest = null;
+    for (const p of this.accounts) {
+      if (selfGroup.has(p) || p.provider !== 'codex' || p.type !== 'oauth' || p.enabled === false) continue;
+      if (p.poolBenchedBy || p.refreshDead || p.subscriptionGone || this.capacityIdentity(p) == null) continue;
+      const peerModels = p.quota?.codexModels ?? p.codexModels;
+      if (!peerModels?.length || ownModels.some(model => !peerModels.some(peer => peer.slug === model.slug))) continue;
+      const q = p.quota || {};
+      if (!(now - q.codexWeeklyReadingAt <= LISTING_FRESH_MS)) continue;
+      const at = q.unified7dReset;
+      if (Number.isFinite(at) && at > now && (soonest == null || at < soonest)) soonest = at;
+    }
+    return soonest;
+  }
+
+  /** What the early claim needs about `account`: its effective weekly cap (null =
+   *  uncapped, or lifted by a confirmed reset) and the soonest a compatible account
+   *  frees up. Read live at decision time, so a changed reservation applies at once. */
+  codexResetEarlyInputs(account, now = Date.now()) {
+    if (account?.provider !== 'codex') return null;
+    return { weeklyCap: this._effectiveCap(account, 'wk', now), peerReturnAt: this.codexSoonestPeerReturn(account, now) };
+  }
+
+  /** The sanitized banked-reset expiry the account table shows for `account`: the cloud's
+   *  own summary for a mirror row, this pool's for a row it owns. Null = unknown (never
+   *  read, too old, or an account whose rows this pool cannot see). */
+  codexResetExpiryFor(account, now = Date.now()) {
+    const summary = account?.remote ? account.remoteCodexResetExpiry : this.codexResetExpiry?.(account, now);
+    return summary && Number.isFinite(summary.checkedAt) && now - summary.checkedAt <= LISTING_FRESH_MS ? summary : null;
   }
 
   /**
@@ -5169,7 +5242,8 @@ export class AccountManager {
       if (!(sessionSpare > 0)) return null;
       spare = Math.min(spare, sessionSpare);
     }
-    const reset = account.autoRedeemReset === true && (account.remote
+    const auto = account.remote ? account.autoRedeemReset === true : codexAutoResetOn(account);
+    const reset = auto && (account.remote
       ? account.remoteCodexResetOpportunity : this.codexResetOpportunity?.(account, now));
     return { window, resetAt, rate: spare / (resetAt - now),
       credit: reset?.validUntil > now && reset.expiresAt > now ? reset.expiresAt : Infinity };
@@ -7648,6 +7722,7 @@ export class AccountManager {
       a.codexModels = ra.codexModels || null;
       a.codexResetCredits = ra.codexResetCredits || null;
       a.remoteCodexResetOpportunity = ra.codexResetOpportunity || null;
+      a.remoteCodexResetExpiry = normalizeCodexResetExpiry(ra.codexResetExpiry);
       a.autoRedeemReset = ra.autoRedeemReset;
       // On a rolling upgrade, an old worker can answer a poll after a newer
       // worker already identified this account's meters. Compare provider-read
@@ -7985,8 +8060,12 @@ export class AccountManager {
         provider: a.provider,
         ...(a.provider === 'codex' ? { codexAuth: a.codexAuth,
           codexModels: a.quota?.codexModels ?? a.codexModels,
-          autoRedeemReset: a.remote ? a.autoRedeemReset : a.autoRedeemReset === true,
+          // The EFFECTIVE setting: on unless the owner turned it off, and never for an
+          // account this pool does not own or cannot use (codexAutoResetOn).
+          autoRedeemReset: a.remote ? a.autoRedeemReset : codexAutoResetOn(a),
           codexResetOpportunity: a.remote ? null : this.codexResetOpportunity?.(a, now) || null,
+          // When the banked resets expire: counts and times only, no credit identifiers.
+          codexResetExpiry: a.remote ? null : this.codexResetExpiry?.(a, now) || null,
           codexResetCredits: a.enabled === false ? null : a.quota?.codexResetCredits ?? a.codexResetCredits ?? null } : {}),
         enabled: a.enabled,
         poolBenchedBy: a.poolBenchedBy || null,

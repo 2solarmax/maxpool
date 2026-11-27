@@ -322,14 +322,31 @@ function resetSummary(account) {
   return account.quota?.codexResetCredits ?? account.codexResetCredits;
 }
 
-function codexResetCells(account, now = Date.now()) {
+/** The expiry part of a Codex reset cell: `~11h` / `~3d` for the soonest expiring
+ *  credit, `~never` when every credit is confirmed non-expiring, nothing when the pool
+ *  does not know (no recent read of the credit rows). Unknown and non-expiring must
+ *  never look alike. `expiry` is the sanitized summary — counts and times only. */
+function codexExpirySuffix(expiry, now) {
+  if (!expiry || !(expiry.count > 0)) return '';
+  if (expiry.earliestExpiresAt == null) return '~never';
+  const left = expiry.earliestExpiresAt - now;
+  if (!(left > 0)) return '';
+  const days = left / 86400_000;
+  return days < 1 ? `~${Math.max(1, Math.round(days * 24))}h` : `~${Math.max(1, Math.round(days))}d`;
+}
+
+function codexResetCells(account, now = Date.now(), expiry = null) {
   const reset = resetSummary(account);
   let label = '-';
   if (account.enabled !== false && Number.isInteger(reset?.available) && reset.available >= 0) {
     label = String(reset.available);
+    // Only a count that exists can have an expiry; a count of none shows none.
+    const suffix = reset.available > 0 ? codexExpirySuffix(expiry, now) : '';
+    if ((label + suffix).length <= ARST_W) label += suffix;
     const stale = reset.stale || account.refreshDead || account.subscriptionGone
       || (reset.checkedAt != null && now - reset.checkedAt > LISTING_FRESH_MS);
-    if (stale) label += '?';
+    if (stale && (label + '?').length <= ARST_W) label += '?';
+    if (stale) label = gray(label);
     else label = reset.available > 0 ? green(label) : gray(label);
   }
   return rpad(gray('-'), MRST_W) + ' ' + rpad(label, ARST_W);
@@ -758,7 +775,7 @@ export function applyProviderEnabledToConfig(config, name, enabled) {
   return { changed: true, previous };
 }
 
-export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct, codexLoginArgs };
+export const __tuiTest = { applyProviderEnabledToConfig, formatReset, quotaLabel, bar, emptyBar, scopedWeeklyBar, barLayout, strip, loadText, countdown, acctHeader, fitLine, providerLabel, weeklyPolicyText, capText, capEffectivePct, codexLoginArgs, codexResetCells, codexExpirySuffix };
 
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
@@ -2324,7 +2341,8 @@ export class TUI {
           if (this.codexResets === state) await this._showCodexResets(state.account, notice);
         }, 'codexResets');
     } else if (k === 'a' && this.onSetCodexAutoRedeem) {
-      const enabled = state.account.autoRedeemReset === true;
+      // On unless the owner turned it off (an unset account is enrolled by default).
+      const enabled = state.account.autoRedeemReset !== false;
       this._confirm(enabled ? 'Turn off automatic resets?' : 'Allow automatic resets?',
         enabled ? 'Banked resets remain available for manual use.' : 'Allow the pool to redeem eligible resets for this account.',
         async () => {
@@ -3497,7 +3515,7 @@ export class TUI {
     // dead reset on screen (pre-mortem #18).
     let resetsCell;
     if (a.provider === 'codex') {
-      resetsCell = codexResetCells(a);
+      resetsCell = codexResetCells(a, Date.now(), this.am.codexResetExpiryFor?.(a, Date.now()));
     } else {
       const now = Date.now();
       let general = 0;       // resetsLeft of general-weekly grants + live cards
@@ -4441,7 +4459,7 @@ export class TUI {
       case 'accounts':
         return ` ${bold('a')} Add account  ${bold('l')} Re-auth (browser)  ${bold('n')} Rename  ${bold('t')} Enable/disable  ${bold('u')} Usage cap  ${bold('v')} Check quota  ${bold('d')} Delete  ${bold('Esc')} Back`;
       case 'codexResets': {
-        const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset ? 'on' : 'off'}` : '';
+        const auto = this.onSetCodexAutoRedeem ? `  ${bold('a')} Auto: ${this.codexResets.account.autoRedeemReset !== false ? 'on' : 'off'}` : '';
         const state = this.codexResets;
         const selectable = state.account.enabled !== false
           && canRedeemCodexCredit(state.credits[state.selected]);

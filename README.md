@@ -305,13 +305,35 @@ ChatGPT-hosted connectors use separate APIs.
 
 Codex quota and reset times appear in the account views whenever OpenAI
 reports the corresponding window. The account reset column shows how many
-unused credits are saved for later. Use **Accounts → r** on a local Codex
-account to inspect its free banked resets or confirm a redemption. Press
-**a** in that reset inventory to opt that account into automatic redemption,
-or set `autoRedeemReset: true` on its account entry. Newly added accounts start
-with automatic redemption off. MaxPool applies its shared weekly reset policy
-after a fresh quota reading, including its rules for expiring banked resets and
-an approaching natural refill.
+unused credits are saved for later and when the soonest one expires (`~11h`,
+`~3d`, or `~never` when every credit is confirmed non-expiring). A count with
+no date means the pool has not read the credit details recently. Cloud rows show
+the same, without any credit identifiers. Use **Accounts → r** on a local Codex
+account to inspect its free banked resets or confirm a redemption.
+
+Automatic redemption is on for every locally owned native Codex account unless
+you turn it off: press **a** in the reset inventory, or set `autoRedeemReset: false`
+on its account entry. An explicit off is never overridden. MaxPool applies its
+shared weekly reset policy after a fresh quota reading:
+
+- **A confirmed credit lifts the usage cap.** While an account holds a confirmed,
+  spendable credit and automatic resets are on, its cap does not apply (the same
+  lift Claude grants and z.ai cards get), so the reserve the cap keeps is restored
+  by the reset instead of being held back from the pool. Within a day of the free
+  weekly refill the cap returns.
+- **It fires before exhaustion.** The credit is spent when 3% of room is left to
+  the ceiling the account is held to, not after a rejected request.
+- **It waits when capacity returns soon.** If this account, or a compatible one,
+  gets its free refill within 3 hours and, at the account's average pace this
+  week, the room left lasts until then with 1% to spare, the credit is kept. A
+  short burst does not change that pace, so a burst alone never spends a credit.
+- **It waits while other accounts have room.** At least two other compatible
+  accounts per held reset with ample weekly and session headroom carry the load
+  instead, however far the free refill is. The hold ends the moment that room is
+  gone.
+- **A credit about to expire is spent rather than wasted**, unless it still has
+  half a day left after the free refill — the last resort, which the cap lift is
+  there to make rare.
 
 Token counts requested on the ChatGPT route are estimates. Claude Code
 Remote Control can steer the same running terminal session from a browser

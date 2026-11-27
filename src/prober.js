@@ -12,7 +12,7 @@ import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset
 import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
 import { rememberZaiTerms } from './subscription-terms.js';
 import { listResetGrants, claimResetGrant, appliesTo, clearsGeneralWeekly } from './claude-reset-grants.js';
-import { decideZai, decideClaudeWithReason, CLAUDE_WALL_WEEKLY } from './reset-policy.js';
+import { decideZai, decideClaudeWithReason, CLAUDE_WALL_WEEKLY, codexAutoResetOn } from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
 // Reset-machinery timing lives in ONE leaf module (re-exported for callers that
 // imported these from the prober).
@@ -223,7 +223,7 @@ export class Prober {
         if (!present() || account.credential !== credential) continue;
         if (usage && !usage.error) {
           this.am.applyCodexUsageData(account.index, usage, { sentAt });
-          if (!this._stopping && account.autoRedeemReset === true) await this.onCodexQuota?.(account);
+          if (!this._stopping && codexAutoResetOn(account)) await this.onCodexQuota?.(account);
         } else this.am.recordProbeError?.(account.index, usage?.error || 'probe timed out', usage?.status ?? null);
         if (present() && !this._stopping && !account.refreshDead
           && this._now() - (account.quota.codexCatalogCheckedAt || 0) >= 5 * 60_000) {
