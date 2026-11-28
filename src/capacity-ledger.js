@@ -956,8 +956,11 @@ export class CapacityLedger {
     if (id) this.appliedDrains.add(id);
   }
 
-  static mergeDelta(basePayload, beforePayload, afterPayload) {
-    const ledger = CapacityLedger.fromSerialized(basePayload);
+  /** Merge a worker's handoff delta into `basePayload`. `now` is optional; without it the
+   *  ledger reads the wall clock, which drops history older than its retention window. A
+   *  caller that accrues against a frozen clock (a test, a replay) passes the same clock. */
+  static mergeDelta(basePayload, beforePayload, afterPayload, { now = () => Date.now() } = {}) {
+    const ledger = CapacityLedger.fromSerialized(basePayload, { now });
     ledger.applyDrain(CapacityLedger.drainDelta(beforePayload, afterPayload));
     return ledger.serialize();
   }

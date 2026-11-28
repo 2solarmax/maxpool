@@ -418,7 +418,7 @@ const longCredit = { ...availableCredit, id: 'banked-credit-long', expiresAt: re
 // that still supplies them is accepted and ignored, which these tests prove.
 function limitSweep(owner, { inputs = { weeklyCap: null, peerReturnAt: null }, rows = [longCredit], consumed = [] } = {}) {
   const manager = { accounts: [owner], ensureTokenFresh: async () => true, codexResetEarlyInputs: () => inputs,
-    noteWallHold() {}, countPeersWithRoom: () => 0 };
+    noteWallHold() {}, countPeersWithRoom: () => 0, clearRateLimited: () => false };
   const redeemer = new ResetCreditRedeemer(manager, {
     now: () => resetNow, log() {}, transactState: resetFixture().transactState,
     detailsFn: async () => ({ credits: rows }),

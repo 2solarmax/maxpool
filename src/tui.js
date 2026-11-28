@@ -3431,7 +3431,7 @@ export class TUI {
     process.stdout.write(buf);
   }
 
-  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true, width = Infinity) {
+  _renderAcct(idx, bw, showBoth, showFable = showBoth, showSession = true, width = 100) {
     let a = this.am.accounts[idx];
     // A row benched by the duplicate guard renders the CLOUD's live copy (status,
     // bars, in-flight, request counts) — never the stale local snapshot. Identity

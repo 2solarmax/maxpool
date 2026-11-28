@@ -52,7 +52,14 @@ test('Codex account rows show native quota and distinguish unknown and banked re
   const wideRow = strip(tui._renderAcct(1, 9, true, true, true, 160));
   assert.doesNotMatch(wideRow, /Fbl|Fable/i);
   assert.match(wideRow, /Wk/);
-  const row = () => strip(tui._renderAcct(1, bw, showBoth, showFable, showSession));
+  // The row is rendered at a STATED width. A Codex row has two forms: with room for
+  // the bars it shows `Wk <bar> 45%`, and without it the compact `Wk45%` (the
+  // 80-column screen row below). At the width-less fallback (100) the bars do not
+  // fit, so the wide form needs a width that fits them (≥115) but is still below
+  // the 139 where the 5hR column shifts the fixed cells (ARst would no longer
+  // sit at `col`, which is read from acctHeader(160)).
+  const width = 120;
+  const row = () => strip(tui._renderAcct(1, bw, showBoth, showFable, showSession, width));
   assert.equal(row().slice(col, col + 1), '-');
   assert.doesNotMatch(row(), /Tok |Req /, 'native subscriptions do not show API-key quota labels');
 

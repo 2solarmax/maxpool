@@ -89,7 +89,9 @@ test('post-handoff usage merges into the new worker without counting pre-handoff
   const next = CapacityLedger.fromSerialized(baton, { now: () => now });
   next.accrue('a', { input: 3, cacheCreation: 1 });
   worker.accrue('a', { input: 7, cacheRead: 4 });
-  const state = CapacityLedger.mergeDelta(next.serialize(), baton, worker.serialize());
+  // The merge must run on the SAME frozen clock: on the wall clock the 20 Nov history
+  // falls out of the retention window a week later and the 3h figure empties.
+  const state = CapacityLedger.mergeDelta(next.serialize(), baton, worker.serialize(), { now: () => now });
   const view = CapacityLedger.fromSerialized(state, { now: () => now }).cacheWindows('a', now);
   assert.deepEqual(view.windows.all, { input: 15, cacheRead: 19, cacheWrite: 1, output: 0, hit: 19 / 35, partial: false });
   assert.equal(view.windows['3h'].cacheRead, 19);
