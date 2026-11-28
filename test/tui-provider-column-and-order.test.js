@@ -6,7 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 const { providerLabel, acctHeader, strip } = __tuiTest;
 
 // A pool with OAuth accounts INTERLEAVED with providers in the canonical array, to
-// prove the DISPLAY order (Claude first, providers last) is decoupled from the array.
+// prove the DISPLAY order (by shown provider, then name) is decoupled from the array.
 function mixedManager() {
   const am = new AccountManager([
     { name: 'oauthA', type: 'oauth', accessToken: 't1', refreshToken: 'r1', expiresAt: Date.now() + 3600_000 },
@@ -17,13 +17,15 @@ function mixedManager() {
   return am;
 }
 
-// ── W2: Claude/OAuth accounts render BEFORE providers ────────────────────────────
+// ── W2: rows sort by the provider they show, then by name ────────────────────────
+// (Supersedes "Claude first, providers last, first-seen family order" — 2026-11-28.)
 
-test('W2 _displayOrder lists non-provider accounts first, providers last, stable within each group', () => {
+test('W2 _displayOrder sorts by shown provider then name, independent of the array order', () => {
   const am = mixedManager();
   const tui = new TUI({ accountManager: am });
-  // canonical array: [oauthA, glm, oauthB, kimi] → display: [oauthA, oauthB, glm, kimi]
-  assert.deepEqual(tui._displayOrder(), [0, 2, 1, 3]);
+  // canonical array: [oauthA, glm, oauthB, kimi] → Anthropic, Anthropic, Moonshot, z.ai
+  // → display: [oauthA, oauthB, kimi, glm]
+  assert.deepEqual(tui._displayOrder(), [0, 2, 3, 1]);
 });
 
 test('W2 the canonical am.accounts order is NOT mutated (routing/index actions unaffected)', () => {

@@ -57,6 +57,14 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
   function pct(v) { if (v == null || !isFinite(v)) return null; return Math.max(0, Math.min(100, v > 1 ? v : v * 100)); }
   function providerName(a) { return a.provider === 'codex' ? 'Codex' : (a.provider || (a.type === 'oauth' ? 'Claude' : a.type)); }
+  // Display sort for both account lists (owner 2026-11-28): the provider the card
+  // SHOWS, then the account name it SHOWS, alphabetical and case-insensitive. The
+  // status response is read-only here; this orders the rendered cards only.
+  function byProviderThenName(x, y) {
+    var px = String(providerName(x)).toLowerCase(), py = String(providerName(y)).toLowerCase();
+    if (px !== py) return px < py ? -1 : 1;
+    return String(x.name).toLowerCase().localeCompare(String(y.name).toLowerCase());
+  }
   function codexQuotaDetails(a) {
     if (a.provider !== 'codex') return '';
     var q = a.quota || {};
@@ -110,7 +118,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     for (var i = 0; i < pools.length; i++) {
       var pl = pools[i];
       var tag = '<span class="chip" style="background:var(--chip)">' + esc(pl.name) + (pl.ok ? '' : ' · unreachable') + '</span>';
-      var accts = (pl.accounts || []).map(function (ra) {
+      var accts = (pl.accounts || []).slice().sort(byProviderThenName).map(function (ra) {
         var q = ra.quota || {};
         var five = q.unified5h != null ? q.unified5h : q.providerSes;
         var week = q.unified7d != null ? q.unified7d : q.providerWk;
@@ -153,12 +161,14 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
   }
 
   function render(s) {
-    // Live needs-login accounts first; switched-off accounts last.
+    // Switched-off accounts last and live needs-login accounts first, only among
+    // cards that show the same provider and name; the provider-then-name sort above
+    // it decides every other pair.
     function rank(a) { return a.enabled === false ? 2 : (a.refreshDead ? 0 : 1); }
     // Mirror rows (a.remote) render only under their pool chip below — keeping
     // them in the main grid duplicated every cloud account on the linking machine.
     var accts = (s.accounts || []).filter(function (a) { return !a.remote; }).sort(function (x, y) {
-      return rank(x) - rank(y) || String(x.name).localeCompare(String(y.name));
+      return byProviderThenName(x, y) || rank(x) - rank(y);
     });
     var dead = accts.filter(function (a) { return a.refreshDead && a.enabled !== false; }).length;
     var callers = s.callers || {};

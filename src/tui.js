@@ -2260,33 +2260,34 @@ export class TUI {
     this.selIdx = selectable.includes(this.am.currentIndex) ? this.am.currentIndex : selectable[0];
   }
 
-  // Real am.accounts indices in DISPLAY order: non-provider (Claude/OAuth/apikey)
-  // accounts first, providers (GLM/Kimi fallback) last, stable within each group.
+  // Real am.accounts indices in DISPLAY order, as a sorted VIEW: the caller gets
+  // original indices and the canonical array is never mutated (routing and every
+  // index-keyed action keep addressing the row they always did).
+  //
+  // Sort keys, in order (owner 2026-10-29 and 2026-11-28):
+  //   1. Where — local rows first, cloud rows after.
+  //   2. The provider the row SHOWS (the Provider column label), alphabetical.
+  //      Same-provider rows stay together, as they have since 2026-08-17 — now by
+  //      name rather than by the order the family first appeared in the config.
+  //   3. The account name the row SHOWS (a cloud row is named like the account,
+  //      without its internal uniqueness suffix), alphabetical, case-insensitive.
+  // Because the keys are things the user can see, the order does not depend on the
+  // order accounts were added or re-logged in.
   // The single source of truth for row order — the render loop AND selection nav
-  // both iterate it, so the highlight can never desync from the visible list. The
-  // canonical am.accounts array order is never mutated (routing/index actions safe).
+  // both iterate it, so the highlight can never desync from the visible list.
   _displayOrder() {
-    const nonProv = [];
-    const prov = [];
-    this.am.accounts.forEach((a, i) => (a.type === 'provider' ? prov : nonProv).push(i));
-    // GROUP providers by family (all GLM together, all Kimi together). Providers land
-    // in the config array in the order they were ADDED, so a GLM account added after a
-    // Kimi rendered below it — same-provider accounts split across the table (reported
-    // 2026-08-17: "accounts need to be grouped by provider... you shouldn't be mixing
-    // Anthropic with Z.ai and Moonshot"). Stable: group by first-seen order, preserving
-    // the within-family order and never reordering OAuth rows.
-    const familyFirstSeen = new Map();
-    for (const idx of prov) {
-      const fam = this.am.accounts[idx].provider || 'other';
-      if (!familyFirstSeen.has(fam)) familyFirstSeen.set(fam, []);
-      familyFirstSeen.get(fam).push(idx);
-    }
-    const provGrouped = [...familyFirstSeen.values()].flat();
-    // Owner 2026-10-29: Where is the PRIMARY grouping — local rows first, cloud rows
-    // after — and the existing ordering (providers grouped by family, OAuth as-added)
-    // stays intact WITHIN each group.
-    const all = [...nonProv, ...provGrouped];
-    return [...all.filter(i => !this.am.accounts[i].remote), ...all.filter(i => this.am.accounts[i].remote)];
+    const accounts = this.am.accounts;
+    return accounts
+      .map((a, i) => ({
+        i,
+        where: a.remote ? 1 : 0,
+        prov: providerLabel(a),
+        name: String(a.remote ? (a.remote.remoteName || a.name) : a.name).toLowerCase(),
+      }))
+      // Array.prototype.sort is stable, so rows that tie on every key (e.g. `Bob` and
+      // `bob`) keep their canonical array order — the order never flips on a re-login.
+      .sort((x, y) => x.where - y.where || x.prov.localeCompare(y.prov) || x.name.localeCompare(y.name))
+      .map(k => k.i);
   }
 
   _selectableIndexes(action) {

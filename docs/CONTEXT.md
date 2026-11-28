@@ -33,6 +33,12 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
+### 2026-11-28 · Dashboards list accounts by shown provider, then shown name
+
+Owner asked for every account list on the laptop and cloud dashboards to read alphabetically: by the provider the row shows, then by the account name it shows, ignoring case. The terminal table and Capacity page (one shared `_displayOrder`) and both lists on the web page (this Mac, and each pool's cloud cards) now sort that way. Local rows still come before cloud rows (2026-10-29 ruling), and the sort runs inside each group. This supersedes "OAuth first, providers last" and the first-seen provider-family order (2026-08-17). On the web page, needs-login-first and switched-off-last no longer lead; they only break a tie between two cards with the same provider and name, and a card that needs login still turns red and is counted in the header.
+
+Display only: `_displayOrder` returns original indices from a sorted copy, so `am.accounts`, `account.index`, routing, selection and every action keep addressing the same row. The sort keys are things the user can see (a cloud row's shown name, not its internal `(link) ☁` suffix), and ties keep array order, so re-logging in does not reshuffle the list. Covered by `test/display-sort.test.js`, which exercises the real terminal render, the real selection keys and the real web page script against synthetic accounts, and by ten mutants of the sort keys that it kills. Branch: feat/display-sort-by-provider.
+
 ### 2026-11-28 · Automatic resets: 100% or last resort; one expiry rule for every provider
 
 - `planExpiringReset` applies to spendable weekly resets across GLM, Claude and Codex. In the final 24 hours it directs more new work to the holder without discounting its session usage or concurrency limit. In the last 30 minutes it can spend a reset from 30% measured use, unless the free refill comes first. Claude grants requiring a limit and model-only grants never spend early.

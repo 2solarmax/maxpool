@@ -5,8 +5,9 @@ import { AccountManager } from '../src/account-manager.js';
 
 // Reported 2026-08-17: a new GLM account added to the config AFTER the Kimi row
 // rendered BELOW Kimi — same-provider accounts split across the table. Providers
-// must group by family: all GLM together, then all Kimi (or vice versa — whatever
-// first-seen order dictates), never interleaved.
+// must group by family, never interleaved. Since 2026-11-28 the families come out
+// alphabetically by the provider label shown (Anthropic, Moonshot, z.ai) and rows
+// inside a family alphabetically by name, instead of by first-seen config order.
 
 const { strip } = __tuiTest;
 
@@ -29,8 +30,8 @@ const order = tui => tui._displayOrder().map(i => tui.am.accounts[i].name);
 test('providers group by family — a GLM added after Kimi still renders with GLM', () => {
   const { tui } = build();
   const o = order(tui);
-  // OAuth first, then all zai together, then kimi — no interleaving.
-  assert.deepEqual(o, ['claude-1', 'glm max', 'glm glm1', 'glm glm2', 'kimi max'],
+  // Anthropic, then Moonshot, then z.ai (names sorted inside it) — no interleaving.
+  assert.deepEqual(o, ['claude-1', 'kimi max', 'glm glm1', 'glm glm2', 'glm max'],
     `display order must group families: got ${JSON.stringify(o)}`);
 });
 
@@ -56,12 +57,13 @@ test('the render loop emits the grouped order (the visible table)', () => {
   const glm1At = text.indexOf('glm glm1');
   const glm2At = text.indexOf('glm glm2');
   const kimiAt = text.indexOf('kimi max');
-  assert.ok(glm1At >= 0 && glm2At >= 0 && kimiAt >= 0, 'all rows render');
-  assert.ok(glm2At < kimiAt, 'glm2 renders BEFORE kimi (grouped with its family)');
-  assert.ok(glm1At < kimiAt, 'glm1 before kimi');
+  const glmMaxAt = text.indexOf('glm max');
+  assert.ok(glm1At >= 0 && glm2At >= 0 && glmMaxAt >= 0 && kimiAt >= 0, 'all rows render');
+  assert.ok(kimiAt < glm1At, 'Moonshot sorts before z.ai');
+  assert.ok(glm1At < glm2At && glm2At < glmMaxAt, 'the z.ai rows render together, sorted by name');
 });
 
-test('kimi-first config also groups (order determined by first-seen, not hardcoded)', () => {
+test('kimi-first config also groups (order is by shown provider and name, not first-seen)', () => {
   const accounts = [
     { name: 'kimi a', type: 'provider', provider: 'kimi', enabled: true, apiKey: 'k1', quota: {} },
     { name: 'glm a', type: 'provider', provider: 'zai', enabled: true, apiKey: 'k2', quota: {} },
@@ -71,5 +73,5 @@ test('kimi-first config also groups (order determined by first-seen, not hardcod
   const tui = new TUI({ accountManager: am, config: {} });
   const o = order(tui);
   assert.deepEqual(o, ['kimi a', 'kimi b', 'glm a'],
-    `kimi-seen-first keeps kimis together: got ${JSON.stringify(o)}`);
+    `kimis stay together, ahead of z.ai: got ${JSON.stringify(o)}`);
 });

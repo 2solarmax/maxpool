@@ -88,7 +88,9 @@ test('D17: hideDisabled OFF — still one row per identity on both surfaces; cap
   assert.equal(new Set(cap).size, cap.length);
   assert.deepEqual([...cap].sort(), [...NAMES].sort(), 'every identity once');
   // identities appear in the order of their PRIMARY (mirror) row's position on the main screen
-  const pos = n => am.accounts.findIndex(a => a.name === n + ' ☁' || (a.name === n && !a.poolBenchedBy));
+  // (display order: local before cloud, then provider, then name — not array position)
+  const display = new TUI({ accountManager: am, config: {} })._displayOrder();
+  const pos = n => display.indexOf(am.accounts.findIndex(a => a.name === n + ' ☁' || (a.name === n && !a.poolBenchedBy)));
   const sorted = [...cap].sort((x, y) => pos(x) - pos(y));
   assert.deepEqual(cap, ['a-local', 'e-off', 'b-pair', 'c-cloud', 'd-prov'].sort((x, y) => pos(x) - pos(y)));
   assert.deepEqual(cap, sorted);
