@@ -5,6 +5,16 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.129] - 2026-11-28
+
+### Added
+
+- List accounts by shown provider, then shown name, on every dashboard
+
+### Changed
+
+- Wait for the reload worker to serve before asserting it serves
+
 ## [1.24.128] - 2026-11-28
 
 ### Added
