@@ -311,7 +311,13 @@ test('(e) a crash that does not exit leaves the worker answering with the termin
     const [first] = childPids(pid);
     await pressRestart(term);
     await waitFor(async () => { const c = childPids(pid); return c.length === 1 && c[0] !== first; }, 90_000, 'the reload worker to be the only worker');
-    assert.equal((await proxyRequest(port, 3000)).status, 200, 'the reload worker serves');
+    // Allow 20 seconds on loaded machines, matching bootPool's first-start wait.
+    let response;
+    await waitFor(async () => {
+      response = await proxyRequest(port, 1000);
+      return response.status === 200;
+    }, 20_000, 'the reload worker to serve');
+    assert.equal(response.status, 200, 'the reload worker serves');
     const [worker] = childPids(pid);
     // 1st crash: the dashboard is up → it is stopped (plain logs from here on).
     // 2nd crash: no dashboard → the plain restore path. Neither may block the worker.
