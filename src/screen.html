@@ -94,8 +94,10 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
     if (a.refreshDead) return ['bad', 'Needs login'];
     if (a.status === 'error') return ['bad', 'Error'];
     // One word per state: the terminal UI calls this state "exhausted" for BOTH
-    // Anthropic and GLM accounts; the web screen used a GLM-era phrase here.
-    if (week != null && week >= 0.999) return ['warn', 'Exhausted this week'];
+    // Anthropic and GLM accounts; the web screen used a GLM-era phrase here. The pool
+    // reads a weekly refusal as full until a reset is spent (weeklyRefused), so a
+    // refused account at 99.9% is exhausted here exactly as it is in routing.
+    if ((week != null && week >= 1) || a.weeklyRefused) return ['warn', 'Exhausted this week'];
     if (a.status === 'throttled' || a.rateLimitedUntil) return ['warn', 'Resting'];
     return ['ok', 'Ready'];
   }
@@ -112,7 +114,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
         var q = ra.quota || {};
         var five = q.unified5h != null ? q.unified5h : q.providerSes;
         var week = q.unified7d != null ? q.unified7d : q.providerWk;
-        var st = ra.refreshDead ? ['bad', 'Needs login'] : ra.status === 'error' ? ['bad', 'Error'] : (week != null && week >= 0.999) ? ['warn', 'Exhausted this week'] : ra.status === 'throttled' ? ['warn', 'Resting'] : ['ok', 'Ready'];
+        var st = stateOf(ra);
         return '<div class="acct">' +
           '<div><div class="name">' + esc(ra.name) + '</div><div class="sub">' + esc(providerName(ra)) + ' · cloud</div></div>' +
           '<div class="bars">' + bar('5h', five) + bar('7d', week) + codexQuotaDetails(ra) + '</div>' +
@@ -121,6 +123,33 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
       out += '<div style="margin:14px 0 4px" class="sub">' + tag + '</div><div class="grid">' + accts + '</div>';
     }
     return out;
+  }
+
+  // What became of each account's latest automatic reset (the terminal's "Resets" line):
+  // spent at 100%, spent as last resort with the share used, expired unused. Last seven
+  // days, newest first. Shares are floored, so a reading below the limit never reads 100%.
+  var RESET_SHOWN_MS = 7 * 24 * 3600 * 1000;
+  function outcomeText(window, o) {
+    var what = window === '5h' ? 'five-hour card ' : window === 'model' ? 'model grant ' : '';
+    return what + (o.label || o.kind);
+  }
+  function resetsLine(s, now) {
+    var items = [];
+    (s.accounts || []).forEach(function (a) {
+      if (!a || a.enabled === false || !a.resetOutcomes) return;
+      Object.keys(a.resetOutcomes).forEach(function (window) {
+        var o = a.resetOutcomes[window];
+        if (!o) return;
+        var at = Number.isFinite(o.seenAt) ? o.seenAt : o.at;
+        if (!o || !Number.isFinite(at) || now - at > RESET_SHOWN_MS || at > now + 60000) return;
+        var mins = Math.max(1, Math.round((now - at) / 60000));
+        var ago = mins < 60 ? mins + 'm ago' : mins < 1440 ? Math.round(mins / 60) + 'h ago' : Math.round(mins / 1440) + 'd ago';
+        items.push({ at: at, text: a.name + ' ' + outcomeText(window, o) + ', ' + ago });
+      });
+    });
+    if (!items.length) return '';
+    items.sort(function (x, y) { return y.at - x.at; });
+    return '<div class="sub" style="margin:10px 0 0"><b>Resets</b> ' + items.map(function (i) { return esc(i.text); }).join(' · ') + '</div>';
   }
 
   function render(s) {
@@ -157,7 +186,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
       (ver ? ' · v' + esc(ver) : '') + ' · updated ' + new Date().toLocaleTimeString() + '</span>' +
       '<button class="link" id="out">Forget key</button></header>' +
       (people ? '<div class="people">' + people + '</div>' : '') +
-      '<div class="grid">' + rows + '</div>' + poolRows(s);
+      '<div class="grid">' + rows + '</div>' + resetsLine(s, Date.now()) + poolRows(s);
     document.getElementById('out').onclick = function () { setKey(''); gate(); };
   }
 

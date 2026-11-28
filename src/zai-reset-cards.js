@@ -26,6 +26,7 @@
  *     probe that cannot spend anything).
  */
 import { createHash } from 'node:crypto';
+import { retryAfterAt } from './oauth.js';
 
 const BASE = 'https://api.z.ai/api/biz/customer-package-reset';
 const LIST_URL = `${BASE}/list?targetType=PERSONAL`;
@@ -140,6 +141,7 @@ export async function redeemResetCard(token, recordId, resetType, { grantType, a
       ok: false,
       error: data?.msg || `envelope code ${data?.code} (HTTP ${res.status})`,
       code: data?.code ?? null,
+      ...(res.headers?.get?.('retry-after') ? { retryAt: retryAfterAt(res.headers.get('retry-after')) } : {}),
     };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };

@@ -955,6 +955,12 @@ async function serverWorkerCommand() {
     intervalMs: probeSeconds * 1000, log: uiLog,
     onCodexQuota: account => hasLease ? codexReset.maybeRedeemForPool([account]) : null,
   });
+  // A provider's weekly refusal spends a reset promptly (accountManager.onWeeklyRefusal):
+  // Codex through the same reactive redemption a request uses, GLM through the prober's
+  // card rule. Primary worker only, like every other automatic reset.
+  accountManager.codexReactiveReset = accounts => hasLease
+    ? codexReset.maybeRedeemForPool(accounts, { reactive: true }).then(result => result?.redeemed === true) : false;
+  accountManager.providerReactiveReset = (account, now) => hasLease ? prober.redeemWeeklyCardNow(account, now) : false;
   const owningCodex = name => accountManager.accounts.find(a => a.name === name && a.codexAuth === 'native' && !a.remote && !a.poolBenchedBy);
   // Tell the AM the probe cadence so the TUI can flag a scoped/provider tag whose
   // background probe has gone stale (> 3× interval since last success).

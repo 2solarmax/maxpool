@@ -2,15 +2,14 @@
 // decisions): "It should fire once the limit is reached!" A credit is spent when the
 // weekly limit is REACHED — never at a routine 96/99/90%, and never because the
 // operator's usage cap binds (a cap is a reservation, not provider exhaustion; a full
-// reset LIFTS the cap instead). The ONE spend below the limit is the final precaution for
-// a credit that is genuinely dying before the free refill. These tests pin the limit,
-// the precaution, the capacity hold, default-on enrolment, and the sanitized expiry the
+// reset LIFTS the cap instead). Expiry never permits a spend below 100%. These tests pin
+// the limit, the capacity hold, default-on enrolment, and the sanitized expiry the
 // account table shows.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager, normalizeCodexResetExpiry } from '../src/account-manager.js';
 import { HOLD_POOL_HAS_ROOM, POLICY, CLAUDE_WALL_WEEKLY, codexAutoResetOn, decideCodexWithReason,
-  weeklyLimitReached } from '../src/reset-policy.js';
+  weeklyLimitReached, LAST_RESORT_REASON } from '../src/reset-policy.js';
 import { __tuiTest } from '../src/tui.js';
 
 const minute = 60_000;
@@ -29,11 +28,10 @@ const spare = count => ({ peersWithRoom: () => count, holdersInPool: () => 1 });
 
 // ── EXACT LIMIT ────────────────────────────────────────────────────────────────
 test('the limit IS the router\'s bench: one constant, so a claim and the bench never disagree', () => {
-  assert.equal(POLICY.limitReached, 0.999);
+  assert.equal(POLICY.limitReached, 1);
   assert.equal(CLAUDE_WALL_WEEKLY, POLICY.limitReached, 'the claim wall is the limit');
-  assert.equal(weeklyLimitReached(0.998), false, 'just under the limit is NOT reached');
-  assert.equal(weeklyLimitReached(0.999), true, 'the limit itself');
-  assert.equal(weeklyLimitReached(1), true);
+  assert.equal(weeklyLimitReached(0.999), false, 'just under the limit is NOT reached');
+  assert.equal(weeklyLimitReached(1), true, 'the limit itself');
   assert.equal(weeklyLimitReached(null), false, 'no reading is no limit');
   assert.equal(weeklyLimitReached(NaN), false);
 });
@@ -42,11 +40,10 @@ test('a credit is spent when the limit is reached, and NOT before', () => {
   const at = used => decide(owner({ unified7d: used, unified7dReset: now + 3 * 24 * hour }), [credit()], spare(0));
   // Routine near-full readings spend nothing. Each of these used to spend (0.96/0.97 via
   // the early claim; 0.99 was the old wall).
-  for (const used of [0.90, 0.95, 0.96, 0.97, 0.975, 0.98, 0.99, 0.995, 0.998]) {
+  for (const used of [0.90, 0.95, 0.96, 0.97, 0.975, 0.98, 0.99, 0.995, 0.998, 0.999]) {
     assert.equal(at(used).action, null, `${used} is below the limit: nothing is spent`);
   }
-  assert.equal(at(0.999).action?.reason, 'weekly at wall', 'the limit is reached');
-  assert.equal(at(1).action?.reason, 'weekly at wall');
+  assert.equal(at(1).action?.reason, 'weekly at wall', 'the limit is reached');
 });
 
 test('the removed early claim is inert: passing its inputs spends nothing below the limit', () => {
@@ -72,35 +69,47 @@ test('an OPERATOR cap is not provider exhaustion: a cap that binds never spends 
   const overCap = owner({ unified7d: 0.74, unified7dReset: now + 60 * hour });
   assert.equal(decide(overCap, [credit()], early({ weeklyCap: 0.70 })).action, null, 'past its cap, still under the limit');
   // A cap ABOVE the limit never hides the limit.
-  assert.equal(decide(owner({ unified7d: 0.999, unified7dReset: now + 60 * hour }), [credit()],
+  assert.equal(decide(owner({ unified7d: 1, unified7dReset: now + 60 * hour }), [credit()],
     early({ weeklyCap: 1 })).action?.reason, 'weekly at wall');
 });
 
-test('THE FINAL PRECAUTION: a genuinely dying credit is still spent below the limit', () => {
-  // The credit dies in 2h; the free refill is 5h away — waiting loses it. This is the
-  // one spend before the limit, and it is kept on purpose (owner, 2026-11-27).
+test('NO EXCEPTION FOR EXPIRY: a dying credit is NOT spent below 100%, however close it is to expiring', () => {
+  // Owner, final contract 2026-11-27: "no automatic reset below 100% even if expiring".
+  // This replaces the same day's "final precaution" (a credit in its last day was spent
+  // on an account that had used 30%+ of its week). Expiry now affects card ORDER and
+  // routing only — never whether a partially used account is full.
   const account = owner({ unified7d: 0.45, unified7dReset: now + 5 * hour });
-  assert.equal(decide(account, [credit({ expiresAt: now + 2 * hour })], spare(5)).action?.reason, 'dying value',
-    'spare accounts or not: a dying credit is spent');
-  // It still needs the week far enough along that the refill buys real capacity.
-  assert.equal(decide(owner({ unified7d: 0.29 }), [credit({ expiresAt: now + 2 * hour })], spare(0)).action, null);
-  // It is not "dying" with a day or more to live: then it waits for the limit.
-  assert.equal(decide(account, [credit({ expiresAt: now + 24 * hour })], spare(0)).action, null);
-  // ...and a dying credit that would OUTLIVE the free refill waits for the free refill.
-  const refillSoon = owner({ unified7d: 0.45, unified7dReset: now + 2 * hour });
-  assert.equal(decide(refillSoon, [credit({ expiresAt: now + 20 * hour })], spare(0)).action, null, 'free refill <24h away');
+  for (const left of [2 * hour, 20 * hour, 23 * hour]) {
+    for (const peers of [0, 5]) {
+      assert.equal(decide(account, [credit({ expiresAt: now + left })], spare(peers)).action, null,
+        `dying in ${left / hour}h with ${peers} spare peers: not spent below 100%`);
+    }
+  }
+  // LAST RESORT (owner 2026-11-28): inside its last 30 minutes the credit IS spent from
+  // 30% used — a nearly full account no longer lets a credit dying in 2 minutes expire.
+  assert.equal(decide(owner({ unified7d: 0.999, unified7dReset: now + 5 * hour }),
+    [credit({ expiresAt: now + 2 * minute })], spare(0)).action?.reason, LAST_RESORT_REASON, '99.9% with a credit dying in 2 min: spent');
+  assert.equal(decide(owner({ unified7d: 0.45, unified7dReset: now + 5 * hour }),
+    [credit({ expiresAt: now + 31 * minute })], spare(0)).action, null, '31 minutes left: not yet');
+  assert.equal(decide(owner({ unified7d: 0.29, unified7dReset: now + 5 * hour }),
+    [credit({ expiresAt: now + 10 * minute })], spare(0)).action, null, 'under 30% used: kept');
+  // The same dying credit at exactly 100% is spent — the limit is the only spend point.
+  assert.equal(decide(owner({ unified7d: 1, unified7dReset: now + 5 * hour }),
+    [credit({ expiresAt: now + 2 * hour })], spare(0)).action?.reason, 'weekly at wall');
 });
 
 test('the capacity hold still applies AT the limit: other accounts with room keep the credit', () => {
-  const limit = owner({ unified7d: 0.999, unified7dReset: now + 40 * hour });
+  const limit = owner({ unified7d: 1, unified7dReset: now + 40 * hour });
   const held = decide(limit, [credit()], spare(2));
   assert.equal(held.action, null);
   assert.equal(held.reason, HOLD_POOL_HAS_ROOM);
   assert.equal(held.heldScope, 'general');
   assert.equal(held.heldEarly, undefined, 'there is no early hold any more');
   assert.equal(decide(limit, [credit()], spare(1)).action?.reason, 'weekly at wall', 'one roomy peer is not enough cover');
-  // A dying credit outranks the hold: it is spent before it is lost.
-  assert.equal(decide(limit, [credit({ expiresAt: now + 5 * hour })], spare(5)).action?.reason, 'dying value');
+  // At 100% a credit that dies before the refill cannot wait for it: the hold lets go
+  // and the credit is spent now (it would be worth nothing after it expires).
+  assert.equal(decide(limit, [credit({ expiresAt: now + 5 * hour })], spare(5)).action?.reason, 'weekly at wall',
+    'a credit dying before the refill is spent at 100%, room or not');
 });
 
 test('a weekly credit is never spent for a session limit alone', () => {
@@ -169,7 +178,7 @@ test('a hold is counted in the pool budget only AT the limit — there is no hol
   assert.equal(am.isHoldingWall(holder), false, 'under the limit: not a wall holder');
   assert.equal(am.countHoldingWalls(other, Date.now()), 1, 'the other account budgets for itself only');
   // At the limit the same stamp is live, and is retired by a claim.
-  holder.quota.unified7d = 0.999;
+  holder.quota.unified7d = 1;
   assert.equal(am.isHoldingWall(holder), true);
   assert.equal(am.countHoldingWalls(other, Date.now()), 2, 'the other account budgets for the holder too');
   holder.lastFullGeneralClaimAt = Date.now() + 1;
@@ -264,14 +273,14 @@ test('REAL WIRING: nothing is spent below the limit on the sweep, spare accounts
   assert.equal((await redeemer.maybeRedeemForPool([holder])).redeemed, false);
   assert.deepEqual(consumed, []);
   // The limit is reached with no spare account: the real sweep spends.
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.999, resetAt: Date.now() + 40 * hour } }, { sentAt: Date.now() });
+  am.applyCodexUsageData(0, { sevenDay: { utilization: 1, resetAt: Date.now() + 40 * hour } }, { sentAt: Date.now() });
   const spent = await redeemer.maybeRedeemForPool([holder]);
   assert.equal(spent.redeemed, true, spent.reason);
   assert.deepEqual(consumed, ['credit-a']);
 });
 
 test('REAL WIRING: at the limit the credit is held while two real peers have room', async () => {
-  const { am, consumed, redeemer } = realPool({ holder: 0.999 });
+  const { am, consumed, redeemer } = realPool({ holder: 1 });
   const holder = am.accounts[0];
   const held = await redeemer.maybeRedeemForPool([holder]);
   assert.equal(held.redeemed, false);
@@ -308,13 +317,13 @@ test('REAL SCORING: only a DYING credit steers, and steering never removes SESSI
   // A credit with 60 days to live is NOT dying: it does not steer (the old rule steered
   // from 7 days out, filling accounts that were nowhere near their limit).
   am.codexResetSpendableExpiry = () => t + 60 * 24 * hour;
-  assert.equal(am._steersForExpiringCredit(holder, Date.now()), false);
+  assert.equal(am._steersForExpiringReset(holder, Date.now()), false);
   assert.deepEqual(scores(), base, 'a distant credit does not steer');
   am.codexResetSpendableExpiry = () => t + 3 * 24 * hour;
-  assert.equal(am._steersForExpiringCredit(holder, Date.now()), false, '3 days is not dying');
+  assert.equal(am._steersForExpiringReset(holder, Date.now()), false, '3 days is not dying');
   // One dying in 20 hours: the WEEKLY cost is dropped so the account gets its share...
   am.codexResetSpendableExpiry = () => t + 20 * hour;
-  assert.equal(am._steersForExpiringCredit(holder, Date.now()), true);
+  assert.equal(am._steersForExpiringReset(holder, Date.now()), true);
   const steered = scores();
   assert.ok(steered.one < base.one && steered.one <= steered.two, `steered ${JSON.stringify(steered)}`);
   assert.equal(am._accountScarcity(holder, Date.now()), 0, 'the weekly pace term no longer prices this account');
@@ -337,21 +346,31 @@ test('REAL SCORING: only a DYING credit steers, and steering never removes SESSI
   const sessionIdle = { ...holder, quota: { ...holder.quota, unified5h: 0.02, unified5hReset: Date.now() + 2 * hour } };
   assert.equal(am._accountScarcity(sessionIdle, Date.now()), am._windowScarcity(0.02, Date.now() + 2 * hour, 5 * hour, Date.now()));
   // At the limit the claim takes over and nothing is steered.
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.999, resetAt: t + 40 * hour } }, { sentAt: Date.now() });
-  assert.equal(am._steersForExpiringCredit(holder, Date.now()), false, 'the limit is the claim\'s');
+  am.applyCodexUsageData(0, { sevenDay: { utilization: 1, resetAt: t + 40 * hour } }, { sentAt: Date.now() });
+  assert.equal(am._steersForExpiringReset(holder, Date.now()), false, 'the limit is the claim\'s');
 });
 
-test('REAL WIRING, full sequence: a DYING credit on a full-enough account is spent before it expires, spare accounts or not', async () => {
+test('REAL WIRING, full sequence: a DYING credit is NOT spent on a partially used account, spare accounts or not', async () => {
   const { am, t, consumed, redeemer } = realPool({ holder: 0.55, peers: [0.10, 0.10] });
   const holder = am.accounts[0];
   const expiring = { id: 'credit-soon', status: 'available', supportedByPlan: true, expiresAt: t + 20 * hour };
   redeemer.detailsFn = async () => ({ credits: [expiring] });
   await redeemer.readDetails(holder);
-  // 45% of the week used, credit dying in 20h, own refill 40h away: the final precaution.
+  // 45% of the week used, credit dying in 20h, own refill 40h away. The old "final
+  // precaution" spent it here (reason "dying value"). It now dies unused instead:
+  // expiry is never a reason to reset an account that is not full.
   am.applyCodexUsageData(0, { sevenDay: { utilization: 0.45, resetAt: t + 40 * hour } }, { sentAt: Date.now() });
   const result = await redeemer.maybeRedeemForPool([holder]);
-  assert.equal(result.redeemed, true, result.reason);
-  assert.equal(result.reason, 'dying value');
+  assert.equal(result.redeemed, false, `must not spend a dying credit below 100% (reason ${result.reason})`);
+  assert.deepEqual(consumed, []);
+  // ...and once the SAME account reaches 100% the credit is spent, dying or not. The
+  // two roomy peers are disabled first: at 100% with room the sweep HOLDS a long-lived
+  // credit for the refill (see the next tests), and this credit dies before that refill.
+  am.accounts.slice(1).forEach(peer => { peer.enabled = false; });
+  am.applyCodexUsageData(0, { sevenDay: { utilization: 1, resetAt: t + 40 * hour } }, { sentAt: Date.now() });
+  const atLimit = await redeemer.maybeRedeemForPool([holder]);
+  assert.equal(atLimit.redeemed, true, atLimit.reason);
+  assert.equal(atLimit.reason, 'weekly at wall');
   assert.deepEqual(consumed, ['credit-soon']);
 });
 

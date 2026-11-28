@@ -72,7 +72,7 @@ test('X3: pressure — critical is RELIEF: an idle reserve still beats it', () =
 
 test('X4: exhausted is NEVER unlocked', () => {
   const am = amWith([oauth('dead', { priority: 0 }), oauth('crit', { priority: 0 }), oauth('down', { priority: 0 })]);
-  am.accounts[0].quota.unified7d = 0.9995;  // exhausted (>= 0.999)
+  am.accounts[0].quota.unified7d = 1;  // exhausted (100%)
   am.accounts[0].quota.unified7dReset = Date.now() + 10 * 60_000;  // dying, but exhausted
   am.accounts[1].quota.unified7d = 0.96;   // critical, reset far → pressure candidate
   am.markRateLimited(2, 3600);              // the third route is down → pressure

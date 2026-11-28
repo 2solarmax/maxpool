@@ -33,27 +33,12 @@ MaxPool serves Claude Code and native Codex. The account analytics change adds c
 
 ## Decisions
 
-### 2026-11-27 · Banked resets fire once the limit is reached; 5-hour cards may be spent; on by default
+### 2026-11-28 · Automatic resets: 100% or last resort; one expiry rule for every provider
 
-Two Codex accounts held a banked reset unspent while the free weekly refill was close, because the policy only claimed at the weekly wall (or after a rejection) and held a dying credit for a refill it would never see. The rule now has three parts.
-
-**Dying credits.** A credit that expires within a day is held for the free refill only when at least 12 hours of its life remain after the refill (`POLICY.refillSurvivalMs`): one that dies before the refill, or just after it, meets an empty-again account and expires unspent, so it is spent now. Per-model readings that are inactive or whose reset time has passed are ignored by the claim (they showed pre-refill utilization and an elapsed refill stamp that read as imminent).
-
-**EXACT LIMIT (owner, 2026-11-27, superseding the near-full decisions).** "It should fire once the limit is reached!" A weekly reset — Codex credit, Claude grant — is spent when the weekly limit is REACHED (`POLICY.limitReached`, 0.999, the same `weeklyExhaustedThreshold` the router benches at; `CLAUDE_WALL_WEEKLY` is now an alias of it, so a claim and the bench cannot disagree). Nothing is spent at a routine 96/99/90%. An OPERATOR usage cap is not provider exhaustion: a cap that binds never spends a credit. A confirmed credit LIFTS the cap instead (Codex joins the Claude/z.ai cap lift; never with automatic resets off, never from the upstream count). The R7 capacity hold still applies at the limit (`wallClaimHeld`), and a weekly reset is never spent for a session limit alone.
-
-This replaces the same day's "early claim" (a confirmed credit spent at `POLICY.earlyMargin` = 3% of room left to its ceiling, with a burn-rate wait for a compatible account freeing up within `POLICY.soonReturnMs`). It spent credits ahead of the limit and measured its margin to the operator's cap. `earlyClaimVerdict`, `sustainedWeeklyBurn`, `codexResetEarlyInputs`, `codexSoonestPeerReturn` and the below-wall "early hold" are removed; `decideCodexWithReason` still accepts `opts.early` and ignores it, so no caller had to change.
-
-**Plan ahead, for a dying credit only.** `_steersForExpiringCredit` (account-manager) leaves the WEEKLY scoring terms out for an account whose confirmed spendable credit is in its last day (`codexSteerForExpiry`, bounded by `POLICY.dyingWindowMs`), so work reaches the account and the credit is spent on one that reached the limit honestly rather than dying unused on an idle one. A credit with more than a day left never steers. Steering never removes SESSION scarcity (review 2026-11-27): `_accountScarcity` now computes its maximum with the weekly terms skipped, instead of zeroing the whole maximum — which is taken over the 5h term too, so a steered account with a 90% session window lost its session cost and was routed to as if empty.
-
-**Five-hour cards (owner, 2026-11-27: "it's okay to spend 5-hour cards too"), replacing the 2026-10-30 "never spent" rule.** `decideZai` spends a DEDICATED five-hour card when the 5h window has reached its own limit (`POLICY.sessionLimitReached` = 1; the window serves to 100%, see `PROVIDER_SES_WALL`) — never at a routine 96/99/90%, never on a dying basis, and never on an account blocked for another reason (`poolBenchedBy`, `subscriptionGone`, `refreshDead`, outside usage, disabled): the card would lift nothing. The weekly card is never spent for a session limit, and a 5h card is never spent in place of a weekly one (R4: the weekly card clears both windows and goes first at its wall). The account table gives five-hour cards their own column, `5hR`, shown from 139 columns (`FIVE_HOUR_COL_FITS_W`, measured: below that it would shrink the quota bars or drop the Fable bar). It is blank for every account it does not apply to; a fresh zero, an unread listing (`?`) and a stale count (`n?`) are three different facts. Five-hour cards are no longer folded into the account-level `ARst` count.
-
-**Z.ai column staleness (fixed).** A z.ai card listed this very sweep rendered grey with `?`. The reset cell judged freshness off the Claude GRANT listing, which a z.ai account never has (`resetGrants` null), so `freshGrants` was false for every z.ai account holding a card. Each listing is now judged by what the account has.
-
-**Not changed — z.ai weekly wall stays at 0.90 (`POLICY.wallWeekly`).** EXACT LIMIT would move it to the limit, but the R6 free-refill hold only has a window between that wall and `freeRefillImmediate` (0.98); at 0.999 every at-wall reading is already past 0.98, so the hold could never fire. Resolve the two together before moving it; it is a GLM production path this change did not otherwise touch. No fresh vendor measurement was taken for this change (no live calls): "the limit" is the bench the router already measures.
-
-**Default on.** Automatic redemption is on for an unset, locally owned, native Codex account; an explicit `false` wins; disabled, benched, dead and cloud-mirror rows are never enrolled. The TUI toggle and the status export show the effective setting. The sweep also reads the credit rows of an enrolled account that holds credits (at most every ten minutes) so the account table can show the soonest expiry; cloud rows carry only counts and times (`codexResetExpiry`). Unknown (no recent read) shows the count alone; confirmed non-expiring shows `~never`.
-
-Verification: pure policy, sweep, status, mirror, table and real-prober tests in `test/codex-early-reset.test.js`, `test/codex-native.test.js` and `test/reset-cards.test.js`; CI only (no portable tests run on the Mac).
+- `planExpiringReset` applies to spendable weekly resets across GLM, Claude and Codex. In the final 24 hours it directs more new work to the holder without discounting its session usage or concurrency limit. In the last 30 minutes it can spend a reset from 30% measured use, unless the free refill comes first. Claude grants requiring a limit and model-only grants never spend early.
+- Otherwise spend at measured 100% or a confirmed weekly refusal. A full session does not turn a partial week into a weekly refusal. For z.ai, monthly-only and unspecified code 1310 responses do not spend; the combined weekly/monthly wording needs the provider timestamp to match the account's fresh, nearly full weekly window. A five-hour card clears only its own full window. Failed eligible spends in the final half hour retry after five minutes, subject to the provider's cooldown.
+- At the weekly wall the GLM hold needs two compatible spare accounts and a refill less than a day away before the card ends. Claude and Codex retain their existing R8 hold: roomy peers per held account, a usable listing, and a grant that survives the refill by a day. Refusals expire on refill, spend or a successful request started after the refusal; an unstamped window has only a probe-fresh grace period.
+- The terminal and web accounts screens show the latest outcome per window, including linked accounts. Refusal-driven spends show the measured percentage separately. Mark expiry unused only when the provider confirms an unused row at expiry; disappearance alone is unknown. The account cache retains inventories and outcomes across restart. Status exports strip outcome IDs. No Slack alert.
 
 ### 2026-11-26 · Status line knows the real model for turns served through a linked pool
 
@@ -226,8 +211,8 @@ accounts could never reach their claim wall. Task:
 probe's SEND time (a probe sent before a claim cannot license another); a
 successful claim spends the reset in the stored listing at once; the reactive
 claim runs off the request (fire-and-forget, 10s abort) and a 401 defers to the
-sweep without backoff; no lift — and no dying-value claim — within 24h of the
-limit's free refill unless the reset itself dies first (D4); mirrors read the
+sweep without backoff; no lift within 24h of the limit's free refill unless the
+reset itself dies first (D4); mirrors read the
 holder's exported lift ceiling; the skip log prints the policy's own reason;
 claim state (cached org, backoff) is per login and cleared on re-login/removal;
 the give-back OR rule also holds for stored (normalized) grants. Timing constants

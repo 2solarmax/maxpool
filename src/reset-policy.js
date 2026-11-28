@@ -1,13 +1,20 @@
-/** Automatic resets require a measured 100% on the window the reset clears.
- * Expiry affects card ordering and routing, never whether partial use is full.
- * A free refill with spare capacity can make spending unnecessary even at 100%.
- */
+/** Resets spend at a measured 100% of the window they clear, or as a last resort when
+ *  one would expire unused (steerForExpiringReset / lastResortReached — one rule for
+ *  every provider). A free refill with spare capacity can make spending unnecessary. */
 import { appliesTo as defaultAppliesTo } from './claude-reset-grants.js';
 import { CLAIM_FRESH_MS, CLAIM_STALE_LISTING_MAX_MS } from './reset-timing.js';
 
 export const POLICY = {
   wallWeekly: 1,
-  dyingWindowMs: 24 * 3600 * 1000, // Expiry affects routing, never the spend threshold.
+  dyingWindowMs: 24 * 3600 * 1000, // PLAN AHEAD: this close to expiry, work is steered to the account
+  // LAST RESORT: this close to expiry an expiring reset is spent although the window
+  // is not full (owner 2026-11-28, replacing the 24h spend-early window: "Why two hours
+  // and not 30 minutes or 10 minutes?"). A failed spend attempt inside this window is
+  // retried at the next check instead of the usual 15m/30m/1h backoff, so the window
+  // holds about six tries.
+  lastResortMs: 30 * 60 * 1000,
+  lastResortRetryMs: 5 * 60 * 1000,
+  dyingMinUtilWeekly: 0.30, // below this an expiring reset buys too little to be worth a full week's clock
   freeRefillWaitMs: 24 * 3600 * 1000,
   // R7 (owner, 2026-11-13): the Claude GENERAL weekly wall claim also waits for the
   // free refill when OTHER accounts can absorb the load. Room per peer: probe-fresh
@@ -33,6 +40,8 @@ export const POLICY = {
 // The plain-words decision reason for an R7 hold — exported so status/log surfaces
 // and tests share one string.
 export const HOLD_POOL_HAS_ROOM = 'other accounts have room';
+// The decision reason for a spend the shared expiry planner made a last resort.
+export const LAST_RESORT_REASON = 'last resort (expiring)';
 
 export const CLAUDE_WALL_WEEKLY = POLICY.limitReached;
 
@@ -63,16 +72,135 @@ export function weeklyLimitReached(util) {
   return Number.isFinite(util) && util >= POLICY.limitReached;
 }
 
-/** PLAN AHEAD (the final precaution only): should work be steered to `account` now, so a
- *  DYING reset is spent on an account that reached its limit honestly rather than dying
- *  unused on an idle one? True only while the reset is inside POLICY.dyingWindowMs of
- *  expiring, the pool may spend it on its own, and the account has not reached the limit
- *  (there the claim itself takes over). A reset with longer to live never steers: it is
- *  not dying, so filling the account now would be spending ahead of the limit. */
-export function codexSteerForExpiry({ expiresAt, util, now } = {}) {
-  if (!Number.isFinite(expiresAt) || !(expiresAt > now) || expiresAt - now > POLICY.dyingWindowMs) return false;
-  if (!Number.isFinite(util)) return false;
-  return util < POLICY.limitReached;
+/** ROUTE UNTIL THE PROVIDER REFUSES (owner 2026-11-28). A weekly refusal is the
+ *  provider's own word that the window is full, so it counts as a 100% reading of THAT
+ *  window — however the probe rounds it (99.9% used to stall the claim). It stands
+ *  until the account serves a request that STARTED after it, a reset is spent on it, or
+ *  the window rolls. `account.weeklyRefusal` is `{ at, refillAt }`, recorded by the
+ *  account manager, which also clears it on such a request (releaseAccount): a stream
+ *  already running when the refusal came finishes without saying the wall is gone. When
+ *  the refill time is unknown the refusal is taken at its word for a bounded time. */
+export function weeklyUsedWithRefusal(account, util, refillAt, now = Date.now()) {
+  const r = account?.weeklyRefusal;
+  if (!Number.isFinite(r?.at) || r.at > now) return util;
+  if ([refillAt, r.refillAt].some(at => Number.isFinite(at) && at <= now)) return util;
+  if (Number.isFinite(r.refillAt) && Number.isFinite(refillAt)) {
+    if (Math.abs(refillAt - r.refillAt) > POLICY.holdRefillSlackMs) return util;
+  } else if (!Number.isFinite(r.refillAt) && now - r.at > CLAIM_FRESH_MS) return util;
+  if (account.lastGeneralClaimAt > r.at) return util;
+  return Math.max(Number.isFinite(util) ? util : 0, POLICY.limitReached);
+}
+
+/** A reset that will expire is handled in ONE place for every provider (owner,
+ *  2026-11-28: "We use the same machinery. There probably should be one common place").
+ *
+ *  A reset returns the used part of the window, so its value is the share of the week
+ *  already used: at 100% a full week comes back; left to expire, nothing does. Two
+ *  moments follow, both answered here from provider-neutral facts:
+ *
+ *  1. PLAN AHEAD — inside POLICY.dyingWindowMs of expiry the account's WEEKLY terms stop
+ *     counting against it in routing, so work flows there and it can reach the limit on
+ *     its own before the reset dies. Its 5-hour terms are untouched: a full session
+ *     window still costs, and a session wall still refuses.
+ *  2. LAST RESORT — inside POLICY.lastResortMs of expiry, with the window at least
+ *     POLICY.dyingMinUtilWeekly used, the reset is spent although the limit is not
+ *     reached. Later is better (more of the week has been used), so the window is as
+ *     short as the checks allow. The ONE exception: a free refill that lands before the
+ *     reset expires makes it worthless, so it is kept then.
+ *
+ *  At or past the limit neither applies: the routine 100% claim (and its free-refill
+ *  hold) owns that account. Expiry never changes WHEN a routine spend happens nor
+ *  WHICH reset is used (soonest expiry first inside its class). */
+export const EXPIRING_RESET = Object.freeze({ STEER: 'steer', LAST_RESORT: 'last-resort' });
+
+export function planExpiringReset({ expiresAt, util, refillAt, now } = {}) {
+  if (!Number.isFinite(expiresAt) || !(expiresAt > now)) return null;
+  if (!Number.isFinite(util) || util >= POLICY.limitReached) return null;
+  if (expiresAt - now <= POLICY.lastResortMs && lastResortReached({ expiresAt, util, refillAt, now })) {
+    return EXPIRING_RESET.LAST_RESORT;
+  }
+  return expiresAt - now <= POLICY.dyingWindowMs ? EXPIRING_RESET.STEER : null;
+}
+
+/** PLAN AHEAD: should work be steered to this account so an expiring reset can reach
+ *  the limit on its own? */
+export function steerForExpiringReset(facts) {
+  return planExpiringReset(facts) != null;
+}
+
+/** Is this the last moment to spend a reset that would otherwise expire unused? */
+export function lastResortReached({ expiresAt, util, refillAt, now } = {}) {
+  if (!Number.isFinite(expiresAt) || !(expiresAt > now) || expiresAt - now > POLICY.lastResortMs) return false;
+  if (!Number.isFinite(util) || util < POLICY.dyingMinUtilWeekly) return false;
+  // A free refill before expiry makes the reset worthless: keep it.
+  if (Number.isFinite(refillAt) && refillAt > now && refillAt < expiresAt) return false;
+  return true;
+}
+
+/** The wait before a FAILED spend attempt is repeated. Inside the last POLICY.lastResortMs
+ *  before the reset expires the usual 15m/30m/1h backoff would outlive it, so it retries
+ *  about every POLICY.lastResortRetryMs instead. That holds for a last-resort spend AND
+ *  for a routine spend at 100% (plan-ahead steering usually brings the account there by
+ *  the last half hour, so that is the common case). A provider's own Retry-After is
+ *  never shortened. */
+export function retryAfterFailedReset({ expiresAt, util, refillAt, now, usualWaitMs, providerWaitMs = 0 } = {}) {
+  const dying = Number.isFinite(expiresAt) && expiresAt > now && expiresAt - now <= POLICY.lastResortMs;
+  const worthRetrying = weeklyLimitReached(util)
+    || planExpiringReset({ expiresAt, util, refillAt, now }) === EXPIRING_RESET.LAST_RESORT;
+  const waitMs = dying && worthRetrying ? Math.min(usualWaitMs ?? Infinity, POLICY.lastResortRetryMs) : (usualWaitMs ?? 0);
+  return Math.max(waitMs, Number.isFinite(providerWaitMs) && providerWaitMs > 0 ? providerWaitMs : 0);
+}
+
+/** The outcome of ONE reset, as the pool dashboard shows it. `at` is when it was
+ *  settled; `util` is the share of the window used when it was spent. */
+export const RESET_OUTCOME = Object.freeze({
+  SPENT: 'spent at 100%',
+  LAST_RESORT: 'spent as last resort',
+  EXPIRED: 'expired unused',
+  UNCONFIRMED: 'no longer listed; outcome unknown',
+  REFUSED: 'spent after weekly refusal',
+  MANUAL: 'spent manually',
+});
+
+/** The share of the window a spent reset was recorded at, in whole percent, rounded
+ *  DOWN so a reading below the limit never prints as 100% (0.999 is not "100% used"). */
+export function percentUsed(util) {
+  return Number.isFinite(util) ? `${util >= 1 ? 100 : Math.min(99, Math.floor(Math.max(0, util) * 100 + 1e-9))}%` : 'unknown';
+}
+
+export function resetOutcomeLabel(outcome) {
+  if (!Object.values(RESET_OUTCOME).includes(outcome?.kind)) return null;
+  if (outcome.kind === RESET_OUTCOME.EXPIRED || outcome.kind === RESET_OUTCOME.UNCONFIRMED) return outcome.kind;
+  if (outcome.kind === RESET_OUTCOME.SPENT && weeklyLimitReached(outcome.util)) return RESET_OUTCOME.SPENT;
+  const kind = outcome.kind === RESET_OUTCOME.SPENT ? 'spent' : outcome.kind;
+  return `${kind} (${Number.isFinite(outcome.util) ? `${percentUsed(outcome.util)} used` : 'usage unknown'})`;
+}
+
+/** Record ONE reset's outcome on its account, for the pool dashboard (owner 2026-11-28:
+ *  spent at 100%, spent as last resort with the share used, or expired unused — no
+ *  Slack alert). The account keeps the latest outcome per class, so a row shows what
+ *  happened to the reset it last held: `weekly` for a reset that clears the week, `5h`
+ *  for a session-only card, `model` for a per-model grant. An expiry is stamped at the
+ *  reset's own end, which can be EARLIER than a spend already recorded in that class
+ *  (the listing that shows it left arrives later): a newer spend is then kept, so the
+ *  line never turns a spent reset into "expired unused". Returns the record, or null
+ *  when an older expiry was not recorded. */
+export function noteResetOutcome(account, kind, { window = 'weekly', util = null, id = null, now = Date.now() } = {}) {
+  if (!account || !Object.values(RESET_OUTCOME).includes(kind)) return null;
+  const outcome = { kind, window, util: Number.isFinite(util) ? Math.max(0, Math.min(1, util)) : null, at: now };
+  if (id != null) outcome.id = String(id);
+  const prev = account.resetOutcomes?.[window];
+  const spent = kind !== RESET_OUTCOME.EXPIRED && kind !== RESET_OUTCOME.UNCONFIRMED;
+  // A successful local redemption settles this inventory row immediately.
+  if (spent && id != null && Array.isArray(account._resetInventory)) {
+    account._resetInventory = account._resetInventory.filter(i => String(i.id) !== String(id) || i.window !== window);
+  }
+  if (prev?.at > now || (!spent && prev?.at === now)) return null;
+  account.resetOutcomes = { ...(account.resetOutcomes || {}), [window]: outcome };
+  // A spent weekly reset answers the refusal that asked for it: it must never license a
+  // second one (weeklyUsedWithRefusal).
+  if (window === 'weekly' && spent) account.weeklyRefusal = null;
+  return outcome;
 }
 
 /** Is this the account whose banked Codex resets the pool may spend on its own? The
@@ -135,15 +263,24 @@ export function decideZai(account, cards, now = Date.now(), { peersWithRoom } = 
 
   // --- weekly card: clears BOTH windows (z.ai docs; measured: glm1 100%->0% both)
   if (weeklyCard) {
-    if (weeklyLimitReached(wkUtil)) {
+    const atWall = weeklyLimitReached(wkUtil);
+    // The shared expiry planner (planExpiringReset): inside its last POLICY.lastResortMs
+    // a card is spent although the week is not full — unless the free refill lands first.
+    const expiring = planExpiringReset({
+      expiresAt: weeklyCard.expiresAt, util: wkUtil, refillAt: q.providerWkReset, now });
+    if (atWall || expiring === EXPIRING_RESET.LAST_RESORT) {
       const refill = q.providerWkReset;
       const remaining = refill - now;
       if (Number.isFinite(refill) && remaining <= 0) return null;
-      const canWait = remaining > 0 && remaining < POLICY.freeRefillWaitMs
+      // KEEP THE RESET: at 100% a free refill less than a day away is waited for while
+      // two compatible spare accounts carry the work — but never when the card would
+      // expire first. A last-resort card has no such refill ahead (it is kept then).
+      const canWait = atWall && remaining > 0 && remaining < POLICY.freeRefillWaitMs
         && (weeklyCard.expiresAt == null || weeklyCard.expiresAt > refill)
         && peersWithRoom?.() >= POLICY.holdMinPeers;
-      if (!canWait) return { kind: 'card', card: weeklyCard, resetType: 'WEEK', reason: 'weekly at wall' };
-      return null; // A session-only card cannot clear the weekly limit.
+      if (!canWait) return { kind: 'card', card: weeklyCard, resetType: 'WEEK',
+        reason: atWall ? 'weekly at wall' : LAST_RESORT_REASON };
+      return null; // held for the free refill; a session-only card cannot clear the weekly limit
     }
   }
 
@@ -219,7 +356,8 @@ function decideSubscriptionWithReason(account, listing, now, opts) {
   if (!grants.length) return skip('grant not usable');
 
   const appliesTo = opts.appliesTo || defaultAppliesTo;
-  const wkUtil = q.unified7d ?? null;
+  // A weekly refusal reads as 100% of this window (weeklyUsedWithRefusal).
+  const wkUtil = weeklyUsedWithRefusal(account, q.unified7d ?? null, q.unified7dReset, now);
   // EXACT LIMIT: the wall IS the limit (CLAUDE_WALL_WEEKLY === POLICY.limitReached).
   const weeklyWall = weeklyLimitReached(wkUtil);
   // Record the general hold even if a separate model window is also full.
@@ -243,6 +381,14 @@ function decideSubscriptionWithReason(account, listing, now, opts) {
       // A give-back-only grant (no seven_day in clears) returns only what the model
       // used — the claim snapshots unified7d so the next probe measures the drop.
       return out({ kind: 'grant', grant: g, scope: 'general', giveBack, reason: 'weekly at wall' }, 'weekly at wall');
+    }
+    // LAST RESORT (the shared expiry planner, planExpiringReset): this grant dies inside
+    // POLICY.lastResortMs. A requiresLimit grant may only ever be spent at the limit, and
+    // a give-back-only grant returns just one model's use — neither is worth a last-resort
+    // claim.
+    if (!g.requiresLimit && !giveBack && planExpiringReset({
+      expiresAt: g.endsAt, util: wkUtil, refillAt: q.unified7dReset, now }) === EXPIRING_RESET.LAST_RESORT) {
+      return out({ kind: 'grant', grant: g, scope: 'general', giveBack, reason: LAST_RESORT_REASON }, LAST_RESORT_REASON);
     }
   }
   if (weeklyWall && !general.length) note('general not held');

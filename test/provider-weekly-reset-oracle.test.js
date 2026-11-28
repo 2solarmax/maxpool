@@ -19,7 +19,7 @@ const providerFleet = () => new AccountManager([
 test('a weekly-exhausted PROVIDER holds finite on its own reset field', () => {
   const am = providerFleet();
   const a = am.accounts[0];
-  a.quota.providerWk = 0.9995;
+  a.quota.providerWk = 1;
   a.quota.providerWkReset = Date.now() + 3 * 86400_000;
   a.quota.unified7dReset = null;            // providers never populate this
 
@@ -39,7 +39,7 @@ test('an Anthropic account still keys on unified7dReset (no regression)', () => 
     { name: 'cc', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
   ], 0.90, { routingMode: 'balance' });
   const a = am.accounts[0];
-  a.quota.unified7d = 0.9995;
+  a.quota.unified7d = 1;
   a.quota.unified7dReset = Date.now() + 2 * 86400_000;
 
   const info = am._retryInfo(a, null);
@@ -51,7 +51,7 @@ test('an Anthropic account still keys on unified7dReset (no regression)', () => 
 test('genuinely-unknown reset still reports Infinity (the honest case survives)', () => {
   const am = providerFleet();
   const a = am.accounts[0];
-  a.quota.providerWk = 0.9995;
+  a.quota.providerWk = 1;
   a.quota.providerWkReset = null;           // truly unknown
   a.quota.unified7dReset = null;
 

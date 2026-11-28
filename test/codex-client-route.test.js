@@ -252,10 +252,13 @@ test('the shared reactive reset can unbench an opted-in native owner before retr
       return { redeemed: true, accountName: 'a' };
     } },
   });
+  const refused = [];
+  am.codexReactiveReset = accounts => { refused.push(...accounts.map(a => a.name)); return false; };
   await (await response(url)).text();
   const next = await response(url, { ...body, input: [{ type: 'reasoning', encrypted_content: 'previous-turn' }] });
   assert.equal(next.status, 200);
   await next.text();
+  assert.deepEqual(refused, ['a']);
   assert.equal(resets, 1);
   assert.deepEqual(calls.map(call => call.headers.authorization), Array(3).fill('Bearer upstream-grant-a'));
   assert.equal(am.accounts[0].usage.totalRequests, 3);

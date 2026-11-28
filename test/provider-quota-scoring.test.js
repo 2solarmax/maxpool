@@ -29,8 +29,11 @@ test('_weeklyRawState reads PROVIDER quota (was always "unknown")', () => {
   // 90% → reserve
   kimi.quota.providerWk = 0.90;
   assert.equal(am._weeklyRawState(kimi), 'reserve');
-  // 99.9% → exhausted (benched)
+  // 99.9% → critical, still served (the floor is the limit itself, owner 2026-11-27)
   kimi.quota.providerWk = 0.999;
+  assert.equal(am._weeklyRawState(kimi), 'critical');
+  // 100% → exhausted (benched)
+  kimi.quota.providerWk = 1;
   assert.equal(am._weeklyRawState(kimi), 'exhausted');
 });
 
@@ -41,7 +44,7 @@ test('_weeklyRawState reads providerSes for a plan with no weekly', () => {
   glm.quota.providerSes = 0.95;
   glm.quota.providerWk = null;
   assert.equal(am._weeklyRawState(glm), 'critical');
-  glm.quota.providerSes = 0.999;
+  glm.quota.providerSes = 1;
   assert.equal(am._weeklyRawState(glm), 'exhausted');
 });
 
@@ -55,7 +58,7 @@ test('_weeklyPaceState reads provider quota (the rebalance trigger)', () => {
 test('_isAvailable benches a provider at exhaustion', () => {
   const am = fleet();
   const kimi = am.accounts.find(a => a.provider === 'kimi');
-  kimi.quota.providerWk = 0.999;
+  kimi.quota.providerWk = 1;
   assert.equal(am._isAvailable(kimi), false, 'exhausted provider must be benched');
   kimi.quota.providerWk = 0.50;
   assert.equal(am._isAvailable(kimi), true, 'healthy provider stays available');
@@ -119,7 +122,7 @@ test('the scheduler PREFERS the less-used provider at RESERVE level (90%+)', () 
 test('a provider at exhaustion is REMOVED from selection (not just scored higher)', () => {
   const am = fleet();
   const kimi = am.accounts.find(a => a.provider === 'kimi');
-  kimi.quota.providerWk = 0.999;
+  kimi.quota.providerWk = 1;
   for (let i = 0; i < 10; i++) {
     const lease = am.acquireAccount({ profile: 'all' }, new Set());
     assert.equal(lease?.account?.name, 'glm', 'exhausted Kimi must never be selected');

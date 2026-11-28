@@ -85,7 +85,7 @@ test('HOLD does not apply in sticky mode (its own binding decides)', () => {
 test('RELEASE: holder weekly exhausted → moves', () => {
   const m = claude3(); const a1 = byName(m, 'a1');
   served(m, a1); loadHolder(a1);
-  a1.quota.unified7d = 0.9995; a1.quota.unified7dReset = FAR();
+  a1.quota.unified7d = 1; a1.quota.unified7dReset = FAR();
   assert.equal(m._weeklyRawState(a1), 'exhausted');
   assert.notEqual(pick(m).name, 'a1');
 });

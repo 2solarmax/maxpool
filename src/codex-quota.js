@@ -300,3 +300,11 @@ export function codexRateLimit(headers, model, now = Date.now(), knownLimit = nu
     retryAfter: resetAt > now ? Math.ceil((resetAt - now) / 1000) : 0,
   };
 }
+
+/** Read only the refused account's shared weekly meter, never a named or session limit. */
+export function codexWeeklyRefusal(headers, limit) {
+  if (!limit || limit.modelScope) return null;
+  const { unified7d, unified5h } = parseCodexQuota(headers);
+  return unified7d >= 1 || (unified7d >= 0.999 && !(unified5h >= 0.999))
+    ? { window: 'weekly', weeklyUtil: unified7d } : null;
+}

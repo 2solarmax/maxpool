@@ -3,8 +3,8 @@ import { createCodexClientRoute, isCodexClientPath } from './codex-client-route.
 import { fetchBoundedOpenAIResponse, fromOpenAIResponse, OPENAI_RESPONSES_URL, toOpenAIRequest, UnsupportedOpenAIRequest, webSearchesInTurn } from './openai-responses.js';
 import { nativeCodexHeaders, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
 import { codexModelFor, validCodexCatalog } from './codex-model-routing.js';
-import { weeklyLimitReached } from './reset-policy.js';
-import { codexRateLimit } from './codex-quota.js';
+import { codexRateLimit, codexWeeklyRefusal } from './codex-quota.js';
+import { CLAIM_FRESH_MS, weeklyLimitReached } from './reset-policy.js';
 import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { normalizeClientHeaders, rewriteMetadataUserIdRaw } from './client-identity.js';
@@ -2321,16 +2321,23 @@ async function forwardRequest(
       // FIRE-AND-FORGET (finding 4): the claim (profile GET + POST) runs OFF the
       // user's request — this request fails over at once; the claim unbenches the
       // account for the NEXT request when it lands. Never awaited here.
-      if (accountManager.tryReactiveClaim && !account.remote) {
-        const weeklyHdr = Number(rateLimitHeaders['anthropic-ratelimit-unified-7d-utilization']);
-        const weeklyWall = weeklyLimitReached(weeklyHdr);
-        const kind = weeklyWall ? 'weekly' : (rateLimit.modelScope || null);
-        if (kind) {
-          try {
-            Promise.resolve(accountManager.tryReactiveClaim(account, { kind, weeklyUtil: weeklyHdr }))
+      // ROUTE UNTIL THE PROVIDER REFUSES, THEN SPEND PROMPTLY (owner 2026-11-28): routing
+      // serves an account up to the refusal, so a reading of 99.9% must never leave its
+      // reset waiting for a probe to say exactly 100%. ONE entry for every provider
+      // (accountManager.onWeeklyRefusal): Claude claims a grant, Codex redeems a credit,
+      // GLM redeems a weekly card — each through its usual rule, free-refill hold included.
+      if (!account.remote) {
+        const refusal = weeklyRefusalOf(account, rateLimitHeaders, errorBody, rateLimit, nativeLimit);
+        try {
+          if (refusal && accountManager.onWeeklyRefusal) {
+            Promise.resolve(accountManager.onWeeklyRefusal(account, refusal))
               .catch(() => { /* best-effort; the sweep retries */ });
-          } catch { /* a synchronous throw must not break the failover below */ }
-        }
+          } else if (rateLimit.modelScope && account.type === 'oauth' && account.provider !== 'codex' && accountManager.tryReactiveClaim) {
+            // A Claude model-scoped 429 claims that model's grant (measured bucket only).
+            Promise.resolve(accountManager.tryReactiveClaim(account, { kind: rateLimit.modelScope }))
+              .catch(() => { /* best-effort; the sweep retries */ });
+          }
+        } catch { /* a synchronous throw must not break the failover below */ }
       }
       accountManager.releaseAccount(lease, { status: 429, error: rateLimit.modelScope ? 'model_rate_limited' : 'rate_limited' });
 
@@ -3793,7 +3800,7 @@ function isContextLengthError(errorBody) {
   return /exceeded model token limit|maximum context length|context length exceeded|context window (?:size )?(?:exceeded|too)|prompt is too long|input is too long|reduce the length of|too many (?:input )?tokens|request too large/i.test(errorBody);
 }
 
-export const __serverTest = { cutLinkInflight, nextStickyBusyWaitMs, readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, parseSSEEvent, extractUsageFromBody, threadOwners: () => threadOwners, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
+export const __serverTest = { cutLinkInflight, nextStickyBusyWaitMs, readPinRefusal, sleepUnlessClientGone, stickyBusyWaitEligible, stickyBusyBudgetMs, usageFromSseData, usageFromBodyTail, tapLinkUsage, parseSSEEvent, extractUsageFromBody, threadOwners: () => threadOwners, stickyKnobs: () => ({ PIN_BUSY_MAX_RETRY_AFTER_S, STICKY_BUSY_MAX_ATTEMPTS, STICKY_BUSY_MIN_BYTES, STICKY_BUSY_WAIT_CAP_MS }), hasEligibleRoute, resendAllowed, directiveOnlySystemMessages, rewriteBodyForAccount, sanitizeBlocksForProvider, reanchorOrphanedSystemMessages, unavailableMessage, computeQueueWindowMs, waitForAvailableRoute, isRetriableUpstreamStatus, classifyEffortRejection, repairEffort, isCapacitySignalStatus, isStrippableThinkingBlock, stripForeignThinkingBlocks, parseRejectedBlockPath, stripRejectedBlockClass, peekRejectedBlockType, describeRejectedBlock, headerValue, getMaxpoolProfile, ensureQueueHeartbeat, ensureQueueHeartbeatInterval, clearQueueHeartbeat, commitStreamGraceHeartbeat, describeRequest, classifyRateLimit, weeklyRefusalOf, isRequestShapeRefusal, looksLikeClaudeCode, parseProviderRetryAfter, secondsUntilParsedTime, detectTranscriptOrigin, isAnthropicIncompatBody, isContextLengthError, isProviderParamRejection, describeBodyShape, logFailedAttempt, isRequestScopedTimeout, clientWaitCeilingMs, scaledTtfbMs, retrySameEligible, parsePatience, computeDeadline, computeLinkHop, nonStreamFirstByteWait, nonStreamBodyWait, nonStreamRemainingMs, deadlineKnobs, deadlineErrorPayload, ttfbKnobs: () => ({ UPSTREAM_TTFB_MS, TTFB_MS_PER_BYTE, BIG_PROMPT_BYTES, CLI_STREAM_CEILING_MS }), streamResponse, startIdleRequestReaper, normalizeModelEcho, classifyHeldStreamPrefix };
 
 async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   if (!upstreamRes.body) return '';
@@ -3818,6 +3825,12 @@ async function readErrorBody(upstreamRes, limitBytes = 64 * 1024) {
   }
 }
 
+function zaiResetStamp(message) {
+  const resetMatch = message.match(/reset at\s+`?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)`?/i)
+      || message.match(/next_flush_time[:\s]+`?([^`\]\n]+?)`?(?:\]|$)/i);
+  return resetMatch?.[1];
+}
+
 function parseProviderRetryAfter(body, provider) {
   const parsed = parseJsonError(body);
   const code = parsed?.code;
@@ -3828,9 +3841,7 @@ function parseProviderRetryAfter(body, provider) {
     // (measured 2026-11-08, code 1310): the bracketed request id trails the time, so
     // an anchor to end-of-string never matches and the parsed time became garbage.
     // Capture the time inside ITS bracket and hand only that to the time parser.
-    const resetMatch = message.match(/reset at\s+`?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)`?/i)
-      || message.match(/next_flush_time[:\s]+`?([^`\]\n]+?)`?(?:\]|$)/i);
-    const resetSeconds = secondsUntilParsedTime(resetMatch?.[1], { tzOffsetMs: ZAI_TZ_OFFSET_MS });
+    const resetSeconds = secondsUntilParsedTime(zaiResetStamp(message), { tzOffsetMs: ZAI_TZ_OFFSET_MS });
     if (resetSeconds) return resetSeconds;
 
     if (['1302', '1303', '1305'].includes(String(code))) return 60;
@@ -3890,6 +3901,54 @@ function isRequestShapeRefusal(headers, errorBody, requestBody) {
   return !looksLikeClaudeCode(requestBody);
 }
 
+// The 429-scope floor: a unified bucket at or above it is the account's own limit, not a
+// per-model sub-limit. A hair below the 100% spend point, because a vendor's header can
+// round a full window to 0.999. Shared by classifyRateLimit and weeklyRefusalOf.
+const RATE_LIMIT_EXHAUSTION_FLOOR = 0.999;
+
+/** Is this 429 the provider refusing the account for its WEEKLY limit? Returns
+ *  `{ window: 'weekly', weeklyUtil }` (the reading the refusal carried, null when none)
+ *  or null for any other refusal: a per-model sub-limit, a five-hour limit, a shared
+ *  throttle. Claude: an account-wide refusal whose weekly header is at the limit while
+ *  the session (5h) header is NOT the spent one — right before a weekly wall the week
+ *  reads 0.999 with a FULL session window, and it is the session that refused; that
+ *  clears on its own and must never spend a weekly reset. Codex: a refusal whose own
+ *  weekly header is spent. GLM: z.ai code 1310 for the WEEK ("Weekly Limit Exhausted");
+ *  the same code answers a monthly limit, which a weekly card does not clear, and 1308
+ *  is the five-hour limit. */
+function weeklyRefusalOf(account, headers, errorBody, rateLimit, nativeLimit) {
+  if (account.type === 'provider') {
+    if (account.provider !== 'zai') return null;
+    const parsed = parseJsonError(errorBody);
+    if (String(parsed?.code) !== '1310') return null;
+    const weekly = /\bweekly\b/i.test(parsed.message);
+    const monthly = /\bmonthly\b/i.test(parsed.message);
+    // The combined vendor message is not proof by itself. Match its *uncapped*
+    // absolute deadline to a fresh weekly reading before spending on that shape.
+    if (!weekly) return null;
+    if (monthly) {
+      const q = account.quota || {};
+      const stamp = zaiResetStamp(parsed.message);
+      const at = stamp && Date.parse(/[zZ]$|[+-]\d{2}:?\d{2}$/.test(stamp) ? stamp : stamp.replace(' ', 'T') + '+08:00');
+      const now = Date.now();
+      if (!(at > now && q.providerWk >= RATE_LIMIT_EXHAUSTION_FLOOR && q.providerWkReset > now
+        && now - q.lastProbeOkAt <= CLAIM_FRESH_MS && Math.abs(at - q.providerWkReset) <= 1000)) return null;
+    }
+    return { window: 'weekly', weeklyUtil: null };
+  }
+  if (account.provider === 'codex') return codexWeeklyRefusal(headers, nativeLimit);
+  if (rateLimit?.scope !== 'account' || rateLimit.modelScope) return null;
+  const weekly = Number(headers['anthropic-ratelimit-unified-7d-utilization']);
+  if (!Number.isFinite(weekly) || weekly < RATE_LIMIT_EXHAUSTION_FLOOR) return null;
+  // A session window that is itself at the floor is what refused: a full 5h window
+  // refills for free and is never worth a weekly reset (the sweep re-reads the week).
+  const fiveHour = Number(headers['anthropic-ratelimit-unified-5h-utilization']);
+  if (Number.isFinite(fiveHour) && fiveHour >= RATE_LIMIT_EXHAUSTION_FLOOR
+    && !weeklyLimitReached(weekly)) return null;
+  // The refusal is the provider's own word that the week is full: read it as 100%.
+  return { window: 'weekly', weeklyUtil: weekly };
+}
+
 function classifyRateLimit(account, headers, body, opts = {}) {
   if (account.type === 'provider' || account.provider === 'codex') return { scope: 'account', fingerprint: null };
 
@@ -3916,12 +3975,12 @@ function classifyRateLimit(account, headers, body, opts = {}) {
   // genuine account cap with stripped headers must bench the whole account, not one
   // model). Neither bucket may be at/above the exhaustion floor.
   const haveUnifiedEvidence = Number.isFinite(weekly) || Number.isFinite(fiveHour);
-  // Exhaustion floor for 429-SCOPE classification — kept in sync with the scheduler's
-  // weeklyExhaustedThreshold (0.999, use-it-or-lose-it). A 429 whose unified buckets are
-  // still below the floor isn't weekly-exhaustion, so a model-family + long-retry-after
-  // 429 benches only that model, not the whole (still-usable) account — matching routing,
-  // which now treats 0.95-0.999 as usable (critical), not benched.
-  const EXHAUSTION_FLOOR = 0.999;
+  // Exhaustion floor for 429-SCOPE classification (RATE_LIMIT_EXHAUSTION_FLOOR). A 429
+  // whose unified buckets are still below the floor isn't weekly-exhaustion, so a
+  // model-family + long-retry-after 429 benches only that model, not the whole
+  // (still-usable) account. Routing benches at 100% (weeklyExhaustedThreshold), so an
+  // account below it keeps serving until the provider itself refuses.
+  const EXHAUSTION_FLOOR = RATE_LIMIT_EXHAUSTION_FLOOR;
   const unifiedNotExhausted =
     (!Number.isFinite(weekly) || weekly < EXHAUSTION_FLOOR) && (!Number.isFinite(fiveHour) || fiveHour < EXHAUSTION_FLOOR);
   const modelScope =

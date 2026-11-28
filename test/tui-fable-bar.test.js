@@ -72,12 +72,23 @@ test('a provider row shows no Fbl label at all and keeps Ses and Wk aligned with
   }
 });
 
-test('an exhausted Fable weekly shows 100% in the bar and still the "Fable maxed" tag', () => {
+test('an exhausted Fable weekly (100%) shows 100% in the bar and still the "Fable maxed" tag', () => {
+  const am = pool();
+  fable(am, 0, { utilization: 1, severity: 'critical' });
+  const line = row(am, 0);
+  assert.match(fableCell(line), /100%/);
+  assert.match(line, /Fable maxed/, 'the existing tag stays');
+});
+
+test('a Fable weekly one step under 100% shows 100% in the bar but is NOT "maxed" (the bench is the limit)', () => {
+  // Owner 2026-11-27: the exhausted floor is 1.0. 99.95% rounds to 100% in the bar and
+  // reads as the usable yellow tag, the same reading the router serves on.
   const am = pool();
   fable(am, 0, { utilization: 0.9995, severity: 'critical' });
   const line = row(am, 0);
   assert.match(fableCell(line), /100%/);
-  assert.match(line, /Fable maxed/, 'the existing tag stays');
+  assert.doesNotMatch(line, /maxed/, 'under the 100% floor: not maxed');
+  assert.match(line, /Fable 100%/);
 });
 
 test('a Fable limit Anthropic reports as inactive still shows its number (the limit exists and counts)', () => {
@@ -121,16 +132,14 @@ test('barLayout: one bar under 70 columns, two from 70, three from 127, three ba
 });
 
 test('barLayout: a two-bar row fills the terminal exactly at 110 columns and never overflows it', () => {
-  const { barLayout } = __tuiTest;
-  // 104 = the first width where two 5-wide bars fit; 70..97 is the long-standing
-  // two-bar tier, where the second bar is clipped at the right edge as before.
+  const { barLayout, show5hColumn } = __tuiTest;
+  // The fixed columns end at 88, plus six cells for 5hR when visible.
   for (let W = 104; W <= 149; W++) {
     const { showFable, bw } = barLayout(W);
-    const rowWidth = 88 + bw + (showFable ? 6 + bw : 0) + 6 + bw;
+    const resetSpan = show5hColumn(W) ? 6 : 0;
+    const rowWidth = 88 + resetSpan + bw + (showFable ? 6 + bw : 0) + 6 + bw;
     assert.ok(rowWidth <= W, `W=${W}: bars end at column ${rowWidth}`);
-    // Three bars never take more of the line than two bars could (134 columns), so
-    // the tags after the bars keep their room on a wide terminal.
-    if (showFable) assert.ok(rowWidth <= 134, `W=${W}: three bars end at column ${rowWidth}`);
+    if (showFable) assert.ok(rowWidth <= 134 + resetSpan, `W=${W}: three bars end at column ${rowWidth}`);
   }
   assert.equal(88 + 2 * barLayout(110).bw + 6, 110);
 });
@@ -169,6 +178,25 @@ test('a full frame at 127 columns shows three bars on every account row, each ro
     assert.ok(l.length <= 127, `fits 127 columns: ${l.length}`);
   }
   assert.match(rows[0], /Fbl\s+45% 3d/, 'the used% is readable at the first three-bar width');
+});
+
+test('the full quota frame adds the 5h reset count without dropping any quota bars', () => {
+  const am = pool();
+  const now = Date.now();
+  fable(am, 0, { utilization: 1 });
+  am.applyProviderUsage(2, { source: 'zai', ses: { utilization: 1, resetAt: now + 3600_000 },
+    wk: { utilization: 0.25, resetAt: now + 3 * DAY } });
+  am.applyResetCards(2, { weekly: [], fiveHour: [{ recordId: 1, expiresAt: now + 2 * DAY }] });
+  const tui = new TUI({ accountManager: am, config: { proxy: { port: 3456 } } });
+  const narrow = frameAt(tui, 138);
+  const wide = frameAt(tui, 139);
+  const rowAt = (lines, name) => lines.find(line => line.trimStart().startsWith(`${name} `));
+  assert.ok(!narrow.some(line => /\b5hR\b/.test(line)), 'no extra column at 138');
+  assert.ok(wide.some(line => /\b5hR\b/.test(line)), 'column label at 139');
+  assert.doesNotMatch(rowAt(narrow, 'glm'), /1~2d/);
+  assert.match(rowAt(wide, 'glm'), /1~2d/);
+  assert.match(rowAt(wide, 'home'), /Fbl .*Ses .*Wk /, 'all three bars remain visible');
+  assert.doesNotMatch(rowAt(wide, 'home'), /1~2d/, 'no 5h card count on a Claude row');
 });
 
 test('a full frame at 109 columns keeps the two-bar layout', () => {

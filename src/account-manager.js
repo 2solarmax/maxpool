@@ -14,7 +14,10 @@ import { hourFloor } from './outside-usage.js';
 import { CapacityLedger, TANK_MIN_UTIL, mergeCycles, tankStatsFromCycles } from './capacity-ledger.js';
 // A1: the ONE shared grant-scope answer (display, routing, claim and lift all read it).
 import { appliesTo, clearsGeneralWeekly, forgetClaimOrg } from './claude-reset-grants.js';
-import { POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM, codexAutoResetOn, codexSteerForExpiry } from './reset-policy.js';
+import {
+  POLICY, CLAUDE_WALL_WEEKLY, probeSentAt, wallClaimHeld, HOLD_POOL_HAS_ROOM, codexAutoResetOn,
+  steerForExpiringReset, weeklyUsedWithRefusal, resetOutcomeLabel, retryAfterFailedReset, RESET_OUTCOME, noteResetOutcome,
+} from './reset-policy.js';
 import {
   LISTING_FRESH_MS, LIFT_GRACE_MS, CLAIM_STALE_LISTING_MAX_MS, CLAIM_BACKOFF_STEPS_MS,
   CLAIM_BACKOFF_CAP_MS, MAX_QUOTA_RETRY_MS, REACTIVE_CLAIM_TIMEOUT_MS, CLAIM_FRESH_MS,
@@ -27,6 +30,8 @@ const REQUEST_FAULT_ESCALATE = 3;
 // local table so account-manager does not import a private constant).
 const WINDOW_MS_BY_KIND = { ses: 5 * 3600_000, wk: 7 * 86400_000 };
 const PROVIDER_SES_WALL = 1;  // provider 5h bench: serve to 100% (owner 2026-10-30); a usage cap still wins
+// The weekly bench every config written before 2026-11-28 carries (see the constructor).
+const LEGACY_WEEKLY_EXHAUSTED_DEFAULT = 0.999;
 
 // A capacity window boundary must move by at least this much to count as a real
 // window ADVANCE rather than reset-stamp jitter (see noteCapacityWindowAdvance).
@@ -143,11 +148,10 @@ const DEFAULT_SCHEDULER = {
   weeklySoftThreshold: 0.65,
   weeklyReserveThreshold: 0.85,
   weeklyCriticalThreshold: 0.95,
-  // Use-it-or-lose-it (2026-07-24): bench only at 99.9%, not 98.5% — the weekly quota
-  // resets, so reserving the top ~1.5% just wastes it. The thin 0.1% floor is the ONE
-  // remaining guard: don't fire a request at an account whose own header already says
-  // it's essentially full (a near-guaranteed-waste hard-429). A real 429 sets util≈1.0
-  // and still benches here. Critical (0.95-0.999) stays last-resort-only (pass 2).
+  // Bench at the LIMIT (100%), the same point every automatic reset is spent at (owner
+  // 2026-11-28: "route until the provider refuses, then spend promptly"). The old 99.9%
+  // bench stopped routing while resets waited for 100%, so an account at 99.9% sat
+  // benched with its reset unspent. Critical (0.95-1) stays last-resort-only (pass 2).
   weeklyExhaustedThreshold: POLICY.limitReached,
   // ── Situational CRITICAL unlock (2026-08-24) ────────────────────────────────
   // An account at critical (≥0.95 weekly) used to be pass-2-only: spent ONLY during
@@ -721,8 +725,20 @@ function _windowElapsedRatio(resetAt, durationMs, now) {
  *  missing new grant fields take the fail-closed default from A1; a missing
  *  capLift means no lift (never recomputed from the mirror's listing copy). */
 export function normalizeRemoteResets(ra) {
-  if (!ra) return { resetCards: null, resetGrants: null, capLift: null };
-  const out = { resetCards: null, resetGrants: null, capLift: null };
+  if (!ra) return { resetCards: null, resetGrants: null, capLift: null, resetOutcomes: null };
+  const out = { resetCards: null, resetGrants: null, capLift: null, resetOutcomes: null };
+  // The holder's reset outcomes (dashboard line), as exported: kind/util/at/seenAt per
+  // window. An older cloud omits them; anything malformed is dropped window by window.
+  if (ra.resetOutcomes && typeof ra.resetOutcomes === 'object') {
+    const kept = {};
+    for (const [w, o] of Object.entries(ra.resetOutcomes)) {
+      if (['weekly', '5h', 'model'].includes(w) && Object.values(RESET_OUTCOME).includes(o?.kind) && Number.isFinite(o.at)) {
+        kept[w] = { kind: o.kind, util: Number.isFinite(o.util) ? o.util : null, at: o.at,
+          ...(Number.isFinite(o.seenAt) ? { seenAt: o.seenAt } : {}) };
+      }
+    }
+    if (Object.keys(kept).length) out.resetOutcomes = kept;
+  }
   if (ra.resetCards && typeof ra.resetCards === 'object') {
     out.resetCards = {
       fiveHour: Array.isArray(ra.resetCards.fiveHour) ? ra.resetCards.fiveHour : [],
@@ -805,6 +821,11 @@ function mergeScopedReadings(previous, readings) {
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.90, schedulerOptions = {}, dependencies = {}) {
     this.scheduler = { ...DEFAULT_SCHEDULER, ...schedulerOptions };
+    // A config written by an older default carries 0.999 — the bench that stalled resets
+    // (owner 2026-11-28). It reads as the limit; any other operator value stands.
+    if (this.scheduler.weeklyExhaustedThreshold === LEGACY_WEEKLY_EXHAUSTED_DEFAULT) {
+      this.scheduler.weeklyExhaustedThreshold = POLICY.limitReached;
+    }
     // Migrate the legacy single-value policy to the new mode if the caller (config)
     // set `crossProviderFallbackPolicy` but not `routingMode`. The per-provider
     // `providers[<key>].claudeFallback` still works under the prefer-* modes.
@@ -1556,6 +1577,10 @@ export class AccountManager {
       for (const k of Object.keys(tel)) if (outcome[k] != null) tel[k] = outcome[k];
       this._recordLoadEvent(account, lease, { ...outcome, ...tel, success: true });
       account.lastSuccessAt = Date.now();
+      // A request that STARTED after a weekly refusal and was served proves the wall is
+      // gone; one already streaming when the refusal came proves nothing
+      // (weeklyUsedWithRefusal), so only the former ends the refusal.
+      if (account.weeklyRefusal && lease.startedAt > account.weeklyRefusal.at) account.weeklyRefusal = null;
       return;
     }
 
@@ -4697,7 +4722,7 @@ export class AccountManager {
     // A FULL lift refilled the week: like every other weekly term, the tie-break must
     // not price it on its pre-refill usage (else a lifted 0.97 is worst-of-pool again).
     const absUsed = this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)
-      && !this._steersForExpiringCredit(account, now) ? this._absWeeklyUsed(account) : 0;
+      && !this._steersForExpiringReset(account, now) ? this._absWeeklyUsed(account) : 0;
     const utilizationCost = (this._rawUtilization(account) + ABS_UTIL_WEIGHT * absUsed) * this.scheduler.utilizationWeight * refillMult * resetMult;
 
     // Per-model weekly de-preference: an account whose scoped weekly for THIS
@@ -4726,7 +4751,11 @@ export class AccountManager {
     // 2.3x early in its window, fading to parity at the same ses 0.65 the multiplier
     // already uses. A multiplier of 1 makes every discounted term byte-identical to
     // pre-2026-08-25 behaviour; reserve/critical/ramp/failure are never discounted.
-    const spread = share * this.scheduler.spreadShareWeight * refillMult * resetMult;
+    // A lifted weekly reset already zeroes the weekly costs. Let its last day still
+    // attract more new work at equal load; never discount session or safety costs.
+    const spreadMult = this.capLiftActive(account, now) && this._steersForExpiringReset(account, now)
+      ? 1 - Math.min(0.9, Math.max(0, this.scheduler.resetBoostDiscount || 0)) : resetMult;
+    const spread = share * this.scheduler.spreadShareWeight * refillMult * spreadMult;
 
     const ramp = this._recoveryRamp(account, now);
     const reserveCost = this._reserveCost(account, now, weeklyState);
@@ -5295,8 +5324,8 @@ export class AccountManager {
    */
   _accountScarcity(account, now = Date.now()) {
     const q = account.quota;
-    // Only a GENUINELY dying credit steers (see _steersForExpiringCredit).
-    const skipWeekly = this._steersForExpiringCredit(account, now);
+    // Only a GENUINELY dying weekly reset steers (see _steersForExpiringReset).
+    const skipWeekly = this._steersForExpiringReset(account, now);
     let scarcity = 0;
     if (q.unified5h != null) {
       scarcity = Math.max(scarcity, this._windowScarcity(q.unified5h, q.unified5hReset, FIVE_HOUR_MS, now));
@@ -5354,7 +5383,7 @@ export class AccountManager {
     // invariant the older tests pin). Unknown/absent reset → face value, same as
     // _accountScarcity. Turn the flag off to restore session-only exactly.
     if (this.scheduler.weeklyAwareScoring !== false && !this._weeklyRefilledByLift(account, now)
-      && !this._steersForExpiringCredit(account, now)) {
+      && !this._steersForExpiringReset(account, now)) {
       if (q.unified7d != null) {
         util = Math.max(util, this._windowScarcity(q.unified7d, q.unified7dReset, WEEK_MS, now));
       }
@@ -5372,24 +5401,72 @@ export class AccountManager {
     return Math.max(q.unified7d != null ? clamp01(q.unified7d) : 0, q.providerWk != null ? clamp01(q.providerWk) : 0);
   }
 
-  /** PLAN AHEAD (the final precaution only): is `account` holding a spendable credit that
-   *  is DYING, so the pool should fill this account first and give the credit a chance to
-   *  be spent on an account that reached its limit honestly, instead of dying unused on an
-   *  idle one? Confirmed rows only (codexResetSpendableExpiry → liftRows), a current weekly
-   *  reading, and the limit not yet reached. ONLY a dying credit steers: one with longer
-   *  to live is not dying, and filling its account would be spending ahead of the limit
-   *  (owner, 2026-11-27). The operator's usage cap plays no part — it is a reservation,
-   *  not provider exhaustion. Its WEEKLY terms are left out of scoring; the SESSION terms
-   *  stay (_accountScarcity, _rawUtilization), so a busy account is never routed to as if
-   *  it were empty. */
-  _steersForExpiringCredit(account, now = Date.now()) {
-    if (account?.provider !== 'codex' || account.remote || account.poolBenchedBy) return false;
-    if (!codexAutoResetOn(account)) return false;
-    const q = account.quota || {};
-    if (!(now - q.codexWeeklyReadingAt <= CLAIM_FRESH_MS)) return false;
-    const expiresAt = this.codexResetSpendableExpiry?.(account, now);
+  /** The soonest-expiring WEEKLY reset the pool may spend on `account` on its own, or
+   *  null when it holds none it can spend. ONE answer for every provider (owner,
+   *  2026-11-28: "We use the same machinery"): a Codex credit from its confirmed rows, a
+   *  Claude grant that clears the general week, a z.ai weekly card. Session-only,
+   *  model-scoped, paused, unusable and expired resets never steer — they refill no
+   *  weekly window, so filling the account would spend ahead of the limit for nothing. */
+  _spendableWeeklyResetExpiry(account, now = Date.now()) {
+    if (!account || account.enabled === false || account.remote || account.poolBenchedBy
+      || account.refreshDead || account.subscriptionGone) return null;
+    if (account.provider === 'codex') {
+      return codexAutoResetOn(account) ? (this.codexResetSpendableExpiry?.(account, now) ?? null) : null;
+    }
+    const live = endsAt => endsAt == null || endsAt > now;
+    const dated = [];
+    if (isClaudeOAuthAccount(account)) {
+      // A restored (pre-reload) listing is a proof of a past count, never spendable.
+      const rg = account.resetGrants;
+      if (rg && rg.stale !== true && rg.eligible !== false && !(rg.cooldownUntil > now)) {
+        for (const g of rg.grants || []) {
+          if (g && !g.paused && !g.expired && g.usableNow !== false && !g.blocking && !g.unavailableReason
+            && (g.resetsLeft ?? 1) > 0 && live(g.endsAt) && clearsGeneralWeekly(g)) dated.push(g.endsAt ?? Infinity);
+        }
+      }
+    } else if (account.type === 'provider' && account.provider === 'zai') {
+      const rc = account.resetCards;
+      if (rc && rc.stale !== true && account.quota?.providerWk != null) {
+        for (const c of rc.weekly || []) {
+          if (c && !c.expired && c.recordId != null && live(c.expiresAt)) dated.push(c.expiresAt ?? Infinity);
+        }
+      }
+    }
+    if (!dated.length) return null;
+    const soonest = Math.min(...dated);
+    return Number.isFinite(soonest) ? soonest : null;   // never expires: nothing to plan for
+  }
+
+  /** PLAN AHEAD — ONE rule for every provider (reset-policy planExpiringReset): while a
+   *  spendable weekly reset is in its last POLICY.dyingWindowMs and the account has not
+   *  reached the limit, its WEEKLY terms are left out of scoring so work flows there and
+   *  it can reach 100% before the reset dies. A reset with longer to live never steers: it
+   *  is not dying, and filling its account would be spending ahead of the limit (owner,
+   *  2026-11-27). The operator's usage cap plays no part — it is a reservation, not
+   *  provider exhaustion. The SESSION terms stay (_accountScarcity, _rawUtilization), so a
+   *  busy account is never routed to as if it were empty. */
+  _steersForExpiringReset(account, now = Date.now()) {
+    const expiresAt = this._spendableWeeklyResetExpiry(account, now);
     if (expiresAt == null) return false;
-    return codexSteerForExpiry({ expiresAt, util: q.unified7d, now });
+    const q = account.quota || {};
+    // The weekly reading must be current: a stale one could hide an account already full.
+    const readAt = account.provider === 'codex' ? q.codexWeeklyReadingAt : q.lastProbeOkAt;
+    if (!(readAt != null && now - readAt <= CLAIM_FRESH_MS)) return false;
+    return steerForExpiringReset({ expiresAt, util: this._weeklyUsedOf(account), refillAt: this._weeklyRefillOf(account), now });
+  }
+
+  /** The share of the WEEKLY window `account` has used (0..1), or null when unknown —
+   *  the one reading every provider's expiry decision is made on. */
+  _weeklyUsedOf(account) {
+    const q = account?.quota || {};
+    const used = account?.type === 'provider' ? q.providerWk : q.unified7d;
+    return Number.isFinite(used) ? used : null;
+  }
+
+  /** When `account`'s own free weekly refill lands, or null when unknown. */
+  _weeklyRefillOf(account) {
+    const q = account?.quota || {};
+    return account?.type === 'provider' ? (q.providerWkReset ?? null) : (q.unified7dReset ?? null);
   }
 
   _windowScarcity(util, resetMs, windowLen, now = Date.now()) {
@@ -5667,8 +5744,8 @@ export class AccountManager {
     const used = clamp01(q.unified7d);
     // C3 CAP LIFT (pre-mortem #10): while a general reset can be spent, the
     // soft/reserve/critical tiers would strand it — above 0.95 an account is
-    // last-resort-only, so it never reaches the 0.99 claim point. Below the wall
-    // (0.999, or the give-back ceiling cap+drop) a lifted account tiers as
+    // last-resort-only, so it never reaches the 100% claim point. Below the wall
+    // (100%, or the give-back ceiling cap+drop) a lifted account tiers as
     // `normal`, at ordinary share; above the ceiling the ordinary logic applies.
     if (this.capLiftActive(account, now)) {
       const ceil = this._capLiftCeiling(account, 'wk', now);
@@ -5996,6 +6073,9 @@ export class AccountManager {
       checkedAt: now,
       stale: false,
     };
+    this.observeResetInventory(account, (listing.grants || [])
+      .filter(g => g && (g.resetsLeft ?? 1) > 0)
+      .map(g => ({ id: g.id, endsAt: g.endsAt ?? null, expired: g.expired === true || g.endsAt != null && g.endsAt <= now, window: appliesTo(g).includes('general') ? 'weekly' : 'model' })), now);
     // C3: re-evaluate the cap lift from the fresh listing.
     this.refreshCapLift(accountIndex, now, 'listing refreshed');
   }
@@ -6062,8 +6142,28 @@ export class AccountManager {
       stale: false,
       lastError: null,
     };
+    const liveCard = window => c => c && c.recordId != null
+      ? [{ id: c.recordId, endsAt: c.expiresAt ?? null, expired: c.expired || c.expiresAt != null && c.expiresAt <= account.resetCards.checkedAt, window }] : [];
+    this.observeResetInventory(account, [...cards.weekly.flatMap(liveCard('weekly')), ...cards.fiveHour.flatMap(liveCard('5h'))]);
     // C3: a z.ai weekly card can start the lift too.
     this.refreshCapLift(accountIndex, Date.now(), 'cards refreshed');
+  }
+
+  /** A row the provider still reports unused at its deadline proves expiry. A row that
+   *  simply disappeared may have been spent elsewhere: report that uncertainty. */
+  observeResetInventory(account, items = [], now = Date.now()) {
+    if (!account || account.remote) return;
+    const prev = account._resetInventory || [];
+    const live = items.filter(i => i?.id != null && !i.expired);
+    account._resetInventory = live.map(({ id, endsAt, window }) => ({ id, endsAt, window }));
+    for (const r of prev) {
+      if (!Number.isFinite(r.endsAt) || r.endsAt > now) continue;
+      const row = items.find(i => String(i.id) === String(r.id) && i.window === r.window);
+      if (row && !row.expired) continue;
+      const noted = noteResetOutcome(account, row?.expired ? RESET_OUTCOME.EXPIRED : RESET_OUTCOME.UNCONFIRMED,
+        { window: r.window, id: r.id, now: r.endsAt });
+      if (noted) noted.seenAt = now;
+    }
   }
 
   /** Remove one card recordId from the stored list after a SUCCESSFUL redeem
@@ -7483,6 +7583,9 @@ export class AccountManager {
       // count instead of nothing; restoreQuotaState marks it stale.
       if (a.resetGrants) out.resetGrants = { ...a.resetGrants, grants: (a.resetGrants.grants || []).map(g => ({ ...g })) };
       if (a.resetCards) out.resetCards = { ...a.resetCards, fiveHour: (a.resetCards.fiveHour || []).map(c => ({ ...c })), weekly: (a.resetCards.weekly || []).map(c => ({ ...c })) };
+      // The dashboard's reset outcomes survive a restart (a self-update restarts often).
+      if (a._resetInventory?.length) out.resetInventory = a._resetInventory.map(i => ({ ...i }));
+      if (a.resetOutcomes) out.resetOutcomes = JSON.parse(JSON.stringify(a.resetOutcomes));
       // R7 HOLD REGISTER survives restart (red-team r5 #3): the hold and the claim
       // stamps that retire it / guard one claim per wall. isHoldingWall re-checks the
       // restored hold against the live wall and refill, so a stale one self-retires.
@@ -7553,6 +7656,10 @@ export class AccountManager {
       }
       if (match.resetCards && !account.resetCards) {
         account.resetCards = { ...match.resetCards, stale: true };
+      }
+      if (Array.isArray(match.resetInventory) && !account._resetInventory) account._resetInventory = match.resetInventory;
+      if (match.resetOutcomes && typeof match.resetOutcomes === 'object' && !account.resetOutcomes) {
+        account.resetOutcomes = match.resetOutcomes;
       }
       // R7 hold register (r5 #3). Boot-time only (index.js), so nothing live is
       // overwritten; an absent field restores as undefined, i.e. never stamped.
@@ -7784,6 +7891,7 @@ export class AccountManager {
       a.resetCards = rr.resetCards;
       a.resetGrants = rr.resetGrants;
       a.capLift = rr.capLift;
+      a.resetOutcomes = rr.resetOutcomes;
       a.remoteTank = ra.tank || null;
       a.remoteKeyFp = ra.keyFingerprint || null;
       a.remoteCycles = ra.cycles || null;
@@ -7905,9 +8013,13 @@ export class AccountManager {
   }
 
   /** C6: record a claim FAILURE — backoff per (account, grantId) 15m/30m/1h, cap 6h.
-   *  A later provider Retry-After takes precedence within the six-hour cap. Both claim paths share the deadline. */
-  noteClaimFailure(accountName, grantId, now = Date.now(), retryAt = 0) {
-    const key = `${accountName}:${grantId}`;
+   *  A later provider Retry-After takes precedence within the six-hour cap. Both claim paths share the deadline.
+   *  LAST RESORT (owner 2026-11-28): when the grant is inside POLICY.lastResortMs of expiry
+   *  the usual steps would outlive it, so the next try is POLICY.lastResortRetryMs away. */
+  noteClaimFailure(account, grantId, now = Date.now(), retryAt = 0) {
+    // Tolerate the (name, grantId) spelling older callers used.
+    if (typeof account === 'string') account = this.accounts.find(a => a.name === account) || { name: account };
+    const key = `${account.name}:${grantId}`;
     if (!this._claimTries) this._claimTries = new Map();
     if (!this._claimRetryUntil) this._claimRetryUntil = new Map();
     const tries = (this._claimTries.get(key) || 0) + 1;
@@ -7915,9 +8027,48 @@ export class AccountManager {
     const steps = CLAIM_BACKOFF_STEPS_MS;
     const policyWait = steps[Math.min(tries - 1, steps.length - 1)];
     const providerWait = Number.isFinite(retryAt) ? retryAt - now : 0;
-    const waitMs = Math.min(CLAIM_BACKOFF_CAP_MS, Math.max(policyWait, providerWait));
+    const grant = (account.resetGrants?.grants || []).find(g => g?.id === grantId);
+    const waitMs = Math.min(CLAIM_BACKOFF_CAP_MS, retryAfterFailedReset({
+      expiresAt: grant?.endsAt, util: weeklyUsedWithRefusal(account, this._weeklyUsedOf(account), this._weeklyRefillOf(account), now), refillAt: this._weeklyRefillOf(account), now,
+      usualWaitMs: policyWait, providerWaitMs: providerWait,
+    }));
     this._claimRetryUntil.set(key, now + waitMs);
     return { tries, waitMs };
+  }
+
+  /** The provider REFUSED `account` for its weekly limit (owner 2026-11-28: "route
+   *  until the provider refuses, then spend promptly"). ONE entry for every provider, so
+   *  no account waits for a probe to read exactly 100% while its reset sits unspent:
+   *  a refusal is the provider's own word that the window is full. Fire-and-forget —
+   *  returns a promise that settles once the attempt is over; never throws.
+   *  `weeklyUtil` is the utilization the refusal carried (null when none): it is
+   *  recorded as a reactive reading, so a reading of 99.9% no longer stalls the claim.
+   *  The free-refill hold still applies (wallClaimHeld): a reset is kept when the refill
+   *  lands first and two compatible spare accounts can carry the work. */
+  async onWeeklyRefusal(account, { weeklyUtil = null, window = 'weekly' } = {}, now = Date.now()) {
+    if (!account || account.remote || account.poolBenchedBy || account.enabled === false) return false;
+    // The refusal stands as a 100% reading of this window for the sweep too, so a failed
+    // claim is retried on the next check instead of waiting for a probe to say 100%.
+    if (window === 'weekly') account.weeklyRefusal = { at: now, refillAt: this._weeklyRefillOf(account) };
+    if (account.provider === 'codex') {
+      // Codex: the reactive sweep reads the credit rows and applies the same decision.
+      return Boolean(await this.codexReactiveReset?.([account]));
+    }
+    if (account.type === 'provider') {
+      // GLM: the prober redeems the weekly card through the same decideZai rule. The
+      // refusal is passed as the account's weekly reading when it carried one.
+      if (Number.isFinite(weeklyUtil)) {
+        account.quota ||= {};
+        account.quota.providerWk = Math.max(account.quota.providerWk ?? 0, clamp01(weeklyUtil));
+      }
+      return Boolean(await this.providerReactiveReset?.(account, now));
+    }
+    if (window === 'weekly' && Number.isFinite(weeklyUtil)) {
+      // A 429's own header is authoritative for the window it refused (the probe reading
+      // may still say 0.999): let tryReactiveClaim's weekly gate read it.
+      return this.tryReactiveClaim(account, { kind: 'weekly', weeklyUtil }, now);
+    }
+    return this.tryReactiveClaim(account, { kind: 'weekly' }, now);
   }
 
   /** C6: a SUCCESSFUL claim clears the backoff for that grant. */
@@ -7926,7 +8077,7 @@ export class AccountManager {
     this._claimTries?.set(`${accountName}:${grantId}`, 0);
   }
 
-  /** Try the reactive claim for a weekly-class 429 (7d header ≥ 0.999) or a scoped
+  /** Try the reactive claim for a weekly-class 429 (a weekly refusal, onWeeklyRefusal) or a scoped
    *  429 (model family). Returns true when a claim was attempted. NEVER called for
    *  a mirror row or a benched/disabled account. Shares the C6 lock and backoff
    *  state with the prober path. The server calls it fire-and-forget; the claim
@@ -7946,7 +8097,7 @@ export class AccountManager {
     if (lastClaimAt != null && !((probeSentAt(account.quota) ?? -Infinity) > lastClaimAt)) return false;
     // No grant (or a scoped 429 without a probe-measured bucket) → the next sweep
     // decides on its own fresh reading.
-    if (kind === 'weekly' && !((Number.isFinite(_weeklyUtil) ? _weeklyUtil : account.quota?.unified7d) >= CLAUDE_WALL_WEEKLY)) return false;
+    if (kind === 'weekly' && !(weeklyUsedWithRefusal(account, _weeklyUtil ?? account.quota?.unified7d, account.quota?.unified7dReset, now) >= CLAUDE_WALL_WEEKLY)) return false;
     const grant = this._reactiveClaimGrant(account, kind, now);
     if (!grant) return false;
     // R7 (owner, 2026-11-13): a wall 429 claims a held reset only when the free
@@ -7990,6 +8141,12 @@ export class AccountManager {
       }
       if (r?.ok) {
         this.noteClaimSuccess(account.name, grant.id);
+        const rawUsed = kind === 'weekly' ? (_weeklyUtil ?? account.quota?.unified7d) : account.quota?.scopedWeekly?.[kind]?.utilization;
+        noteResetOutcome(account, kind === 'weekly' && !(rawUsed >= 1) ? RESET_OUTCOME.REFUSED : RESET_OUTCOME.SPENT, {
+          window: appliesTo(grant).includes('general') && kind === 'weekly' ? 'weekly' : 'model',
+          util: rawUsed,
+          id: grant.id,
+        });
         account.lastClaimAt = Date.now();
         // A spent grant that applies to the general weekly — whatever the 429 kind —
         // counts as the general wall's claim (r3 #3, r4 #3: one claim per wall). Only
@@ -8011,7 +8168,7 @@ export class AccountManager {
         console.log(`[reset-grant] ${account.name}: grant ${grant.id} claimed reactively (${kind === 'weekly' ? 'weekly 429 at the wall' : `${kind} scoped 429`})`);
         return true;
       }
-      const { tries, waitMs } = this.noteClaimFailure(account.name, grant.id, now, r?.retryAt);
+      const { tries, waitMs } = this.noteClaimFailure(account, grant.id, now, r?.retryAt);
       console.log(`[reset-grant] ${account.name}: reactive claim FAILED ${grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       this.endCapLift(account.index, 'reactive claim failed');
       return true;   // attempted
@@ -8116,6 +8273,14 @@ export class AccountManager {
           checkedAt: a.resetGrants.checkedAt, stale: Boolean(a.resetGrants.stale), lastError: a.resetGrants.lastError ?? null,
           eligible: a.resetGrants.eligible !== false,
         },
+        // What became of the account's last automatic reset in each window (spent at
+        // 100%, spent as last resort with the share used, or expired unused). No ids.
+        // Like every other reset export, null for a disabled account.
+        resetOutcomes: a.enabled === false || !a.resetOutcomes ? null : Object.fromEntries(Object.entries(a.resetOutcomes)
+          .map(([w, o]) => [w, { kind: o.kind, label: resetOutcomeLabel(o), util: o.util ?? null, at: o.at, ...(o.seenAt != null ? { seenAt: o.seenAt } : {}) }])),
+        // The provider refused this account for its weekly limit and it has not served
+        // since: the pool reads it as full until a reset is spent (weeklyUsedWithRefusal).
+        weeklyRefused: !a.remote && a.enabled !== false && weeklyUsedWithRefusal(a, 0, this._weeklyRefillOf(a), now) === 1,
         // C3: the holder pool's cap-lift verdict. Mirrors honour this as-is;
         // missing = no lift. Never recomputed on the mirror side.
         // `ceiling` = the holder's lifted cap (null = full lift): a give-back lift

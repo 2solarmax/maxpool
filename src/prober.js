@@ -12,7 +12,10 @@ import { listResetCards, redeemResetCard, fetchZaiModelUsage } from './zai-reset
 import { listSubscriptions, monthlyPriceUSD } from './zai-subs.js';
 import { rememberZaiTerms } from './subscription-terms.js';
 import { listResetGrants, claimResetGrant, appliesTo, clearsGeneralWeekly } from './claude-reset-grants.js';
-import { decideZai, decideClaudeWithReason, CLAUDE_WALL_WEEKLY, codexAutoResetOn } from './reset-policy.js';
+import {
+  decideZai, decideClaudeWithReason, CLAUDE_WALL_WEEKLY, codexAutoResetOn,
+  POLICY, RESET_OUTCOME, noteResetOutcome, retryAfterFailedReset, LAST_RESORT_REASON, weeklyUsedWithRefusal,
+} from './reset-policy.js';
 import { zaiHourlyCalls, compareOutsideUsage, isUsableZaiUsage, OUTSIDE_CHECK_MS } from './outside-usage.js';
 // Reset-machinery timing lives in ONE leaf module (re-exported for callers that
 // imported these from the prober).
@@ -446,11 +449,14 @@ export class Prober {
               this.am.applyResetCards(account.index, cards);
               this._logCardListingTransition(account, cards);
               // A failed or partial quota read can leave the cached 100% from an old window.
+              // A weekly refusal since this window began reads as 100% (weeklyUsedWithRefusal),
+              // so a card attempt that failed after it is retried on this sweep.
               const measured = { ...account, quota: { ...account.quota,
-                providerSes: usage.ses?.utilization, providerWk: usage.wk?.utilization } };
+                providerSes: usage.ses?.utilization,
+                providerWk: weeklyUsedWithRefusal(account, usage.wk?.utilization, usage.wk?.resetAt ?? account.quota?.providerWkReset, this._now()) } };
               const act = usage.error || usage.noPlan ? null : decideZai(measured, cards, this._now(),
                 { peersWithRoom: () => this.am.countPeersWithRoom?.(account, this._now()) });
-              if (act) await this._redeemZaiCard(account, act);
+              if (act) await this._redeemZaiCard(account, act, { util: usage.wk?.utilization, ses: usage.ses?.utilization, refused: measured.quota.providerWk === 1 && !(usage.wk?.utilization >= 1) });
             }
           } catch { /* cards are best-effort */ }
         }
@@ -493,19 +499,62 @@ export class Prober {
     } catch { /* detector is best-effort; never block the probe */ }
   }
 
+  /** The provider REFUSED a z.ai account for its weekly limit (owner 2026-11-28: "GLM
+   *  must have an immediate path after a refusal"). Runs off the request's 429, not the
+   *  next sweep: read the cards, run the SAME decideZai rule the sweep runs, and redeem
+   *  when it says so. A refusal is the provider's own word that the window is full, so
+   *  the stored weekly reading is raised to 100% first — a reading of 99.9% must not
+   *  stall the card while the account sits benched. The free-refill hold (two compatible
+   *  spare accounts and a refill under a day away, before the card expires) still keeps
+   *  the card: decideZai asks the pool live. Never throws; returns true when a card was
+   *  redeemed. Skipped for a mirror, a benched or disabled account, or one whose key is
+   *  used elsewhere (the sweep's own gates). */
+  async redeemWeeklyCardNow(account, now = this._now()) {
+    try {
+      if (!account || account.remote || account.poolBenchedBy || account.enabled === false
+        || account.provider !== 'zai' || !account.credential || account.refreshDead || account.subscriptionGone) return false;
+      if (this.am.writerLease === false || this._stopping) return false;
+      const q = account.quota || {};
+      if (q.weeklyAbsent || q.noPlan || account.outsideUsage?.outside) return false;
+      if (Number.isFinite(q.providerWkReset) && q.providerWkReset <= now) return false;   // the window is refilling
+      const key = `refusal:${account.name}`;
+      const until = this._cardRetryUntil?.get(key);
+      // One refusal-driven attempt per account this often (a burst of 429s must not
+      // hammer the card route; a refusal is always followed by a sweep within minutes).
+      if (until && until > now) return false;
+      if (!this._cardRetryUntil) this._cardRetryUntil = new Map();
+      this._cardRetryUntil.set(key, now + POLICY.lastResortRetryMs);
+      const credential = account.credential;
+      const cards = await this._withTimeout(this.cardsFn(credential));
+      now = this._now();
+      if (!cards || cards.error || this._stopping || this.am.writerLease === false
+        || account.credential !== credential || this.am.accounts[account.index] !== account) return false;
+      this.am.applyResetCards(account.index, cards);
+      // A refusal is the provider's "full" for this window (weeklyUsedWithRefusal): offer
+      // the rule the reading it needs, never lowering a real one.
+      const measured = { ...account, quota: { ...q, providerWk: weeklyUsedWithRefusal(account, q.providerWk, q.providerWkReset, now) } };
+      const act = decideZai(measured, cards, now, { peersWithRoom: () => this.am.countPeersWithRoom?.(account, now) });
+      if (!act || act.resetType !== 'WEEK') return false;
+      return await this._redeemZaiCard(account, act, { util: q.providerWk, refused: !(q.providerWk >= 1) });
+    } catch { return false; }
+  }
+
   /** Execute a z.ai card redeem decided by the policy. Logs before/after.
    *  A FAILED redeem backs off exponentially per card (15m, 30m, 1h, cap 6h):
    *  2026-10-22/23, a z.ai API change made every redeem fail "unavailable" and the
    *  2-minute poll retried the same card 519 times over 16h — the exact
    *  rapid-retry shape z.ai's usage-risk notice flagged before. A success resets
    *  the backoff; the idempotent requestId keeps any overlapping attempt single-spend. */
-  async _redeemZaiCard(account, act) {
+  async _redeemZaiCard(account, act, { util = undefined, ses = undefined, refused = false } = {}) {
     try {
       const key = `${account.name}:${act.card.recordId}`;  // name, not index: index shifts on account removal
       const now = Date.now();
       const until = this._cardRetryUntil?.get(key);
       if (until && until > now) return;                 // still backing off
       const q = account.quota || {};
+      // The reading the decision was made on (the caller's, which may include a weekly
+      // refusal read as 100%): the outcome records what the rule saw, never a stale number.
+      const seen = { wk: util ?? q.providerWk, ses: ses ?? q.providerSes };
       this.log(`[reset-card] ${account.name}: redeeming ${act.resetType} card ${act.card.recordId} (${act.reason}; ses=${q.providerSes ?? '?'} wk=${q.providerWk ?? '?'})`);
       let r = await this._withTimeout(redeemResetCard(account.credential, act.card.recordId, act.resetType, { grantType: act.card.grantType, accountKey: account.name }));
       // grantType-less listing + "unavailable" is the exact 2026-10-22 outage shape; GLOBAL
@@ -518,6 +567,11 @@ export class Prober {
         if (!this._cardRetryUntil) this._cardRetryUntil = new Map();
         this._cardRetryUntil.set(key, 0);               // success clears any backoff
         this._cardTries?.set(key, 0);                   // ...and the failure count (red-team 2026-10-23)
+        // A refusal-driven spend is the provider's "full", not a measured 100%: recorded
+        // with the share the probe read, so the line says what was measured.
+        noteResetOutcome(account, refused && act.resetType === 'WEEK' ? RESET_OUTCOME.REFUSED : act.reason === LAST_RESORT_REASON ? RESET_OUTCOME.LAST_RESORT : RESET_OUTCOME.SPENT,
+          { window: act.resetType === 'WEEK' ? 'weekly' : '5h', util: act.resetType === 'WEEK' ? seen.wk : seen.ses,
+            id: act.card.recordId, now });
         this.log(`[reset-card] ${account.name}: card ${act.card.recordId} redeemed`);
         // The reset opened a new window: a "rate limited" bench from the old one is
         // stale now. Lift it before the follow-up read, so the account serves at once
@@ -545,16 +599,27 @@ export class Prober {
             if (usage && !usage.error) this.am.applyProviderUsage(account.index, usage);
           } catch { /* the sweep re-reads it */ }
         }
+        return true;
       } else {
         const tries = (this._cardTries?.get(key) || 0) + 1;
         if (!this._cardTries) this._cardTries = new Map();
         this._cardTries.set(key, tries);
-        const waitMs = Math.min(6 * 3600_000, 900_000 * 2 ** (tries - 1));
+        // LAST RESORT (owner 2026-11-28): a card inside its last POLICY.lastResortMs is
+        // retried about every POLICY.lastResortRetryMs, not 15m/30m/1h — those would
+        // outlive it. Elsewhere the exponential backoff stands.
+        const usual = Math.min(6 * 3600_000, 900_000 * 2 ** (tries - 1));
+        const retryAt = r?.retryAt ?? null;
+        const waitMs = retryAfterFailedReset({
+          expiresAt: act.card.expiresAt, util: refused ? 1 : act.resetType === 'WEEK' ? seen.wk : seen.ses,
+          refillAt: act.resetType === 'WEEK' ? q.providerWkReset : q.providerSesReset,
+          now, usualWaitMs: usual, providerWaitMs: Number.isFinite(retryAt) ? retryAt - now : 0,
+        });
         if (!this._cardRetryUntil) this._cardRetryUntil = new Map();
         this._cardRetryUntil.set(key, now + waitMs);
         this.log(`[reset-card] ${account.name}: redeem FAILED card ${act.card.recordId} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       }
     } catch (e) { this.log(`[reset-card] ${account.name}: redeem error ${e.message}`); }
+    return false;
   }
 
   /** One log line per ok<->failing transition of the grant listing (no per-poll spam). */
@@ -600,6 +665,13 @@ export class Prober {
       const r = await this._withTimeout(claimResetGrant(account.credential, act.grant.id, { accountKey: account.name }));
       if (r?.ok) {
         this.am.noteClaimSuccess?.(account.name, act.grant.id);
+        const general = act.scope === 'general';
+        noteResetOutcome(account, act.reason === LAST_RESORT_REASON ? RESET_OUTCOME.LAST_RESORT
+          : general && account.weeklyRefusal && !(q.unified7d >= 1) ? RESET_OUTCOME.REFUSED : RESET_OUTCOME.SPENT, {
+          window: general ? 'weekly' : 'model',
+          util: general ? q.unified7d : q.scopedWeekly?.[act.scope]?.utilization,
+          id: act.grant.id,
+        });
         account.lastClaimAt = Date.now();
         // A spent grant that applies to the general weekly — whatever scope it was
         // claimed at — is the general wall's claim (r3 #3, r4 #3); only one that
@@ -634,7 +706,7 @@ export class Prober {
         this.log(`[reset-grant] ${account.name}: grant ${act.grant.id} claimed${r.alreadyUsed ? ' (already used — idempotent)' : ''}`);
         return true;
       }
-      const { tries, waitMs } = this.am.noteClaimFailure?.(account.name, act.grant.id, now, r?.retryAt)
+      const { tries, waitMs } = this.am.noteClaimFailure?.(account, act.grant.id, now, r?.retryAt)
         || { tries: 1, waitMs: CLAIM_BACKOFF_STEPS_MS[0] };
       this.log(`[reset-grant] ${account.name}: claim FAILED ${act.grant.id} (try ${tries}, next attempt in ${Math.round(waitMs / 60000)}min): ${r?.error}`);
       // A failed claim ENDS any cap lift (C3: "ends at once on a claim (success or failure)").

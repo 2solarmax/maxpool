@@ -173,7 +173,7 @@ test('gives-back-weekly counts as general on a NORMALIZED grant too (every store
   assert.deepEqual(appliesTo(g).sort(), ['fable', 'general'], 'normalized give-back grant applies to the general weekly');
   // And the policy claims it at the GENERAL weekly wall, as a give-back claim.
   const a = { name: 'a', enabled: true, lastClaimAt: null,
-    quota: { unified7d: 0.995, unified7dReset: Date.now() + 3 * DAY, lastProbeOkAt: Date.now() } };
+    quota: { unified7d: 1, unified7dReset: Date.now() + 3 * DAY, lastProbeOkAt: Date.now() } };
   const act = decideClaude(a, { grants: [g], eligible: true, stale: false, cooldownUntil: null });
   assert.ok(act, 'claimed at the general weekly wall');
   assert.equal(act.scope, 'general');

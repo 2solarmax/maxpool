@@ -110,7 +110,7 @@ test('a GENUINE account-wide rejection (rejected + unified exhausted) still bloc
   const am = manager(2);
   am.updateQuota(0, {
     'anthropic-ratelimit-unified-status': 'rejected',
-    'anthropic-ratelimit-unified-7d-utilization': '0.9995', // exhausted (>= 0.999) → corroborates account-wide
+    'anthropic-ratelimit-unified-7d-utilization': '1', // exhausted (100%) → corroborates account-wide
   });
   const a1 = am.accounts[0];
   assert.equal(am._isAccountWideRejected(a1), true);

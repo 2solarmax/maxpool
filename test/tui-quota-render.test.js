@@ -35,12 +35,20 @@ test('scoped tag renders the real % at 90% (not "maxed")', () => {
   assert.doesNotMatch(line, /maxed/, '90% is not maxed');
 });
 
-test('scoped tag renders "maxed" only at genuine exhaustion (>= 0.999)', () => {
-  const am = oauthAM();
-  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.9995, severity: 'critical', isActive: true, resetAt: Date.now() + 3 * DAY } } });
-  const tui = new TUI({ accountManager: am });
-  const line = strip(tui._renderAcct(0, 11, true));
-  assert.match(line, /Fable maxed/);
+test('scoped tag renders "maxed" only at genuine exhaustion (100% — the same floor the router benches at)', () => {
+  // Owner 2026-11-27: the weekly bench is the limit itself (1.0), so the tag and the
+  // bench still agree. The paint is stripped of color first, then read as plain text.
+  const at = utilization => {
+    const am = oauthAM();
+    am.applyUsageData(0, { scopedWeekly: { fable: { utilization, severity: 'critical', isActive: true, resetAt: Date.now() + 3 * DAY } } });
+    return strip(new TUI({ accountManager: am })._renderAcct(0, 11, true));
+  };
+  assert.match(at(1), /Fable maxed/, '100%: maxed');
+  // Just under the limit is NOT maxed any more: it rounds to 100% in the yellow tag,
+  // which is the same reading the router serves on (critical, not benched).
+  const near = at(0.9995);
+  assert.doesNotMatch(near, /maxed/, '99.95% is under the 100% floor');
+  assert.match(near, /Fable 100%/, 'the real reading, rounded, in the usable color');
 });
 
 test('a below-reserve scoped cap shows no tag at all', () => {
@@ -64,10 +72,10 @@ test('an INACTIVE Fable cap with a stale probe still shows the Fable 90% tag (is
   assert.doesNotMatch(strip(raw), /maxed/);
 });
 
-test('an INACTIVE Fable cap at >= 0.999 shows the red "Fable maxed" tag', () => {
+test('an INACTIVE Fable cap at 100% shows the red "Fable maxed" tag', () => {
   const am = oauthAM();
   am.quotaProbeIntervalMs = 60_000;
-  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 0.9995, severity: 'critical', isActive: false, resetAt: Date.now() + 3 * DAY } } });
+  am.applyUsageData(0, { scopedWeekly: { fable: { utilization: 1, severity: 'critical', isActive: false, resetAt: Date.now() + 3 * DAY } } });
   am.accounts[0].quota.lastProbeOkAt = Date.now() - 5 * 60_000;
   am.accounts[0].quota.lastProbeErrorStatus = 429;
   const raw = new TUI({ accountManager: am })._renderAcct(0, 11, true);

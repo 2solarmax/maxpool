@@ -2,7 +2,9 @@
 // at the weekly wall, HOLD the reset claim when BOTH the account's free weekly
 // refill is < 24h away AND at least two other accounts in this pool have room.
 // Unknown capacity → claim as before. A grant that would die before (or right
-// at) the refill is always claimed. Dying-value and session-only rules unchanged.
+// at) the refill is always claimed. Session-only rules unchanged. The wall is the
+// measured 100% (owner, 2026-11-27): there is no dying-value claim any more, so a
+// grant that expires soon is NOT spent on an account that is not full.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as policy from '../src/reset-policy.js';
@@ -17,7 +19,7 @@ const HOLD = 'other accounts have room';
 // Every helper takes an explicit `now` (red-team #5): a boundary test reads ONE
 // clock value for building its fixture AND for the decision, so it can't drift by
 // a millisecond between the two.
-function acct({ wk = 0.995, resetIn = 18 * H, scoped = null, now = Date.now(), lastProbeOkAt = now, lastClaimAt = null } = {}) {
+function acct({ wk = 1, resetIn = 18 * H, scoped = null, now = Date.now(), lastProbeOkAt = now, lastClaimAt = null } = {}) {
   return { name: 'a', enabled: true, lastClaimAt,
     quota: { unified7d: wk, unified7dReset: now + resetIn, unified5h: 0.2, lastProbeOkAt, scopedWeekly: scoped } };
 }
@@ -78,9 +80,16 @@ test('CLAIM: a grant that expires within 24h AFTER the refill is claimed too (it
   assert.equal(why(acct(), listing({ grants: [G({ endsAt: null })] }), peers(5)).reason, HOLD);
 });
 
-test('UNCHANGED: dying-value claim (below the wall) still fires with ample peers', () => {
-  const r = why(acct({ wk: 0.5, resetIn: 3 * DAY }), listing({ grants: [G({ endsAt: Date.now() + 10 * H })] }), peers(5));
-  assert.equal(r.action?.reason, 'dying value');
+test('CHANGED (owner 2026-11-27): a DYING grant is NOT claimed below 100%, with or without peers', () => {
+  // The old "dying value" claim spent a grant in its last day on an account that had
+  // used 30%+ of its week. Expiry is no longer a reason to reset a partially used account.
+  for (const n of [0, 5]) {
+    for (const left of [1 * H, 10 * H, 23 * H]) {
+      const now = Date.now();
+      const r = why(acct({ wk: 0.5, resetIn: 3 * DAY, now }), listing({ grants: [G({ endsAt: now + left }, now)], now }), peers(n), now);
+      assert.equal(r.action, null, `dying in ${left / H}h, ${n} peers: nothing is spent (got ${r.reason})`);
+    }
+  }
 });
 
 test('UNCHANGED: a session-only grant is never claimed, peers or not', () => {
@@ -123,7 +132,7 @@ function pool(n = 3, now = Date.now()) {
     a.quota.lastProbeOkAt = now;
   }
   const self = am.accounts[0];
-  self.quota.unified7d = 0.995; self.quota.unified7dReset = now + 18 * H;
+  self.quota.unified7d = 1; self.quota.unified7dReset = now + 18 * H;
   return am;
 }
 const count = (am, now = Date.now()) => am.countPeersWithRoom(am.accounts[0], now);
@@ -217,7 +226,7 @@ test('RT1 (blocker): a GENERAL hold never leans on peers whose model limit is ex
   const cases = {
     'fable measured full (0.80, no room)': { fable: { utilization: 0.80, resetAt: now + DAY } },
     'fable reactive 429 mark': { fable: { utilization: 1.0, resetAt: now + DAY, reactive: true } },
-    'opus exhausted': { opus: { utilization: 0.999, resetAt: now + DAY } },
+    'opus exhausted': { opus: { utilization: 1, resetAt: now + DAY } },
   };
   for (const [name, sw] of Object.entries(cases)) {
     const a = pool(3, now);
@@ -239,7 +248,7 @@ test('RT1 (blocker, e2e): a general wall with Fable-exhausted peers → the prob
   for (const p of am.accounts.slice(1)) p.quota.scopedWeekly = { fable: { utilization: 1.0, resetAt: Date.now() + DAY, isActive: true } };
   const posts = [];
   const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
-    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
+    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 1, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
     grantsFn: async () => listing({ grants: [G()] }) });
   prober._now = () => 1_700_000_000_000 + 6 * 60_000;
   const restore = stubFetch(posts);
@@ -247,13 +256,22 @@ test('RT1 (blocker, e2e): a general wall with Fable-exhausted peers → the prob
   assert.equal(posts.length, 1);
 });
 
-test('RT2 (blocker): a general hold falls through to the model loop — a DYING Fable grant is still claimed', () => {
+test('RT2 (blocker): a general hold falls through to the model loop — a DYING Fable grant on a model bucket that is NOT full is not claimed', () => {
+  // The hold still falls through to the model loop (the structure RT2 guarded), but the
+  // model loop now claims only a bucket measured at 100%. A 50% Fable bucket spends nothing.
   const now = Date.now();
   const scoped = { fable: { utilization: 0.5, resetAt: now + 3 * DAY, isActive: true } };
   const dyingFable = G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt: now + 10 * H }, now);
   const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), dyingFable], now }), { peersWithRoom: () => 2 }, now);
-  assert.equal(r.action?.grant?.id, 'f1', `dying Fable claimed (got ${r.reason})`);
-  assert.equal(r.action?.reason, 'dying value');
+  assert.equal(r.action, null, `a dying Fable grant is kept below 100% (got ${r.reason})`);
+  assert.equal(r.heldScope, 'general', 'the general hold is still reported');
+  assert.equal(r.reason, HOLD);
+  // The model loop DOES run under the hold: a Fable bucket at 100% whose grant would die
+  // before the general refill is claimed (it would be lost).
+  const fullScoped = { fable: { utilization: 1, resetAt: now + 3 * DAY, isActive: true } };
+  const hit = why(acct({ scoped: fullScoped, now }), listing({ grants: [G({}, now), dyingFable], now }), { peersWithRoom: () => 2 }, now);
+  assert.equal(hit.action?.grant?.id, 'f1', `a full Fable bucket is claimed under the hold (got ${hit.reason})`);
+  assert.equal(hit.action?.reason, 'fable weekly at wall');
 });
 
 test('RT3 (major): the reactive weekly-429 path holds even when the walled account\'s probe and listing are stale (the normal state at the wall)', async () => {
@@ -302,7 +320,7 @@ test('RT2-3 (server order): a Fable 429 never spends a Fable reset on the fast p
       const am = pool(3);
       const self = am.accounts[0];
       self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
-      self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };   // the probe's measurement
+      self.quota.scopedWeekly = { fable: { utilization: 1, resetAt: Date.now() + 18 * H, isActive: true } };   // the probe's measurement
       if (fableRoomOnPeers) for (const p of am.accounts.slice(1)) p.quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } };
       am.applyResetGrants(0, listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }));
       am.markRateLimited(0, 60, { status: 429, recordFailure: false, modelScope: 'fable' });
@@ -370,7 +388,7 @@ test('RT2-1 (major): probe ANSWERS but the listing call fails (stale) → a held
     am.applyResetGrants(0, listing({ grants: [G()] }));
     assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'held on the 429');
     const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
-      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
+      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 1, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
       grantsFn: async () => ({ error: 'HTTP 429' }) });
     prober._now = () => Date.now() + 6 * 60_000;
     for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;
@@ -487,9 +505,9 @@ test('RT2-2 (major): 4 walled accounts, 2 roomy peers → exactly one holds, the
   const restore = stubFetch(posts);
   try {
     const am = pool(6);
-    for (const a of am.accounts.slice(0, 4)) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+    for (const a of am.accounts.slice(0, 4)) { a.quota.unified7d = 1; a.quota.unified7dReset = Date.now() + 18 * H; }
     const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
-      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
+      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 1, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
       grantsFn: async () => listing({ grants: [G()] }) });
     prober._now = () => Date.now() + 6 * 60_000;
     for (const a of am.accounts.slice(0, 4)) await prober.probeOne(a);
@@ -507,7 +525,7 @@ test('RT2-2 (major): the same pool-wide budget on the 429 fast path', async () =
   const restore = stubFetch(posts);
   try {
     const am = pool(4);
-    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 1; a.quota.unified7dReset = Date.now() + 18 * H; }
     am.applyResetGrants(0, listing({ grants: [G()] }));
     am.applyResetGrants(1, listing({ grants: [G()] }));
     assert.equal(await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 }), false, 'first wall held');
@@ -524,7 +542,7 @@ async function secondWallHolds(mutateFirst) {
   const restore = stubFetch(posts);
   try {
     const am = pool(4);
-    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 1; a.quota.unified7dReset = Date.now() + 18 * H; }
     am.applyResetGrants(0, listing({ grants: [G()] }));
     am.applyResetGrants(1, listing({ grants: [G()] }));
     assert.equal(await am.tryReactiveClaim(am.accounts[0], { kind: 'weekly', weeklyUtil: 1 }), false, 'c0 holds');
@@ -581,7 +599,7 @@ test('RT2-1 (scope of the rescue): a sweep that decides FRESH (probe + listing f
   const real = am.tryReactiveClaim.bind(am);
   am.tryReactiveClaim = (...a) => { reactiveCalls++; return real(...a); };
   const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
-    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
+    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 1, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
     grantsFn: async () => listing({ grants: [G()] }) });
   prober._now = () => Date.now() + 6 * 60_000;
   await prober.probeOne(self);
@@ -660,7 +678,7 @@ test('PROBER: holds while two peers have room (logs the reason), claims on the s
   const logs = [];
   const posts = [];
   const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m), providerProbeFn: async () => null,
-    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
+    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 1, resetAt: Date.now() + 18 * H }, weeklyAbsent: false }),
     grantsFn: async () => listing({ grants: [G()] }) });
   let clock = 1_700_000_000_000;
   prober._now = () => clock;
@@ -693,16 +711,16 @@ test('REACTIVE: a weekly 429 at the wall honours the same hold (no claim while p
 });
 
 // ── red-team round 3 (2026-11-13): the hold is for the GENERAL weekly wall ONLY ──
-// Orchestrator decision: a per-model (Fable) wall and a dying-value grant claim
-// exactly as at cb969da — no hold, no hold record, no rescue for them.
+// Orchestrator decision: a per-model (Fable) wall claims exactly as at cb969da — no
+// hold, no hold record, no rescue for it.
 const fableWallProbe = (wk = 0.5, wkResetIn = 3 * DAY) => async () => ({
   fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: wk, resetAt: Date.now() + wkResetIn },
-  scopedWeekly: { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }, weeklyAbsent: false });
+  scopedWeekly: { fable: { utilization: 1, resetAt: Date.now() + 18 * H, isActive: true } }, weeklyAbsent: false });
 const fableRoomOn = ps => { for (const p of ps) p.quota.scopedWeekly = { fable: { utilization: 0.2, resetAt: Date.now() + DAY } }; };
 
 test('R3-1: a Fable WALL claims as at cb969da — no hold, whatever room the peers have; capacity is never asked', () => {
   const now = Date.now();
-  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H, isActive: true } };
+  const scoped = { fable: { utilization: 1, resetAt: now + 18 * H, isActive: true } };
   const asked = [];
   const r = why(acct({ wk: 0.5, resetIn: 3 * DAY, scoped, now }), listing({ grants: [G({ clears: ['seven_day_overage_included'] }, now)], now }),
     { peersWithRoom: (...a) => { asked.push(a); return 9; }, holdersInPool: () => 1 }, now);
@@ -735,7 +753,7 @@ test('R3-1 (fast path): a 429 over a probe-measured Fable wall claims as at cb96
     // general weekly below the wall but its refill 18h out: only "general only" keeps
     // this Fable 429 out of the hold (the general refill stamp would otherwise hold it)
     self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 18 * H;
-    self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
+    self.quota.scopedWeekly = { fable: { utilization: 1, resetAt: Date.now() + 18 * H, isActive: true } };
     fableRoomOn(am.accounts.slice(1));
     am.applyResetGrants(0, listing({ grants: [G({ clears: ['seven_day_overage_included'] })] }));
     assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'attempted');
@@ -746,7 +764,7 @@ test('R3-1 (fast path): a 429 over a probe-measured Fable wall claims as at cb96
 
 test('R3-2: general wall HELD + a Fable WALL → nothing claimed (the account is benched by the general wall; a Fable reset buys nothing)', () => {
   const now = Date.now();
-  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H, isActive: true } };
+  const scoped = { fable: { utilization: 1, resetAt: now + 18 * H, isActive: true } };
   const grants = [G({}, now), G({ id: 'f1', clears: ['seven_day_overage_included'] }, now)];
   // real counter: peers that report NO Fable reading still carry the general wall
   // (unknown Fable binds nothing), so the general wall holds — and the Fable wall waits
@@ -765,32 +783,32 @@ test('R3-2: general wall HELD + a Fable WALL → nothing claimed (the account is
   assert.equal(why(acct({ scoped, now }), listing({ grants: [grants[1]], now }), peers(9), now).action?.reason, 'fable weekly at wall');
 });
 
-test('R3-2: general wall HELD + a DYING Fable grant → the Fable grant is claimed AND the general hold is still reported', () => {
+test('R3-2: general wall HELD + a DYING Fable grant → nothing is claimed for a 50% bucket AND the general hold is still reported', () => {
   const now = Date.now();
   const scoped = { fable: { utilization: 0.5, resetAt: now + 3 * DAY, isActive: true } };
   const dyingFable = G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt: now + 10 * H }, now);
   const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), dyingFable], now }), peers(2), now);
-  assert.equal(r.action?.grant?.id, 'f1');
-  assert.equal(r.action?.reason, 'dying value');
+  assert.equal(r.action, null, 'expiry alone never spends a grant');
   assert.equal(r.heldScope, 'general', 'the caller must still register the general hold');
-  // control: nothing held → no heldScope on the same dying claim
+  assert.equal(r.reason, HOLD);
+  // control: nothing held → no heldScope on the same (still unspent) decision
   const c = why(acct({ wk: 0.5, resetIn: 3 * DAY, scoped, now }), listing({ grants: [G({}, now), dyingFable], now }), peers(2), now);
-  assert.equal(c.action?.grant?.id, 'f1');
+  assert.equal(c.action, null);
   assert.equal(c.heldScope ?? null, null);
 });
 
-test('R3-2/3 (sweep): a dying Fable claimed under a general hold registers the hold, and that Fable claim does not retire it', async () => {
+test('R3-2/3 (sweep): a FULL Fable bucket whose grant dies before the general refill is claimed under a general hold, registers the hold, and does not retire it', async () => {
   const am = pool(3);
   const self = am.accounts[0];
   const posts = [];
   const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
-    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H },
-      scopedWeekly: { fable: { utilization: 0.5, resetAt: Date.now() + 3 * DAY, isActive: true } }, weeklyAbsent: false }),
+    probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 1, resetAt: Date.now() + 18 * H },
+      scopedWeekly: { fable: { utilization: 1, resetAt: Date.now() + 3 * DAY, isActive: true } }, weeklyAbsent: false }),
     grantsFn: async () => listing({ grants: [G(), G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt: Date.now() + 10 * H })] }) });
   prober._now = () => Date.now() + 6 * 60_000;
   const restore = stubFetch(posts);
   try { await prober.probeOne(self); } finally { restore(); }
-  assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'the dying Fable grant was claimed');
+  assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1, 'the Fable grant (full bucket, dies before the refill) was claimed');
   assert.equal(am.isHoldingWall(self), true, 'the general hold is registered and still live');
 });
 
@@ -799,14 +817,14 @@ test('R3-3: a general hold is retired only by a claim that clears the GENERAL we
   const restore = stubFetch(posts);
   try {
     const am = pool(4);
-    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+    for (const a of am.accounts.slice(0, 2)) { a.quota.unified7d = 1; a.quota.unified7dReset = Date.now() + 18 * H; }
     am.applyResetGrants(0, listing({ grants: [G()] }));
     am.applyResetGrants(1, listing({ grants: [G()] }));
     const [c0, c1] = am.accounts;
     assert.equal(await am.tryReactiveClaim(c0, { kind: 'weekly', weeklyUtil: 1 }), false, 'c0 holds');
     const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null });
     const fable = G({ id: 'f1', clears: ['seven_day_overage_included'] });
-    assert.equal(await prober._claimClaudeGrant(c0, { kind: 'grant', grant: fable, scope: 'fable', reason: 'dying value' }), true, 'precondition: Fable claimed');
+    assert.equal(await prober._claimClaudeGrant(c0, { kind: 'grant', grant: fable, scope: 'fable', reason: 'fable weekly at wall' }), true, 'precondition: Fable claimed');
     assert.equal(am.isHoldingWall(c0), true, 'a Fable claim leaves the general hold live');
     await am.tryReactiveClaim(c1, { kind: 'weekly', weeklyUtil: 1 });
     assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 2, 'c0 still holds → its budget is spent → c1 claims');
@@ -884,7 +902,7 @@ test('R3-3 (fast path): a Fable 429 claim on an account holding its general wall
     const self = am.accounts[0];
     am.applyResetGrants(0, listing({ grants: [G(), G({ id: 'f1', clears: ['seven_day_overage_included'] })] }));
     assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'general wall held');
-    self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
+    self.quota.scopedWeekly = { fable: { utilization: 1, resetAt: Date.now() + 18 * H, isActive: true } };
     assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'precondition: the Fable 429 claims (as at cb969da)');
     assert.equal(posts.filter(u => /reset_rate_limits/.test(u)).length, 1);
     assert.equal(am.isHoldingWall(self), true, 'the Fable claim refilled nothing the general hold waits on');
@@ -894,7 +912,7 @@ test('R3-3 (fast path): a Fable 429 claim on an account holding its general wall
 // ── red-team round 4 (2026-11-13) ────────────────────────────────────────────
 test('R4-1 (blocker): under the general hold a Fable WALL grant that would die before (or within a day after) the refill is still claimed', () => {
   const now = Date.now();
-  const scoped = { fable: { utilization: 0.995, resetAt: now + 18 * H, isActive: true } };   // general refill: 18h (acct default)
+  const scoped = { fable: { utilization: 1, resetAt: now + 18 * H, isActive: true } };   // general refill: 18h (acct default)
   const fable = endsAt => G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt }, now);
   for (const [name, endsAt] of [['expires in 10h, before the refill', now + 10 * H], ['expires 12h after the refill', now + 18 * H + 12 * H]]) {
     const r = why(acct({ scoped, now }), listing({ grants: [G({}, now), fable(endsAt)], now }), peers(2), now);
@@ -916,14 +934,14 @@ test('R4-2 (major): after a Fable claim under the hold, a dark probe with no roo
     const self = am.accounts[0];
     const posts = [];
     const prober = new Prober(am, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
-      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 0.995, resetAt: Date.now() + 18 * H },
-        scopedWeekly: { fable: { utilization: 0.5, resetAt: Date.now() + 3 * DAY, isActive: true } }, weeklyAbsent: false }),
+      probeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: Date.now() + H }, sevenDay: { utilization: 1, resetAt: Date.now() + 18 * H },
+        scopedWeekly: { fable: { utilization: 1, resetAt: Date.now() + 3 * DAY, isActive: true } }, weeklyAbsent: false }),
       grantsFn: async () => listing({ grants: [G(), G({ id: 'f1', clears: ['seven_day_overage_included'], endsAt: Date.now() + 10 * H })] }) });
     prober._now = () => Date.now() + 6 * 60_000;
     const restore = stubFetch(posts);
     try {
       await prober.probeOne(self);
-      assert.equal(posts.length, 1, `${via}: precondition — the dying Fable grant was claimed under the general hold`);
+      assert.equal(posts.length, 1, `${via}: precondition — the Fable grant (full bucket, dies before the refill) was claimed under the general hold`);
       assert.equal(am.isHoldingWall(self), true, `${via}: precondition — still holding`);
       for (const p of am.accounts.slice(1)) p.quota.lastProbeOkAt = Date.now() - 10 * 60_000;   // room can no longer be confirmed
       if (via === 'rescue') await failingProber(am, posts).probeOne(self);
@@ -972,7 +990,7 @@ test('R4-3 (minor): a claim that spends a grant clearing the GENERAL weekly reti
       const self = am.accounts[0];
       am.applyResetGrants(0, listing({ grants: [broad()] }));
       assert.equal(await am.tryReactiveClaim(self, { kind: 'weekly', weeklyUtil: 1 }), false, 'general wall held');
-      self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } };
+      self.quota.scopedWeekly = { fable: { utilization: 1, resetAt: Date.now() + 18 * H, isActive: true } };
       assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true, 'precondition: the Fable 429 spends the broad grant');
       assert.equal(am.isHoldingWall(self), false, 'fast path: the broad grant refilled the general weekly');
     } finally { restore(); }
@@ -1050,7 +1068,7 @@ test('R4-2 (control): one claim per wall still holds for a Fable wall — a seco
     const am = pool(3);
     const self = am.accounts[0];
     self.quota.unified7d = 0.5; self.quota.unified7dReset = Date.now() + 3 * DAY;
-    const wall = () => { self.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }; };
+    const wall = () => { self.quota.scopedWeekly = { fable: { utilization: 1, resetAt: Date.now() + 18 * H, isActive: true } }; };
     am.applyResetGrants(0, listing({ grants: [G({ id: 'f1', clears: ['seven_day_overage_included'] }), G({ id: 'f2', clears: ['seven_day_overage_included'] })] }));
     wall();
     assert.equal(await am.tryReactiveClaim(self, { kind: 'fable' }), true);
@@ -1064,7 +1082,7 @@ test('R4-2 (control): one claim per wall still holds for a Fable wall — a seco
 // A give-back Fable grant: refills the Fable weekly and returns what Fable used to
 // the general weekly — appliesTo() says 'general', but it does NOT clear seven_day.
 const GB = (o = {}, now = Date.now()) => G({ id: 'f-gb', clears: ['seven_day_overage_included'], givesBackWeekly: true, endsAt: now + 5 * DAY, ...o }, now);
-const fableWall = a => { a.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 18 * H, isActive: true } }; };
+const fableWall = a => { a.quota.scopedWeekly = { fable: { utilization: 1, resetAt: Date.now() + 18 * H, isActive: true } }; };
 const claimPosts = posts => posts.filter(u => /reset_rate_limits/.test(u)).length;
 
 test('R5-1 (major): a give-back Fable grant spent at a Fable 429 keeps the general hold live — the dark-endpoint rescue still runs and the wall still counts', async () => {
@@ -1160,7 +1178,7 @@ test('R5-2 (major): a dead holder is no holder — its frozen wall never doubles
     try {
       const am = pool(5);                                              // c0, c1 walled; c2..c4 roomy
       const [c0, c1] = am.accounts;
-      for (const a of [c0, c1]) { a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 18 * H; }
+      for (const a of [c0, c1]) { a.quota.unified7d = 1; a.quota.unified7dReset = Date.now() + 18 * H; }
       am.applyResetGrants(0, listing({ grants: [G()] }));
       am.applyResetGrants(1, listing({ grants: [G()] }));
       assert.equal(await am.tryReactiveClaim(c0, { kind: 'weekly', weeklyUtil: 1 }), false, `${name}: precondition c0 held`);

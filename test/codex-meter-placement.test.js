@@ -247,11 +247,14 @@ test('unsuccessful comparable attempts never book served-elsewhere evidence', ()
 });
 
 test('expiring credit shadow needs fresh detail, opted-in ownership and a current redemption decision', async () => {
+  // The shadow reports only a decision that WOULD spend. Under the final contract
+  // (owner 2026-11-27) a credit is spent at 100% only, so below 100% there is no
+  // opportunity even for a credit in its last hour (it used to be a dying-value spend).
   const am = manager();
   const account = am.accounts[0];
   const now = Date.now();
   const expiresAt = now + hour;
-  account.quota.unified7d = 0.76;
+  account.quota.unified7d = 1;
   account.quota.unified7dReset = now + 72 * hour;
   account.quota.codexWeeklyReadingAt = now;
   account.quota.codexResetCredits = { available: 2, checkedAt: now };
@@ -266,18 +269,25 @@ test('expiring credit shadow needs fresh detail, opted-in ownership and a curren
   await redeemer.readDetails(account);
   assert.equal(redeemer.expiringOpportunity(account, now)?.expiresAt, expiresAt);
   assert.equal(redeemer.expiringOpportunity(account, now + hour), null);
+  // Below 100% nothing is spent, so nothing is reported — however soon the credit dies.
+  account.quota.unified7d = 0.76;
+  assert.equal(redeemer.expiringOpportunity(account, now), null, '76% used, credit dies in 1h: no opportunity');
+  account.quota.unified7d = 0.999;
+  assert.equal(redeemer.expiringOpportunity(account, now), null, '99.9% used: still not the limit');
+  account.quota.unified7d = 1;
   // The free refill lands in 2h, but this credit dies in 1h: the refill never reaches it,
-  // so it is still a decision to spend (the refill used to hide it).
+  // so it is still a decision to spend (the refill never hides a credit it would outlive).
   account.quota.unified7dReset = now + 2 * hour;
   assert.equal(redeemer.expiringOpportunity(account, now)?.expiresAt, expiresAt);
-  // A credit that outlives the refill by half a day is held for it: no opportunity.
-  const longLived = new ResetCreditRedeemer(am, { now: () => now, detailsFn: async () => ({ credits: [
+  // A confirmed credit with at least a day left after the refill can be held if peers have room.
+  const longLived = new ResetCreditRedeemer(am, { now: () => now, peersWithRoom: () => 2, detailsFn: async () => ({ credits: [
     { id: 'long', status: 'available', supportedByPlan: true, expiresAt: now + 20 * hour }] }),
   consumeFn: () => assert.fail('a shadow observation must not spend') });
   account.quota.unified7dReset = now + 2 * hour;
   await longLived.readDetails(account);
-  assert.equal(longLived.expiringOpportunity(account, now), null);
-  // Control: with the refill far away the same credit is a dying one worth reporting.
+  assert.equal(longLived.expiringOpportunity(account, now)?.expiresAt, now + 20 * hour,
+    'a credit expiring within a day after the refill cannot be held');
+  // The short-lived credit is reported once the refill is too far away to wait for.
   account.quota.unified7dReset = now + 72 * hour;
   assert.equal(longLived.expiringOpportunity(account, now)?.expiresAt, now + 20 * hour);
   account.autoRedeemReset = false;

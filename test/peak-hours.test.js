@@ -194,7 +194,7 @@ test('D5 compound: peak-barred + weekly-exhausted → weekly reset dominates (pr
   ccOf(am).enabled = false;
   am.accounts.find(a => a.provider === 'kimi').enabled = false;
   const glm = glmOf(am);
-  glm.quota.providerWk = 0.9995;
+  glm.quota.providerWk = 1;
   const weeklyReset = TUE_IN + 3 * 86400_000;   // 3 days — dominates the 3h window
   glm.quota.providerWkReset = weeklyReset;
   // The substantive guarantee: the hold reports the TRUE soonest-usable time, i.e. the

@@ -17,6 +17,7 @@ import { describeLinkError } from './pool-link.js';
 import { normalizeRemoteResets, resolveStickyBusyBudget } from './account-manager.js';
 import { appliesTo } from './claude-reset-grants.js';
 import { LISTING_FRESH_MS } from './reset-timing.js';
+import { resetOutcomeLabel } from './reset-policy.js';
 import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
 import { subscriptionTermsFor } from './subscription-terms.js';
 
@@ -314,6 +315,56 @@ function headroomSpan(r) {
 function truncLine(s, w) {
   return vw(s) > w ? truncate(s, w) : s;
 }
+
+// How far back the accounts screen lists what became of each automatic reset.
+const RESET_OUTCOME_SHOWN_MS = 7 * 24 * 3600_000;
+
+function agoLabel(ms) {
+  const minutes = Math.max(1, Math.round(ms / 60_000));
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 24 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+}
+
+/** The "Resets" line under the accounts table (owner 2026-11-28): what became of each
+ *  account's latest automatic reset — spent at 100%, spent as last resort with the share
+ *  of the window used, or expired unused. Weekly resets, five-hour cards and per-model
+ *  grants; newest first, last seven days, as many as fit. Null when nothing to show. */
+export function resetOutcomesLine(accounts, width, now = Date.now()) {
+  const items = [];
+  for (const a of accounts || []) {
+    // A cloud mirror carries the holder's own outcomes in its status export.
+    if (!a || a.enabled === false) continue;
+    for (const [window, o] of Object.entries(a.resetOutcomes || {})) {
+      if (!o || !Object.hasOwn(RESET_OUTCOME_WINDOWS, window)) continue;
+      const label = resetOutcomeLabel(o);
+      // An expiry is stamped at the reset's own end, which the pool may see hours later;
+      // the line says when it was SEEN (seenAt), so a fresh observation never reads "7d ago".
+      const at = Number.isFinite(o.seenAt) ? o.seenAt : o.at;
+      if (!label || !Number.isFinite(at) || now - at > RESET_OUTCOME_SHOWN_MS || at > now + 60_000) continue;
+      const name = String(a.name).replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+      items.push({ at, text: `${name} ${RESET_OUTCOME_WINDOWS[window]}${label}, ${agoLabel(now - at)}` });
+    }
+  }
+  if (!items.length) return null;
+  items.sort((x, y) => y.at - x.at);
+  const head = ' Resets  ';
+  let line = head;
+  let shown = 0;
+  for (const it of items) {
+    const next = (shown ? line + ' · ' : line) + it.text;
+    // The first entry is cut to fit like every other one; width counts visible cells.
+    if (!shown && vw(next) > width - 1) return dim(truncLine(next, Math.max(0, width - 2)) + '…');
+    if (vw(next) > width - 1 && shown) break;
+    line = next;
+    shown++;
+  }
+  return shown ? dim(line) : null;
+}
+
+const RESET_OUTCOME_WINDOWS = Object.freeze({
+  weekly: '', '5h': 'five-hour card ', model: 'model grant ',
+});
 
 function fitLine(s, w) {
   const v = vw(s);
@@ -3257,6 +3308,8 @@ export class TUI {
       if (hidden > 0) {
         lines.push(` ${dim(`… ${hidden} disabled account${hidden === 1 ? '' : 's'} hidden — press h to show`)}`);
       }
+      const outcomes = resetOutcomesLine(this.am.accounts, W);
+      if (outcomes) lines.push(outcomes);
       // The glossary FOOTER is gone (owner, 2026-08-27). A legend is a symptom: it
       // exists to decode a row that could not be read on its own. Every cell now
       // says what it means in words ("2 live · 17 req/hr", "quota 12m old ·
@@ -3394,13 +3447,14 @@ export class TUI {
       let resetsOverlay;
       if (r.resetGrants != null || r.resetCards != null || r.capLift != null) {
         const nr = normalizeRemoteResets(r);
-        resetsOverlay = { resetGrants: nr.resetGrants, resetCards: nr.resetCards, capLift: nr.capLift };
+        resetsOverlay = { resetGrants: nr.resetGrants, resetCards: nr.resetCards, capLift: nr.capLift, resetOutcomes: nr.resetOutcomes };
       } else {
         const prev = a._twinResetsOverlay || {};
         resetsOverlay = {
           resetGrants: prev.resetGrants ? { ...prev.resetGrants, stale: true } : null,
           resetCards: prev.resetCards ? { ...prev.resetCards, stale: true } : null,
           capLift: prev.capLift ?? null,
+          resetOutcomes: prev.resetOutcomes ?? null,
         };
       }
       a._twinResetsOverlay = resetsOverlay;   // remember for the next frame's fallback
@@ -3736,7 +3790,7 @@ export class TUI {
     // still usable, "Fable maxed" (red) ONLY at genuine exhaustion. This is the
     // SAME predicate the router benches on (_scopedExhausted), so "maxed" renders
     // iff the model is actually benched — 90%/critical is no longer mislabelled.
-    const exhaustedFloor = this.am.scheduler?.weeklyExhaustedThreshold ?? 0.999;
+    const exhaustedFloor = this.am.scheduler?.weeklyExhaustedThreshold ?? 1;
     const reserveFloor = this.am.scheduler?.weeklyReserveThreshold ?? 0.85;
     const scopedTags = [];
     for (const [fam, e] of Object.entries(q.scopedWeekly || {})) {

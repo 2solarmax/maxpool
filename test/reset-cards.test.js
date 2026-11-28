@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCardExpiry, listResetCards, redeemResetCard } from '../src/zai-reset-cards.js';
-import { decideZai, decideClaude } from '../src/reset-policy.js';
+import { decideZai, decideClaude, POLICY, LAST_RESORT_REASON } from '../src/reset-policy.js';
 
 const H = 3600_000;
 const DAY = 24 * H;
@@ -23,20 +23,57 @@ test('parseCardExpiry reads z.ai timestamps as Beijing time (UTC+8)', () => {
 });
 
 // ── R0: the owner's enabled gate ──────────────────────────────────────────────
-test('R0: a DISABLED account never redeems — even at the wall with a dying card', () => {
+test('R0: a DISABLED account never redeems — even at 100% with a card in its last hours', () => {
   const cards = { weekly: [{ recordId: 1, expiresAt: soon(2 * H), expired: false }], fiveHour: [] };
-  assert.equal(decideZai(acct({ wk: 0.99, enabled: false }), cards), null);
+  assert.equal(decideZai(acct({ wk: 1, enabled: false }), cards), null);
   const grants = { grants: [grant({ endsAt: soon(2 * H) })], eligible: true, nextGrantId: null, cooldownUntil: null };
-  assert.equal(decideClaude(acct({ wk: 0.99, enabled: false }), grants), null);
+  assert.equal(decideClaude(acct({ wk: 1, enabled: false }), grants), null);
 });
 
-// ── R1: at-the-wall ───────────────────────────────────────────────────────────
-test('R1: weekly card fires at 90% weekly', () => {
+// ── R1: at-the-limit ──────────────────────────────────────────────────────────
+test('R1: weekly card fires only at 100% weekly (owner 2026-11-27: nothing before fully used)', () => {
   const cards = { weekly: [{ recordId: 9, expiresAt: soon(20 * DAY), expired: false }], fiveHour: [] };
-  const act = decideZai(acct({ wk: 0.91, ses: 0.2 }), cards);
+  // Was 0.90: a card was spent with up to 10% of the week left.
+  for (const wk of [0.91, 0.95, 0.99, 0.999]) assert.equal(decideZai(acct({ wk, ses: 0.2 }), cards), null, `${wk}: card kept`);
+  const act = decideZai(acct({ wk: 1, ses: 0.2 }), cards);
   assert.equal(act?.card?.recordId, 9);
   assert.equal(act?.resetType, 'WEEK');
   assert.equal(act?.reason, 'weekly at wall');
+});
+
+test('R1: an expiring card is NOT spent below 100% until its last 30 minutes', () => {
+  // Owner, 2026-11-28 (replacing the 24h "dying value" window and the 2-hour proposal:
+  // "Why two hours and not 30 minutes or 10 minutes?"): expiry is a reason to spend below
+  // 100% only inside POLICY.lastResortMs, and only with the week at least 30% used.
+  assert.equal(POLICY.lastResortMs, 30 * 60_000);
+  for (const left of [31 * 60_000, 2 * H, 12 * H, 23 * H]) {
+    const cards = { weekly: [{ recordId: 9, expiresAt: soon(left), expired: false }], fiveHour: [] };
+    for (const wk of [0.05, 0.30, 0.45, 0.80, 0.99, 0.999]) {
+      assert.equal(decideZai(acct({ wk, ses: 0.3 }), cards), null, `card dying in ${left / H}h at weekly ${wk}: kept`);
+    }
+    // The same expiring card at 100% is spent.
+    assert.equal(decideZai(acct({ wk: 1, ses: 0.3 }), cards)?.reason, 'weekly at wall', `card dying in ${left / H}h at 100%: spent`);
+  }
+});
+
+test('R1: LAST RESORT — inside its last 30 minutes a card is spent from 30% used, unless the free refill lands first', () => {
+  for (const left of [1 * 60_000, 20 * 60_000, 30 * 60_000]) {
+    const cards = { weekly: [{ recordId: 9, expiresAt: soon(left), expired: false }], fiveHour: [] };
+    for (const wk of [0.30, 0.45, 0.80, 0.999]) {
+      assert.equal(decideZai(acct({ wk, ses: 0.3 }), cards)?.reason, LAST_RESORT_REASON, `${left / 60_000} min left at ${wk}: spent`);
+    }
+    // Under 30% used the card buys too little: kept.
+    assert.equal(decideZai(acct({ wk: 0.29, ses: 0.3 }), cards), null, `${left / 60_000} min left at 29%: kept`);
+    // A free refill BEFORE the card expires makes it worthless: kept.
+    const refillFirst = acct({ wk: 0.8, ses: 0.3 });
+    refillFirst.quota.providerWkReset = soon(left / 2);
+    assert.equal(decideZai(refillFirst, cards), null, 'the free refill lands first: kept');
+    // A last-resort spend is never held for the free refill by spare accounts.
+    assert.equal(decideZai(acct({ wk: 0.8, ses: 0.3 }), cards, Date.now(), { peersWithRoom: () => 5 })?.reason, LAST_RESORT_REASON);
+  }
+  // A five-hour card is never a last resort: only a full five-hour window spends it.
+  const fiveHour = { weekly: [], fiveHour: [{ recordId: 5, expiresAt: soon(10 * 60_000), expired: false }] };
+  assert.equal(decideZai(acct({ wk: 0.5, ses: 0.9 }), fiveHour), null);
 });
 
 test('R1: below the wall does NOT fire (save the card)', () => {
@@ -70,11 +107,35 @@ test('5h card: a DEDICATED card for the session limit — the weekly card is nev
   const act = decideZai(acct({ wk: 0.5, ses: 1 }), both);
   assert.equal(act?.resetType, 'FIVE_HOUR', 'the dedicated card clears the session limit');
   assert.equal(act?.card?.recordId, 6);
-  // R4 (order) still holds: the weekly card at ITS wall clears BOTH windows, so it goes
+  // R4 (order) still holds: the weekly card at ITS limit clears BOTH windows, so it goes
   // first even when the session is also at its limit.
-  const atWeeklyWall = decideZai(acct({ wk: 0.95, ses: 1 }), both);
+  const atWeeklyWall = decideZai(acct({ wk: 1, ses: 1 }), both);
   assert.equal(atWeeklyWall?.resetType, 'WEEK', 'the weekly card clears both, so it goes first');
   assert.equal(atWeeklyWall?.card?.recordId, 9);
+});
+
+test('5h card: NEVER while the weekly window is full (owner, final contract 2026-11-27)', () => {
+  // A session-only card cannot clear a full weekly limit: the account stays blocked by
+  // its week, so the card would lift nothing. It waits for the weekly refill or a
+  // weekly card, even when the 5h window is also at 100% and the card is about to expire.
+  const only5h = { weekly: [], fiveHour: [{ recordId: 5, expiresAt: soon(20 * DAY), expired: false }] };
+  const dying5h = { weekly: [], fiveHour: [{ recordId: 5, expiresAt: soon(1 * H), expired: false }] };
+  for (const cards of [only5h, dying5h]) {
+    for (const wkReset of [null, Date.now() + 30 * H, Date.now() + 5 * DAY]) {
+      const a = acct({ wk: 1, ses: 1 });
+      a.quota.providerWkReset = wkReset;
+      assert.equal(decideZai(a, cards), null, `weekly 100% (refill ${wkReset == null ? 'unknown' : 'in ' + Math.round((wkReset - Date.now()) / H) + 'h'}): the 5h card is kept`);
+    }
+  }
+  // A 5h reading whose own window already rolled over is stale (the window is refilling
+  // right now): the card is not spent on it either.
+  const rolled = acct({ wk: 0.2, ses: 1 });
+  rolled.quota.providerSesReset = Date.now() - 60_000;
+  assert.equal(decideZai(rolled, only5h), null, 'the 5h window already rolled over: its 100% reading is stale, the card is kept');
+  // Control: the same reading with the window still running spends the card.
+  const live = acct({ wk: 0.2, ses: 1 });
+  live.quota.providerSesReset = Date.now() + 2 * H;
+  assert.equal(decideZai(live, only5h)?.resetType, 'FIVE_HOUR');
 });
 
 test('5h card: never spent on an account blocked for ANOTHER reason (it would lift nothing)', () => {
@@ -89,8 +150,8 @@ test('5h card: never spent on an account blocked for ANOTHER reason (it would li
 });
 
 test('5h card: not on a dying basis, and expired/undated cards are handled', () => {
-  // The weekly rule's final precaution is NOT worth a 5h card: one dying unused costs
-  // minutes of capacity, so a 5h card is only ever spent at the session limit.
+  // Expiry is never a reason to spend (owner, final contract 2026-11-27): a 5h card in
+  // its last hours is kept below 100% exactly like any other card.
   const dying = { weekly: [], fiveHour: [{ recordId: 5, expiresAt: soon(2 * H), expired: false }] };
   assert.equal(decideZai(acct({ wk: 0.2, ses: 0.9 }), dying), null, 'dying 5h card below the limit: not spent');
   assert.equal(decideZai(acct({ wk: 0.2, ses: 1 }), dying)?.resetType, 'FIVE_HOUR', 'at the limit it is spent, dying or not');
@@ -106,21 +167,16 @@ test('5h card: not on a dying basis, and expired/undated cards are handled', () 
   assert.equal(decideZai(acct({ wk: 0.2, ses: 1 }), two)?.card?.recordId, 3, 'soonest expiry is spent first');
 });
 
-// ── R2: dying value ───────────────────────────────────────────────────────────
-test('R2: card expiring <24h fires even BELOW the wall (value evaporates)', () => {
+// ── R2 (REMOVED, owner 2026-11-27): expiry is never a reason to spend ──────────
+test('R2 (removed): a card expiring in 2h is NOT spent on a partially used account', () => {
+  // Was "dying value": the card below was redeemed at 45% of the week used because it
+  // would expire in 2h. The owner's final contract: nothing below 100%, expiring or not.
   const cards = { weekly: [{ recordId: 9, expiresAt: soon(2 * H), expired: false }], fiveHour: [] };
-  const act = decideZai(acct({ wk: 0.45, ses: 0.3 }), cards);
-  assert.equal(act?.reason, 'dying value');
-});
-
-test('R2: dying card does NOT fire at trivial utilization (refill buys nothing)', () => {
-  const cards = { weekly: [{ recordId: 9, expiresAt: soon(2 * H), expired: false }], fiveHour: [] };
-  assert.equal(decideZai(acct({ wk: 0.05, ses: 0.01 }), cards), null);
-});
-
-test('R3: expired cards are never chosen', () => {
-  const cards = { weekly: [{ recordId: 9, expiresAt: soon(-1 * H), expired: true }], fiveHour: [] };
-  assert.equal(decideZai(acct({ wk: 0.99 }), cards), null);
+  assert.equal(decideZai(acct({ wk: 0.45, ses: 0.3 }), cards), null, 'kept: 45% used is not 100%');
+  // An already-expired card is never chosen either, at any level (R3).
+  const expired = { weekly: [{ recordId: 9, expiresAt: soon(-1 * H), expired: false }], fiveHour: [] };
+  assert.equal(decideZai(acct({ wk: 1, ses: 0.3 }), expired), null, 'an expired card is dropped by its expiry date, even unflagged');
+  assert.equal(decideZai(acct({ wk: 1, ses: 0.3 }), { weekly: [{ recordId: 9, expiresAt: soon(-1 * H), expired: true }], fiveHour: [] }), null);
 });
 
 // ── Claude grants ─────────────────────────────────────────────────────────────
@@ -129,33 +185,34 @@ function grant({ endsAt = soon(20 * DAY), resetsLeft = 1, usableNow = true, paus
     givesBackWeekly: false, blocking: false, unavailableReason: null, label: null, expired: endsAt <= Date.now(), ...rest };
 }
 
-test('claude: general grant fires at the Claude weekly wall (the 0.999 limit, NOT the z.ai 0.90)', () => {
+test('claude: general grant fires only at 100% — the same limit as z.ai', () => {
   const g = grant();
   assert.equal(decideClaude(acct({ wk: 0.98 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null }), null,
-    'below CLAUDE_WALL_WEEKLY: no claim (z.ai 0.90 wall must NOT move)');
+    'below the 100% limit: no claim');
   // EXACT LIMIT (2026-11-27): 0.99 used to BE the Claude wall and claim; it is now below it.
   assert.equal(decideClaude(acct({ wk: 0.99 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null }), null,
     '0.99 is under the limit: no claim');
-  const act = decideClaude(acct({ wk: 0.995 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
+  const act = decideClaude(acct({ wk: 1 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
   assert.equal(act?.grant?.id, 'g1');
   assert.equal(act?.scope, 'general');
+  assert.equal(act?.reason, 'weekly at wall');
 });
 
-test('claude: requiresLimit grant is NOT spent on dying value pre-wall', () => {
-  const g = grant({ endsAt: soon(2 * H), requiresLimit: true });
-  assert.equal(decideClaude(acct({ wk: 0.4 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null }), null);
-});
-
-test('claude: no-requirement grant IS spent on dying value', () => {
-  const g = grant({ endsAt: soon(2 * H), requiresLimit: false });
-  const act = decideClaude(acct({ wk: 0.4 }), { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
-  assert.equal(act?.reason, 'dying value');
+test('claude: a DYING grant is NOT spent before 100%, requiresLimit or not (was "dying value")', () => {
+  // Both of these used to differ: a no-requirement grant in its last hours was claimed
+  // on an account at 40% of its week. Now expiry alone never claims.
+  const listing = g => ({ grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: null });
+  assert.equal(decideClaude(acct({ wk: 0.4 }), listing(grant({ endsAt: soon(2 * H), requiresLimit: true }))), null);
+  assert.equal(decideClaude(acct({ wk: 0.4 }), listing(grant({ endsAt: soon(2 * H), requiresLimit: false }))), null,
+    'kept: 40% used is not 100%, however soon the grant expires');
+  // The same dying grant is claimed once the account is full.
+  assert.equal(decideClaude(acct({ wk: 1 }), listing(grant({ endsAt: soon(2 * H), requiresLimit: false })))?.reason, 'weekly at wall');
 });
 
 test('claude: cooldown blocks; spent grants (resets_left 0) dropped upstream', () => {
   const g = grant();
   const cooled = { grants: [g], eligible: true, nextGrantId: 'g1', cooldownUntil: soon(H) };
-  assert.equal(decideClaude(acct({ wk: 0.995 }), cooled), null);
+  assert.equal(decideClaude(acct({ wk: 1 }), cooled), null);
 });
 
 test('claude: per-grant scope beats the server-named order (pre-mortem #8)', () => {
@@ -165,7 +222,7 @@ test('claude: per-grant scope beats the server-named order (pre-mortem #8)', () 
   const general = grant({ id: 'gen', clears: ['seven_day'] });
   const fable = grant({ id: 'fab', clears: ['seven_day_overage_included'] });
   const a = acct({ wk: 0.50 });
-  a.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: soon(3 * DAY), isActive: true } };
+  a.quota.scopedWeekly = { fable: { utilization: 1, resetAt: soon(3 * DAY), isActive: true } };
   const act = decideClaude(a, { grants: [general, fable], eligible: true, nextGrantId: 'gen', cooldownUntil: null });
   assert.equal(act?.grant?.id, 'fab', 'the scoped-wall grant is chosen, not nextGrantId');
   assert.equal(act?.scope, 'fable');
@@ -287,6 +344,25 @@ test('failed redeem backs off; success clears it', async () => {
   globalThis.fetch = realFetch;
 });
 
+// LAST RESORT (owner 2026-11-28): a card inside its last 30 minutes cannot wait out the
+// 15m/30m/1h steps — the attempt is repeated about every five minutes instead.
+test('a failed last-resort redeem is retried in 5 minutes, not 15', async () => {
+  const { Prober } = await import('../src/prober.js');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ status: 200, json: async () => ({ code: 400, success: false, msg: 'unavailable' }) });
+  const logs = [];
+  const self = { _cardTries: new Map(), _cardRetryUntil: new Map() };
+  const acct = { name: 'glm t', index: 0, credential: 'tok', quota: { providerWk: 0.8, providerWkReset: Date.now() + 2 * DAY } };
+  const act = { card: { recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 20 * 60_000 }, resetType: 'WEEK', reason: LAST_RESORT_REASON };
+  const p = Object.create(Prober.prototype, { _cardTries: { value: self._cardTries }, _cardRetryUntil: { value: self._cardRetryUntil } });
+  p.log = m => logs.push(m); p.am = {}; p._withTimeout = x => x;
+  try {
+    await Prober.prototype._redeemZaiCard.call(p, acct, act);
+    assert.match(logs.at(-1), /try 1, next attempt in 5min/);
+    assert.ok(self._cardRetryUntil.get('glm t:9') - Date.now() <= 5 * 60_000);
+  } finally { globalThis.fetch = realFetch; }
+});
+
 // ── red-team hardening (2026-10-23, verdict CONCERNS ×4 minor) ────────────────
 test('requestId idempotency key is account-scoped (card 9 on two accounts differ)', () => {
   // same recordId, different accounts → different requestIds; same pair → identical (retry-stable)
@@ -329,120 +405,139 @@ test('backoff key is the account NAME (stable across reindex), and tries resets 
   assert.match(src, /_cardTries\?\.set\(key, 0\)/, 'tries reset on success');
 });
 
-// ── wait-for-free-refill (owner-approved 2026-10-23) ──────────────────────────
-// A weekly card is NOT redeemed at the 90% wall when z.ai's free weekly refill
-// lands <24h away and the account is not critically full (<98%) — the free
-// refill makes the card redundant. At >=98% redeem regardless: the owner is
-// never blocked waiting for a free refill that is only hours away.
-test('W1 RED: holds weekly card when free refill <24h away and util <0.98', () => {
-  const soon = Date.now() + 12 * 3600_000;            // free refill in 12h
-  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
-  const a = acct({ ses: 0.2, wk: 0.93 });
-  a.quota.providerWkReset = soon;
-  assert.equal(decideZai(a, cards), null, 'must HOLD the card — free refill in 12h, util 93%');
+// ── wait for the free refill (owner 2026-10-23; final contract 2026-11-27) ───────
+// A weekly card is spent ONLY at a measured 100%. At 100% it WAITS for z.ai's free
+// weekly refill only when ALL of these hold:
+//   • the refill lands within a day (freeRefillWaitMs), and
+//   • the card will still be alive after that refill, and
+//   • at least TWO compatible peer accounts have room right now (the 4th decideZai
+//     argument, a peersWithRoom callback — the same count the Claude hold uses).
+// Otherwise it is spent at once: no refill time known, refill more than a day away,
+// card dies before the refill, or fewer than two peers with room.
+const room = n => ({ peersWithRoom: () => n });
+const WEEK_CARD = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
+const full = (refillIn, ses = 0.2) => { const a = acct({ ses, wk: 1 }); a.quota.providerWkReset = refillIn == null ? null : Date.now() + refillIn; return a; };
+
+test('W1: at 100%, refill in 12h, two compatible peers with room → the card WAITS for the free refill', () => {
+  const act = decideZai(full(12 * H), WEEK_CARD, Date.now(), room(2));
+  assert.equal(act, null, 'held: the free refill arrives first and the peers carry the load');
+  assert.equal(decideZai(full(12 * H), WEEK_CARD, Date.now(), room(5)), null, 'more room keeps holding');
 });
 
-test('W2: redeems at >=0.98 even with free refill imminent', () => {
-  const soon = Date.now() + 3 * 3600_000;             // refill in 3h but account critically full
-  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
-  const a = acct({ ses: 0.2, wk: 0.98 });
-  a.quota.providerWkReset = soon;
-  const act = decideZai(a, cards);
-  assert.equal(act?.card?.recordId, 9, 'never-block guarantee: redeem at 98%');
+test('W2: at 100%, refill in 12h, but FEWER than two peers have room → the card is spent at once', () => {
+  // The owner is never left blocked on a free refill when the pool has no room to wait in.
+  assert.equal(decideZai(full(12 * H), WEEK_CARD, Date.now(), room(0))?.reason, 'weekly at wall', 'no room: spend');
+  assert.equal(decideZai(full(12 * H), WEEK_CARD, Date.now(), room(1))?.reason, 'weekly at wall', 'ONE roomy peer is not enough to wait');
+  // No callback at all (a caller that cannot count peers) is unknown capacity → spend.
+  assert.equal(decideZai(full(12 * H), WEEK_CARD, Date.now())?.reason, 'weekly at wall', 'unknown capacity: spend');
+  assert.equal(decideZai(full(12 * H), WEEK_CARD, Date.now(), room(undefined))?.reason, 'weekly at wall', 'a counter that answers undefined: spend');
 });
 
-test('W3: refill >=24h away → existing wall behavior unchanged', () => {
-  const later = Date.now() + 30 * 3600_000;           // refill in 30h
-  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
-  const a = acct({ ses: 0.2, wk: 0.93 });
-  a.quota.providerWkReset = later;
-  assert.equal(decideZai(a, cards)?.card?.recordId, 9, 'wall redeem stands when refill is far');
+test('W3: refill 30h away → the card is spent now, peers or not (a day is too long to wait)', () => {
+  for (const n of [0, 2, 5]) {
+    assert.equal(decideZai(full(30 * H), WEEK_CARD, Date.now(), room(n))?.card?.recordId, 9, `${n} peers: wall redeem stands when the refill is far`);
+  }
 });
 
-test('W4: unknown refill time (null) → existing behavior unchanged', () => {
-  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
-  const a = acct({ ses: 0.2, wk: 0.93 });
-  a.quota.providerWkReset = null;
-  assert.equal(decideZai(a, cards)?.card?.recordId, 9, 'no refill info → redeem as today');
+test('W4: unknown refill time (null) → the card is spent now, peers or not (never wait on a guess)', () => {
+  for (const n of [0, 2, 5]) {
+    assert.equal(decideZai(full(null), WEEK_CARD, Date.now(), room(n))?.card?.recordId, 9, `${n} peers: no refill info → redeem`);
+  }
 });
 
-test('W5: hold does not affect dying-value weekly redeems', () => {
-  // dying-value (<24h on the CARD) still fires even with free refill imminent
+test('W5: a card that DIES BEFORE the free refill is spent now — waiting would lose it', () => {
+  // Refill in 5h, the card expires in 2h: it cannot wait for a refill it will never see.
   const cards = { weekly: [{ recordId: 5, grantType: 'GLOBAL', expiresAt: Date.now() + 2 * H, expired: false }], fiveHour: [] };
-  const a = acct({ ses: 0.6, wk: 0.4 });
-  a.quota.providerWkReset = Date.now() + 5 * 3600_000;
-  const act = decideZai(a, cards);
-  assert.equal(act?.reason, 'dying value', 'dying card redeemed, not held');
+  for (const n of [2, 5]) {
+    assert.equal(decideZai(full(5 * H, 0.6), cards, Date.now(), room(n))?.reason, 'weekly at wall', `${n} peers: spent, not held`);
+  }
+  // Control: the same refill with a card that outlives it is held.
+  assert.equal(decideZai(full(5 * H, 0.6), WEEK_CARD, Date.now(), room(2)), null);
 });
 
-test('W6: wall AND dying together with imminent free refill — dying wins over hold (card expiring)', () => {
-  // Card expires in 2h, util at wall 0.93, free refill in 5h. Holding burns the card's
-  // remaining life for a refill that lands after the card dies — must redeem (dying).
+test('W6: below 100% an expiring card is NEVER spent — with the refill near or far, peers or not', () => {
+  // Was "dying value": a card in its last 24h was redeemed at 30%+ used. Removed.
   const cards = { weekly: [{ recordId: 5, grantType: 'GLOBAL', expiresAt: Date.now() + 2 * H, expired: false }], fiveHour: [] };
-  const a = acct({ ses: 0.1, wk: 0.93 });
-  a.quota.providerWkReset = Date.now() + 5 * 3600_000;
-  const act = decideZai(a, cards);
-  assert.ok(act?.kind === 'card' && act.card.recordId === 5, 'dying-value redeem must not be held by R6 (reason label may read "weekly at wall" when both are true)');
+  for (const refillIn of [5 * H, 5 * DAY, null]) {
+    for (const n of [0, 2]) {
+      const a = acct({ ses: 0.1, wk: 0.93 });
+      a.quota.providerWkReset = refillIn == null ? null : Date.now() + refillIn;
+      assert.equal(decideZai(a, cards, Date.now(), room(n)), null,
+        `93% used, card dies in 2h, refill ${refillIn == null ? 'unknown' : 'in ' + Math.round(refillIn / H) + 'h'}, ${n} peers: kept`);
+    }
+  }
 });
 
-// ── R6 hold does not starve the 5h wall (red-team concern 1, 2026-10-23) ──────
-test('W7: during a weekly hold, a 5h card is spent only once the 5h LIMIT is reached', () => {
+test('W7: the free-refill WAIT is strictly inside a day — 1s under 24h waits, exactly 24h spends', () => {
+  const at = Date.now();
+  const refill = at + 24 * H;
+  const a = acct({ ses: 0.1, wk: 1 });
+  a.quota.providerWkReset = refill;
+  assert.equal(decideZai(a, WEEK_CARD, refill - 24 * H + 1000, room(2)), null, '23h59m59s to the refill: inside the wait window');
+  assert.equal(decideZai(a, WEEK_CARD, refill - 24 * H, room(2))?.card?.recordId, 9, 'exactly 24h: outside the window → redeem');
+  assert.equal(decideZai(a, WEEK_CARD, refill - 24 * H - 1000, room(2))?.card?.recordId, 9, 'more than 24h: redeem');
+});
+
+test('W8: a refill time already in the PAST (a rolled window, stale 100%) spends nothing', () => {
+  // The 100% reading belongs to the window that just rolled: the account is refilling.
+  const a = full(-60_000);
+  assert.equal(decideZai(a, WEEK_CARD, Date.now(), room(0)), null, 'nothing to reset: the window already rolled');
+  assert.equal(decideZai(a, WEEK_CARD, Date.now(), room(2)), null);
+});
+
+test('W9: R4 intact — at 100% the WEEKLY card clears both windows and goes first, hold or no hold', () => {
+  const both = { ...WEEK_CARD, fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }] };
+  // Refill far: the weekly card is spent (never the 5h one) even with the session full.
+  assert.equal(decideZai(full(30 * H, 1), both, Date.now(), room(2))?.resetType, 'WEEK', 'weekly card preferred when not held');
+  // Weekly held (refill near, room): the 5h card does NOT take its place — the account is
+  // blocked by its full WEEK, which a session-only card cannot clear (final contract).
+  const held = decideZai(full(12 * H, 1), both, Date.now(), room(2));
+  assert.equal(held, null, 'weekly held and the session full: the 5h card is kept too');
+});
+
+// ── the 5h card vs a full WEEK (final contract 2026-11-27) ─────────────────────
+test('the 5h card is spent for a 100% SESSION only, and never while the WEEK is at 100%', () => {
   const cards = {
     weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
     fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
   };
+  // Weekly at 93% (not full), session at 97%: nothing is due.
   const a = acct({ ses: 0.97, wk: 0.93 });
-  a.quota.providerWkReset = Date.now() + 12 * 3600_000;   // free refill in 12h → weekly HELD
-  // Session at 97%: below the 5h limit. The weekly is held AND the 5h card is not due.
-  assert.equal(decideZai(a, cards), null, 'weekly held, and 97% of the 5h window is not its limit');
-  // The 5h limit is reached while the weekly is still held: the DEDICATED 5h card goes.
-  // The weekly hold is about the WEEKLY refill; it says nothing about a full 5h window,
-  // which the free weekly refill would also clear but which is blocking the account NOW.
+  a.quota.providerWkReset = Date.now() + 12 * 3600_000;
+  assert.equal(decideZai(a, cards, Date.now(), room(2)), null, '93% week and 97% session: neither limit is reached');
+  // Session reaches 100% while the week is NOT full: the DEDICATED 5h card goes.
   a.quota.providerSes = 1;
-  const act = decideZai(a, cards);
+  const act = decideZai(a, cards, Date.now(), room(2));
   assert.equal(act?.resetType, 'FIVE_HOUR', 'the 5h limit is reached: its own card is spent');
-  assert.equal(act?.card?.recordId, 6, 'never the held weekly card');
+  assert.equal(act?.card?.recordId, 6, 'never the weekly card');
+  // The week reaches 100% too, with the weekly card HELD for its refill: the 5h card is
+  // kept — the account is blocked by its week, which the 5h card cannot clear.
+  a.quota.providerWk = 1;
+  assert.equal(decideZai(a, cards, Date.now(), room(2)), null, 'week full and held: the 5h card waits with it');
+  // ...and with NO weekly card held at all, a full week still keeps the 5h card.
+  const only5h = { weekly: [], fiveHour: cards.fiveHour };
+  a.quota.providerWkReset = Date.now() + 5 * DAY;       // far: the week stays full for days
+  assert.equal(decideZai(a, only5h, Date.now(), room(2)), null, 'a full week is not a session-only block: the 5h card is kept');
 });
 
-test('W8: R4 intact — a 5h window below its limit never takes a card while the weekly card is redeemable', () => {
-  const cards = {
-    weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
-    fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }],
-  };
-  const a = acct({ ses: 0.97, wk: 0.93 });
-  a.quota.providerWkReset = Date.now() + 30 * 3600_000;   // refill far → weekly redeemable → R4 rules
-  const act = decideZai(a, cards);
-  assert.equal(act?.resetType, 'WEEK', 'weekly card still preferred when not held');
-  // And with the weekly card at its wall, a 5h window AT its limit changes nothing: the
-  // weekly card clears both windows, so it is the one card that is spent.
-  a.quota.providerSes = 1;
-  assert.equal(decideZai(a, cards)?.resetType, 'WEEK');
-});
-
-test('W9: 24h boundary — refill exactly 24h+1s away redeems at the wall', () => {
-  const cards = { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] };
-  const a = acct({ ses: 0.1, wk: 0.93 });
-  a.quota.providerWkReset = Date.now() + 24 * 3600_000 + 1000;
-  assert.equal(decideZai(a, cards)?.card?.recordId, 9, 'outside the wait window → redeem');
-});
-
-test('owner 2026-10-30: a dying weekly card/grant is never spent because of the SESSION window alone', () => {
+test('owner 2026-10-30, still true: a weekly card/grant is never spent because of the SESSION window alone', () => {
   const now = Date.now();
-  const soon = now + 3 * 3600 * 1000;   // < 24h left — dying
-  // z.ai: weekly 10%, session 96%, weekly card expiring in 3h
+  const endsAt = now + 3 * 3600 * 1000;   // expiring in 3h
+  // z.ai: weekly 10%, session 96%
   const zai = { enabled: true, quota: { providerSes: 0.96, providerWk: 0.10 } };
-  const cards = { weekly: [{ recordId: 'w1', expiresAt: soon, expired: false }], fiveHour: [] };
-  assert.equal(decideZai(zai, cards, now), null, 'session-driven dying spend refused');
-  // control: same card, weekly at 40% → dying value on the WEEKLY window → spend
+  const cards = { weekly: [{ recordId: 'w1', expiresAt: endsAt, expired: false }], fiveHour: [] };
+  assert.equal(decideZai(zai, cards, now), null, 'session-driven spend refused');
+  // Control (changed 2026-11-27): weekly at 40% used to spend this dying card ("dying
+  // value"). It is now kept: only a measured 100% spends a weekly card.
   const zaiWk = { enabled: true, quota: { providerSes: 0.10, providerWk: 0.40 } };
-  assert.equal(decideZai(zaiWk, cards, now)?.reason, 'dying value', 'weekly-driven dying spend still allowed');
-  // Claude: weekly-clearing grant, weekly 10%, session 96%, dying
+  assert.equal(decideZai(zaiWk, cards, now), null, 'a dying card at 40% of the week: kept');
+  // Claude: weekly-clearing grant, weekly 10%, session 96%, expiring in 3h
   const freshQ = { unified5h: 0.96, unified7d: 0.10, unified7dReset: now + 3 * DAY, lastProbeOkAt: now };
   const cl = { enabled: true, quota: freshQ };
-  const listing = { eligible: true, grants: [{ id: 'g1', usableNow: true, endsAt: soon, clears: ['five_hour', 'seven_day'], givesBackWeekly: false }] };
-  assert.equal(decideClaude(cl, listing, now, { now }), null, 'session-driven dying grant refused');
+  const listing = { eligible: true, grants: [{ id: 'g1', usableNow: true, endsAt, clears: ['five_hour', 'seven_day'], givesBackWeekly: false }] };
+  assert.equal(decideClaude(cl, listing, now, { now }), null, 'session-driven grant claim refused');
   const clWk = { enabled: true, quota: { ...freshQ, unified5h: 0.10, unified7d: 0.40 } };
-  assert.equal(decideClaude(clWk, listing, now, { now })?.reason, 'dying value', 'weekly-driven dying grant still allowed');
+  assert.equal(decideClaude(clWk, listing, now, { now }), null, 'a dying grant at 40% of the week: kept');
 });
 
 // ── TEST 8 (A4, 2026-11-10): z.ai card listings keep the last good on error/timeout/drift ──
@@ -646,7 +741,7 @@ test('the 5h column: blank where it does not apply; 0, unknown and stale are dis
   const live = { provider: 'zai', resetCards: { fiveHour: [
     { recordId: 2, expiresAt: t + 9 * DAY, expired: false }, { recordId: 1, expiresAt: t + 11 * 3600_000, expired: false }], checkedAt: t } };
   assert.equal(cell(live).trim(), '2~11h', 'count and soonest expiry');
-  assert.equal(cell(live).includes('\x1b[32m'), true, 'a live card is GREEN');
+  assert.equal(fiveHourResetCell(live, t).includes('\x1b[32m'), true, 'a live card is GREEN');
   // Expired cards on the listing do not count.
   const withExpired = { provider: 'zai', resetCards: { fiveHour: [
     { recordId: 1, expiresAt: t + 3 * DAY, expired: false }, { recordId: 2, expiresAt: t - DAY, expired: true }], checkedAt: t } };
@@ -701,14 +796,22 @@ test('the 5h column never squeezes a quota bar: it is shown only where it costs 
 // ── The 5h card through the REAL prober (the wiring a decideZai unit test cannot see) ──
 // The decision reads the session usage from THIS sweep's probe (applyProviderUsage runs
 // before decideZai), and the prober sends the policy's resetType on the wire.
-test('REAL WIRING: a 5h card is redeemed through the prober only once the probed session window is at its limit', async () => {
+test('REAL WIRING: a 5h card is redeemed through the prober only once the probed session window is at 100%', async () => {
   const { AccountManager } = await import('../src/account-manager.js');
   const { Prober } = await import('../src/prober.js');
   const realFetch = globalThis.fetch;
   const realLog = console.log;
   console.log = () => {};
   try {
-    for (const [sesUtil, expectSpent] of [[1.0, true], [0.999, false], [0.96, false], [0.02, false]]) {
+    // [session reading, weekly reading, spent?]
+    const cases = [
+      [1.0, 0.2, true],    // session at 100%, week not full: the DEDICATED 5h card goes
+      [1.0, 1.0, false],   // week at 100% too: the 5h card cannot clear it → kept
+      [0.999, 0.2, false], // one step under the session limit: kept
+      [0.96, 0.2, false],
+      [0.02, 0.2, false],
+    ];
+    for (const [sesUtil, wkUtil, expectSpent] of cases) {
       const am = new AccountManager([{ name: 'glm t', type: 'provider', provider: 'zai', apiKey: 'k', credential: 'k' }], 0.9);
       const a = am.accounts[0];
       const posts = [];
@@ -718,21 +821,75 @@ test('REAL WIRING: a 5h card is redeemed through the prober only once the probed
       };
       const logs = [];
       const prober = new Prober(am, { intervalMs: 0, log: m => logs.push(m),
-        // The probe reports the session window; the decision reads THAT, this sweep.
+        // The probe reports both windows; the decision reads THOSE, this sweep.
         providerProbeFn: async () => ({ source: 'zai', ses: { utilization: sesUtil, resetAt: Date.now() + 2 * H },
-          wk: { utilization: 0.2, resetAt: Date.now() + 3 * DAY } }),
+          wk: { utilization: wkUtil, resetAt: Date.now() + 3 * DAY } }),
         cardsFn: async () => ({ weekly: [], fiveHour: [{ recordId: 6, grantType: 'GLOBAL', expiresAt: Date.now() + 20 * DAY, expired: false }] }) });
       await prober.probeProvider(a);
       assert.equal(a.quota.providerSes, sesUtil, 'precondition: the probe reading is what the decision sees');
       if (expectSpent) {
-        assert.equal(posts.length, 1, `session ${sesUtil}: the card is redeemed`);
+        assert.equal(posts.length, 1, `session ${sesUtil} / week ${wkUtil}: the card is redeemed`);
         assert.equal(posts[0].resetType, 'FIVE_HOUR', 'the DEDICATED five-hour card is what is sent');
         assert.equal(posts[0].recordId, 6);
+        assert.equal(a.resetOutcomes['5h'].kind, 'spent at 100%');
+        assert.equal(a.resetOutcomes['5h'].util, 1);
         assert.equal(posts[0].grantType, 'GLOBAL');
         assert.ok(logs.some(l => /redeeming FIVE_HOUR card 6 \(session at limit/.test(l)), 'logged with its reason');
       } else {
-        assert.equal(posts.length, 0, `session ${sesUtil}: below the 5h limit, no card is spent`);
+        assert.equal(posts.length, 0, `session ${sesUtil} / week ${wkUtil}: no card is spent`);
       }
     }
+  } finally { globalThis.fetch = realFetch; console.log = realLog; }
+});
+
+// The weekly hold needs a LIVE count of compatible peers with room. The prober passes
+// `am.countPeersWithRoom` as the 4th decideZai argument; this is the only place that
+// wiring exists, so it is walked through the REAL AccountManager + Prober.
+test('REAL WIRING: at 100% a weekly card WAITS for the free refill only while two compatible GLM peers have room', async () => {
+  const { AccountManager } = await import('../src/account-manager.js');
+  const { Prober } = await import('../src/prober.js');
+  const realFetch = globalThis.fetch;
+  const realLog = console.log;
+  console.log = () => {};
+  const glm = name => ({ name, type: 'provider', provider: 'zai', apiKey: `k-${name}`, credential: `k-${name}`,
+    modelMap: { sonnet: name === 'incompatible' ? 'glm-other' : 'glm-fixture' } });
+  const stubFetch = posts => { globalThis.fetch = async (_u, init) => {
+    if (init?.method === 'POST') { posts.push(JSON.parse(init.body)); return { status: 200, json: async () => ({ code: 200, success: true, data: 1 }) }; }
+    return { status: 200, json: async () => ({ code: 200, data: { fiveHourResets: [], weekResets: [] } }) };
+  }; };
+  try {
+    // Each peer's probe reading: [weekly, session]. "Roomy" = weekly ≤ 0.65 and session ≤ 0.65.
+    const readings = { 'glm full': [1, 0.2], 'peer a': [0.2, 0.2], 'peer b': [0.3, 0.3], incompatible: [0.2, 0.2] };
+    const run = async (names) => {
+      const am = new AccountManager(names.map(glm), 0.9);
+      const posts = [];
+      stubFetch(posts);
+      // Only the walled account carries a card; peers hold none, so they never redeem.
+      const prober = new Prober(am, { intervalMs: 0, log: () => {},
+        providerProbeFn: async acc => ({ source: 'zai', ses: { utilization: readings[acc.name][1], resetAt: Date.now() + 2 * H },
+          wk: { utilization: readings[acc.name][0], resetAt: acc.name === 'glm full' ? Date.now() + 12 * H : Date.now() + 3 * DAY } }),
+        cardsFn: async cred => cred === 'k-glm full'
+          ? { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 60 * DAY, expired: false }], fiveHour: [] }
+          : { weekly: [], fiveHour: [] } });
+      // The peers' probes land first so their room is FRESH when the walled account decides.
+      for (const acc of [...am.accounts.slice(1), am.accounts[0]]) await prober.probeProvider(acc);
+      return { am, posts, full: am.accounts.find(a => a.name === 'glm full') };
+    };
+
+    // Two compatible peers with room: the card waits for the refill 12h away.
+    const held = await run(['glm full', 'peer a', 'peer b']);
+    assert.equal(held.am.countPeersWithRoom(held.full), 2, 'precondition: both peers count as having room');
+    assert.equal(held.posts.length, 0, 'held: two roomy peers carry the load until the free refill');
+
+    // ONE roomy peer: not enough to wait — the card is spent at once.
+    const one = await run(['glm full', 'peer a', 'incompatible']);
+    assert.equal(one.am.countPeersWithRoom(one.full), 1, 'the second roomy account is incompatible and does not count');
+    assert.equal(one.posts.length, 1, 'one roomy peer is not enough: the weekly card is redeemed');
+    assert.equal(one.posts[0].resetType, 'WEEK');
+    assert.equal(one.posts[0].recordId, 9);
+
+    // Alone in the pool: nothing to wait in — the card is spent.
+    const alone = await run(['glm full']);
+    assert.equal(alone.posts.length, 1, 'no peers: the weekly card is redeemed');
   } finally { globalThis.fetch = realFetch; console.log = realLog; }
 });

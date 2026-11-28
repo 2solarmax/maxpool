@@ -162,7 +162,7 @@ test('RELEASE: critical weekly without an unlock cannot serve → moves; an unlo
 test('RELEASE: exhausted/capped weekly cannot serve (benched in every pass) — gate named', () => {
   const m = am(2); am_ref = m;
   const first = acquire(m); release(first);
-  first.account.quota.unified7d = 0.9995; first.account.quota.unified7dReset = FAR();
+  first.account.quota.unified7d = 1; first.account.quota.unified7dReset = FAR();
   assert.equal(m._weeklyRawState(first.account), 'exhausted');
   assert.equal(m._affinityRelease(first.account), 'weekly-exhausted');
   first.account.quota.unified7d = 0.5; first.account.capUtilization = 0.4; first.account.capMode = 'reserve'; first.account.capCeiling = 0.3;

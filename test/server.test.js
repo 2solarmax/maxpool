@@ -17,9 +17,9 @@ test('classifyRateLimit tags modelScope on a per-model weekly cap (long reset, u
 });
 
 test('classifyRateLimit does NOT model-scope a genuine UNIFIED weekly cap', () => {
-  // 0.9995 = genuinely unified-exhausted under the 0.999 floor (use-it-or-lose-it); at
+  // 1 = genuinely unified-exhausted at the 100% floor (use-it-or-lose-it); at
   // this the rejection is account-wide, not a per-model cap on a still-healthy account.
-  const headers = { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '0.9995' };
+  const headers = { 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-7d-utilization': '1' };
   const r = classifyRateLimit(oauthAcct, headers, '{"error":{"message":"weekly limit reached"}}', { model: 'claude-fable-5', retryAfter: 2 * 24 * 3600 });
   assert.equal(r.scope, 'account');
   assert.equal(r.modelScope, null, 'unified is exhausted → whole-account bench, not model-scoped');
@@ -1676,12 +1676,14 @@ test('Z.AI 429 body reset hint controls provider cooldown when retry-after is mi
     res.end(JSON.stringify({
       error: {
         code: '1310',
-        message: `Weekly/Monthly Limit Exhausted. Your limit will reset at ${resetAt}`,
+        message: `Weekly Limit Exhausted. Your limit will reset at ${resetAt}`,
       },
     }));
   });
   const zaiPort = await listen(zaiUpstream);
   const am = new AccountManager([], 0.90, { crossProviderFallbackPolicy: 'when-exhausted' });
+  const refused = [];
+  am.providerReactiveReset = a => { refused.push(a.name); return false; };
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'tc-test' },
     upstream: 'http://127.0.0.1:1',
@@ -1700,6 +1702,7 @@ test('Z.AI 429 body reset hint controls provider cooldown when retry-after is mi
       },
       body: JSON.stringify({ model: 'claude-sonnet-test', messages: [] }),
     });
+    assert.deepEqual(refused, ['glm-fallback']);
     assert.equal(res.status, 429);
     const account = am.accounts.find(a => a.name === 'glm-fallback');
     assert.ok(account.rateLimitedUntil - Date.now() > 90_000);

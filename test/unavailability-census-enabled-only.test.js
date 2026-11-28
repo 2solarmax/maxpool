@@ -49,7 +49,7 @@ test('quota-dominant classification uses enabled accounts only', () => {
   const am = new AccountManager(mkAccounts(3, { enabledFirst: 2 }), 0.90);
   // Both enabled accounts weekly-exhausted; one disabled.
   for (const a of am.accounts.slice(0, 2)) {
-    a.quota.unified7d = 0.999;
+    a.quota.unified7d = 1;
     a.quota.unified7dReset = Date.now() + 5 * 86400_000;
   }
   const c = am.unavailabilityCensus();

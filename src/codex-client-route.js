@@ -4,7 +4,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { nativeCodexHeaders, nativeCodexOwnerIdentity, normalizeNativeCodexModel, NATIVE_CODEX_RESPONSES_URL } from './codex-native.js';
-import { codexRateLimit } from './codex-quota.js';
+import { codexRateLimit, codexWeeklyRefusal } from './codex-quota.js';
 import { HOP_HEADER } from './pool-link.js';
 import { finishInference, capacityDenial, noteRoutingUsage } from './routing-service-analytics.js';
 
@@ -373,6 +373,10 @@ export function createCodexClientRoute(manager, config, hooks, redeemForRequest)
             const retry = limit ? retryAfter(upstream, limit.retryAfter) : null;
             if (sameAttemptGrant() && limit) manager.markRateLimited(account.index, retry, { recordFailure: false, modelScope: limit.modelScope, modelWindow: limit.modelWindow });
             else if (sameAttemptGrant() && upstream.status === 401) manager.markAuthFailed(account.index, 401, 'native_codex_unauthorized');
+            if (!draining && sameAttemptGrant() && limit) {
+              const refused = codexWeeklyRefusal(upstream.headers, limit);
+              if (refused) Promise.resolve(manager.onWeeklyRefusal?.(account, refused)).catch(() => {});
+            }
             if (ctx.service && limit) {
               ctx.service.denied = limit.modelWindow === 'weekly' ? 'weeklyDenied'
                 : limit.modelWindow === '5h' ? 'sessionDenied' : 'unclassifiedDenied';

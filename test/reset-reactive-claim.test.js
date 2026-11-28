@@ -51,7 +51,7 @@ test('SC5: scoped 429 + measured fable bucket → exactly 1 claim POST, bench cl
   const calls = [];
   const restore = stubClaim({ calls });
   try {
-    const manager = am({ grants: FABLE(2), scoped: { fable: { utilization: 0.995, resetAt: Date.now() + 2 * DAY, isActive: true } } });
+    const manager = am({ grants: FABLE(2), scoped: { fable: { utilization: 1, resetAt: Date.now() + 2 * DAY, isActive: true } } });
     const a = manager.accounts[0];
     a.status = 'throttled'; a.rateLimitedUntil = Date.now() + 4 * H; a.lastError = 'rate_limited';   // the 429 bench
     const attempted = await manager.tryReactiveClaim(a, { kind: 'fable' });
@@ -65,7 +65,7 @@ test('SC5: scoped 429 + measured fable bucket → exactly 1 claim POST, bench cl
     // A second Fable 429 on the SAME wall, with the measured bucket still in place
     // (judge #12: the old test passed only because the entry was deleted) and an
     // unspent Fable grant still held — no probe has landed since the claim.
-    a.quota.scopedWeekly = { fable: { utilization: 0.995, resetAt: Date.now() + 2 * DAY, isActive: true } };
+    a.quota.scopedWeekly = { fable: { utilization: 1, resetAt: Date.now() + 2 * DAY, isActive: true } };
     assert.equal(await manager.tryReactiveClaim(a, { kind: 'fable' }), false, 'suppressed by the one-claim-per-wall guard');
     assert.equal(calls.filter(u => /reset_rate_limits/.test(u)).length, 1, 'no second claim');
   } finally { restore(); }
@@ -76,7 +76,7 @@ test('SC5/8: stale stored listing (20 min) + 7d-class 429 → claim POST same ti
   const calls = [];
   const restore = stubClaim({ calls });
   try {
-    const manager = am({ grants: GEN(), wk: 0.999 });
+    const manager = am({ grants: GEN(), wk: 1 });
     const a = manager.accounts[0];
     a.resetGrants.stale = true;
     a.resetGrants.checkedAt = Date.now() - 20 * 60_000;   // stale but ≤ 6h
@@ -84,6 +84,8 @@ test('SC5/8: stale stored listing (20 min) + 7d-class 429 → claim POST same ti
     const t0 = Date.now();
     const attempted = await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 });
     assert.equal(attempted, true, 'the claim fired without a fresh listing');
+    assert.equal(a.resetOutcomes.weekly.kind, 'spent at 100%');
+    assert.equal(a.resetOutcomes.weekly.util, 1);
     assert.equal(calls.filter(u => /reset_rate_limits/.test(u)).length, 1, 'one claim POST');
     assert.ok(Date.now() - t0 < 1000, 'same tick');
     assert.equal(calls.filter(u => /oauth\/token/.test(u)).length, 0, 'ZERO calls to the refresh endpoint');
@@ -91,8 +93,24 @@ test('SC5/8: stale stored listing (20 min) + 7d-class 429 → claim POST same ti
   } finally { restore(); }
 });
 
+test('reactive weekly claim ignores a 99.9% reading even with an expiring grant', async () => {
+  const calls = [];
+  const restore = stubClaim({ calls });
+  try {
+    const grants = GEN();
+    grants.grants[0].endsAt = Date.now() + H;
+    const manager = am({ grants, wk: 0.999 });
+    const a = manager.accounts[0];
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 0.999 }), false);
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly' }), false, 'the stored reading is below 100% too');
+    assert.deepEqual(calls, [], 'no profile fetch or claim below 100%');
+    assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1 }), true);
+    assert.equal(calls.filter(u => /reset_rate_limits/.test(u)).length, 1);
+  } finally { restore(); }
+});
+
 // ── TEST 17: a scoped 429 without a measured bucket → no claim (the sweep decides) ─
-test('SC8: scoped Fable 429 with an unmeasured bucket → 0 claims; measured 0.995 → ONLY the Fable grant', async () => {
+test('SC8: scoped Fable 429 with an unmeasured bucket → 0 claims; measured at 100% → ONLY the Fable grant', async () => {
   const calls = [];
   const restore = stubClaim({ calls });
   try {
@@ -104,9 +122,9 @@ test('SC8: scoped Fable 429 with an unmeasured bucket → 0 claims; measured 0.9
     assert.equal(att, false, 'no claim attempted');
     assert.equal(calls.filter(u => /reset_rate_limits/.test(u)).length, 0, '0 claims on an unmeasured bucket');
 
-    // (b) measured at 0.995: only the Fable grant is claimed (not the general one).
+    // (b) measured at 100%: only the Fable grant is claimed (not the general one).
     const mgrB = am({ grants: { grants: [...GEN().grants, ...FABLE(1).grants], nextGrantId: null, cooldownUntil: null, eligible: true, checkedAt: Date.now(), stale: false },
-      scoped: { fable: { utilization: 0.995, resetAt: Date.now() + 2 * DAY, isActive: true } }, wk: 0.4 });
+      scoped: { fable: { utilization: 1, resetAt: Date.now() + 2 * DAY, isActive: true } }, wk: 0.4 });
     const aB = mgrB.accounts[0];
     await mgrB.tryReactiveClaim(aB, { kind: 'fable' });
     assert.equal(calls.filter(u => /reset_rate_limits/.test(u)).length, 1);
@@ -121,7 +139,7 @@ test('SC8: one claim per account even when probe and reactive fire together', as
   const calls = [];
   const restore = stubClaim({ calls });
   try {
-    const manager = am({ grants: GEN(), wk: 0.995 });
+    const manager = am({ grants: GEN(), wk: 1 });
     const a = manager.accounts[0];
     // Two concurrent reactive attempts (the probe path and the request path).
     await Promise.all([
@@ -138,7 +156,7 @@ test('SC8: a mirror row, a pool-benched account, a disabled account, an outside-
   const calls = [];
   const restore = stubClaim({ calls });
   try {
-    const manager = am({ grants: GEN(), wk: 0.995 });
+    const manager = am({ grants: GEN(), wk: 1 });
     const a = manager.accounts[0];
 
     // Mirror row: the 429 arrived from the cloud; the mirror holds no credential.
@@ -172,7 +190,7 @@ test('SC8: a failing claim attempts at 0, +15m, +45m only; one profile GET per a
   try {
     const manager = new AccountManager([{ name: 'claude BACKOFF-UNIQUE', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
     const a = manager.accounts[0];
-    a.quota.unified7d = 0.995; a.quota.unified7dReset = Date.now() + 3 * DAY; a.quota.lastProbeOkAt = Date.now();
+    a.quota.unified7d = 1; a.quota.unified7dReset = Date.now() + 3 * DAY; a.quota.lastProbeOkAt = Date.now();
     manager.applyResetGrants(0, GEN());
     await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 });       // attempt 1 (0m)
     shift.ms = 5 * 60_000;
@@ -199,10 +217,10 @@ test('SC8: the claim lock covers BOTH paths (prober suppressed while reactive ho
   const calls = [];
   const restore = stubClaim({ calls });
   try {
-    const manager = am({ grants: GEN(), wk: 0.995 });
+    const manager = am({ grants: GEN(), wk: 1 });
     const a = manager.accounts[0];
     const prober = new Prober(manager, { intervalMs: 0, log: () => {}, providerProbeFn: async () => null,
-      probeFn: async () => ({ fiveHour: { utilization: 0.2 }, sevenDay: { utilization: 0.995 }, weeklyAbsent: false }),
+      probeFn: async () => ({ fiveHour: { utilization: 0.2 }, sevenDay: { utilization: 1 }, weeklyAbsent: false }),
       grantsFn: async () => a.resetGrants });
     // The reactive path holds the lock (a claim in flight): the prober's own claim
     // must be suppressed for the same account.
@@ -213,6 +231,8 @@ test('SC8: the claim lock covers BOTH paths (prober suppressed while reactive ho
     manager.releaseClaimLock(a.name);
     const claimed2 = await prober._claimClaudeGrant(a, { grant: GEN().grants[0], scope: 'general', reason: 'weekly at wall' });
     assert.equal(claimed2, true, 'the prober claims once the lock is free');
+    assert.equal(a.resetOutcomes.weekly.kind, 'spent at 100%');
+    assert.equal(a.resetOutcomes.weekly.util, 1);
   } finally { restore(); }
 });
 
@@ -226,7 +246,7 @@ test('SC8 (judge #1): sequential weekly 429s after a claim → ONE POST; resetsL
   try {
     const listing = GEN();
     listing.grants[0].resetsLeft = 2; listing.grants[0].resetsTotal = 2;
-    const manager = am({ grants: listing, wk: 0.999 });
+    const manager = am({ grants: listing, wk: 1 });
     const a = manager.accounts[0];
     const posts = () => calls.filter(u => /reset_rate_limits/.test(u)).length;
 
@@ -239,10 +259,10 @@ test('SC8 (judge #1): sequential weekly 429s after a claim → ONE POST; resetsL
     assert.equal(posts(), 1, 'no second claim for the same wall');
 
     // The prober race: a probe SENT before the claim lands after it, still carrying
-    // the pre-claim 0.999 reading. Neither path may treat it as a new wall.
+    // the pre-claim 100% reading. Neither path may treat it as a new wall.
     const claimAt = a.lastClaimAt;
     await new Promise(r => setTimeout(r, 5));
-    manager.applyUsageData(0, usageAt(0.999), { sentAt: claimAt - 1000 });
+    manager.applyUsageData(0, usageAt(1), { sentAt: claimAt - 1000 });
     assert.ok(a.quota.lastProbeOkAt > claimAt, 'precondition: the reading was APPLIED after the claim');
     assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 }), false);
     assert.equal(decideClaude(a, a.resetGrants), null, 'the prober path refuses the same late reading');
@@ -250,7 +270,7 @@ test('SC8 (judge #1): sequential weekly 429s after a claim → ONE POST; resetsL
 
     // Negative control: a probe SENT after the claim still at the wall is a NEW wall.
     await new Promise(r => setTimeout(r, 5));
-    manager.applyUsageData(0, usageAt(0.999), { sentAt: Date.now() });
+    manager.applyUsageData(0, usageAt(1), { sentAt: Date.now() });
     assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 }), true);
     assert.equal(posts(), 2, 'a probe sent after the claim licenses the remaining reset');
     assert.equal(a.resetGrants.grants.length, 0, 'resetsLeft 1 → 0: the grant left the stored listing');
@@ -271,7 +291,7 @@ test('SC8 (judge #4): a 401 on the reactive claim sets NO backoff and leaves the
   try {
     const manager = new AccountManager([{ name: 'claude 401-UNIQUE', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
     const a = manager.accounts[0];
-    a.quota.unified7d = 0.999; a.quota.unified7dReset = Date.now() + 3 * DAY; a.quota.lastProbeOkAt = Date.now();
+    a.quota.unified7d = 1; a.quota.unified7dReset = Date.now() + 3 * DAY; a.quota.lastProbeOkAt = Date.now();
     manager.applyResetGrants(0, GEN());
     assert.equal(await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 }), true, 'attempted');
     const key = `${a.name}:g1`;
@@ -296,7 +316,7 @@ test('SC8 (judge #4): the reactive claim carries an abort signal (bounded; never
   try {
     const manager = new AccountManager([{ name: 'claude SIGNAL-UNIQUE', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.9);
     const a = manager.accounts[0];
-    a.quota.unified7d = 0.999; a.quota.unified7dReset = Date.now() + 3 * DAY; a.quota.lastProbeOkAt = Date.now();
+    a.quota.unified7d = 1; a.quota.unified7dReset = Date.now() + 3 * DAY; a.quota.lastProbeOkAt = Date.now();
     manager.applyResetGrants(0, GEN());
     await manager.tryReactiveClaim(a, { kind: 'weekly', weeklyUtil: 1.0 });
     assert.ok(signals.length >= 1);

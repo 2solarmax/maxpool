@@ -49,8 +49,8 @@ function setUsage(a, { wk, ses, wkReset = 3 * DAY, sesReset = 3 * H, scoped = nu
   if (scoped) a.quota.scopedWeekly = scoped;
 }
 
-// ── TEST 21: the lift suspends the cap; the claim fires at the 0.999 limit; cap returns ──
-test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal, claim at the 0.999 limit, capped returns after the claim', async () => {
+// ── TEST 21: the lift suspends the cap; the claim fires at the 1.0 limit; cap returns ──
+test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal, claim at the 100% limit, capped returns after the claim', async () => {
   const am = cappedAm({ cap: 0.75 });
   const a = am.accounts[0];
   setUsage(a, { wk: 0.93 });
@@ -60,13 +60,13 @@ test('SC10: capped 0.75 + fresh seven_day grant → not capped, routable normal,
   am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
   assert.equal(am.capLiftActive(a), true, 'the lift is active');
   assert.notEqual(am._weeklyRawState(a), 'capped', 'not capped while lifted');
-  assert.equal(am._weeklyRawState(a), 'normal', 'routable at normal share (0.93 < 0.999 wall)');
+  assert.equal(am._weeklyRawState(a), 'normal', 'routable at normal share (0.93 < 1.0 wall)');
   assert.equal(am._isSessionQuotaUnavailable(a), false, 'the session bench reads no cap either');
   // Climb to the claim point; the PROBER claims (the real end-of-lift path —
   // judge #12: ending it via an empty listing never exercised the claim).
-  setUsage(a, { wk: 0.999 });
+  setUsage(a, { wk: 1.0 });
   const act = decideClaude(a, a.resetGrants);
-  assert.ok(act, 'the claim fires at the limit (0.999 used, limit 0.999)');
+  assert.ok(act, 'the claim fires at the limit (1.0 used, limit 1.0)');
   const restore = stubClaimFetch({ ok: true });
   try { assert.equal(await quietProber(am)._claimClaudeGrant(a, act), true, 'claimed'); }
   finally { restore(); }
@@ -153,7 +153,7 @@ test('SC10: fresh→stale→fresh at 60s cadence = at most 2 state changes; no w
 test('SC10: a claim failure while lifted applies the cap again on the next evaluation', async () => {
   const am = cappedAm({ cap: 0.75 });
   const a = am.accounts[0];
-  setUsage(a, { wk: 0.999 });
+  setUsage(a, { wk: 1.0 });
   am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
   assert.equal(am.capLiftActive(a), true);
   // Drive the REAL claim path with a failing claim (judge #12: calling endCapLift
@@ -191,7 +191,7 @@ test('SC10: Fable-only grant and unmeasured give-back grant NEVER lift; measured
 });
 
 // ── TEST 26: the lift suspends BOTH windows + the GLM max(ses,wk) cap ─────────
-test('SC10: (a) Claude ses 0.80 over a 0.75 cap is not session-benched while lifted; (b) GLM capped 0.60 climbs past it and the card redeems at 0.90', async () => {
+test('SC10: (a) Claude ses 0.80 over a 0.75 cap is not session-benched while lifted; (b) GLM capped 0.60 climbs past it and the card redeems at 100%', async () => {
   // (a) Claude
   const am = cappedAm({ cap: 0.75, type: 'oauth' });
   const claude = am.accounts[0];
@@ -200,7 +200,7 @@ test('SC10: (a) Claude ses 0.80 over a 0.75 cap is not session-benched while lif
   am.applyResetGrants(0, { grants: [GEN_GRANT()], eligible: true });
   assert.equal(am._isSessionQuotaUnavailable(claude), false, 'the session bench reads no cap while lifted');
 
-  // (b) GLM: cap 0.60 on max(ses,wk); a usable weekly card lifts; wk climbs to the 0.90 wall.
+  // (b) GLM: cap 0.60 on max(ses,wk); a usable weekly card lifts; wk climbs to the 100% wall.
   const glm = cappedAm({ cap: 0.60, type: 'provider', provider: 'zai' });
   const g = glm.accounts[0];
   g.quota.providerSes = 0.30; g.quota.providerSesReset = Date.now() + 3 * H;
@@ -210,11 +210,14 @@ test('SC10: (a) Claude ses 0.80 over a 0.75 cap is not session-benched while lif
   glm.applyResetCards(0, { weekly: [{ recordId: 9, grantType: 'GLOBAL', expiresAt: Date.now() + 20 * DAY, expired: false }], fiveHour: [] });
   assert.equal(glm.capLiftActive(g), true, 'a z.ai weekly card lifts the provider cap');
   assert.notEqual(glm._weeklyRawState(g), 'capped', 'routable past 0.60 while lifted');
-  // climbs to the wall → decideZai redeems at 0.90
-  g.quota.providerWk = 0.91;
   const { decideZai } = await import('../src/reset-policy.js');
+  // below 100% the card is kept, even at the old 0.90 wall
+  g.quota.providerWk = 0.91;
+  assert.equal(decideZai(g, glm.accounts[0].resetCards), null, '0.91 is not 100%: the card is kept');
+  // climbs to the limit → decideZai redeems (no peers: nothing to wait in)
+  g.quota.providerWk = 1;
   const act = decideZai(g, glm.accounts[0].resetCards);
-  assert.equal(act?.card?.recordId, 9, 'the card redeems at the 0.90 wall');
+  assert.equal(act?.card?.recordId, 9, 'the card redeems at 100%');
 });
 
 // ── C3 start-gates: dead/benched accounts never lift ──────────────────────────

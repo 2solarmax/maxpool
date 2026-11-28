@@ -321,23 +321,48 @@ shared weekly reset policy after a fresh quota reading:
   lift Claude grants and z.ai cards get), so the reserve the cap keeps is restored
   by the reset instead of being held back from the pool. Within a day of the free
   weekly refill the cap returns.
-- **It fires once the limit is reached.** The credit is spent when the weekly
-  limit is reached, which is the same point MaxPool stops routing to the account.
-  Nothing is spent at 96, 99 or 90 percent. A usage cap is your reservation, not
-  the provider's limit: a cap that binds never spends a credit. The credit lifts
-  the cap instead.
+- **It fires at 100 percent.** The credit is spent when the weekly limit is fully
+  used. MaxPool keeps routing to the account until the provider itself refuses
+  it, then spends the credit straight away, so an account that reads 99.9
+  percent is never left blocked with a credit unspent. A usage cap is your
+  reservation, not the provider's limit: a cap that binds never spends a credit.
+  The credit lifts the cap instead.
 - **It waits while other accounts have room.** At least two other compatible
   accounts per held reset with ample weekly and session headroom carry the load
   instead, however far the free refill is. The hold ends the moment that room is
-  gone.
-- **A credit about to expire is spent rather than wasted.** A credit with under a
-  day to live is spent once the account has used enough of its week, unless it
-  still has half a day left after the free refill. This is the final precaution
-  and the only time a credit is spent before the limit. While a credit is in its
-  last day, work is steered to its account so it reaches the limit honestly
-  instead of the credit dying unused on an idle account. That steering leaves the
-  account's 5-hour cost alone: a busy session still makes it an expensive pick.
-  A credit with more than a day left never steers.
+  gone. A credit that would expire before the free refill is never held for it.
+
+The same rules apply to every automatic reset, for every provider (Claude grants,
+Codex credits and GLM cards), through one shared planner:
+
+- **Plan ahead in the last day.** While a weekly reset has less than a day to
+  live, work is steered to its account so it can reach 100 percent on its own
+  before the reset expires. That steering leaves the account's 5-hour cost alone:
+  a busy session still makes it an expensive pick. A reset with more than a day
+  left never steers.
+- **Last resort in the last 30 minutes.** If the account is still below 100
+  percent, the reset is spent within 30 minutes of expiring, as long as at least
+  30 percent of the week is used. A failed attempt inside those 30 minutes is
+  retried about every five minutes, whether the spend was a last resort or the
+  routine one at 100 percent. A free refill that arrives before the reset expires
+  makes it worthless, so the reset is kept then. Most Claude grants can only ever
+  be used at the limit (the listing marks them so); those are never spent early.
+- **GLM weekly cards** at 100 percent wait for z.ai's free weekly refill only when
+  that refill lands in less than a day, the card will still be valid after it,
+  and at least two other compatible GLM accounts have room right now. Otherwise
+  the card is spent at once. A weekly refusal from z.ai spends the card at once
+  too, without waiting for the next quota check.
+- **GLM 5-hour cards** are spent only when the 5-hour window is at 100 percent and
+  the week is not. A full week is not something a 5-hour card can clear, so the
+  card waits for the weekly refill or a weekly card. A 5-hour card is never spent
+  early because it is about to expire.
+- **What happened to each reset** shows on the accounts screen, on a `Resets` line
+  under the accounts (and on the web screen): spent at 100 percent, spent as last
+  resort with the share of the week used, or expired unused. The share is rounded
+  down, so a spend below the limit never reads as 100 percent. A weekly refusal
+  and a manual spend are identified separately. If a reset disappears and the
+  provider does not confirm it expired unused, its outcome is unknown. Each
+  window shows its latest outcome from the last seven days. No Slack alert is sent.
 
 Token counts requested on the ChatGPT route are estimates. Claude Code
 Remote Control can steer the same running terminal session from a browser
@@ -471,7 +496,7 @@ TEAMCLAUDE_CONFIG=./my-config.json maxpool server
     "weeklySoftThreshold": 0.65,
     "weeklyReserveThreshold": 0.85,
     "weeklyCriticalThreshold": 0.95,
-    "weeklyExhaustedThreshold": 0.999,
+    "weeklyExhaustedThreshold": 1.0,
     "weeklyBurnDebtWeight": 0.6
   },
   "retry": {

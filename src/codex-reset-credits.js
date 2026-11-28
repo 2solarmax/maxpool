@@ -6,7 +6,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { fetchCodexUsage } from './codex-usage.js';
-import { CLAIM_FRESH_MS, CLAUDE_WALL_WEEKLY, POLICY, codexAutoResetOn, decideCodexWithReason } from './reset-policy.js';
+import {
+  CLAIM_FRESH_MS, CLAUDE_WALL_WEEKLY, POLICY, codexAutoResetOn, decideCodexWithReason,
+  planExpiringReset, EXPIRING_RESET, RESET_OUTCOME, noteResetOutcome, retryAfterFailedReset, LAST_RESORT_REASON,
+  weeklyUsedWithRefusal,
+} from './reset-policy.js';
 import { CLAIM_BACKOFF_STEPS_MS, GRANTS_EVERY_MS, LIFT_GRACE_MS, LISTING_FRESH_MS, REACTIVE_CLAIM_TIMEOUT_MS } from './reset-timing.js';
 import { nativeCodexHeaders } from './codex-native.js';
 
@@ -147,7 +151,7 @@ export async function consumeResetCredit(account, { creditId = null, redeemReque
     // A declined redemption comes back 200 with its reason in `code`, so the
     // verdict is read from the BODY and a non-2xx means only that no verdict
     // was reached. Reversing those two would report "no_credit" as a success.
-    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
+    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status, retryAt: resetRetryAt(res) };
     const data = await res.json();
     const windows = Number(data?.windows_reset);
     return {
@@ -280,7 +284,7 @@ export class ResetCreditRedeemer {
     return value;
   }
 
-  async _reserve(account, creditId, manual, now, deadline) {
+  async _reserve(account, creditId, manual, now, deadline, retryMs = RETRY_COOLDOWN_MS) {
     const identity = this._identity(account);
     if (!identity) return { reason: 'the Codex account is missing a stable workspace identity' };
     if (!creditId) return { reason: 'upstream did not identify the banked reset' };
@@ -308,7 +312,7 @@ export class ResetCreditRedeemer {
           identity, credit,
           requestId: sameCredit ? pending.requestId : randomUUID(),
           replaying: sameCredit,
-          reservedUntil: now + RETRY_COOLDOWN_MS,
+          reservedUntil: now + retryMs,
         };
         // A lost worker leaves this conservative hold in place. A subsequent
         // attempt at the same credit replays the exact upstream request ID.
@@ -322,7 +326,7 @@ export class ResetCreditRedeemer {
     }
   }
 
-  async _finish(reservation, { redeemed, uncertain, now }) {
+  async _finish(reservation, { redeemed, uncertain, now, retryMs = RETRY_COOLDOWN_MS }) {
     try {
       await this._updatePersistent(current => {
         if (current.pending?.requestId !== reservation.requestId) return { state: current, value: null };
@@ -335,7 +339,7 @@ export class ResetCreditRedeemer {
           state: {
             ledger,
             pending: uncertain ? { ...reservation, reservedUntil: now } : null,
-            fleetCooldownUntil: redeemed ? now + SUCCESS_COOLDOWN_MS : uncertain ? now + RETRY_COOLDOWN_MS : 0,
+            fleetCooldownUntil: redeemed ? now + SUCCESS_COOLDOWN_MS : uncertain ? now + retryMs : 0,
           },
           value: null,
         };
@@ -344,7 +348,7 @@ export class ResetCreditRedeemer {
       // Keep the original reservation and pause locally even if finishing its
       // durable update failed. The upstream POST must not be repeated to
       // recover a failure to persist its outcome.
-      this.fleetCooldownUntil = Math.max(this.fleetCooldownUntil, now + RETRY_COOLDOWN_MS);
+      this.fleetCooldownUntil = Math.max(this.fleetCooldownUntil, now + retryMs);
       this.log('[MaxPool] Could not persist the Codex banked reset outcome');
     }
   }
@@ -356,9 +360,15 @@ export class ResetCreditRedeemer {
     try { read = await this.detailsFn(account, opts); } catch (/** @type {any} */ error) {
       read = { error: error?.message || String(error) };
     }
-    if (this._owns(account) && account.credential === credential && !(account.lastClaimAt >= sentAt)) {
-      if (sentAt >= (this.opportunityDetails.get(account)?.creditsAt || 0)) {
-        this.opportunityDetails.set(account, { credits: !read.error && Array.isArray(read.credits) ? read.credits : null, creditsAt: sentAt });
+    if (this._owns(account) && account.credential === credential && !(account.lastClaimAt >= sentAt)
+      && sentAt >= (this.opportunityDetails.get(account)?.creditsAt || 0)) {
+      this.opportunityDetails.set(account, { credits: !read.error && Array.isArray(read.credits) ? read.credits : null, creditsAt: sentAt });
+      // A credit that left the rows after its own end expired unused (dashboard outcome).
+      if (!read.error && Array.isArray(read.credits)) {
+        this.am.observeResetInventory?.(account, read.credits
+          .filter(credit => ['available', 'expired'].includes(credit?.status))
+          .map(credit => ({ id: credit.id, endsAt: credit.expiresAt ?? null, window: 'weekly',
+            expired: credit.status === 'expired' || credit.expiresAt != null && credit.expiresAt <= sentAt })), sentAt);
       }
       // A confirmed (or vanished) credit changes whether the account's cap is lifted.
       this.am.refreshCapLift?.(account.index, this.now(), 'credits refreshed');
@@ -431,14 +441,20 @@ export class ResetCreditRedeemer {
   // every EXPIRY_REFRESH_MS. A failed read is retried later, never in a tight loop, and
   // never touches the claim cooldown.
   async _noteExpiry(account, now, deadline) {
-    if (!(account.quota?.codexResetCredits?.available > 0)) return;
     const state = this._stateFor(account);
-    if (now < state.expiryRetryAt) return;
     const seen = this.opportunityDetails.get(account);
+    // The upstream count says whether any exist; the rows are read only then. The ONE
+    // exception: the last read showed a credit that was live THEN, and the count has
+    // since dropped — read the rows once more, so a credit that lapsed is seen leaving
+    // and the dashboard records "expired unused" (observeResetInventory). An empty read
+    // clears `live` below, so this costs one read per lapse, never one per sweep.
+    const live = seen?.credits ? redeemableCredit(seen.credits, seen.creditsAt) : null;
+    if (!(account.quota?.codexResetCredits?.available > 0) && !live && !account._resetInventory?.length) return;
+    if (now < state.expiryRetryAt) return;
     if (seen && now - seen.creditsAt < EXPIRY_REFRESH_MS) return;
     if (this._timeLeft(deadline) <= 0) return;
     const result = await this._credits(account, state, now, deadline);
-    if (result.error) state.expiryRetryAt = now + EXPIRY_REFRESH_MS;
+    if (result.error) state.expiryRetryAt = Math.max(result.retryAt || 0, now + this._retryMs(account, EXPIRY_REFRESH_MS, now));
   }
 
   /**
@@ -484,24 +500,38 @@ export class ResetCreditRedeemer {
       // Keep the cap lift in step with the stored rows on every sweep (no network): it
       // ends as soon as they age out, a redeem backs off, or automatic resets go off.
       this.am.refreshCapLift?.(account.index, now, 'credits refreshed');
-      // A cap or an expiring credit is not a full weekly window. Keep the listing
-      // current below the limit, without authorizing consumption.
-      const minimum = CLAUDE_WALL_WEEKLY;
-      if (!(q.unified7d >= minimum) || !(q.unified7dReset > now)
-        || !(now - q.codexWeeklyReadingAt <= CLAIM_FRESH_MS)) {
+      // A cap is not a full weekly window. Keep the listing current below the limit,
+      // without authorizing consumption. ONE exception (owner 2026-11-28, the shared
+      // expiry planner): a confirmed credit inside its last POLICY.lastResortMs IS
+      // decided below the limit — that is the last resort, and the decision itself
+      // checks the 30%-used floor and the free refill. A request refusal never spends
+      // below the limit: it acts at the weekly wall only.
+      const fresh = now - q.codexWeeklyReadingAt <= CLAIM_FRESH_MS;
+      const atLimit = weeklyUsedWithRefusal(account, q.unified7d, q.unified7dReset, now) >= CLAUDE_WALL_WEEKLY;
+      if (!fresh || !(q.unified7dReset > now) || (!atLimit && reactive)) {
         // Nothing to decide on this account now. A sweep may still refresh the expiry
         // the table shows (an account that will read its credits below does not need to).
         if (!reactive) await this._noteExpiry(account, now, deadline);
         continue;
       }
+      if (!atLimit) {
+        // Below the limit: read the rows first (at most every EXPIRY_REFRESH_MS), so a
+        // credit entering its last-resort window is seen on THIS sweep, then let the
+        // shared planner decide whether it is one.
+        await this._noteExpiry(account, now, deadline);
+        if (this._decision(account, this._stateFor(account), false, now).reason !== LAST_RESORT_REASON) continue;
+      }
       const summary = q.codexResetCredits;
       if (summary && now - summary.checkedAt <= CLAIM_FRESH_MS
-        && summary.available === 0) continue;
+        && summary.available === 0) {
+        if (!reactive && atLimit) await this._noteExpiry(account, now, deadline);
+        continue;
+      }
       const state = this._stateFor(account);
       if (now < state.cooldownUntil) continue;
       const result = await this._credits(account, state, now, deadline);
       if (result.error) {
-        state.cooldownUntil = now + CLAIM_BACKOFF_STEPS_MS[0];
+        state.cooldownUntil = Math.max(result.retryAt || 0, now + this._retryMs(account, CLAIM_BACKOFF_STEPS_MS[0], now));
         reason = result.error;
         continue;
       }
@@ -512,7 +542,7 @@ export class ResetCreditRedeemer {
     }
     actions.sort((a, b) => byExpiry(a.grant.endsAt, b.grant.endsAt));
     for (const { account, state, grant, reason: why } of actions) {
-      const result = await this._consume(account, state, { creditId: grant.id, reason: why }, this.now(), deadline, reactive);
+      const result = await this._consume(account, state, { creditId: grant.id, reason: why, expiresAt: grant.endsAt }, this.now(), deadline, reactive);
       if (result.redeemed) return result;
       reason = result.reason;
       if (this.now() < this.fleetCooldownUntil || this._timeLeft(deadline) <= 0) break;
@@ -521,8 +551,18 @@ export class ResetCreditRedeemer {
   }
 
   _decision(account, state, reactive, now) {
-    if (reactive && !(account.quota?.unified7d >= CLAUDE_WALL_WEEKLY)) {
+    const used = weeklyUsedWithRefusal(account, account.quota?.unified7d, account.quota?.unified7dReset, now);
+    // A refusal acts at the weekly wall only; a last-resort spend is the sweep's.
+    if (reactive && !(used >= CLAUDE_WALL_WEEKLY)) {
       return { action: null, reason: 'weekly below wall' };
+    }
+    // BELOW the limit the shared planner decides alone (one place for every provider):
+    // nothing is spent before POLICY.lastResortMs of expiry.
+    if (!(used >= CLAUDE_WALL_WEEKLY)) {
+      const soonest = redeemableCredit(state.credits || [], now);
+      const plan = planExpiringReset({ expiresAt: soonest?.expiresAt ?? null, util: account.quota?.unified7d,
+        refillAt: account.quota?.unified7dReset, now });
+      if (plan !== EXPIRING_RESET.LAST_RESORT) return { action: null, reason: 'weekly below limit' };
     }
     const summary = account.quota?.codexResetCredits;
     if (summary && now - summary.checkedAt <= CLAIM_FRESH_MS
@@ -616,7 +656,7 @@ export class ResetCreditRedeemer {
     const timeoutMs = this._timeLeft(deadline);
     if (timeoutMs <= 0) return { error: 'ran out of the redeem budget before reading the credit rows' };
     const result = await this.readDetails(account, { timeoutMs });
-    if (result?.error) return { error: result.error };
+    if (result?.error) return result;
     const credits = result?.credits || [];
     state.credits = credits;
     state.creditsAt = now;
@@ -645,13 +685,23 @@ export class ResetCreditRedeemer {
       // no idempotency key minted for a request never made. Per-account only —
       // nothing was sent, so the fleet has nothing to be careful of.
       const why = fresh.error || 'ran out of the redeem budget';
-      state.cooldownUntil = now + RETRY_COOLDOWN_MS;
+      state.cooldownUntil = now + this._retryMs(account, RETRY_COOLDOWN_MS, now, verdict.expiresAt);
       this.log(`[MaxPool] Codex rate-limit reset on "${name}" stopped before redeeming — ${why}`);
       return { redeemed: false, reason: why };
     }
 
     const validate = () => this._decision(account, state, reactive, this.now()).action?.grant.id === verdict.creditId;
-    return this.redeemGrant(account, verdict.creditId, { deadline, reason: verdict.reason, validate });
+    return this.redeemGrant(account, verdict.creditId, { deadline, reason: verdict.reason, validate, expiresAt: verdict.expiresAt });
+  }
+
+  /** The wait before an automatic attempt on `account` is repeated after it failed: the
+   *  usual cooldown, or about POLICY.lastResortRetryMs while the credit it is for is
+   *  inside its last-resort window (the shared retryAfterFailedReset rule). */
+  _retryMs(account, usualWaitMs, now = this.now(), expiresAt = undefined) {
+    const soonest = expiresAt !== undefined ? expiresAt
+      : redeemableCredit(this.opportunityDetails.get(account)?.credits || this._stateFor(account).credits || [], now)?.expiresAt;
+    return retryAfterFailedReset({ expiresAt: soonest ?? null, util: weeklyUsedWithRefusal(account, account?.quota?.unified7d, account?.quota?.unified7dReset, now),
+      refillAt: account?.quota?.unified7dReset, now, usualWaitMs });
   }
 
   /**
@@ -663,24 +713,29 @@ export class ResetCreditRedeemer {
    * @param {{ manual?: boolean, deadline?: number, reason?: string, validate?: () => boolean }} [opts]
    * @returns {Promise<RedeemResult>}
    */
-  async redeemGrant(account, creditId, { manual = false, deadline = this.now() + this.timeoutMs, reason = 'manual redeem', validate } = {}) {
+  async redeemGrant(account, creditId, { manual = false, deadline = this.now() + this.timeoutMs, reason = 'manual redeem', validate, expiresAt } = {}) {
     if (!this._owns(account)) {
       return { redeemed: false, reason: 'this Codex account cannot redeem a banked reset here' };
     }
     const now = this.now();
-    const { reservation, reason: unavailable } = await this._reserve(account, creditId, manual, now, deadline);
+    // A manual redeem keeps the usual cooldown; an automatic one inside its last-resort
+    // window retries about every POLICY.lastResortRetryMs (the request id is replayed,
+    // so a retry after an uncertain outcome can never spend twice).
+    let retryMs = manual ? RETRY_COOLDOWN_MS : this._retryMs(account, RETRY_COOLDOWN_MS, now, expiresAt);
+    const { reservation, reason: unavailable } = await this._reserve(account, creditId, manual, now, deadline, retryMs);
     if (!reservation) return { redeemed: false, reason: unavailable };
     const { requestId: redeemRequestId } = reservation;
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
     const timeoutMs = this._timeLeft(deadline);
     if (timeoutMs <= 0 || !this._owns(account) || (!manual && !automaticFor(account)) || (validate && !validate())) {
-      await this._finish(reservation, { redeemed: false, uncertain: reservation.replaying, now });
+      await this._finish(reservation, { redeemed: false, uncertain: reservation.replaying, now, retryMs });
       const reason = timeoutMs <= 0 ? 'ran out of the redeem budget' : 'account or automatic reset eligibility changed';
       return { redeemed: false, reason };
     }
 
     this.log(`[MaxPool] ${manual ? 'Manually redeeming' : 'Redeeming'} a free Codex rate-limit reset on "${name}" — ${reason}`);
+    const usedBefore = account.quota?.unified7d;
     let result;
     try {
       result = await this.consumeFn(account, { creditId, redeemRequestId }, { timeoutMs });
@@ -690,11 +745,19 @@ export class ResetCreditRedeemer {
     const redeemed = !result?.error && (result?.code === 'reset' || result?.code === 'already_redeemed');
     const declined = result?.code === 'no_credit' || result?.code === 'nothing_to_reset';
     const uncertain = !redeemed && !declined || Boolean(result?.error);
-    await this._finish(reservation, { redeemed, uncertain, now: this.now() });
+    retryMs = Math.max(retryMs, (result?.retryAt || 0) - this.now());
+    await this._finish(reservation, { redeemed, uncertain, now: this.now(), retryMs });
+    // The pool dashboard shows what became of each automatic reset (owner 2026-11-28),
+    // recorded on the reading the decision was made on, before the post-reset re-read.
+    if (redeemed) {
+      noteResetOutcome(account, manual ? RESET_OUTCOME.MANUAL : reason === LAST_RESORT_REASON ? RESET_OUTCOME.LAST_RESORT
+        : account.weeklyRefusal && !(usedBefore >= 1) ? RESET_OUTCOME.REFUSED : RESET_OUTCOME.SPENT,
+        { util: usedBefore, id: creditId, now: this.now() });
+    }
     state.credits = null;
     this.opportunityDetails.delete(account);
     this.am.refreshCapLift?.(account.index, this.now(), 'credit spent or unsettled');
-    state.cooldownUntil = now + (redeemed ? SUCCESS_COOLDOWN_MS : RETRY_COOLDOWN_MS);
+    state.cooldownUntil = this.now() + (redeemed ? SUCCESS_COOLDOWN_MS : retryMs);
     if (uncertain) {
       const detail = safeLine(result?.error || 'no upstream verdict');
       this.log(`[MaxPool] Codex reset outcome is uncertain on "${name}" — ${detail}; the pool holds off`);

@@ -21,7 +21,7 @@ function localPool(now) {
   ], 0.9);
   const self = am.accounts[0];
   self.accountUuid = 'u-self';
-  self.quota.unified7d = 0.995; self.quota.unified7dReset = now + 18 * H;
+  self.quota.unified7d = 1; self.quota.unified7dReset = now + 18 * H;
   self.quota.unified5h = 0.2; self.quota.lastProbeOkAt = now;
   return am;
 }
@@ -146,7 +146,7 @@ test('(h) a cloud row that is holding its own wall counts as a holder on the Mac
   const now = Date.now();
   const holding = cloudRow('cloud-held', 'u-ch', now, {
     wallHolding: true,
-    quota: { unified7d: 0.995, unified7dReset: now + 10 * H, unified5h: 0.2, lastProbeOkAt: now },
+    quota: { unified7d: 1, unified7dReset: now + 10 * H, unified5h: 0.2, lastProbeOkAt: now },
   });
   const am = withMirrors([holding, cloudRow('cloud-2', 'u-c2', now), cloudRow('cloud-3', 'u-c3', now)], now);
   assert.equal(count(am, now), 2, 'the two roomy cloud rows are peers');
