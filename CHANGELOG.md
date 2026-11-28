@@ -5,6 +5,22 @@ All notable changes to maxpool are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.128] - 2026-11-28
+
+### Added
+
+- Spend banked resets when the limit is reached, and 5-hour cards in their own column
+- Share expiry planning and last-resort redemption across account providers
+
+### Changed
+
+- Restore park-lift from live, move limit fixtures to the limit, begin the 100% rule
+- No automatic reset below 100%; refill hold with compatible spare accounts
+
+### Fixed
+
+- Keep reset display and worker-handoff checks deterministic
+
 ## [1.24.127] - 2026-11-27
 
 ### Fixed
